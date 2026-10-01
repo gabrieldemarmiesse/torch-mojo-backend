@@ -47,7 +47,9 @@ from tmb.ops.common import (
     OVERLAP_PARTIAL,
     assert_no_internal_overlap,
     assert_no_partial_overlap,
+    fill_value,
     overlap_status,
+    resized_geometry,
     check_out,
     fill_value,
     same_view,
@@ -119,26 +121,38 @@ def _dest(
     inputs: List[T],
     identity: Bool,
     internal_check: Bool = True,
+    copy_shortcut: Bool = False,
+    zero_first: Bool = False,
 ) raises -> Tuple[T, Int]:
     """The tensor an `out=` / `grad_input=` overload writes, and how the
     result reaches the caller's tensor (DIRECT / COPY_BACK / RESIZE_COPY /
-    NO_OP).
+    NO_OP). The checks follow the "Upsample / pad" rows of the overlap
+    table in tmb/ops/common.mojo: the structured meta resizes the out
+    first, and only what the CUDA kernel then does checks anything --
 
-    `identity`: the op copies its input unchanged (CUDA's `output.copy_(input)`
-    shortcut), so an `out` that IS that input view is a no-op, as on CUDA.
-    torch's upsample and pad kernels run no overlap check against their
-    input, so an `out` overlapping it does not raise: the result is computed
-    into a fresh tensor and copied back (the input is read before anything
-    is written), except upsample's same-size shortcut, CUDA's
-    `output.copy_(input)`, which refuses a partial overlap like copy_.
-    `internal_check`: upsample's out still refuses internal overlap (an
-    expanded out), pad's does not. An `out` that must be resized
-    while it shares storage with an input is resized only after the kernel
-    ran into a fresh tensor: the resize may reallocate the storage the
-    input's pointer still addresses."""
+    `copy_shortcut`: the kernel's same-size `output.copy_(input)` (copy_'s
+    internal-overlap check, then its partial-overlap check against the
+    input; the same tensor is a no-op). `zero_first`: bilinear2d's backward
+    zeroes grad_input before that copy, so a grad_input that IS grad_output
+    ends up zero. `internal_check`: the kernel copies a non-contiguous out
+    back with copy_, which refuses an internally overlapping one.
+    Otherwise nothing is checked, as in torch, and an out overlapping the
+    input gets the result computed into a fresh tensor and copied back.
+    `identity`: the op copies its input unchanged, so an `out` that IS that
+    input view is a no-op. An `out` that must be resized while it shares
+    storage with an input is resized only after the kernel ran into a fresh
+    tensor: the resize may reallocate the storage the input's pointer still
+    addresses."""
     var dst = v_tensor(args[unsafe_offset=i])
     check_out(dst, like)
     var shape = _shape(dims)
+    var post = resized_geometry(dst, shape, len(dims))
+    if copy_shortcut:
+        assert_no_internal_overlap(post)
+        for k in range(len(inputs)):
+            assert_no_partial_overlap(post, inputs[k])
+    elif internal_check and not post.contig:
+        assert_no_internal_overlap(post)
     var matches = dst.rank == len(dims)
     if matches:
         for k in range(len(dims)):
@@ -146,16 +160,14 @@ def _dest(
                 matches = False
                 break
     if matches and identity and same_view(dst, inputs[0]):
+        if zero_first:
+            fill_value(dst, 0.0)
         return (dst^, NO_OP)
     var overlaps = False
     for k in range(len(inputs)):
         var status = overlap_status(dst, inputs[k])
         if status == OVERLAP_FULL or status == OVERLAP_PARTIAL:
             overlaps = True
-        if identity and internal_check:
-            # Upsample's same-size shortcut is `output.copy_(input)`, whose
-            # TensorIterator refuses a partial overlap.
-            assert_no_partial_overlap(dst, inputs[k])
     if not matches:
         for k in range(len(inputs)):
             if shares_storage(dst, inputs[k]):
@@ -165,8 +177,6 @@ def _dest(
                 )
         resize_out(dst, shape, len(dims))
         return (dst^, DIRECT)
-    if internal_check:
-        assert_no_internal_overlap(dst)
     if dst.contig and not overlaps:
         return (dst^, DIRECT)
     return (new_tensor(shape, len(dims), dst.stype, dst.device), COPY_BACK)
@@ -386,6 +396,39 @@ def _run_upsample[
     _ = ctx
 
 
+def _has_copy_shortcut[MODE: Int, RANK: Int]() -> Bool:
+    """The CUDA kernels with a host-side same-size `copy_`:
+    upsample_nearest2d / _upsample_nearest_exact2d and upsample_bilinear2d,
+    forward and backward (UpSampleNearest2d.cu, UpSampleBilinear2d.cu)."""
+    return RANK == 2 and (
+        MODE == NEAREST or MODE == NEAREST_EXACT or MODE == LINEAR
+    )
+
+
+def _copies_back[MODE: Int, RANK: Int, BACKWARD: Bool]() -> Bool:
+    """The CUDA kernels that compute a non-contiguous out into a temporary
+    and `copy_` it back (so refuse an internally overlapping out): nearest
+    2-d (both ways) and 3-d forward, bilinear 2-d backward, trilinear
+    backward, antialiased forward."""
+    comptime if MODE == NEAREST or MODE == NEAREST_EXACT:
+        return RANK == 2 or (RANK == 3 and not BACKWARD)
+    elif MODE == LINEAR:
+        return BACKWARD and RANK >= 2
+    elif MODE == BILINEAR_AA:
+        return not BACKWARD
+    else:
+        return False
+
+
+def _same_dims(a: List[Int], b: List[Int]) -> Bool:
+    if len(a) != len(b):
+        return False
+    for k in range(len(a)):
+        if a[k] != b[k]:
+            return False
+    return True
+
+
 def _is_identity[
     MODE: Int, RANK: Int, BACKWARD: Bool
 ](in_dims: List[Int], out_dims: List[Int], scales: List[Float64]) -> Bool:
@@ -450,7 +493,16 @@ def op_upsample[
     var how = DIRECT
     comptime if OUT:
         var d = _dest(
-            args, first_scale + RANK, a, out_dims, [a.copy()], identity
+            args,
+            first_scale + RANK,
+            a,
+            out_dims,
+            [a.copy()],
+            identity,
+            _copies_back[MODE, RANK, False](),
+            _has_copy_shortcut[MODE, RANK]()
+            and a.numel > 0
+            and _same_dims(in_dims, out_dims),
         )
         dst = d[0].copy()
         how = d[1]
@@ -513,8 +565,21 @@ def op_upsample_backward[
     var dst: T
     var how = DIRECT
     comptime if OUT:
+        var grad_input_numel = 1
+        for k in range(len(in_dims)):
+            grad_input_numel *= in_dims[k]
         var d = _dest(
-            args, first_scale + RANK, g, in_dims, [g.copy()], identity
+            args,
+            first_scale + RANK,
+            g,
+            in_dims,
+            [g.copy()],
+            identity,
+            _copies_back[MODE, RANK, True](),
+            _has_copy_shortcut[MODE, RANK]()
+            and grad_input_numel > 0
+            and _same_dims(in_dims, out_dims),
+            MODE == LINEAR and RANK == 2,
         )
         dst = d[0].copy()
         how = d[1]

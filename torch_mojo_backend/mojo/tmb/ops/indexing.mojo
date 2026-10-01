@@ -86,6 +86,7 @@ from tmb.ops.common import (
     copy_strided_into,
     cast_to,
     device_str,
+    resized_geometry,
     fill_value,
     is_int_stype,
     resize_out,
@@ -107,6 +108,7 @@ from tmb.ops.data_movement import (
     _scatter_into,
     _scatter_launch,
     _scatter_validate,
+    check_self_copy,
     index_put_slice,
     scatter_add_sorted,
     scatter_scalar,
@@ -1596,7 +1598,10 @@ def _scatter_reduce_op(
                 alert_not_deterministic("scatter_reduce_cuda_kernel")
     if out_pos >= 0:
         var out = v_tensor(args[unsafe_offset=out_pos])
+        # scatter_meta_impl checks the out as given; scatter_impl then
+        # copies self in after the resize.
         _check_out_of(out, a, index, src)
+        check_self_copy(out, a)
         if same_view(out, a):
             _scatter_red_or_fill(
                 out, a, dim, index, src, value, ivalue, red, include_self, what
@@ -1912,9 +1917,13 @@ def _index_reduce_op(
     if out_pos >= 0:
         var out = v_tensor(args[unsafe_offset=out_pos])
         check_out(out, a)
-        assert_no_internal_overlap(out)
-        assert_no_overlap(out, index)
-        assert_no_overlap(out, source)
+        # index_func_meta_impl sets the out's shape, then checks it; the
+        # kernel then copies self in (`copy_`'s partial-overlap check).
+        var post = resized_geometry(out, a.shape, a.rank)
+        assert_no_internal_overlap(post)
+        assert_no_overlap(post, index)
+        assert_no_overlap(post, source)
+        check_self_copy(out, a)
         if same_view(out, a):
             _index_reduce_into(out, a, dim, index, source, red, include_self)
         else:

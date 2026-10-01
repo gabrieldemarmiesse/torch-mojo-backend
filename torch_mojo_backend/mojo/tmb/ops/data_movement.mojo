@@ -105,6 +105,7 @@ from tmb.ops.common import (
     assert_no_overlap,
     assert_no_partial_overlap,
     is_int_stype,
+    resized_geometry,
     scalar_to_float,
     scalar_to_int,
     broadcast_shape,
@@ -1276,31 +1277,6 @@ def _scalar_type_name(dt: DType) -> String:
     return String(dt)
 
 
-def resized_geometry(dest: T, shape: IndexList[MAX_RANK], rank: Int) -> T:
-    """`dest` as `resize_out(dest, shape, rank)` would leave it -- the same
-    tensor (handle, storage, offset), contiguous at the new shape unless it
-    already has that shape -- for overlap checks that ATen runs after the
-    resize, made before it. Kernel-only: never handed to the dispatcher."""
-    if dest.rank == rank:
-        var same = True
-        for d in range(rank):
-            if dest.dim(d) != shape[MAX_RANK - rank + d]:
-                same = False
-        if same:
-            return dest.copy()
-    var t = dest.copy()
-    # An empty view reports no data pointer; the resize keeps its offset.
-    t.ptr = dest.storage_ptr() + dest.offset * dest.itemsize
-    t.rank = rank
-    t.shape = shape
-    t.strides = contiguous_strides(shape, rank)
-    t.numel = 1
-    for d in range(rank):
-        t.numel *= shape[MAX_RANK - rank + d]
-    t.contig = True
-    return t^
-
-
 def _cat_out_batched(ins: List[T], dim: Int, out_t: T) raises -> Bool:
     """Write the concatenation straight into an existing contiguous `out` of
     the result shape with one batched rectangle copy (converting when the
@@ -2223,6 +2199,11 @@ def op_scatter_src_out(
     var dim = _scatter_validate(
         a, v_int(args[unsafe_offset=1]), index, src.copy(), False
     )
+    # scatter_meta_impl on the out as given, then scatter_impl's copy_.
+    assert_no_internal_overlap(out)
+    assert_no_overlap(out, index)
+    assert_no_overlap(out, src)
+    check_self_copy(out, a)
     _copy_self_into_out(out, a, "scatter")
     _scatter_into(out, dim, _dim_or1(a, dim), index, src^, 0.0, False, False)
     ret_ref(rets, 0, out)
@@ -2523,11 +2504,10 @@ def op_index_select_out(
     var index = v_tensor(args[unsafe_offset=2])
     var out = v_tensor(args[unsafe_offset=3])
     var shape = _index_select_shape(a, dim, index)
-    # index_select_out_cuda's checks (on the post-resize geometry).
-    var post = resized_geometry(out, shape, a.rank)
-    assert_no_internal_overlap(post)
-    assert_no_overlap(post, a)
-    assert_no_overlap(post, index)
+    # index_select_out_cuda checks the out as given, then resizes it.
+    assert_no_internal_overlap(out)
+    assert_no_overlap(out, a)
+    assert_no_overlap(out, index)
     _out_target(out, shape, a.rank, a, "index_select")
     _index_select_into(out, a, dim, index)
     ret_ref(rets, 0, out)
@@ -2565,6 +2545,14 @@ def op_scatter_add_(
     ret_ref(rets, 0, a)
 
 
+def check_self_copy(dest: T, a: T) raises:
+    """`if (!result.is_same(self)) result.copy_(self)` after the out took
+    self's shape: copy_'s partial-overlap check, on the post-resize
+    geometry (scatter / index_add / index_reduce out= overloads)."""
+    if dest.impl() != a.impl():
+        assert_no_partial_overlap(resized_geometry(dest, a.shape, a.rank), a)
+
+
 def _copy_self_into_out(mut out: T, a: T, what: String) raises:
     """`out = self.clone()` for the out= overload of an accumulating op:
     resize `out` to self's shape when it differs, then copy self over unless
@@ -2586,6 +2574,11 @@ def op_scatter_add_out(
     var src = v_tensor(args[unsafe_offset=3])
     var out = v_tensor(args[unsafe_offset=4])
     var dim = _scatter_add_check(a, v_int(args[unsafe_offset=1]), index, src)
+    # scatter_meta_impl checks the out as given, before setting its shape.
+    assert_no_internal_overlap(out)
+    assert_no_overlap(out, index)
+    assert_no_overlap(out, src)
+    check_self_copy(out, a)
     _copy_self_into_out(out, a, "scatter_add")
     _scatter_into(out, dim, _dim_or1(a, dim), index, src^, 0.0, False, True)
     ret_ref(rets, 0, out)
@@ -2736,6 +2729,12 @@ def op_index_add_out(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=5])
+    # index_func_meta_impl sets the out's shape, then checks it.
+    var post = resized_geometry(out, a.shape, a.rank)
+    assert_no_internal_overlap(post)
+    assert_no_overlap(post, v_tensor(args[unsafe_offset=2]))
+    assert_no_overlap(post, v_tensor(args[unsafe_offset=3]))
+    check_self_copy(out, a)
     _copy_self_into_out(out, a, "index_add")
     _index_add_into(
         out,

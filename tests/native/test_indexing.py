@@ -1449,7 +1449,7 @@ def test_deterministic_index_add_float32_order_is_cuda_s(mojo_device, width):
         torch.use_deterministic_algorithms(before)
     for c in range(width):
         expected = _index_put_sum_reference(
-            src[:, c].tolist(), base[0, c].item(), width
+            src[:, c].tolist(), base[0, c].item(), width, _index_put_warp(mojo_device)
         )
         assert got[0, c].item() == expected
     assert torch.equal(got[1], base[1])
