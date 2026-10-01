@@ -79,6 +79,7 @@ COVERS: dict[str, str] = {
         "test_scatter_reduce (reduce='add'/'multiply' are its sum/prod launches)"
     ),
     "aten::index_reduce": "test_index_reduce",
+    "aten::_embedding_bag_forward_only": "test_embedding_bag",
 }
 
 _SAME_KERNEL_OUT = (
@@ -113,6 +114,24 @@ SKIPPED: dict[str, str] = {
     "aten::scatter_reduce_.two": _SAME_KERNEL_INPLACE,
     "aten::index_reduce.out": _SAME_KERNEL_OUT,
     "aten::index_reduce_": _SAME_KERNEL_INPLACE,
+    "aten::_embedding_bag": (
+        "test_embedding_bag's kernel: the same launch, taken when the weight "
+        "requires grad"
+    ),
+    "aten::_embedding_bag_backward": (
+        "argument checks, then _embedding_bag_dense_backward"
+    ),
+    "aten::_embedding_bag_dense_backward": (
+        "index_select / mul / div / index_add (or scatter_add for max) "
+        "through the dispatcher, each benchmarked: no kernel of its own"
+    ),
+    "aten::_embedding_bag_per_sample_weights_backward": (
+        "index_select / mul / sum through the dispatcher, each benchmarked"
+    ),
+    "aten::embedding_renorm_": (
+        "a host dedup of the indices (one read) and a per-row rescale kernel; "
+        "the read dominates"
+    ),
 }
 
 
@@ -389,4 +408,36 @@ def test_index_reduce(
         lambda: torch.index_reduce(x_ref, dim, idx_ref, s_ref, layout),
         lambda: torch.index_reduce(x_our, dim, idx_our, s_our, layout),
         flops=float(selected * (cols if dim == 0 else rows)),
+    )
+
+
+# (vocab, dim, bags, bag length)
+EMB_BAG_SHAPES: dict[str, tuple[int, int, int, int]] = {
+    "V50304xD768_B1024xL48": (50304, 768, 1024, 48),
+    "V1000xD64_B357xL7": (1000, 64, 357, 7),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", EMB_BAG_SHAPES)
+@pytest.mark.parametrize("layout", ("sum", "mean", "max"))
+@pytest.mark.bench_op("_embedding_bag_forward_only")
+def test_embedding_bag(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    vocab, dim, bags, length = EMB_BAG_SHAPES[shape_id]
+    w_ref, w_our = both(
+        torch.randn(vocab, dim, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    i_ref, i_our = both(torch.randint(0, vocab, (bags * length,)), hw, mojo_device)
+    o_ref, o_our = both(torch.arange(0, bags * length, length), hw, mojo_device)
+    bench.run(
+        lambda: F.embedding_bag(i_ref, w_ref, o_ref, mode=layout),
+        lambda: F.embedding_bag(i_our, w_our, o_our, mode=layout),
+        flops=float(bags * length * dim),
     )

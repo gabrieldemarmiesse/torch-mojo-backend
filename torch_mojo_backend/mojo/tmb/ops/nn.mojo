@@ -1674,6 +1674,18 @@ def op_embedding(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var table = v_tensor(args[unsafe_offset=0])
     var idx = v_tensor(args[unsafe_offset=1])
     _require_mojo(table, "embedding")
+    # Embedding.cpp's checks, before any decline.
+    if table.rank != 2:
+        raise Error("'weight' must be 2-D")
+    if idx.dtype != DType.int32 and idx.dtype != DType.int64:
+        raise Error(
+            (
+                "Expected tensor for argument #1 'indices' to have one of the"
+                " following scalar types: Long, Int; but got "
+            ),
+            String(idx.dtype),
+            " instead (while checking arguments for embedding)",
+        )
     if (
         table.device != idx.device
         or not _is_float(table.dtype)
