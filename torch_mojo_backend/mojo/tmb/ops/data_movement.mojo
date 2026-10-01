@@ -106,6 +106,7 @@ from tmb.ops.common import (
     assert_no_partial_overlap,
     is_int_stype,
     resized_geometry,
+    shares_storage,
     scalar_to_float,
     scalar_to_int,
     broadcast_shape,
@@ -1399,6 +1400,38 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # to the front of `base`.
     if not out.same_shape(result.t):
         resize_out(out, result.t.shape, result.t.rank)
+        # ATen reads the inputs after this resize (one kernel over all of
+        # them): an input sharing the out's storage is re-read, and the
+        # concatenation redone from what it holds now.
+        var shared = False
+        for x in real:
+            if shares_storage(out, x):
+                shared = True
+        if shared:
+            # CUDA copies the inputs into their slices one after another, so
+            # an input sharing the out's storage reads what earlier inputs
+            # wrote there.
+            _ = result^
+            var at = 0
+            for x in real:
+                var xi = T(x.h)
+                var sh = out.shape
+                sh[MAX_RANK - rank + dim] = xi.dim(dim)
+                var piece = own(
+                    view_strided(
+                        out,
+                        sh,
+                        out.strides,
+                        rank,
+                        out.offset + at * out.stride(dim),
+                    )
+                )
+                if xi.numel > 0:
+                    _device_copy(piece.t, xi)
+                _ = piece^
+                at += xi.dim(dim)
+            ret_ref(rets, 0, out)
+            return
     # copy_'s route: pairs the device cast lacks (int8/int16, float64 on
     # Apple GPUs) convert on the host.
     _device_copy(out, result.t)
@@ -2205,6 +2238,9 @@ def op_scatter_src_out(
     assert_no_overlap(out, src)
     check_self_copy(out, a)
     _copy_self_into_out(out, a, "scatter")
+    a = T(a.h)
+    index = T(index.h)
+    src = T(src.h)
     _scatter_into(out, dim, _dim_or1(a, dim), index, src^, 0.0, False, False)
     ret_ref(rets, 0, out)
 
@@ -2391,7 +2427,8 @@ def op_gather_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     assert_no_overlap(post, a)
     assert_no_partial_overlap(post, index)
     _out_target(out, shape, index.rank, a, "gather")
-    _gather_into(out, a, dim, index, "gather")
+    # Re-read the inputs: the resize may have moved a storage they share.
+    _gather_into(out, T(a.h), dim, T(index.h), "gather")
     ret_ref(rets, 0, out)
 
 
@@ -2509,7 +2546,43 @@ def op_index_select_out(
     assert_no_overlap(out, a)
     assert_no_overlap(out, index)
     _out_target(out, shape, a.rank, a, "index_select")
-    _index_select_into(out, a, dim, index)
+    # Re-read the inputs: the resize may have moved a storage they share.
+    var a2 = T(a.h)
+    var index2 = T(index.h)
+    if shares_storage(out, a2) and index2.numel <= 16 and index2.numel > 1:
+        # CUDA's small-index kernel (<= 16 indices) walks the indices in
+        # order: a slice read after an earlier one was written sees it.
+        var d = _norm_dim(dim, a2.rank, "index_select")
+        for i in range(index2.numel):
+            var ish = IndexList[MAX_RANK](1)
+            var ist = IndexList[MAX_RANK](0)
+            var one = own(
+                view_strided(
+                    index2,
+                    ish,
+                    ist,
+                    1,
+                    index2.offset
+                    + i * (index2.stride(0) if index2.rank > 0 else 0),
+                )
+            )
+            var osh = out.shape
+            osh[MAX_RANK - out.rank + d] = 1
+            var piece = own(
+                view_strided(
+                    out,
+                    osh,
+                    out.strides,
+                    out.rank,
+                    out.offset + i * out.stride(d),
+                )
+            )
+            _index_select_into(piece.t, a2, dim, one.t)
+            _ = piece^
+            _ = one^
+        ret_ref(rets, 0, out)
+        return
+    _index_select_into(out, a2, dim, index2)
     ret_ref(rets, 0, out)
 
 
@@ -2553,12 +2626,15 @@ def check_self_copy(dest: T, a: T) raises:
         assert_no_partial_overlap(resized_geometry(dest, a.shape, a.rank), a)
 
 
-def _copy_self_into_out(mut out: T, a: T, what: String) raises:
-    """`out = self.clone()` for the out= overload of an accumulating op:
-    resize `out` to self's shape when it differs, then copy self over unless
-    `out` IS self."""
-    _out_target(out, a.shape, a.rank, a, what)
-    if out.ptr == a.ptr and strides_equal(out.strides, a.strides, a.rank):
+def _copy_self_into_out(mut out: T, a_in: T, what: String) raises:
+    """ATen's sequence for the out= overload of a scatter / index op: resize
+    `out` to self's shape (structured meta), then `if (!out.is_same(self))
+    out.copy_(self)` -- on the caller's tensor, with self re-read after the
+    resize (it may have moved a storage self shares). The caller re-reads
+    its other inputs too."""
+    _out_target(out, a_in.shape, a_in.rank, a_in, what)
+    var a = T(a_in.h)
+    if out.impl() == a.impl():
         return
     if a.numel > 0:
         copy_strided_into(out, a)
@@ -2580,16 +2656,16 @@ def op_scatter_add_out(
     assert_no_overlap(out, src)
     check_self_copy(out, a)
     _copy_self_into_out(out, a, "scatter_add")
+    a = T(a.h)
+    index = T(index.h)
+    src = T(src.h)
     _scatter_into(out, dim, _dim_or1(a, dim), index, src^, 0.0, False, True)
     ret_ref(rets, 0, out)
 
 
-def _index_add_into(
-    target: T, a: T, dim_in: Int, index: T, source: T, alpha: Value
-) raises:
-    """`target[..., index[i], ...] += alpha * source[..., i, ...]` along
-    `dim`: ScatterAddDim over source's index space with the 1-D index
-    broadcast (stride 0) across every other coordinate."""
+def _index_add_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
+    """index_add's argument checks (index_func_meta_impl's), before any
+    overlap check or write; returns the normalized dim."""
     var dim = _norm_dim(dim_in, a.rank, "index_add")
     var rank = max(a.rank, 1)
     _check_index(index, a, "index_add")
@@ -2634,6 +2710,17 @@ def _index_add_into(
     _ = ctx
     if metal and a.dtype == DType.float64:
         unsupported("aten::index_add of " + String(a.dtype) + " on Apple GPU")
+    return dim
+
+
+def _index_add_into(
+    target: T, a: T, dim_in: Int, index: T, source: T, alpha: Value
+) raises:
+    """`target[..., index[i], ...] += alpha * source[..., i, ...]` along
+    `dim`: ScatterAddDim over source's index space with the 1-D index
+    broadcast (stride 0) across every other coordinate."""
+    var dim = _index_add_check(a, dim_in, index, source)
+    var rank = max(a.rank, 1)
     if source.numel == 0:
         return
     # `alpha * source` through the dispatcher when alpha is not 1 (autograd's
@@ -2729,6 +2816,12 @@ def op_index_add_out(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=5])
+    _ = _index_add_check(
+        a,
+        v_int(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+        v_tensor(args[unsafe_offset=3]),
+    )
     # index_func_meta_impl sets the out's shape, then checks it.
     var post = resized_geometry(out, a.shape, a.rank)
     assert_no_internal_overlap(post)
@@ -2738,7 +2831,7 @@ def op_index_add_out(
     _copy_self_into_out(out, a, "index_add")
     _index_add_into(
         out,
-        a,
+        T(a.h),
         v_int(args[unsafe_offset=1]),
         v_tensor(args[unsafe_offset=2]),
         v_tensor(args[unsafe_offset=3]),
