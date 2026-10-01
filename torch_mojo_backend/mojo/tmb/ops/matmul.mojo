@@ -1450,6 +1450,39 @@ def _round_to(c: _Coef, st: Int32) -> _Coef:
     return _Coef(c.f.cast[DType.bfloat16]().cast[DType.float64](), 0, False)
 
 
+def _raw_zero(v: Value) raises -> Bool:
+    """`scalar.toComplexDouble() == 0`: no range check, nothing converted."""
+    return v_f64(v) == 0.0
+
+
+def _coefs(
+    alpha_v: Value,
+    beta_v: Value,
+    st: Int32,
+    self_st: Int32,
+    numel: Int,
+    k: Int,
+    scalar_t: Bool = False,
+) raises -> Tuple[_Coef, _Coef]:
+    """(alpha, beta) converted only where CUDA converts them: nothing for an
+    empty result; for an empty reduction (k == 0) alpha is never read and
+    beta is `scalar_tensor(beta, self.scalar_type())` (range-checked in
+    self's dtype); otherwise both in opmath (or scalar_t: addmv's gemv)."""
+    var zero = _unit(st, 0)
+    if numel == 0:
+        return (zero, zero)
+    if k == 0:
+        if _raw_zero(beta_v):
+            return (zero, zero)
+        if is_int_stype(self_st):
+            return (zero, _Coef(0.0, scalar_to_int(beta_v, self_st), True))
+        var f = scalar_to_float(beta_v, self_st)
+        return (zero, _round_to(_Coef(f, 0, False), self_st))
+    if scalar_t:
+        return (_coef_scalar_t(alpha_v, st), _coef_scalar_t(beta_v, st))
+    return (_coef(alpha_v, st), _coef(beta_v, st))
+
+
 def _int_product(a: T, b: T, out_stype: Int32) raises -> T:
     """`a @ b` on integer operands: IntMmSpec over dense copies."""
     var ca = Tmp(a)
@@ -1470,6 +1503,12 @@ def _int_product(a: T, b: T, out_stype: Int32) raises -> T:
     _ = ca^
     _ = cb^
     return out.take()
+
+
+def _product_dims(a: T, b: T) -> List[Int]:
+    var dims = _leading_dims(a)
+    dims.append(b.dim(b.rank - 1))
+    return dims^
 
 
 def _product(a: T, b: T, out_stype: Int32) raises -> T:
@@ -1521,7 +1560,13 @@ def _blas(
         compute = ST_FLOAT32
     if not use_addend and (alpha.one() or k == 0):
         compute = out_stype  # the bare product: no epilogue
-    var product = own(_product(a, b, compute))
+    # alpha == 0: BLAS never reads A or B (a NaN there does not propagate),
+    # the result is `beta * addend`.
+    var product = own(
+        _zeros(
+            _product_dims(a, b), compute, a.device
+        ) if alpha.zero() else _product(a, b, compute)
+    )
     if not _has_dims(product.t, dims):
         var shaped = _view(product.t, dims)
         product = own(shaped^)  # the view keeps the storage alive
@@ -2033,12 +2078,16 @@ def _addmm_run(
     var k = mat1.dim(1)
     var n = mat2.dim(1)
     var dims: List[Int] = [m, n]
-    var alpha = _coef(alpha_v, mat1.stype)
-    var beta = _coef(beta_v, mat1.stype)
-    if not beta.zero():
+    if not _raw_zero(beta_v):
         _check_expand(self, dims, "addmm")
+    var coefs = _coefs(alpha_v, beta_v, mat1.stype, self.stype, m * n, k)
+    var alpha = coefs[0]
+    var beta = coefs[1]
+    var act = activation
     if k == 0:
-        beta = _round_to(beta, self.stype)
+        # CUDA's k == 0 shortcut returns `beta * self` before the epilogue
+        # that would apply _addmm_activation's relu / gelu.
+        act = ACT_NONE
     if (
         alpha.one()
         and beta.one()
@@ -2051,9 +2100,7 @@ def _addmm_run(
     ):
         var fused = _addmm_route(self, mat1, mat2)
         if fused:
-            _hand_back(
-                rets, dest, Res(fused.value().copy(), True), dims, activation
-            )
+            _hand_back(rets, dest, Res(fused.value().copy(), True), dims, act)
             return
     _blas_out(
         rets,
@@ -2065,7 +2112,7 @@ def _addmm_run(
         out_stype,
         dims,
         dest,
-        activation,
+        act,
     )
 
 
@@ -2120,6 +2167,7 @@ def op_addmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var mat2 = v_tensor(args[unsafe_offset=2])
     _addmm_meta(self, mat1, mat2, False)
     _check_inplace(self, [mat1.dim(0), mat2.dim(1)])
+    assert_no_internal_overlap(self)
     _addmm_run(
         rets,
         self,
@@ -2275,13 +2323,27 @@ def _baddbmm_run(
     ts.append(b1.copy())
     ts.append(b2.copy())
     _check_same_device(ts)
+    var zero = _unit(b1.stype, 0)
+    var alpha = zero
+    var beta = zero
+    var k = b1.dim(2)
+    if _prod(dims) > 0:
+        if k > 0:
+            alpha = _coef(alpha_v, b1.stype)
+            beta = _coef(beta_v, b1.stype)
+        elif not _raw_zero(beta_v):
+            # `result.mul_(beta)`: the Scalar as a wrapped double, unchecked.
+            if is_int_stype(b1.stype):
+                beta = _Coef(0.0, v_int(beta_v), True)
+            else:
+                beta = _Coef(v_f64(beta_v), 0, False)
     _blas_out(
         rets,
         Optional[T](self.copy()),
         b1,
         b2,
-        _coef(alpha_v, b1.stype),
-        _coef(beta_v, b1.stype),
+        alpha,
+        beta,
         out_stype,
         dims,
         dest,
@@ -2532,12 +2594,21 @@ def _addbmm_run(
     var m = b1.dim(1)
     var k = b1.dim(2)
     var n = b2.dim(2)
-    var alpha = _coef(alpha_v, b1.stype)
-    var beta = _coef(beta_v, b1.stype)
+    var alpha = _unit(b1.stype, 0)
+    var beta = alpha
+    if nb == 0:
+        # `result.mul_(beta)`: the Scalar as a wrapped double, unchecked.
+        if m * n > 0 and not _raw_zero(beta_v):
+            if is_int_stype(b1.stype):
+                beta = _Coef(0.0, v_int(beta_v), True)
+            else:
+                beta = _Coef(v_f64(beta_v), 0, False)
+    else:
+        # The first batch's addmm_ (its k == 0 shortcut included).
+        var coefs = _coefs(alpha_v, beta_v, b1.stype, self.stype, m * n, k)
+        alpha = coefs[0]
+        beta = coefs[1]
     if nb > 0 and not is_int_stype(b1.stype):
-        if k == 0:
-            # The first batch's addmm_ takes addmm's k == 0 shortcut.
-            beta = _round_to(beta, self.stype)
         var a0 = own(_batch_matrix(b1, 0))
         var c0 = own(_batch_matrix(b2, 0))
         var first = _blas(
@@ -2650,8 +2721,12 @@ def op_addbmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = v_tensor(args[unsafe_offset=0])
     var b1 = v_tensor(args[unsafe_offset=1])
     var b2 = v_tensor(args[unsafe_offset=2])
+    # Composite in ATen (`addbmm_out(self, ..., self)`): a broadcastable
+    # self is computed fresh, then resized to the result and written; a
+    # self already of the result's shape is accumulated in place.
     var dims = _addbmm_checks(self, b1, b2)
-    _check_inplace(self, dims)
+    if _has_dims(self, dims):
+        assert_no_internal_overlap(self)
     _addbmm_run(
         rets,
         self,
@@ -2726,13 +2801,16 @@ def _addmv_run(
     strides[MAX_RANK - 2] = vec.stride(0)
     strides[MAX_RANK - 1] = 1
     var col = own(view_strided(vec, shape, strides, 2, vec.offset))
+    var coefs = _coefs(
+        alpha_v, beta_v, mat.stype, self.stype, mat.dim(0), mat.numel, True
+    )
     _blas_out(
         rets,
         Optional[T](self.copy()),
         mat,
         col.t,
-        _coef_scalar_t(alpha_v, mat.stype),
-        _coef_scalar_t(beta_v, mat.stype),
+        coefs[0],
+        coefs[1],
         vec.stype,
         [mat.dim(0)],
         dest,
@@ -2786,6 +2864,7 @@ def op_addmv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var vec = v_tensor(args[unsafe_offset=2])
     _addmv_meta(self, mat, vec)
     _check_inplace(self, [mat.dim(0)])
+    assert_no_internal_overlap(self)
     _addmv_run(
         rets,
         self,
@@ -3300,7 +3379,15 @@ def _linear_general(rets: Values, a: T, w: T, bias: Optional[T]) raises:
         )
     var ts: List[T] = [a.copy(), w.copy()]
     var dims: List[Int] = [rows, n]
-    if bias:
+    # A bias of rank > 1 broadcasts against the unflattened output: ATen's
+    # `matmul(input, weight.t()).add_(bias)`, the add after the product.
+    var late_bias = Optional[T]()
+    var fused_bias = Optional[T]()
+    if bias and bias.value().rank > 1:
+        late_bias = bias.value().copy()
+    elif bias:
+        fused_bias = bias.value().copy()
+    if fused_bias:
         if bias.value().stype != a.stype:
             raise Error(
                 "self and mat2 must have the same dtype, but got ",
@@ -3321,7 +3408,7 @@ def _linear_general(rets: Values, a: T, w: T, bias: Optional[T]) raises:
     wstrides[MAX_RANK - 1] = w.stride(0)
     var wt = own(view_strided(w, wshape, wstrides, 2, w.offset))
     var one = _unit(a.stype, 1)
-    var res = _blas(bias, a2.t, wt.t, one, one, a.stype, dims, None)
+    var res = _blas(fused_bias, a2.t, wt.t, one, one, a.stype, dims, None)
     _ = a2^
     _ = wt^
     _ = dense^
@@ -3330,6 +3417,16 @@ def _linear_general(rets: Values, a: T, w: T, bias: Optional[T]) raises:
     shape.append(n)
     var shaped = own(_view(flat.t, shape))
     _ = flat^
+    if late_bias:
+        if (
+            late_bias.value().device != a.device
+            or not late_bias.value().on_mojo()
+        ):
+            _check_same_device([a.copy(), late_bias.value().copy()])
+        var biased = own(_add_or_raise(shaped.t, late_bias.value()))
+        _ = shaped^
+        ret_owned(rets, 0, biased)
+        return
     ret_owned(rets, 0, shaped)
 
 

@@ -410,17 +410,6 @@ def test_addr_half_is_bit_identical_to_cpu(mojo_gpu: str, dtype, beta, alpha):
 # --- the BLAS family: alpha / beta, out=, in-place, .dtype, empty -----------
 
 
-def _cuda_like(beta, c, alpha, product64, dtype):
-    """cuBLAS's `alpha * acc + beta * C` in float32 (double for double) from
-    an exactly accumulated product, rounded once to `dtype`."""
-    w = torch.float64 if dtype == torch.float64 else torch.float32
-    acc = product64.to(w)
-    res = alpha * acc
-    if beta != 0:
-        res = res + beta * c.to(w)
-    return res.to(dtype)
-
-
 def _close(got: torch.Tensor, ref: torch.Tensor):
     """One ulp of the result dtype (summation order), else fp32 accuracy."""
     if got.dtype in (torch.float16, torch.bfloat16):
@@ -441,7 +430,7 @@ def test_addmm_alpha_beta(mojo_device, dtype, beta, alpha, self_shape):
     c = torch.randn(self_shape, generator=generator).to(dtype)
     a = torch.randn(19, 37, generator=generator).to(dtype)
     b = torch.randn(37, 29, generator=generator).to(dtype)
-    ref = _cuda_like(beta, c, alpha, a.double() @ b.double(), dtype)
+    ref = torch.addmm(c, a, b, beta=beta, alpha=alpha)
     dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
     with assert_ran("aten::addmm"):
         got = torch.addmm(dc, da, db, beta=beta, alpha=alpha)
@@ -474,6 +463,87 @@ def test_addmm_beta_zero_ignores_nan_and_alpha_scales_before_rounding(mojo_gpu):
     assert torch.equal(got.cpu(), torch.full((4, 8), 262.144).half())
 
 
+@pytest.mark.parametrize("dtype", BLAS_DTYPES)
+def test_alpha_zero_never_reads_the_matrices(mojo_device, dtype):
+    """alpha == 0: BLAS returns `beta * self` without the product, so a NaN
+    or inf in the matrices does not propagate."""
+    c = torch.randn(4, 6).to(dtype)
+    a = torch.full((4, 5), float("nan")).to(dtype)
+    b = torch.full((5, 6), float("inf")).to(dtype)
+    dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
+    want = (0.5 * c.float()).to(dtype)
+    _close(torch.addmm(dc, da, db, beta=0.5, alpha=0), want)
+    _close(torch.addmv(dc[:, 0], da, db[:, 0], beta=0.5, alpha=0), want[:, 0])
+    _close(torch.baddbmm(dc[None], da[None], db[None], beta=0.5, alpha=0), want[None])
+    _close(torch.addbmm(dc, da[None], db[None], beta=0.5, alpha=0), want)
+    zeros = torch.addmm(dc, da, db, beta=0, alpha=0)
+    assert torch.equal(zeros.cpu(), torch.zeros(4, 6, dtype=dtype))
+
+
+def test_ignored_scalars_are_never_converted(mojo_gpu):
+    """CUDA converts alpha only when a product is formed: an out-of-range
+    alpha is accepted with an empty reduction or an empty result."""
+    c = torch.randn(3, 4, device=mojo_gpu)
+    k0 = torch.addmm(
+        c,
+        torch.randn(3, 0, device=mojo_gpu),
+        torch.randn(0, 4, device=mojo_gpu),
+        alpha=1e100,
+    )
+    torch.testing.assert_close(k0.cpu(), c.cpu())
+    empty = torch.addmm(
+        c[:0],
+        torch.randn(0, 2, device=mojo_gpu),
+        torch.randn(2, 4, device=mojo_gpu),
+        alpha=1e100,
+        beta=1e100,
+    )
+    assert empty.shape == (0, 4)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.addmm(
+            c,
+            torch.randn(3, 2, device=mojo_gpu),
+            torch.randn(2, 4, device=mojo_gpu),
+            alpha=1e100,
+        )
+
+
+def test_inplace_overlap_and_broadcast_self(mojo_gpu):
+    """addmm_ / addmv_ refuse an expanded self (its elements alias); addbmm_
+    is composite in ATen and resizes a broadcastable self to the result."""
+    a = torch.randn(2, 4, device=mojo_gpu)
+    b = torch.randn(4, 3, device=mojo_gpu)
+    expanded = torch.randn(1, 3, device=mojo_gpu).expand(2, 3)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        expanded.addmm_(a, b)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.randn(1, device=mojo_gpu).expand(2).addmv_(a, b[:, 0])
+    b1, b2 = torch.randn(2, 2, 4), torch.randn(2, 4, 3)
+    scalar = torch.tensor(2.0)
+    ours = scalar.to(mojo_gpu)
+    assert ours.addbmm_(b1.to(mojo_gpu), b2.to(mojo_gpu)) is ours
+    torch.testing.assert_close(ours.cpu(), scalar.addbmm_(b1, b2), atol=1e-5, rtol=1e-5)
+
+
+def test_linear_bias_broadcasts_like_torch(mojo_gpu):
+    """A bias of rank > 1 is added to the unflattened output (ATen's
+    `matmul(input, weight.t()).add_(bias)`)."""
+    x, w, bias = torch.randn(2, 3, 4), torch.randn(5, 4), torch.randn(3, 5)
+    got = torch.nn.functional.linear(x.to(mojo_gpu), w.to(mojo_gpu), bias.to(mojo_gpu))
+    torch.testing.assert_close(
+        got.cpu(), torch.nn.functional.linear(x, w, bias), atol=1e-5, rtol=1e-5
+    )
+
+
+def test_addmm_activation_empty_reduction_skips_the_activation(mojo_gpu):
+    """CUDA's k == 0 shortcut returns `beta * self` before the relu / gelu
+    epilogue runs (addmm_out_cuda_impl)."""
+    c = torch.tensor([-1.0, 2.0, -3.0], device=mojo_gpu)
+    a, b = torch.randn(2, 0, device=mojo_gpu), torch.randn(0, 3, device=mojo_gpu)
+    got = torch.ops.aten._addmm_activation(c, a, b, beta=2)
+    assert torch.equal(got.cpu(), torch.tensor([-2.0, 4.0, -6.0]).expand(2, 3))
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_addmm_empty_reduction_is_beta_self(mojo_device, dtype):
     """k == 0: CUDA's shortcut multiplies self by beta stored in self's
@@ -497,7 +567,11 @@ def test_baddbmm(mojo_device, dtype, beta, alpha):
     c = torch.randn(3, 1, 21, generator=generator).to(dtype)
     a = torch.randn(3, 11, 17, generator=generator).to(dtype)
     b = torch.randn(3, 21, 17, generator=generator).to(dtype).transpose(1, 2)
-    ref = _cuda_like(beta, c, alpha, torch.bmm(a.double(), b.double()), dtype)
+    ref = torch.baddbmm(c, a, b, beta=beta, alpha=alpha)
+    if alpha == 0:
+        # CPU's reduced-precision baddbmm is off here for a transposed
+        # batch2 (stock CUDA, like this device, gives exactly beta * self).
+        ref = (beta * c.float()).expand(3, 11, 21).to(dtype)
     dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
     with assert_ran("aten::baddbmm"):
         got = torch.baddbmm(dc, da, db, beta=beta, alpha=alpha)
@@ -519,9 +593,7 @@ def test_addbmm_accumulates_batch_by_batch(mojo_device, dtype, beta, alpha):
     c = torch.randn(13, generator=generator).to(dtype)
     a = torch.randn(4, 9, 15, generator=generator).to(dtype)
     b = torch.randn(4, 15, 13, generator=generator).to(dtype)
-    acc = _cuda_like(beta, c.expand(9, 13), alpha, a[0].double() @ b[0].double(), dtype)
-    for i in range(1, 4):
-        acc = _cuda_like(1, acc, alpha, a[i].double() @ b[i].double(), dtype)
+    acc = torch.addbmm(c, a, b, beta=beta, alpha=alpha)
     dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
     with assert_ran("aten::addbmm"):
         got = torch.addbmm(dc, da, db, beta=beta, alpha=alpha)
@@ -546,9 +618,7 @@ def test_addmv(mojo_device, dtype, beta, alpha):
     c = torch.randn(23, generator=generator).to(dtype)
     mat = torch.randn(23, 41, generator=generator).to(dtype)
     vec = torch.randn(82, generator=generator).to(dtype)[::2]
-    al = torch.tensor(alpha).to(dtype).item()
-    be = torch.tensor(beta).to(dtype).item()
-    ref = _cuda_like(be, c, al, mat.double() @ vec.double(), dtype)
+    ref = torch.addmv(c, mat, vec, beta=beta, alpha=alpha)
     dc, dm, dv = c.to(mojo_device), mat.to(mojo_device), vec.to(mojo_device)
     with assert_ran("aten::addmv"):
         got = torch.addmv(dc, dm, dv, beta=beta, alpha=alpha)
@@ -560,9 +630,7 @@ def test_addmv(mojo_device, dtype, beta, alpha):
     assert inplace.addmv_(dm, dv, beta=beta, alpha=alpha) is inplace
     _close(inplace, ref)
     one = torch.addmv(dc[:1], dm, dv, beta=beta, alpha=alpha)
-    _close(
-        one, _cuda_like(be, c[:1].expand(23), al, mat.double() @ vec.double(), dtype)
-    )
+    _close(one, torch.addmv(c[:1], mat, vec, beta=beta, alpha=alpha))
     # matmul / mv of a matrix and a vector reach addmv
     _close(dm @ dv, (mat.double() @ vec.double()).to(dtype))
 
