@@ -1167,6 +1167,41 @@ def test_to_copy_device_round_trip(mojo_device):
     torch.testing.assert_close(back, x)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA wheel and GPU")
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"dtype": torch.float64},
+        {"memory_format": torch.channels_last},
+        {"dtype": torch.float16, "non_blocking": True},
+    ],
+    ids=["plain", "float64", "channels_last", "half_non_blocking"],
+)
+def test_to_copy_between_mojo_and_cuda(mojo_gpu, kwargs):
+    # PrivateUse1 outranks CUDA in the dispatch key set, so both directions
+    # reach our `_to_copy`, which bounces through the host.
+    x = _fill((2, 3, 4, 5), torch.float32)
+    to_cuda = x.to(mojo_gpu).to("cuda", **kwargs)
+    ref = x.to("cuda", **kwargs)
+    torch.cuda.synchronize()
+    assert to_cuda.device.type == "cuda"
+    assert (to_cuda.dtype, to_cuda.stride()) == (ref.dtype, ref.stride())
+    torch.testing.assert_close(to_cuda.cpu(), ref.cpu(), rtol=0, atol=0)
+    back = ref.to(mojo_gpu, **kwargs)
+    expected = x.to(**kwargs)
+    assert back.device == torch.device(mojo_gpu)
+    assert (back.dtype, back.stride()) == (expected.dtype, expected.stride())
+    torch.testing.assert_close(back.cpu(), expected, rtol=0, atol=0)
+    # strided sources in both directions
+    torch.testing.assert_close(
+        x.to(mojo_gpu).transpose(0, 3).to("cuda").cpu(), x.transpose(0, 3)
+    )
+    torch.testing.assert_close(
+        x.cuda().transpose(1, 2).to(mojo_gpu).cpu(), x.transpose(1, 2)
+    )
+
+
 # ---------------------------------------------------------------------------
 # cat
 # ---------------------------------------------------------------------------
