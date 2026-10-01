@@ -840,9 +840,17 @@ def _scan_1d_tile_scan_kernel[
             0
         ] if has_excl else tp
         has_excl = True
-    var run = excl if has_excl else Op.identity[acc]()
+    # With no exclusive prefix (thread 0 of tile 0) cub seeds the running
+    # value with the first item, not identity + item: -0.0 stays -0.0.
+    var run = excl if has_excl else items[0]
     comptime for k in range(CUB_ITEMS):
-        run = _merge[Op, dtype, acc](run, Int64(-1), items[k], Int64(-1))[0]
+        comptime if k > 0:
+            run = _merge[Op, dtype, acc](run, Int64(-1), items[k], Int64(-1))[0]
+        else:
+            if has_excl:
+                run = _merge[Op, dtype, acc](
+                    run, Int64(-1), items[k], Int64(-1)
+                )[0]
         tile[unsafe_offset=tid * CUB_ITEMS + k] = run
     _ = cnt
     barrier()
@@ -880,10 +888,10 @@ def _scan_1d_cub[
     var tiles = ceildiv(n, CUB_TILE)
     var ws = ctx.enqueue_create_buffer[acc](2 * tiles)
     var ws_ptr = ws.unsafe_ptr().as_unsafe_any_origin()
-    _enqueue_cached[_scan_1d_tile_agg_kernel[Op, dtype]](
-        ctx, tiles, 1, 1, CUB_THREADS, ws_ptr, inp, Int64(n)
-    )
-    if tiles > 1:
+    if tiles > 1:  # one tile reads no prefix: only the rescan runs
+        _enqueue_cached[_scan_1d_tile_agg_kernel[Op, dtype]](
+            ctx, tiles, 1, 1, CUB_THREADS, ws_ptr, inp, Int64(n)
+        )
         _enqueue_cached[_scan_1d_tile_prefix_kernel[Op, dtype]](
             ctx, 1, 1, 1, CUB_PREFIX_THREADS, ws_ptr, Int64(tiles)
         )
@@ -917,8 +925,11 @@ def _scan[
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
     else:
+        # Every float scan CUDA sends to cub takes cub's order and seed (the
+        # first element, so a leading -0.0 survives); integer sums are exact
+        # in any order.
         comptime if not Op.with_index and Op.rounds and (
-            dtype == DType.float16 or dtype == DType.bfloat16
+            dtype.is_floating_point()
         ):
             if route == ROUTE_1D:
                 _scan_1d_cub[Op, dtype](out, inp, n, ctx)
@@ -926,7 +937,7 @@ def _scan[
         comptime if not Op.with_index:
             if route != ROUTE_OUTER and inner == 1:
                 # CUDA's innermost-dim scan (also standing in for its cub
-                # route of a 1-D scan of a dtype that does not round).
+                # route of a 1-D integer scan).
                 var log_x = _cuda_log_threads_x(outer, n)
                 var ny = CUDA_SCAN_THREADS >> log_x
                 _enqueue_cached_2d[_scan_rows_sklansky_kernel[Op, dtype]](

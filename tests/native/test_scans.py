@@ -107,6 +107,97 @@ def _cub_1d(x: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
     return out.to(dt)
 
 
+def _parallel_tile_prefixes(aggs: torch.Tensor, dt: torch.dtype) -> list[torch.Tensor]:
+    """The device's tile-prefix pass past CUB_SEQ_TILES tiles
+    (`_scan_1d_tile_prefix_kernel`): 1024 chunks reduced in order, a
+    Kogge-Stone scan of the chunk totals, each chunk's prefixes in order."""
+    threads = 1024
+    tiles = aggs.numel()
+    chunk = -(-tiles // threads)
+    tot = torch.zeros(threads)
+    for t in range(threads):
+        lo, hi = min(t * chunk, tiles), min(t * chunk + chunk, tiles)
+        if lo < hi:
+            acc = aggs[lo]
+            for i in range(lo + 1, hi):
+                acc = _round(acc + aggs[i], dt)
+            tot[t] = acc
+    v = tot.clone()
+    off = 1
+    while off < threads:
+        shifted = torch.roll(v, off)
+        idx = torch.arange(threads) >= off
+        v = torch.where(idx, _round(shifted + v, dt), v)
+        off *= 2
+    prefixes = [torch.tensor(0.0)] * tiles  # tile 0 has none (unread)
+    for t in range(threads):
+        lo, hi = min(t * chunk, tiles), min(t * chunk + chunk, tiles)
+        has = t > 0 and lo > 0
+        p = v[t - 1] if t > 0 else torch.tensor(0.0)
+        for i in range(lo, hi):
+            if has:
+                prefixes[i] = p
+                p = _round(p + aggs[i], dt)
+            else:
+                p = aggs[i]
+                has = True
+    return prefixes
+
+
+def device_lowp_cumsum_1d(x: torch.Tensor) -> torch.Tensor:
+    """The device's 1-D half/bf16 cumsum past CUB_SEQ_TILES (64) tiles:
+    cub's tile structure, tile prefixes from the parallel prefix pass."""
+    dt = x.dtype
+    threads, items = 128, 30
+    tile_n = threads * items
+    xf = x.float()
+    n = xf.numel()
+    tiles = -(-n // tile_n)
+    aggs = torch.zeros(tiles)
+    blocks = []
+    for t in range(tiles):
+        tile = torch.zeros(tile_n)
+        w = min(tile_n, n - t * tile_n)
+        tile[:w] = xf[t * tile_n : t * tile_n + w]
+        tile = tile.reshape(threads, items)
+        agg = tile[:, 0].clone()
+        for k in range(1, items):
+            agg = _round(agg + tile[:, k], dt)
+        v = agg.clone()
+        lane = torch.arange(threads) % 32
+        for off in (1, 2, 4, 8, 16):
+            v = torch.where(lane >= off, _round(torch.roll(v, off) + v, dt), v)
+        warp_tot = v.reshape(4, 32)[:, 31]
+        excl = torch.roll(v, 1)
+        has = lane > 0
+        wps = [warp_tot[0]]
+        acc = warp_tot[0]
+        for wi in range(1, 4):
+            wps.append(acc)
+            acc = _round(acc + warp_tot[wi], dt)
+        aggs[t] = acc
+        for tid in range(threads):
+            wi = tid // 32
+            if wi > 0:
+                excl[tid] = _round(wps[wi] + excl[tid], dt) if has[tid] else wps[wi]
+                has[tid] = True
+        blocks.append((tile, excl, has, w))
+    prefixes = _parallel_tile_prefixes(aggs, dt)
+    out = torch.empty(n)
+    for t, (tile, excl, has, w) in enumerate(blocks):
+        if t > 0:
+            excl = torch.where(has, _round(prefixes[t] + excl, dt), prefixes[t])
+            has = torch.ones_like(has)
+        run = excl.clone()
+        res = torch.zeros(threads, items)
+        for k in range(items):
+            first = (k == 0) & ~has
+            run = torch.where(first, tile[:, k], _round(run + tile[:, k], dt))
+            res[:, k] = run
+        out[t * tile_n : t * tile_n + w] = res.flatten()[:w]
+    return out.to(dt)
+
+
 SHAPES_DIMS = [
     ((7,), 0),
     ((5, 300), 1),
@@ -411,3 +502,44 @@ def test_lowp_cumsum_rounds_like_cuda(mojo_gpu, shape, dim, dtype):
         (shape, dim, dtype)
     ]
     torch.testing.assert_close(got, cuda_lowp_cumsum(x, dim).float(), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("n", [245_761, 300_001, 1_000_003])
+def test_lowp_cumsum_1d_parallel_tile_prefix(mojo_gpu, dtype, n):
+    """Past 64 tiles (245,760 elements) the tile prefixes come from the
+    parallel prefix pass: bit-exact against its model, sizes off the tile."""
+    torch.manual_seed(n)
+    x = torch.randn(n).to(dtype)
+    got = torch.cumsum(x.to(mojo_gpu), 0).cpu()
+    torch.testing.assert_close(got, device_lowp_cumsum_1d(x), atol=0, rtol=0)
+
+
+def _assert_bitwise(got: torch.Tensor, expected: torch.Tensor):
+    torch.testing.assert_close(got, expected, atol=0, rtol=0, equal_nan=True)
+    assert torch.equal(torch.signbit(got), torch.signbit(expected))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_cumsum_1d_keeps_leading_negative_zero(mojo_gpu, dtype):
+    """cub seeds the scan with the first item: CUDA gives [-0, -0, 1]."""
+    x = torch.tensor([-0.0, -0.0, 1.0], dtype=dtype)
+    got = torch.cumsum(x.to(mojo_gpu), 0).cpu()
+    _assert_bitwise(got, torch.tensor([-0.0, -0.0, 1.0], dtype=dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("n", [3840 * 5 + 17, 300_001])
+def test_cumsum_1d_negative_zero_multi_tile(mojo_gpu, dtype, n):
+    """Leading -0.0 runs and zeros spread over many tiles, below (cub's
+    sequential look-back order) and above 64 tiles (the parallel prefix
+    pass): bit-exact and sign-exact against the model of each."""
+    torch.manual_seed(n)
+    x = torch.randn(n).to(dtype)
+    x[torch.rand(n) < 0.3] = 0.0
+    x[torch.rand(n) < 0.1] = -0.0
+    x[:50] = -0.0
+    got = torch.cumsum(x.to(mojo_gpu), 0).cpu()
+    model = cuda_lowp_cumsum(x, 0) if n <= 245_760 else device_lowp_cumsum_1d(x)
+    _assert_bitwise(got, model)
+    assert torch.signbit(got[:50]).all()
