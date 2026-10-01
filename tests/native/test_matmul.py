@@ -464,20 +464,27 @@ def test_addmm_beta_zero_ignores_nan_and_alpha_scales_before_rounding(mojo_gpu):
 
 
 @pytest.mark.parametrize("dtype", BLAS_DTYPES)
-def test_alpha_zero_never_reads_the_matrices(mojo_device, dtype):
-    """alpha == 0: BLAS returns `beta * self` without the product, so a NaN
-    or inf in the matrices does not propagate."""
+def test_alpha_zero_matches_cuda(mojo_device, dtype):
+    """alpha == 0 with NaN / inf in the matrices. Oracle: stock CUDA torch
+    2.14 on an H100, measured (CPU torch is not it here): the float32 GEMMs
+    and addmv's gemv never read the matrices (`beta * self`), while the
+    float16 / bfloat16 GEMMs still form the product, so `0 * NaN` is NaN."""
     c = torch.randn(4, 6).to(dtype)
     a = torch.full((4, 5), float("nan")).to(dtype)
     b = torch.full((5, 6), float("inf")).to(dtype)
     dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
     want = (0.5 * c.float()).to(dtype)
-    _close(torch.addmm(dc, da, db, beta=0.5, alpha=0), want)
     _close(torch.addmv(dc[:, 0], da, db[:, 0], beta=0.5, alpha=0), want[:, 0])
-    _close(torch.baddbmm(dc[None], da[None], db[None], beta=0.5, alpha=0), want[None])
-    _close(torch.addbmm(dc, da[None], db[None], beta=0.5, alpha=0), want)
-    zeros = torch.addmm(dc, da, db, beta=0, alpha=0)
-    assert torch.equal(zeros.cpu(), torch.zeros(4, 6, dtype=dtype))
+    gemm = [
+        torch.addmm(dc, da, db, beta=0.5, alpha=0),
+        torch.baddbmm(dc[None], da[None], db[None], beta=0.5, alpha=0)[0],
+        torch.addbmm(dc, da[None], db[None], beta=0.5, alpha=0),
+    ]
+    for got in gemm:
+        if dtype == torch.float32:
+            _close(got, want)
+        else:
+            assert got.isnan().all()
 
 
 def test_ignored_scalars_are_never_converted(mojo_gpu):
@@ -544,6 +551,71 @@ def test_linear_bias_broadcasts_like_torch(mojo_gpu):
         torch.nn.functional.linear(
             dev_x[:, 0], dev_w, torch.randn(2, 2, 5, device=mojo_gpu)
         )
+
+
+def test_linear_mirrors_aten_dispatch(mojo_gpu):
+    """Linear.cpp's branches: a 2-D input with any bias, and a contiguous
+    input with a (squeezable) bias vector, are addmm -- the bias joins the
+    product before the one rounding, so a float16 product past the range
+    comes back into it (128 * 128 * 4 - 65504 = 32); otherwise matmul then
+    `add_` (a 0-d float64 bias does not promote float32)."""
+    f16 = torch.float16
+
+    def full(*shape, value):
+        return torch.full(shape, value, dtype=f16, device=mojo_gpu)
+
+    x, w = full(2, 4, value=128.0), full(3, 4, value=128.0)
+    got = torch.nn.functional.linear(x, w, full(2, 3, value=-65504.0))
+    assert torch.equal(got.cpu(), torch.full((2, 3), 32.0, dtype=f16))
+    got = torch.nn.functional.linear(x[None], w, full(1, 3, value=-65504.0))
+    assert torch.equal(got.cpu(), torch.full((1, 2, 3), 32.0, dtype=f16))
+    if not is_metal(mojo_gpu):
+        # A bias vector takes the bias-fused GEMM routes; Apple's rounds the
+        # half product before its bias add (a known gap of that route).
+        got = torch.nn.functional.linear(x, w, full(3, value=-65504.0))
+        assert torch.equal(got.cpu(), torch.full((2, 3), 32.0, dtype=f16))
+    if not is_metal(mojo_gpu):  # no float64 on Apple GPUs
+        x3, w3 = torch.randn(2, 3, 4), torch.randn(5, 4)
+        b0 = torch.tensor(0.1, dtype=torch.float64)
+        got = torch.nn.functional.linear(
+            x3.to(mojo_gpu), w3.to(mojo_gpu), b0.to(mojo_gpu)
+        )
+        assert got.dtype == torch.float32
+        torch.testing.assert_close(got.cpu(), torch.nn.functional.linear(x3, w3, b0))
+
+
+def test_inplace_and_out_internal_overlap(mojo_gpu):
+    """Every structured in-place / out= op refuses a destination whose
+    elements alias, checked after the meta's resize (a wrong-shape
+    expanded out is resized, not refused), as stock CUDA does."""
+
+    def r(*shape):
+        return torch.randn(*shape, device=mojo_gpu)
+
+    with pytest.raises(RuntimeError, match="single memory location"):
+        r(2, 1, 3).expand(2, 4, 3).baddbmm_(r(2, 4, 5), r(2, 5, 3))
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.bmm(r(2, 4, 5), r(2, 5, 3), out=r(1, 1, 3).expand(2, 4, 3))
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.ops.aten._addmm_activation(
+            r(3), r(2, 4), r(4, 3), out=r(1, 3).expand(2, 3)
+        )
+    out = torch.mm(r(2, 4), r(4, 3), out=r(1).expand(5))
+    assert out.shape == (2, 3)
+
+
+def test_integer_empty_batch_float_beta_raises(mojo_gpu):
+    """`result.mul_(beta)` on an integer result with a float beta."""
+
+    def i(*shape):
+        return torch.randint(-5, 5, shape, device=mojo_gpu)
+
+    with pytest.raises(RuntimeError, match="can't be cast to the desired output type"):
+        torch.addbmm(i(2, 3), i(0, 2, 4), i(0, 4, 3), beta=0.5)
+    with pytest.raises(RuntimeError, match="can't be cast to the desired output type"):
+        torch.baddbmm(i(1, 2, 3), i(1, 2, 0), i(1, 0, 3), beta=0.5)
+    got = torch.addbmm(i(2, 3), i(0, 2, 4), i(0, 4, 3), beta=2)
+    assert got.dtype == torch.int64
 
 
 def test_addmm_activation_empty_reduction_skips_the_activation(mojo_gpu):
