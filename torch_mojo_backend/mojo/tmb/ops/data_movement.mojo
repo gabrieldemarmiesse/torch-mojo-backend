@@ -95,6 +95,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     broadcast_shape,
+    check_out,
     is_cast_dtype_on,
     cast_into,
     device_str,
@@ -1418,13 +1419,18 @@ def op_repeat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def _triangular(t: T, diagonal: Int, upper: Int) raises -> Owned:
+def _triangular(t: T, diagonal_in: Int, upper: Int) raises -> Owned:
     if t.rank < 2:
-        unsupported("aten::tril/triu on a tensor with fewer than 2 dims")
+        raise Error(
+            "triu" if upper else "tril",
+            ": input tensor must have at least 2 dimensions",
+        )
     var out = own(new_like(t))
     if out.t.numel > 0:
         var rows = t.dim(-2)
         var cols = t.dim(-1)
+        # ATen clamps k to [-n, m] so `i + k` cannot overflow.
+        var diagonal = min(max(diagonal_in, -rows), cols)
         var batch = t.numel // (rows * cols)
         var src = contiguous(t)
         var ctx = ctx_for(t.device)
@@ -1461,6 +1467,49 @@ def op_triu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var diagonal = v_int_or(args[unsafe_offset=1], 0)
     var out = _triangular(t, diagonal, 1)
     ret_owned(rets, 0, out)
+
+
+def _triangular_out(
+    args: Values, rets: Values, upper: Int, in_place: Bool
+) raises:
+    """tril/triu `.out` and in-place: the result is computed into a fresh
+    tensor first, so an `out` aliasing self (or being resized) cannot
+    corrupt the read, then written where the caller's tensor lives."""
+    var t = v_tensor(args[unsafe_offset=0])
+    var diagonal = v_int_or(args[unsafe_offset=1], 0)
+    var dest = t.copy()
+    if not in_place:
+        dest = v_tensor(args[unsafe_offset=2])
+        check_out(dest, t)
+    var res = _triangular(t, diagonal, upper)
+    if not in_place:
+        resize_out(dest, res.t.shape, res.t.rank)
+    if res.t.numel > 0:
+        copy_strided_into(dest, res.t)
+    _ = res^
+    ret_ref(rets, 0, dest)
+
+
+# aten::tril.out(Tensor self, SymInt diagonal=0, *, Tensor(a!) out)
+#   -> Tensor(a!)
+def op_tril_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _triangular_out(args, rets, 0, False)
+
+
+# aten::triu.out(Tensor self, SymInt diagonal=0, *, Tensor(a!) out)
+#   -> Tensor(a!)
+def op_triu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _triangular_out(args, rets, 1, False)
+
+
+# aten::tril_(Tensor(a!) self, SymInt diagonal=0) -> Tensor(a!)
+def op_tril_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _triangular_out(args, rets, 0, True)
+
+
+# aten::triu_(Tensor(a!) self, SymInt diagonal=0) -> Tensor(a!)
+def op_triu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _triangular_out(args, rets, 1, True)
 
 
 # ---------------------------------------------------------------------------
@@ -1588,9 +1637,17 @@ def _scatter_launch(
     value: Float64,
     accumulate: Bool,
     what: String,
+    rop: Int = 0,
+    identity: Bool = False,
+    ordered: Bool = False,
 ) raises:
     """One ScatterDim / ScatterAddDim launch over the rank-<=4 index space
     `dims` (every stride list has its length), then the bad-index report.
+    `rop` (the kernel family's `ROP_*`: 2 prod, 3 amax, 4 amin) makes it a
+    ScatterReduceDim read-modify-write; `identity` writes that reduction's
+    identity instead of src / `value` (`include_self=False`). `ordered`
+    walks `dim` in index order per thread, without atomics (the index must
+    be broadcast off `dim`; see the kernel).
 
     The kernel skips a write whose index falls outside [0, dim_size) and
     raises an int32 flag; the read back is one 4-byte D2H, after which a bad
@@ -1611,9 +1668,14 @@ def _scatter_launch(
     var ctx = ctx_for(dest.device)
     var flag = own(new_tensor(IndexList[MAX_RANK](1), 1, ST_INT32, dest.device))
     fill_value(flag.t, 0.0)
-    var call = KernelCall(
-        "data_movement", "ScatterAddDim" if accumulate else "ScatterDim"
-    )
+    var op = String("ScatterDim")
+    if identity:
+        op = "ScatterDim"
+    elif rop >= 2:
+        op = "ScatterReduceDim"
+    elif accumulate:
+        op = "ScatterAddDim"
+    var call = KernelCall("data_movement", op)
     call.arg_dtype(0, dest.dtype)
     call.arg_dtype(1, index.dtype)
     call.arg_dtype(2, src_dtype)
@@ -1623,10 +1685,12 @@ def _scatter_launch(
     call.int(src_ptr)
     call.tuple(params)
     call.int(flag.t.ptr)
-    call.int(1 if is_value else 0)
+    call.int(2 if identity else (1 if is_value else 0))
     call.f64(value)
     call.int(dtype_code(dest.dtype))
     call.int(ctx_ptr(ctx))
+    call.int(rop)
+    call.int(1 if ordered else 0)
     call.run()
     var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
     copy_to_host(ctx, flag.t.ptr, host_flag.t.ptr, 4)
@@ -1682,8 +1746,8 @@ def _scatter_validate(
         )
     if index.numel == 0:
         return dim
-    if index.dtype != DType.int64:
-        raise Error(what, "(): Expected dtype int64 for index")
+    if index.dtype != DType.int64 and index.dtype != DType.int32:
+        raise Error(what, "(): Expected dtype int32/int64 for index")
     if index.device != a.device or (src and src.value().device != a.device):
         unsupported("aten::" + what + " with operands on different devices")
     if max(index.rank, 1) != rank:
@@ -1729,7 +1793,8 @@ def _scatter_into(
 ) raises:
     """Scatter into `target` (shaped like self, any strides), which already
     holds self's values."""
-    var idx_c = own_if_new(contiguous(index), index)
+    var idx64 = own_if_new(cast_to(index, ST_INT64), index)
+    var idx_c = own_if_new(contiguous(idx64.t), idx64.t)
     var src_ptr = target.ptr
     var src_dtype = target.dtype
     var src_strides = List[Int]()
@@ -1757,6 +1822,7 @@ def _scatter_into(
         String("scatter_add") if accumulate else String("scatter"),
     )
     _ = idx_c^
+    _ = idx64^
 
 
 def _scatter_common(
@@ -3144,6 +3210,10 @@ def register_data_movement(site: Site) raises:
     impl[op_repeat, "repeat"](site)
     impl[op_tril, "tril"](site)
     impl[op_triu, "triu"](site)
+    impl[op_tril_out, "tril.out"](site)
+    impl[op_triu_out, "triu.out"](site)
+    impl[op_tril_, "tril_"](site)
+    impl[op_triu_, "triu_"](site)
     impl[op_select_scatter, "select_scatter"](site)
     impl[op_scatter_src, "scatter.src"](site)
     impl[op_scatter_src_, "scatter_.src"](site)

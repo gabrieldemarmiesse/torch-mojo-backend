@@ -180,6 +180,33 @@ SKIPPED: dict[str, str] = {
         "benchmarked in their own families"
     ),
     "aten::vdot": "dot for the real dtypes: mul + sum, both benchmarked",
+    "aten::tril.out": _PAD_OUT.replace("resample", "TriangularCopy"),
+    "aten::triu.out": _PAD_OUT.replace("resample", "TriangularCopy"),
+    "aten::tril_": "test_tril's TriangularCopy, then a strided copy into self",
+    "aten::triu_": "test_triu's TriangularCopy, then a strided copy into self",
+    "aten::range.out": (
+        "the Arange kernel test_arange measures, with an inclusive end"
+    ),
+    "aten::randperm.generator_out": (
+        "random_ (test_inplace) and sort.stable (test_reduction) through the "
+        "dispatcher: no kernel of its own"
+    ),
+    "aten::nonzero.out": (
+        "nonzero's host round trip (no device kernel), copied into out"
+    ),
+    "aten::nonzero_static": (
+        "nonzero's host round trip (no device kernel), a fill and a memcpy"
+    ),
+    "aten::nonzero_static.out": ("nonzero_static, copied into the caller's out"),
+    "aten::index.Tensor_out": (
+        "index.Tensor (test_embedding's test_index), copied into out"
+    ),
+    "aten::narrow_copy.out": (
+        "a narrow view's strided copy (test_copy_row_strided's kernel), copied into out"
+    ),
+    "aten::fill_.Tensor": (
+        "a one-element read of the value, then fill_.Scalar's fill kernel"
+    ),
     **{
         f"aten::{m}_pad{r}d{suffix}": _PAD_OUT
         for m in PAD_MODES

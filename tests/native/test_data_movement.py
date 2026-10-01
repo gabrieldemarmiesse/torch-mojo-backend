@@ -1357,6 +1357,45 @@ def test_triu_every_dtype(mojo_gpu):
         torch.testing.assert_close(x.to(mojo_gpu).triu(1).cpu(), x.triu(1))
 
 
+@pytest.mark.parametrize("name", ["tril", "triu"])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize("diagonal", [-9, -1, 0, 2, 1 << 62])
+def test_tril_triu_out_and_in_place(mojo_device, name, dtype, diagonal):
+    x = (_fill((3, 4, 5), torch.int64) % 5 - 1).to(dtype)
+    expected = getattr(x, name)(diagonal)
+    out = torch.empty(0, dtype=dtype, device=mojo_device)
+    with ran(f"aten::{name}.out"):
+        getattr(torch, name)(x.to(mojo_device), diagonal, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    # A transposed out of the right shape is written where it lives.
+    out = torch.empty(5, 4, 3, dtype=dtype, device=mojo_device).permute(2, 1, 0)
+    getattr(torch, name)(x.to(mojo_device), diagonal, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    y = x.to(mojo_device)
+    with ran(f"aten::{name}_"):
+        getattr(y, name + "_")(diagonal)
+    torch.testing.assert_close(y.cpu(), expected, rtol=0, atol=0)
+    # In place on a strided view.
+    y = x.to(mojo_device).transpose(1, 2)
+    getattr(y, name + "_")(diagonal)
+    torch.testing.assert_close(y.cpu(), getattr(x.transpose(1, 2), name)(diagonal))
+
+
+def test_tril_triu_reject_fewer_than_two_dims(mojo_device):
+    for name in ("tril", "triu"):
+        with pytest.raises(
+            RuntimeError, match=f"{name}: input tensor must have at least 2"
+        ):
+            getattr(torch, name)(torch.ones(3, device=mojo_device))
+        with pytest.raises(RuntimeError, match="dtype"):
+            getattr(torch, name)(
+                torch.ones(3, 3, device=mojo_device),
+                out=torch.empty(3, 3, dtype=torch.int64, device=mojo_device),
+            )
+
+
 # ---------------------------------------------------------------------------
 # reflection_pad2d / replication_pad2d
 # ---------------------------------------------------------------------------
@@ -1807,8 +1846,8 @@ def test_scatter_add_inplace_out_and_empty(mojo_gpu):
 
 
 def test_scatter_add_rejects_bad_indices(mojo_gpu):
-    """Like CPU torch: an out-of-range index raises, and so does an int32
-    index (scatter_add requires int64)."""
+    """Like CPU torch: an out-of-range index raises, and so does a float
+    index (torch 2.11 takes int32 or int64)."""
     a = torch.zeros(4, 5, device=mojo_gpu)
     src = torch.ones(2, 5, device=mojo_gpu)
     for bad in (4, -1):
@@ -1816,8 +1855,13 @@ def test_scatter_add_rejects_bad_indices(mojo_gpu):
         index[1, 3] = bad
         with pytest.raises(RuntimeError, match="index out of range"):
             a.scatter_add(0, index, src)
-    with pytest.raises(RuntimeError, match="int64"):
-        a.scatter_add(0, torch.zeros(2, 5, dtype=torch.int32, device=mojo_gpu), src)
+    with pytest.raises(RuntimeError, match="int32/int64"):
+        a.scatter_add(0, torch.zeros(2, 5, device=mojo_gpu), src)
+    i32 = torch.tensor([[0, 3, 3, 1, 0], [3, 3, 2, 1, 0]], dtype=torch.int32)
+    torch.testing.assert_close(
+        a.scatter_add(0, i32.to(mojo_gpu), src).cpu(),
+        a.cpu().scatter_add(0, i32, src.cpu()),
+    )
 
 
 @pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])

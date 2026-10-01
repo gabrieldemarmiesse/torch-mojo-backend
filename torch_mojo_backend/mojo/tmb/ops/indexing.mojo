@@ -21,6 +21,13 @@ memory families already have.
   right=True)`. Its output length is data-dependent: like ATen's CUDA
   kernel it reads the total (and the negativity check) back to the host
   unless `output_size` is given.
+* scatter(reduce=) / scatter.value(_out) / scatter_reduce / index_reduce --
+  `ScatterAddDim` for sum and mean, `ScatterReduceDim` (compare-and-swap)
+  for prod / amax / amin, `ScatterDim` for the `include_self=False`
+  identity fill.
+* nonzero.out / nonzero_static / index.Tensor_out / narrow_copy.out /
+  fill_.Tensor -- the functional op through the dispatcher, written into
+  the caller's tensor.
 
 A "raw view" below is a `T` whose shape/strides/pointer were rewritten for
 a kernel launch: it still carries its base's handle, so it is only ever
@@ -46,15 +53,20 @@ from tmb.backend.abi import (
     own_if_new,
     ret_owned,
     ret_ref,
+    alert_not_deterministic,
+    index_error,
     tensor_arg,
     unsupported,
     v_bool,
+    v_f64,
     v_int,
     v_is_none,
+    v_string,
     v_tensor,
+    v_tensor_list,
     view_strided,
 )
-from tmb.backend.device import ctx_for
+from tmb.backend.device import copy_d2d, ctx_for
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
@@ -64,18 +76,29 @@ from tmb.ops.common import (
     check_out,
     contiguous,
     copy_strided_into,
+    cast_to,
+    device_str,
     fill_value,
+    is_int_stype,
     resize_out,
+    same_view,
+    scalar_to_float,
+    scalar_to_int,
+    shape_str,
 )
 from tmb.ops.compare import _where_select, scalar_as_fill
 from tmb.ops.data_movement import (
+    _dim_or1,
     _dims_of,
     _gather_dim_launch,
     _is_scatter_add_dtype,
     _is_scatter_dtype,
     _norm_dim,
     _scalar_type_name,
+    _materialize_contiguous,
+    _scatter_into,
     _scatter_launch,
+    _scatter_validate,
     _strides_of,
 )
 from tmb.ops.factories import _arange_fill
@@ -1240,6 +1263,764 @@ def op_repeat_interleave_tensor(
     ret_owned(rets, 0, out)
 
 
+# ---------------------------------------------------------------------------
+# scatter(reduce=) / scatter.value / scatter_reduce / index_reduce -- ATen's
+# `scatter_impl` + `scatter_reduce_two` and `index_reduce_func_cuda_impl`
+# (native/TensorAdvancedIndexing.cpp, native/cuda/ScatterGatherKernel.cu,
+# native/cuda/Indexing.cu). Sum and mean ride ScatterAddDim's atomic add;
+# prod / amax / amin are ScatterReduceDim's compare-and-swap, which
+# computes them as ATen's gpuAtomicMul / gpuAtomicMax / gpuAtomicMin do
+# (in the dtype, NaN wins). `include_self=False` first writes the
+# reduction's identity into every scattered-to slot, and mean divides by a
+# count scattered the same way (floor division for integers), as upstream.
+# Duplicate indices combine in an unspecified order, like CUDA's atomics: a
+# float sum or mean can differ from CPU in the last bits.
+# ---------------------------------------------------------------------------
+
+comptime _RED_SUM = 1
+comptime _RED_PROD = 2  # the values the kernel family's ROP_* take
+comptime _RED_MAX = 3
+comptime _RED_MIN = 4
+comptime _RED_MEAN = 5
+
+
+def _reduction(reduce: String, new_options: Bool) raises -> Int:
+    """`get_operator_enum` (native/ReductionType.h)."""
+    if not new_options:
+        if reduce == "add":
+            return _RED_SUM
+        if reduce == "multiply":
+            return _RED_PROD
+        raise Error("reduce argument must be either add or multiply.")
+    if reduce == "sum":
+        return _RED_SUM
+    if reduce == "prod":
+        return _RED_PROD
+    if reduce == "mean":
+        return _RED_MEAN
+    if reduce == "amax" or reduce == "max":
+        return _RED_MAX
+    if reduce == "amin" or reduce == "min":
+        return _RED_MIN
+    raise Error(
+        "reduce argument must be either sum, prod, mean, amax or amin, got ",
+        reduce,
+    )
+
+
+def _reduce_dtype_check(a: T, red: Int, what: String) raises:
+    if not _is_scatter_add_dtype(a.dtype):
+        unsupported(
+            "aten::"
+            + what
+            + " of dtype "
+            + String(a.dtype)
+            + " (no atomic read-modify-write for it on the device)"
+        )
+    if red == _RED_MEAN and a.dtype == DType.bool:
+        unsupported("aten::" + what + " mean of a bool tensor")
+
+
+def _scalar_value(a: T, v: Value) raises -> Float64:
+    """A Scalar `value` as `a`'s dtype will hold it (range-checked)."""
+    if is_int_stype(a.stype):
+        return Float64(scalar_to_int(v, a.stype))
+    if a.dtype == DType.bool:
+        return 1.0 if v_f64(v) != 0.0 else 0.0
+    return scalar_to_float(v, a.stype)
+
+
+def _reduce_launch(
+    target: T,
+    dim_size: Int,
+    idx: T,
+    idx_strides: List[Int],
+    dims: List[Int],
+    dim: Int,
+    src: Optional[T],
+    value: Float64,
+    red: Int,
+    include_self: Bool,
+    what: String,
+    ordered: Bool = False,
+) raises:
+    """Reduce src (or the scalar `value`) into `target`, which holds self's
+    values, over the index space `dims` (int64 `idx` read through
+    `idx_strides`). The bad-index report of `_scatter_launch` applies.
+    `ordered` reduces each slot in index order (`_scatter_launch`)."""
+    var src_ptr = target.ptr
+    var src_dtype = target.dtype
+    var src_strides = List[Int]()
+    for _ in range(len(dims)):
+        src_strides.append(0)
+    if src:
+        src_ptr = src.value().ptr
+        src_dtype = src.value().dtype
+        src_strides = _strides_of(src.value())
+    var add = red == _RED_SUM or red == _RED_MEAN
+    var rop = 0 if add else red
+    if not include_self:
+        _scatter_launch(
+            target,
+            _strides_of(target),
+            idx,
+            idx_strides,
+            src_ptr,
+            src_dtype,
+            src_strides,
+            dims,
+            dim,
+            dim_size,
+            True,
+            0.0,
+            False,
+            what,
+            rop,
+            not add,
+        )
+    _scatter_launch(
+        target,
+        _strides_of(target),
+        idx,
+        idx_strides,
+        src_ptr,
+        src_dtype,
+        src_strides,
+        dims,
+        dim,
+        dim_size,
+        not src,
+        value,
+        add,
+        what,
+        rop,
+        False,
+        ordered,
+    )
+    if red != _RED_MEAN:
+        return
+    var counts = own(new_like(target))
+    fill_value(counts.t, 1.0 if include_self else 0.0)
+    _scatter_launch(
+        counts.t,
+        _strides_of(counts.t),
+        idx,
+        idx_strides,
+        counts.t.ptr,
+        counts.t.dtype,
+        src_strides,
+        dims,
+        dim,
+        dim_size,
+        True,
+        1.0,
+        True,
+        what,
+    )
+    # count.masked_fill_(count == 0, 1): a count is never negative.
+    var safe = own(
+        _call1("aten::clamp_min", "", [tensor_arg(counts.t), _scalar_int(1)])
+    )
+    var floating = target.dtype.is_floating_point()
+    var r = call_op(
+        String("aten::div") if floating else String("aten::floor_divide"),
+        String("Tensor") if floating else String(""),
+        [tensor_arg(target), tensor_arg(safe.t)],
+        1,
+    )
+    var quotient = own(r.take_tensor(0))
+    copy_strided_into(target, quotient.t)
+    _ = quotient^
+    _ = safe^
+    _ = counts^
+
+
+def _scatter_reduce_into(
+    target: T,
+    a: T,
+    dim: Int,
+    index: T,
+    src: Optional[T],
+    value: Float64,
+    red: Int,
+    include_self: Bool,
+    what: String,
+) raises:
+    """`scatter_impl` on a validated call: `target` holds self's values."""
+    if index.numel == 0:
+        return
+    var idx64 = own_if_new(cast_to(index, ST_INT64), index)
+    var idx_c = own_if_new(contiguous(idx64.t), idx64.t)
+    _reduce_launch(
+        target,
+        _dim_or1(a, dim),
+        idx_c.t,
+        _strides_of(idx_c.t),
+        _dims_of(idx_c.t),
+        dim,
+        src,
+        value,
+        red,
+        include_self,
+        what,
+    )
+    _ = idx_c^
+    _ = idx64^
+
+
+def _write_result(mut dest: T, res: T, what: String) raises:
+    """Hand a computed result to a caller's `out=`: torch's `resize_output`,
+    then a copy. The result was computed before `out` was touched, so an
+    `out` sharing storage with an input cannot corrupt the read."""
+    resize_out(dest, res.shape, res.rank)
+    if res.numel > 0:
+        copy_strided_into(dest, res)
+
+
+def _check_out_of(dest: T, a: T, index: T, src: Optional[T]) raises:
+    """The `out=` checks of `scatter_meta_impl`, before anything is written."""
+    check_out(dest, a)
+    assert_no_internal_overlap(dest)
+    assert_no_overlap(dest, index)
+    if src:
+        assert_no_overlap(dest, src.value())
+
+
+def _scatter_reduce_op(
+    args: Values,
+    rets: Values,
+    src_pos: Int,
+    is_scalar: Bool,
+    reduce_pos: Int,
+    new_options: Bool,
+    include_self_pos: Int,
+    out_pos: Int,
+    in_place: Bool,
+    what: String,
+) raises:
+    """Every scatter / scatter_reduce overload with a reduce or a scalar:
+    `reduce_pos` < 0 is a plain scatter.value, `out_pos` >= 0 an `out=`."""
+    var a = v_tensor(args[unsafe_offset=0])
+    var dim_in = v_int(args[unsafe_offset=1])
+    var index = v_tensor(args[unsafe_offset=2])
+    var src = Optional[T](None)
+    var value = 0.0
+    if is_scalar:
+        value = _scalar_value(a, args[unsafe_offset=src_pos])
+    else:
+        src = v_tensor(args[unsafe_offset=src_pos])
+    var red = 0
+    if reduce_pos >= 0:
+        red = _reduction(v_string(args[unsafe_offset=reduce_pos]), new_options)
+    var include_self = True
+    if include_self_pos >= 0:
+        include_self = v_bool(args[unsafe_offset=include_self_pos])
+    var dim = _scatter_validate(a, dim_in, index, src, False)
+    if red != 0:
+        _reduce_dtype_check(a, red, what)
+        if not is_scalar and (red == _RED_PROD or not new_options):
+            alert_not_deterministic("scatter_reduce_cuda_kernel")
+    if out_pos >= 0:
+        var out = v_tensor(args[unsafe_offset=out_pos])
+        _check_out_of(out, a, index, src)
+        if same_view(out, a):
+            _scatter_red_or_fill(
+                out, a, dim, index, src, value, red, include_self, what
+            )
+        else:
+            var res = own(_materialize_contiguous(a))
+            _scatter_red_or_fill(
+                res.t, a, dim, index, src, value, red, include_self, what
+            )
+            _write_result(out, res.t, what)
+            _ = res^
+        ret_ref(rets, 0, out)
+        return
+    if in_place:
+        _scatter_red_or_fill(
+            a, a, dim, index, src, value, red, include_self, what
+        )
+        ret_ref(rets, 0, a)
+        return
+    var res = own(_materialize_contiguous(a))
+    _scatter_red_or_fill(
+        res.t, a, dim, index, src, value, red, include_self, what
+    )
+    ret_owned(rets, 0, res)
+
+
+def _scatter_red_or_fill(
+    target: T,
+    a: T,
+    dim: Int,
+    index: T,
+    src: Optional[T],
+    value: Float64,
+    red: Int,
+    include_self: Bool,
+    what: String,
+) raises:
+    if red == 0:
+        _scatter_into(
+            target, dim, _dim_or1(a, dim), index, src, value, not src, False
+        )
+    else:
+        _scatter_reduce_into(
+            target, a, dim, index, src, value, red, include_self, what
+        )
+
+
+# aten::scatter.value_out(Tensor self, int dim, Tensor index, Scalar value, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_scatter_value_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(args, rets, 3, True, -1, False, -1, 4, False, "scatter")
+
+
+# aten::scatter_.value(Tensor(a!) self, int dim, Tensor index, Scalar value)
+#   -> Tensor(a!)
+def op_scatter__value(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(args, rets, 3, True, -1, False, -1, -1, True, "scatter")
+
+
+# aten::scatter.reduce(Tensor self, int dim, Tensor index, Tensor src, *,
+#   str reduce) -> Tensor
+def op_scatter_reduce(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(args, rets, 3, False, 4, False, -1, -1, False, "scatter")
+
+
+# aten::scatter_.reduce(Tensor(a!) self, int dim, Tensor index, Tensor src, *,
+#   str reduce) -> Tensor(a!)
+def op_scatter__reduce(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(args, rets, 3, False, 4, False, -1, -1, True, "scatter")
+
+
+# aten::scatter.reduce_out(Tensor self, int dim, Tensor index, Tensor src, *,
+#   str reduce, Tensor(a!) out) -> Tensor(a!)
+def op_scatter_reduce_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(args, rets, 3, False, 4, False, -1, 5, False, "scatter")
+
+
+# aten::scatter.value_reduce(Tensor self, int dim, Tensor index, Scalar value,
+#   *, str reduce) -> Tensor
+def op_scatter_value_reduce(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(args, rets, 3, True, 4, False, -1, -1, False, "scatter")
+
+
+# aten::scatter_.value_reduce(Tensor(a!) self, int dim, Tensor index,
+#   Scalar value, *, str reduce) -> Tensor(a!)
+def op_scatter__value_reduce(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(args, rets, 3, True, 4, False, -1, -1, True, "scatter")
+
+
+# aten::scatter.value_reduce_out(Tensor self, int dim, Tensor index,
+#   Scalar value, *, str reduce, Tensor(a!) out) -> Tensor(a!)
+def op_scatter_value_reduce_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(args, rets, 3, True, 4, False, -1, 5, False, "scatter")
+
+
+# aten::scatter_reduce.two(Tensor self, int dim, Tensor index, Tensor src,
+#   str reduce, *, bool include_self=True) -> Tensor
+def op_scatter_reduce_two(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(
+        args, rets, 3, False, 4, True, 5, -1, False, "scatter_reduce"
+    )
+
+
+# aten::scatter_reduce_.two(Tensor(a!) self, int dim, Tensor index,
+#   Tensor src, str reduce, *, bool include_self=True) -> Tensor(a!)
+def op_scatter_reduce__two(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(
+        args, rets, 3, False, 4, True, 5, -1, True, "scatter_reduce"
+    )
+
+
+# aten::scatter_reduce.two_out(Tensor self, int dim, Tensor index,
+#   Tensor src, str reduce, *, bool include_self=True, Tensor(a!) out)
+#   -> Tensor(a!)
+def op_scatter_reduce_two_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _scatter_reduce_op(
+        args, rets, 3, False, 4, True, 5, 6, False, "scatter_reduce"
+    )
+
+
+def _index_reduce_check(
+    a: T, dim_in: Int, index: T, source: T, reduce: String
+) raises -> Tuple[Int, Int]:
+    """`index_func_meta_impl` + the reduce check of index_reduce's meta;
+    returns (dim, reduction)."""
+    if (
+        reduce != "prod"
+        and reduce != "mean"
+        and reduce != "amax"
+        and reduce != "amin"
+    ):
+        raise Error(
+            (
+                "index_reduce(): Expected reduce to be one of prod, mean, amax"
+                " or amin but got "
+            ),
+            reduce,
+            ".",
+        )
+    var dim = _norm_dim(dim_in, a.rank, "index_reduce")
+    if index.rank > 1:
+        index_error(
+            "index_reduce_(): Index is supposed to be a vector, but got dim: "
+            + String(index.rank)
+        )
+    if index.dtype != DType.int64 and index.dtype != DType.int32:
+        raise Error(
+            "index_reduce_(): Expected dtype int32/int64 for index but got: ",
+            _scalar_type_name(index.dtype),
+        )
+    if source.dtype != a.dtype:
+        raise Error(
+            "index_reduce_(): self (",
+            _scalar_type_name(a.dtype),
+            ") and source (",
+            _scalar_type_name(source.dtype),
+            ") must have the same scalar type",
+        )
+    if not (dim == 0 or dim < source.rank):
+        raise Error(
+            "index_reduce_(): Indexing dim ",
+            dim,
+            " is out of bounds of the source tensor with dim ",
+            source.rank,
+        )
+    var src_n = 1 if source.rank == 0 else source.dim(dim)
+    if index.numel != src_n:
+        raise Error(
+            "index_reduce_(): Number of indices (",
+            index.numel,
+            ") should be equal to source.size(dim): (",
+            src_n,
+            "), for dim: ",
+            dim,
+        )
+    var same = True
+    if source.rank != 0 and a.rank != 0:
+        if source.rank != a.rank:
+            same = False
+        else:
+            for d in range(a.rank):
+                if d != dim and source.dim(d) != a.dim(d):
+                    same = False
+    elif source.rank != a.rank:
+        same = False
+    if not same:
+        raise Error(
+            (
+                "source tensor shape must match self tensor shape, excluding"
+                " the specified dimension. Got self.shape = "
+            ),
+            shape_str(a),
+            " source.shape = ",
+            shape_str(source),
+        )
+    if a.rank > 4:
+        unsupported("aten::index_reduce with rank greater than 4")
+    if index.device != a.device or source.device != a.device:
+        unsupported("aten::index_reduce with operands on different devices")
+    var red = _reduction(reduce, True)
+    _reduce_dtype_check(a, red, "index_reduce")
+    if a.dtype == DType.bool:
+        unsupported("aten::index_reduce of a bool tensor")
+    var ctx = ctx_for(a.device)
+    var metal = ctx.api() == "metal"
+    _ = ctx
+    if metal and a.dtype == DType.float64:
+        unsupported("aten::index_reduce of float64 on Apple GPU")
+    return (dim, red)
+
+
+def _index_reduce_into(
+    target: T,
+    a: T,
+    dim: Int,
+    index: T,
+    source: T,
+    red: Int,
+    include_self: Bool,
+) raises:
+    """`target[..., index[i], ...] (red)= source[..., i, ...]` along `dim`:
+    the reduce launch over source's index space with the 1-D index
+    broadcast (stride 0) across every other coordinate."""
+    alert_not_deterministic("index_reduce_cuda")
+    if index.numel == 0:
+        return
+    # CUDA's indexFuncSmallIndex (<= 16 indices) reduces every slot in index
+    # order; above that it is atomic (indexFuncLargeIndex).
+    var ordered = index.numel <= 16
+    var idx = own_if_new(cast_to(index, ST_INT64), index)
+    var idx_stride = idx.t.stride(0) if idx.t.rank == 1 else 0
+    var idx_strides = List[Int](capacity=max(a.rank, 1))
+    for d in range(max(a.rank, 1)):
+        idx_strides.append(idx_stride if d == dim else 0)
+    _reduce_launch(
+        target,
+        _dim_or1(a, dim),
+        idx.t,
+        idx_strides,
+        _dims_of(source),
+        dim,
+        source.copy(),
+        0.0,
+        red,
+        include_self,
+        "index_reduce",
+        ordered,
+    )
+    _ = idx^
+
+
+def _index_reduce_op(
+    args: Values, rets: Values, out_pos: Int, in_place: Bool
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var index = v_tensor(args[unsafe_offset=2])
+    var source = v_tensor(args[unsafe_offset=3])
+    var checked = _index_reduce_check(
+        a,
+        v_int(args[unsafe_offset=1]),
+        index,
+        source,
+        v_string(args[unsafe_offset=4]),
+    )
+    var dim = checked[0]
+    var red = checked[1]
+    var include_self = v_bool(args[unsafe_offset=5])
+    if out_pos >= 0:
+        var out = v_tensor(args[unsafe_offset=out_pos])
+        check_out(out, a)
+        assert_no_internal_overlap(out)
+        assert_no_overlap(out, index)
+        assert_no_overlap(out, source)
+        if same_view(out, a):
+            _index_reduce_into(out, a, dim, index, source, red, include_self)
+        else:
+            var res = own(_materialize_contiguous(a))
+            _index_reduce_into(res.t, a, dim, index, source, red, include_self)
+            _write_result(out, res.t, "index_reduce")
+            _ = res^
+        ret_ref(rets, 0, out)
+        return
+    if in_place:
+        _index_reduce_into(a, a, dim, index, source, red, include_self)
+        ret_ref(rets, 0, a)
+        return
+    var res = own(_materialize_contiguous(a))
+    _index_reduce_into(res.t, a, dim, index, source, red, include_self)
+    ret_owned(rets, 0, res)
+
+
+# aten::index_reduce(Tensor self, int dim, Tensor index, Tensor source,
+#   str reduce, *, bool include_self=True) -> Tensor
+def op_index_reduce(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _index_reduce_op(args, rets, -1, False)
+
+
+# aten::index_reduce_(Tensor(a!) self, int dim, Tensor index, Tensor source,
+#   str reduce, *, bool include_self=True) -> Tensor(a!)
+def op_index_reduce_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _index_reduce_op(args, rets, -1, True)
+
+
+# aten::index_reduce.out(Tensor self, int dim, Tensor index, Tensor source,
+#   str reduce, *, bool include_self=True, Tensor(a!) out) -> Tensor(a!)
+def op_index_reduce_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _index_reduce_op(args, rets, 6, False)
+
+
+# ---------------------------------------------------------------------------
+# nonzero.out / nonzero_static / index.Tensor_out / narrow_copy.out /
+# fill_.Tensor -- the functional op through the dispatcher, then written
+# into the caller's tensor (ATen's `nonzero_out_cuda`,
+# `nonzero_static_cuda`, `index_out`, `narrow_copy_dense_cpu_out`,
+# `fill_`). The result is complete before `out` is resized, so an `out`
+# aliasing an input cannot corrupt the read.
+# ---------------------------------------------------------------------------
+
+
+def _nonzero_out_checks(t: T, dest: T, what: String) raises:
+    if dest.dtype != DType.int64:
+        if what == "nonzero_static":
+            raise Error(
+                (
+                    "nonzero_static: Expected out tensor to have scalar type"
+                    " Long but got "
+                ),
+                _scalar_type_name(dest.dtype),
+            )
+        raise Error(
+            "Expected object of scalar type Long as out, but got ",
+            _scalar_type_name(dest.dtype),
+        )
+    if dest.device_type != t.device_type or dest.device != t.device:
+        raise Error(
+            "expected self and out to be on the same device, but got out on ",
+            device_str(dest),
+            " and self on ",
+            device_str(t),
+        )
+
+
+# aten::nonzero.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
+def op_nonzero_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dest = v_tensor(args[unsafe_offset=1])
+    _nonzero_out_checks(t, dest, "nonzero")
+    var res = own(_call1("aten::nonzero", "", [tensor_arg(t)]))
+    _write_result(dest, res.t, "nonzero")
+    _ = res^
+    ret_ref(rets, 0, dest)
+
+
+def _nonzero_static(t: T, size: Int, fill: Int) raises -> Owned:
+    """The first `size` rows of `nonzero(t)`, the rest `fill_value`."""
+    if size < 0:
+        raise Error("nonzero_static: 'size' must be an non-negative integer")
+    var nz = own(_call1("aten::nonzero", "", [tensor_arg(t)]))
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 2] = size
+    shape[MAX_RANK - 1] = t.rank
+    var res = own(new_tensor(shape, 2, ST_INT64, t.device))
+    if res.t.numel > 0:
+        fill_value(res.t, _scalar_int(fill))
+        var rows = min(nz.t.dim(0), size)
+        if rows > 0:
+            var ctx = ctx_for(t.device)
+            copy_d2d(ctx, res.t.ptr, nz.t.ptr, rows * t.rank * 8)
+            _ = ctx
+    _ = nz^
+    return res^
+
+
+# aten::nonzero_static(Tensor self, *, SymInt size, int fill_value=-1)
+#   -> Tensor
+def op_nonzero_static(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var res = _nonzero_static(
+        t, v_int(args[unsafe_offset=1]), v_int(args[unsafe_offset=2])
+    )
+    ret_owned(rets, 0, res)
+
+
+# aten::nonzero_static.out(Tensor self, *, SymInt size, int fill_value=-1,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_nonzero_static_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dest = v_tensor(args[unsafe_offset=3])
+    _nonzero_out_checks(t, dest, "nonzero_static")
+    var res = _nonzero_static(
+        t, v_int(args[unsafe_offset=1]), v_int(args[unsafe_offset=2])
+    )
+    _write_result(dest, res.t, "nonzero_static")
+    _ = res^
+    ret_ref(rets, 0, dest)
+
+
+# aten::index.Tensor_out(Tensor self, Tensor?[] indices, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_index_tensor_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dest = v_tensor(args[unsafe_offset=2])
+    check_out(dest, t)
+    assert_no_internal_overlap(dest)
+    assert_no_overlap(dest, t)
+    for idx in v_tensor_list(args[unsafe_offset=1]):
+        assert_no_overlap(dest, idx)
+    var res = own(
+        _call1(
+            "aten::index",
+            "Tensor",
+            [tensor_arg(t), args[unsafe_offset=1].copy()],
+        )
+    )
+    _write_result(dest, res.t, "index")
+    _ = res^
+    ret_ref(rets, 0, dest)
+
+
+# aten::narrow_copy.out(Tensor self, int dim, SymInt start, SymInt length, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_narrow_copy_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var dest = v_tensor(args[unsafe_offset=4])
+    check_out(dest, t)
+    var res = own(
+        _call1(
+            "aten::narrow_copy",
+            "",
+            [
+                tensor_arg(t),
+                args[unsafe_offset=1].copy(),
+                args[unsafe_offset=2].copy(),
+                args[unsafe_offset=3].copy(),
+            ],
+        )
+    )
+    _write_result(dest, res.t, "narrow_copy")
+    _ = res^
+    ret_ref(rets, 0, dest)
+
+
+# aten::fill_.Tensor(Tensor(a!) self, Tensor value) -> Tensor(a!)
+def op_fill__tensor(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var value = v_tensor(args[unsafe_offset=1])
+    if value.rank != 0:
+        raise Error(
+            "fill_ only supports 0-dimension value tensor but got tensor with ",
+            value.rank,
+            " dimensions.",
+        )
+    # The value is read once, on the host (a device value costs one sync,
+    # where CUDA copies on the stream), then filled with fill_.Scalar's
+    # conversion rules. Reading it first also covers a value aliasing self.
+    var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+    fill_value(t, r[0])
+    ret_ref(rets, 0, t)
+
+
 def register_indexing(site: Site) raises:
     impl[op_flip, "flip"](site)
     impl[op_roll, "roll"](site)
@@ -1256,3 +2037,23 @@ def register_indexing(site: Site) raises:
     impl[op_index_copy_out, "index_copy.out"](site)
     impl[op_masked_scatter_, "masked_scatter_"](site)
     impl[op_repeat_interleave_tensor, "repeat_interleave.Tensor"](site)
+    impl[op_scatter_value_out, "scatter.value_out"](site)
+    impl[op_scatter__value, "scatter_.value"](site)
+    impl[op_scatter_reduce, "scatter.reduce"](site)
+    impl[op_scatter__reduce, "scatter_.reduce"](site)
+    impl[op_scatter_reduce_out, "scatter.reduce_out"](site)
+    impl[op_scatter_value_reduce, "scatter.value_reduce"](site)
+    impl[op_scatter__value_reduce, "scatter_.value_reduce"](site)
+    impl[op_scatter_value_reduce_out, "scatter.value_reduce_out"](site)
+    impl[op_scatter_reduce_two, "scatter_reduce.two"](site)
+    impl[op_scatter_reduce__two, "scatter_reduce_.two"](site)
+    impl[op_scatter_reduce_two_out, "scatter_reduce.two_out"](site)
+    impl[op_index_reduce, "index_reduce"](site)
+    impl[op_index_reduce_, "index_reduce_"](site)
+    impl[op_index_reduce_out, "index_reduce.out"](site)
+    impl[op_nonzero_out, "nonzero.out"](site)
+    impl[op_nonzero_static, "nonzero_static"](site)
+    impl[op_nonzero_static_out, "nonzero_static.out"](site)
+    impl[op_index_tensor_out, "index.Tensor_out"](site)
+    impl[op_narrow_copy_out, "narrow_copy.out"](site)
+    impl[op_fill__tensor, "fill_.Tensor"](site)
