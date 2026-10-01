@@ -9,7 +9,8 @@ nll_loss is driven through F.nll_loss the way a training loop reaches
 it (the functional nll_loss_forward / nll_loss_backward).  N12288xC50304
 is the padded-vocab nanoGPT loss regime.  nll_loss2d is the segmentation
 regime of F.cross_entropy over [N, C, H, W] logits; the margin losses run
-at a classifier's (batch, classes).
+at a classifier's (batch, classes); CTC at a speech recognizer's (time,
+batch, vocabulary) with targets a quarter of the input length.
 
 The elementwise losses (mse, smooth_l1, huber, binary_cross_entropy and
 its logits form) run with reduction='mean', the default a training loop
@@ -73,6 +74,8 @@ COVERS: dict[str, str] = (
         "aten::multilabel_margin_loss_backward": (
             "test_multilabel_margin_loss_backward"
         ),
+        "aten::_ctc_loss": "test_ctc_loss",
+        "aten::_ctc_loss_backward": "test_ctc_loss_backward",
     }
     | {f"aten::{name}": "test_loss" for name in LOSS_OPS}
     | {f"aten::{name}": "test_loss_backward" for name in LOSS_BACKWARD_OPS}
@@ -94,6 +97,14 @@ SKIPPED: dict[str, str] = {
     ),
     "aten::bernoulli.out": (
         "out.resize_ + the BernoulliTensor kernel bernoulli_.Tensor launches"
+    ),
+    "aten::_ctc_loss.Tensor": (
+        "a synchronizing read of the lengths, then the _ctc_loss kernel "
+        "test_ctc_loss measures"
+    ),
+    "aten::_ctc_loss_backward.Tensor": (
+        "a synchronizing read of the lengths, then the _ctc_loss_backward "
+        "kernels test_ctc_loss_backward measures"
     ),
     "aten::_fill_mem_eff_dropout_mask_": (
         "a testing hook of memory-efficient attention (upstream: 'only used "
@@ -448,4 +459,57 @@ def test_multilabel_margin_loss_backward(
             g_our, x_our, t_our, 1, it_our
         ),
         flops=float(x_ref.numel()),
+    )
+
+
+# (T, B, C, S): time steps, batch, vocabulary, target length
+CTC_SHAPES: dict[str, tuple[int, int, int, int]] = {
+    "T200xB16xC32xS50": (200, 16, 32, 50),
+    "T97xB5xC29xS23": (97, 5, 29, 23),
+}
+
+
+def _ctc_case(
+    shape_id: str, hw: Hardware, mojo: torch.device
+) -> tuple[list[torch.Tensor], list[torch.Tensor], list[int], list[int]]:
+    t, b, c, s = CTC_SHAPES[shape_id]
+    lp = torch.randn(t, b, c).log_softmax(2)
+    tg = torch.randint(1, c, (b, s))
+    lp_ref, lp_our = both(lp, hw, mojo)
+    tg_ref, tg_our = both(tg, hw, mojo)
+    return [lp_ref, tg_ref], [lp_our, tg_our], [t] * b, [s] * b
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", CTC_SHAPES)
+@pytest.mark.bench_op("_ctc_loss")
+def test_ctc_loss(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    refs, ours, il, tl = _ctc_case(shape_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten._ctc_loss(*refs, il, tl, 0, False),
+        lambda: torch.ops.aten._ctc_loss(*ours, il, tl, 0, False),
+        flops=float(refs[0].numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", CTC_SHAPES)
+@pytest.mark.bench_op("_ctc_loss_backward")
+def test_ctc_loss_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    refs, ours, il, tl = _ctc_case(shape_id, hw, mojo_device)
+    nll_ref, la_ref = torch.ops.aten._ctc_loss(*refs, il, tl, 0, False)
+    nll_our, la_our = torch.ops.aten._ctc_loss(*ours, il, tl, 0, False)
+    g_ref, g_our = both(torch.ones(len(il)), hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten._ctc_loss_backward(
+            g_ref, *refs, il, tl, nll_ref, la_ref, 0, False
+        ),
+        lambda: torch.ops.aten._ctc_loss_backward(
+            g_our, *ours, il, tl, nll_our, la_our, 0, False
+        ),
+        flops=float(refs[0].numel()),
     )

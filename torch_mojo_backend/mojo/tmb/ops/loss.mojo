@@ -12,13 +12,21 @@ resize and copy into the caller's (`store_out`), so an `out` that aliases an
 input is only written after every input was read.
 """
 from std.utils import IndexList
-from std.utils.numerics import nan
+from std.utils.numerics import min_or_neg_inf, nan
 
 from tmb.backend.abi import (
+    DEVICE_TYPE_CPU,
+    IntList,
+    MEMORY_FORMAT_CONTIGUOUS,
     Owned,
+    ST_INT32,
     ST_INT64,
     ST_UINT8,
     T,
+    TAG_BOOL,
+    TAG_DEVICE,
+    TAG_DTYPE,
+    TAG_MEMORY_FORMAT,
     Value,
     Values,
     new_tensor,
@@ -30,11 +38,12 @@ from tmb.backend.abi import (
     ret_owned,
     ret_ref,
     unsupported,
+    v_bool,
     v_int,
     v_is_none,
     v_tensor,
 )
-from tmb.backend.device import ctx_for, ctx_ptr, dev
+from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
@@ -44,6 +53,7 @@ from tmb.ops.common import (
     device_str,
     fill_value,
     forward_args,
+    is_int_stype,
     scalar_to_float,
     scalar_to_int,
     store_out,
@@ -1123,6 +1133,464 @@ def op_multilabel_margin_loss_backward_grad_input(
     ret_ref(rets, 0, dst)
 
 
+# ---------------------------------------------------------------------------
+# CTC loss (LossCTC.cu)
+# ---------------------------------------------------------------------------
+
+
+comptime CTC_C = "ctc_loss_gpu"
+
+
+def _ctc_while() -> String:
+    return String(" (while checking arguments for ") + CTC_C + ")"
+
+
+def _tensor_type_name(t: T) -> String:
+    """`Tensor::toString()` as CUDA's checks print it, for this device."""
+    return String("torch.mojo.") + _scalar_type_name(t.dtype) + "Tensor"
+
+
+def _upload_lengths(lengths: List[Int], device: Int) raises -> Owned:
+    """`at::tensor(lengths, kLong)` on the device."""
+    var host = List[Int64](capacity=max(len(lengths), 1))
+    for v in lengths:
+        host.append(Int64(v))
+    var out = own(new_tensor(_shape1(len(lengths)), 1, ST_INT64, device))
+    if len(lengths) > 0:
+        copy_from_host(
+            device,
+            ctx_for(device),
+            out.t.ptr,
+            Int(host.unsafe_ptr()),
+            8 * len(lengths),
+        )
+    _ = host^
+    return out^
+
+
+def _host_lengths(
+    v: Value, like: T, name: StaticString, method: StaticString
+) raises -> List[Int]:
+    """A lengths tensor as host ints: LossCTC.cpp `ctc_loss_tensor`'s
+    integral check and `lengths.to(kCPU, kLong)` (a synchronizing read),
+    after the dispatcher wrapper's same-device check of the `.Tensor`
+    overloads."""
+    var t = v_tensor(v)
+    if t.device_type != like.device_type or t.device != like.device:
+        raise Error(
+            "Expected all tensors to be on the same device, but got ",
+            name,
+            " is on ",
+            device_str(t),
+            ", different from other tensors on ",
+            device_str(like),
+            " (when checking argument in method ",
+            method,
+            ")",
+        )
+    if not is_int_stype(t.stype):
+        raise Error(name, " must be integral")
+    var r = call_op(
+        String("aten::_to_copy"),
+        String(""),
+        [
+            tensor_arg(t),
+            Value(TAG_DTYPE, 0, Int64(ST_INT64), 0),
+            none_arg(),
+            Value(TAG_DEVICE, 0, Int64(DEVICE_TYPE_CPU), -1),
+            none_arg(),
+            Value(TAG_BOOL, 0, 0, 0),
+            Value(TAG_MEMORY_FORMAT, 0, Int64(MEMORY_FORMAT_CONTIGUOUS), 0),
+        ],
+        1,
+    )
+    var host = own(r.take_tensor(0))
+    var out = List[Int](capacity=host.t.numel)
+    var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=host.t.ptr)
+    for i in range(host.t.numel):
+        out.append(Int(p[unsafe_offset=i]))
+    _ = host^
+    return out^
+
+
+struct CtcGeom(Movable):
+    var batch: Int
+    var labels: Int
+    var max_input: Int
+    var max_target: Int
+    var tg_stride: Int  # targets' row length for [B, S], 0 when concatenated
+
+    def __init__(
+        out self,
+        batch: Int,
+        labels: Int,
+        max_input: Int,
+        max_target: Int,
+        tg_stride: Int,
+    ):
+        self.batch = batch
+        self.labels = labels
+        self.max_input = max_input
+        self.max_target = max_target
+        self.tg_stride = tg_stride
+
+
+def _ctc_dtypes(log_probs: T, targets: T) raises:
+    if not log_probs.on_mojo():
+        raise Error("expected log_probs on the mojo device")
+    if log_probs.dtype != DType.float32 and log_probs.dtype != DType.float64:
+        unsupported(
+            String('"ctc_loss_cuda" not implemented for \'')
+            + _scalar_type_name(log_probs.dtype)
+            + "'"
+        )
+    if (
+        log_probs.dtype == DType.float64
+        and dev(log_probs.device)[].api == "metal"
+    ):
+        unsupported("float64 CTC is unavailable on Apple GPUs")
+    if targets.stype != ST_INT64 and targets.stype != ST_INT32:
+        raise Error(
+            (
+                "Expected tensor for argument #2 'targets' to have scalar type"
+                " Int; but got "
+            ),
+            _tensor_type_name(targets),
+            " instead",
+            _ctc_while(),
+        )
+
+
+def _ctc_checks(
+    log_probs: T,
+    targets: T,
+    input_lengths: List[Int],
+    target_lengths: List[Int],
+    blank: Int,
+) raises -> CtcGeom:
+    """ctc_loss_gpu_template's argument checks, in its order."""
+    if log_probs.numel == 0:
+        raise Error("log_probs tensor must not be empty")
+    _same_device(log_probs, targets)
+    _ctc_dtypes(log_probs, targets)
+    if log_probs.rank != 3:
+        raise Error(
+            "Expected 3-dimensional tensor, but got ",
+            log_probs.rank,
+            "-dimensional tensor for argument #1 'log_probs'",
+            _ctc_while(),
+        )
+    if targets.rank < 1 or targets.rank > 2:
+        raise Error(
+            "Expected 1 to 2 dimensions, but got ",
+            targets.rank,
+            "-dimensional tensor for argument #2 'targets'",
+            _ctc_while(),
+        )
+    var batch = log_probs.dim(1)
+    var labels = log_probs.dim(2)
+    if blank < 0 or blank >= labels:
+        raise Error("blank must be in label range")
+    if len(input_lengths) != batch:
+        raise Error("input_lengths must be of size batch_size")
+    if len(target_lengths) != batch:
+        raise Error("target_lengths must be of size batch_size")
+    var max_target = 0
+    var pos = 0
+    for i in range(batch):
+        var tl = target_lengths[i]
+        if tl < 0:
+            raise Error(
+                (
+                    "Expected target_lengths to have value at least 0, but got"
+                    " value "
+                ),
+                tl,
+                _ctc_while(),
+            )
+        pos += tl
+        max_target = max(max_target, tl)
+    var tg_stride = 0
+    if targets.rank == 1:
+        if targets.dim(0) != pos:
+            raise Error(
+                "Expected tensor to have size ",
+                pos,
+                " at dimension 0, but got size ",
+                targets.dim(0),
+                " for argument #2 'targets'",
+                _ctc_while(),
+            )
+    else:
+        if targets.dim(0) != batch:
+            raise Error(
+                "Expected tensor to have size ",
+                batch,
+                " at dimension 0, but got size ",
+                targets.dim(0),
+                " for argument #2 'targets'",
+                _ctc_while(),
+            )
+        if targets.dim(1) < max_target:
+            raise Error(
+                "Expected tensor to have size at least ",
+                max_target,
+                " at dimension 1, but got size ",
+                targets.dim(1),
+                " for argument #2 'targets'",
+                _ctc_while(),
+            )
+        tg_stride = targets.dim(1)
+    var max_input = log_probs.dim(0)
+    for b in range(batch):
+        var il = input_lengths[b]
+        if il < 0:
+            raise Error(
+                (
+                    "Expected input_lengths to have value at least 0, but got"
+                    " value "
+                ),
+                il,
+                _ctc_while(),
+            )
+        if il > max_input:
+            raise Error(
+                "Expected input_lengths to have value at most ",
+                max_input,
+                ", but got value ",
+                il,
+                _ctc_while(),
+            )
+    return CtcGeom(batch, labels, max_input, max_target, tg_stride)
+
+
+def _ctc_params(g: CtcGeom, blank: Int, zero_infinity: Bool) -> List[Int]:
+    var p = List[Int](capacity=7)
+    p.append(g.max_input)
+    p.append(g.max_target)
+    p.append(g.batch)
+    p.append(g.labels)
+    p.append(blank)
+    p.append(g.tg_stride)
+    p.append(1 if zero_infinity else 0)
+    return p^
+
+
+def _ctc_forward(
+    args: Values,
+    input_lengths: List[Int],
+    target_lengths: List[Int],
+) raises -> OwnedPair:
+    """ctc_loss_gpu: (neg_log_likelihood [B], log_alpha [B, T, 2L + 1])."""
+    var log_probs = v_tensor(args[unsafe_offset=0])
+    var targets = v_tensor(args[unsafe_offset=1])
+    var blank = v_int(args[unsafe_offset=4])
+    var g = _ctc_checks(
+        log_probs, targets, input_lengths, target_lengths, blank
+    )
+    var lp = Dense(log_probs)
+    var tg = Dense(targets)
+    var il = _upload_lengths(input_lengths, log_probs.device)
+    var tl = _upload_lengths(target_lengths, log_probs.device)
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 3] = g.batch
+    shape[MAX_RANK - 2] = g.max_input
+    shape[MAX_RANK - 1] = 2 * g.max_target + 1
+    var log_alpha = own(new_tensor(shape, 3, log_probs.stype, log_probs.device))
+    var nll = own(
+        new_tensor(_shape1(g.batch), 1, log_probs.stype, log_probs.device)
+    )
+    if g.batch > 0:
+        var ctx = ctx_for(log_probs.device)
+        var call = KernelCall("loss", "Ctc")
+        call.arg_dtype(0, log_probs.dtype)
+        call.arg_dtype(1, targets.dtype)
+        call.int(log_alpha.t.ptr)
+        call.int(nll.t.ptr)
+        call.int(lp.t.ptr)
+        call.int(il.t.ptr)
+        call.int(tg.t.ptr)
+        call.int(tl.t.ptr)
+        call.tuple(_ctc_params(g, blank, False))
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+    _ = lp^
+    _ = tg^
+    _ = il^
+    _ = tl^
+    return OwnedPair(nll^, log_alpha^)
+
+
+def _ctc_backward(
+    args: Values,
+    input_lengths: List[Int],
+    target_lengths: List[Int],
+) raises -> Owned:
+    """ctc_loss_backward_gpu: the gradient wrt log_probs, `[T, B, C]`."""
+    var grad = v_tensor(args[unsafe_offset=0])
+    var log_probs = v_tensor(args[unsafe_offset=1])
+    var targets = v_tensor(args[unsafe_offset=2])
+    var nll_t = v_tensor(args[unsafe_offset=5])
+    var log_alpha = v_tensor(args[unsafe_offset=6])
+    var blank = v_int(args[unsafe_offset=7])
+    var zero_infinity = v_bool(args[unsafe_offset=8])
+    _same_device(log_probs, targets)
+    _same_device(log_probs, grad)
+    _same_device(log_probs, nll_t)
+    _same_device(log_probs, log_alpha)
+    _ctc_dtypes(log_probs, targets)
+    _expect_dtype(grad, log_probs)
+    _expect_dtype(nll_t, log_probs)
+    _expect_dtype(log_alpha, log_probs)
+    if log_probs.rank != 3 or log_alpha.rank != 3:
+        raise Error("ctc_loss_backward: log_probs and log_alpha must be 3-D")
+    var batch = log_probs.dim(1)
+    if (
+        len(input_lengths) < batch
+        or len(target_lengths) < batch
+        or nll_t.numel < batch
+        or grad.numel < batch
+    ):
+        raise Error("ctc_loss_backward: per-sample arguments shorter than B")
+    var max_target = 0
+    var tg_stride = 0
+    if targets.rank == 1:
+        for i in range(batch):
+            max_target = max(max_target, target_lengths[i])
+    else:
+        # LossCTC.cu: `log_alpha.size(2) / 2` (targets.size(1) may be larger).
+        max_target = log_alpha.dim(2) // 2
+        tg_stride = targets.dim(1)
+    var g = CtcGeom(
+        batch, log_probs.dim(2), log_probs.dim(0), max_target, tg_stride
+    )
+    var lp = Dense(log_probs)
+    var tg = Dense(targets)
+    var la = Dense(log_alpha)
+    var go = Dense(grad)
+    var nll = Dense(nll_t)
+    var il = _upload_lengths(input_lengths, log_probs.device)
+    var tl = _upload_lengths(target_lengths, log_probs.device)
+    var neg = min_or_neg_inf[DType.float64]()
+    var out = own(
+        new_tensor(
+            log_probs.shape, log_probs.rank, log_probs.stype, log_probs.device
+        )
+    )
+    fill_value(out.t, neg)
+    var log_beta = own(
+        new_tensor(
+            log_alpha.shape, log_alpha.rank, log_alpha.stype, log_alpha.device
+        )
+    )
+    fill_value(log_beta.t, neg)
+    if batch > 0 and log_probs.numel > 0:
+        var ctx = ctx_for(log_probs.device)
+        var call = KernelCall("loss", "CtcBackward")
+        call.arg_dtype(0, log_probs.dtype)
+        call.arg_dtype(1, targets.dtype)
+        call.int(out.t.ptr)
+        call.int(log_beta.t.ptr)
+        call.int(go.t.ptr)
+        call.int(la.t.ptr)
+        call.int(lp.t.ptr)
+        call.int(il.t.ptr)
+        call.int(tg.t.ptr)
+        call.int(tl.t.ptr)
+        call.int(nll.t.ptr)
+        call.tuple(_ctc_params(g, blank, zero_infinity))
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+    _ = lp^
+    _ = tg^
+    _ = la^
+    _ = go^
+    _ = nll^
+    _ = il^
+    _ = tl^
+    _ = log_beta^
+    return out^
+
+
+# aten::_ctc_loss(Tensor log_probs, Tensor targets, int[] input_lengths,
+#   int[] target_lengths, int blank=0, bool zero_infinity=False)
+#   -> (Tensor, Tensor)
+def op_ctc_loss(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var r = _ctc_forward(
+        args,
+        IntList(args[unsafe_offset=2]).to_list(),
+        IntList(args[unsafe_offset=3]).to_list(),
+    )
+    ret_owned(rets, 0, r.first)
+    ret_owned(rets, 1, r.second)
+
+
+# aten::_ctc_loss.Tensor(Tensor log_probs, Tensor targets,
+#   Tensor input_lengths, Tensor target_lengths, int blank=0,
+#   bool zero_infinity=False) -> (Tensor, Tensor)
+def op_ctc_loss_tensor(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var r = _ctc_forward(
+        args,
+        _host_lengths(
+            args[unsafe_offset=2],
+            v_tensor(args[unsafe_offset=0]),
+            "input_lengths",
+            "wrapper_PrivateUse1_Tensor__ctc_loss",
+        ),
+        _host_lengths(
+            args[unsafe_offset=3],
+            v_tensor(args[unsafe_offset=0]),
+            "target_lengths",
+            "wrapper_PrivateUse1_Tensor__ctc_loss",
+        ),
+    )
+    ret_owned(rets, 0, r.first)
+    ret_owned(rets, 1, r.second)
+
+
+# aten::_ctc_loss_backward(Tensor grad, Tensor log_probs, Tensor targets,
+#   int[] input_lengths, int[] target_lengths, Tensor neg_log_likelihood,
+#   Tensor log_alpha, int blank, bool zero_infinity=False) -> Tensor
+def op_ctc_loss_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var r = _ctc_backward(
+        args,
+        IntList(args[unsafe_offset=3]).to_list(),
+        IntList(args[unsafe_offset=4]).to_list(),
+    )
+    ret_owned(rets, 0, r)
+
+
+# aten::_ctc_loss_backward.Tensor(Tensor grad, Tensor log_probs,
+#   Tensor targets, Tensor input_lengths, Tensor target_lengths,
+#   Tensor neg_log_likelihood, Tensor log_alpha, int blank,
+#   bool zero_infinity=False) -> Tensor
+def op_ctc_loss_backward_tensor(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var r = _ctc_backward(
+        args,
+        _host_lengths(
+            args[unsafe_offset=3],
+            v_tensor(args[unsafe_offset=1]),
+            "input_lengths",
+            "wrapper_PrivateUse1_Tensor__ctc_loss_backward",
+        ),
+        _host_lengths(
+            args[unsafe_offset=4],
+            v_tensor(args[unsafe_offset=1]),
+            "target_lengths",
+            "wrapper_PrivateUse1_Tensor__ctc_loss_backward",
+        ),
+    )
+    ret_owned(rets, 0, r)
+
+
 def register_loss(site: Site) raises:
     impl[op_nll_loss_forward, "nll_loss_forward"](site)
     impl[op_nll_loss_forward_output, "nll_loss_forward.output"](site)
@@ -1155,3 +1623,7 @@ def register_loss(site: Site) raises:
         op_multilabel_margin_loss_backward_grad_input,
         "multilabel_margin_loss_backward.grad_input",
     ](site)
+    impl[op_ctc_loss, "_ctc_loss"](site)
+    impl[op_ctc_loss_tensor, "_ctc_loss.Tensor"](site)
+    impl[op_ctc_loss_backward, "_ctc_loss_backward"](site)
+    impl[op_ctc_loss_backward_tensor, "_ctc_loss_backward.Tensor"](site)

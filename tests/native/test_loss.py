@@ -670,3 +670,155 @@ def test_multilabel_margin_loss_errors(mojo_device):
         aten.multilabel_margin_loss_forward(
             torch.randn(0, device=d), torch.zeros(0, dtype=torch.long, device=d), 1
         )
+
+
+# ---------------------------------------------------------------------------
+# CTC loss
+# ---------------------------------------------------------------------------
+
+
+def _ctc_case(T, B, C, S, tdtype, concat, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    lp = torch.randn(T, B, C, generator=g).log_softmax(2)
+    il = [T - (i % 2) for i in range(B)]
+    tl = [max(0, min(S, (2 * i + 1) % (S + 1))) for i in range(B)]
+    if B > 2:
+        tl[2] = 0
+    tg = torch.randint(1, C, (B, S), generator=g, dtype=tdtype)
+    if concat:
+        tg = torch.cat([tg[i, : tl[i]] for i in range(B)])
+    return lp, tg, il, tl
+
+
+@pytest.mark.parametrize("shape", [(6, 3, 5, 3), (20, 4, 7, 6), (50, 2, 30, 20)])
+@pytest.mark.parametrize("tdtype", [torch.int64, torch.int32])
+@pytest.mark.parametrize("concat", [False, True])
+@pytest.mark.parametrize("reduction", ["none", "mean", "sum"])
+def test_ctc_loss_matches_cpu(mojo_device, shape, tdtype, concat, reduction):
+    steps, batch, labels, longest = shape
+    lp, tg, il_list, tl_list = _ctc_case(steps, batch, labels, longest, tdtype, concat)
+    il, tl = torch.tensor(il_list), torch.tensor(tl_list)
+    for zero_infinity in [False, True]:
+        lr = lp.clone().requires_grad_()
+        want = F.ctc_loss(
+            lr, tg, il, tl, reduction=reduction, zero_infinity=zero_infinity
+        )
+        lm = lp.to(mojo_device).requires_grad_()
+        with ran("aten::_ctc_loss"):
+            got = F.ctc_loss(
+                lm,
+                tg.to(mojo_device),
+                il,
+                tl,
+                reduction=reduction,
+                zero_infinity=zero_infinity,
+            )
+        grad = torch.rand_like(want) + 0.5
+        want.backward(grad)
+        with ran("aten::_ctc_loss_backward"):
+            got.backward(grad.to(mojo_device))
+        assert lm.grad is not None and lr.grad is not None
+        torch.testing.assert_close(
+            got.detach().cpu(), want.detach(), atol=1e-4, rtol=1e-4
+        )
+        torch.testing.assert_close(lm.grad.cpu(), lr.grad, atol=1e-4, rtol=1e-4)
+
+
+def test_ctc_loss_float64_and_infinite(mojo_device):
+    _f64_or_skip(mojo_device)
+    lp, tg, il, tl = _ctc_case(12, 3, 6, 4, torch.int64, False, seed=4)
+    lp = lp.double()
+    want = torch.ops.aten._ctc_loss(lp, tg, il, tl, 0, False)
+    got = torch.ops.aten._ctc_loss(
+        lp.to(mojo_device), tg.to(mojo_device), il, tl, 0, False
+    )
+    torch.testing.assert_close(got[0].cpu(), want[0])
+    # An impossible alignment (four repeated labels in three steps): inf,
+    # and zero_infinity zeroes its gradient.
+    lp3 = torch.randn(3, 1, 4, dtype=torch.float64).log_softmax(2)
+    tg3 = torch.tensor([[1, 1, 1, 1]])
+    for zi in [False, True]:
+        lr = lp3.clone().requires_grad_()
+        il3, tl3 = torch.tensor([3]), torch.tensor([4])
+        want = F.ctc_loss(lr, tg3, il3, tl3, reduction="sum", zero_infinity=zi)
+        lm = lp3.to(mojo_device).requires_grad_()
+        got = F.ctc_loss(
+            lm, tg3.to(mojo_device), il3, tl3, reduction="sum", zero_infinity=zi
+        )
+        want.backward()
+        got.backward()
+        assert lm.grad is not None and lr.grad is not None
+        torch.testing.assert_close(got.detach().cpu(), want.detach())
+        if zi:
+            torch.testing.assert_close(lm.grad.cpu(), lr.grad)
+        else:
+            # LossCTC.cu's collect kernel: exp(-inf + inf - lp) is NaN for
+            # every label (CPU's kernel differs here).
+            assert torch.isnan(lm.grad.cpu()).all()
+
+
+def test_ctc_loss_tensor_overloads(mojo_device):
+    lp, tg, il, tl = _ctc_case(10, 3, 5, 4, torch.int64, True, seed=8)
+    d = mojo_device
+    ilt, tlt = torch.tensor(il), torch.tensor(tl)
+    want = torch.ops.aten._ctc_loss(lp, tg, il, tl, 0, False)
+    with ran("aten::_ctc_loss.Tensor"):
+        got = torch.ops.aten._ctc_loss.Tensor(
+            lp.to(d), tg.to(d), ilt.to(d), tlt.to(d).int(), 0, False
+        )
+    torch.testing.assert_close(got[0].cpu(), want[0], atol=1e-5, rtol=1e-5)
+    g = torch.rand(3) + 0.5
+    want_g = torch.ops.aten._ctc_loss_backward(
+        g, lp, tg, il, tl, want[0], want[1], 0, False
+    )
+    with ran("aten::_ctc_loss_backward.Tensor"):
+        got_g = torch.ops.aten._ctc_loss_backward.Tensor(
+            g.to(d), lp.to(d), tg.to(d), ilt.to(d), tlt.to(d), got[0], got[1], 0, False
+        )
+    torch.testing.assert_close(got_g.cpu(), want_g, atol=1e-5, rtol=1e-5)
+    with pytest.raises(RuntimeError, match="input_lengths is on cpu"):
+        torch.ops.aten._ctc_loss.Tensor(lp.to(d), tg.to(d), ilt, tlt.to(d), 0, False)
+    with pytest.raises(RuntimeError, match="input_lengths must be integral"):
+        torch.ops.aten._ctc_loss.Tensor(
+            lp.to(d), tg.to(d), ilt.float().to(d), tlt.to(d), 0, False
+        )
+
+
+def test_ctc_loss_errors(mojo_device):
+    d = mojo_device
+    lp = torch.randn(5, 2, 4, device=d).log_softmax(2)
+    tg = torch.zeros(2, 3, dtype=torch.long, device=d)
+    cases = [
+        ((lp, tg.float(), [5, 5], [2, 2], 0), "to have scalar type Int; but got"),
+        (
+            (lp[0], tg, [5, 5], [2, 2], 0),
+            "Expected 3-dimensional tensor, but got 2-dimensional tensor for argument #1 'log_probs'",
+        ),
+        (
+            (lp, tg.view(2, 3, 1), [5, 5], [2, 2], 0),
+            "Expected 1 to 2 dimensions, but got 3-dimensional tensor",
+        ),
+        (
+            (lp, torch.zeros(5, dtype=torch.long, device=d), [5, 5], [2, 2], 0),
+            "Expected tensor to have size 4 at dimension 0, but got size 5",
+        ),
+        (
+            (lp, tg[:, :1], [5, 5], [2, 2], 0),
+            "Expected tensor to have size at least 2 at dimension 1, but got size 1",
+        ),
+        (
+            (lp, tg, [5, 6], [2, 2], 0),
+            "Expected input_lengths to have value at most 5, but got value 6",
+        ),
+        (
+            (lp, tg, [5, 5], [2, -1], 0),
+            "Expected target_lengths to have value at least 0",
+        ),
+        ((lp, tg, [5, 5], [2, 2], 4), "blank must be in label range"),
+        ((lp, tg, [5], [2, 2], 0), "input_lengths must be of size batch_size"),
+    ]
+    for args, match in cases:
+        with pytest.raises(RuntimeError, match=match):
+            torch.ops.aten._ctc_loss(*args, False)
+    with pytest.raises(NotImplementedError, match="not implemented for 'Half'"):
+        torch.ops.aten._ctc_loss(lp.half(), tg, [5, 5], [2, 2], 0, False)

@@ -214,7 +214,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "nn_functional_conv_transpose3d": ("float32", "bfloat16", "float16", "int64"),
     "nn_functional_cosine_embedding_loss": ("bool",),
     "nn_functional_cross_entropy": ("bfloat16",),
-    "nn_functional_ctc_loss": ("float32",),
     "nn_functional_embedding_bag": ("float32", "bfloat16", "float16"),
     "nn_functional_grid_sample": ("float32", "bfloat16", "float16"),
     "nn_functional_group_norm": ("float32", "bfloat16", "float16"),

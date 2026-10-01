@@ -77,6 +77,7 @@ from tmb.kernels.loss.nll_kernels import (
     nll_forward_reduce,
 )
 
+from tmb.kernels.loss.ctc_kernels import ctc_backward, ctc_forward
 from tmb.kernels.loss.margin_kernels import (
     multi_margin_backward,
     multi_margin_forward,
@@ -845,6 +846,79 @@ def _margin_dispatch(argv: Argv) raises:
 
 
 # ---------------------------------------------------------------------------
+# CTC (DTYPE_ARG_0 = log_probs: float32 / float64, DTYPE_ARG_1 = targets:
+# int32 / int64)
+#
+#   Ctc:          log_alpha, nll, log_probs, input_lengths, targets,
+#                 target_lengths, params, ctx
+#   CtcBackward:  grad, log_beta, grad_out, log_alpha, log_probs,
+#                 input_lengths, targets, target_lengths, nll, params, ctx
+# params: (T, L, B, C, blank, targets' row stride or 0 for concatenated,
+# zero_infinity).
+# ---------------------------------------------------------------------------
+
+
+comptime CTC_TARGET_DTYPES = [DType.int64, DType.int32]
+
+
+def _ctc_go[
+    dtype: DType, tdtype: DType
+](argv: Argv) raises where dtype.is_floating_point():
+    comptime if _op_on["Ctc"]():
+        var p = argv[unsafe_offset=6]
+        ctc_forward[dtype, tdtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_int(argv[unsafe_offset=4]),
+            _raw_int(argv[unsafe_offset=5]),
+            _raw_tuple_int(p, 0),
+            _raw_tuple_int(p, 1),
+            _raw_tuple_int(p, 2),
+            _raw_tuple_int(p, 3),
+            _raw_tuple_int(p, 4),
+            _raw_tuple_int(p, 5),
+            _raw_ctx(argv[unsafe_offset=7]),
+        )
+    else:
+        var p = argv[unsafe_offset=9]
+        ctc_backward[dtype, tdtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_int(argv[unsafe_offset=4]),
+            _raw_int(argv[unsafe_offset=5]),
+            _raw_int(argv[unsafe_offset=6]),
+            _raw_int(argv[unsafe_offset=7]),
+            _raw_int(argv[unsafe_offset=8]),
+            _raw_tuple_int(p, 0),
+            _raw_tuple_int(p, 1),
+            _raw_tuple_int(p, 2),
+            _raw_tuple_int(p, 3),
+            _raw_tuple_int(p, 4),
+            _raw_tuple_int(p, 5),
+            _raw_tuple_int(p, 6) != 0,
+            _raw_ctx(argv[unsafe_offset=10]),
+        )
+
+
+def _ctc_dispatch(argv: Argv) raises:
+    # Spelled out per float dtype: the kernels' `is_floating_point()`
+    # constraint needs a concrete dtype as evidence.
+    comptime for tdt in CTC_TARGET_DTYPES:
+        comptime if _dtype_arg_on[1, tdt]():
+            comptime if _dtype_arg_on[0, DType.float32]():
+                _ctc_go[DType.float32, tdt](argv)
+                return
+            elif _dtype_arg_on[0, DType.float64]():
+                _ctc_go[DType.float64, tdt](argv)
+                return
+    raise Error("ctc: no (log_probs, targets) dtype pair compiled in")
+
+
+# ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
 
@@ -874,6 +948,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             or _op_on["MultilabelMarginBackward"]()
         ):
             _margin_dispatch(argv)
+            return 0
+        comptime if _op_on["Ctc"]() or _op_on["CtcBackward"]():
+            _ctc_dispatch(argv)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:
