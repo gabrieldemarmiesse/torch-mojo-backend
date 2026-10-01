@@ -604,6 +604,71 @@ def test_inplace_and_out_internal_overlap(mojo_gpu):
     assert out.shape == (2, 3)
 
 
+def test_self_partially_overlapping_out_raises(mojo_gpu):
+    """addmv and baddbmm copy self into the result first (`copy_` /
+    the meta's `result.copy_(self)`), whose partial-overlap check raises;
+    beta == 0 copies nothing, and a broadcast self is ATen's TooHard case."""
+    base = torch.randn(6, device=mojo_gpu)
+    mat, vec = torch.randn(3, 4, device=mojo_gpu), torch.randn(4, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="refer to a single memory location"):
+        torch.addmv(base[:3], mat, vec, out=base[1:4])
+    torch.addmv(base[:3], mat, vec, beta=0, out=base[1:4])
+    torch.addmv(base[1:2], mat, vec, out=base[0:3])
+    b3 = torch.randn(3, 4, 3, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="refer to a single memory location"):
+        torch.baddbmm(
+            b3[:2],
+            torch.randn(2, 4, 5, device=mojo_gpu),
+            torch.randn(2, 5, 3, device=mojo_gpu),
+            out=b3[1:3],
+        )
+
+
+def test_addmv_empty_matrix_keeps_self_shape(mojo_gpu):
+    """addmv_out_cuda's empty-matrix shortcut is `mul_out(result, self,
+    beta)`: the result takes self's own shape (a 0-d self gives a 0-d
+    result); beta == 0 zeros the `[m]` result instead."""
+    c = torch.tensor(1.5)
+    mat, vec = torch.randn(3, 0), torch.randn(0)
+    dmat, dvec = mat.to(mojo_gpu), vec.to(mojo_gpu)
+    got = torch.addmv(c.to(mojo_gpu), dmat, dvec, beta=2)
+    assert got.shape == () and got.item() == 3.0
+    assert torch.addmv(c.to(mojo_gpu), dmat, dvec, beta=0).shape == (3,)
+    one = torch.addmv(torch.ones(1, device=mojo_gpu), dmat, dvec, beta=2)
+    assert one.shape == (1,)
+
+
+def test_addbmm_dtype_rules_follow_the_composite(mojo_gpu):
+    """addbmm_impl_ copies self into the result and only each batch's
+    addmm_ compares dtypes -- against the result: a float64 self with a
+    float32 out is valid, and an empty batch list takes any dtype."""
+    if is_metal(mojo_gpu):
+        pytest.skip("float64 self: no float64 on Apple GPUs")
+    self64 = torch.randn(2, 3, dtype=torch.float64)
+    b1, b2 = torch.randn(2, 2, 4), torch.randn(2, 4, 3)
+    out = torch.empty(2, 3, device=mojo_gpu)
+    torch.addbmm(self64.to(mojo_gpu), b1.to(mojo_gpu), b2.to(mojo_gpu), out=out)
+    ref = torch.addbmm(self64, b1, b2, out=torch.empty(2, 3))
+    torch.testing.assert_close(out.cpu(), ref, atol=1e-5, rtol=1e-5)
+    empty = torch.addbmm(
+        self64.to(mojo_gpu), b1[:0].to(mojo_gpu), b2[:0].to(mojo_gpu), beta=0.5
+    )
+    assert empty.dtype == torch.float64
+    torch.testing.assert_close(empty.cpu(), 0.5 * self64)
+    with pytest.raises(RuntimeError, match="self and mat2 must have the same dtype"):
+        torch.addbmm(self64.to(mojo_gpu), b1.to(mojo_gpu), b2.to(mojo_gpu))
+
+
+def test_weight_int8pack_mm_empty_k_still_scales(mojo_gpu):
+    """K == 0: the zero accumulator is still multiplied by the scales."""
+    x = torch.randn(2, 0, device=mojo_gpu)
+    w = torch.zeros(3, 0, dtype=torch.int8, device=mojo_gpu)
+    s = torch.tensor([float("nan"), 1.0, float("inf")], device=mojo_gpu)
+    got = torch.ops.aten._weight_int8pack_mm(x, w, s).cpu()
+    assert got[:, 0].isnan().all() and got[:, 2].isnan().all()
+    assert (got[:, 1] == 0).all()
+
+
 def test_integer_empty_batch_float_beta_raises(mojo_gpu):
     """`result.mul_(beta)` on an integer result with a float beta."""
 
