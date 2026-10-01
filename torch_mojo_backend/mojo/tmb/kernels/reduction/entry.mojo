@@ -234,7 +234,10 @@ def _moment_mean[
     data near its range (`[3e38, 3e38]` has mean 3e38, not inf). A null
     pointer (var / std alone) writes nothing."""
     if Int(mean_ptr) != 0:
-        mean_ptr[unsafe_offset=o] = (shift + s / Float32(n)).cast[dtype]()
+        # A single element IS its mean (Welford's first update), infinite
+        # ones included: shift + (x - shift) would be inf - inf = NaN there.
+        var m = shift if n == 1 else shift + s / Float32(n)
+        mean_ptr[unsafe_offset=o] = m.cast[dtype]()
 
 
 @always_inline
@@ -398,7 +401,8 @@ def _moments_contig_kernel[
     # Cold path, kept off the straight line above: `block.sum` broadcasts, so
     # the whole block agrees, and a second read about the now-known accurate
     # mean removes the cancellation entirely.
-    if fused and _moment_cancels(bs, bq, cols):
+    # (One element has nothing to cancel: its shift is its mean.)
+    if fused and cols > 1 and _moment_cancels(bs, bq, cols):
         shift = shift + bs / Float32(cols)
         _moments_scan_contig[V=V, vec_align=vec_align, threads=MOMENT_THREADS](
             in_ptr,
@@ -499,7 +503,7 @@ def _moments_strided_kernel[
 
     # Cold path: a second read about the now-known accurate mean, for the rare
     # column whose first element was a poor stand-in for its own mean.
-    if fused and _moment_cancels(s, q, reduce_n):
+    if fused and reduce_n > 1 and _moment_cancels(s, q, reduce_n):
         shift += s / Float32(reduce_n)
         s = Float32(0)
         q = Float32(0)

@@ -324,6 +324,29 @@ def test_weight_norm_interface_matches_cpu(mojo_gpu, dtype, dim):
     torch.testing.assert_close(norms.cpu(), ref_n, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_weight_norm_interface_one_dim(mojo_gpu, dtype):
+    """A 1-d weight: every element is its own slice (norm = |v|)."""
+    v = torch.randn(7).to(dtype)
+    g = torch.randn(7).to(dtype)
+    w, norms = torch._weight_norm_interface(v.to(mojo_gpu), g.to(mojo_gpu), 0)
+    ref_w, ref_n = torch._weight_norm_interface(v.float(), g.float(), 0)
+    assert w.shape == (7,) and norms.shape == (7,)
+    atol, rtol = (None, None) if dtype == torch.float32 else (1e-2, 1e-2)
+    torch.testing.assert_close(w.cpu().float(), ref_w, atol=atol, rtol=rtol)
+    torch.testing.assert_close(norms.cpu(), ref_n, atol=atol, rtol=rtol)
+    gw = torch.randn(7).to(dtype)
+    gv, gg = torch.ops.aten._weight_norm_interface_backward(
+        gw.to(mojo_gpu), v.to(mojo_gpu), g.to(mojo_gpu), norms, 0
+    )
+    rv, rg = torch.ops.aten._weight_norm_interface_backward(
+        gw.float(), v.float(), g.float(), ref_n, 0
+    )
+    assert gv.shape == (7,) and gg.shape == (7,)
+    torch.testing.assert_close(gv.cpu().float(), rv, atol=atol, rtol=rtol)
+    torch.testing.assert_close(gg.cpu().float(), rg, atol=atol, rtol=rtol)
+
+
 def test_weight_norm_through_nn_utils_backward(mojo_gpu):
     torch.manual_seed(0)
     lin = torch.nn.Linear(5, 4)

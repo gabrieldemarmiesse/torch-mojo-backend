@@ -393,6 +393,10 @@ _CUDA_ONES_CUMSUM = {
     ((4096,), 0, torch.bfloat16): (4080.0, 8331240.0),
     ((1, 4096), 1, torch.float16): (4080.0, 8361152.0),
     ((1, 4096), 1, torch.bfloat16): (4080.0, 8331240.0),
+    # A trailing size-1 dim: the scan dim is not the last one, so CUDA takes
+    # its outer-dim (sequential) route.
+    ((2, 4096, 1), 1, torch.float16): (2048.0, 12584960.0),
+    ((2, 4096, 1), 1, torch.bfloat16): (256.0, 2031872.0),
 }
 
 
