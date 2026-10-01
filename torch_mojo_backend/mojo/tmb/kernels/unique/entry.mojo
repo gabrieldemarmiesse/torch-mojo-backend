@@ -287,13 +287,14 @@ def _counts_go(
 
 
 # ---------------------------------------------------------------------------
-# RowMergePass: one pass of a stable bottom-up merge sort of row indices by
-# lexicographic row order (unique_dim_cuda_template's thrust::sort
-# comparator: the first element where `<` or `>` holds decides; NaN, which
-# satisfies neither, compares equal). Runs of `width` sorted rows are merged
-# pairwise: each row finds its rank in the partner run by binary search
-# (lower bound from the left run, upper bound from the right, so equal rows
-# keep their order) and is written straight to its merged position.
+# RowMergePass: one pass of a bottom-up merge sort of row indices. The order
+# is a strict total order, so every row has exactly one merged position and
+# every output slot is written: rows compare lexicographically with NaN after
+# every number (torch.sort's order; NaNs tie with each other), and rows that
+# compare equal fall back to their original index, which also keeps the sort
+# stable. Runs of `width` sorted rows are merged pairwise: each row counts
+# the partner run's rows ordered before it by binary search and is written
+# straight to its merged position.
 # ---------------------------------------------------------------------------
 
 
@@ -304,11 +305,18 @@ def _row_less[
     for k in range(w):
         var x = data[unsafe_offset=a * w + k]
         var y = data[unsafe_offset=b * w + k]
+        comptime if dtype.is_floating_point():
+            var x_nan = x != x
+            var y_nan = y != y
+            if x_nan or y_nan:
+                if x_nan and y_nan:
+                    continue
+                return y_nan
         if x < y:
             return True
         if x > y:
             return False
-    return False
+    return a < b
 
 
 @__name(t"unique_row_merge_{dtype}_t{GS_THREADS}")
@@ -336,29 +344,24 @@ def _row_merge_kernel[
         var right_start = left_start + width
         var right_stop = min(right_start + width, n)
         var me = Int(in_perm[unsafe_offset=i])
-        var dest: Int
-        if run & 1 == 0:
-            # Left run: rows of the right run strictly less than me.
-            var lo = right_start
-            var hi = right_stop
-            while lo < hi:
-                var mid = (lo + hi) >> 1
-                if _row_less(data, Int(in_perm[unsafe_offset=mid]), me, w):
-                    lo = mid + 1
-                else:
-                    hi = mid
-            dest = i + (lo - right_start)
-        else:
-            # Right run: rows of the left run not greater than me.
-            var lo = left_start
-            var hi = right_start
-            while lo < hi:
-                var mid = (lo + hi) >> 1
-                if not _row_less(data, me, Int(in_perm[unsafe_offset=mid]), w):
-                    lo = mid + 1
-                else:
-                    hi = mid
-            dest = left_start + (i - right_start) + (lo - left_start)
+        # The partner run, and how many of its rows order before me (no
+        # ties: the order is total).
+        var p_lo = right_start
+        var p_hi = right_stop
+        var own_start = left_start
+        if run & 1 != 0:
+            p_lo = left_start
+            p_hi = right_start
+            own_start = right_start
+        var lo = p_lo
+        var hi = max(p_hi, p_lo)
+        while lo < hi:
+            var mid = (lo + hi) >> 1
+            if _row_less(data, Int(in_perm[unsafe_offset=mid]), me, w):
+                lo = mid + 1
+            else:
+                hi = mid
+        var dest = left_start + (i - own_start) + (lo - p_lo)
         out_perm[unsafe_offset=dest] = Int64(me)
         i += step
 

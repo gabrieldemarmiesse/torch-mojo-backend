@@ -8,11 +8,10 @@
 * _embedding_bag_backward -- ATen's generic `_embedding_bag_backward_symint`
   (native/EmbeddingBag.cpp): index promotion, offset2bag rebuilt when the
   forward did not return one, then the dense backward.
-* _embedding_bag_dense_backward -- sum / mean: by default
-  `EmbeddingBagBackwardAtomic` (atomics into an accumulator-dtype buffer,
-  CUDA's fused atomic route); under deterministic algorithms a stable sort
-  of the indices, their runs, then `EmbeddingBagBackwardSorted`, CUDA's
-  chunked two-pass segment sum in CUDA's summation order; max
+* _embedding_bag_dense_backward -- sum / mean: a stable sort of the
+  indices, their runs, then `EmbeddingBagBackwardSorted`, CUDA's chunked
+  two-pass segment sum in CUDA's summation order, deterministic as CUDA's
+  (whose atomic variant never serves embedding_bag); max
   scatter_adds into the rows max_indices names (atomic, alerting like
   CUDA's embedding_bag_backward_cuda_max).
 * _embedding_bag_per_sample_weights_backward -- index_select / mul / sum:
@@ -41,7 +40,6 @@ from tmb.backend.abi import (
     Values,
     alert_not_deterministic,
     cpu_empty,
-    deterministic_algorithms,
     dtype_code,
     index_error,
     new_tensor,
@@ -66,7 +64,7 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import call_op, cast_into, cast_to, contiguous, fill_value
+from tmb.ops.common import call_op, cast_to, contiguous, fill_value
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.unique import run_bounds, unique_flat
 
@@ -557,62 +555,10 @@ def op_embedding_bag_dense_backward(
         psw_stride = psw.value().stride(0)
     var mean = 1 if mode == _MODE_MEAN else 0
     var ctx = ctx_for(device)
-    if not deterministic_algorithms():
-        # The default route: atomics into an accumulator-dtype buffer.
-        var acc = _acc_stype(grad)
-        var buf = _zeros(_mat(num_weights, features), 2, acc, device)
-        var counts = Optional[Owned](None)
-        if scale_grad_by_freq:
-            var z = _zeros(_vec(num_weights), 1, ST_INT64, device)
-            var ones = own(new_tensor(_vec(n), 1, ST_INT64, device))
-            fill_value(ones.t, 1.0)
-            counts = _op(
-                "aten::index_add",
-                "",
-                [_t(z.t), _int(0), _t(idx.t), _t(ones.t), _scalar(1)],
-            )
-            _ = ones^
-            _ = z^
-        var call = KernelCall("embedding_bag", "EmbeddingBagBackwardAtomic")
-        call.arg_dtype(0, grad.dtype)
-        call.int(buf.t.ptr)
-        call.int(g.t.ptr)
-        call.int(idx.t.ptr)
-        call.int(o2b.t.ptr)
-        call.int(bs.t.ptr)
-        call.int(psw_ptr)
-        call.int(counts.value().t.ptr if counts else 0)
-        call.tuple(
-            [
-                n,
-                features,
-                mean,
-                1 if psw else 0,
-                psw_stride,
-                1 if scale_grad_by_freq else 0,
-                padding_idx,
-            ]
-        )
-        call.int(dtype_code(grad.dtype))
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = counts^
-        if acc == grad.stype:
-            _ = gw^
-            ret_owned(rets, 0, buf)
-        else:
-            cast_into(gw.t, buf.t)
-            _ = buf^
-            ret_owned(rets, 0, gw)
-        _ = g^
-        _ = bs^
-        _ = o2b^
-        _ = idx^
-        _ = ctx
-        return
-    # Deterministic: a stable sort of the indices (CUDA's
-    # radix_sort_pairs), the runs of equal indices (the unique family), then
-    # CUDA's chunked two-pass segment sum.
+    # Always deterministic, as on CUDA (its fused atomic kernel needs an
+    # undefined offset2bag, which embedding_bag never passes): a stable sort
+    # of the indices (radix_sort_pairs), the runs of equal indices (the
+    # unique family), then CUDA's chunked two-pass segment sum.
     fill_value(gw.t, 0.0)
     var r = call_op(
         "aten::sort",

@@ -370,7 +370,7 @@ def test_embedding_renorm_validates_every_index_first(mojo_device):
 @pytest.mark.parametrize("mode", ["sum", "mean"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
 def test_embedding_bag_backward_default_route(mojo_device, mode, dtype):
-    """The default (atomic) route agrees with the deterministic one."""
+    """The backward is deterministic in both modes (one route, as CUDA)."""
     g = torch.Generator().manual_seed(11)
     weight = torch.randn(30, 8, generator=g).to(dtype)
     indices = torch.randint(0, 30, (500,), generator=g)
@@ -393,4 +393,4 @@ def test_embedding_bag_backward_default_route(mojo_device, mode, dtype):
             grads.append(_grad(w))
     finally:
         torch.use_deterministic_algorithms(before)
-    _close(grads[0], grads[1], dtype)
+    assert torch.equal(grads[0], grads[1])

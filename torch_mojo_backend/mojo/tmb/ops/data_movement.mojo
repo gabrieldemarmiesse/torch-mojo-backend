@@ -1726,6 +1726,33 @@ def _scatter_launch(
         )
 
 
+# CUDA's warp size: index_put's sorted route rounds per addition for slices
+# wider than this (indexing_backward_kernel vs _small_stride / _stride_1).
+comptime _INDEX_PUT_WARP = 32
+
+
+def index_put_slice(target: T, index: T, dim: Int) raises -> Int:
+    """The `sliceSize` CUDA's deterministic `_scatter_via_index_put` hands
+    index_put: the extent after `dim` when self is 1-D or the index is
+    broadcast (stride 0) off `dim` (it indexes `dim` alone), else 1 (every
+    dim is indexed)."""
+    var broadcast = True
+    for d in range(index.rank):
+        if d != dim and index.stride(d) != 0:
+            broadcast = False
+    if target.rank > 1 and not broadcast:
+        return 1
+    return trailing_size(target, dim)
+
+
+def trailing_size(t: T, dim: Int) -> Int:
+    """The product of `t`'s extents after `dim`."""
+    var n = 1
+    for d in range(dim + 1, t.rank):
+        n *= t.dim(d)
+    return n
+
+
 def scatter_add_sorted(
     target: T,
     index: T,
@@ -1736,6 +1763,7 @@ def scatter_add_sorted(
     dim: Int,
     dim_size: Int,
     what: String,
+    slice_size: Int,
 ) raises:
     """`target[...] += src[...]` like `_scatter_launch(accumulate=True)`, but
     ordered and deterministic: the targets are stably sorted and every run
@@ -1811,7 +1839,10 @@ def scatter_add_sorted(
     sc.int(perm.t.ptr)
     sc.int(srcoff.t.ptr)
     sc.int(src.ptr)
-    sc.tuple([total, 0])
+    var mode = 2 if slice_size > _INDEX_PUT_WARP else (
+        1 if slice_size > 1 else 0
+    )
+    sc.tuple([total, 0, mode])
     sc.f64(0.0)
     sc.int(dtype_code(target.dtype))
     sc.int(ctx_ptr(ctx))
@@ -1931,6 +1962,7 @@ def _scatter_into(
             dim,
             dim_size,
             "scatter_add",
+            index_put_slice(target, index, dim),
         )
     else:
         _scatter_launch(
@@ -2471,6 +2503,8 @@ def _index_add_into(
             dim,
             _dim_or1(a, dim),
             "index_add",
+            # index_put_ over [None] * dim + [index]: the slices after dim.
+            trailing_size(target, dim),
         )
     else:
         _scatter_launch(

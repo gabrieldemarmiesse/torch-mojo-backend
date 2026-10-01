@@ -16,9 +16,11 @@ run_length_encode), which is visible for -0.0 / 0.0 runs; NaN never equals
 anything; outputs the caller did not ask for are empty, except the flat
 ops' inverse of an empty input, which has the input's shape, and a bool
 input's counts, which CUDA always returns. (Where CUDA returns an undefined
-inverse for bool, this returns an empty one.) Rows compare with CUDA's
-row comparator (`<` / `>`, so NaN ties with everything), but this merge
-sort is stable where thrust's need not be: NaN rows can group differently.
+inverse for bool, this returns an empty one.) Rows sort with NaN after
+every number, as torch.sort orders values (CUDA's `<` / `>` row comparator
+is no strict weak order with NaN, so its NaN placement is undefined), and
+NaN never equals NaN, so a row holding one is always its own group, as on
+CPU.
 """
 from std.utils import IndexList
 
