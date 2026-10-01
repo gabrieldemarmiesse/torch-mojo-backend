@@ -208,6 +208,73 @@ def assert_no_partial_overlap(written: T, other: T) raises:
         raise Error(_OVERLAP_MESSAGE)
 
 
+# ---------------------------------------------------------------------------
+# When each out= / in-place op checks overlap, from the ATen v2.14 sources
+# (structured meta, then the CUDA impl). "after resize" checks run here on
+# `resized_geometry(out, ...)` before anything is resized or written: the
+# same verdict, with no input pointer left stale. Status names as in
+# `overlap_status`; "partial" = assert_no_partial_overlap, "overlap" =
+# assert_no_overlap, "internal" = assert_no_internal_overlap.
+#
+#  op (overload)                     | order and checks
+#  ----------------------------------+------------------------------------
+#  cat.out (TensorShape.cpp meta)    | resize, then internal + overlap vs
+#                                    | every input
+#  gather.out (meta)                 | resize, then internal, overlap vs
+#                                    | self, partial vs index
+#  index_select.out (Indexing.cu)    | internal, overlap vs self and index
+#                                    | on the out as given, then resize
+#  scatter.* / scatter_add /         | internal, overlap vs index and src
+#  scatter_reduce out= and in-place  | on the out as given (meta, before
+#  (scatter_meta_impl, scatter_impl) | set_output); then resize; then
+#                                    | `copy_(self)` unless the out IS self:
+#                                    | partial vs self
+#  index_add / index_reduce /        | resize, then internal, overlap vs
+#  index_copy out= and in-place      | index and source (index_func_meta_
+#  (index_func_meta_impl)            | impl); then `copy_(self)` unless the
+#                                    | out IS self: partial vs self
+#  put_ / index_put_                 | overlap of self vs values (self is
+#                                    | never resized)
+#  upsample_nearest2d,               | resize (meta); the kernel's same-
+#  _upsample_nearest_exact2d,        | size shortcut `output.copy_(input)`:
+#  upsample_bilinear2d, fwd and bwd  | internal, then partial vs input
+#  (UpSampleNearest2d.cu,            | (nearest fwd skips it for an empty
+#  UpSampleBilinear2d.cu)            | input, bwd for an empty grad_input;
+#                                    | bilinear bwd zeroes grad_input first)
+#  other upsample modes and sizes    | resize; no input check; internal
+#                                    | only where the kernel copies a
+#                                    | non-contiguous out back (nearest 2-d,
+#                                    | nearest 3-d fwd, bilinear 2-d bwd,
+#                                    | trilinear bwd, antialiased fwd)
+#  reflection / replication pad      | no overlap check at all
+# ---------------------------------------------------------------------------
+
+
+def resized_geometry(dest: T, shape: IndexList[MAX_RANK], rank: Int) -> T:
+    """`dest` as `resize_out(dest, shape, rank)` would leave it -- the same
+    tensor (handle, storage, offset), contiguous at the new shape unless it
+    already has that shape -- for overlap checks that ATen runs after the
+    resize, made before it. Kernel-only: never handed to the dispatcher."""
+    if dest.rank == rank:
+        var same = True
+        for d in range(rank):
+            if dest.dim(d) != shape[MAX_RANK - rank + d]:
+                same = False
+        if same:
+            return dest.copy()
+    var t = dest.copy()
+    # An empty view reports no data pointer; the resize keeps its offset.
+    t.ptr = dest.storage_ptr() + dest.offset * dest.itemsize
+    t.rank = rank
+    t.shape = shape
+    t.strides = contiguous_strides(shape, rank)
+    t.numel = 1
+    for d in range(rank):
+        t.numel *= shape[MAX_RANK - rank + d]
+    t.contig = True
+    return t^
+
+
 def shares_storage(a: T, b: T) -> Bool:
     """Whether `a` and `b` view one storage, overlapping or not. An `out=`
     that shares storage with an input must not be resized before the kernel

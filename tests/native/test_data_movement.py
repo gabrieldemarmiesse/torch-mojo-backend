@@ -3045,3 +3045,248 @@ def test_cat_gather_index_select_index_put_out_overlap(mojo_device):
         torch.index_select(a, 0, torch.tensor([0, 1, 2], device=mojo_device), out=a)
     with pytest.raises(RuntimeError, match="single memory location"):
         a.index_put_((torch.tensor([0, 1, 2], device=mojo_device),), a)
+
+
+# One case per row of the overlap-order table in tmb/ops/common.mojo; the
+# expected outcome of each was checked against stock CUDA torch 2.11.
+def _arange10(dev: str) -> torch.Tensor:
+    return torch.arange(10.0, device=dev)
+
+
+_A = torch.ops.aten
+_OVERLAP_ROWS = {
+    # cat.out: resize, then check.
+    "cat_resized_onto_inputs": (
+        True,
+        lambda d: (lambda x: torch.cat([x[:3], x[3:5]], out=x[:2]))(_arange10(d)),
+    ),
+    # gather.out: resize, then check.
+    "gather_resized_onto_self": (
+        True,
+        lambda d: (
+            lambda x: torch.gather(
+                x[2:6], 0, torch.tensor([0, 1, 2, 3], device=d), out=x[:0]
+            )
+        )(_arange10(d)),
+    ),
+    # index_select.out: check the out as given, then resize.
+    "index_select_checks_before_resize": (
+        True,
+        lambda d: (
+            lambda x: torch.index_select(
+                x[4:6], 0, torch.tensor([0, 1], device=d), out=x[:6]
+            )
+        )(_arange10(d)),
+    ),
+    "index_select_resized_onto_self_passes": (
+        False,
+        lambda d: (
+            lambda x: torch.index_select(
+                x[1:3], 0, torch.tensor([0, 1], device=d), out=x[:0]
+            )
+        )(_arange10(d)),
+    ),
+    # scatter family: meta checks before resize, then copy_(self) after it.
+    "scatter_add_out_copies_self": (
+        True,
+        lambda d: (
+            lambda x: torch.scatter_add(
+                x[2:6],
+                0,
+                torch.tensor([0], device=d),
+                torch.ones(1, device=d),
+                out=x[:0],
+            )
+        )(_arange10(d)),
+    ),
+    "scatter_add_out_is_self_passes": (
+        False,
+        lambda d: (
+            lambda x: torch.scatter_add(
+                x, 0, torch.tensor([0], device=d), torch.ones(1, device=d), out=x
+            )
+        )(_arange10(d)),
+    ),
+    # index_add / index_reduce / index_copy: resize, check, copy_(self).
+    "index_add_out_vs_source": (
+        True,
+        lambda d: (
+            lambda x: torch.index_add(
+                torch.zeros(4, device=d),
+                0,
+                torch.tensor([0, 1], device=d),
+                x[1:3],
+                out=x[:0],
+            )
+        )(_arange10(d)),
+    ),
+    "index_reduce_out_copies_self": (
+        True,
+        lambda d: (
+            lambda x: torch.index_reduce(
+                x[2:6],
+                0,
+                torch.tensor([0, 1], device=d),
+                torch.ones(2, device=d),
+                "prod",
+                out=x[:0],
+            )
+        )(_arange10(d)),
+    ),
+    # index_put_: self vs values.
+    "index_put_values_alias_self": (
+        True,
+        lambda d: (lambda a: a.index_put_((torch.tensor([0, 1], device=d),), a[:2]))(
+            torch.arange(4.0, device=d)
+        ),
+    ),
+    # Same-size nearest2d: resize, then the copy_ shortcut's partial check.
+    "nearest2d_same_size_copy_shortcut": (
+        True,
+        lambda d: (
+            lambda b: _A.upsample_nearest2d.out(
+                b[8:24].view(1, 1, 4, 4), [4, 4], None, None, out=b[:0]
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    # nearest1d: no shortcut, no check.
+    "nearest1d_same_size_no_check": (
+        False,
+        lambda d: (
+            lambda b: _A.upsample_nearest1d.out(
+                b[:16].view(1, 1, 16), [16], None, out=b[8:24].view(1, 1, 16)
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    # Copy-back modes refuse an internally overlapping out; others do not.
+    "nearest2d_expanded_out": (
+        True,
+        lambda d: _A.upsample_nearest2d.out(
+            torch.ones(1, 1, 4, 4, device=d),
+            [6, 6],
+            None,
+            None,
+            out=torch.empty(1, 1, 1, 1, device=d).expand(1, 1, 6, 6),
+        ),
+    ),
+    "nearest1d_expanded_out_passes": (
+        False,
+        lambda d: _A.upsample_nearest1d.out(
+            torch.ones(1, 1, 4, device=d),
+            [6],
+            None,
+            out=torch.empty(1, 1, 1, device=d).expand(1, 1, 6),
+        ),
+    ),
+    # Pad: no check at all.
+    "reflection_pad_partial_passes": (
+        False,
+        lambda d: (
+            lambda b: _A.reflection_pad2d.out(
+                b[:16].view(1, 1, 4, 4), [1, 1, 1, 1], out=b[8:44].view(1, 1, 6, 6)
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+}
+
+
+@pytest.mark.parametrize("row", list(_OVERLAP_ROWS))
+def test_overlap_order_table(mojo_device, row):
+    raises, call = _OVERLAP_ROWS[row]
+    if raises:
+        with pytest.raises(RuntimeError, match="memory location"):
+            call(mojo_device)
+    else:
+        call(mojo_device)
+
+
+def test_bilinear2d_backward_same_tensor_is_zeroed(mojo_device):
+    """CUDA zeroes grad_input before its same-size copy_: a grad_input that
+    IS grad_output ends up zero."""
+    g = torch.ones(1, 1, 4, 4, device=mojo_device)
+    _A.upsample_bilinear2d_backward.grad_input(
+        g, [4, 4], [1, 1, 4, 4], False, None, None, grad_input=g
+    )
+    assert g.cpu().sum().item() == 0.0
+
+
+_OVERLAP_ROWS_MORE = {
+    "index_select_empty_out_onto_self_passes": (
+        False,
+        lambda d: (
+            lambda b: torch.index_select(
+                b[:12].view(3, 4), 0, torch.tensor([0, 1], device=d), out=b[:0]
+            )
+        )(torch.zeros(20, device=d)),
+    ),
+    "index_select_expanded_wrong_shape_out": (
+        True,
+        lambda d: torch.index_select(
+            torch.ones(3, 2, device=d),
+            0,
+            torch.tensor([0, 1], device=d),
+            out=torch.zeros(1, device=d).expand(6),
+        ),
+    ),
+    "linear1d_same_size_partial_passes": (
+        False,
+        lambda d: (
+            lambda b: _A.upsample_linear1d.out(
+                b[:16].view(1, 1, 16), [16], False, None, out=b[8:24].view(1, 1, 16)
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    "bicubic2d_same_size_partial_passes": (
+        False,
+        lambda d: (
+            lambda b: _A.upsample_bicubic2d.out(
+                b[:16].view(1, 1, 4, 4),
+                [4, 4],
+                False,
+                None,
+                None,
+                out=b[8:24].view(1, 1, 4, 4),
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    "nearest3d_same_size_partial_passes": (
+        False,
+        lambda d: (
+            lambda b: _A.upsample_nearest3d.out(
+                b[:16].view(1, 1, 2, 2, 4),
+                [2, 2, 4],
+                None,
+                None,
+                None,
+                out=b[8:24].view(1, 1, 2, 2, 4),
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    "nearest2d_empty_dst_resized_onto_input": (
+        True,
+        lambda d: (
+            lambda b: _A.upsample_nearest2d.out(
+                b[8:24].view(1, 1, 4, 4), [4, 4], None, None, out=b[4:4]
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    "bilinear2d_same_size_partial": (
+        True,
+        lambda d: (
+            lambda b: _A.upsample_bilinear2d.out(
+                b[:16].view(1, 1, 4, 4),
+                [4, 4],
+                False,
+                None,
+                None,
+                out=b[8:24].view(1, 1, 4, 4),
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+}
+_OVERLAP_ROWS.update(_OVERLAP_ROWS_MORE)
+
+
+@pytest.mark.parametrize("row", list(_OVERLAP_ROWS_MORE))
+def test_overlap_order_table_more(mojo_device, row):
+    test_overlap_order_table(mojo_device, row)
