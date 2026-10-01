@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from tests.native.conftest import is_metal, ran
+from torch_mojo_backend import get_accelerators
 
 DTYPES = [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.bool]
 
@@ -1322,7 +1323,7 @@ def test_deterministic_index_add_rounds_like_cuda(mojo_device, width, dtype):
     z = torch.zeros(2, width, dtype=dtype)
     idx = torch.zeros(1024, dtype=torch.long)
     ones = torch.ones(1024, width, dtype=dtype)
-    if width > 32:
+    if width > _index_put_warp(mojo_device):
         expected_value = torch.zeros(1, dtype=dtype)
         for _ in range(1024):
             expected_value += 1
@@ -1373,14 +1374,7 @@ def test_fill_tensor_value_devices_and_overlap(mojo_device):
 
 
 @pytest.mark.skipif(
-    len(
-        [
-            a
-            for a in __import__("torch_mojo_backend").get_accelerators()
-            if a.label != "cpu"
-        ]
-    )
-    < 2,
+    len([a for a in get_accelerators() if a.label != "cpu"]) < 2,
     reason="needs two mojo GPUs",
 )
 def test_fill_tensor_value_on_another_gpu_is_range_checked():
@@ -1389,7 +1383,15 @@ def test_fill_tensor_value_on_another_gpu_is_range_checked():
         x.fill_(torch.tensor(300, device="mojo:1"))
 
 
-def _index_put_sum_reference(values: list[float], start: float, width: int) -> float:
+def _index_put_warp(device: str) -> int:
+    """The warp of index_put's sorted route: 64 lanes on ROCm, else 32."""
+    idx = int(device.rsplit(":", 1)[-1])
+    return 64 if get_accelerators()[idx].api == "hip" else 32
+
+
+def _index_put_sum_reference(
+    values: list[float], start: float, width: int, warp: int = 32
+) -> float:
     """CUDA's sorted index_put accumulation of one float32 run into `start`:
     width 1 sums 32 lanes and a shuffle-down tree (indexing_backward_kernel_
     stride_1), widths up to 32 sum sequentially from 0 (_small_stride); both
@@ -1398,24 +1400,28 @@ def _index_put_sum_reference(values: list[float], start: float, width: int) -> f
     acc = f(0)
     j = 0
     if width == 1:
-        passes = len(values) // 32
+        passes = len(values) // warp
         if passes:
-            lanes = [f(0)] * 32
+            lanes = [f(0)] * warp
             for p in range(passes):
-                for lane in range(32):
-                    lanes[lane] = f(lanes[lane] + f(values[p * 32 + lane]))
-            offset = 16
+                for lane in range(warp):
+                    lanes[lane] = f(lanes[lane] + f(values[p * warp + lane]))
+            offset = warp // 2
             while offset:
                 lanes = [
                     f(
                         lanes[lane]
-                        + (lanes[lane + offset] if lane + offset < 32 else lanes[lane])
+                        + (
+                            lanes[lane + offset]
+                            if lane + offset < warp
+                            else lanes[lane]
+                        )
                     )
-                    for lane in range(32)
+                    for lane in range(warp)
                 ]
                 offset //= 2
             acc = lanes[0]
-        j = passes * 32
+        j = passes * warp
     for v in values[j:]:
         acc = f(acc + f(v))
     return float(f(f(start) + acc))

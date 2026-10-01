@@ -98,6 +98,7 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     assert_no_internal_overlap,
     assert_no_overlap,
+    assert_no_partial_overlap,
     is_int_stype,
     scalar_to_float,
     scalar_to_int,
@@ -1164,6 +1165,31 @@ def _scalar_type_name(dt: DType) -> String:
     return String(dt)
 
 
+def resized_geometry(dest: T, shape: IndexList[MAX_RANK], rank: Int) -> T:
+    """`dest` as `resize_out(dest, shape, rank)` would leave it -- the same
+    tensor (handle, storage, offset), contiguous at the new shape unless it
+    already has that shape -- for overlap checks that ATen runs after the
+    resize, made before it. Kernel-only: never handed to the dispatcher."""
+    if dest.rank == rank:
+        var same = True
+        for d in range(rank):
+            if dest.dim(d) != shape[MAX_RANK - rank + d]:
+                same = False
+        if same:
+            return dest.copy()
+    var t = dest.copy()
+    # An empty view reports no data pointer; the resize keeps its offset.
+    t.ptr = dest.storage_ptr() + dest.offset * dest.itemsize
+    t.rank = rank
+    t.shape = shape
+    t.strides = contiguous_strides(shape, rank)
+    t.numel = 1
+    for d in range(rank):
+        t.numel *= shape[MAX_RANK - rank + d]
+    t.contig = True
+    return t^
+
+
 def _cat_out_batched(ins: List[T], dim: Int, out_t: T) raises -> Bool:
     """Write the concatenation straight into an existing contiguous `out` of
     the result shape with one batched rectangle copy (converting when the
@@ -1253,22 +1279,23 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         unsupported("aten::cat.out of only legacy-empty tensors")
     var rank = real[0].rank
     var dim = dim_in + rank if dim_in < 0 else dim_in
-    # cat's meta (TensorShape.cpp) checks the out against every input once
-    # its shape is set; an out already of that shape is checked here, before
-    # anything is written (a resized out is fresh storage).
-    if dim >= 0 and dim < rank and out.rank == rank:
-        var shaped = True
+    # cat's meta (TensorShape.cpp) resizes the out first -- a resize keeps
+    # its storage and offset, so `out=x[:2]` still shares `x` -- then checks
+    # it against every input. The checks run here on the out's post-resize
+    # geometry, before any resize or write: the same verdict, with no input
+    # pointer left stale.
+    if dim >= 0 and dim < rank:
         var along = 0
         for x in real:
             if x.rank == rank:
                 along += x.dim(dim)
+        var shape = IndexList[MAX_RANK](1)
         for d in range(rank):
-            if out.dim(d) != (along if d == dim else real[0].dim(d)):
-                shaped = False
-        if shaped:
-            assert_no_internal_overlap(out)
-            for x in all_tensors:
-                assert_no_overlap(out, x)
+            shape[MAX_RANK - rank + d] = along if d == dim else real[0].dim(d)
+        var target = resized_geometry(out, shape, rank)
+        assert_no_internal_overlap(target)
+        for x in all_tensors:
+            assert_no_overlap(target, x)
     if _cat_out_batched(real, dim, out):
         ret_ref(rets, 0, out)
         return
@@ -2265,6 +2292,12 @@ def op_gather_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var index = v_tensor(args[unsafe_offset=2])
     var out = v_tensor(args[unsafe_offset=4])
     var shape = _gather_check(a, dim, index)
+    # gather's meta: after the resize, no internal overlap, no overlap with
+    # self, no partial overlap with the index.
+    var post = resized_geometry(out, shape, index.rank)
+    assert_no_internal_overlap(post)
+    assert_no_overlap(post, a)
+    assert_no_partial_overlap(post, index)
     _out_target(out, shape, index.rank, a, "gather")
     _gather_into(out, a, dim, index, "gather")
     ret_ref(rets, 0, out)
@@ -2379,6 +2412,11 @@ def op_index_select_out(
     var index = v_tensor(args[unsafe_offset=2])
     var out = v_tensor(args[unsafe_offset=3])
     var shape = _index_select_shape(a, dim, index)
+    # index_select_out_cuda's checks (on the post-resize geometry).
+    var post = resized_geometry(out, shape, a.rank)
+    assert_no_internal_overlap(post)
+    assert_no_overlap(post, a)
+    assert_no_overlap(post, index)
     _out_target(out, shape, a.rank, a, "index_select")
     _index_select_into(out, a, dim, index)
     ret_ref(rets, 0, out)
@@ -2909,6 +2947,9 @@ def op_index_put_impl_(
         unsupported(
             "_index_put_impl_: values rank exceeds the indexed result rank"
         )
+    # _index_put_impl_'s `assert_no_overlap(self, value)`: a RuntimeError,
+    # before the narrower decline below.
+    assert_no_overlap(target, values)
     if _overlaps_contiguous_target(
         target, values
     ) or _overlaps_contiguous_target(target, index):

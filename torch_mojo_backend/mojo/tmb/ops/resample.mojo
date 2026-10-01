@@ -46,6 +46,7 @@ from tmb.ops.common import (
     OVERLAP_FULL,
     OVERLAP_PARTIAL,
     assert_no_internal_overlap,
+    assert_no_partial_overlap,
     overlap_status,
     check_out,
     fill_value,
@@ -128,8 +129,10 @@ def _dest(
     torch's upsample and pad kernels run no overlap check against their
     input, so an `out` overlapping it does not raise: the result is computed
     into a fresh tensor and copied back (the input is read before anything
-    is written). `internal_check`: upsample's out still refuses internal
-    overlap (an expanded out), pad's does not. An `out` that must be resized
+    is written), except upsample's same-size shortcut, CUDA's
+    `output.copy_(input)`, which refuses a partial overlap like copy_.
+    `internal_check`: upsample's out still refuses internal overlap (an
+    expanded out), pad's does not. An `out` that must be resized
     while it shares storage with an input is resized only after the kernel
     ran into a fresh tensor: the resize may reallocate the storage the
     input's pointer still addresses."""
@@ -149,6 +152,10 @@ def _dest(
         var status = overlap_status(dst, inputs[k])
         if status == OVERLAP_FULL or status == OVERLAP_PARTIAL:
             overlaps = True
+        if identity and internal_check:
+            # Upsample's same-size shortcut is `output.copy_(input)`, whose
+            # TensorIterator refuses a partial overlap.
+            assert_no_partial_overlap(dst, inputs[k])
     if not matches:
         for k in range(len(inputs)):
             if shares_storage(dst, inputs[k]):
