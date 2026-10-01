@@ -18,9 +18,11 @@ from tmb.backend.abi import (
     ST_INT64,
     ST_INT8,
     ST_UINT8,
+    Owned,
     T,
     Value,
     Values,
+    _channels_last_strides,
     check,
     Results,
     call_op,
@@ -33,6 +35,7 @@ from tmb.backend.abi import (
     max_dtype,
     new_like,
     new_like_dtype,
+    new_strided,
     new_tensor,
     own,
     own_if_new,
@@ -898,3 +901,36 @@ def store_out(mut dst: T, var src: T) raises:
     assert_no_internal_overlap(dst)
     resize_out(dst, held.t.shape, held.t.rank)
     copy_strided_into(dst, held.t)
+
+
+def is_channels_last_layout(t: T) -> Bool:
+    """`suggest_memory_format() != Contiguous` for the dense layouts that
+    matter here: a rank-4/5 tensor laid out channels-last (NHWC / NDHWC)
+    that is not also plain contiguous."""
+    if t.contig or (t.rank != 4 and t.rank != 5):
+        return False
+    var want = _channels_last_strides(t.shape, t.rank)
+    for i in range(t.rank):
+        if t.dim(i) > 1 and t.stride(i) != want[MAX_RANK - t.rank + i]:
+            return False
+    return True
+
+
+def like_layout(var r: Owned, like: T) raises -> Owned:
+    """A fresh contiguous result `r` re-laid-out channels-last when `like`
+    (the op's input) is, as torch's `empty_like` / `suggest_memory_format`
+    allocations are. Same values; `r` is released."""
+    if not is_channels_last_layout(like) or not r.t.same_shape(like):
+        return r^
+    var out = own(
+        new_strided(
+            like.shape,
+            _channels_last_strides(like.shape, like.rank),
+            like.rank,
+            r.t.stype,
+            r.t.device,
+        )
+    )
+    copy_strided_into(out.t, r.t)
+    _ = r^
+    return out^

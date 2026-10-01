@@ -16,20 +16,22 @@ contiguous: `[B, S]` rows, or the concatenation of every sample's target
 sample; a sample's cells only depend on its own earlier timestep, so the
 values do not depend on CUDA's (target, batch) thread geometry.
 
-CUDA picks its gradient kernel by problem size: the collect kernel used
-here for small problems, and for large ones `exp(log_probs)` minus a
-logsumexp over the blank positions plus an atomicAdd kernel for the other
-labels. Both compute equation (16); this port always takes the
-deterministic collect route, so large problems can differ from CUDA in the
-last bits.
+CUDA picks its gradient formula by problem size, and so does this port
+(`ctc_is_large`): the collect kernel for small problems, and for large ones
+`exp(log_probs)` minus a logsumexp over the blank positions plus an
+atomicAdd kernel for the other labels. The two differ beyond rounding (an
+impossible alignment gives NaN for every label on the small route, finite
+values for the absent labels on the large one). The large route's
+non-blank subtractions are summed by one thread per (sample, timestep) in
+target order instead of CUDA's atomics: deterministic, same terms.
 """
 
 from max.gpu import block_dim, block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from max.gpu.sync import barrier
-from std.math import exp, log
 from std.utils.numerics import inf, neg_inf
 
+from tmb.kernels.common.libdevice_port import nv_exp, nv_expf, nv_log, nv_logf
 from tmb.kernels.common.op_utils import _enqueue_cached, _make_ptr
 
 
@@ -68,15 +70,21 @@ def _target_offset[
 
 
 @always_inline
-def _exp[
-    dtype: DType
-](x: Scalar[dtype]) -> Scalar[dtype] where dtype.is_floating_point():
-    """`exp` that propagates NaN: the float64 device lowering returns inf for
-    a NaN argument, where CUDA's `exp` (and IEEE) gives NaN -- the -inf + inf
-    of an impossible alignment's gradient must stay NaN."""
-    if x != x:
-        return x
-    return exp(x)
+def _exp[dtype: DType](x: Scalar[dtype]) -> Scalar[dtype]:
+    """CUDA's `std::exp`: libdevice `__nv_exp` / `__nv_expf`, ported."""
+    comptime if dtype == DType.float64:
+        return rebind[Scalar[dtype]](nv_exp(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dtype]](nv_expf(rebind[Float32](x)))
+
+
+@always_inline
+def _log[dtype: DType](x: Scalar[dtype]) -> Scalar[dtype]:
+    """CUDA's `std::log`: libdevice `__nv_log` / `__nv_logf`, ported."""
+    comptime if dtype == DType.float64:
+        return rebind[Scalar[dtype]](nv_log(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dtype]](nv_logf(rebind[Float32](x)))
 
 
 @always_inline
@@ -92,7 +100,7 @@ def _lse3[
         m = c
     if m == neg_inf[dtype]():
         m = 0
-    return log(_exp(a - m) + _exp(b - m) + _exp(c - m)) + m
+    return _log(_exp(a - m) + _exp(b - m) + _exp(c - m)) + m
 
 
 @__name(t"ctc_loss_log_alpha_{dtype}_{tdtype}")
@@ -190,7 +198,7 @@ def _alpha_kernel[
         var m = l1 if l1 > l2 else l2
         if m == neginf:
             m = 0
-        nll_ptr[unsafe_offset=b] = -(log(_exp(l1 - m) + _exp(l2 - m)) + m)
+        nll_ptr[unsafe_offset=b] = -(_log(_exp(l1 - m) + _exp(l2 - m)) + m)
 
 
 @__name(t"ctc_loss_log_beta_{dtype}_{tdtype}")
@@ -336,7 +344,7 @@ def _collect_kernel[
             else:
                 var m = lcab if lcab > lab else lab
                 gr_ptr[unsafe_offset=g_row + c] = (
-                    log(_exp(lcab - m) + _exp(lab - m)) + m
+                    _log(_exp(lcab - m) + _exp(lab - m)) + m
                 )
     var nll = nll_ptr[unsafe_offset=b]
     var gr = go_ptr[unsafe_offset=b]
@@ -352,6 +360,112 @@ def _collect_kernel[
             ) * gr
         else:
             gr_ptr[unsafe_offset=g_row + c] = 0
+
+
+@__name(t"ctc_loss_collect_large_{dtype}_{tdtype}")
+def _collect_large_kernel[
+    dtype: DType, tdtype: DType
+](
+    gr_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    go_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    la_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    lb_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    lp_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    il_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    tg_ptr: Pointer[Scalar[tdtype], MutAnyOrigin],
+    tl_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
+    nll_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
+    max_input_arg: Int64,
+    max_target_arg: Int64,
+    batch_arg: Int64,
+    labels_arg: Int64,
+    blank_arg: Int64,
+    tg_batch_stride_arg: Int64,
+    zero_infinity_arg: Int64,
+) where dtype.is_floating_point():
+    """LossCTC.cu's large-problem route, one thread per (sample, timestep):
+    `exp(log_probs)`; the blank's `-= exp(logsumexp_s(alpha + beta at even
+    s) + nll - lp_blank)`; `*= grad_out`; zero_infinity's `where`; then
+    ctc_loss_backward_collect_nonblank_gpu_kernel's subtractions; then
+    ctc_loss_zero_padded_gradients past the input length."""
+    comptime neginf = neg_inf[dtype]()
+    var b = Int(block_idx.y)
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var max_input = Int(max_input_arg)
+    var batch = Int(batch_arg)
+    if t >= max_input or b >= batch:
+        return
+    var max_target = Int(max_target_arg)
+    var s_count = 2 * max_target + 1
+    var labels = Int(labels_arg)
+    var blank = Int(blank_arg)
+    var input_length = Int(il_ptr[unsafe_offset=b])
+    var target_length = Int(tl_ptr[unsafe_offset=b])
+    var g_row = t * batch * labels + b * labels
+    var ab_row = (b * max_input + t) * s_count
+    if t >= input_length:
+        for c in range(labels):
+            gr_ptr[unsafe_offset=g_row + c] = 0
+        return
+    var nll = nll_ptr[unsafe_offset=b]
+    var gr = go_ptr[unsafe_offset=b]
+    for c in range(labels):
+        gr_ptr[unsafe_offset=g_row + c] = _exp(lp_ptr[unsafe_offset=g_row + c])
+    # at::logsumexp over the max_target + 1 blank positions: an infinite
+    # maximum is replaced by 0.
+    var m = neginf
+    for k in range(max_target + 1):
+        var v = (
+            la_ptr[unsafe_offset=ab_row + 2 * k]
+            + lb_ptr[unsafe_offset=ab_row + 2 * k]
+        )
+        if v > m:
+            m = v
+    if m == neginf or m == -neginf:
+        m = 0
+    var acc = Scalar[dtype](0)
+    for k in range(max_target + 1):
+        acc += _exp(
+            la_ptr[unsafe_offset=ab_row + 2 * k]
+            + lb_ptr[unsafe_offset=ab_row + 2 * k]
+            - m
+        )
+    var lse = _log(acc) + m
+    var lp_blank = lp_ptr[unsafe_offset=g_row + blank]
+    gr_ptr[unsafe_offset=g_row + blank] = gr_ptr[
+        unsafe_offset=g_row + blank
+    ] - _exp(lse + nll - lp_blank)
+    var zeroed = Int(zero_infinity_arg) != 0 and nll == -neginf
+    for c in range(labels):
+        if zeroed:
+            gr_ptr[unsafe_offset=g_row + c] = 0
+        else:
+            gr_ptr[unsafe_offset=g_row + c] = (
+                gr_ptr[unsafe_offset=g_row + c] * gr
+            )
+    if zeroed:
+        return
+    var tg_off = _target_offset[tdtype](tl_ptr, b, Int(tg_batch_stride_arg))
+    for s in range(target_length):
+        var target = Int(tg_ptr[unsafe_offset=tg_off + s])
+        var lp = lp_ptr[unsafe_offset=g_row + target]
+        var term = (
+            -_exp(
+                la_ptr[unsafe_offset=ab_row + 2 * s + 1]
+                + lb_ptr[unsafe_offset=ab_row + 2 * s + 1]
+                + nll
+                - lp
+            )
+            * gr
+        )
+        gr_ptr[unsafe_offset=g_row + target] = (
+            gr_ptr[unsafe_offset=g_row + target] + term
+        )
+
+
+def ctc_is_large(max_input: Int, batch: Int, labels: Int) -> Bool:
+    """LossCTC.cu's size heuristic for the gradient route."""
+    return (2 * max_input + (24 * batch) // 10 + (2 * labels) // 10) > 450
 
 
 def _block_for(max_target: Int) -> Int:
@@ -449,6 +563,31 @@ def ctc_backward[
     var threads = 32
     while threads < max_input and threads < 256:
         threads *= 2
+    if ctc_is_large(max_input, batch, labels):
+        _enqueue_cached[_collect_large_kernel[dtype, tdtype]](
+            ctx,
+            (max_input + threads - 1) // threads,
+            batch,
+            1,
+            threads,
+            _make_ptr[dtype](grad_addr).as_unsafe_any_origin(),
+            _make_ptr[dtype](go_addr).as_unsafe_any_origin(),
+            _make_ptr[dtype](la_addr).as_unsafe_any_origin(),
+            lb,
+            lp,
+            il,
+            tg,
+            tl,
+            _make_ptr[dtype](nll_addr).as_unsafe_any_origin(),
+            Int64(max_input),
+            Int64(max_target),
+            Int64(batch),
+            Int64(labels),
+            Int64(blank),
+            Int64(tg_batch_stride),
+            Int64(1 if zero_infinity else 0),
+        )
+        return
     _enqueue_cached[_collect_kernel[dtype, tdtype]](
         ctx,
         (max_input + threads - 1) // threads,

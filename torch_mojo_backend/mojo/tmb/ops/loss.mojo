@@ -29,6 +29,8 @@ from tmb.backend.abi import (
     TAG_MEMORY_FORMAT,
     Value,
     Values,
+    cpu_empty,
+    index_error,
     new_tensor,
     none_arg,
     own,
@@ -37,25 +39,36 @@ from tmb.backend.abi import (
     view_strided,
     ret_owned,
     ret_ref,
+    ret_tensor,
     unsupported,
     v_bool,
     v_int,
     v_is_none,
     v_tensor,
 )
-from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr, dev
+from tmb.backend.device import (
+    copy_from_host,
+    copy_to_host,
+    ctx_for,
+    ctx_ptr,
+    dev,
+)
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_internal_overlap,
     call_op,
     check_out_as,
     contiguous,
+    copy_strided_into,
     device_str,
     fill_value,
     forward_args,
     is_int_stype,
+    resize_out,
     scalar_to_float,
     scalar_to_int,
+    shares_storage,
     store_out,
 )
 from tmb.ops.data_movement import _scalar_type_name
@@ -289,12 +302,18 @@ def _nll_forward_shape_checks(args: Values) raises:
     """The forward-only part of the `nll_loss_forward` meta."""
     var input = v_tensor(args[unsafe_offset=0])
     var target = v_tensor(args[unsafe_offset=1])
+    if input.rank < 1 or input.rank > 2:
+        raise Error("input tensor should be 1D or 2D")
+    if target.rank > 1:
+        raise Error(
+            "0D or 1D target tensor expected, multi-target not supported"
+        )
     if input.rank == 1 and target.rank == 1 and target.dim(0) != 1:
         raise Error(
             "For 1D input, 1D target must have size 1, but got target size: ",
             target.dim(0),
         )
-    if input.rank != 1 and input.dim(0) != target.dim(0):
+    if input.rank != 1 and input.dim(0) != _size0(target):
         raise Error(
             "size mismatch (got input: ",
             sizes_str(input),
@@ -312,6 +331,13 @@ def _nll_forward_shape_checks(args: Values) raises:
                 " classes or no classes but got weight tensor of shape: ",
                 sizes_str(w),
             )
+
+
+def _size0(t: T) raises -> Int:
+    """`t.size(0)`, raising as torch does for a 0-d tensor."""
+    if t.rank == 0:
+        index_error("dimension specified as 0 but tensor has no dimensions")
+    return t.dim(0)
 
 
 def _reduction(v: Int) -> Int:
@@ -347,38 +373,145 @@ def _nll_fast_f32(a: NllArgs, reduction: Int, weighted: Bool) -> Bool:
     )
 
 
-def _nll_forward(args: Values, spatial: Bool) raises -> OwnedPair:
+struct Dest(Movable):
+    """Where an op writes one result: a fresh tensor, or the caller's `out=`
+    tensor itself when it can take the kernel's dense writes directly (it
+    shares no storage with an input and is contiguous once resized).
+    Otherwise a fresh tensor is resized-and-copied into it at `finish`, after
+    every input was read."""
+
+    var t: T
+    var fresh: Bool
+    var has_caller: Bool
+    var caller: T
+
+    def __init__(
+        out self,
+        shape: IndexList[MAX_RANK],
+        rank: Int,
+        like: T,
+        caller: Optional[T],
+        inputs: List[T],
+    ) raises:
+        self.has_caller = Bool(caller)
+        if caller:
+            var o = caller.value().copy()
+            var alias = False
+            for x in inputs:
+                if shares_storage(o, x):
+                    alias = True
+            if not alias:
+                assert_no_internal_overlap(o)
+                resize_out(o, shape, rank)
+                if o.contig:
+                    self.t = o.copy()
+                    self.fresh = False
+                    self.caller = o^
+                    return
+            self.caller = o^
+        else:
+            self.caller = like.copy()
+        self.t = new_tensor(shape, rank, like.stype, like.device)
+        self.fresh = True
+
+    def finish(mut self, rets: Values, i: Int) raises:
+        """Hand the result back as result `i`."""
+        if not self.has_caller:
+            self.fresh = False
+            ret_tensor(rets, i, self.t)
+            return
+        if self.fresh:
+            self.fresh = False
+            if self.caller.same_shape(self.t) and not shares_storage(
+                self.caller, self.t
+            ):
+                # Correct shape, a strided caller tensor: written in place.
+                copy_strided_into(self.caller, self.t)
+                release(self.t.h)
+            else:
+                store_out(self.caller, self.t.copy())
+        ret_ref(rets, i, self.caller)
+
+    def __deinit__(deinit self):
+        if self.fresh:
+            release(self.t.h)
+
+
+def _err_flag(device: Int) raises -> Owned:
+    """A zeroed int64[2] (flag, offending target) the generic NLL kernels
+    raise for a target outside [0, classes)."""
+    var f = own(new_tensor(_shape1(2), 1, ST_INT64, device))
+    fill_value(f.t, 0.0)
+    return f^
+
+
+def _raise_bad_target(flag: T) raises:
+    """Read the flag back (a synchronizing 16-byte read) and raise like
+    CPU torch for a bad target; CUDA's device assert has no message."""
+    var host = own(cpu_empty(_shape1(2), 1, ST_INT64))
+    copy_to_host(ctx_for(flag.device), flag.ptr, host.t.ptr, 16)
+    var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=host.t.ptr)
+    var bad = p[unsafe_offset=0] != 0
+    var target = Int(p[unsafe_offset=1])
+    _ = host^
+    if bad:
+        index_error(String("Target ") + String(target) + " is out of bounds.")
+
+
+def _nll_inputs(args: Values, idx: List[Int]) raises -> List[T]:
+    var out = List[T]()
+    for i in idx:
+        if not v_is_none(args[unsafe_offset=i]):
+            out.append(v_tensor(args[unsafe_offset=i]))
+    return out^
+
+
+def _nll_forward(
+    args: Values,
+    rets: Values,
+    spatial: Bool,
+    out_o: Optional[T],
+    out_tw: Optional[T],
+) raises:
     """`nll_loss_forward` (Loss.cu nll_loss_forward_out_cuda_template) or
-    `nll_loss2d_forward` (NLLLoss2d.cu): (output, total_weight)."""
+    `nll_loss2d_forward` (NLLLoss2d.cu): results 0 (output) and 1
+    (total_weight), into the caller's tensors when given."""
     if not spatial:
         _nll_forward_shape_checks(args)
     var a = _nll_checks(args, 0, spatial)
     var reduction = _reduction(v_int(args[unsafe_offset=3]))
     var ignore_index = v_int(args[unsafe_offset=4])
     var input = a.input.t.copy()
-    var tw = _scalar(input.stype, input.device)
     var none_mode = reduction == 0 and not a.one_d
-    var out: Owned
+    var oshape = IndexList[MAX_RANK](1)
+    var orank = 0
     if none_mode:
         if spatial:
-            var shape = IndexList[MAX_RANK](1)
-            shape[MAX_RANK - 3] = input.dim(0)
-            shape[MAX_RANK - 2] = input.dim(2)
-            shape[MAX_RANK - 1] = input.dim(3)
-            out = own(new_tensor(shape, 3, input.stype, input.device))
+            oshape[MAX_RANK - 3] = input.dim(0)
+            oshape[MAX_RANK - 2] = input.dim(2)
+            oshape[MAX_RANK - 1] = input.dim(3)
+            orank = 3
         else:
-            out = own(
-                new_tensor(_shape1(a.batch), 1, input.stype, input.device)
-            )
+            oshape = _shape1(a.batch)
+            orank = 1
+    var ins = _nll_inputs(args, [0, 1, 2])
+    var out = Dest(oshape, orank, input, out_o, ins)
+    var tw_ins = ins.copy()
+    if out_o:
+        tw_ins.append(out_o.value().copy())
+    var tw = Dest(IndexList[MAX_RANK](1), 0, input, out_tw, tw_ins)
+    if none_mode:
         fill_value(tw.t, 0.0)
         if a.batch * a.map == 0:
-            return OwnedPair(out^, tw^)
-    else:
-        out = _scalar(input.stype, input.device)
-        if a.target.t.numel == 0:
-            fill_value(out.t, nan[DType.float64]() if reduction == 1 else 0.0)
-            fill_value(tw.t, 0.0)
-            return OwnedPair(out^, tw^)
+            out.finish(rets, 0)
+            tw.finish(rets, 1)
+            return
+    elif a.target.t.numel == 0:
+        fill_value(out.t, nan[DType.float64]() if reduction == 1 else 0.0)
+        fill_value(tw.t, 0.0)
+        out.finish(rets, 0)
+        tw.finish(rets, 1)
+        return
     var ctx = ctx_for(input.device)
     if _nll_fast_f32(a, reduction, a.weight_ptr() != 0):
         var call = KernelCall("loss", "NllLossForwardF32")
@@ -397,33 +530,38 @@ def _nll_forward(args: Values, spatial: Bool) raises -> OwnedPair:
         call.int(ignore_index)
         call.int(ctx_ptr(ctx))
         call.run()
-        _ = ctx
-        _ = a^
-        return OwnedPair(out^, tw^)
-    var scratch = own(new_tensor(_shape1(1), 1, input.stype, input.device))
-    if spatial and not none_mode:
-        # NLLLoss2d.cu: GET_BLOCKS(map) / 128 blocks per sample, at least 1
-        # (nll2d_blocks_per_sample in kernels/loss/nll_kernels.mojo).
-        var bps = max(1, ((a.map + 127) // 128) // 128)
-        scratch = own(
-            new_tensor(_shape1(2 * bps * a.batch), 1, input.stype, input.device)
-        )
-    var call = KernelCall("loss", "Nll")
-    call.arg_dtype(0, input.dtype)
-    call.arg_dtype(1, a.target.t.dtype)
-    call.int(out.t.ptr)
-    call.int(tw.t.ptr)
-    call.int(input.ptr)
-    call.int(a.target.t.ptr)
-    call.int(a.weight_ptr())
-    call.int(scratch.t.ptr)
-    call.tuple(_nll_params(a, reduction, ignore_index))
-    call.int(ctx_ptr(ctx))
-    call.run()
+    else:
+        var scratch = own(new_tensor(_shape1(1), 1, input.stype, input.device))
+        if spatial and not none_mode:
+            # NLLLoss2d.cu: GET_BLOCKS(map) / 128 blocks per sample, at least
+            # 1 (nll2d_blocks_per_sample in kernels/loss/nll_kernels.mojo).
+            var bps = max(1, ((a.map + 127) // 128) // 128)
+            scratch = own(
+                new_tensor(
+                    _shape1(2 * bps * a.batch), 1, input.stype, input.device
+                )
+            )
+        var err = _err_flag(input.device)
+        var call = KernelCall("loss", "Nll")
+        call.arg_dtype(0, input.dtype)
+        call.arg_dtype(1, a.target.t.dtype)
+        call.int(out.t.ptr)
+        call.int(tw.t.ptr)
+        call.int(input.ptr)
+        call.int(a.target.t.ptr)
+        call.int(a.weight_ptr())
+        call.int(scratch.t.ptr)
+        call.int(err.t.ptr)
+        call.tuple(_nll_params(a, reduction, ignore_index))
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _raise_bad_target(err.t)
+        _ = scratch^
+        _ = err^
     _ = ctx
-    _ = scratch^
     _ = a^
-    return OwnedPair(out^, tw^)
+    out.finish(rets, 0)
+    tw.finish(rets, 1)
 
 
 def _nll_backward_checks(args: Values, a: NllArgs, spatial: Bool) raises:
@@ -465,7 +603,7 @@ def _nll_backward_checks(args: Values, a: NllArgs, spatial: Bool) raises:
                 )
     else:
         var no_batch = input.rank == 1 and target.rank == 0
-        if not no_batch and input.dim(0) != target.dim(0):
+        if not no_batch and input.dim(0) != _size0(target):
             raise Error(
                 "size mismatch (got input: ",
                 sizes_str(input),
@@ -508,19 +646,29 @@ def _nll_backward_checks(args: Values, a: NllArgs, spatial: Bool) raises:
     _expect_dtype(tw, input)
 
 
-def _nll_backward(args: Values, spatial: Bool) raises -> Owned:
+def _nll_backward(
+    args: Values, rets: Values, spatial: Bool, out_gi: Optional[T]
+) raises:
     """`nll_loss_backward` (Loss.cu nll_loss_backward_out_cuda) or
-    `nll_loss2d_backward` (NLLLoss2d.cu): a zeroed grad_input with the
-    target slots written."""
+    `nll_loss2d_backward` (NLLLoss2d.cu): grad_input as result 0, into the
+    caller's tensor when given. The hand-tuned f32 kernel writes every
+    element; the generic one writes the target slots of a zeroed tensor."""
     var a = _nll_checks(args, 1, spatial)
     _nll_backward_checks(args, a, spatial)
     var reduction = _reduction(v_int(args[unsafe_offset=4]))
     var ignore_index = v_int(args[unsafe_offset=5])
     var input = a.input.t.copy()
-    var gi = own(new_tensor(input.shape, input.rank, input.stype, input.device))
-    fill_value(gi.t, 0.0)
+    var gi = Dest(
+        input.shape,
+        input.rank,
+        input,
+        out_gi,
+        _nll_inputs(args, [0, 1, 2, 3, 6]),
+    )
     if a.batch * a.map == 0 or input.numel == 0:
-        return gi^
+        fill_value(gi.t, 0.0)
+        gi.finish(rets, 0)
+        return
     var grad = Dense(v_tensor(args[unsafe_offset=0]))
     var tw = Dense(v_tensor(args[unsafe_offset=6]))
     var ctx = ctx_for(input.device)
@@ -542,6 +690,8 @@ def _nll_backward(args: Values, spatial: Bool) raises -> Owned:
         call.int(ctx_ptr(ctx))
         call.run()
     else:
+        fill_value(gi.t, 0.0)
+        var err = _err_flag(input.device)
         var call = KernelCall("loss", "NllBackward")
         call.arg_dtype(0, input.dtype)
         call.arg_dtype(1, a.target.t.dtype)
@@ -550,20 +700,21 @@ def _nll_backward(args: Values, spatial: Bool) raises -> Owned:
         call.int(a.target.t.ptr)
         call.int(a.weight_ptr())
         call.int(tw.t.ptr)
+        call.int(err.t.ptr)
         call.tuple(_nll_params(a, reduction, ignore_index))
         call.int(ctx_ptr(ctx))
         call.run()
+        _raise_bad_target(err.t)
+        _ = err^
     _ = ctx
     _ = grad^
     _ = tw^
     _ = a^
-    return gi^
+    gi.finish(rets, 0)
 
 
 def _nll_forward_ret(args: Values, rets: Values, spatial: Bool) raises:
-    var r = _nll_forward(args, spatial)
-    ret_owned(rets, 0, r.first)
-    ret_owned(rets, 1, r.second)
+    _nll_forward(args, rets, spatial, None, None)
 
 
 def _nll_forward_out(args: Values, rets: Values, spatial: Bool) raises:
@@ -572,20 +723,14 @@ def _nll_forward_out(args: Values, rets: Values, spatial: Bool) raises:
     var total_weight = v_tensor(args[unsafe_offset=6])
     check_out_as(output, like.stype, like)
     check_out_as(total_weight, like.stype, like)
-    var r = _nll_forward(args, spatial)
-    store_out(output, r.first.take())
-    store_out(total_weight, r.second.take())
-    ret_ref(rets, 0, output)
-    ret_ref(rets, 1, total_weight)
+    _nll_forward(args, rets, spatial, output^, total_weight^)
 
 
 def _nll_backward_out(args: Values, rets: Values, spatial: Bool) raises:
     var like = v_tensor(args[unsafe_offset=1])
     var grad_input = v_tensor(args[unsafe_offset=7])
     check_out_as(grad_input, like.stype, like)
-    var gi = _nll_backward(args, spatial)
-    store_out(grad_input, gi.take())
-    ret_ref(rets, 0, grad_input)
+    _nll_backward(args, rets, spatial, grad_input^)
 
 
 # aten::nll_loss_forward(Tensor self, Tensor target, Tensor? weight,
@@ -611,8 +756,7 @@ def op_nll_loss_forward_output(
 def op_nll_loss_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var gi = _nll_backward(args, False)
-    ret_owned(rets, 0, gi)
+    _nll_backward(args, rets, False, None)
 
 
 # aten::nll_loss_backward.grad_input(Tensor grad_output, Tensor self,
@@ -647,8 +791,7 @@ def op_nll_loss2d_forward_output(
 def op_nll_loss2d_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var gi = _nll_backward(args, True)
-    ret_owned(rets, 0, gi)
+    _nll_backward(args, rets, True, None)
 
 
 # aten::nll_loss2d_backward.grad_input(Tensor grad_output, Tensor self,

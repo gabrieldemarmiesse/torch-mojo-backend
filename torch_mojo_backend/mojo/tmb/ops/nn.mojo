@@ -39,6 +39,7 @@ from tmb.backend.abi import (
     new_like,
     new_like_dtype,
     new_tensor,
+    none_arg,
     own,
     release,
     retain,
@@ -644,6 +645,7 @@ def op_masked_softmax(
         and dim == rank - 1
         and elems <= 1024
         and elems * a.itemsize <= 4096
+        and mask.contig
         and a.dim(1) % 2 != 0
     ):
         # CUDA's transformer-mask kernel, which the persistent route takes.
@@ -723,38 +725,83 @@ def op_masked_softmax_backward(
     if mask.dtype != DType.bool:
         raise Error("Mask should be a boolean tensor")
     _masked_float(grad, "masked_softmax_backward")
-    var zeroed_r = call_op(
-        String("aten::masked_fill"),
-        String("Scalar"),
-        [tensor_arg(o.t), tensor_arg(m.t), Value(TAG_SCALAR_INT, 0, 0, 0)],
-        1,
+    var elems = o.t.dim(dim)
+    if elems > 1024 or elems * grad.itemsize > 4096 or dim < rank - 1:
+        # The fallback: `_softmax_backward_data(grad, output.masked_fill(mask,
+        # 0))`, where a non-finite grad at a masked position makes NaN.
+        var zeroed = _op1(
+            "aten::masked_fill",
+            "Scalar",
+            [tensor_arg(o.t), tensor_arg(m.t), Value(TAG_SCALAR_INT, 0, 0, 0)],
+        )
+        var gi = _op1(
+            "aten::_softmax_backward_data",
+            "",
+            [
+                tensor_arg(g.t),
+                tensor_arg(zeroed.t),
+                int_arg(dim),
+                Value(TAG_DTYPE, 0, Int64(grad.stype), 0),
+            ],
+        )
+        _ = zeroed^
+        var res = _shaped_as(gi^, grad)
+        _ = g^
+        _ = o^
+        _ = m^
+        ret_owned(rets, 0, res)
+        return
+    # The persistent kernel: `tmp = grad * output` in the dtype, then in
+    # acc_type `tmp - output * sum(tmp over the unmasked positions)`, the
+    # masked positions written as 0.
+    var tmp = _op1("aten::mul", "Tensor", [tensor_arg(g.t), tensor_arg(o.t)])
+    var acc = ST_FLOAT32 if _is_float(grad.dtype) else grad.stype
+    var tmp_a = _nn_cast(tmp, acc)
+    var o_a = _nn_cast(_nn_hold(o.t), acc)
+    var tmp_m = _op1(
+        "aten::masked_fill",
+        "Scalar",
+        [tensor_arg(tmp_a.t), tensor_arg(m.t), Value(TAG_SCALAR_INT, 0, 0, 0)],
     )
-    var zeroed = own(zeroed_r.take_tensor(0))
-    var gi_r = call_op(
-        String("aten::_softmax_backward_data"),
-        String(""),
+    var dims = List[Int64](capacity=1)
+    dims.append(Int64(dim))
+    var total = _op1(
+        "aten::sum",
+        "dim_IntList",
         [
-            tensor_arg(g.t),
-            tensor_arg(zeroed.t),
-            int_arg(dim),
-            Value(TAG_DTYPE, 0, Int64(grad.stype), 0),
+            tensor_arg(tmp_m.t),
+            Value(TAG_INT_LIST, 1, Int64(Int(dims.unsafe_ptr())), 0),
+            bool_arg(True),
+            none_arg(),
         ],
-        1,
     )
-    _ = zeroed^  # read through its handle by the call above
-    var gi = own(gi_r.take_tensor(0))
-    var final_r = call_op(
-        String("aten::masked_fill"),
-        String("Scalar"),
-        [tensor_arg(gi.t), tensor_arg(m.t), Value(TAG_SCALAR_INT, 0, 0, 0)],
-        1,
+    _ = dims^
+    _ = tmp_m^
+    var scaled = _nn_mul(o_a, total)
+    var diff = _nn_sub(tmp_a, scaled)
+    _ = tmp^
+    _ = scaled^
+    var zeroed = _op1(
+        "aten::masked_fill",
+        "Scalar",
+        [tensor_arg(diff.t), tensor_arg(m.t), Value(TAG_SCALAR_INT, 0, 0, 0)],
     )
-    _ = gi^
-    var res = _shaped_as(own(final_r.take_tensor(0)), grad)
+    _ = diff^
+    var res = _shaped_as(_nn_cast(zeroed, grad.stype), grad)
+    _ = zeroed^
     _ = g^
     _ = o^
     _ = m^
     ret_owned(rets, 0, res)
+
+
+def _op1(
+    name: StaticString, overload: StaticString, var args: List[Value]
+) raises -> Owned:
+    """One aten op through the dispatcher, its one Tensor result owned. The
+    caller keeps every `Owned` it read a handle from alive past the call."""
+    var r = call_op(String(name), String(overload), args^, 1)
+    return own(r.take_tensor(0))
 
 
 # ---------------------------------------------------------------------------

@@ -306,8 +306,9 @@ def bn_gather[
             var cf = count.cast[acc_t]()
             var_n += v + (avg - m) * (avg - m) * nf * cf * factor
             avg = nf * factor * avg + cf * factor * m
-            # `index_t n += scalar_t count`: the float sum, truncated.
-            n = Int(Float32(n) + count.cast[DType.float32]())
+            # `index_t n += scalar_t count`: the sum in scalar_t's
+            # arithmetic (c10::Half / BFloat16 round it), truncated.
+            n = Int(Scalar[rdtype](n) + count)
         sm_ptr[unsafe_offset=i] = avg
         si_ptr[unsafe_offset=i] = Scalar[acc_t](1) / sqrt(
             var_n / Scalar[acc_t](n) + epsilon

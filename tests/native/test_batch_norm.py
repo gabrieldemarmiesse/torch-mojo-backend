@@ -192,7 +192,8 @@ def test_batch_norm_with_update_and_backward(mojo_device, dtype):
         [False, True, False],
         reserve,
     )
-    assert masked[0].numel() == 0 and masked[2].numel() == 0
+    # Unrequested gradients are undefined, as on CUDA's native route.
+    assert masked[0] is None and masked[2] is None
     _close(masked[1], want_g[1], dtype)
 
 
@@ -566,3 +567,67 @@ def test_batch_norm_backward_elemt(mojo_device, dtype, shape, affine):
                 mojo_device, g, x, mean, invstd, None, sum_dy, sum_dy_xmu, count.long()
             )
         )
+
+
+def test_native_batch_norm_float64_weight_bias_dtypes(mojo_device):
+    """batch_norm_elementwise reads weight / bias as float64 pointers on its
+    contiguous route: another dtype is CUDA's error, never a misread."""
+    skip_if_metal(mojo_device, "Apple GPUs have no float64")
+    x, w, b, rm, rv = _bn_inputs((4, 3, 5), torch.float64)
+    xd, rmd, rvd = _to(mojo_device, x, rm, rv)
+    with pytest.raises(
+        RuntimeError, match="Expected bias to have type Double but got Float"
+    ):
+        aten.native_batch_norm(
+            xd, w.to(mojo_device), b.float().to(mojo_device), rmd, rvd, True, 0.1, 1e-5
+        )
+    with pytest.raises(
+        RuntimeError, match="Expected weight to have type Double but got Float"
+    ):
+        aten.native_batch_norm(
+            xd, w.float().to(mojo_device), None, rmd, rvd, False, 0.1, 1e-5
+        )
+
+
+@pytest.mark.parametrize("train", [True, False])
+def test_native_batch_norm_backward_float64(mojo_device, train):
+    skip_if_metal(mojo_device, "Apple GPUs have no float64")
+    x, w, b, rm, rv = _bn_inputs((4, 3, 5), torch.float64)
+    g = torch.randn(4, 3, 5, dtype=torch.float64)
+    _, sm, si = aten.native_batch_norm(x, w, b, rm.clone(), rv.clone(), True, 0.1, 1e-5)
+    want = aten.native_batch_norm_backward(
+        g, x, w, rm, rv, sm, si, train, 1e-5, [True, True, True]
+    )
+    got = aten.native_batch_norm_backward(
+        *_to(mojo_device, g, x, w, rm, rv, sm, si), train, 1e-5, [True, True, True]
+    )
+    for gt, wt in zip(got, want):
+        _close(gt, wt, torch.float64)
+
+
+@pytest.mark.parametrize("training", [True, False])
+def test_batch_norm_channels_last_outputs(mojo_device, training):
+    """CUDA allocates the output `empty_like(input)`: channels-last in,
+    channels-last out (values unchanged)."""
+    x, w, b, rm, rv = _bn_inputs((2, 3, 4, 5), torch.float32)
+    xcl = x.to(memory_format=torch.channels_last)
+    want = aten.native_batch_norm(
+        xcl, w, b, rm.clone(), rv.clone(), training, 0.1, 1e-5
+    )
+    got = aten.native_batch_norm(
+        *_to(mojo_device, xcl, w, b, rm, rv), training, 0.1, 1e-5
+    )
+    assert got[0].stride() == xcl.stride()
+    _close(got[0], want[0])
+    mean = torch.randn(3)
+    invstd = torch.rand(3) + 0.5
+    e = aten.batch_norm_elemt(*_to(mojo_device, xcl, w, b, mean, invstd), 1e-5)
+    assert e.stride() == xcl.stride()
+    g = torch.randn(2, 3, 4, 5).to(memory_format=torch.channels_last)
+    gi = aten.native_batch_norm_backward(
+        *_to(mojo_device, g, xcl, w, rm, rv, got[1].cpu(), got[2].cpu()),
+        training,
+        1e-5,
+        [True, True, True],
+    )[0]
+    assert gi.stride() == xcl.stride()

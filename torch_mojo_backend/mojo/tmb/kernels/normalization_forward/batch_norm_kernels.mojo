@@ -313,6 +313,7 @@ def _bn_finalize[
     count: Int,
     eps: Float32,
     momentum: Float32,
+    bessel: Float32,
     has_running: Bool,
 ):
     """ATen's rules, verbatim: the BIASED variance normalizes the output while
@@ -330,9 +331,9 @@ def _bn_finalize[
             keep * run_mean_ptr[unsafe_offset=c].cast[DType.float32]()
             + momentum * mean
         ).cast[sdtype]()
-        # CUDA's `var * static_cast<acc_t>(double(N) / double(N - 1))` (the
-        # float quotient rounds identically): one sample gives 0 * inf, NaN.
-        var unbiased = biased * (nf / (nf - 1.0))
+        # CUDA's `var * static_cast<acc_t>(double(N) / double(N - 1))`, the
+        # factor formed on the host: one sample gives 0 * inf, NaN.
+        var unbiased = biased * bessel
         run_var_ptr[unsafe_offset=c] = (
             keep * run_var_ptr[unsafe_offset=c].cast[DType.float32]()
             + momentum * unbiased
@@ -356,6 +357,7 @@ def _bn_moments_fused_kernel[
     hxw_arg: Int64,
     eps: Float32,
     momentum: Float32,
+    bessel: Float32,
     has_running_arg: Int64,
 ):
     """One block per channel, no workspace and no second launch: the block
@@ -398,6 +400,7 @@ def _bn_moments_fused_kernel[
             count,
             eps,
             momentum,
+            bessel,
             Int(has_running_arg) != 0,
         )
 
@@ -493,6 +496,7 @@ def _bn_merge_kernel[
     hxw_arg: Int64,
     eps: Float32,
     momentum: Float32,
+    bessel: Float32,
     has_running_arg: Int64,
     finalize_arg: Int64,
 ):
@@ -548,6 +552,7 @@ def _bn_merge_kernel[
         count,
         eps,
         momentum,
+        bessel,
         Int(has_running_arg) != 0,
     )
 
@@ -603,6 +608,7 @@ def enqueue_batch_norm_stats[
     var run_mean_ptr = _make_ptr[sdtype](run_mean_addr).as_unsafe_any_origin()
     var run_var_ptr = _make_ptr[sdtype](run_var_addr).as_unsafe_any_origin()
     var count = runs * hxw
+    var bessel = Float32(Float64(count) / Float64(count - 1))
 
     comptime V = 16 // size_of[dtype]()
     var splits = _bn_splits(
@@ -630,6 +636,7 @@ def enqueue_batch_norm_stats[
             Int64(hxw),
             eps,
             momentum,
+            bessel,
             Int64(1 if has_running else 0),
         )
         return
@@ -681,6 +688,7 @@ def enqueue_batch_norm_stats[
             Int64(hxw),
             eps,
             momentum,
+            bessel,
             Int64(1 if has_running else 0),
             Int64(repass),
         )

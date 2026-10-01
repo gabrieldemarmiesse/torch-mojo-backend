@@ -230,6 +230,29 @@ def test_softmax_rank0_non_finite(mojo_device, value):
         )
 
 
+def test_masked_softmax_backward_masked_inf_grad(mojo_gpu):
+    """CUDA's persistent kernel reduces only the unmasked positions: an inf
+    gradient under the mask does not leak NaN into the row."""
+    out = torch.tensor([[0.0, 0.25, 0.75]])
+    grad = torch.tensor([[float("inf"), 1.0, 2.0]])
+    mask = torch.tensor([[True, False, False]])
+    got = torch.ops.aten._masked_softmax_backward(
+        grad.to(mojo_gpu), out.to(mojo_gpu), mask.to(mojo_gpu), -1
+    )
+    torch.testing.assert_close(got.cpu(), torch.tensor([[0.0, -0.1875, 0.1875]]))
+
+
+def test_masked_softmax_odd_heads_noncontiguous_mask(mojo_device):
+    """A non-contiguous key-padding mask takes CUDA's fallback, which has
+    no even-head restriction."""
+    x = torch.randn(2, 3, 4, 4)
+    full = torch.rand(4, 2) > 0.5
+    mask = full.t()  # [2, 4], not contiguous
+    got = torch.ops.aten._masked_softmax(x.to(mojo_device), mask.to(mojo_device), -1, 1)
+    want = _masked_softmax_reference(x, mask.reshape(2, 1, 1, 4), -1)
+    torch.testing.assert_close(got.cpu(), want, equal_nan=True)
+
+
 def _masked_softmax_reference(x, mask, dim):
     return torch.softmax(x.masked_fill(mask, float("-inf")), dim)
 

@@ -344,6 +344,69 @@ def test_nll_loss_errors(mojo_device, args, match):
         aten.nll_loss_forward(x, t, None, 1, -100)
 
 
+def test_nll_loss_scalar_operands_raise(mojo_device):
+    d = mojo_device
+    with pytest.raises(RuntimeError, match="input tensor should be 1D or 2D"):
+        aten.nll_loss_forward(
+            torch.tensor(1.0, device=d), torch.tensor(0, device=d), None, 1, -100
+        )
+    with pytest.raises(
+        IndexError, match="dimension specified as 0 but tensor has no dimensions"
+    ):
+        aten.nll_loss_forward(
+            torch.randn(2, 3, device=d), torch.tensor(0, device=d), None, 1, -100
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("spatial", [False, True])
+@pytest.mark.parametrize("reduction", [0, 1])
+def test_nll_loss_target_out_of_range_raises(mojo_device, dtype, spatial, reduction):
+    """CUDA asserts on a target outside [0, classes); the generic kernels
+    raise (the weighted case leaves the f32 fast path)."""
+    d = mojo_device
+    shape = (2, 3, 2, 2) if spatial else (4, 3)
+    x = torch.randn(shape, dtype=dtype, device=d)
+    t = torch.zeros((2, 2, 2) if spatial else (4,), dtype=torch.long)
+    t.view(-1)[1] = 7
+    w = torch.ones(3, dtype=dtype, device=d)
+    fn = aten.nll_loss2d_forward if spatial else aten.nll_loss_forward
+    with pytest.raises(IndexError, match="Target 7 is out of bounds"):
+        fn(x, t.to(d), w, reduction, -100)
+    tw = torch.tensor(1.0, dtype=dtype, device=d)
+    g = torch.ones(t.shape if reduction == 0 else (), dtype=dtype, device=d)
+    bwd = aten.nll_loss2d_backward if spatial else aten.nll_loss_backward
+    with pytest.raises(IndexError, match="Target 7 is out of bounds"):
+        bwd(g, x, t.to(d), w, reduction, -100, tw)
+
+
+def test_nll_loss_out_written_in_place(mojo_device):
+    """A fitting contiguous `out=` is the kernel's destination: its storage
+    is kept, no temporary."""
+    d = mojo_device
+    x, t, _ = _nll_case((6, 5), torch.float32, None, seed=2)
+    out = torch.empty(6, device=d)
+    tw = torch.empty((), device=d)
+    ptr = out.data_ptr()
+    aten.nll_loss_forward.output(
+        x.to(d), t.to(d), None, 0, -100, output=out, total_weight=tw
+    )
+    assert out.data_ptr() == ptr
+    want = aten.nll_loss_forward(x, t, None, 0, -100)[0]
+    _close(out, want, torch.float32)
+    gi = torch.full((6, 5), 7.0, device=d)
+    gptr = gi.data_ptr()
+    aten.nll_loss_backward.grad_input(
+        torch.ones(6, device=d), x.to(d), t.to(d), None, 0, -100, tw, grad_input=gi
+    )
+    assert gi.data_ptr() == gptr
+    _close(
+        gi,
+        aten.nll_loss_backward(torch.ones(6), x, t, None, 0, -100, torch.tensor(0.0)),
+        torch.float32,
+    )
+
+
 def test_nll_loss_weight_errors(mojo_device):
     x = torch.randn(2, 3, device=mojo_device)
     t = torch.zeros(2, dtype=torch.long, device=mojo_device)
@@ -755,6 +818,36 @@ def test_ctc_loss_float64_and_infinite(mojo_device):
             # LossCTC.cu's collect kernel: exp(-inf + inf - lp) is NaN for
             # every label (CPU's kernel differs here).
             assert torch.isnan(lm.grad.cpu()).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_ctc_loss_large_route(mojo_device, dtype):
+    """LossCTC.cu takes its large-problem gradient for 2T + 2.4B + C/5 >
+    450: an impossible alignment leaves the absent labels finite there
+    (the small route makes them NaN)."""
+    if dtype == torch.float64:
+        _f64_or_skip(mojo_device)
+    g = torch.Generator().manual_seed(1)
+    lp = torch.randn(230, 1, 4, generator=g, dtype=dtype).log_softmax(2)
+    tg = torch.tensor([[1, 1, 1]])
+    lm = lp.to(mojo_device).requires_grad_()
+    il, tl = torch.tensor([2]), torch.tensor([3])
+    F.ctc_loss(lm, tg.to(mojo_device), il, tl, reduction="sum").backward()
+    grad = lm.grad
+    assert grad is not None
+    grad = grad.cpu()
+    assert torch.isfinite(grad[:2, 0, 2:]).all()
+    assert (grad[2:] == 0).all()
+    # A feasible large problem matches CPU.
+    lp2 = torch.randn(240, 3, 6, generator=g, dtype=dtype).log_softmax(2)
+    tg2 = torch.randint(1, 6, (3, 20), generator=g)
+    il2, tl2 = torch.tensor([240, 200, 150]), torch.tensor([20, 15, 0])
+    lr2 = lp2.clone().requires_grad_()
+    lm2 = lp2.to(mojo_device).requires_grad_()
+    F.ctc_loss(lr2, tg2, il2, tl2, reduction="sum").backward()
+    F.ctc_loss(lm2, tg2.to(mojo_device), il2, tl2, reduction="sum").backward()
+    assert lm2.grad is not None and lr2.grad is not None
+    torch.testing.assert_close(lm2.grad.cpu(), lr2.grad, atol=1e-4, rtol=1e-4)
 
 
 def test_ctc_loss_tensor_overloads(mojo_device):

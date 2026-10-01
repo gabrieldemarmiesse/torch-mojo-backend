@@ -12,6 +12,7 @@ from tmb.backend.abi import (
     ST_BFLOAT16,
     ST_FLOAT16,
     ST_FLOAT32,
+    ST_FLOAT64,
     T,
     TAG_BOOL,
     TAG_BOOL_LIST,
@@ -47,7 +48,7 @@ from tmb.backend.abi import (
     view_strided,
 )
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.backend.device import ctx_for, ctx_ptr
+from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.matmul import _sm90_cuda
 from tmb.ops.common import (
@@ -56,6 +57,7 @@ from tmb.ops.common import (
     copy_strided_into,
     device_str,
     fill_value,
+    like_layout,
     resize_out,
 )
 from tmb.ops.data_movement import _scalar_type_name
@@ -393,6 +395,20 @@ def _div_scalar(a: Owned, v: Float64) raises -> Owned:
     )
 
 
+def _pow_neg_half(a: Owned) raises -> Owned:
+    """`rsqrt` of a float64 tensor (no float64 rsqrt kernel here)."""
+    return own(
+        _dispatch(
+            "aten::pow",
+            "Tensor_Scalar",
+            [
+                _tensor_value(a.t),
+                Value(TAG_SCALAR_DOUBLE, 0, f64_bits(-0.5), 0),
+            ],
+        )
+    )
+
+
 def _rsqrt(a: Owned) raises -> Owned:
     return own(_dispatch("aten::rsqrt", "", [_tensor_value(a.t)]))
 
@@ -520,15 +536,17 @@ def _shaped_like(gi: Owned, out_like: T) raises -> Owned:
     """`gi` (an `[N, C, HxW]` result) in the dtype and shape of `out_like`."""
     var res = _cast(gi, out_like.stype)
     if res.t.rank == out_like.rank:
-        return res^
+        return like_layout(res^, out_like)
     var dense = _dense(res)
-    return _view_as(dense, out_like.shape, out_like.rank)
+    return like_layout(_view_as(dense, out_like.shape, out_like.rank), out_like)
 
 
-def _filled_channels(c: Int, value: Float64, device: Int) raises -> Owned:
+def _filled_channels(
+    c: Int, value: Float64, device: Int, stype: Int32 = ST_FLOAT32
+) raises -> Owned:
     var shape = IndexList[MAX_RANK](1)
     shape[MAX_RANK - 1] = c
-    var t = own(new_tensor(shape, 1, ST_FLOAT32, device))
+    var t = own(new_tensor(shape, 1, stype, device))
     fill_value(t.t, value)
     return t^
 
@@ -607,8 +625,8 @@ def _bn_backward(
     var c = a.t.dim(1)
     var n = a.t.numel // c
     var device = a.t.device
-    var zeros = _filled_channels(c, 0.0, device)
-    var ones = _filled_channels(c, 1.0, device)
+    var zeros = _filled_channels(c, 0.0, device, cst)
+    var ones = _filled_channels(c, 1.0, device, cst)
     var need_bias = mask[2] or (mask[0] and train)
     var need_weight = mask[1] or (mask[0] and train)
     var grad_bias = _empty_result(cst, device)
@@ -697,7 +715,9 @@ def _bn_stats_then_backward(
     var mean = _bn_channel_vec(args[unsafe_offset=3], c, cst)
     var var_t = _bn_channel_vec(args[unsafe_offset=4], c, cst)
     var shifted = _add_scalar(var_t, eps)
-    var invstd = _rsqrt(shifted)
+    var invstd = _rsqrt(shifted) if cst != ST_FLOAT64 else _pow_neg_half(
+        shifted
+    )
     _bn_backward(
         args, rets, grad, a, out_like, mean, invstd, False, cst, pst, mask
     )
@@ -738,16 +758,20 @@ def op_native_batch_norm_backward(
         a.dtype != DType.float32
         and a.dtype != DType.bfloat16
         and a.dtype != DType.float16
+        and a.dtype != DType.float64
     ):
         unsupported("native_batch_norm_backward of dtype " + String(a.dtype))
+    if a.dtype == DType.float64 and dev(a.device)[].api == "metal":
+        unsupported("float64 batch norm is unavailable on Apple GPUs")
     if a.rank < 2:
         unsupported("native_batch_norm_backward needs a tensor of rank >= 2")
     if not grad.same_shape(a):
         unsupported(
             "native_batch_norm_backward: grad_out and input must share a shape"
         )
-    # ATen's opmath_t: the whole formula runs in float32 for a half input.
-    var cst = ST_FLOAT32
+    # ATen's opmath_t: the whole formula runs in float32 for a half input,
+    # float64 for float64.
+    var cst = ST_FLOAT64 if a.dtype == DType.float64 else ST_FLOAT32
     var pst = cst
     if not v_is_none(args[unsafe_offset=2]):
         pst = v_tensor(args[unsafe_offset=2]).stype

@@ -21,6 +21,7 @@ from tmb.backend.abi import (
     ST_UINT8,
     T,
     TAG_SCALAR_DOUBLE,
+    TAG_TENSOR,
     TAG_SCALAR_INT,
     Value,
     Values,
@@ -52,6 +53,8 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     forward_args,
+    is_channels_last_layout,
+    like_layout,
     store_out,
 )
 from tmb.ops.data_movement import _scalar_type_name
@@ -230,18 +233,11 @@ def op_batch_norm_backward(
         forward_args(args, 10),
         3,
     )
-    var a = v_tensor(args[unsafe_offset=1])
     var mask = _bool_list(args[unsafe_offset=9])
     for i in range(3):
-        if i >= len(mask) or not mask[i]:
-            # An unrequested gradient: the 0-element stand-in (an undefined
-            # result of this non-optional schema trips the autograd layer;
-            # CUDA's cuDNN route returns all three).
-            ret_tensor(
-                rets,
-                i,
-                new_tensor(IndexList[MAX_RANK](0), 1, a.stype, a.device),
-            )
+        if i >= len(mask) or not mask[i] or r[i].tag != TAG_TENSOR:
+            # An unrequested gradient is undefined, as on CUDA's native route.
+            rets[unsafe_offset=i] = none_arg()
         else:
             ret_tensor(rets, i, r.take_tensor(i))
 
@@ -520,7 +516,7 @@ def _elemt(args: Values) raises -> Owned:
     _ = invstd^
     _ = w^
     _ = b^
-    return out^
+    return like_layout(out^, a)
 
 
 # aten::batch_norm_elemt(Tensor input, Tensor? weight, Tensor? bias,
@@ -916,7 +912,8 @@ def op_batch_norm_backward_elemt(
     _ = sum_dy_xmu^
     _ = cnt^
     _ = w^
-    ret_owned(rets, 0, gi)
+    var gl = like_layout(gi^, a)
+    ret_owned(rets, 0, gl)
 
 
 # ---------------------------------------------------------------------------
@@ -984,13 +981,26 @@ def _bn_f64(
     var has_b = _opt(args, 2)
     var w = v_tensor(args[unsafe_offset=1]) if has_w else a.copy()
     var b = v_tensor(args[unsafe_offset=2]) if has_b else a.copy()
+    # batch_norm_elementwise's routes read weight and bias as typed
+    # pointers, except the TensorIterator one (neither contiguous nor
+    # channels-last), which converts them.
+    if a.contig and not _uses_channels_last(a):
+        if has_w:
+            _expect_type(w, ST_FLOAT64, "weight")
+        if has_b:
+            _expect_type(b, ST_FLOAT64, "bias")
+    elif _uses_channels_last(a):
+        if has_w:
+            _expect_dtype(w, a)
+        if has_b:
+            _expect_dtype(b, a)
     var wd = Optional[Dense](None)
     var bd = Optional[Dense](None)
     if has_w:
-        wd = _channel_vec(args, 1, a, p.c, "weight")
+        wd = _as_stype(_channel_vec(args, 1, a, p.c, "weight"), ST_FLOAT64)
         w = wd.value().t.copy()
     if has_b:
-        bd = _channel_vec(args, 2, a, p.c, "bias")
+        bd = _as_stype(_channel_vec(args, 2, a, p.c, "bias"), ST_FLOAT64)
         b = bd.value().t.copy()
     var out = own(new_tensor(a.shape, a.rank, a.stype, a.device))
     var mean = _vec(p.c, ST_FLOAT64, a.device)
@@ -1067,14 +1077,27 @@ def _bn_f64(
     ret_owned(rets, 2, invstd)
 
 
+def _relayout_ret0(rets: Values, a: T) raises:
+    """Result 0 (a fresh contiguous output) in `a`'s channels-last layout
+    when `a` has one: CUDA allocates it with `empty_like(input)`."""
+    if not is_channels_last_layout(a):
+        return
+    var cur = own(T(Int(rets[unsafe_offset=0].a)))
+    rets[unsafe_offset=0] = none_arg()
+    var o = like_layout(cur^, a)
+    ret_owned(rets, 0, o)
+
+
 # aten::native_batch_norm (and `_native_batch_norm_legit`, the same schema)
 def op_native_batch_norm_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if v_tensor(args[unsafe_offset=0]).dtype == DType.float64:
+    var a = v_tensor(args[unsafe_offset=0])
+    if a.dtype == DType.float64:
         _bn_f64(args, rets, 3, v_bool(args[unsafe_offset=5]), 7, 6)
-        return
-    op_native_batch_norm(args, n_args, rets, n_rets)
+    else:
+        op_native_batch_norm(args, n_args, rets, n_rets)
+    _relayout_ret0(rets, a)
 
 
 # aten::_native_batch_norm_legit_no_training(Tensor input, Tensor? weight,
@@ -1083,10 +1106,12 @@ def op_native_batch_norm_any(
 def op_batch_norm_legit_no_training_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if v_tensor(args[unsafe_offset=0]).dtype == DType.float64:
+    var a = v_tensor(args[unsafe_offset=0])
+    if a.dtype == DType.float64:
         _bn_f64(args, rets, 3, False, 6, -1)
-        return
-    op_batch_norm_legit_no_training(args, n_args, rets, n_rets)
+    else:
+        op_batch_norm_legit_no_training(args, n_args, rets, n_rets)
+    _relayout_ret0(rets, a)
 
 
 def register_batch_norm(site: Site) raises:

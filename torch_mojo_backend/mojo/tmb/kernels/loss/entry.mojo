@@ -654,17 +654,19 @@ def _nll_backward_dispatcher(argv: Argv, argc: Int) raises:
 # Generic NLL (every float dtype, weights, 1-D / 2-D / spatial)
 #
 #   Nll:          out, total_weight, input, target, weight (0 = none),
-#                 scratch (nll_loss2d's reduced form), params, ctx
+#                 scratch (nll_loss2d's reduced form), err (int64[2]: flag,
+#                 offending target), params, ctx
 #   NllBackward:  grad_input (zeroed), grad_output, target, weight,
-#                 total_weight, params, ctx
+#                 total_weight, err, params, ctx
 # with params the P_* tuple of nll_kernels.mojo.
 # ---------------------------------------------------------------------------
 
 
 def _nll_go[dtype: DType, tdtype: DType](argv: Argv) raises:
-    var p = argv[unsafe_offset=6]
+    var p = argv[unsafe_offset=7]
     if _raw_tuple_len(p) != P_LEN:
         raise Error("nll: expected ", P_LEN, " params")
+    var err = _raw_int(argv[unsafe_offset=6])
     var batch = _raw_tuple_int(p, P_BATCH)
     var classes = _raw_tuple_int(p, P_CLASSES)
     var map = _raw_tuple_int(p, P_MAP)
@@ -672,13 +674,14 @@ def _nll_go[dtype: DType, tdtype: DType](argv: Argv) raises:
     var ignore_index = _raw_tuple_int(p, P_IGNORE)
     var one_d = _raw_tuple_int(p, P_ONE_D) != 0
     var spatial = _raw_tuple_int(p, P_SPATIAL) != 0
-    var ctx = _raw_ctx(argv[unsafe_offset=7])
+    var ctx = _raw_ctx(argv[unsafe_offset=8])
     if reduction == 0 and not one_d:
         nll_forward_none[dtype, tdtype](
             _raw_int(argv[unsafe_offset=0]),
             _raw_int(argv[unsafe_offset=2]),
             _raw_int(argv[unsafe_offset=3]),
             _raw_int(argv[unsafe_offset=4]),
+            err,
             batch,
             classes,
             map,
@@ -693,6 +696,7 @@ def _nll_go[dtype: DType, tdtype: DType](argv: Argv) raises:
             _raw_int(argv[unsafe_offset=3]),
             _raw_int(argv[unsafe_offset=4]),
             _raw_int(argv[unsafe_offset=5]),
+            err,
             batch,
             classes,
             map,
@@ -707,6 +711,7 @@ def _nll_go[dtype: DType, tdtype: DType](argv: Argv) raises:
             _raw_int(argv[unsafe_offset=2]),
             _raw_int(argv[unsafe_offset=3]),
             _raw_int(argv[unsafe_offset=4]),
+            err,
             batch,
             classes,
             reduction == 1,
@@ -717,7 +722,7 @@ def _nll_go[dtype: DType, tdtype: DType](argv: Argv) raises:
 
 
 def _nll_backward_go[dtype: DType, tdtype: DType](argv: Argv) raises:
-    var p = argv[unsafe_offset=5]
+    var p = argv[unsafe_offset=6]
     if _raw_tuple_len(p) != P_LEN:
         raise Error("nll: expected ", P_LEN, " params")
     var reduction = _raw_tuple_int(p, P_REDUCTION)
@@ -729,12 +734,13 @@ def _nll_backward_go[dtype: DType, tdtype: DType](argv: Argv) raises:
         _raw_int(argv[unsafe_offset=2]),
         _raw_int(argv[unsafe_offset=3]),
         _raw_int(argv[unsafe_offset=4]),
+        _raw_int(argv[unsafe_offset=5]),
         _raw_tuple_int(p, P_BATCH),
         _raw_tuple_int(p, P_CLASSES),
         _raw_tuple_int(p, P_MAP),
         reduction,
         _raw_tuple_int(p, P_IGNORE),
-        _raw_ctx(argv[unsafe_offset=6]),
+        _raw_ctx(argv[unsafe_offset=7]),
     )
 
 
