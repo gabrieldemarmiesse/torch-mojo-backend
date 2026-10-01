@@ -30,3 +30,8 @@ comptime TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD = (
 # Not ours: the OS scratch directory, where the loader stages the
 # intermediate files of a build before installing them into the cache.
 comptime TMPDIR = "TMPDIR"
+
+# The Mojo import path the toolchain reads (torch_mojo_backend/
+# _mojo_import_path.py extends it with the live source root); a snapshot
+# build drops that root from it (loader.mojo `_build`).
+comptime MODULAR_MOJO_MAX_IMPORT_PATH = "MODULAR_MOJO_MAX_IMPORT_PATH"

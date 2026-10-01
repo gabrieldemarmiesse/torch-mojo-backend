@@ -17,7 +17,11 @@ from std.subprocess import run as run_command
 from std.sys.info import CompilationTarget
 from std.time import perf_counter_ns
 
-from tmb.backend.env_vars import TMPDIR, TORCH_MOJO_BACKEND_WERROR
+from tmb.backend.env_vars import (
+    MODULAR_MOJO_MAX_IMPORT_PATH,
+    TMPDIR,
+    TORCH_MOJO_BACKEND_WERROR,
+)
 from tmb.kernels.common.op_utils import Argv
 
 
@@ -163,24 +167,27 @@ struct Loader(Movable):
             return path + "/__init__.mojo"
         return String()
 
-    def _closure(self, entry: String) raises -> List[String]:
+    def _closure_texts(
+        self, entry: String
+    ) raises -> Tuple[List[String], Dict[String, String]]:
         """Every .mojo file `entry` reaches through `from X import` /
-        `import X`, in a deterministic order: the sources one build compiles
-        in, so touching any of them invalidates it. native/__init__.py's
-        `mojo_import_closure` is the same walk for the Python-driven
-        builds."""
+        `import X` (sorted: the sources one build compiles in, so touching
+        any of them invalidates it), with the text each was read as. Each
+        file is read ONCE, so the import walk, the hash and a snapshot all
+        see the same bytes. native/__init__.py's `mojo_import_closure` is
+        the same walk for the Python-driven builds."""
         var files = List[String]()
-        var seen = Dict[String, Bool]()
+        var texts = Dict[String, String]()
         var todo = List[String]()
         todo.append(entry)
         while len(todo) > 0:
             var f = todo.pop()
-            if f in seen:
+            if f in texts:
                 continue
-            seen[f] = True
+            var text = Path(f).read_text()
+            texts[f] = text
             files.append(f)
             var here = String(f[byte = : f.rfind("/")])
-            var text = Path(f).read_text()
             for line in text.splitlines():
                 var s = String(line)
                 var name: String
@@ -197,28 +204,69 @@ struct Loader(Movable):
                 else:
                     continue
                 var cand = self._module_file(name, here)
-                if cand != "" and cand not in seen:
+                if cand != "" and cand not in texts:
                     todo.append(cand)
         sort(files)
-        return files^
+        return (files^, texts^)
 
-    def _hash_closure(mut self, key: String, entry: String) raises -> String:
+    def _hash_texts(
+        self, files: List[String], texts: Dict[String, String]
+    ) raises -> String:
         """Cache key of one build: every source it compiles in, named
-        relative to the root, plus the toolchain -- so touching any of them
-        invalidates it."""
-        if key in self.source_hashes:
-            return self.source_hashes[key]
+        relative to the root, plus the toolchain."""
         var h: UInt64 = 14695981039346656037
         _fnv1a(h, CACHE_ABI.as_bytes())
         _fnv1a(h, self.toolchain.as_bytes())
-        for f in self._closure(entry):
+        for f in files:
             var rel = String(f[byte = self.root.byte_length() :])
             _fnv1a(h, rel.as_bytes())
-            var bytes = Path(f).read_bytes()
-            _fnv1a(h, Span(bytes))
-        var out = _hex(h)
+            _fnv1a(h, texts[f].as_bytes())
+        return _hex(h)
+
+    def _hash_closure(mut self, key: String, entry: String) raises -> String:
+        """The memoized cache key (the hot path's: hashed once per process).
+        A build never trusts it -- `snapshot` re-reads the sources it
+        compiles and keys the build by what it actually read."""
+        if key in self.source_hashes:
+            return self.source_hashes[key]
+        var ft = self._closure_texts(entry)
+        var out = self._hash_texts(ft[0], ft[1])
         self.source_hashes[key] = out
         return out
+
+    def snapshot(mut self, family: String) raises -> Tuple[String, String]:
+        """(snapshot root, hash) of the family's sources as they are NOW.
+
+        The closure is read once and written to a node-local directory named
+        by its hash, and the build compiles THAT copy: a source edited while
+        the process runs can then never be compiled under the hash of its
+        previous contents (the memoized key of `source_hash`), and two
+        processes building the same hash share one stable path (the
+        compiler's module cache keys on the source path). The memo is
+        refreshed to what was read, so this process's later lookups use the
+        key of the code it actually built."""
+        var entry = self.family_dir(family) + "/entry.mojo"
+        var ft = self._closure_texts(entry)
+        var h = self._hash_texts(ft[0], ft[1])
+        self.source_hashes["family:" + family] = h
+        var base = _local_dir("torch-mojo-backend-src-")
+        var dest = base + "/" + family + "-" + h
+        if isdir(dest):
+            return (dest, h)
+        var tmp = dest + ".tmp" + String(perf_counter_ns())
+        for f in ft[0]:
+            var rel = String(f[byte = self.root.byte_length() :])
+            var target = tmp + rel
+            makedirs(String(target[byte = : target.rfind("/")]), exist_ok=True)
+            Path(target).write_text(ft[1][f])
+        var r = external_call["rename", Int32](
+            tmp.as_c_string_span().ptr(), dest.as_c_string_span().ptr()
+        )
+        if r != 0 and not isdir(dest):
+            raise Error("could not install the source snapshot ", dest)
+        if r != 0:  # another process installed the same snapshot first
+            _ = run_command("rm -rf '" + tmp + "'")
+        return (dest, h)
 
     def source_hash(mut self, family: String) raises -> String:
         return self._hash_closure(
@@ -229,6 +277,7 @@ struct Loader(Movable):
         mut self,
         label: String,
         src: String,
+        root: String,
         defines: List[String],
         out_path: String,
     ) raises:
@@ -249,14 +298,28 @@ struct Loader(Movable):
         )
         # MODULAR_HOME, MODULAR_CACHE_DIR: the compiler's own caches go to
         # local scratch too (native/__init__.py compiler_env explains why)
-        var cmd = (
-            _compiler_env()
-            + " '"
+        var cmd = _compiler_env()
+        var import_path = getenv(MODULAR_MOJO_MAX_IMPORT_PATH)
+        if root != self.root and import_path != "":
+            # The import path names the live source root too, and its entries
+            # outrank -I: a snapshot build drops every entry holding a `tmb`
+            # package, or each `tmb` module would resolve twice (ambiguous
+            # import) -- or worse, to the live file.
+            var kept = List[String]()
+            for e in import_path.split(","):
+                var entry = String(e)
+                if entry != "" and not isdir(entry + "/" + KERNELS):
+                    kept.append(entry)
+            cmd += (
+                " " + MODULAR_MOJO_MAX_IMPORT_PATH + "='" + ",".join(kept) + "'"
+            )
+        cmd += (
+            " '"
             + self.mojo_exe
             + "' build '"
             + src
             + "' --emit shared-lib -I '"
-            + self.root
+            + root
             + "'"
         )
         comptime if CompilationTarget.is_macos():
@@ -346,6 +409,7 @@ struct Loader(Movable):
         so: String,
         label: String,
         src: String,
+        root: String,
         defines: List[String],
     ) raises:
         """Build `so` unless it is already in the cache, once per box: the
@@ -365,7 +429,7 @@ struct Loader(Movable):
 
         try:
             if not exists(so):
-                self._build(label, src, defines, so)
+                self._build(label, src, root, defines, so)
         finally:
             if fd >= 0:
                 _ = external_call["flock", Int32](fd, Int32(8))  # LOCK_UN
@@ -393,13 +457,19 @@ struct Loader(Movable):
                 + self.source_hash(family)
                 + ".so"
             )
-            self._ensure_built(
-                key,
-                so,
-                family,
-                self.family_dir(family) + "/entry.mojo",
-                defines,
-            )
+            if not exists(so):
+                # A miss compiles a snapshot of the sources and keys the
+                # build by THAT snapshot's hash, never by the memo.
+                var snap = self.snapshot(family)
+                so = self.cache_dir + "/" + key + ".hash-" + snap[1] + ".so"
+                self._ensure_built(
+                    key,
+                    so,
+                    family,
+                    snap[0] + "/" + KERNELS + "/" + family + "/entry.mojo",
+                    snap[0],
+                    defines,
+                )
             var fam = Family(so)
             var addr = fam.entry
             self.families[key] = fam^
