@@ -30,6 +30,7 @@ from tmb.backend.abi import (
     TAG_SCALAR_INT,
     TAG_TENSOR,
     Value,
+    _channels_last_strides,
     Values,
     bool_arg,
     contiguous_strides,
@@ -38,6 +39,7 @@ from tmb.backend.abi import (
     int_arg,
     new_like,
     new_like_dtype,
+    new_strided,
     new_tensor,
     none_arg,
     own,
@@ -67,6 +69,7 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     forward_args,
+    is_channels_last_layout,
     resize_out,
     store_out,
 )
@@ -1315,7 +1318,8 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     if inner <= 0 or planes <= 0:
         unsupported("batch norm geometry must be positive")
     var am = _mat(a)
-    var out = own(new_like(a))
+    var out_cl = is_channels_last_layout(a)
+    var out = own(_bn_out_alloc(a, out_cl))
     var save_mean = own(_channel_vec(channels, mean.stype, a.device))
     var save_invstd = own(_channel_vec(channels, mean.stype, a.device))
     var ctx = ctx_for(a.device)
@@ -1339,6 +1343,7 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     params.append(1 if has_b else 0)
     params.append(save_mean.t.ptr)
     params.append(save_invstd.t.ptr)
+    params.append(1 if out_cl else 0)
     call.tuple(params)
     call.int(ctx_ptr(ctx))
     call.run()
@@ -1361,6 +1366,21 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
         return
     ret_owned(rets, 1, save_mean)
     ret_owned(rets, 2, save_invstd)
+
+
+def _bn_out_alloc(a: T, out_cl: Bool) raises -> T:
+    """The batch-norm output, laid out as CUDA's `empty_like(input)` for a
+    channels-last input (the elementwise kernel writes it in place), else
+    contiguous."""
+    if out_cl:
+        return new_strided(
+            a.shape,
+            _channels_last_strides(a.shape, a.rank),
+            a.rank,
+            a.stype,
+            a.device,
+        )
+    return new_like(a)
 
 
 def _channel_vec(channels: Int, stype: Int32, device: Int) raises -> T:
@@ -1456,7 +1476,8 @@ def _bn_training(args: Values, rets: Values) raises:
         hxw *= a.dim(i)
     var runs = a.dim(0)
     var am = _mat(a)
-    var out = own(new_like(a))
+    var out_cl = is_channels_last_layout(a)
+    var out = own(_bn_out_alloc(a, out_cl))
     var save_mean = own(_channel_vec(channels, ST_FLOAT32, a.device))
     var save_invstd = own(_channel_vec(channels, ST_FLOAT32, a.device))
     var ctx = ctx_for(a.device)
@@ -1487,6 +1508,7 @@ def _bn_training(args: Values, rets: Values) raises:
     params.append(1 if has_w else 0)
     params.append(1 if has_b else 0)
     params.append(1 if has_mean else 0)
+    params.append(1 if out_cl else 0)
     call.tuple(params)
     call.int(ctx_ptr(ctx))
     call.run()

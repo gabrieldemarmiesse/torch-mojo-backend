@@ -932,6 +932,13 @@ def like_layout(var r: Owned, like: T, any_dense: Bool = False) raises -> Owned:
         strides = _channels_last_strides(like.shape, like.rank)
     else:
         return r^
+    var same = True
+    for i in range(like.rank):
+        var k = MAX_RANK - like.rank + i
+        if like.shape[k] > 1 and r.t.strides[k] != strides[k]:
+            same = False
+    if same:
+        return r^  # already laid out so: nothing to copy
     var out = own(
         new_strided(like.shape, strides, like.rank, r.t.stype, r.t.device)
     )

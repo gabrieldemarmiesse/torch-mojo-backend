@@ -1104,8 +1104,8 @@ def _bn_sync(
     mom_i: Int,
 ) raises:
     """batch_norm_cuda on the batch_norm_sync kernels, for a float64 input
-    (the normalization_forward kernels are float32 throughout) or a
-    channels-last one (read and written where it lies, no relayout copy):
+    (the normalization_forward kernels are float32 throughout; a
+    channels-last one is read and written where it lies):
     Welford statistics with the running update and `rsqrt(var + eps)`
     (batch_norm_update_stats_and_invert / batch_norm_calc_invstd), or the
     running statistics copied and inverted, then batch_norm_elementwise."""
@@ -1186,10 +1186,10 @@ def _bn_sync(
 
 
 def _sync_route(a: T) raises -> Bool:
-    """float64, or a channels-last input of any float dtype."""
-    return a.on_mojo() and (
-        a.dtype == DType.float64 or is_channels_last_layout(a)
-    )
+    """float64, which the normalization_forward kernels (float32
+    throughout) do not take; every other dtype, channels-last included,
+    stays on them."""
+    return a.on_mojo() and a.dtype == DType.float64
 
 
 def _relayout_ret0(rets: Values, a: T) raises:

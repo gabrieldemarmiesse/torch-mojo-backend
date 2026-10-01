@@ -40,6 +40,7 @@ from tmb.kernels.common.op_utils import (
     _raw_int,
     _raw_tuple_f64,
     _raw_tuple_int,
+    _raw_tuple_len,
     _spec_dispatcher10,
     _spec_dispatcher15,
     _spec_dispatcher8,
@@ -218,6 +219,8 @@ def _batch_norm_infer_go(
     # the elementwise kernel emits them from the prologue it already runs.
     var save_mean_addr = _raw_tuple_int(params, 6)
     var save_invstd_addr = _raw_tuple_int(params, 7)
+    # Optional ninth slot: write the output channels-last.
+    var out_cl = _raw_tuple_len(params) > 8 and _raw_tuple_int(params, 8) != 0
     if channels <= 0 or inner <= 0 or planes <= 0:
         raise Error("batch norm geometry must be positive")
     if out_addr == 0 or in_addr == 0 or mean_addr == 0 or var_addr == 0:
@@ -254,6 +257,7 @@ def _batch_norm_infer_go(
                         ctx,
                         save_mean_addr,
                         save_invstd_addr,
+                        out_cl,
                     )
     if not handled:
         raise Error("unsupported dtype combination for batch norm inference")
@@ -290,6 +294,8 @@ def _batch_norm_train_go(
     var has_weight = _raw_tuple_int(params, 5) != 0
     var has_bias = _raw_tuple_int(params, 6) != 0
     var has_running = _raw_tuple_int(params, 7) != 0
+    # Optional ninth slot: write the output channels-last.
+    var out_cl = _raw_tuple_len(params) > 8 and _raw_tuple_int(params, 8) != 0
     if channels <= 0 or runs <= 0 or hxw <= 0:
         raise Error("batch norm geometry must be positive")
     if out_addr == 0 or in_addr == 0:
@@ -343,6 +349,9 @@ def _batch_norm_train_go(
                         has_weight,
                         has_bias,
                         ctx,
+                        0,
+                        0,
+                        out_cl,
                     )
     if not handled:
         raise Error("unsupported dtype combination for batch norm training")

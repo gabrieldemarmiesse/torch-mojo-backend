@@ -130,16 +130,25 @@ def _bn_scale_shift[
         shift = beta_ptr[unsafe_offset=c].cast[DType.float32]()
 
 
+@always_inline
+def _cl_suffix[out_cl: Bool]() -> StaticString:
+    comptime if out_cl:
+        return "_cl"
+    else:
+        return ""
+
+
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(BN_THREADS))
 )
-@__name(t"batch_norm_elemwise_{dtype}_{from_invstd}_v{V}")
+@__name(t"batch_norm_elemwise_{dtype}_{from_invstd}_v{V}{_cl_suffix[out_cl]()}")
 def _bn_elementwise_kernel[
     dtype: DType,
     pdtype: DType,
     sdtype: DType,
     V: Int,
     from_invstd: Bool,
+    out_cl: Bool = False,
 ](
     out_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
     in_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
@@ -219,9 +228,16 @@ def _bn_elementwise_kernel[
         var x = in_ptr.unsafe_load[width=V, alignment=align](at).cast[
             DType.float32
         ]()
-        out_ptr.unsafe_store[width=V, alignment=align](
-            at, ((x - mean) * scale + shift).cast[dtype]()
-        )
+        var y = ((x - mean) * scale + shift).cast[dtype]()
+        comptime if out_cl:
+            # A channels-last output (V == 1): element (n, c, s) of the
+            # contiguous input lands at (n * inner + s) * channels + c.
+            var n = plane // channels
+            out_ptr.unsafe_store[width=V, alignment=align](
+                (n * inner_slots + slot) * channels + plane - n * channels, y
+            )
+        else:
+            out_ptr.unsafe_store[width=V, alignment=align](at, y)
         plane += plane_stride
 
 
@@ -714,9 +730,11 @@ def enqueue_batch_norm_elementwise[
     ctx: DeviceContext,
     save_mean_addr: Int = 0,
     save_invstd_addr: Int = 0,
+    out_cl: Bool = False,
 ) raises:
     """`out = (x - mean[c]) * invstd[c] * gamma[c] + beta[c]` over an NC...
-    contiguous tensor, `inner` being the product of the dims after C."""
+    contiguous tensor, `inner` being the product of the dims after C; with
+    `out_cl` the output is written channels-last (unvectorized)."""
     comptime if not has_accelerator():
         raise Error("no GPU accelerator available at compile time")
     var out_ptr = _make_ptr[dtype](out_addr).as_unsafe_any_origin()
@@ -737,6 +755,31 @@ def enqueue_batch_norm_elementwise[
     comptime V = 16 // size_of[dtype]()
     # A plane starts at `plane * inner`, so `inner % V == 0` plus a 16-byte
     # aligned base is what makes every plane's vectors land on a boundary.
+    if out_cl:
+        _enqueue_cached[
+            _bn_elementwise_kernel[dtype, pdtype, sdtype, 1, from_invstd, True]
+        ](
+            ctx,
+            ceildiv(inner, BN_THREADS),
+            max(1, min(planes, _MAX_GRID)),
+            1,
+            BN_THREADS,
+            out_ptr,
+            in_ptr,
+            mean_ptr,
+            var_ptr,
+            gamma_ptr,
+            beta_ptr,
+            save_mean_ptr,
+            save_invstd_ptr,
+            eps,
+            Int64(inner),
+            Int64(channels),
+            Int64(planes),
+            Int64(hw),
+            Int64(hb),
+        )
+        return
     var vectorized = (
         _vec16_phase[dtype](in_addr) == 0
         and _vec16_phase[dtype](out_addr) == 0

@@ -657,33 +657,81 @@ def test_batch_norm_elemt_mixed_parameter_dtypes(mojo_device):
     torch.testing.assert_close(got.cpu(), want)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def _cl(x):
+    return x.to(
+        memory_format=torch.channels_last if x.dim() == 4 else torch.channels_last_3d
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("training", [True, False])
-def test_batch_norm_channels_last_matches_contiguous(mojo_device, dtype, training):
-    """The channels-last route (read and written in place) gives the values
-    of the contiguous one, running statistics included."""
-    x, w, b, rm, rv = _bn_inputs((3, 4, 5, 6), dtype)
+@pytest.mark.parametrize("shape", [(3, 4, 5, 6), (2, 3, 4, 5, 3)])
+def test_batch_norm_channels_last_matches_cpu(mojo_device, dtype, training, shape):
+    """NHWC / NDHWC in, the same layout out (CUDA's `empty_like`), values
+    and running statistics as CPU torch's (the float32 computation)."""
+    x, w, b, rm, rv = _bn_inputs(shape, dtype)
+    xcl = _cl(x)
     w32, b32 = w.float(), b.float()
-    rm1, rv1 = _to(mojo_device, rm.float(), rv.float())
-    rm2, rv2 = _to(mojo_device, rm.float(), rv.float())
-    xd = x.to(mojo_device)
+    rm32, rv32 = rm.float().clone(), rv.float().clone()
+    rmd, rvd = _to(mojo_device, rm32, rv32)
     want = aten.native_batch_norm(
-        xd, *_to(mojo_device, w32, b32), rm1, rv1, training, 0.1, 1e-5
+        xcl.float(), w32, b32, rm32, rv32, training, 0.1, 1e-5
     )
     got = aten.native_batch_norm(
-        xd.to(memory_format=torch.channels_last),
-        *_to(mojo_device, w32, b32),
-        rm2,
-        rv2,
-        training,
-        0.1,
-        1e-5,
+        *_to(mojo_device, xcl, w32, b32), rmd, rvd, training, 0.1, 1e-5
     )
-    assert got[0].is_contiguous(memory_format=torch.channels_last)
-    for g_, w_ in zip(got, want):
-        _close(g_.contiguous(), w_.cpu(), dtype)
-    _close(rm2, rm1.cpu())
-    _close(rv2, rv1.cpu())
+    assert got[0].stride() == xcl.stride()
+    _close(got[0], want[0].to(dtype), dtype)
+    if training:
+        _close(got[1], want[1])
+        _close(got[2], want[2])
+        _close(rmd, rm32)
+        _close(rvd, rv32)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("shape", [(3, 4, 5, 6), (2, 3, 4, 5, 3)])
+def test_sync_batch_norm_ops_channels_last(mojo_device, dtype, shape):
+    """SyncBatchNorm's blocks on channels-last inputs, read where they lie:
+    against the float64 formulas, the elementwise outputs channels-last."""
+    x, w, _, _, _ = _bn_inputs(shape, dtype)
+    g = torch.randn(shape).to(dtype)
+    xcl, gcl = _cl(x), _cl(g)
+    c = shape[1]
+    mean, var = _ref_stats(x)
+    got_mean, got_invstd = aten.batch_norm_stats(xcl.to(mojo_device), 1e-5)
+    _close(got_mean, mean)
+    _close(got_invstd, 1 / (var + 1e-5).sqrt())
+    m = torch.randn(c)
+    inv = torch.rand(c) + 0.5
+    bshape = [1, c] + [1] * (len(shape) - 2)
+    e = aten.batch_norm_elemt(*_to(mojo_device, xcl, None, None, m, inv), 1e-5)
+    assert e.stride() == xcl.stride()
+    want_e = (x.double() - m.double().view(bshape)) * inv.double().view(bshape)
+    _close(e, want_e.to(dtype), dtype)
+    red = aten.batch_norm_backward_reduce(
+        *_to(mojo_device, gcl, xcl, m, inv, None), True, False, False
+    )
+    want_red = _ref_backward_reduce(g, x, m, inv)
+    tol = 2e-5 if dtype == torch.float32 else 3e-2
+    for k in range(2):
+        scale = 1 + _planes(g).abs().sum(dim=(0, 2)) * 4
+        assert ((red[k].cpu().double() - want_red[k]).abs() <= tol * scale).all()
+    sdy, sdx = torch.randn(c), torch.randn(c)
+    cnt = torch.tensor([7], dtype=torch.int32)
+    gi = aten.batch_norm_backward_elemt(
+        *_to(mojo_device, gcl, xcl, m, inv, None, sdy, sdx, cnt)
+    )
+    assert gi.stride() == xcl.stride()
+    norm = 1 / 7
+    iv = inv.double().view(bshape)
+    want_gi = (
+        g.double()
+        - (sdy.double() * norm).view(bshape)
+        - (x.double() - m.double().view(bshape))
+        * (iv * iv * sdx.double().view(bshape) * norm)
+    ) * iv
+    _close(gi, want_gi.to(dtype), dtype)
 
 
 def test_batch_norm_dense_permuted_input_keeps_strides(mojo_device):

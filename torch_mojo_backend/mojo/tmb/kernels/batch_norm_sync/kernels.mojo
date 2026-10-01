@@ -286,10 +286,21 @@ def bn_elemt[
         out_cl,
     )
     def func[width: Int, alignment: Int = 1](idx: Coord):
+        # Walk the output's physical order, so its writes (and a same-layout
+        # input's reads) are coalesced.
         var i = Int(idx[0].value())
-        var c = (i // hxw) % channels
-        var n = i // (hxw * channels)
-        var sp = i % hxw
+        var c: Int
+        var n: Int
+        var sp: Int
+        if out_cl:
+            c = i % channels
+            var q = i // channels
+            sp = q % hxw
+            n = q // hxw
+        else:
+            c = (i // hxw) % channels
+            n = i // (hxw * channels)
+            sp = i % hxw
         var gamma = w_ptr[unsafe_offset=c].cast[acc_t]() if has_w else Scalar[
             acc_t
         ](1)
@@ -749,10 +760,21 @@ def bn_backward_elemt[
         out_cl,
     )
     def func[width: Int, alignment: Int = 1](idx: Coord):
+        # Walk the output's physical order, so its writes (and a same-layout
+        # input's reads) are coalesced.
         var i = Int(idx[0].value())
-        var c = (i // hxw) % channels
-        var n = i // (hxw * channels)
-        var sp = i % hxw
+        var c: Int
+        var n: Int
+        var sp: Int
+        if out_cl:
+            c = i % channels
+            var q = i // channels
+            sp = q % hxw
+            n = q // hxw
+        else:
+            c = (i // hxw) % channels
+            n = i // (hxw * channels)
+            sp = i % hxw
         var total = 0
         for k in range(world):
             total += Int(cnt_ptr[unsafe_offset=k])
