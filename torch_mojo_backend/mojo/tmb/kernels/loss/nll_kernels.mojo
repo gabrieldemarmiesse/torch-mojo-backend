@@ -68,16 +68,20 @@ comptime P_LEN = 7
 
 
 @always_inline
-def _valid(t: Int, ignore_index: Int, classes: Int, err_addr: Int) -> Bool:
+def _valid(
+    t: Int,
+    ignore_index: Int,
+    classes: Int,
+    err: Pointer[Scalar[DType.int64], MutAnyOrigin],
+) -> Bool:
     """Whether target `t` contributes. A target that is neither
     `ignore_index` nor in `[0, classes)` (CUDA's device assert) raises the
-    int64 flag at `err_addr` and records the target after it; the op reads
+    int64 flag at `err` and records the target after it; the op reads
     them back and raises."""
     if t == ignore_index:
         return False
     if t >= 0 and t < classes:
         return True
-    var err = _make_ptr[DType.int64](err_addr)
     err[unsafe_offset=1] = Int64(t)
     err[unsafe_offset=0] = 1
     return False
@@ -105,6 +109,8 @@ def nll_forward_none[
     var t_ptr = _make_ptr[tdtype](target_addr)
     var w_ptr = _make_ptr[dtype](weight_addr)
     var has_w = weight_addr != 0
+    # A typed pointer, captured: Metal reaches only buffers handed in.
+    var err_ptr = _make_ptr[DType.int64](err_addr).as_unsafe_any_origin()
 
     @always_inline
     @__parameter
@@ -117,7 +123,7 @@ def nll_forward_none[
         classes,
         map,
         ignore_index,
-        err_addr,
+        err_ptr,
     )
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -125,7 +131,7 @@ def nll_forward_none[
         var s = i - b * map
         var t = Int(t_ptr[unsafe_offset=i])
         var loss = Scalar[dtype](0)
-        if _valid(t, ignore_index, classes, err_addr):
+        if _valid(t, ignore_index, classes, err_ptr):
             var w = w_ptr[unsafe_offset=t] if has_w else Scalar[dtype](1)
             loss = -w * in_ptr[unsafe_offset=(b * classes + t) * map + s]
         out_ptr[unsafe_offset=i] = loss
@@ -148,10 +154,9 @@ def _nll_reduce_kernel[
     mean_arg: Int64,
     ignore_arg: Int64,
     one_d_arg: Int64,
-    err_arg: Int64,
+    err_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ):
     """Loss.cu nll_loss_forward_reduce_cuda_kernel_{1d,2d}: one block."""
-    var err_addr = Int(err_arg)
     comptime acc_t = _acc[dtype]()
     var has_w = Int(has_w_arg) != 0
     var nframe = Int(nframe_arg)
@@ -163,7 +168,7 @@ def _nll_reduce_kernel[
     if Int(one_d_arg) != 0:
         if tid == 0:
             var t = Int(t_ptr[unsafe_offset=0])
-            if _valid(t, ignore_index, classes, err_addr):
+            if _valid(t, ignore_index, classes, err_ptr):
                 var w = w_ptr[unsafe_offset=t] if has_w else Scalar[dtype](1)
                 tw_ptr[unsafe_offset=0] = w
                 if mean:
@@ -189,7 +194,7 @@ def _nll_reduce_kernel[
     var i = tid
     while i < nframe:
         var t = Int(t_ptr[unsafe_offset=i])
-        if _valid(t, ignore_index, classes, err_addr):
+        if _valid(t, ignore_index, classes, err_ptr):
             var w = w_ptr[unsafe_offset=t] if has_w else Scalar[dtype](1)
             acc_in -= (in_ptr[unsafe_offset=i * classes + t] * w).cast[acc_t]()
             acc_w += w.cast[acc_t]()
@@ -258,7 +263,7 @@ def nll_forward_reduce[
         Int64(1 if mean else 0),
         Int64(ignore_index),
         Int64(1 if one_d else 0),
-        Int64(err_addr),
+        _make_ptr[DType.int64](err_addr).as_unsafe_any_origin(),
     )
 
 
@@ -275,7 +280,7 @@ def _nll2d_partial_kernel[
     map_arg: Int64,
     bps_arg: Int64,
     ignore_arg: Int64,
-    err_arg: Int64,
+    err_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ):
     """NLLLoss2d.cu nll_loss2d_forward_kernel up to its block reduction; the
     two block sums go to `scratch[2 * block]` rounded to the input dtype
@@ -286,7 +291,6 @@ def _nll2d_partial_kernel[
     var map = Int(map_arg)
     var bps = Int(bps_arg)
     var ignore_index = Int(ignore_arg)
-    var err_addr = Int(err_arg)
     var blk = Int(block_idx.x)
     var sample = blk // bps
     var toffset = sample * map
@@ -297,7 +301,7 @@ def _nll2d_partial_kernel[
     var i = (blk % bps) * NLL2D_THREADS + Int(thread_idx.x)
     while i < map:
         var t = Int(t_ptr[unsafe_offset=toffset + i])
-        if _valid(t, ignore_index, classes, err_addr):
+        if _valid(t, ignore_index, classes, err_ptr):
             var w = w_ptr[unsafe_offset=t] if has_w else Scalar[dtype](1)
             input_sum -= (in_ptr[unsafe_offset=ioffset + i + map * t] * w).cast[
                 acc_t
@@ -379,7 +383,7 @@ def nll2d_forward_reduce[
         Int64(map),
         Int64(bps),
         Int64(ignore_index),
-        Int64(err_addr),
+        _make_ptr[DType.int64](err_addr).as_unsafe_any_origin(),
     )
     _enqueue_cached[_nll2d_final_kernel[dtype]](
         ctx,
@@ -423,6 +427,8 @@ def nll_backward[
     var w_ptr = _make_ptr[dtype](weight_addr)
     var tw_ptr = _make_ptr[dtype](tw_addr)
     var has_w = weight_addr != 0
+    # A typed pointer, captured: Metal reaches only buffers handed in.
+    var err_ptr = _make_ptr[DType.int64](err_addr).as_unsafe_any_origin()
 
     @always_inline
     @__parameter
@@ -437,12 +443,12 @@ def nll_backward[
         map,
         reduction,
         ignore_index,
-        err_addr,
+        err_ptr,
     )
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
         var t = Int(t_ptr[unsafe_offset=i])
-        if not _valid(t, ignore_index, classes, err_addr):
+        if not _valid(t, ignore_index, classes, err_ptr):
             return
         var b = i // map
         var s = i - b * map
