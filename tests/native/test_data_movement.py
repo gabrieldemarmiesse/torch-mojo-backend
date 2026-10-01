@@ -3346,9 +3346,13 @@ def _alias_index_select(d: str) -> torch.Tensor:
 
 
 def _alias_cat(d: str) -> torch.Tensor:
+    """Inputs that share the resized out's storage race with the writes (on
+    CUDA too): only the elements no other write can reach are checked --
+    out[0] (x[0] onto itself), out[3] (x[3] onto itself), and the storage
+    past the out."""
     x = torch.arange(8.0, device=d)
     torch.cat([x[::2][:2], x[1::2][:2]], out=x[:0])
-    return x
+    return x[[0, 3, 4, 5, 6, 7]]
 
 
 def _alias_linear1d_bwd(d: str) -> torch.Tensor:
@@ -3395,7 +3399,7 @@ _ALIASING_ROWS = {
         _alias_index_select,
         [3.0, 2.0, 2.0, 3.0, 4.0, 5.0],
     ),
-    "cat_inputs_in_order": (_alias_cat, [0.0, 2.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+    "cat_reads_after_resize": (_alias_cat, [0.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
     "linear1d_bwd_zeroes_aliased_grad": (_alias_linear1d_bwd, [0.0] * 4),
     "reflection_pad_bwd_zeroes_aliased_grad": (_alias_pad_bwd, [0.0] * 16),
     "nearest2d_bwd_same_size_copy": (_alias_nearest2d_bwd_same, [0.0, 1.0, 2.0, 3.0]),

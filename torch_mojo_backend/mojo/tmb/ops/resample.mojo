@@ -565,7 +565,11 @@ def op_upsample_backward[
         # interpolating backwards take that `.contiguous()` first, then
         # zero; the nearest ones never zero.
         comptime if MODE == LINEAR and RANK == 2:
-            fill_value(dst, 0.0)
+            # CUDA zeroes grad_input before reading grad_output; the gather
+            # kernel writes every element, so only an aliased grad_output can
+            # tell the difference: zero only then.
+            if shares_storage(dst, g):
+                fill_value(dst, 0.0)
             if shortcut:
                 if dst.impl() != g.impl():
                     copy_strided_into(dst, g)  # grad_input.copy_(grad_output)
@@ -577,7 +581,11 @@ def op_upsample_backward[
                 _ = src^
         elif MODE >= LINEAR:
             var src = own_if_new(contiguous(g), g)
-            fill_value(dst, 0.0)
+            # CUDA zeroes grad_input before reading grad_output; the gather
+            # kernel writes every element, so only an aliased grad_output can
+            # tell the difference: zero only then.
+            if shares_storage(dst, g):
+                fill_value(dst, 0.0)
             _into[MODE, RANK, True](
                 dst, src.t, identity, in_dims, out_dims, align, scales
             )
@@ -895,7 +903,11 @@ def op_pad_backward[
         var dst = _dest(args, 3, g, in_dims, [g.copy()], False, False)
         g = T(g.h)  # the resize may have moved a storage `g` shares
         if dst.numel > 0:
-            fill_value(dst, 0.0)
+            # CUDA zeroes grad_input before reading grad_output; the gather
+            # kernel writes every element, so only an aliased grad_output can
+            # tell the difference: zero only then.
+            if shares_storage(dst, g):
+                fill_value(dst, 0.0)
         _pad_into[REFLECT, RANK, True](dst, g, in_dims, out_dims, padding)
         ret_ref(rets, 0, dst)
     else:

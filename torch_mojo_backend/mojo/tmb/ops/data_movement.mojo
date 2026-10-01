@@ -1297,9 +1297,10 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             if shares_storage(out, x):
                 shared = True
         if shared:
-            # CUDA copies the inputs into their slices one after another, so
-            # an input sharing the out's storage reads what earlier inputs
-            # wrote there.
+            # An input sharing the out's storage races with the writes on
+            # CUDA (parallel_cat copies contiguous inputs in one launch);
+            # here the inputs are copied into their slices one after another,
+            # one of the outcomes that race allows, read after the resize.
             _ = result^
             var at = 0
             for x in real:
