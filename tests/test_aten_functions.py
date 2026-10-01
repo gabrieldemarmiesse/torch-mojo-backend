@@ -6568,6 +6568,32 @@ def test_aten_nan_to_num_integral_compiled_is_a_copy(dtype: torch.dtype, device:
     torch.testing.assert_close(x, before)
 
 
+@pytest.mark.parametrize("beta,alpha", [(1, 1), (0.6, 0.2), (0, 0.5)])
+def test_aten_addmv(conf: Conf, call_checker: CallChecker, beta: float, alpha: float):
+    call_checker.register(aten_functions.aten_addmv)
+
+    def fn(c, mat, vec):
+        return aten.addmv(c, mat, vec, beta=beta, alpha=alpha)
+
+    c = torch.randn(5)
+    if beta == 0:
+        c[0] = float("nan")  # beta == 0 never reads self
+    check_outputs(fn, conf, [c, torch.randn(5, 7), torch.randn(7)])
+
+
+@pytest.mark.parametrize("beta,alpha", [(1, 1), (0.6, 0.2), (0, 0.5)])
+def test_aten_addbmm(conf: Conf, call_checker: CallChecker, beta: float, alpha: float):
+    call_checker.register(aten_functions.aten_addbmm)
+
+    def fn(c, b1, b2):
+        return aten.addbmm(c, b1, b2, beta=beta, alpha=alpha)
+
+    c = torch.randn(4, 6)
+    if beta == 0:
+        c[0, 0] = float("nan")
+    check_outputs(fn, conf, [c, torch.randn(3, 4, 5), torch.randn(3, 5, 6)])
+
+
 @pytest.mark.parametrize("name", ["igamma", "igammac"])
 def test_aten_igamma(conf: Conf, call_checker: CallChecker, name: str):
     call_checker.register(getattr(aten_functions, f"aten_{name}"))
