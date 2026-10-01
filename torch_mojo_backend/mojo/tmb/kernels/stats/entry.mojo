@@ -542,9 +542,9 @@ def _welford_project[
 ):
     """`WelfordOps::project`: var = m2 / max(n - correction, 0), its root for
     std, rounded once to the output dtype."""
-    var divisor = nf - correction
-    if divisor < 0:
-        divisor = Scalar[acc](0)
+    # `nf > correction ? nf - correction : 0`: a NaN correction (every
+    # comparison false) divides by 0, as on CUDA.
+    var divisor = nf - correction if nf > correction else Scalar[acc](0)
     var v = m2 / divisor
     if take_sqrt:
         v = sqrt(v)

@@ -267,13 +267,28 @@ def _compare_functional_out(
     ret_ref(rets, 0, out_arg)
 
 
+def _scalar_fill(a: T, v: Value) raises -> Owned:
+    """The Scalar operand as a 0-d tensor of `a`'s dtype. An integer scalar
+    against an integer tensor is filled from its int64 bits (the #606
+    integer-Scalar path, exact past 2**53); everything else goes through
+    `scalar_embed`'s Float64."""
+    var fill = own(new_scalar(a.stype, a.device))
+    if (
+        v_scalar_is_integral(v)
+        and not a.dtype.is_floating_point()
+        and a.dtype != DType.bool
+    ):
+        fill_value(fill.t, v)
+    else:
+        fill_value(fill.t, scalar_embed(v, a.dtype))
+    return fill^
+
+
 def _compare_scalar(op: StaticString, args: Values, rets: Values) raises:
     var a = v_tensor(args[unsafe_offset=0])
     if not a.on_mojo():
         raise Error("expected the mojo device")
-    var value = scalar_embed(args[unsafe_offset=1], a.dtype)
-    var fill = own(new_scalar(a.stype, a.device))
-    fill_value(fill.t, value)
+    var fill = _scalar_fill(a, args[unsafe_offset=1])
     var out = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
     _compare_spec(op, a, fill.t, out.t)
     _ = fill^  # alive past the launch
@@ -286,9 +301,7 @@ def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
         raise Error("expected the mojo device")
     var out_arg = v_tensor(args[unsafe_offset=2])
     _compare_out_guard(out_arg, a, a)
-    var value = scalar_embed(args[unsafe_offset=1], a.dtype)
-    var fill = own(new_scalar(a.stype, a.device))
-    fill_value(fill.t, value)
+    var fill = _scalar_fill(a, args[unsafe_offset=1])
     if out_arg.stype != ST_BOOL:
         var res = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
         _compare_spec(op, a, fill.t, res.t)
@@ -677,6 +690,8 @@ def _isin_scalar_tensor(el: Value, te: T, invert: Bool) raises -> Owned:
             # int64 comparison: a scalar outside the dtype matches nothing.
             var v = v_int(el)
             possible = Float64(v) >= rng[0] and Float64(v) <= rng[1]
+            if not possible:  # (a stand-in: nothing can match)
+                test = int_arg(0)
         elif te.dtype == DType.int64 and abs(x) >= 9007199254740992.0:
             # Past 2**53 several int64 values round to the same double.
             tc = own(cast_to(te, ST_FLOAT64))

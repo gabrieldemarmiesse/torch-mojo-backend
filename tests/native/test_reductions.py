@@ -4403,6 +4403,25 @@ def test_var_mean_welford_geometries(mojo_gpu, dtype, shape, dims):
         assert v.dtype == dtype and m.dtype == dtype
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float64])
+def test_var_std_nan_correction_divides_by_zero(mojo_gpu, dtype):
+    """CUDA's divisor is `n > correction ? n - correction : 0`: a NaN
+    correction gives a zero divisor, so the variance is inf (not NaN)."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    nan = float("nan")
+    x = torch.tensor([1.0, 2.0], dtype=dtype, device=mojo_gpu)
+    x2 = torch.tensor([[1.0, 2.0], [3.0, 5.0]], dtype=dtype, device=mojo_gpu)
+    for got in (
+        torch.var_mean(x, correction=nan)[0],
+        torch.std_mean(x, correction=nan)[0],
+        torch.var(x, correction=nan),
+        torch.std(x, correction=nan),
+        torch.var(x2, dim=0, correction=nan),
+    ):
+        assert torch.isinf(got.cpu()).all()
+
+
 @pytest.mark.parametrize("bad", [float("inf"), float("nan")])
 @pytest.mark.parametrize(
     ("shape", "where", "dim", "correction"),
