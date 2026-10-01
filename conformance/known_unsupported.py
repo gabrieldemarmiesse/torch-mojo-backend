@@ -248,7 +248,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "to_sparse": ("float32", "bfloat16", "float16", "int64", "bool"),
     "topk": ("bfloat16", "int64"),
     "triangular_solve": ("float32",),
-    "unique_consecutive": ("float32", "bfloat16", "float16", "int64", "bool"),
     "var_mean": ("float32", "bfloat16", "float16"),
     "var_mean_unbiased": ("float32", "bfloat16", "float16"),
     "view_as_complex": ("float32", "float16"),

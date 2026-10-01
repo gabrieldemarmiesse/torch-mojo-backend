@@ -873,3 +873,73 @@ def test_fill_tensor(mojo_device, dtype):
     _check(y, x.clone().fill_(x[1, 2].item()))
     with pytest.raises(RuntimeError, match="0-dimension value tensor"):
         x.to(mojo_device).fill_(torch.ones(2))
+
+
+# ---------------------------------------------------------------------------
+# unique family (host round trip)
+# ---------------------------------------------------------------------------
+
+
+def _as_tuple(r: torch.Tensor | tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    return r if isinstance(r, tuple) else (r,)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"return_inverse": True},
+        {"return_counts": True},
+        {"return_inverse": True, "return_counts": True},
+        {"sorted": False, "return_inverse": True},
+        {"dim": 0, "return_inverse": True, "return_counts": True},
+        {"dim": 1, "return_counts": True},
+    ],
+)
+def test_unique(mojo_device, dtype, kwargs):
+    x = (_make((4, 6), torch.float32) / 6).round().to(dtype)
+    x[2] = x[0]
+    with ran("aten::_unique2", "aten::unique_dim"):
+        got = _as_tuple(torch.unique(x.to(mojo_device), **kwargs))
+    for g, e in zip(got, _as_tuple(torch.unique(x, **kwargs)), strict=True):
+        _check(g, e)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"return_inverse": True, "return_counts": True},
+        {"dim": 0, "return_inverse": True},
+        {"dim": 1, "return_counts": True},
+    ],
+)
+def test_unique_consecutive(mojo_device, dtype, kwargs):
+    x = (_make((5, 4), torch.float32) / 8).round().to(dtype)
+    x[1] = x[0]
+    with ran("aten::unique_consecutive", "aten::unique_dim_consecutive"):
+        got = _as_tuple(torch.unique_consecutive(x.to(mojo_device), **kwargs))
+    for g, e in zip(got, _as_tuple(torch.unique_consecutive(x, **kwargs)), strict=True):
+        _check(g, e)
+
+
+def test_unique_edges(mojo_device):
+    s = torch.tensor(3.0)
+    for g, e in zip(
+        torch.unique(s.to(mojo_device), return_inverse=True),
+        torch.unique(s, return_inverse=True),
+        strict=True,
+    ):
+        _check(g, e)
+    _check(torch.unique(torch.empty(0).to(mojo_device)), torch.unique(torch.empty(0)))
+    nan = float("nan")
+    x = torch.tensor([2.0, nan, 1.0, 2.0, nan])
+    got = torch.unique(x.to(mojo_device), return_counts=True)
+    torch.testing.assert_close(got[0].cpu(), torch.unique(x), equal_nan=True)
+    # torch.unique_consecutive of a strided view.
+    y = torch.tensor([[1, 1], [2, 2], [2, 3]]).t()
+    _check(torch.unique_consecutive(y.to(mojo_device)), torch.unique_consecutive(y))
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        torch.unique(torch.ones(2, 3).to(mojo_device), dim=4)

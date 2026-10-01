@@ -204,6 +204,19 @@ SKIPPED: dict[str, str] = {
     "aten::narrow_copy.out": (
         "a narrow view's strided copy (test_copy_row_strided's kernel), copied into out"
     ),
+    **{
+        f"aten::{name}": (
+            "data-dependent output: a host round trip through the CPU kernel "
+            "of the same op, no device kernel"
+        )
+        for name in (
+            "_unique",
+            "_unique2",
+            "unique_dim",
+            "unique_consecutive",
+            "unique_dim_consecutive",
+        )
+    },
     "aten::fill_.Tensor": (
         "a one-element read of the value, then fill_.Scalar's fill kernel"
     ),
