@@ -233,7 +233,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "nn_functional_one_hot": ("int64",),
     "nn_functional_pdist": ("float32",),
     "nn_functional_poisson_nll_loss": ("int64",),
-    "nn_functional_soft_margin_loss": ("float32", "bfloat16", "float16"),
     "norm_nuc": ("float32",),
     "ormqr": ("float32",),
     "pinverse": ("float32",),
