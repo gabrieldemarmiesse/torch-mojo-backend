@@ -1,16 +1,19 @@
 """ATen ops: nn group (see agents_docs/native_backend.md).
 
-Softmax family, normalization (layer / batch / group), NLL loss, embedding,
-pooling lives in pooling.mojo, upsampling in resample.mojo. Ported from the old Python fast path
+Softmax family (masked softmax included), normalization (layer / batch /
+group), embedding; the losses live in loss.mojo, the batch-norm overloads
+and SyncBatchNorm's building blocks in batch_norm.mojo, pooling in
+pooling.mojo, upsampling in resample.mojo. Ported from the old Python fast path
 (`eager_kernels/aten_fast.py`): same dtype gating, same route cascade (which
 kernel for which dtype / layout / device), same output allocation and the same
 kernel slot lists.
 
 Families used: nn (classic pointer ABI + SoftmaxSpec),
 normalization_forward, normalization_backward, softmax_backward,
-loss, embedding_backward, reduction (LogSoftmaxSpec).
+embedding_backward, reduction (LogSoftmaxSpec).
 """
 from std.utils import IndexList
+from std.utils.numerics import min_or_neg_inf
 
 from tmb.backend.abi import (
     IntList,
@@ -20,6 +23,7 @@ from tmb.backend.abi import (
     T,
     TAG_BOOL,
     TAG_BOOL_LIST,
+    TAG_DTYPE,
     TAG_INT_LIST,
     TAG_NONE,
     TAG_SCALAR_DOUBLE,
@@ -27,10 +31,11 @@ from tmb.backend.abi import (
     TAG_TENSOR,
     Value,
     Values,
-    bits_f64,
+    bool_arg,
     contiguous_strides,
     dtype_code,
     f64_bits,
+    int_arg,
     new_like,
     new_like_dtype,
     new_tensor,
@@ -40,6 +45,7 @@ from tmb.backend.abi import (
     ret_owned,
     ret_ref,
     ret_tensor,
+    tensor_arg,
     view_strided,
     unsupported,
     v_bool,
@@ -55,16 +61,16 @@ from tmb.kernels.common.op_utils import MAX_RANK, _f64_slot
 from tmb.ops.common import (
     call_op,
     cast_to,
+    check_out_as,
     contiguous,
     copy_strided_into,
     fill_value,
+    forward_args,
     resize_out,
+    store_out,
 )
+from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
-
-# The three dtypes every nn kernel family is instantiated for
-# (`op_utils.FLOAT_DTYPES` / `aten_fast._FLOAT_DTYPES`).
-comptime NAN_BITS = Int64(0x7FF8000000000000)
 
 
 def _is_float(dt: DType) -> Bool:
@@ -279,17 +285,10 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
         return
     var work = _cast(self, work_stype)
     var rank = work.t.rank
-    if rank == 0:
-        if log_variant and dim != -1 and dim != 0:
-            unsupported("log_softmax dim out of range for a 0-d tensor")
-        var flat = own(new_like(work.t))
-        fill_value(flat.t, 0.0 if log_variant else 1.0)
-        ret_owned(rets, 0, flat)
-        return
-    if dim < -rank or dim >= rank:
+    if dim < -max(rank, 1) or dim >= max(rank, 1):
         unsupported("softmax dim out of range")
     if dim < 0:
-        dim += rank
+        dim += max(rank, 1)
     var family = String("nn")
     var op = String("SoftmaxSpec")
     if work.t.dtype == DType.float64:
@@ -297,6 +296,16 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
     elif log_variant:
         family = String("reduction")
         op = String("LogSoftmaxSpec")
+    if rank == 0:
+        # CUDA's host_softmax views a 0-d input as `[1]`, so a lone -inf or
+        # NaN propagates (exp(-inf - -inf) is NaN) instead of reading 1.
+        var x = _as_rank1(work.t)
+        var flat = own(new_like(x.t))
+        _softmax_launch(family, op, log_variant, x.t, flat.t)
+        var res = _shaped_as(flat^, work.t)
+        _ = x^
+        ret_owned(rets, 0, res)
+        return
     if dim == rank - 1:
         var src = _mat(work.t)
         var out = own(
@@ -467,6 +476,285 @@ def _check_rows(dst: T, cols: Int, numel: Int) raises:
         )
     if numel // cols >= 2147483648:
         unsupported("_log_softmax_backward_data: more than 2^31 rows")
+
+
+# ---------------------------------------------------------------------------
+# Softmax `out=` overloads and the masked softmax pair
+# ---------------------------------------------------------------------------
+
+
+def sizes_str(t: T) -> String:
+    """`IntArrayRef` as torch streams it into an error message: `[2, 3]`."""
+    var s = String("[")
+    for i in range(t.rank):
+        if i:
+            s += ", "
+        s += String(t.dim(i))
+    return s + "]"
+
+
+def _softmax_out(
+    args: Values, rets: Values, name: StaticString, out_i: Int, stype: Int32
+) raises:
+    """A structured softmax `out=` overload: its functional overload, then
+    `resize_output` + copy into the caller's tensor. `stype` is the dtype the
+    meta function gives the result; the out must already carry it."""
+    var like = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=out_i])
+    check_out_as(dst, stype, like)
+    var r = call_op(String(name), String(""), forward_args(args, out_i), 1)
+    store_out(dst, r.take_tensor(0))
+    ret_ref(rets, 0, dst)
+
+
+# aten::_softmax.out(Tensor self, int dim, bool half_to_float, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_softmax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var st = ST_FLOAT32 if v_bool(args[unsafe_offset=2]) else a.stype
+    _softmax_out(args, rets, "aten::_softmax", 3, st)
+
+
+# aten::_log_softmax.out(Tensor self, int dim, bool half_to_float, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_log_softmax_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var st = ST_FLOAT32 if v_bool(args[unsafe_offset=2]) else a.stype
+    _softmax_out(args, rets, "aten::_log_softmax", 3, st)
+
+
+# aten::_softmax_backward_data.out(Tensor grad_output, Tensor output, int dim,
+#   ScalarType input_dtype, *, Tensor(a!) grad_input) -> Tensor(a!)
+def op_softmax_backward_data_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var st = v_dtype_or(
+        args[unsafe_offset=3], v_tensor(args[unsafe_offset=0]).stype
+    )
+    _softmax_out(args, rets, "aten::_softmax_backward_data", 4, st)
+
+
+# aten::_log_softmax_backward_data.out(Tensor grad_output, Tensor output,
+#   int dim, ScalarType input_dtype, *, Tensor(a!) out) -> Tensor(a!)
+def op_log_softmax_backward_data_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var st = v_dtype_or(
+        args[unsafe_offset=3], v_tensor(args[unsafe_offset=0]).stype
+    )
+    _softmax_out(args, rets, "aten::_log_softmax_backward_data", 4, st)
+
+
+def _masked_float(t: T, what: StaticString) raises:
+    """AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, ...)."""
+    if not _is_float(t.dtype) and t.dtype != DType.float64:
+        raise Error(
+            '"',
+            what,
+            "\" not implemented for '",
+            _scalar_type_name(t.dtype),
+            "'",
+        )
+
+
+def _as_rank1(t: T) raises -> Owned:
+    """A 0-d tensor as its one-element `[1]` view (`view(1)`), anything else
+    as a second handle to itself."""
+    if t.rank != 0:
+        return own(T(retain(t)))
+    var shape = IndexList[MAX_RANK](1)
+    var strides = IndexList[MAX_RANK](1)
+    return own(view_strided(t, shape, strides, 1, t.offset))
+
+
+def _shaped_as(var r: Owned, like: T) raises -> Owned:
+    """A contiguous result `r` viewed with `like`'s logical shape (the 0-d
+    input of the masked softmax pair gets its 0-d result back)."""
+    if r.t.rank == like.rank:
+        return r^
+    var v = own(
+        view_strided(
+            r.t,
+            like.shape,
+            contiguous_strides(like.shape, like.rank),
+            like.rank,
+            r.t.offset,
+        )
+    )
+    return v^
+
+
+# aten::_masked_softmax(Tensor self, Tensor mask, int? dim=None,
+#   int? mask_type=None) -> Tensor
+def op_masked_softmax(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """SoftMax.cu `masked_softmax_cuda`: `softmax(self.masked_fill(mask,
+    -inf), dim)`. Its persistent and its fallback kernel agree on every
+    value, a fully masked row included (NaN: `exp` sums to zero), so the
+    composition is exact; the mask layouts CUDA accepts are reproduced
+    (`mask_type` 0: a [T, T] mask over [B, H, T, T]; 1: a [B, T] key-padding
+    mask; 2, or any type: a mask of the input's own shape)."""
+    var a = v_tensor(args[unsafe_offset=0])
+    var mask = v_tensor(args[unsafe_offset=1])
+    if mask.dtype != DType.bool:
+        raise Error("Mask should be a boolean tensor")
+    if v_is_none(args[unsafe_offset=3]):
+        raise Error("Mask Type should be defined")
+    var mask_type = v_int(args[unsafe_offset=3])
+    if mask_type < 0 or mask_type > 2:
+        raise Error(
+            "Mask Type should be 0 (src_mask), 1 (src_key_padding_mask), or 2"
+            " (default_mask)"
+        )
+    var is_bxt = (
+        mask_type == 1
+        and a.rank == 4
+        and mask.rank == 2
+        and a.dim(0) == mask.dim(0)
+        and a.dim(2) == mask.dim(1)
+        and a.dim(3) == mask.dim(1)
+    )
+    var is_txt = (
+        mask_type == 0
+        and a.rank == 4
+        and mask.rank == 2
+        and a.dim(3) == mask.dim(1)
+        and a.dim(2) == mask.dim(0)
+        and mask.dim(0) == mask.dim(1)
+    )
+    if not (mask.same_shape(a) or is_bxt or is_txt):
+        raise Error(
+            "Mask shape should match input. mask: ",
+            sizes_str(mask),
+            " input: ",
+            sizes_str(a),
+        )
+    _masked_float(a, "masked_softmax")
+    var x = _as_rank1(a)
+    var rank = x.t.rank
+    var dim = rank - 1
+    if not v_is_none(args[unsafe_offset=2]):
+        dim = v_int(args[unsafe_offset=2])
+    var elems = x.t.dim(dim) if dim >= -rank and dim < rank else 0
+    if (
+        is_bxt
+        and dim == rank - 1
+        and elems <= 1024
+        and elems * a.itemsize <= 4096
+        and a.dim(1) % 2 != 0
+    ):
+        # CUDA's transformer-mask kernel, which the persistent route takes.
+        raise Error("Only support when num_heads is even in transformer")
+    var m = _as_rank1(mask)
+    if is_bxt:
+        var shape = IndexList[MAX_RANK](1)
+        var strides = IndexList[MAX_RANK](0)
+        shape[MAX_RANK - 4] = mask.dim(0)
+        shape[MAX_RANK - 1] = mask.dim(1)
+        strides[MAX_RANK - 4] = mask.stride(0)
+        strides[MAX_RANK - 1] = mask.stride(1)
+        m = own(view_strided(mask, shape, strides, 4, mask.offset))
+    var neg_inf = min_or_neg_inf[DType.float64]()
+    var filled_r = call_op(
+        String("aten::masked_fill"),
+        String("Scalar"),
+        [
+            tensor_arg(x.t),
+            tensor_arg(m.t),
+            Value(TAG_SCALAR_DOUBLE, 0, f64_bits(neg_inf), 0),
+        ],
+        1,
+    )
+    var filled = own(filled_r.take_tensor(0))
+    var sm = call_op(
+        String("aten::_softmax"),
+        String(""),
+        [tensor_arg(filled.t), int_arg(dim), bool_arg(False)],
+        1,
+    )
+    _ = filled^  # read through its handle by the call above
+    var res = _shaped_as(own(sm.take_tensor(0)), a)
+    _ = x^
+    _ = m^
+    ret_owned(rets, 0, res)
+
+
+# aten::_masked_softmax_backward(Tensor grad_output, Tensor output,
+#   Tensor mask, int? dim=None) -> Tensor
+def op_masked_softmax_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """SoftMax.cu `masked_softmax_backward_cuda`: the softmax backward of
+    `output.masked_fill(mask, 0)` with the masked positions' gradient forced
+    to exactly zero, as its persistent kernel writes them (the fallback's
+    `0 * grad` agrees except for a non-finite grad there)."""
+    var grad = v_tensor(args[unsafe_offset=0])
+    var output = v_tensor(args[unsafe_offset=1])
+    var mask = v_tensor(args[unsafe_offset=2])
+    if grad.numel == 0:
+        ret_tensor(rets, 0, new_like(grad))
+        return
+    var g = _as_rank1(grad)
+    var o = _as_rank1(output)
+    var m = _as_rank1(mask)
+    var rank = o.t.rank
+    var dim = rank - 1
+    if not v_is_none(args[unsafe_offset=3]):
+        dim = v_int(args[unsafe_offset=3])
+        if dim < -rank or dim >= rank:
+            raise Error(
+                "Dimension out of range (expected to be in range of [",
+                -rank,
+                ", ",
+                rank - 1,
+                "], but got ",
+                dim,
+                ")",
+            )
+        if dim < 0:
+            dim += rank
+    if dim < 0 or dim >= g.t.rank:
+        raise Error("dim must be non-negative and less than input dimensions")
+    if not g.t.same_shape(m.t):
+        raise Error("Mask shape should match grad shape")
+    if mask.dtype != DType.bool:
+        raise Error("Mask should be a boolean tensor")
+    _masked_float(grad, "masked_softmax_backward")
+    var zeroed_r = call_op(
+        String("aten::masked_fill"),
+        String("Scalar"),
+        [tensor_arg(o.t), tensor_arg(m.t), Value(TAG_SCALAR_INT, 0, 0, 0)],
+        1,
+    )
+    var zeroed = own(zeroed_r.take_tensor(0))
+    var gi_r = call_op(
+        String("aten::_softmax_backward_data"),
+        String(""),
+        [
+            tensor_arg(g.t),
+            tensor_arg(zeroed.t),
+            int_arg(dim),
+            Value(TAG_DTYPE, 0, Int64(grad.stype), 0),
+        ],
+        1,
+    )
+    _ = zeroed^  # read through its handle by the call above
+    var gi = own(gi_r.take_tensor(0))
+    var final_r = call_op(
+        String("aten::masked_fill"),
+        String("Scalar"),
+        [tensor_arg(gi.t), tensor_arg(m.t), Value(TAG_SCALAR_INT, 0, 0, 0)],
+        1,
+    )
+    _ = gi^
+    var res = _shaped_as(own(final_r.take_tensor(0)), grad)
+    _ = g^
+    _ = o^
+    _ = m^
+    ret_owned(rets, 0, res)
 
 
 # ---------------------------------------------------------------------------
@@ -937,27 +1225,40 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     if not _is_float(a.dtype):
         unsupported("batch norm of dtype " + String(a.dtype))
     var channels = _bn_channels(a)
-    if (
-        v_is_none(args[unsafe_offset=1])
-        or v_is_none(args[unsafe_offset=2])
-        or v_is_none(args[unsafe_offset=base])
-        or v_is_none(args[unsafe_offset=base + 1])
+    if v_is_none(args[unsafe_offset=base]) or v_is_none(
+        args[unsafe_offset=base + 1]
     ):
-        unsupported(
-            "inference batch norm needs weight, bias and both running"
-            " statistics"
+        # Normalization.cu batch_norm_cuda_out: `TORCH_CHECK(has_running_mean)`.
+        raise Error(
+            "Expected has_running_mean to be true, but got false.  (Could this"
+            " error message be improved?  If so, please report an enhancement"
+            " request to PyTorch.)"
         )
-    var gamma = v_tensor(args[unsafe_offset=1])
-    var beta = v_tensor(args[unsafe_offset=2])
+    var has_w = not v_is_none(args[unsafe_offset=1])
+    var has_b = not v_is_none(args[unsafe_offset=2])
     var mean = v_tensor(args[unsafe_offset=base])
     var var_t = v_tensor(args[unsafe_offset=base + 1])
     var eps = v_f64(args[unsafe_offset=eps_i])
-    _bn_param(gamma, a, channels, "batch norm weight")
-    _bn_param(beta, a, channels, "batch norm bias")
+    var gamma_ptr = 0
+    var beta_ptr = 0
+    var param_dtype = a.dtype
+    if has_w:
+        var gamma = v_tensor(args[unsafe_offset=1])
+        _bn_param(gamma, a, channels, "batch norm weight")
+        gamma_ptr = gamma.ptr
+        param_dtype = gamma.dtype
+    if has_b:
+        var beta = v_tensor(args[unsafe_offset=2])
+        _bn_param(beta, a, channels, "batch norm bias")
+        if has_w and beta.stype != v_tensor(args[unsafe_offset=1]).stype:
+            unsupported("batch norm: weight and bias must share a dtype")
+        beta_ptr = beta.ptr
+        if not has_w:
+            param_dtype = beta.dtype
     _bn_param(mean, a, channels, "batch norm running_mean")
     _bn_param(var_t, a, channels, "batch norm running_var")
-    if mean.stype != var_t.stype or gamma.stype != beta.stype:
-        unsupported("batch norm: running statistics (and affine) must pair up")
+    if mean.stype != var_t.stype:
+        unsupported("batch norm: running statistics must pair up")
     var inner = 1
     for i in range(2, a.rank):
         inner *= a.dim(i)
@@ -972,21 +1273,21 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     var call = KernelCall("normalization_forward", "BatchNormInfer")
     call.arg_dtype(0, a.dtype)
     call.arg_dtype(1, mean.dtype)
-    call.arg_dtype(2, gamma.dtype)
+    call.arg_dtype(2, param_dtype)
     call.out_dtype(out.t.dtype)
     call.int(out.t.ptr)
     call.int(am.t.ptr)
     call.int(mean.ptr)
     call.int(var_t.ptr)
-    call.int(gamma.ptr)
-    call.int(beta.ptr)
+    call.int(gamma_ptr)
+    call.int(beta_ptr)
     var params = List[Int]()
     params.append(_f64_slot(eps))
     params.append(channels)
     params.append(inner)
     params.append(planes)
-    params.append(1)
-    params.append(1)
+    params.append(1 if has_w else 0)
+    params.append(1 if has_b else 0)
     params.append(save_mean.t.ptr)
     params.append(save_invstd.t.ptr)
     call.tuple(params)
@@ -995,6 +1296,20 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     _ = am.t.ptr
     _ = ctx
     ret_owned(rets, 0, out)
+    if mean.stype != ST_FLOAT32:
+        # batch_norm_cuda allocates both in the accumulation dtype (float32
+        # here: float64 inputs are declined above) and `copy_`s into them.
+        # The invstd is formed in float32 from the running variance
+        # (batch_norm_calc_invstd's acc_t), not rounded through its dtype.
+        var m32 = own(cast_to(mean, ST_FLOAT32))
+        var v32 = _nn_cast(_nn_hold(var_t), ST_FLOAT32)
+        var shifted = _nn_add_scalar(v32, eps)
+        var s32 = _nn_rsqrt(shifted)
+        _ = v32^
+        _ = shifted^
+        ret_owned(rets, 1, m32)
+        ret_owned(rets, 2, s32)
+        return
     ret_owned(rets, 1, save_mean)
     ret_owned(rets, 2, save_invstd)
 
@@ -1091,9 +1406,6 @@ def _bn_training(args: Values, rets: Values) raises:
     for i in range(2, a.rank):
         hxw *= a.dim(i)
     var runs = a.dim(0)
-    if runs * hxw < 2:
-        # ATen's unbiased running variance divides by N-1.
-        unsupported("training batch norm over a single sample")
     var am = _mat(a)
     var out = own(new_like(a))
     var save_mean = own(_channel_vec(channels, ST_FLOAT32, a.device))
@@ -1252,201 +1564,6 @@ def op_native_group_norm(
 
 
 # ---------------------------------------------------------------------------
-# NLL loss (the f32 / int64 kernels, `out=` ABI)
-# ---------------------------------------------------------------------------
-
-
-def _nll_inputs(
-    args: Values, self_i: Int, target_i: Int, weight_i: Int, red_i: Int
-) raises -> Tuple[Int, Int]:
-    """Validate the two-dimensional f32/i64 contract; returns (rows, classes).
-
-    Enqueue-only, so label values are never inspected on the host: each label
-    must be in `[0, classes)` or exactly `ignore_index`.
-    """
-    if not v_is_none(args[unsafe_offset=weight_i]):
-        unsupported("nll_loss with a class weight tensor")
-    var reduction = v_int(args[unsafe_offset=red_i])
-    if reduction < 0 or reduction > 2:
-        raise Error("nll_loss: invalid reduction ", reduction)
-    var log_probs = v_tensor(args[unsafe_offset=self_i])
-    var labels = v_tensor(args[unsafe_offset=target_i])
-    _require_mojo(log_probs, "nll_loss")
-    if not _on_gpu(log_probs):
-        unsupported("nll_loss needs an accelerator")
-    if (
-        log_probs.dtype != DType.float32
-        or not log_probs.contig
-        or log_probs.rank != 2
-    ):
-        unsupported("nll_loss covers a contiguous 2-D float32 input only")
-    var rows = log_probs.dim(0)
-    var classes = log_probs.dim(1)
-    if (
-        classes <= 0
-        or labels.dtype != DType.int64
-        or labels.device != log_probs.device
-        or labels.rank != 1
-        or labels.dim(0) != rows
-    ):
-        unsupported("nll_loss: target must be an int64[N] on the same device")
-    return (rows, classes)
-
-
-# aten::nll_loss_forward.output(Tensor self, Tensor target, Tensor? weight,
-#   int reduction, SymInt ignore_index, *, Tensor(a!) output,
-#   Tensor(b!) total_weight) -> (Tensor(a!), Tensor(b!))
-def op_nll_loss_forward_output(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var geom = _nll_inputs(args, 0, 1, 2, 3)
-    var rows = geom[0]
-    var classes = geom[1]
-    var reduction = v_int(args[unsafe_offset=3])
-    var ignore_index = v_int(args[unsafe_offset=4])
-    var log_probs = v_tensor(args[unsafe_offset=0])
-    var labels = v_tensor(args[unsafe_offset=1])
-    var output = v_tensor(args[unsafe_offset=5])
-    var total_weight = v_tensor(args[unsafe_offset=6])
-    if output.ptr == total_weight.ptr:
-        unsupported("nll_loss_forward: output and total_weight alias")
-    _nll_out_ok(output, log_probs, "output")
-    _nll_out_ok(total_weight, log_probs, "total_weight")
-    var out_shape = IndexList[MAX_RANK](1)
-    var out_rank = 0
-    if reduction == 0:
-        out_shape[MAX_RANK - 1] = rows
-        out_rank = 1
-    var wo = _nll_dest(output, out_shape, out_rank)
-    var wt = _nll_dest(total_weight, IndexList[MAX_RANK](1), 0)
-    if rows == 0:
-        # PyTorch defines the empty reduced loss as NaN for mean and zero for
-        # sum; reduction=none already has no elements.
-        fill_value(wt.t, 0.0)
-        if reduction == 1:
-            fill_value(wo.t, bits_f64(NAN_BITS))
-        elif reduction == 2:
-            fill_value(wo.t, 0.0)
-    else:
-        var lm = _mat(labels)
-        var ctx = ctx_for(log_probs.device)
-        var call = KernelCall("loss", "NllLossForwardF32")
-        call.arg_dtype(0, log_probs.dtype)
-        call.arg_dtype(1, lm.t.dtype)
-        call.out_dtype_i(0, DType.float32)
-        call.out_dtype_i(1, DType.float32)
-        call.flag("REDUCTION", reduction)
-        call.int(wo.t.ptr)
-        call.int(wt.t.ptr)
-        call.int(log_probs.ptr)
-        call.int(lm.t.ptr)
-        call.int(rows)
-        call.int(classes)
-        call.int(reduction)
-        call.int(ignore_index)
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = lm.t.ptr
-        _ = ctx
-    if wo.t.h != output.h:
-        copy_strided_into(output, wo.t)
-    if wt.t.h != total_weight.h:
-        copy_strided_into(total_weight, wt.t)
-    ret_ref(rets, 0, output)
-    ret_ref(rets, 1, total_weight)
-
-
-# aten::nll_loss_backward.grad_input(Tensor grad_output, Tensor self,
-#   Tensor target, Tensor? weight, int reduction, SymInt ignore_index,
-#   Tensor total_weight, *, Tensor(a!) grad_input) -> Tensor(a!)
-def op_nll_loss_backward_grad_input(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var geom = _nll_inputs(args, 1, 2, 3, 4)
-    var rows = geom[0]
-    var classes = geom[1]
-    var reduction = v_int(args[unsafe_offset=4])
-    var ignore_index = v_int(args[unsafe_offset=5])
-    var grad = v_tensor(args[unsafe_offset=0])
-    var log_probs = v_tensor(args[unsafe_offset=1])
-    var labels = v_tensor(args[unsafe_offset=2])
-    var weight_sum = v_tensor(args[unsafe_offset=6])
-    var grad_input = v_tensor(args[unsafe_offset=7])
-    if grad.dtype != DType.float32 or grad.device != log_probs.device:
-        unsupported("nll_loss_backward: grad_output must be float32")
-    if reduction == 0:
-        if grad.rank != 1 or grad.dim(0) != rows:
-            unsupported("nll_loss_backward: grad_output must be a [N] vector")
-    elif grad.numel != 1:
-        unsupported("nll_loss_backward: grad_output must be a scalar")
-    if (
-        weight_sum.dtype != DType.float32
-        or weight_sum.device != log_probs.device
-        or weight_sum.numel != 1
-    ):
-        unsupported("nll_loss_backward: total_weight must be a float32 scalar")
-    _nll_out_ok(grad_input, log_probs, "grad_input")
-    var wg = _nll_dest(grad_input, log_probs.shape, 2)
-    if rows != 0:
-        var lm = _mat(labels)
-        var gm = _mat(grad)
-        var wm = _mat(weight_sum)
-        var ctx = ctx_for(log_probs.device)
-        var call = KernelCall("loss", "NllLossBackwardF32")
-        call.arg_dtype(0, gm.t.dtype)
-        call.arg_dtype(1, lm.t.dtype)
-        call.arg_dtype(2, wm.t.dtype)
-        call.out_dtype(DType.float32)
-        call.flag("REDUCTION", reduction)
-        call.int(wg.t.ptr)
-        call.int(gm.t.ptr)
-        call.int(lm.t.ptr)
-        call.int(wm.t.ptr)
-        call.int(rows)
-        call.int(classes)
-        call.int(reduction)
-        call.int(ignore_index)
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = lm.t.ptr
-        _ = gm.t.ptr
-        _ = wm.t.ptr
-        _ = ctx
-    if wg.t.h != grad_input.h:
-        copy_strided_into(grad_input, wg.t)
-    ret_ref(rets, 0, grad_input)
-
-
-def _nll_out_ok(dst: T, like: T, what: StaticString) raises:
-    if dst.dtype != DType.float32 or dst.device != like.device:
-        unsupported(
-            String(what) + " must be a float32 tensor on the input's device"
-        )
-
-
-def _nll_dest(mut dst: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Held:
-    """Where the kernel writes for this `out=` argument.
-
-    A wrong-shaped out is resized in place (the eager out= convention). A
-    correctly-shaped but strided view keeps its storage and takes one ordered
-    strided copy after the kernel; the common contiguous case is written
-    directly.
-    """
-    var matches = dst.rank == rank
-    if matches:
-        for i in range(rank):
-            if dst.dim(i) != shape[MAX_RANK - rank + i]:
-                matches = False
-                break
-    if not matches:
-        resize_out(dst, shape, rank)
-        return Held(dst.copy(), False)
-    if dst.contig:
-        return Held(dst.copy(), False)
-    return Held(new_tensor(shape, rank, dst.stype, dst.device), True)
-
-
-# ---------------------------------------------------------------------------
 # Embedding
 # ---------------------------------------------------------------------------
 
@@ -1564,15 +1681,17 @@ def op_embedding_dense_backward(
 def register_nn(site: Site) raises:
     impl[op_log_softmax, "_log_softmax"](site)
     impl[op_log_softmax_backward_data, "_log_softmax_backward_data"](site)
-    impl[
-        op_batch_norm_legit_no_training, "_native_batch_norm_legit_no_training"
-    ](site)
     impl[op_softmax, "_softmax"](site)
+    impl[op_softmax_out, "_softmax.out"](site)
+    impl[op_log_softmax_out, "_log_softmax.out"](site)
+    impl[op_softmax_backward_data_out, "_softmax_backward_data.out"](site)
+    impl[op_log_softmax_backward_data_out, "_log_softmax_backward_data.out"](
+        site
+    )
+    impl[op_masked_softmax, "_masked_softmax"](site)
+    impl[op_masked_softmax_backward, "_masked_softmax_backward"](site)
     impl[op_embedding, "embedding"](site)
     impl[op_embedding_dense_backward, "embedding_dense_backward"](site)
-    impl[op_native_batch_norm, "native_batch_norm"](site)
     impl[op_native_group_norm, "native_group_norm"](site)
     impl[op_native_layer_norm, "native_layer_norm"](site)
     impl[op_native_layer_norm_backward, "native_layer_norm_backward"](site)
-    impl[op_nll_loss_backward_grad_input, "nll_loss_backward.grad_input"](site)
-    impl[op_nll_loss_forward_output, "nll_loss_forward.output"](site)

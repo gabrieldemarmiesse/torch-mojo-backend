@@ -49,15 +49,51 @@ from tmb.kernels.common.op_utils import (
     _enqueue_cached,
     _make_ptr,
     _raw_ctx,
+    _raw_f64,
     _raw_int,
+    _raw_tuple_int,
+    _raw_tuple_len,
 )
 
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
     NO_OP_COMPILED,
+    _dtype_arg_on,
     _op_on,
     _tmb_entry_error,
 )
+from tmb.kernels.loss.nll_kernels import (
+    P_BATCH,
+    P_CLASSES,
+    P_IGNORE,
+    P_LEN,
+    P_MAP,
+    P_ONE_D,
+    P_REDUCTION,
+    P_SPATIAL,
+    nll2d_forward_reduce,
+    nll_backward,
+    nll_forward_none,
+    nll_forward_reduce,
+)
+
+from tmb.kernels.loss.margin_kernels import (
+    multi_margin_backward,
+    multi_margin_forward,
+    multilabel_margin_backward,
+    multilabel_margin_forward,
+)
+
+# Every float dtype the generic loss kernels take (CUDA's
+# AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16)).
+comptime LOSS_DTYPES = [
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+    DType.float64,
+]
+# nll_loss targets: Long or Byte (AT_DISPATCH_NLL_LOSS_INDEX_TYPES).
+comptime NLL_TARGET_DTYPES = [DType.int64, DType.uint8]
 
 
 comptime _NONE_BLOCK = 256
@@ -614,6 +650,201 @@ def _nll_backward_dispatcher(argv: Argv, argc: Int) raises:
 
 
 # ---------------------------------------------------------------------------
+# Generic NLL (every float dtype, weights, 1-D / 2-D / spatial)
+#
+#   Nll:          out, total_weight, input, target, weight (0 = none),
+#                 scratch (nll_loss2d's reduced form), params, ctx
+#   NllBackward:  grad_input (zeroed), grad_output, target, weight,
+#                 total_weight, params, ctx
+# with params the P_* tuple of nll_kernels.mojo.
+# ---------------------------------------------------------------------------
+
+
+def _nll_go[dtype: DType, tdtype: DType](argv: Argv) raises:
+    var p = argv[unsafe_offset=6]
+    if _raw_tuple_len(p) != P_LEN:
+        raise Error("nll: expected ", P_LEN, " params")
+    var batch = _raw_tuple_int(p, P_BATCH)
+    var classes = _raw_tuple_int(p, P_CLASSES)
+    var map = _raw_tuple_int(p, P_MAP)
+    var reduction = _raw_tuple_int(p, P_REDUCTION)
+    var ignore_index = _raw_tuple_int(p, P_IGNORE)
+    var one_d = _raw_tuple_int(p, P_ONE_D) != 0
+    var spatial = _raw_tuple_int(p, P_SPATIAL) != 0
+    var ctx = _raw_ctx(argv[unsafe_offset=7])
+    if reduction == 0 and not one_d:
+        nll_forward_none[dtype, tdtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_int(argv[unsafe_offset=4]),
+            batch,
+            classes,
+            map,
+            ignore_index,
+            ctx,
+        )
+    elif spatial:
+        nll2d_forward_reduce[dtype, tdtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_int(argv[unsafe_offset=4]),
+            _raw_int(argv[unsafe_offset=5]),
+            batch,
+            classes,
+            map,
+            reduction == 1,
+            ignore_index,
+            ctx,
+        )
+    else:
+        nll_forward_reduce[dtype, tdtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_int(argv[unsafe_offset=4]),
+            batch,
+            classes,
+            reduction == 1,
+            ignore_index,
+            one_d,
+            ctx,
+        )
+
+
+def _nll_backward_go[dtype: DType, tdtype: DType](argv: Argv) raises:
+    var p = argv[unsafe_offset=5]
+    if _raw_tuple_len(p) != P_LEN:
+        raise Error("nll: expected ", P_LEN, " params")
+    var reduction = _raw_tuple_int(p, P_REDUCTION)
+    if _raw_tuple_int(p, P_ONE_D) != 0 and reduction == 0:
+        reduction = 2  # the 1-D input takes the reduced kernel
+    nll_backward[dtype, tdtype](
+        _raw_int(argv[unsafe_offset=0]),
+        _raw_int(argv[unsafe_offset=1]),
+        _raw_int(argv[unsafe_offset=2]),
+        _raw_int(argv[unsafe_offset=3]),
+        _raw_int(argv[unsafe_offset=4]),
+        _raw_tuple_int(p, P_BATCH),
+        _raw_tuple_int(p, P_CLASSES),
+        _raw_tuple_int(p, P_MAP),
+        reduction,
+        _raw_tuple_int(p, P_IGNORE),
+        _raw_ctx(argv[unsafe_offset=6]),
+    )
+
+
+def _nll_dispatch[backward: Bool](argv: Argv) raises:
+    comptime for dt in LOSS_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            comptime for tdt in NLL_TARGET_DTYPES:
+                comptime if _dtype_arg_on[1, tdt]():
+                    comptime if backward:
+                        _nll_backward_go[dt, tdt](argv)
+                    else:
+                        _nll_go[dt, tdt](argv)
+                    return
+    raise Error("nll: no (input, target) dtype pair compiled into this build")
+
+
+# ---------------------------------------------------------------------------
+# Margin losses (DTYPE_ARG_0 = the input dtype)
+#
+#   MultiMargin:               out, input, target, weight, params
+#                              (nframe, dim, p, size_average), margin, ctx
+#   MultiMarginBackward:       grad_input, grad_output, input, target, weight,
+#                              params (nframe, dim, p, size_average, reduce),
+#                              margin, ctx
+#   MultilabelMargin:          out, input, target, is_target, params
+#                              (nframe, dim, size_average), ctx
+#   MultilabelMarginBackward:  grad_input, grad_output, input, target,
+#                              is_target, params (nframe, dim, reduce), gain,
+#                              ctx
+# `margin` / `gain` travel as float64 and are rounded to the input dtype here
+# on the host, through float32 for the narrow dtypes like `c10::Half(double)`.
+# ---------------------------------------------------------------------------
+
+
+def _to_dtype[dtype: DType](v: Float64) -> Scalar[dtype]:
+    comptime if dtype == DType.float64:
+        return v.cast[dtype]()
+    else:
+        return v.cast[DType.float32]().cast[dtype]()
+
+
+def _margin_go[dtype: DType](argv: Argv) raises:
+    comptime if _op_on["MultiMargin"]():
+        var p = argv[unsafe_offset=4]
+        multi_margin_forward[dtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_tuple_int(p, 0),
+            _raw_tuple_int(p, 1),
+            _raw_tuple_int(p, 2),
+            _raw_tuple_int(p, 3) != 0,
+            _to_dtype[dtype](_raw_f64(argv[unsafe_offset=5])),
+            _raw_ctx(argv[unsafe_offset=6]),
+        )
+    elif _op_on["MultiMarginBackward"]():
+        var p = argv[unsafe_offset=5]
+        multi_margin_backward[dtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_int(argv[unsafe_offset=4]),
+            _raw_tuple_int(p, 0),
+            _raw_tuple_int(p, 1),
+            _raw_tuple_int(p, 2),
+            _raw_tuple_int(p, 3) != 0,
+            _raw_tuple_int(p, 4) != 0,
+            _to_dtype[dtype](_raw_f64(argv[unsafe_offset=6])),
+            _raw_ctx(argv[unsafe_offset=7]),
+        )
+    elif _op_on["MultilabelMargin"]():
+        var p = argv[unsafe_offset=4]
+        multilabel_margin_forward[dtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_tuple_int(p, 0),
+            _raw_tuple_int(p, 1),
+            _raw_tuple_int(p, 2) != 0,
+            _raw_ctx(argv[unsafe_offset=5]),
+        )
+    elif _op_on["MultilabelMarginBackward"]():
+        var p = argv[unsafe_offset=5]
+        multilabel_margin_backward[dtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _raw_int(argv[unsafe_offset=4]),
+            _raw_tuple_int(p, 0),
+            _raw_tuple_int(p, 1),
+            _raw_tuple_int(p, 2) != 0,
+            _to_dtype[dtype](_raw_f64(argv[unsafe_offset=6])),
+            _raw_ctx(argv[unsafe_offset=7]),
+        )
+    else:
+        raise Error(NO_OP_COMPILED)
+
+
+def _margin_dispatch(argv: Argv) raises:
+    comptime for dt in LOSS_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            _margin_go[dt](argv)
+            return
+    raise Error("margin loss: no input dtype compiled into this build")
+
+
+# ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
 
@@ -629,6 +860,20 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["NllLossBackwardF32"]():
             _nll_backward_dispatcher(argv, argc)
+            return 0
+        comptime if _op_on["Nll"]():
+            _nll_dispatch[False](argv)
+            return 0
+        comptime if _op_on["NllBackward"]():
+            _nll_dispatch[True](argv)
+            return 0
+        comptime if (
+            _op_on["MultiMargin"]()
+            or _op_on["MultiMarginBackward"]()
+            or _op_on["MultilabelMargin"]()
+            or _op_on["MultilabelMarginBackward"]()
+        ):
+            _margin_dispatch(argv)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:

@@ -20,6 +20,7 @@ from tmb.backend.abi import (
     ST_UINT8,
     T,
     Value,
+    Values,
     check,
     Results,
     call_op,
@@ -875,3 +876,25 @@ def release_if_new(result: T, original: T):
     covers the raising paths too; reach for that one in new code."""
     if result.h != original.h:
         release(result.h)
+
+
+def forward_args(args: Values, n: Int) -> List[Value]:
+    """The first `n` argument records, copied: what an `out=` overload hands
+    its functional overload through `call_op` (same schema prefix)."""
+    var out = List[Value](capacity=max(n, 1))
+    for i in range(n):
+        out.append(args[unsafe_offset=i].copy())
+    return out^
+
+
+def store_out(mut dst: T, var src: T) raises:
+    """Copy a FRESH functional result (owned, released here) into a caller's
+    `out=` tensor: torch's `resize_output` then a strided copy.
+
+    The result is computed before `dst` is touched, so an `out` that shares
+    storage with an input is only resized after every input was read. The
+    caller ran `check_out_as` on `dst` before computing."""
+    var held = own(src^)
+    assert_no_internal_overlap(dst)
+    resize_out(dst, held.t.shape, held.t.rank)
+    copy_strided_into(dst, held.t)

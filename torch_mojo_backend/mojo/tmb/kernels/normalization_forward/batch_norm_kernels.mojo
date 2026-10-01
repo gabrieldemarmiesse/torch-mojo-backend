@@ -330,9 +330,9 @@ def _bn_finalize[
             keep * run_mean_ptr[unsafe_offset=c].cast[DType.float32]()
             + momentum * mean
         ).cast[sdtype]()
-        var unbiased = biased
-        if count > 1:
-            unbiased = m2 / (nf - 1.0)
+        # CUDA's `var * static_cast<acc_t>(double(N) / double(N - 1))` (the
+        # float quotient rounds identically): one sample gives 0 * inf, NaN.
+        var unbiased = biased * (nf / (nf - 1.0))
         run_var_ptr[unsafe_offset=c] = (
             keep * run_var_ptr[unsafe_offset=c].cast[DType.float32]()
             + momentum * unbiased
