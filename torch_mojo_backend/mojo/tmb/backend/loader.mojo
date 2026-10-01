@@ -43,6 +43,9 @@ comptime _EAGER_ELEMENTWISE_DEFINE = "TMB_EAGER_ELEMENTWISE=1"
 # tmb.<pkg>.<module> import ...`. Kernel families are
 # `tmb/kernels/<family>/entry.mojo`.
 comptime PACKAGE = "tmb"
+# Written last into a source snapshot (`Loader.snapshot`): its presence says
+# the snapshot is complete.
+comptime SNAPSHOT_MARKER = ".snapshot-complete"
 comptime KERNELS = "tmb/kernels"
 
 
@@ -251,22 +254,38 @@ struct Loader(Movable):
         self.source_hashes["family:" + family] = h
         var base = _local_dir("torch-mojo-backend-src-")
         var dest = base + "/" + family + "-" + h
-        if isdir(dest):
+        if self._snapshot_complete(dest, ft[0]):
             return (dest, h)
+        # Written to a temp dir, completion marker last, then renamed into
+        # place: a reader never sees a half-written snapshot. One that TMPDIR
+        # aging has thinned since (a file or the marker gone) is replaced.
         var tmp = dest + ".tmp" + String(perf_counter_ns())
         for f in ft[0]:
             var rel = String(f[byte = self.root.byte_length() :])
             var target = tmp + rel
             makedirs(String(target[byte = : target.rfind("/")]), exist_ok=True)
             Path(target).write_text(ft[1][f])
+        Path(tmp + "/" + SNAPSHOT_MARKER).write_text(h)
+        if isdir(dest) and not self._snapshot_complete(dest, ft[0]):
+            _ = run_command("rm -rf '" + dest + "'")
         var r = external_call["rename", Int32](
             tmp.as_c_string_span().ptr(), dest.as_c_string_span().ptr()
         )
-        if r != 0 and not isdir(dest):
-            raise Error("could not install the source snapshot ", dest)
         if r != 0:  # another process installed the same snapshot first
             _ = run_command("rm -rf '" + tmp + "'")
+            if not self._snapshot_complete(dest, ft[0]):
+                raise Error("could not install the source snapshot ", dest)
         return (dest, h)
+
+    def _snapshot_complete(self, dest: String, files: List[String]) -> Bool:
+        """A snapshot is reusable only if its marker and every source of the
+        closure are present (node-local TMPDIR may age files out)."""
+        if not exists(dest + "/" + SNAPSHOT_MARKER):
+            return False
+        for f in files:
+            if not exists(dest + String(f[byte = self.root.byte_length() :])):
+                return False
+        return True
 
     def source_hash(mut self, family: String) raises -> String:
         return self._hash_closure(

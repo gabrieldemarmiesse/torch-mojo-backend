@@ -7,6 +7,106 @@ import torch
 
 from tests.native.conftest import ran, skip_if_metal
 
+
+def _round(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return t.to(dtype).float()
+
+
+def cuda_lowp_cumsum(x: torch.Tensor, dim: int) -> torch.Tensor:
+    """CUDA's half/bfloat16 cumsum, step for step (ScanUtils.cuh `scan_dim`):
+    every addition rounds to the element dtype, in the order of the route
+    CUDA takes -- one sequential line per element of the other dims (outer
+    dim), Sklansky tiles with the carry folded into each tile's first element
+    (innermost dim), cub's 128-thread x 30-item tiles (1-D; in-order
+    look-back)."""
+    dt = x.dtype
+    dim = dim % x.dim()
+    if x.numel() == x.size(dim):
+        return _cub_1d(x.flatten(), dt).reshape(x.shape)
+    if dim != x.dim() - 1:
+        xm = x.movedim(dim, 0).float()
+        out = torch.empty_like(xm)
+        acc = torch.zeros_like(xm[0])
+        for i in range(xm.shape[0]):
+            acc = _round(acc + xm[i], dt)
+            out[i] = acc
+        return out.to(dt).movedim(0, dim)
+    rows = x.numel() // x.size(-1)
+    n = x.size(-1)
+    lx = max(0, (n - 1).bit_length())
+    ly = max(0, (rows - 1).bit_length())
+    log_x = ((9 + lx - ly) % (1 << 32)) // 2  # uint32 arithmetic
+    log_x = min(max(log_x, 4), 9)
+    nx = 1 << log_x
+    xr = x.reshape(rows, n).float()
+    out = torch.empty_like(xr)
+    total = torch.zeros(rows)
+    for c0 in range(0, n, 2 * nx):
+        buf = torch.zeros(rows, 2 * nx)
+        w = min(2 * nx, n - c0)
+        buf[:, :w] = xr[:, c0 : c0 + w]
+        buf[:, 0] = _round(buf[:, 0] + total, dt)
+        for m in range(log_x + 1):
+            sz = 1 << m
+            t = torch.arange(nx)
+            a = ((t >> m) << (m + 1)) | sz
+            ti = a + (t % sz)
+            si = a - 1
+            buf[:, ti] = _round(buf[:, ti] + buf[:, si], dt)
+        out[:, c0 : c0 + w] = buf[:, :w]
+        total = buf[:, 2 * nx - 1].clone()
+    return out.to(dt).reshape(x.shape)
+
+
+def _cub_1d(x: torch.Tensor, dt: torch.dtype) -> torch.Tensor:
+    threads, items = 128, 30
+    xf = x.float()
+    n = xf.numel()
+    out = torch.empty(n)
+    prefix = None
+    for t0 in range(0, n, threads * items):
+        tile = torch.zeros(threads * items)
+        w = min(threads * items, n - t0)
+        tile[:w] = xf[t0 : t0 + w]
+        cnt = torch.clamp(w - torch.arange(threads) * items, 0, items)
+        tile = tile.reshape(threads, items)
+        agg = tile[:, 0].clone()
+        for k in range(1, items):
+            agg = torch.where(k < cnt, _round(agg + tile[:, k], dt), agg)
+        v = agg.clone()
+        for off in (1, 2, 4, 8, 16):
+            lane = torch.arange(threads) % 32
+            shifted = torch.roll(v, off)
+            v = torch.where(lane >= off, _round(shifted + v, dt), v)
+        warp_tot = v.reshape(4, 32)[:, 31]
+        excl = torch.roll(v, 1)
+        has = (torch.arange(threads) % 32) > 0
+        # wps[w]: the in-order total of the warps before w (wps[0] unused).
+        wps = [warp_tot[0]]
+        acc = warp_tot[0]
+        for wi in range(1, 4):
+            wps.append(acc)
+            acc = _round(acc + warp_tot[wi], dt)
+        block_tot = acc
+        for tid in range(threads):
+            wi = tid // 32
+            if wi > 0:
+                excl[tid] = _round(wps[wi] + excl[tid], dt) if has[tid] else wps[wi]
+                has[tid] = True
+        if prefix is not None:
+            excl = torch.where(has, _round(prefix + excl, dt), prefix)
+            has[:] = True
+        run = excl.clone()
+        res = torch.zeros(threads, items)
+        for k in range(items):
+            first = (k == 0) & ~has
+            run = torch.where(first, tile[:, k], _round(run + tile[:, k], dt))
+            res[:, k] = run
+        out[t0 : t0 + w] = res.flatten()[:w]
+        prefix = block_tot if prefix is None else _round(prefix + block_tot, dt)
+    return out.to(dt)
+
+
 SHAPES_DIMS = [
     ((7,), 0),
     ((5, 300), 1),
@@ -20,7 +120,9 @@ SHAPES_DIMS = [
 
 def _float_tol(dtype: torch.dtype) -> tuple[float | None, float | None]:
     if dtype in (torch.float16, torch.bfloat16):
-        return 2e-2, 2e-2
+        # CUDA (and this device) round the half running value after every
+        # step; the reference rounds once.
+        return 1.0, 5e-2
     if dtype == torch.float32:
         # The block scans add in a tree, CPU in sequence: a few ulp of the
         # running sum, which near a cancellation is large relative to it.
@@ -36,8 +138,10 @@ def test_cumsum_every_dim_matches_cpu(mojo_gpu, shape, dim, dtype):
     x = (torch.randn(shape) * 4).to(dtype)
     with ran("aten::cumsum"):
         got = torch.cumsum(x.to(mojo_gpu), dim)
-    # float32 accumulation, rounded once: the float32 CPU result (half
-    # dtypes against the float32 scan of their values).
+    if dtype in (torch.float16, torch.bfloat16):
+        # Bit-exact against CUDA's rounding order.
+        torch.testing.assert_close(got.cpu(), cuda_lowp_cumsum(x, dim), atol=0, rtol=0)
+        return
     ref = torch.cumsum(x.float() if dtype.is_floating_point else x, dim).to(got.dtype)
     atol, rtol = _float_tol(dtype)
     torch.testing.assert_close(got.cpu(), ref, atol=atol, rtol=rtol)
@@ -277,3 +381,29 @@ def test_logcumsumexp_integer_scalar_and_empty(mojo_gpu):
     e = torch.empty(0, 3, dtype=torch.int64)
     got = torch.logcumsumexp(e.to(mojo_gpu), 1)
     assert got.shape == (0, 3) and got.dtype == torch.int64
+
+
+# Stock CUDA (torch 2.14, H100), recorded: max and sum of cumsum(ones).
+_CUDA_ONES_CUMSUM = {
+    ((2, 4096, 2), 1, torch.float16): (2048.0, 25169920.0),
+    ((2, 4096, 2), 1, torch.bfloat16): (256.0, 4063744.0),
+    ((3, 5000), 1, torch.float16): (4996.0, 37484376.0),
+    ((3, 5000), 1, torch.bfloat16): (4960.0, 37298304.0),
+    ((4096,), 0, torch.float16): (4080.0, 8361152.0),
+    ((4096,), 0, torch.bfloat16): (4080.0, 8331240.0),
+    ((1, 4096), 1, torch.float16): (4080.0, 8361152.0),
+    ((1, 4096), 1, torch.bfloat16): (4080.0, 8331240.0),
+}
+
+
+@pytest.mark.parametrize(("shape", "dim", "dtype"), list(_CUDA_ONES_CUMSUM))
+def test_lowp_cumsum_rounds_like_cuda(mojo_gpu, shape, dim, dtype):
+    """CUDA's scan_dim<scalar_t> keeps the half running sum in half on all of
+    its routes (outer dim, innermost dim, cub for 1-D): cumsum(ones) saturates
+    where CUDA's does."""
+    x = torch.ones(shape, dtype=dtype)
+    got = torch.cumsum(x.to(mojo_gpu), dim).cpu().float()
+    assert (got.max().item(), got.sum().item()) == _CUDA_ONES_CUMSUM[
+        (shape, dim, dtype)
+    ]
+    torch.testing.assert_close(got, cuda_lowp_cumsum(x, dim).float(), atol=0, rtol=0)

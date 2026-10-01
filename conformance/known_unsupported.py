@@ -222,6 +222,7 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "unique_consecutive": ("float32", "bfloat16", "float16", "int64", "bool"),
     "view_as_complex": ("float32", "float16"),
     "logcumsumexp": ("float16",),
+    "cumsum": ("bfloat16", "float16"),
 }
 # --- END GENERATED test_matches_cpu ---
 
