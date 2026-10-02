@@ -962,6 +962,15 @@ def binary_promotion(a: T, b: T) raises -> DType:
         a_dtype == DType.bfloat16 and b_dtype == DType.float16
     ):
         return DType.float32
+    if (
+        (a_dtype == DType.float64 or b_dtype == DType.float64)
+        and a_dtype.is_floating_point()
+        and b_dtype.is_floating_point()
+        and is_cast_dtype_on(DType.float64, a)
+    ):
+        # Rank-aware, as torch: a 0-d float64 (linalg's tolerances) meets a
+        # dimensioned float32 in float32.
+        return max_dtype(result_type(a, b))
     unsupported(
         "no dtype promotion for " + String(a_dtype) + " and " + String(b_dtype)
     )

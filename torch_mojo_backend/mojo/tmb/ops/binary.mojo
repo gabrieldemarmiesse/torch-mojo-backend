@@ -81,6 +81,7 @@ from tmb.ops.common import (
     contiguous,
     copy_strided_into,
     fill_value,
+    is_cast_dtype_on,
     is_int_stype,
     resize_out,
     scalar_to_float,
@@ -113,6 +114,15 @@ def _b_castable(st: Int32) -> Bool:
         or st == ST_UINT8
         or st == ST_BOOL
     )
+
+
+def _b_castable_on(st: Int32, t: T) raises -> Bool:
+    """`_b_castable`, plus float64 wherever the device cast kernel has it
+    (not on an Apple GPU): a float32 operand meeting a float64 0-d tensor,
+    as linalg's tolerances are (`linalg_matrix_rank`, `linalg_pinv`)."""
+    if st == ST_FLOAT64:
+        return is_cast_dtype_on(DType.float64, t)
+    return _b_castable(st)
 
 
 def _b_bcast_dtype(st: Int32) -> Bool:
@@ -170,9 +180,13 @@ def _b_promote(a: T, b: T) raises -> Int32:
     if not known_stype(a.stype) or not known_stype(b.stype):
         return Int32(-1)
     var r = result_type(a, b)
-    if a.stype != r and not (_b_castable(a.stype) and _b_castable(r)):
+    if a.stype != r and not (
+        _b_castable_on(a.stype, a) and _b_castable_on(r, a)
+    ):
         return Int32(-1)
-    if b.stype != r and not (_b_castable(b.stype) and _b_castable(r)):
+    if b.stype != r and not (
+        _b_castable_on(b.stype, b) and _b_castable_on(r, b)
+    ):
         return Int32(-1)
     return r
 
@@ -371,7 +385,7 @@ def _b_hold(t: T) -> Held:
 def _b_cast(t: T, st: Int32) raises -> Held:
     if t.stype == st:
         return Held(t.copy(), False)
-    if not (_b_castable(t.stype) and _b_castable(st)):
+    if not (_b_castable_on(t.stype, t) and _b_castable_on(st, t)):
         unsupported(
             "a cast from dtype "
             + String(t.stype)

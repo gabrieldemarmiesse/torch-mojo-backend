@@ -403,6 +403,11 @@ _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
             ("nn_functional_instance_norm", torch.bfloat16),
             ("nn_functional_instance_norm", torch.float16),
             ("pow", torch.float32),
+            # Scaling and squaring of a batch with 1-norms near 27 (five
+            # squarings) amplifies float32 GEMM summation order: on the
+            # sample this node holds, 0.016 from the float64 answer against
+            # CPU torch's own 0.050.
+            ("matrix_exp", torch.float32),
         }
     ),
     "gfx942": frozenset(
@@ -513,13 +518,22 @@ class TestOpInfoConformance(TestCase):
                 # itself, so a missing dependency elsewhere still shows.
                 torch.accelerator.synchronize()
             expected = op(sample.input, *sample.args, **sample.kwargs)
+            # What upstream's own CPU-vs-device test (test_ops.py,
+            # `test_compare_cpu`) compares: the outputs after the sample's
+            # `output_process_fn_grad`, which the linalg OpInfos use to drop
+            # what is not unique (the signs of singular and eigenvectors, the
+            # columns `full_matrices` adds). Applied to both legs, on the CPU.
+            actual = sample.output_process_fn_grad(_to_cpu(actual))
+            expected = sample.output_process_fn_grad(expected)
             if (
                 (op.formatted_name, dtype) in _FP64_ANCHORED
                 and isinstance(actual, torch.Tensor)
                 and isinstance(expected, torch.Tensor)
             ):
                 exact = _to_float64(sample)
-                reference = op(exact.input, *exact.args, **exact.kwargs)
+                reference = sample.output_process_fn_grad(
+                    op(exact.input, *exact.args, **exact.kwargs)
+                )
                 assert isinstance(reference, torch.Tensor)
                 cpu_actual = _to_cpu(actual)
                 assert isinstance(cpu_actual, torch.Tensor)

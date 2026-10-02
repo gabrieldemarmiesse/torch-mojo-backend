@@ -28,6 +28,7 @@ from tmb.ops.distance import register_distance
 from tmb.ops.factories import register_factories
 from tmb.ops.foreach import register_foreach
 from tmb.ops.indexing import register_indexing
+from tmb.ops.linalg import register_linalg
 from tmb.ops.loss import register_loss
 from tmb.ops.matmul import register_matmul
 from tmb.ops.nn import register_nn
@@ -69,6 +70,7 @@ def _register_ops(lib: Int) raises:
     _group[register_scans](lib)
     _group[register_stats](lib)
     _group[register_matmul](lib)
+    _group[register_linalg](lib)
     _group[register_nn](lib)
     _group[register_loss](lib)
     _group[register_batch_norm](lib)
