@@ -242,15 +242,17 @@ def test_call_cuda_needs_a_mojo_tensor():
 
 
 def test_fallback_runs_an_op_the_mojo_device_lacks(gpu):
-    """`aten::histc` has no mojo kernel: without the fallback it raises, with
-    it the CUDA kernel runs on the mojo tensors."""
-    x = torch.randn(8, 5, device=gpu)
+    """`aten::linalg_cholesky_ex` has no mojo kernel: without the fallback it
+    raises, with it the CUDA kernel runs on the mojo tensors."""
+    a = torch.randn(5, 5)
+    spd = a @ a.T + 5 * torch.eye(5)
+    x = spd.to(gpu)
     with pytest.raises(NotImplementedError):
-        torch.histc(x, bins=4, min=-2, max=2)
+        torch.linalg.cholesky(x)
     with cuda_interop.cuda_fallback():
-        out = torch.histc(x, bins=4, min=-2, max=2)
+        out = torch.linalg.cholesky(x)
     assert out.device.type == "mojo"
-    torch.testing.assert_close(out.cpu(), torch.histc(x.cpu(), bins=4, min=-2, max=2))
+    torch.testing.assert_close(out.cpu(), torch.linalg.cholesky(spd))
 
 
 def test_fallback_carries_autograd(gpu):
@@ -315,11 +317,11 @@ def test_fallback_is_only_a_fallback(gpu):
 
 
 def test_the_fallback_goes_away_with_its_block(gpu):
-    x = torch.randn(8, 5, device=gpu)
+    x = torch.eye(4, device=gpu)
     with cuda_interop.cuda_fallback():
-        torch.histc(x, bins=4)
+        torch.linalg.cholesky(x)
     with pytest.raises(NotImplementedError):
-        torch.histc(x, bins=4)
+        torch.linalg.cholesky(x)
 
 
 def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
