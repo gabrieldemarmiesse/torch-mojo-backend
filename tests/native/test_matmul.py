@@ -3229,3 +3229,18 @@ def test_convolution_error_wording(mojo_device):
         RuntimeError, match="but got dilation_height: 0, dilation_width: 0"
     ):
         F.conv2d(x, w, dilation=0)
+
+
+def test_conv_entry_point_out_resizes_before_the_overlap_check(mojo_device):
+    """ATen resizes a wrongly shaped out first: an expanded out of another
+    shape gets fresh storage and succeeds, as on CPU."""
+    x = torch.randn(1, 1, 5, 5)
+    w = torch.randn(1, 1, 3, 3)
+    args = ([3, 3], None, [1, 1], [0, 0], [1, 1])
+    want = torch.ops.aten.slow_conv_dilated2d(x, w, *args)
+    out = torch.empty(1, device=mojo_device).expand(2)
+    torch.ops.aten.slow_conv_dilated2d.out(
+        x.to(mojo_device), w.to(mojo_device), *args, out=out
+    )
+    assert out.shape == want.shape
+    torch.testing.assert_close(out.cpu(), want, atol=1e-5, rtol=1e-5)

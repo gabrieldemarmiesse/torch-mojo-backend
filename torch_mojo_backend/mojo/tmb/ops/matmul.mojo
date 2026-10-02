@@ -5271,11 +5271,23 @@ def _out_dest(args: Values, slot: Int) raises -> T:
     kernel runs."""
     var dest = v_tensor(args[unsafe_offset=slot])
     check_out(dest, v_tensor(args[unsafe_offset=0]))
-    # The result is computed into a fresh tensor and copied, so an `out`
-    # aliasing an input reads nothing stale; one that overlaps ITSELF would
-    # have several results race for one address.
-    assert_no_internal_overlap(dest)
     return dest^
+
+
+def _store_conv_out(rets: Values, slot: Int, dest: T, var result: T) raises:
+    """ATen's order for an `out=`: `resize_output` first when the shape
+    differs (fresh, non-overlapping storage), then the internal-overlap check
+    on the FINAL layout, then the copy. The result is computed into a fresh
+    tensor, so an `out` aliasing an input reads nothing stale; one that
+    overlaps ITSELF would have several results race for one address."""
+    var held = own(result^)
+    var dst = dest.copy()
+    if not dst.same_shape(held.t):
+        resize_out(dst, held.t.shape, held.t.rank)
+    assert_no_internal_overlap(dst)
+    copy_strided_into(dst, held.t)
+    _ = held^
+    ret_ref(rets, slot, dst)
 
 
 # aten::_conv_depthwise2d(Tensor self, Tensor weight, SymInt[2] kernel_size,
@@ -5299,7 +5311,7 @@ def op_conv_depthwise2d_out(
     var r = _entry_conv(
         args, 2, "conv_depthwise2d", True, False, True, _UNBATCHED_REJECT
     )
-    _store_out(rets, dest, r^)
+    _store_conv_out(rets, 0, dest, r^)
 
 
 # aten::conv_depthwise3d(Tensor self, Tensor weight, SymInt[3] kernel_size,
@@ -5323,7 +5335,7 @@ def op_conv_depthwise3d_out(
     var r = _entry_conv(
         args, 3, "conv_depthwise3d", True, False, True, _UNBATCHED_KEEP
     )
-    _store_out(rets, dest, r^)
+    _store_conv_out(rets, 0, dest, r^)
 
 
 # aten::_slow_conv2d_forward(Tensor self, Tensor weight, SymInt[2] kernel_size,
@@ -5347,7 +5359,7 @@ def op_slow_conv2d_forward_out(
     var r = _entry_conv(
         args, 2, "slow_conv2d", False, False, False, _UNBATCHED_REJECT
     )
-    _store_out(rets, dest, r^)
+    _store_conv_out(rets, 0, dest, r^)
 
 
 # aten::slow_conv3d_forward(Tensor self, Tensor weight, SymInt[3] kernel_size,
@@ -5371,7 +5383,7 @@ def op_slow_conv3d_forward_out(
     var r = _entry_conv(
         args, 3, "slow_conv3d", False, False, False, _UNBATCHED_REJECT
     )
-    _store_out(rets, dest, r^)
+    _store_conv_out(rets, 0, dest, r^)
 
 
 # aten::slow_conv_dilated2d(Tensor self, Tensor weight, SymInt[2] kernel_size,
@@ -5402,7 +5414,7 @@ def op_slow_conv_dilated2d_out(
     var r = _entry_conv(
         args, 2, "slow_conv_dilated2d", True, False, False, _UNBATCHED_SQUEEZE
     )
-    _store_out(rets, dest, r^)
+    _store_conv_out(rets, 0, dest, r^)
 
 
 # aten::slow_conv_dilated3d -- slow_conv_dilated2d with three spatial axes.
@@ -5431,7 +5443,7 @@ def op_slow_conv_dilated3d_out(
     var r = _entry_conv(
         args, 3, "slow_conv_dilated3d", True, False, False, _UNBATCHED_SQUEEZE
     )
-    _store_out(rets, dest, r^)
+    _store_conv_out(rets, 0, dest, r^)
 
 
 # aten::slow_conv_transpose2d(Tensor self, Tensor weight,
@@ -5456,7 +5468,7 @@ def op_slow_conv_transpose2d_out(
     var r = _entry_conv(
         args, 2, "slow_conv_transpose2d", True, True, False, _UNBATCHED_KEEP
     )
-    _store_out(rets, dest, r^)
+    _store_conv_out(rets, 0, dest, r^)
 
 
 # aten::slow_conv_transpose3d -- slow_conv_transpose2d with three spatial axes.
@@ -5485,7 +5497,7 @@ def op_slow_conv_transpose3d_out(
     var r = _entry_conv(
         args, 3, "slow_conv_transpose3d", True, True, False, _UNBATCHED_SQUEEZE
     )
-    _store_out(rets, dest, r^)
+    _store_conv_out(rets, 0, dest, r^)
 
 
 def _slow_conv2d_grads(
@@ -5553,23 +5565,29 @@ def op_slow_conv2d_backward_out(
     for i in range(3):
         var d = v_tensor(args[unsafe_offset=6 + i])
         check_out(d, input)
-        assert_no_internal_overlap(d)
-        for j in range(len(outs)):
-            assert_no_overlap(d, outs[j])
         outs.append(d^)
     var gi = own(_empty_result(input.stype, input.device))
     var gw = own(_empty_result(input.stype, input.device))
     var gb = own(_empty_result(input.stype, input.device))
     _slow_conv2d_grads(args, [True, True, True], gi, gw, gb)
+    # Resize every out first, then check the final layouts (each against
+    # itself and the others), then copy: ATen's order.
     for i in range(3):
-        var dst = outs[i].copy()
         var src = gi.t.copy() if i == 0 else (
             gw.t.copy() if i == 1 else gb.t.copy()
         )
-        if not dst.same_shape(src):
-            resize_out(dst, src.shape, src.rank)
-        copy_strided_into(dst, src)
-        ret_ref(rets, i, dst)
+        if not outs[i].same_shape(src):
+            resize_out(outs[i], src.shape, src.rank)
+    for i in range(3):
+        assert_no_internal_overlap(outs[i])
+        for j in range(i):
+            assert_no_overlap(outs[i], outs[j])
+    for i in range(3):
+        var src = gi.t.copy() if i == 0 else (
+            gw.t.copy() if i == 1 else gb.t.copy()
+        )
+        copy_strided_into(outs[i], src)
+        ret_ref(rets, i, outs[i])
     _ = gi^
     _ = gw^
     _ = gb^
