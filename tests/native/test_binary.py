@@ -94,17 +94,17 @@ def test_div_int_by_float_scalar_uses_the_default_dtype(mojo_gpu):
 
 
 def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
-    """`promote_integer_inputs_to_float` reads `torch.get_default_dtype()`.
-    The divide kernel does cover float64, but data_movement_ops' CAST_DTYPES
-    does not, so an integer numerator cannot be lifted into it: the op must
-    decline rather than quietly hand back float32."""
-    _, a = _both((6,), torch.int64, mojo_gpu)
+    """`promote_integer_inputs_to_float` reads `torch.get_default_dtype()`:
+    an integer numerator is lifted into float64 when that is the default."""
+    cpu, a = _both((6,), torch.int64, mojo_gpu)
     torch.set_default_dtype(torch.float64)
     try:
-        with pytest.raises(NotImplementedError, match="a cast from dtype"):
-            a / a
+        got = (a / a).cpu()
+        expected = cpu / cpu
     finally:
         torch.set_default_dtype(torch.float32)
+    assert got.dtype == torch.float64
+    torch.testing.assert_close(got, expected, equal_nan=True)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
