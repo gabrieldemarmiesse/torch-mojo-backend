@@ -2218,12 +2218,37 @@ def op_linalg_qr_out(
 # ---------------------------------------------------------------------------
 
 
+def _wide_jacobi(A: T) raises -> Bool:
+    """Whether a float32 Jacobi decomposition runs in float64 and rounds once
+    (any GPU with float64): float32 rotations accumulate rounding over the
+    sweeps, LAPACK's float32 Householder reductions do not."""
+    return A.stype == ST_FLOAT32 and A.numel > 0 and not _is_metal(A)
+
+
+def _narrowed(t: T, st: Int32, fortran: Bool) raises -> Owned:
+    """`t` cast to `st`, batched column-major when `fortran` and t is a
+    matrix batch, else contiguous."""
+    var c = own(cast_to(t, st))
+    if not fortran or t.rank < 2 or t.numel == 0:
+        return c^
+    var out = own(_new_f(_dims(t), st, t.device))
+    copy_strided_into(out.t, c.t)
+    return out^
+
+
 def _eigh(A: T, uplo: String, compute_v: Bool) raises -> Tuple[Owned, Owned]:
     _check_square(A, "linalg.eigh")
     var u = uplo.upper()
     if uplo.byte_length() != 1 or (u != "U" and u != "L"):
         raise Error("Expected UPLO argument to be 'L' or 'U', but got ", uplo)
     _check_compute(A, "linalg.eigh")
+    if _wide_jacobi(A):
+        var A64 = own(cast_to(A, ST_FLOAT64))
+        var r = _eigh(A64.t, uplo, compute_v)
+        return (
+            _narrowed(r[0].t, ST_FLOAT32, False),
+            _narrowed(r[1].t, ST_FLOAT32, compute_v),
+        )
     var n = A.dim(-1)
     var batch = _batch_dims(A)
     var W = own(_new_c(_with1(batch.copy(), n), A.stype, A.device))
@@ -2374,6 +2399,14 @@ def _svd(
         raise Error(
             "torch.linalg.svd: keyword argument `driver=` is only supported on"
             " CUDA inputs with cuSOLVER backend."
+        )
+    if _wide_jacobi(A):
+        var A64 = own(cast_to(A, ST_FLOAT64))
+        var r = _svd(A64.t, full_matrices, compute_uv, False)
+        return (
+            _narrowed(r[0].t, ST_FLOAT32, compute_uv),
+            _narrowed(r[1].t, ST_FLOAT32, False),
+            _narrowed(r[2].t, ST_FLOAT32, compute_uv),
         )
     var m = A.dim(-2)
     var n = A.dim(-1)
@@ -2814,6 +2847,13 @@ def _lstsq(
     var sv = own(_empty0(A.stype, A.device))
     if m == 0 or n == 0 or X.t.numel == 0:
         fill_value(X.t, 0.0)
+        if m > n:
+            # Nothing was solved: torch's raw residuals are B's rows n..m,
+            # summed over the rows (shape batch + (nrhs,), even if empty).
+            var tail = own(_narrow(Bx.t, -2, n, m - n))
+            var sq = _binary("aten::mul", tail.t, tail.t)
+            residuals = _reduce_dim("aten::sum", sq.t, -2, False)
+            _ = tail^
     else:
         var Acp = own(_clone_f(Ax.t))
         if m >= n:
@@ -2904,6 +2944,12 @@ def op_linalg_lstsq_out(
     var res_out = v_tensor(args[unsafe_offset=5])
     var rank_out = v_tensor(args[unsafe_offset=6])
     var sv_out = v_tensor(args[unsafe_offset=7])
+    if (
+        _is_complex(sol_out.stype)
+        or _is_complex(res_out.stype)
+        or _is_complex(sv_out.stype)
+    ):
+        unsupported("torch.linalg.lstsq: complex out= tensors on mojo")
     _lstsq_out_check(sol_out, A, "solution")
     _lstsq_out_check(res_out, A, "residuals")
     _lstsq_out_check(rank_out, A, "rank")
@@ -3191,13 +3237,29 @@ def _mexp_scale_square(A: T, norm: T, theta: Float64) raises -> Owned:
     sw.t(s_raw.t)
     sw.s(0.0)
     var s = sw.one()
-    var ng = _unary("aten::neg", s.t)
-    var pw = _Op("aten::pow", "Scalar")
-    pw.s(2.0)
-    pw.t(ng.t)
-    var p2 = pw.one()
+    # 2^-s in two factors, 2^-floor(s/2) and 2^-(s - floor(s/2)): for s
+    # near 127 the single factor is subnormal, which Metal flushes to zero.
+    var half = _scalar_op("aten::mul", "Scalar", s.t, 0.5)
+    var s1 = _unary("aten::floor", half.t)
+    var s2 = _binary("aten::sub", s.t, s1.t)
+    var n1 = _unary("aten::neg", s1.t)
+    var n2 = _unary("aten::neg", s2.t)
+    var pw1 = _Op("aten::pow", "Scalar")
+    pw1.s(2.0)
+    pw1.t(n1.t)
+    var f1 = pw1.one()
+    var pw2 = _Op("aten::pow", "Scalar")
+    pw2.s(2.0)
+    pw2.t(n2.t)
+    var p2 = pw2.one()
+    var f1v = own(_view_b11(f1.t))
     var p3 = own(_view_b11(p2.t))
-    var scaled = _binary("aten::mul", A, p3.t)
+    var half_scaled = _binary("aten::mul", A, f1v.t)
+    var scaled = _binary("aten::mul", half_scaled.t, p3.t)
+    _ = half^
+    _ = s2^
+    _ = n1^
+    _ = n2^
     var E = _mexp_T(scaled.t, 18)
     var mx = _unary("aten::max", s.t)
     var smax = _item(mx.t)
@@ -3224,7 +3286,8 @@ def _mexp_scale_square(A: T, norm: T, theta: Float64) raises -> Owned:
     _ = q^
     _ = lg^
     _ = ce^
-    _ = ng^
+    _ = s1^
+    _ = f1v^
     _ = p2^
     _ = p3^
     _ = s3^

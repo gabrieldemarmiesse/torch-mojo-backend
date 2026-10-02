@@ -596,3 +596,78 @@ def test_ldl_solve_accepts_int64_pivots_as_torch(mojo_gpu: str):
         torch.linalg.ldl_solve(LD, piv.long(), b),
         torch.float32,
     )
+
+
+# --- round-2 review regressions -----------------------------------------------------
+
+
+def test_svd_keeps_small_singular_values_next_to_large(mojo_gpu: str):
+    a = torch.diag(torch.tensor([2.0**30, 2.0**-60]))
+    s = torch.linalg.svdvals(a.to(mojo_gpu)).cpu()
+    assert s.tolist() == [2.0**30, 2.0**-60]
+    U, S, Vh = torch.linalg.svd(a.to(mojo_gpu))
+    _close(U.cpu().abs(), torch.eye(2), torch.float32)
+
+
+def test_jacobi_small_block_next_to_large(mojo_gpu: str):
+    a = torch.tensor([[1e8, 0.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]])
+    s = torch.linalg.svdvals(a.to(mojo_gpu)).cpu()
+    torch.testing.assert_close(
+        s, torch.tensor([1e8, 1.618034, 0.618034]), rtol=1e-5, atol=0.0
+    )
+    e = torch.tensor([[1e8, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]])
+    w = torch.linalg.eigvalsh(e.to(mojo_gpu)).cpu()
+    torch.testing.assert_close(w, torch.tensor([-1.0, 1.0, 1e8]), rtol=1e-6, atol=1e-6)
+
+
+def test_jacobi_float32_accuracy_at_size(mojo_gpu: str):
+    """Against the float64 answer, within a small factor of LAPACK's own
+    float32 error (CPU torch's). Off Metal the float32 Jacobi runs in
+    float64 and rounds once; on Metal (no float64) the rotations run in
+    float32, and each sweep's rounding of the off-diagonal entries adds up:
+    measured 20x CPU's error on the M4 for this case, so the bar is 50x
+    there."""
+    factor = 50 if is_metal(mojo_gpu) else 10
+    torch.manual_seed(21)
+    a = torch.randn(256, 256)
+    a = a + a.mT
+    exact = torch.linalg.eigvalsh(a.double())
+    err = (torch.linalg.eigvalsh(a.to(mojo_gpu)).cpu().double() - exact).abs().max()
+    cpu_err = (torch.linalg.eigvalsh(a).double() - exact).abs().max()
+    assert err <= factor * cpu_err + 1e-5, (err, cpu_err)
+    b = torch.randn(300, 200)
+    exact = torch.linalg.svdvals(b.double())
+    err = (torch.linalg.svdvals(b.to(mojo_gpu)).cpu().double() - exact).abs().max()
+    cpu_err = (torch.linalg.svdvals(b).double() - exact).abs().max()
+    assert err <= factor * cpu_err + 1e-5, (err, cpu_err)
+
+
+def test_lstsq_empty_overdetermined_residuals(mojo_gpu: str):
+    a = torch.empty(0, 3, 2)
+    b = torch.empty(0, 3, 1)
+    got = torch.linalg.lstsq(a.to(mojo_gpu), b.to(mojo_gpu))
+    assert (
+        got.residuals.shape
+        == torch.linalg.lstsq(a, b, driver="gels").residuals.shape
+        == (0, 1)
+    )
+
+
+def test_lstsq_complex_out_declines(mojo_gpu: str):
+    # The device holds no complex tensor, so the only complex out that can
+    # arrive is a host one: declined, not refused with a wrong message.
+    a = torch.randn(4, 3).to(mojo_gpu)
+    outs = (
+        torch.empty(0, dtype=torch.complex64),
+        torch.empty(0, device=mojo_gpu),
+        torch.empty(0, dtype=torch.int64, device=mojo_gpu),
+        torch.empty(0, device=mojo_gpu),
+    )
+    with pytest.raises(NotImplementedError):
+        torch.linalg.lstsq(a, a, out=outs)
+
+
+def test_matrix_exp_huge_norm_scaling(mojo_gpu: str):
+    a = torch.diag(torch.tensor([-3e38, -3e38]))
+    got = torch.linalg.matrix_exp(a.to(mojo_gpu)).cpu()
+    assert torch.equal(got, torch.zeros(2, 2)), got

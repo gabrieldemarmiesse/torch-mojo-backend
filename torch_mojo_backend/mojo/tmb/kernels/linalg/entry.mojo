@@ -146,24 +146,23 @@ def _block_max[dt: DType](v: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def _pow2_scale[dt: DType](mx: Scalar[dt]) -> Tuple[Scalar[dt], Scalar[dt]]:
-    """(up, down), powers of two with mx * up / down in [0.5, 2) for a
-    finite mx > 0 ((1, 1) otherwise): scaling by them is exact, as LAPACK's
-    dlascl intends. Two factors, each a normal number, because the single
-    factor 2e38 needs (2^-128) is subnormal, and Metal flushes those to
-    zero."""
+    """(up, down), powers of two that bring a largest magnitude `mx` outside
+    LAPACK's safe range [rmin, rmax] (ssyev / sgesvd: rmin = sqrt(safmin /
+    eps), rmax = 1 / rmin) back to its edge -- (1, 1) when mx is inside it,
+    zero or not finite, so ordinary inputs are left untouched. Two factors,
+    each a normal number: a single factor such as 2^-128 is subnormal, and
+    Metal flushes those to zero."""
     var up = Scalar[dt](1)
     var down = Scalar[dt](1)
     if not (mx > 0) or mx - mx != 0:
         return (up, down)
-    # The largest power of two `up` may reach: 2^100 (float32), 2^1000.
-    var cap = Scalar[dt](1.2676506002282294e30)
-    comptime if dt == DType.float64:
-        cap = Scalar[dt](1.0715086071862673e301)
+    var rmin = sqrt(_sfmin[dt]() / _eps[dt]())
+    var rmax = 1 / rmin
     var x = mx
-    while x >= 2:
+    while x > rmax:
         x *= 0.5
         down *= 2
-    while x < 0.5 and up < cap:
+    while x < rmin:
         x *= 2
         up *= 2
     return (up, down)
@@ -716,7 +715,8 @@ def _syevj_kernel[
 ):
     """The symmetric matrix whose `lower` (else upper) triangle `src`
     holds is copied whole into `a` (n x n, column-major), scaled by a power
-    of two to a largest magnitude in [0.5, 2) so no rotation over- or
+    of two (only when its largest magnitude is outside LAPACK's safe
+    range) so no rotation over- or
     underflows; `vw` (n x n) and `ws` (2n + 2 per matrix) are workspaces
     too. The eigenvalues land ascending in `w_out` (n per matrix), their
     vectors in the columns of `v_out` (n x n, column-major). `info` is 0, or
@@ -761,16 +761,14 @@ def _syevj_kernel[
         var sc2 = _pow2_scale[dt](amax)
         var up = sc2[0]
         var down = sc2[1]
-        var sq = Scalar[dt](0)
-        idx = tid
-        while idx < n * n:
-            var x = a[unsafe_offset=ab + idx] * up / down
-            a[unsafe_offset=ab + idx] = x
-            sq += x * x
-            idx += nt
-        # Rotations below eps * ||A||_F change A by less than its rounding:
-        # skipping them is what lets a rank-deficient matrix converge.
-        var floor = _eps[dt]() * sqrt(block_sum[dt, LA_THREADS](sq))
+        if up != 1 or down != 1:
+            idx = tid
+            while idx < n * n:
+                a[unsafe_offset=ab + idx] = (
+                    a[unsafe_offset=ab + idx] * up / down
+                )
+                idx += nt
+        barrier()
         var converged = True
         for _sweep in range(JACOBI_MAX_SWEEPS):
             if n < 2 or not finite:
@@ -790,7 +788,9 @@ def _syevj_kernel[
                         var apq = a[unsafe_offset=ab + p + q * n]
                         var app = a[unsafe_offset=ab + p + p * n]
                         var aqq = a[unsafe_offset=ab + q + q * n]
-                        if _abs(apq) > floor and _abs(apq) > tol * sqrt(
+                        # The classic relative test, with an absolute floor
+                        # at the underflow threshold only.
+                        if _abs(apq) > _sfmin[dt]() and _abs(apq) > tol * sqrt(
                             _abs(app)
                         ) * sqrt(_abs(aqq)):
                             var theta = (aqq - app) / (2 * apq)
@@ -803,9 +803,18 @@ def _syevj_kernel[
                                     tt = -tt
                             c = 1 / sqrt(1 + tt * tt)
                             s = tt * c
+                            # Rutishauser: the new diagonal from t, and the
+                            # pair's off-diagonal set to exactly zero below
+                            # rather than recomputed (its recomputation
+                            # carries eps * |A| of noise that would keep
+                            # the pair rotating forever).
+                            app = app - tt * apq
+                            aqq = aqq + tt * apq
                             flag[unsafe_offset=0] = 1
-                    ws[unsafe_offset=wsb + 2 * t] = c
-                    ws[unsafe_offset=wsb + 2 * t + 1] = s
+                        ws[unsafe_offset=wsb + 4 * t + 2] = app
+                        ws[unsafe_offset=wsb + 4 * t + 3] = aqq
+                    ws[unsafe_offset=wsb + 4 * t] = c
+                    ws[unsafe_offset=wsb + 4 * t + 1] = s
                     t += nt
                 barrier()
                 # A J and V J: columns p, q of every row.
@@ -813,9 +822,9 @@ def _syevj_kernel[
                 while idx < n * pairs:
                     var r = idx % n
                     var pt = idx // n
-                    var s = ws[unsafe_offset=wsb + 2 * pt + 1]
+                    var s = ws[unsafe_offset=wsb + 4 * pt + 1]
                     if s != 0:
-                        var c = ws[unsafe_offset=wsb + 2 * pt]
+                        var c = ws[unsafe_offset=wsb + 4 * pt]
                         var pq = _rr_pair(rnd, pt, mm)
                         var p = pq[0]
                         var q = pq[1]
@@ -835,9 +844,9 @@ def _syevj_kernel[
                 while idx < n * pairs:
                     var r = idx % n
                     var pt = idx // n
-                    var s = ws[unsafe_offset=wsb + 2 * pt + 1]
+                    var s = ws[unsafe_offset=wsb + 4 * pt + 1]
                     if s != 0:
-                        var c = ws[unsafe_offset=wsb + 2 * pt]
+                        var c = ws[unsafe_offset=wsb + 4 * pt]
                         var pq = _rr_pair(rnd, pt, mm)
                         var p = pq[0]
                         var q = pq[1]
@@ -846,6 +855,22 @@ def _syevj_kernel[
                         a[unsafe_offset=ab + p + r * n] = c * x - s * y
                         a[unsafe_offset=ab + q + r * n] = s * x + c * y
                     idx += nt
+                barrier()
+                t = tid
+                while t < pairs:
+                    if ws[unsafe_offset=wsb + 4 * t + 1] != 0:
+                        var pq = _rr_pair(rnd, t, mm)
+                        var p = pq[0]
+                        var q = pq[1]
+                        a[unsafe_offset=ab + p + p * n] = ws[
+                            unsafe_offset=wsb + 4 * t + 2
+                        ]
+                        a[unsafe_offset=ab + q + q * n] = ws[
+                            unsafe_offset=wsb + 4 * t + 3
+                        ]
+                        a[unsafe_offset=ab + p + q * n] = 0
+                        a[unsafe_offset=ab + q + p * n] = 0
+                    t += nt
                 barrier()
             var rotated = flag[unsafe_offset=0]
             barrier()
@@ -908,7 +933,7 @@ def _gesvdj_kernel[
 ):
     """One-sided Jacobi on `u` (m x n, m >= n, column-major), which starts
     as a copy of `src` (read through its strides) scaled by a power of two
-    to a largest magnitude in [0.5, 2), as LAPACK's gesvd scales, so no
+    (only outside LAPACK's safe range, as its gesvd scales), so no
     column norm over- or underflows; `info` is 0, or n for a non-finite
     input or no convergence. The rest:
     rotates column pairs until every pair is orthogonal, accumulating the
@@ -956,17 +981,14 @@ def _gesvdj_kernel[
         var sc2 = _pow2_scale[dt](amax)
         var up = sc2[0]
         var down = sc2[1]
-        var sq = Scalar[dt](0)
-        idx = tid
-        while idx < m * n:
-            var x = u[unsafe_offset=ub + idx] * up / down
-            u[unsafe_offset=ub + idx] = x
-            sq += x * x
-            idx += nt
-        # A column pair whose inner product is below eps^2 * ||A||_F^2 is
-        # orthogonal to working precision: skipping it is what lets a
-        # rank-deficient matrix converge.
-        var floor = _eps[dt]() * _eps[dt]() * block_sum[dt, LA_THREADS](sq)
+        if up != 1 or down != 1:
+            idx = tid
+            while idx < m * n:
+                u[unsafe_offset=ub + idx] = (
+                    u[unsafe_offset=ub + idx] * up / down
+                )
+                idx += nt
+        barrier()
         var converged = True
         for _sweep in range(JACOBI_MAX_SWEEPS):
             if n < 2 or not finite:
@@ -992,9 +1014,9 @@ def _gesvdj_kernel[
                             alpha += x * x
                             beta += y * y
                             gamma += x * y
-                        if _abs(gamma) > floor and _abs(gamma) > tol * sqrt(
-                            alpha
-                        ) * sqrt(beta):
+                        if _abs(gamma) > _sfmin[dt]() and _abs(
+                            gamma
+                        ) > tol * sqrt(alpha) * sqrt(beta):
                             var zeta = (beta - alpha) / (2 * gamma)
                             var tt: Scalar[dt]
                             if _abs(zeta) > 1 / _eps[dt]():
@@ -1051,7 +1073,8 @@ def _gesvdj_kernel[
             for r in range(m):
                 var x = u[unsafe_offset=ub + r + idx * m]
                 acc += x * x
-            ws[unsafe_offset=wsb + n + 2 + idx] = sqrt(acc) / up * down
+            # kept scaled: U divides by it before any unscaling
+            ws[unsafe_offset=wsb + n + 2 + idx] = sqrt(acc)
             idx += nt
         barrier()
         idx = tid
@@ -1062,7 +1085,7 @@ def _gesvdj_kernel[
                 if _before(x, idx, ws[unsafe_offset=wsb + n + 2 + j], j):
                     rank += 1
             # `rank` counts the values after x ascending: its slot descending.
-            s_out[unsafe_offset=b * n + rank] = x
+            s_out[unsafe_offset=b * n + rank] = x / up * down
             ws[unsafe_offset=wsb + idx] = Scalar[dt](rank)
             idx += nt
         barrier()
@@ -1072,7 +1095,7 @@ def _gesvdj_kernel[
                 var r = idx % m
                 var j = idx // m
                 var rank = Int(ws[unsafe_offset=wsb + j])
-                var sig = ws[unsafe_offset=wsb + n + 2 + j] * up / down
+                var sig = ws[unsafe_offset=wsb + n + 2 + j]
                 var x = u[unsafe_offset=ub + idx]
                 u_out[
                     unsafe_offset=ub + r + rank * m
