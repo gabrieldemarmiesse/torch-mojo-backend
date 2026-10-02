@@ -73,6 +73,7 @@ from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     assert_no_internal_overlap,
+    can_cast,
     cast_to,
     check_out_as,
     copy_strided_into,
@@ -391,6 +392,23 @@ def _check_square(t: T, name: String, arg: String = "A") raises:
 
 def _same_device(a: T, b: T) -> Bool:
     return a.device_type == b.device_type and a.device == b.device
+
+
+def _all_on(t: T, other: T) raises:
+    """The kernels dereference every operand on `t`'s device: anything on
+    another device (a CPU pivots tensor, say) is refused, with the message
+    of torch's TensorIterator / dispatcher device check."""
+    if not _same_device(t, other):
+        raise Error(
+            (
+                "Expected all tensors to be on the same device, but found at"
+                " least two devices, "
+            ),
+            device_str(t),
+            " and ",
+            device_str(other),
+            "!",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -898,6 +916,7 @@ def op_cholesky_solve_helper(
     var B = v_tensor(args[unsafe_offset=0])
     var A = v_tensor(args[unsafe_offset=1])
     var upper = v_bool(args[unsafe_offset=2])
+    _linear_solve_check(B, A, "cholesky_solve")
     _check_compute(A, "cholesky_solve")
     if B.stype != A.stype:
         raise Error(
@@ -1069,6 +1088,8 @@ def _lu_unpack(
                 _sizes_str(got),
                 " instead.",
             )
+    if unpack_pivots:
+        _all_on(LU, piv)
     _check_compute(LU, "torch.lu_unpack")
     var P: Owned
     if unpack_pivots:
@@ -1241,6 +1262,8 @@ def _lu_solve(LU: T, piv: T, B: T, left: Bool, adjoint: Bool) raises -> Owned:
             _sizes_str(pd),
             " instead",
         )
+    _all_on(LU, piv)
+    _all_on(LU, B)
     var batch = _broadcast(_batch_dims(B), _batch_dims(LU))
     var rows = B.dim(-2)
     var cols = B.dim(-1)
@@ -1417,6 +1440,7 @@ def _solve_ex(
             " supported for left=False. In this case linalg.solve is"
             " equivalent to B / A.squeeze(-1)"
         )
+    _all_on(A, B)
     var f = _lu_factor(A, True)
     if check_errors:
         _check_errors(f[2].t, "torch.linalg.solve_ex", A.rank == 2)
@@ -1627,6 +1651,7 @@ def _solve_triangular(
             B.dim(-1),
             ")",
         )
+    _all_on(A, B)
     _check_compute(A, "linalg.solve_triangular")
     var batch = _broadcast(_batch_dims(B), _batch_dims(A))
     var n = A.dim(-1)
@@ -1676,6 +1701,7 @@ def op_linalg_solve_triangular_out(
 ) raises:
     var a = _st_args(args)
     var out = v_tensor(args[unsafe_offset=5])
+    _all_on(a[0], out)
     var X = _solve_triangular(a[0], a[1], a[2], a[3], a[4])
     _store_cast(out, X.t)
     ret_ref(rets, 0, out)
@@ -2047,6 +2073,26 @@ def _ormqr(
             " and result has dtype ",
             _st_name(result_st),
         )
+    if not _same_device(tau, input):
+        raise Error(
+            (
+                "torch.ormqr: Expected tau and input tensors to be on the same"
+                " device, but got tau on "
+            ),
+            device_str(tau),
+            " and input on ",
+            device_str(input),
+        )
+    if not _same_device(other, input):
+        raise Error(
+            (
+                "torch.ormqr: Expected other and input tensors to be on the"
+                " same device, but got other on "
+            ),
+            device_str(other),
+            " and input on ",
+            device_str(input),
+        )
     _check_compute(input, "torch.ormqr")
     var C = own(_clone_f(other))
     if C.t.numel == 0:
@@ -2193,6 +2239,7 @@ def _eigh(A: T, uplo: String, compute_v: Bool) raises -> Tuple[Owned, Owned]:
     var work = own(_new_c(_with(batch.copy(), n, n), A.stype, A.device))
     var vw = own(_new_c(_with(batch.copy(), n, n), A.stype, A.device))
     var ws = own(_new_c(_with1(batch.copy(), 2 * n + 2), A.stype, A.device))
+    var info = own(_new_c(batch.copy(), ST_INT32, A.device))
     var l = List[Int]()
     l.append(V.t.ptr if compute_v else vw.t.ptr)
     l.append(n)
@@ -2202,6 +2249,7 @@ def _eigh(A: T, uplo: String, compute_v: Bool) raises -> Tuple[Owned, Owned]:
     l.append(Af.t.stride(-1))
     l.append(_bstride(Af.t))
     l.append(1 if u == "L" else 0)
+    l.append(info.t.ptr)
     _launch(
         "Syevj",
         A.dtype,
@@ -2217,6 +2265,7 @@ def _eigh(A: T, uplo: String, compute_v: Bool) raises -> Tuple[Owned, Owned]:
     _ = work^
     _ = vw^
     _ = ws^
+    _check_errors(info.t, "linalg.eigh", A.rank == 2)
     return (W^, V^)
 
 
@@ -2366,6 +2415,7 @@ def _svd(
     var vw = own(_new_c(_with(batch.copy(), k, k), A.stype, A.device))
     var vo = own(_new_c(_with(batch.copy(), k, k), A.stype, A.device))
     var ws = own(_new_c(_with1(batch.copy(), 3 * k + 2), A.stype, A.device))
+    var info = own(_new_c(batch.copy(), ST_INT32, A.device))
     var l = List[Int]()
     l.append(uo.t.ptr)
     l.append(vo.t.ptr)
@@ -2376,6 +2426,7 @@ def _svd(
     l.append(Xf.t.stride(-2))
     l.append(Xf.t.stride(-1))
     l.append(_bstride(Xf.t))
+    l.append(info.t.ptr)
     _launch(
         "Gesvdj",
         A.dtype,
@@ -2391,6 +2442,7 @@ def _svd(
     _ = u^
     _ = vw^
     _ = ws^
+    _check_errors(info.t, "linalg.svd", A.rank == 2)
     if not compute_uv:
         return (U^, S^, Vh^)
     # uo / vo hold, per matrix, column-major mm x k and k x k: view them so.
@@ -2587,6 +2639,7 @@ def _ldl_solve(LD: T, piv: T, B: T, hermitian: Bool) raises -> Owned:
             " does not match b dtype ",
             _st_name(B.stype),
         )
+    _all_on(LD, piv)
     var batch = _broadcast(_batch_dims(B), _batch_dims(LD))
     var X = own(
         _new_f(_with(batch.copy(), B.dim(-2), B.dim(-1)), B.stype, B.device)
@@ -2684,13 +2737,15 @@ def _reduce_dim(
 
 
 def _lstsq_driver(v: Value) raises -> String:
+    """`get_default_lstsq_driver` as on CUDA: 'gels' by default and the only
+    driver accepted."""
     if v_is_none(v):
-        return String("gelsy")
+        return String("gels")
     var d = v_string(v).lower()
-    if d != "gels" and d != "gelsy" and d != "gelsd" and d != "gelss":
+    if d != "gels":
         raise Error(
-            "torch.linalg.lstsq: parameter `driver` should be one of (gels,"
-            " gelsy, gelsd, gelss)"
+            "torch.linalg.lstsq: `driver` other than `gels` is not supported"
+            " on CUDA"
         )
     return d
 
@@ -2698,10 +2753,10 @@ def _lstsq_driver(v: Value) raises -> String:
 def _lstsq(
     A: T, B: T, rcond_v: Value, driver_v: Value
 ) raises -> Tuple[Owned, Owned, Owned, Owned]:
-    """`linalg_lstsq` as torch runs it off CUDA (CPU / MPS: every driver,
-    'gelsy' by default). 'gels' solves through Householder QR (a full-rank
-    A, as LAPACK's); the others through the SVD, with the rank they count
-    from `rcond`."""
+    """`linalg_lstsq` as torch runs it on CUDA: the 'gels' driver only,
+    Householder QR of A (m >= n) or of A^T (m < n, the minimum-norm
+    solution), as CUDA's `linalg_lstsq_gels`; rank and singular values come
+    back empty, residuals for an overdetermined system."""
     if A.rank < 2:
         raise Error(
             "torch.linalg.lstsq: input must have at least 2 dimensions."
@@ -2744,37 +2799,22 @@ def _lstsq(
             " and input on ",
             device_str(A),
         )
-    var driver = _lstsq_driver(driver_v)
+    _ = _lstsq_driver(driver_v)
+    _ = rcond_v  # rcond only matters to the rank-revealing drivers
     _check_compute(A, "torch.linalg.lstsq")
     var m = A.dim(-2)
     var n = A.dim(-1)
     var nrhs = B2.t.dim(-1)
-    var eps = (
-        2.220446049250313e-16 if A.stype
-        == ST_FLOAT64 else 1.1920928955078125e-07
-    )
-    var rcond = eps * Float64(max(m, n))
-    if not v_is_none(rcond_v):
-        rcond = v_f64(rcond_v)
     var batch = _broadcast(_batch_dims(A), _batch_dims(B2.t))
     var Ax = own(_expand(A, _with(batch.copy(), m, n)))
     var Bx = own(_expand(B2.t, _with(batch.copy(), m, nrhs)))
-    var abatch = _batch_dims(A)
     var X = own(_new_f(_with(batch.copy(), n, nrhs), A.stype, A.device))
     var residuals = own(_empty0(A.stype, A.device))
     var rank = own(_empty0(ST_INT64, A.device))
     var sv = own(_empty0(A.stype, A.device))
-    if driver != "gels":
-        rank = own(_new_c(abatch.copy(), ST_INT64, A.device))
-    if driver == "gelsd" or driver == "gelss":
-        sv = own(_new_c(_with1(abatch.copy(), min(m, n)), A.stype, A.device))
     if m == 0 or n == 0 or X.t.numel == 0:
         fill_value(X.t, 0.0)
-        if rank.t.numel > 0:
-            fill_value(rank.t, 0.0)
-        if sv.t.numel > 0:
-            fill_value(sv.t, 0.0)
-    elif driver == "gels":
+    else:
         var Acp = own(_clone_f(Ax.t))
         if m >= n:
             var tau = own(_new_c(_with1(batch.copy(), n), A.stype, A.device))
@@ -2811,58 +2851,6 @@ def _lstsq(
             _ = Xtop^
             _ = Q^
         _ = Acp^
-    else:
-        var svd = _svd(Ax.t, False, True, False)
-        var Ut = own(_mT(svd[0].t))
-        var UtB = _matmul(Ut.t, Bx.t)
-        var smax = _reduce_dim("aten::amax", svd[1].t, -1, True)
-        var thr = _scalar_op("aten::mul", "Scalar", smax.t, rcond)
-        var c = _Op("aten::gt", "Tensor")
-        c.t(svd[1].t)
-        c.t(thr.t)
-        var mask = c.one()
-        var inv = _unary("aten::reciprocal", svd[1].t)
-        var w = _Op("aten::where", "ScalarOther")
-        w.t(mask.t)
-        w.t(inv.t)
-        w.s(0.0)
-        var winv = w.one()
-        var wcol = own(_unsqueeze_last(winv.t))
-        var Y = _binary("aten::mul", UtB.t, wcol.t)
-        var V = own(_mT(svd[2].t))
-        var Xs = _matmul(V.t, Y.t)
-        copy_strided_into(X.t, Xs.t)
-        var rk = _Op("aten::sum", "dim_IntList")
-        rk.t(mask.t)
-        var d = List[Int]()
-        d.append(-1)
-        rk.ints(d)
-        rk.b(False)
-        rk.none()
-        var rsum = rk.one()
-        var rcast = own_if_new(cast_to(rsum.t, ST_INT64), rsum.t)
-        # rank (and the singular values) have A's batch shape; the batch
-        # broadcast against B only repeats them.
-        var rb = own(_narrow_batch_like(rcast.t, abatch))
-        copy_strided_into(rank.t, rb.t)
-        if sv.t.numel > 0:
-            var sb = own(_narrow_batch_like(svd[1].t, abatch, True))
-            copy_strided_into(sv.t, sb.t)
-        if m > n and driver != "gelsy":
-            var full = _item_all_rank(rsum.t, n)
-            if full:
-                var AX = _matmul(Ax.t, X.t)
-                var diff = _binary("aten::sub", AX.t, Bx.t)
-                var sq = _binary("aten::mul", diff.t, diff.t)
-                residuals = _reduce_dim("aten::sum", sq.t, -2, False)
-                _ = AX^
-                _ = diff^
-        _ = mask^
-        _ = inv^
-        _ = winv^
-        _ = rsum^
-        _ = Ut^
-        _ = V^
     var sol: Owned
     if vector_case:
         sol = own(_squeeze_last(X.t))
@@ -2874,38 +2862,25 @@ def _lstsq(
     return (sol^, residuals^, rank^, sv^)
 
 
-def _narrow_batch_like(
-    t: T, abatch: List[Int], has_last: Bool = False
-) raises -> T:
-    """t (broadcast batch [+ one trailing dim]) cut back to A's batch shape:
-    index 0 along every dim A broadcast from size 1 or did not have."""
-    var r = len(abatch) + (1 if has_last else 0)
-    var lead = t.rank - r
-    var shape = IndexList[MAX_RANK](1)
-    var strides = IndexList[MAX_RANK](0)
-    for i in range(r):
-        var ti = lead + i
-        var want = abatch[i] if i < len(abatch) else t.dim(ti)
-        shape[MAX_RANK - r + i] = want
-        strides[MAX_RANK - r + i] = t.stride(ti) if want == t.dim(ti) else 0
-    return view_strided(t, shape, strides, r, t.offset)
+def _lstsq_out_dtype(dest: T, from_st: Int32, name: StaticString) raises:
+    """`checkLinalgCompatibleDtype`: `from_st` must cast safely into the
+    out tensor's dtype (c10::canCast)."""
+    if not can_cast(from_st, dest.stype) or (
+        _is_complex(dest.stype) != _is_complex(from_st) and _is_complex(from_st)
+    ):
+        raise Error(
+            "torch.linalg.lstsq: Expected ",
+            name,
+            " to be safely castable from ",
+            _st_name(from_st),
+            " dtype, but got ",
+            name,
+            " with dtype ",
+            _st_name(dest.stype),
+        )
 
 
-def _item_all_rank(rsum: T, n: Int) raises -> Bool:
-    """`at::all(rank == n).item()`."""
-    var c = _Op("aten::eq", "Scalar")
-    c.t(rsum)
-    c.si(n)
-    var e = c.one()
-    var a = _unary("aten::all", e.t)
-    var v = _item(a.t)
-    _ = e^
-    return v != 0.0
-
-
-def _lstsq_out_check(
-    dest: T, input: T, name: StaticString, expect_st: Int32
-) raises:
+def _lstsq_out_check(dest: T, input: T, name: StaticString) raises:
     if not _same_device(dest, input):
         raise Error(
             "torch.linalg.lstsq: Expected ",
@@ -2929,11 +2904,16 @@ def op_linalg_lstsq_out(
     var res_out = v_tensor(args[unsafe_offset=5])
     var rank_out = v_tensor(args[unsafe_offset=6])
     var sv_out = v_tensor(args[unsafe_offset=7])
+    _lstsq_out_check(sol_out, A, "solution")
+    _lstsq_out_check(res_out, A, "residuals")
+    _lstsq_out_check(rank_out, A, "rank")
+    _lstsq_out_check(sv_out, A, "singular_values")
+    _lstsq_out_dtype(sol_out, A.stype, "solution")
+    # torch names the residuals "solution" in this message too
+    _lstsq_out_dtype(res_out, A.stype, "solution")
+    _lstsq_out_dtype(rank_out, ST_INT64, "rank")
+    _lstsq_out_dtype(sv_out, A.stype, "singular_values")
     var r = _lstsq(A, B, args[unsafe_offset=2], args[unsafe_offset=3])
-    _lstsq_out_check(sol_out, A, "solution", A.stype)
-    _lstsq_out_check(res_out, A, "residuals", A.stype)
-    _lstsq_out_check(rank_out, A, "rank", ST_INT64)
-    _lstsq_out_check(sv_out, A, "singular_values", A.stype)
     _store_cast(sol_out, r[0].t)
     _store_cast(res_out, r[1].t)
     _store_cast(rank_out, r[2].t)
@@ -3202,7 +3182,15 @@ def _mexp_scale_square(A: T, norm: T, theta: Float64) raises -> Owned:
     var cm = _Op("aten::clamp_min", "")
     cm.t(ce.t)
     cm.s(0.0)
-    var s = cm.one()
+    var s_raw = cm.one()
+    # A matrix with a non-finite norm squares zero times and comes out NaN
+    # (torch's result for it); it must not set every other matrix's count.
+    var fin = _unary("aten::isfinite", norm)
+    var sw = _Op("aten::where", "ScalarOther")
+    sw.t(fin.t)
+    sw.t(s_raw.t)
+    sw.s(0.0)
+    var s = sw.one()
     var ng = _unary("aten::neg", s.t)
     var pw = _Op("aten::pow", "Scalar")
     pw.s(2.0)
@@ -3226,6 +3214,13 @@ def _mexp_scale_square(A: T, norm: T, theta: Float64) raises -> Owned:
         _ = sq^
         _ = g^
         it += 1
+    var fin3 = own(_view_b11(fin.t))
+    var nw = _Op("aten::where", "ScalarOther")
+    nw.t(fin3.t)
+    nw.t(E.t)
+    nw.s(nan[DType.float64]())
+    E = nw.one()
+    _ = s_raw^
     _ = q^
     _ = lg^
     _ = ce^
@@ -3270,6 +3265,8 @@ def _matrix_exp(a: T) raises -> Owned:
         return own(_clone_c(a))
     if n == 1:
         return _unary("aten::exp", a)
+    if a.numel == 0:  # an empty batch
+        return own(_clone_c(a))
     var ac = own(_clone_c(a))
     var d3 = List[Int]()
     d3.append(_batch_count(a))

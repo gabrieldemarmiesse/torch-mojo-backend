@@ -112,6 +112,97 @@ def _lapy2[dt: DType](x: Scalar[dt], y: Scalar[dt]) -> Scalar[dt]:
 
 
 @always_inline
+def _nan_max[dt: DType](x: Scalar[dt], y: Scalar[dt]) -> Scalar[dt]:
+    """max that propagates NaN."""
+    if x != x:
+        return x
+    if y != y:
+        return y
+    return max(x, y)
+
+
+@always_inline
+def _block_max[dt: DType](v: Scalar[dt]) -> Scalar[dt]:
+    """NaN-propagating max of `v` over the LA_THREADS-thread block, to every
+    thread (every thread must call it)."""
+    var sh = stack_allocation[
+        LA_THREADS, dt, address_space=AddressSpace.SHARED
+    ]()
+    var tid = Int(thread_idx.x)
+    sh[unsafe_offset=tid] = v
+    barrier()
+    var stride = LA_THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            sh[unsafe_offset=tid] = _nan_max(
+                sh[unsafe_offset=tid], sh[unsafe_offset=tid + stride]
+            )
+        barrier()
+        stride //= 2
+    var r = sh[unsafe_offset=0]
+    barrier()
+    return r
+
+
+@always_inline
+def _pow2_scale[dt: DType](mx: Scalar[dt]) -> Tuple[Scalar[dt], Scalar[dt]]:
+    """(up, down), powers of two with mx * up / down in [0.5, 2) for a
+    finite mx > 0 ((1, 1) otherwise): scaling by them is exact, as LAPACK's
+    dlascl intends. Two factors, each a normal number, because the single
+    factor 2e38 needs (2^-128) is subnormal, and Metal flushes those to
+    zero."""
+    var up = Scalar[dt](1)
+    var down = Scalar[dt](1)
+    if not (mx > 0) or mx - mx != 0:
+        return (up, down)
+    # The largest power of two `up` may reach: 2^100 (float32), 2^1000.
+    var cap = Scalar[dt](1.2676506002282294e30)
+    comptime if dt == DType.float64:
+        cap = Scalar[dt](1.0715086071862673e301)
+    var x = mx
+    while x >= 2:
+        x *= 0.5
+        down *= 2
+    while x < 0.5 and up < cap:
+        x *= 2
+        up *= 2
+    return (up, down)
+
+
+@always_inline
+def _is_finite[dt: DType](x: Scalar[dt]) -> Bool:
+    return x - x == 0
+
+
+@always_inline
+def _scaled_norm[
+    dt: DType
+](v: FPtr[dt], start: Int, stop: Int, stride: Int, off: Int) -> Scalar[dt]:
+    """The 2-norm of v[off + i * stride], i in [start, stop), over the block,
+    without overflow or underflow: scaled by the largest magnitude, as
+    LAPACK's dnrm2. Every thread must call it."""
+    var tid = Int(thread_idx.x)
+    var nt = Int(block_dim.x)
+    var mx = Scalar[dt](0)
+    var i = start + tid
+    while i < stop:
+        mx = _nan_max(mx, _abs(v[unsafe_offset=off + i * stride]))
+        i += nt
+    var scale = _block_max[dt](mx)
+    var acc = Scalar[dt](0)
+    if scale > 0 and _is_finite(scale):
+        i = start + tid
+        while i < stop:
+            var x = v[unsafe_offset=off + i * stride] / scale
+            acc += x * x
+            i += nt
+    var total = block_sum[dt, LA_THREADS](acc)
+    if not (scale > 0) or not _is_finite(scale):
+        return scale  # 0, inf or NaN
+    return scale * sqrt(total)
+
+
+@always_inline
 def _blocks(n: Int) -> Int:
     return max(1, min(n, LA_MAX_BLOCKS))
 
@@ -464,13 +555,8 @@ def _geqrf_kernel[
         var base = b * bs
         for j in range(k):
             var alpha = a[unsafe_offset=base + j * rs + j * cs]
-            var part = Scalar[dt](0)
-            var i = j + 1 + tid
-            while i < m:
-                var x = a[unsafe_offset=base + i * rs + j * cs]
-                part += x * x
-                i += nt
-            var xnorm = sqrt(block_sum[dt, LA_THREADS](part))
+            var xnorm = _scaled_norm[dt](a, j + 1, m, rs, base + j * cs)
+            var i = 0
             # larfg: H (alpha, x) = (beta, 0), H = I - tau v v^T, v = (1, x/(alpha-beta))
             var t = Scalar[dt](0)
             if xnorm != 0:
@@ -626,12 +712,16 @@ def _syevj_kernel[
     s_cs64: Int64,
     s_bs64: Int64,
     lower64: Int64,
+    info: IPtr,
 ):
     """The symmetric matrix whose `lower` (else upper) triangle `src`
-    holds is copied whole into `a` (n x n, column-major); `vw` (n x n) and
-    `ws` (2n + 2 per matrix) are workspaces too. The eigenvalues land
-    ascending in `w_out` (n per matrix), their vectors in the columns of
-    `v_out` (n x n, column-major)."""
+    holds is copied whole into `a` (n x n, column-major), scaled by a power
+    of two to a largest magnitude in [0.5, 2) so no rotation over- or
+    underflows; `vw` (n x n) and `ws` (2n + 2 per matrix) are workspaces
+    too. The eigenvalues land ascending in `w_out` (n per matrix), their
+    vectors in the columns of `v_out` (n x n, column-major). `info` is 0, or
+    n for a non-finite input or no convergence (torch then raises, as on
+    LAPACK's info > 0)."""
     var n = Int(n64)
     var batch = Int(batch64)
     var want_v = want_v64 != 0
@@ -652,22 +742,38 @@ def _syevj_kernel[
         var ab = b * n * n
         var wsb = b * (2 * n + 2)
         var idx = tid
+        var mx = Scalar[dt](0)
         while idx < n * n:
             var i = idx % n
             var j = idx // n
             var own_half = i >= j if lower else i <= j
             var r = i if own_half else j
             var c = j if own_half else i
-            a[unsafe_offset=ab + idx] = src[
-                unsafe_offset=b * s_bs + r * s_rs + c * s_cs
-            ]
+            var x = src[unsafe_offset=b * s_bs + r * s_rs + c * s_cs]
+            mx = _nan_max(mx, _abs(x))
+            a[unsafe_offset=ab + idx] = x
             vw[unsafe_offset=ab + idx] = Scalar[dt](1) if idx % (
                 n + 1
             ) == 0 else Scalar[dt](0)
             idx += nt
-        barrier()
+        var amax = _block_max[dt](mx)
+        var finite = _is_finite(amax)
+        var sc2 = _pow2_scale[dt](amax)
+        var up = sc2[0]
+        var down = sc2[1]
+        var sq = Scalar[dt](0)
+        idx = tid
+        while idx < n * n:
+            var x = a[unsafe_offset=ab + idx] * up / down
+            a[unsafe_offset=ab + idx] = x
+            sq += x * x
+            idx += nt
+        # Rotations below eps * ||A||_F change A by less than its rounding:
+        # skipping them is what lets a rank-deficient matrix converge.
+        var floor = _eps[dt]() * sqrt(block_sum[dt, LA_THREADS](sq))
+        var converged = True
         for _sweep in range(JACOBI_MAX_SWEEPS):
-            if n < 2:
+            if n < 2 or not finite:
                 break
             if tid == 0:
                 flag[unsafe_offset=0] = 0
@@ -684,7 +790,7 @@ def _syevj_kernel[
                         var apq = a[unsafe_offset=ab + p + q * n]
                         var app = a[unsafe_offset=ab + p + p * n]
                         var aqq = a[unsafe_offset=ab + q + q * n]
-                        if apq != 0 and _abs(apq) > tol * sqrt(
+                        if _abs(apq) > floor and _abs(apq) > tol * sqrt(
                             _abs(app)
                         ) * sqrt(_abs(aqq)):
                             var theta = (aqq - app) / (2 * apq)
@@ -745,6 +851,12 @@ def _syevj_kernel[
             barrier()
             if rotated == 0:
                 break
+            if _sweep == JACOBI_MAX_SWEEPS - 1:
+                converged = False
+        if tid == 0:
+            info[unsafe_offset=b] = Int32(0) if (
+                finite and converged
+            ) else Int32(max(n, 1))
         # Rank each eigenvalue, then scatter values and vectors into place.
         idx = tid
         while idx < n:
@@ -753,7 +865,7 @@ def _syevj_kernel[
             for j in range(n):
                 if _before(a[unsafe_offset=ab + j + j * n], j, x, idx):
                     rank += 1
-            w_out[unsafe_offset=b * n + rank] = x
+            w_out[unsafe_offset=b * n + rank] = x / up * down
             ws[unsafe_offset=wsb + idx] = Scalar[dt](rank)
             idx += nt
         barrier()
@@ -792,9 +904,13 @@ def _gesvdj_kernel[
     s_rs64: Int64,
     s_cs64: Int64,
     s_bs64: Int64,
+    info: IPtr,
 ):
     """One-sided Jacobi on `u` (m x n, m >= n, column-major), which starts
-    as a copy of `src` (read through its strides):
+    as a copy of `src` (read through its strides) scaled by a power of two
+    to a largest magnitude in [0.5, 2), as LAPACK's gesvd scales, so no
+    column norm over- or underflows; `info` is 0, or n for a non-finite
+    input or no convergence. The rest:
     rotates column pairs until every pair is orthogonal, accumulating the
     rotations in `vw` (n x n). The column norms are the singular values,
     descending in `s_out` (n); `u_out` (m x n) gets the normalized columns
@@ -821,10 +937,13 @@ def _gesvdj_kernel[
         var vb = b * n * n
         var wsb = b * (3 * n + 2)
         var idx = tid
+        var mx = Scalar[dt](0)
         while idx < m * n:
-            u[unsafe_offset=ub + idx] = src[
+            var x = src[
                 unsafe_offset=b * s_bs + (idx % m) * s_rs + (idx // m) * s_cs
             ]
+            mx = _nan_max(mx, _abs(x))
+            u[unsafe_offset=ub + idx] = x
             idx += nt
         idx = tid
         while idx < n * n:
@@ -832,9 +951,25 @@ def _gesvdj_kernel[
                 n + 1
             ) == 0 else Scalar[dt](0)
             idx += nt
-        barrier()
+        var amax = _block_max[dt](mx)
+        var finite = _is_finite(amax)
+        var sc2 = _pow2_scale[dt](amax)
+        var up = sc2[0]
+        var down = sc2[1]
+        var sq = Scalar[dt](0)
+        idx = tid
+        while idx < m * n:
+            var x = u[unsafe_offset=ub + idx] * up / down
+            u[unsafe_offset=ub + idx] = x
+            sq += x * x
+            idx += nt
+        # A column pair whose inner product is below eps^2 * ||A||_F^2 is
+        # orthogonal to working precision: skipping it is what lets a
+        # rank-deficient matrix converge.
+        var floor = _eps[dt]() * _eps[dt]() * block_sum[dt, LA_THREADS](sq)
+        var converged = True
         for _sweep in range(JACOBI_MAX_SWEEPS):
-            if n < 2:
+            if n < 2 or not finite:
                 break
             if tid == 0:
                 flag[unsafe_offset=0] = 0
@@ -857,7 +992,7 @@ def _gesvdj_kernel[
                             alpha += x * x
                             beta += y * y
                             gamma += x * y
-                        if gamma != 0 and _abs(gamma) > tol * sqrt(
+                        if _abs(gamma) > floor and _abs(gamma) > tol * sqrt(
                             alpha
                         ) * sqrt(beta):
                             var zeta = (beta - alpha) / (2 * gamma)
@@ -902,6 +1037,12 @@ def _gesvdj_kernel[
             barrier()
             if rotated == 0:
                 break
+            if _sweep == JACOBI_MAX_SWEEPS - 1:
+                converged = False
+        if tid == 0:
+            info[unsafe_offset=b] = Int32(0) if (
+                finite and converged
+            ) else Int32(max(n, 1))
         # Column norms, then descending ranks (NaN first, as the reversed
         # ascending order), then the scatter.
         idx = tid
@@ -910,7 +1051,7 @@ def _gesvdj_kernel[
             for r in range(m):
                 var x = u[unsafe_offset=ub + r + idx * m]
                 acc += x * x
-            ws[unsafe_offset=wsb + n + 2 + idx] = sqrt(acc)
+            ws[unsafe_offset=wsb + n + 2 + idx] = sqrt(acc) / up * down
             idx += nt
         barrier()
         idx = tid
@@ -931,7 +1072,7 @@ def _gesvdj_kernel[
                 var r = idx % m
                 var j = idx // m
                 var rank = Int(ws[unsafe_offset=wsb + j])
-                var sig = ws[unsafe_offset=wsb + n + 2 + j]
+                var sig = ws[unsafe_offset=wsb + n + 2 + j] * up / down
                 var x = u[unsafe_offset=ub + idx]
                 u_out[
                     unsafe_offset=ub + r + rank * m
@@ -1477,6 +1618,7 @@ def _launch[
                 _ti(ints, 5),
                 _ti(ints, 6),
                 _ti(ints, 7),
+                _ip(Int(_ti(ints, 8))),
             )
         elif _op_on["Gesvdj"]():
             # p0 src, p1 u, p2 vw, p3 ws, p4 s; ints: u_out, v_out, m, n,
@@ -1501,6 +1643,7 @@ def _launch[
                 _ti(ints, 6),
                 _ti(ints, 7),
                 _ti(ints, 8),
+                _ip(Int(_ti(ints, 9))),
             )
         elif _op_on["Sytrs"]():
             # n, ncols, a_rs, a_cs, a_bs, piv_bs, b_rs, b_cs, b_bs, batch

@@ -422,23 +422,38 @@ def test_ldl(mojo_gpu: str, dtype: torch.dtype):
     )
 
 
-@pytest.mark.parametrize("driver", ["gels", "gelsy", "gelsd", "gelss"])
 @pytest.mark.parametrize("shape", [(6, 3), (3, 6), (4, 4)])
-def test_lstsq(mojo_gpu: str, driver: str, shape):
+def test_lstsq(mojo_gpu: str, shape):
+    """CUDA's lstsq: the 'gels' driver (the default) through QR."""
     torch.manual_seed(17)
     a = torch.randn(2, *shape)
     b = torch.randn(2, shape[0], 2)
-    got = torch.linalg.lstsq(a.to(mojo_gpu), b.to(mojo_gpu), driver=driver)
-    exp = torch.linalg.lstsq(a, b, driver=driver)
-    if driver == "gels" and shape[0] < shape[1]:
-        # LAPACK's gels gives the minimum-norm solution of the
-        # underdetermined system; check it solves A X = B.
-        _close(a @ got.solution.cpu(), b, torch.float32)
+    got = torch.linalg.lstsq(a.to(mojo_gpu), b.to(mojo_gpu))
+    exp = torch.linalg.lstsq(a, b, driver="gels")
+    if shape[0] < shape[1]:
+        # the minimum-norm solution of the underdetermined system
+        _close(got.solution, torch.linalg.pinv(a) @ b, torch.float32)
     else:
         _close(got.solution, exp.solution, torch.float32)
     _close(got.residuals, exp.residuals, torch.float32)
-    assert torch.equal(got.rank.cpu(), exp.rank)
-    _close(got.singular_values, exp.singular_values, torch.float32)
+    assert got.rank.numel() == 0 and got.singular_values.numel() == 0
+
+
+@pytest.mark.parametrize("driver", ["gelsy", "gelsd", "GELSS"])
+def test_lstsq_rejects_other_drivers_as_cuda(mojo_gpu: str, driver: str):
+    a = torch.randn(4, 3).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="other than `gels` is not supported"):
+        torch.linalg.lstsq(a, a, driver=driver)
+
+
+def test_lstsq_out_dtype_checked(mojo_gpu: str):
+    a = torch.randn(4, 3).to(mojo_gpu)
+    sol = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    res = torch.empty(0, device=mojo_gpu)
+    rank = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    sv = torch.empty(0, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Expected solution to be safely castable"):
+        torch.linalg.lstsq(a, a, out=(sol, res, rank, sv))
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
@@ -474,3 +489,110 @@ def test_float64_declines_on_metal(mojo_gpu: str):
         pytest.skip("only Apple GPUs lack float64")
     with pytest.raises(NotImplementedError):
         torch.linalg.inv(torch.eye(3, dtype=torch.float64).to(mojo_gpu))
+
+
+# --- review regressions ---------------------------------------------------------
+
+
+def test_matrix_exp_non_finite(mojo_gpu: str):
+    inf = torch.tensor([[float("inf"), 1.0], [0.0, 1.0]])
+    assert torch.linalg.matrix_exp(inf.to(mojo_gpu)).cpu().isnan().all()
+    torch.manual_seed(19)
+    batch = torch.stack([torch.full((3, 3), float("nan")), 5 * torch.eye(3)])
+    got = torch.linalg.matrix_exp(batch.to(mojo_gpu)).cpu()
+    assert got[0].isnan().all()
+    _close(got[1], torch.linalg.matrix_exp(batch[1]), torch.float32)
+    big = torch.stack([torch.full((3, 3), float("nan")), 20 * torch.randn(3, 3)])
+    exp = torch.linalg.matrix_exp(big[1].double()).float()
+    torch.testing.assert_close(
+        torch.linalg.matrix_exp(big.to(mojo_gpu)).cpu()[1],
+        exp,
+        rtol=1e-3,
+        atol=1e-3 * exp.abs().max().item(),
+    )
+
+
+def test_matrix_exp_empty_batch(mojo_gpu: str):
+    assert torch.linalg.matrix_exp(torch.empty(0, 3, 3).to(mojo_gpu)).shape == (0, 3, 3)
+
+
+def test_operands_on_other_devices_are_refused(mojo_gpu: str):
+    qr, tau = torch.geqrf(torch.randn(4, 3))
+    c = torch.randn(4, 2)
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.ormqr(qr.to(mojo_gpu), tau, c.to(mojo_gpu))
+    LU, piv = torch.linalg.lu_factor(torch.randn(3, 3))
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.linalg.lu_solve(LU.to(mojo_gpu), piv, torch.randn(3, 1).to(mojo_gpu))
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.lu_unpack(LU.to(mojo_gpu), piv)
+    a = torch.randn(3, 3).triu() + 3 * torch.eye(3)
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.linalg.solve_triangular(
+            a.to(mojo_gpu),
+            torch.randn(3, 1).to(mojo_gpu),
+            upper=True,
+            out=torch.empty(3, 1),
+        )
+
+
+@pytest.mark.parametrize("scale", [1e20, 1e-30])
+def test_qr_and_svd_extreme_scales(mojo_gpu: str, scale: float):
+    a = torch.tensor([[1.0, 0.0], [1.0, 1.0]]) * scale
+    q, r = torch.linalg.qr(a.to(mojo_gpu))
+    q0, r0 = torch.linalg.qr(a)
+    torch.testing.assert_close(q.cpu(), q0, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(r.cpu(), r0, rtol=1e-5, atol=0.0)
+    _close(torch.geqrf(a.to(mojo_gpu))[1], torch.geqrf(a)[1], torch.float32)
+    s = torch.linalg.svdvals((scale * torch.eye(3)).to(mojo_gpu)).cpu()
+    torch.testing.assert_close(s, torch.full((3,), scale), rtol=1e-6, atol=0.0)
+
+
+def test_eigh_extreme_scale(mojo_gpu: str):
+    a = torch.tensor([[-2e38, 1e38], [1e38, 2e38]])
+    w = torch.linalg.eigvalsh(a.to(mojo_gpu)).cpu()
+    torch.testing.assert_close(
+        w, torch.tensor([-2.2361e38, 2.2361e38]), rtol=1e-4, atol=0.0
+    )
+
+
+def test_eigh_rank_deficient_converges(mojo_gpu: str):
+    torch.manual_seed(20)
+    v = torch.randn(64, 1)
+    a = v @ v.mT  # rank 1
+    w, q = torch.linalg.eigh(a.to(mojo_gpu))
+    _close(w, torch.linalg.eigvalsh(a), torch.float32)
+    _close(q.cpu() @ torch.diag(w.cpu()) @ q.cpu().mT, a, torch.float32)
+
+
+def test_eigh_and_svd_of_nan_raise(mojo_gpu: str):
+    a = torch.full((3, 3), float("nan"))
+    with pytest.raises(RuntimeError, match="failed to converge"):
+        torch.linalg.eigh(a.to(mojo_gpu))
+    with pytest.raises(RuntimeError, match="failed to converge"):
+        torch.linalg.svd(a.to(mojo_gpu))
+
+
+def test_solve_triangular_strides_match_torch(mojo_gpu: str):
+    a = torch.randn(2, 3, 3).triu() + 3 * torch.eye(3)
+    for left, b in ((True, torch.randn(2, 3, 4)), (False, torch.randn(2, 4, 3))):
+        got = torch.linalg.solve_triangular(
+            a.to(mojo_gpu), b.to(mojo_gpu), upper=True, left=left
+        )
+        assert (
+            got.stride()
+            == torch.linalg.solve_triangular(a, b, upper=True, left=left).stride()
+        )
+
+
+def test_ldl_solve_accepts_int64_pivots_as_torch(mojo_gpu: str):
+    a = _sym(4, 4)
+    LD, piv = torch.linalg.ldl_factor(a)
+    b = torch.randn(4, 2)
+    _close(
+        torch.linalg.ldl_solve(
+            LD.to(mojo_gpu), piv.long().to(mojo_gpu), b.to(mojo_gpu)
+        ),
+        torch.linalg.ldl_solve(LD, piv.long(), b),
+        torch.float32,
+    )

@@ -159,6 +159,8 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "masked_cumsum": ("bfloat16", "float16"),
     # Matches CUDA, not CPU: CUDA's half cumsum rounds every addition (scan_dim<scalar_t>); bit-equal to stock CUDA on every sample.
     "cumulative_trapezoid": ("float16",),
+    "linalg_lstsq": ("float32",),
+    "linalg_lstsq_grad_oriented": ("float32",),
 }
 # --- END GENERATED test_matches_cpu ---
 
