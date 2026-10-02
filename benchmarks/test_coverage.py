@@ -254,7 +254,10 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::log1p.out": _OUT,
     "aten::logical_not.out": _OUT,
     "aten::logit.out": _OUT,
-    "aten::logit_": _OUT,
+    "aten::logit_": (
+        "in-place form of logit.out, which this suite already measures: the "
+        "same kernel launched with out=self"
+    ),
     "aten::lt.Scalar_out": _OUT,
     "aten::lt.Tensor_out": _OUT,
     "aten::masked_fill.Scalar_out": _OUT,

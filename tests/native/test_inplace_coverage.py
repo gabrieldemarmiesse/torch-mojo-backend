@@ -313,6 +313,72 @@ def test_logit_inplace_noncontiguous(mojo_gpu):
     torch.testing.assert_close(dev_t.cpu(), cpu_t, rtol=1e-4, atol=1e-5)
 
 
+@pytest.mark.parametrize("eps", [None, 0.0, 0.05, -1.0])
+def test_logit_inplace_clamps_at_eps(mojo_gpu, eps):
+    """Values outside [eps, 1 - eps] and outside (0, 1): clamped, inf or NaN
+    exactly as CPU torch (a negative eps, like None, does not clamp)."""
+    base = torch.tensor([-0.5, 0.0, 0.01, 0.04, 0.5, 0.96, 0.99, 1.0, 1.5])
+    cpu = base.clone()
+    cpu.logit_(eps=eps)
+    x = base.to(mojo_gpu)
+    x.logit_(eps=eps)
+    torch.testing.assert_close(x.cpu(), cpu, rtol=1e-5, atol=1e-6, equal_nan=True)
+
+
+def test_logit_inplace_empty_and_0d(mojo_gpu):
+    for base in (torch.empty(0), torch.tensor(0.25)):
+        cpu = base.clone()
+        cpu.logit_()
+        x = base.to(mojo_gpu)
+        x.logit_()
+        assert x.shape == cpu.shape
+        torch.testing.assert_close(x.cpu(), cpu)
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.int32, torch.bool])
+@pytest.mark.parametrize("default", [torch.float32, torch.float64])
+def test_logit_inplace_refuses_integer_self(mojo_gpu, dtype, default):
+    previous = torch.get_default_dtype()
+    torch.set_default_dtype(default)
+    try:
+        base = torch.tensor([0, 1, 1], dtype=dtype)
+        with pytest.raises(RuntimeError) as cpu_err:
+            base.clone().logit_()
+        with pytest.raises(RuntimeError) as dev_err:
+            base.to(mojo_gpu).logit_()
+    finally:
+        torch.set_default_dtype(previous)
+    assert "can't be cast to the desired output type" in str(cpu_err.value)
+    # the device appends the op it raised from: "... [aten::logit_]"
+    assert str(dev_err.value).startswith(str(cpu_err.value).splitlines()[0])
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda t: t.div_(2.5, rounding_mode="trunc"),
+        lambda t: t.div_(-2.5, rounding_mode="floor"),
+        lambda t: t.fmod_(1.5),
+        lambda t: t.copysign_(-1.0),
+        lambda t: torch.ops.aten.xlogy_.Scalar_Other(t, 3.0),
+    ],
+    ids=[
+        "div_Scalar_mode_trunc",
+        "div_Scalar_mode_floor",
+        "fmod_Scalar",
+        "copysign_Scalar",
+        "xlogy_Scalar_Other",
+    ],
+)
+def test_scalar_overloads_inplace_match_cpu(mojo_gpu, call):
+    base = torch.tensor([5.0, -6.0, 7.5, -8.5, 0.0, 0.25])
+    cpu = base.clone()
+    call(cpu)
+    x = base.to(mojo_gpu)
+    call(x)
+    torch.testing.assert_close(x.cpu(), cpu, rtol=1e-5, atol=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # binary: Tensor-Tensor in-place math ops with no fast path of their own.
 # ---------------------------------------------------------------------------
