@@ -5578,6 +5578,10 @@ def op_slow_conv2d_backward_out(
         )
         if not outs[i].same_shape(src):
             resize_out(outs[i], src.shape, src.rank)
+    # Every pointer after the LAST resize: growing one out can move a
+    # storage another shares, leaving that one's cached pointer dangling.
+    for i in range(3):
+        outs[i] = T(outs[i].h)
     for i in range(3):
         assert_no_internal_overlap(outs[i])
         for j in range(i):

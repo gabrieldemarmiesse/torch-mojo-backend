@@ -1325,13 +1325,15 @@ def op_grid_sampler_backward[
         call.run()
         _ = ctx
     comptime if OUT:
-        var d1 = v_tensor(args[unsafe_offset=8])
         if need_in:
             var d0 = v_tensor(args[unsafe_offset=7])
             _copy_to_out(d0, gi.t, gi_dims, name)
             ret_ref(rets, 0, d0)
         else:
             ret_ref(rets, 0, v_tensor(args[unsafe_offset=7]))
+        # Read out1 only now: resizing out0 can move a storage the two share,
+        # and every pointer must be taken after the resizes before it.
+        var d1 = v_tensor(args[unsafe_offset=8])
         _copy_to_out(d1, gg.t, gg_dims, name)
         ret_ref(rets, 1, d1)
         _ = gi^

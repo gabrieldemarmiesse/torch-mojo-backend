@@ -3244,3 +3244,29 @@ def test_conv_entry_point_out_resizes_before_the_overlap_check(mojo_device):
     )
     assert out.shape == want.shape
     torch.testing.assert_close(out.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
+def test_slow_conv2d_backward_out_shared_storage_resize(mojo_device):
+    """grad_weight grows the storage it shares with grad_input: every out's
+    pointer must be re-read after the last resize (CPU accepts this)."""
+    gen = torch.Generator().manual_seed(5)
+    x = torch.randn(1, 1, 5, 5, generator=gen)
+    w = torch.randn(1, 1, 3, 3, generator=gen)
+    go = torch.randn(1, 1, 3, 3, generator=gen)
+    args = ([3, 3], [1, 1], [0, 0])
+    want = torch.ops.aten._slow_conv2d_backward(go, x, w, *args, [True] * 3)
+    base = torch.zeros(26, device=mojo_device)
+    gi = base[:25].view(1, 1, 5, 5)
+    gw = base[25:]
+    gb = torch.empty(0, device=mojo_device)
+    torch.ops.aten._slow_conv2d_backward.grad_input(
+        go.to(mojo_device),
+        x.to(mojo_device),
+        w.to(mojo_device),
+        *args,
+        grad_input=gi,
+        grad_weight=gw,
+        grad_bias=gb,
+    )
+    for got, ref in zip((gi, gw, gb), want, strict=True):
+        torch.testing.assert_close(got.cpu(), ref, atol=1e-5, rtol=1e-5)

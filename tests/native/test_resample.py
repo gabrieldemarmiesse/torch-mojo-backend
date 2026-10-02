@@ -958,3 +958,33 @@ def test_upsample_aa_keeps_sliced_channels_last(mojo_device):
     assert want.is_contiguous(memory_format=torch.channels_last)
     assert got.stride() == want.stride()
     torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
+def test_grid_sample_backward_out_shared_storage_resize(mojo_device):
+    """out0 grows the storage it shares with out1: out1's pointer must be
+    read after that resize."""
+    x, grid = _grid_inputs((1, 1, 3, 3), (2, 2), torch.float32)
+    go = torch.randn(1, 1, 2, 2)
+    want = torch.ops.aten.grid_sampler_2d_backward(
+        go, x, grid, 0, 0, False, [True, True]
+    )
+    # Resizing out0 to (1, 1, 3, 3) grows the 5-element storage; out1, a
+    # stale view of it until re-read, is then resized and written. The two
+    # overlap after the resizes, so (as on CPU) out1 is written last and is
+    # the one whose values survive.
+    base = torch.zeros(5, device=mojo_device)
+    out0 = base[:1]
+    out1 = base[1:5]
+    torch.ops.aten.grid_sampler_2d_backward.out(
+        go.to(mojo_device),
+        x.to(mojo_device),
+        grid.to(mojo_device),
+        0,
+        0,
+        False,
+        [True, True],
+        out0=out0,
+        out1=out1,
+    )
+    assert out0.shape == want[0].shape
+    torch.testing.assert_close(out1.cpu(), want[1], atol=1e-5, rtol=1e-5)
