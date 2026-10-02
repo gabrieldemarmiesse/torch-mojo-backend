@@ -86,6 +86,7 @@ comptime OUT_DTYPES = [
 
 # Every kind this family builds, with its operand count.
 comptime KINDS_1 = [
+    "blas_scale",
     "elu",
     "frexp_exponent",
     "frexp_mantissa",
@@ -103,10 +104,12 @@ comptime KINDS_1 = [
     "softplus",
     "softshrink",
     "threshold",
+    "widen",
 ]
 comptime KINDS_2 = [
     "add_relu",
     "atan2",
+    "blas_axpby",
     "chebyshev_polynomial_t",
     "chebyshev_polynomial_u",
     "chebyshev_polynomial_v",
@@ -132,6 +135,7 @@ comptime KINDS_2 = [
     "hypot",
     "igamma",
     "igammac",
+    "int4_nibble",
     "ipow",
     "isclose",
     "laguerre_polynomial_l",
@@ -179,6 +183,7 @@ comptime KINDS_3 = [
     "dirichlet_grad",
     "glu_backward_b",
     "huber_backward",
+    "int4_dequant",
     "lerp",
     "mse_backward",
     "prelu_backward_input",

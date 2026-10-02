@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tests.native.conftest import is_metal, ran, skip_if_metal
+from tests.native.test_scans import cuda_lowp_cumsum
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
 
@@ -3287,8 +3288,10 @@ def test_cumsum_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
     expected = torch.cumsum(x, dim=dim)
     assert result.dtype == expected.dtype
     if dtype.is_floating_point:
+        # CUDA's half running sum rounds after every addition; CPU's float
+        # one rounds once, so the reference is CUDA's order, bit-exact.
         torch.testing.assert_close(
-            result.cpu(), expected, rtol=_CUMSUM_LOWP_RTOL, atol=_CUMSUM_LOWP_ATOL
+            result.cpu(), cuda_lowp_cumsum(x, dim), rtol=0, atol=0
         )
     else:
         torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
@@ -3309,8 +3312,10 @@ def test_cumsum_workspace_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
     expected = torch.cumsum(x, dim=dim)
     assert result.dtype == expected.dtype
     if dtype.is_floating_point:
+        # CUDA's half running sum rounds after every addition; CPU's float
+        # one rounds once, so the reference is CUDA's order, bit-exact.
         torch.testing.assert_close(
-            result.cpu(), expected, rtol=_CUMSUM_LOWP_RTOL, atol=_CUMSUM_LOWP_ATOL
+            result.cpu(), cuda_lowp_cumsum(x, dim), rtol=0, atol=0
         )
     else:
         torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
@@ -3395,12 +3400,13 @@ def test_cumsum_rank2_out_of_range_dim_declines(mojo_gpu, dim):
         torch.cumsum(x.to(mojo_gpu), dim=dim)
 
 
-def test_cumsum_declines_middle_dim_on_rank3(mojo_gpu):
-    """rank>=3 non-trailing dims are out of this kernel family's scope and must
-    raise, not silently compute the wrong axis."""
-    x = torch.randn(4, 5, 6).to(mojo_gpu)
-    with pytest.raises(NotImplementedError):
-        torch.cumsum(x, dim=1)
+def test_cumsum_middle_dim_on_rank3(mojo_gpu):
+    """rank>=3 non-trailing dims run on the scan family (tmb/ops/scans.mojo)
+    and must scan the right axis."""
+    x = torch.randn(4, 5, 6)
+    torch.testing.assert_close(
+        torch.cumsum(x.to(mojo_gpu), dim=1).cpu(), torch.cumsum(x, dim=1)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3530,14 +3536,13 @@ def test_cumsum_empty_dtype_kwarg(mojo_gpu):
 def test_unsupported_inputs_raise_not_implemented(mojo_gpu):
     """Eager has no graph fallback: every gate the old fast path answered with
     NOT_HANDLED is an actionable NotImplementedError here."""
-    with pytest.raises(NotImplementedError):
-        # int8/int16 promote to int64 through a cast the cast kernel does not
-        # dispatch on (same gap sum.IntList_out/cumsum document elsewhere).
-        torch.tensor(3, dtype=torch.int8).to(mojo_gpu).sum()
+    # int8/int16 promote to int64 through the device cast kernel.
+    assert torch.tensor(3, dtype=torch.int8).to(mojo_gpu).sum().item() == 3
     with pytest.raises(NotImplementedError):
         torch.mean(torch.randint(0, 4, (3, 4), dtype=torch.int64).to(mojo_gpu), dim=1)
-    with pytest.raises(NotImplementedError):
-        torch.argmax(torch.empty(0, 4).to(mojo_gpu), dim=1)
+    # An empty reduce dim is torch's own IndexError, not a decline.
+    with pytest.raises(IndexError, match="non-zero size"):
+        torch.argmax(torch.empty(0, 4).to(mojo_gpu), dim=0)
     with pytest.raises(NotImplementedError):
         torch.ops.aten.any.dims((torch.randn(3, 4) > 0).to(mojo_gpu), [])
 
@@ -4300,3 +4305,173 @@ def test_median_and_kthvalue_errors(mojo_gpu):
         torch.median(torch.empty(2, 0).to(mojo_gpu), 1)
     with pytest.raises(RuntimeError, match="not implemented for 'Bool'"):
         torch.median(torch.tensor([True, False]).to(mojo_gpu), 0)
+
+
+@pytest.mark.parametrize("op", [torch.var_mean, torch.std_mean])
+@pytest.mark.parametrize("dim", [None, 0, 1])
+def test_var_mean_takes_the_mean_from_the_moments_pass(mojo_gpu, op, dim):
+    """The mean of [3e38, 3e38] is 3e38: a sum / n would overflow to inf."""
+    x = torch.full((4, 2), 3e38)
+    v, m = op(x.to(mojo_gpu), dim=dim)
+    rv, rm = op(x, dim=dim)
+    torch.testing.assert_close(m.cpu(), rm)
+    torch.testing.assert_close(v.cpu(), rv)
+    y = torch.randn(64, 257)
+    v, m = op(y.to(mojo_gpu), dim=dim)
+    rv, rm = op(y, dim=dim)
+    torch.testing.assert_close(m.cpu(), rm, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(v.cpu(), rv, atol=1e-5, rtol=1e-4)
+
+
+def test_var_mean_split_reduction_mean(mojo_gpu):
+    """A full reduction long enough to split across blocks: the mean comes
+    out of the merge."""
+    x = torch.randn(1 << 20) + 5.0
+    v, m = torch.var_mean(x.to(mojo_gpu))
+    rv, rm = torch.var_mean(x.double())
+    torch.testing.assert_close(m.cpu().double(), rm, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(v.cpu().double(), rv, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("op", [torch.var, torch.std])
+@pytest.mark.parametrize("dim", [None, 1, (0, 2)])
+def test_std_var_float64(mojo_gpu, op, dim):
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.randn(3, 5, 7, dtype=torch.float64)
+    torch.testing.assert_close(op(x.to(mojo_gpu), dim=dim).cpu(), op(x, dim=dim))
+    v, m = torch.var_mean(x.to(mojo_gpu), dim=dim, correction=0)
+    rv, rm = torch.var_mean(x, dim=dim, correction=0)
+    torch.testing.assert_close(v.cpu(), rv)
+    torch.testing.assert_close(m.cpu(), rm)
+
+
+def test_float64_moments_do_not_overflow(mojo_gpu):
+    """CUDA's float64 Welford: `[1e308, 1e308]` has variance 0 and mean
+    1e308 (a sum-based mean overflows to inf)."""
+    skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([1e308, 1e308], dtype=torch.float64)
+    for op in (torch.var_mean, torch.std_mean):
+        v, m = op(x.to(mojo_gpu))
+        assert v.item() == 0.0 and m.item() == 1e308
+    assert torch.var(x.to(mojo_gpu)).item() == 0.0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_var_mean_of_one_infinite_element(mojo_gpu, dtype):
+    """One element is its own mean, infinite or not (CUDA keeps mean=inf,
+    variance NaN)."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([float("inf")], dtype=dtype)
+    for correction in (0, 1):
+        v, m = torch.var_mean(x.to(mojo_gpu), correction=correction)
+        assert m.item() == float("inf") and math.isnan(v.item())
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
+)
+@pytest.mark.parametrize(
+    ("shape", "dims"),
+    [
+        ((1 << 20,), None),  # one row split across many blocks, then merged
+        ((3, 357_789), (1,)),  # split rows, length off the vector width
+        ((1000, 128), (1,)),  # short rows: several rows per warp
+        ((77, 6), (1,)),  # rows shorter than a vector
+        ((8, 7, 33, 5), (0, 2, 3)),  # NCHW stats: segments off the width
+        ((4, 6, 16, 16), (0, 2, 3)),  # NCHW stats: 16-byte segments
+        ((5, 3, 4), (0, 2)),
+        ((6, 9, 70), (1,)),  # strided reduce axis (columns)
+        ((2, 3000, 40), (1,)),  # strided axis, split across blocks
+        ((5, 3, 4), (1, 0)),  # non-adjacent order: copied first
+        ((4, 5, 6, 7), (1, 3)),  # interleaved: copied first
+    ],
+)
+def test_var_mean_welford_geometries(mojo_gpu, dtype, shape, dims):
+    """Every Welford route (contiguous rows, split rows, segmented rows,
+    strided columns, permuted copy) against a float64 CPU reference."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    torch.manual_seed(len(shape))
+    x = (torch.randn(shape) * 3 + 5).to(dtype)
+    ref_v, ref_m = torch.var_mean(x.double(), dim=dims, correction=1)
+    for op, ref in ((torch.var_mean, ref_v), (torch.std_mean, ref_v.sqrt())):
+        v, m = op(x.to(mojo_gpu), dim=dims, correction=1)
+        tol = {torch.float16: 2e-3, torch.bfloat16: 1.6e-2}.get(dtype, 1e-5)
+        torch.testing.assert_close(v.cpu().double(), ref, rtol=tol, atol=tol)
+        torch.testing.assert_close(m.cpu().double(), ref_m, rtol=tol, atol=tol)
+        assert v.dtype == dtype and m.dtype == dtype
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float64])
+def test_var_std_nan_correction_divides_by_zero(mojo_gpu, dtype):
+    """CUDA's divisor is `n > correction ? n - correction : 0`: a NaN
+    correction gives a zero divisor, so the variance is inf (not NaN)."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    nan = float("nan")
+    x = torch.tensor([1.0, 2.0], dtype=dtype, device=mojo_gpu)
+    x2 = torch.tensor([[1.0, 2.0], [3.0, 5.0]], dtype=dtype, device=mojo_gpu)
+    for got in (
+        torch.var_mean(x, correction=nan)[0],
+        torch.std_mean(x, correction=nan)[0],
+        torch.var(x, correction=nan),
+        torch.std(x, correction=nan),
+        torch.var(x2, dim=0, correction=nan),
+    ):
+        assert torch.isinf(got.cpu()).all()
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("nan")])
+@pytest.mark.parametrize(
+    ("shape", "where", "dim", "correction"),
+    [
+        ((1, 2), (0, 0), 0, 0),  # columns of one element
+        ((2, 4), (0, 0), 0, 1),  # the column kernel's tail
+        ((1, 64), (0, 5), 0, 0),
+        ((9, 2), (4, 1), 0, 1),
+        ((3, 7), (1, 2), 1, 0),  # rows
+    ],
+)
+def test_welford_inf_and_nan_like_cuda(mojo_gpu, bad, shape, where, dim, correction):
+    """`WelfordOps::reduce` takes m2 from x - mean, so a lone inf (or NaN)
+    gives a NaN variance -- also where a slice holds one element. The
+    float64 var / std alone take the same kernels."""
+    x = torch.arange(1.0, 1 + shape[0] * shape[1]).reshape(shape)
+    x[where] = bad
+    for dtype in (torch.float32, torch.float64):
+        if dtype == torch.float64 and is_metal(mojo_gpu):
+            continue  # no float64 on Apple GPUs
+        xd = x.to(dtype)
+        ref = torch.var_mean(xd, dim=dim, correction=correction)
+        for op in (torch.var_mean, torch.std_mean):
+            got = op(xd.to(mojo_gpu), dim=dim, correction=correction)
+            want = op(xd, dim=dim, correction=correction)
+            for g, w in zip(got, want, strict=True):
+                torch.testing.assert_close(g.cpu(), w, equal_nan=True)
+        for op in (torch.var, torch.std):
+            got = op(xd.to(mojo_gpu), dim=dim, correction=correction)
+            torch.testing.assert_close(
+                got.cpu(), op(xd, dim=dim, correction=correction), equal_nan=True
+            )
+        assert ref[0].isnan().any()
+
+
+@pytest.mark.parametrize(
+    ("dtype", "big"),
+    [(torch.float64, 1e308), (torch.float32, 3e38), (torch.float16, 60000.0)],
+)
+def test_var_mean_is_welford_and_does_not_overflow(mojo_gpu, dtype, big):
+    """CUDA's WelfordOps: the mean of [0, big, big] is 2 * big / 3 in every
+    dtype (a sum-then-divide mean overflows)."""
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    x = torch.tensor([0.0, big, big], dtype=dtype)
+    for op in (torch.var_mean, torch.std_mean):
+        _, m = op(x.to(mojo_gpu))
+        torch.testing.assert_close(
+            m.cpu().double(),
+            torch.tensor(big / 3 * 2, dtype=torch.float64),
+            rtol=1e-3,
+            atol=0,
+        )

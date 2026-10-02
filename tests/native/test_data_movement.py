@@ -1167,6 +1167,45 @@ def test_to_copy_device_round_trip(mojo_device):
     torch.testing.assert_close(back, x)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA wheel and GPU")
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"dtype": torch.float64},
+        {"memory_format": torch.channels_last},
+        {"dtype": torch.float16, "non_blocking": True},
+    ],
+    ids=["plain", "float64", "channels_last", "half_non_blocking"],
+)
+def test_to_copy_between_mojo_and_cuda(mojo_gpu, kwargs):
+    # PrivateUse1 outranks CUDA in the dispatch key set, so both directions
+    # reach our `_to_copy`, which bounces through the host.
+    x = _fill((2, 3, 4, 5), torch.float32)
+    to_cuda = x.to(mojo_gpu).to("cuda", **kwargs)
+    ref = x.to("cuda", **kwargs)
+    torch.cuda.synchronize()
+    assert to_cuda.device.type == "cuda"
+    assert (to_cuda.dtype, to_cuda.stride()) == (ref.dtype, ref.stride())
+    torch.testing.assert_close(to_cuda.cpu(), ref.cpu(), rtol=0, atol=0)
+    back = ref.to(mojo_gpu, **kwargs)
+    expected = x.to(**kwargs)
+    assert back.device == torch.device(mojo_gpu)
+    assert (back.dtype, back.stride()) == (expected.dtype, expected.stride())
+    torch.testing.assert_close(back.cpu(), expected, rtol=0, atol=0)
+    # strided sources in both directions
+    torch.testing.assert_close(
+        x.to(mojo_gpu).transpose(0, 3).to("cuda").cpu(), x.transpose(0, 3)
+    )
+    torch.testing.assert_close(
+        x.cuda().transpose(1, 2).to(mojo_gpu).cpu(), x.transpose(1, 2)
+    )
+    # A bare device type resolves to the current mojo device.
+    bare = torch.ops.aten._to_copy(x.cuda(), device=torch.device(mojo_gpu).type)
+    assert bare.device == torch.device(mojo_gpu)
+    torch.testing.assert_close(bare.cpu(), x, rtol=0, atol=0)
+
+
 # ---------------------------------------------------------------------------
 # cat
 # ---------------------------------------------------------------------------
@@ -1355,6 +1394,45 @@ def test_triu_every_dtype(mojo_gpu):
     for dtype in (torch.bfloat16, torch.int64, torch.uint8, torch.bool):
         x = (_fill((6, 6), torch.int64) % 2).to(dtype)
         torch.testing.assert_close(x.to(mojo_gpu).triu(1).cpu(), x.triu(1))
+
+
+@pytest.mark.parametrize("name", ["tril", "triu"])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.int64, torch.bool]
+)
+@pytest.mark.parametrize("diagonal", [-9, -1, 0, 2, 1 << 62])
+def test_tril_triu_out_and_in_place(mojo_device, name, dtype, diagonal):
+    x = (_fill((3, 4, 5), torch.int64) % 5 - 1).to(dtype)
+    expected = getattr(x, name)(diagonal)
+    out = torch.empty(0, dtype=dtype, device=mojo_device)
+    with ran(f"aten::{name}.out"):
+        getattr(torch, name)(x.to(mojo_device), diagonal, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    # A transposed out of the right shape is written where it lives.
+    out = torch.empty(5, 4, 3, dtype=dtype, device=mojo_device).permute(2, 1, 0)
+    getattr(torch, name)(x.to(mojo_device), diagonal, out=out)
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+    y = x.to(mojo_device)
+    with ran(f"aten::{name}_"):
+        getattr(y, name + "_")(diagonal)
+    torch.testing.assert_close(y.cpu(), expected, rtol=0, atol=0)
+    # In place on a strided view.
+    y = x.to(mojo_device).transpose(1, 2)
+    getattr(y, name + "_")(diagonal)
+    torch.testing.assert_close(y.cpu(), getattr(x.transpose(1, 2), name)(diagonal))
+
+
+def test_tril_triu_reject_fewer_than_two_dims(mojo_device):
+    for name in ("tril", "triu"):
+        with pytest.raises(
+            RuntimeError, match=f"{name}: input tensor must have at least 2"
+        ):
+            getattr(torch, name)(torch.ones(3, device=mojo_device))
+        with pytest.raises(RuntimeError, match="dtype"):
+            getattr(torch, name)(
+                torch.ones(3, 3, device=mojo_device),
+                out=torch.empty(3, 3, dtype=torch.int64, device=mojo_device),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1807,8 +1885,8 @@ def test_scatter_add_inplace_out_and_empty(mojo_gpu):
 
 
 def test_scatter_add_rejects_bad_indices(mojo_gpu):
-    """Like CPU torch: an out-of-range index raises, and so does an int32
-    index (scatter_add requires int64)."""
+    """Like CPU torch: an out-of-range index raises, and so does a float
+    index (torch 2.11 takes int32 or int64)."""
     a = torch.zeros(4, 5, device=mojo_gpu)
     src = torch.ones(2, 5, device=mojo_gpu)
     for bad in (4, -1):
@@ -1816,8 +1894,13 @@ def test_scatter_add_rejects_bad_indices(mojo_gpu):
         index[1, 3] = bad
         with pytest.raises(RuntimeError, match="index out of range"):
             a.scatter_add(0, index, src)
-    with pytest.raises(RuntimeError, match="int64"):
-        a.scatter_add(0, torch.zeros(2, 5, dtype=torch.int32, device=mojo_gpu), src)
+    with pytest.raises(RuntimeError, match="int32/int64"):
+        a.scatter_add(0, torch.zeros(2, 5, device=mojo_gpu), src)
+    i32 = torch.tensor([[0, 3, 3, 1, 0], [3, 3, 2, 1, 0]], dtype=torch.int32)
+    torch.testing.assert_close(
+        a.scatter_add(0, i32.to(mojo_gpu), src).cpu(),
+        a.cpu().scatter_add(0, i32, src.cpu()),
+    )
 
 
 @pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])
@@ -2225,12 +2308,13 @@ def test_cat_cast_fallbacks(mojo_gpu, kind):
             expected.shape
         )
     elif kind == "overlap":
-        # Existing temporary route safely reads BF16 views before writing
-        # overlapping FP32 output. Preserve that backend behavior.
+        # A dense input overlapping the out: cat's meta raises, as on CUDA.
         out = torch.empty_like(expected, device=mojo_gpu, dtype=dtype)
         source = out.view(torch.bfloat16).reshape(-1)[:48].view(3, 16)
         source.copy_(torch.cat(hosts, 1).to(mojo_gpu))
-        parts = [source]
+        with pytest.raises(RuntimeError, match="single memory location"):
+            torch.cat([source], 1, out=out)
+        return
     else:
         out = torch.empty_like(expected, device=mojo_gpu, dtype=dtype)
     torch.cat(parts, 1, out=out)
@@ -2545,6 +2629,190 @@ def test_set_source_tensor_keeps_its_own_dtype(mojo_gpu):
     torch.ops.aten.set_.source_Tensor(destination, source)
     assert destination.dtype == torch.int32
     assert destination.cpu().tolist() == [0, 1065353216, 1073741824, 1077936128]
+
+
+def test_set_without_source_empties_the_tensor(mojo_gpu):
+    t = torch.arange(4, dtype=torch.float16).to(mojo_gpu)
+    old = t.untyped_storage().data_ptr()
+    assert torch.ops.aten.set_.default(t) is t
+    assert (t.shape, t.stride(), t.storage_offset(), t.dtype) == (
+        (0,),
+        (1,),
+        0,
+        torch.float16,
+    )
+    assert t.untyped_storage().nbytes() == 0
+    assert t.untyped_storage().data_ptr() != old or old == 0
+
+
+def test_is_set_to_matches_cpu(mojo_gpu):
+    def probe(base):
+        z = base.view(4)
+        e = base.new_empty(0)
+        return [
+            z.is_set_to(z),
+            z.is_set_to(z[1:]),
+            z[1:].is_set_to(z[1:]),
+            z.is_set_to(z.view(2, 2)),
+            z.view(2, 2).t().is_set_to(z.view(2, 2).t()),
+            z.is_set_to(z.clone()),
+            e.is_set_to(e),
+            e.is_set_to(e.view(0)),
+            e.is_set_to(base.new_empty(0)),
+        ]
+
+    assert probe(torch.empty(2, 2).to(mojo_gpu)) == probe(torch.empty(2, 2))
+
+
+# ---------------------------------------------------------------------------
+# resize_ / resize_as_
+# ---------------------------------------------------------------------------
+
+
+def _resized(t, size, memory_format=None):
+    t.resize_(size, memory_format=memory_format)
+    return t.shape, t.stride(), t.storage_offset(), t.untyped_storage().nbytes()
+
+
+@pytest.mark.parametrize(
+    ("make", "size", "memory_format"),
+    [
+        (lambda d: torch.zeros(4, device=d), (2, 3), None),
+        (lambda d: torch.zeros(4, device=d), (2,), None),
+        (lambda d: torch.zeros(4, device=d), (0,), None),
+        (lambda d: torch.zeros(0, device=d), (3, 5), None),
+        (lambda d: torch.zeros((), device=d), (), None),
+        (lambda d: torch.zeros(5, device=d)[2:], (6,), None),
+        (lambda d: torch.zeros(2, 3, 4, device=d), (2, 3, 4, 5), torch.channels_last),
+        (
+            lambda d: torch.zeros(2, 3, 4, 5, 6, device=d),
+            (2, 3, 4, 5, 6),
+            torch.channels_last_3d,
+        ),
+        (lambda d: torch.zeros(2, 3, device=d).t(), (3, 2), None),
+        (lambda d: torch.zeros(2, 3, device=d).t(), (3, 2), torch.contiguous_format),
+        (lambda d: torch.zeros(2, 3, device=d), (0, -1), None),
+    ],
+)
+def test_resize_matches_cpu(mojo_gpu, make, size, memory_format):
+    assert _resized(make(mojo_gpu), size, memory_format=memory_format) == _resized(
+        make("cpu"), size, memory_format=memory_format
+    )
+
+
+def test_resize_keeps_the_bytes(mojo_gpu):
+    x = torch.arange(6, dtype=torch.float32)
+    t = x.to(mojo_gpu)
+    t.resize_(4, 5)
+    assert t.cpu().flatten()[:6].tolist() == x.tolist()
+    view = torch.arange(5.0).to(mojo_gpu)[2:]
+    view.resize_(6)
+    assert view.cpu()[:3].tolist() == [2.0, 3.0, 4.0]
+    t.resize_(2)
+    assert t.cpu().tolist() == [0.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    ("size", "memory_format", "message"),
+    [
+        (
+            (2, 3),
+            torch.channels_last,
+            "required rank 4 tensor to use channels_last format",
+        ),
+        ((2, 3), torch.preserve_format, "Unsupported memory formatPreserve"),
+        ((-1,), None, "numel: integer multiplication overflow"),
+        ((2**40, 2**40), None, "numel: integer multiplication overflow"),
+        ((2**62,), None, "Storage size calculation overflowed"),
+    ],
+)
+def test_resize_errors_match_cpu(mojo_gpu, size, memory_format, message):
+    for device in ("cpu", mojo_gpu):
+        with pytest.raises(RuntimeError, match=message):
+            torch.empty(3, device=device).resize_(*size, memory_format=memory_format)
+
+
+def test_resize_refuses_a_storage_that_is_not_resizable(mojo_gpu):
+    imported = torch.from_dlpack(torch.arange(4.0).to(mojo_gpu))
+    assert not imported.untyped_storage().resizable()
+    with pytest.raises(
+        RuntimeError, match="Trying to resize storage that is not resizable"
+    ):
+        imported.resize_(100)
+    imported.resize_(2)  # shrinking reallocates nothing
+    assert imported.cpu().tolist() == [0.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.int32,
+        torch.uint8,
+        torch.int64,
+        torch.bool,
+    ],
+)
+def test_resize_fills_new_memory_when_deterministic(mojo_gpu, dtype):
+    def grown(device):
+        t = torch.zeros(5, dtype=dtype, device=device)[1:3]
+        t.resize_(2, 3)
+        return t.untyped_storage().nbytes(), t.cpu()
+
+    torch.use_deterministic_algorithms(True)
+    try:
+        got, want = grown(mojo_gpu), grown("cpu")
+    finally:
+        torch.use_deterministic_algorithms(False)
+    assert got[0] == want[0]
+    torch.testing.assert_close(got[1], want[1], equal_nan=True, rtol=0, atol=0)
+
+
+def test_resize_as_(mojo_gpu):
+    t = torch.empty(3, device=mojo_gpu)
+    t.resize_as_(torch.empty(2, 3, 4, 5).to(memory_format=torch.channels_last))
+    assert (t.shape, t.stride()) == ((2, 3, 4, 5), (60, 20, 5, 1))
+    t.resize_as_(
+        torch.empty(2, 3, 4, 5).to(memory_format=torch.channels_last),
+        memory_format=torch.preserve_format,
+    )
+    assert t.stride() == (60, 1, 15, 3)
+
+
+def test_copy_from_and_resize(mojo_gpu):
+    src = torch.arange(6.0).view(2, 3)
+    dst = torch.empty(0, device=mojo_gpu)
+    out = torch.ops.aten._copy_from_and_resize(src, dst)
+    assert out is dst
+    torch.testing.assert_close(dst.cpu(), src, rtol=0, atol=0)
+    dst16 = torch.empty(7, dtype=torch.float16, device=mojo_gpu)
+    torch.ops.aten._copy_from_and_resize(src.t(), dst16)
+    torch.testing.assert_close(dst16.cpu(), src.t().half(), rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# from_file
+# ---------------------------------------------------------------------------
+
+
+def test_from_file(mojo_gpu, tmp_path):
+    path = tmp_path / "data.bin"
+    path.write_bytes(torch.arange(10, dtype=torch.float32).numpy().tobytes())
+    for size, dtype, shared in [
+        (10, torch.float32, None),
+        (4, torch.int32, False),
+        (0, torch.float16, None),
+    ]:
+        got = torch.from_file(
+            str(path), shared=shared, size=size, dtype=dtype, device=mojo_gpu
+        )
+        want = torch.from_file(str(path), shared=shared, size=size, dtype=dtype)
+        assert got.device == torch.device(mojo_gpu)
+        assert torch.equal(got.cpu(), want)
+    with pytest.raises(NotImplementedError, match="shared=True"):
+        torch.from_file(str(path), shared=True, size=2, device=mojo_gpu)
 
 
 # ---------------------------------------------------------------------------
@@ -2967,3 +3235,405 @@ def test_index_put_declined_inputs(mojo_gpu: str, case: str):
     with pytest.raises(NotImplementedError):
         data.index_put_((indices.to(mojo_gpu),), values)
     torch.testing.assert_close(data.cpu(), torch.zeros(3, 4))
+
+
+def test_cat_out_partial_overlap_raises(mojo_device):
+    """cat's meta checks the out against every input (TensorShape.cpp)."""
+    x = torch.arange(10.0, device=mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.cat([x[2:5], x[5:7]], out=x[:5])
+    # A disjoint out of the same storage is fine.
+    torch.cat([x[0:2], x[2:4]], out=x[5:9])
+    assert x.cpu()[5:9].tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_cat_out_resized_overlap_raises(mojo_device):
+    """cat's meta resizes the out (same storage) and then checks overlap."""
+    x = torch.arange(10.0, device=mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.cat([x[:3], x[3:5]], out=x[:2])
+    assert x.cpu().tolist() == list(range(10))
+
+
+def test_cat_gather_index_select_index_put_out_overlap(mojo_device):
+    x = torch.arange(10.0, device=mojo_device)
+    for out in (x[:4], x[:0]):
+        with pytest.raises(RuntimeError, match="single memory location"):
+            torch.cat([x[2:5], x[5:7]], out=out)
+    a = torch.arange(12.0, device=mojo_device).view(3, 4)
+    i = torch.zeros(3, 4, dtype=torch.long, device=mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.gather(a, 0, i, out=a)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.index_select(a, 0, torch.tensor([0, 1, 2], device=mojo_device), out=a)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        a.index_put_((torch.tensor([0, 1, 2], device=mojo_device),), a)
+
+
+# One case per row of the overlap-order table in tmb/ops/common.mojo; the
+# expected outcome of each was checked against stock CUDA torch 2.11.
+def _arange10(dev: str) -> torch.Tensor:
+    return torch.arange(10.0, device=dev)
+
+
+_A = torch.ops.aten
+_OVERLAP_ROWS = {
+    # cat.out: resize, then check.
+    "cat_resized_onto_inputs": (
+        True,
+        lambda d: (lambda x: torch.cat([x[:3], x[3:5]], out=x[:2]))(_arange10(d)),
+    ),
+    # gather.out: resize, then check.
+    "gather_resized_onto_self": (
+        True,
+        lambda d: (
+            lambda x: torch.gather(
+                x[2:6], 0, torch.tensor([0, 1, 2, 3], device=d), out=x[:0]
+            )
+        )(_arange10(d)),
+    ),
+    # index_select.out: check the out as given, then resize.
+    "index_select_checks_before_resize": (
+        True,
+        lambda d: (
+            lambda x: torch.index_select(
+                x[4:6], 0, torch.tensor([0, 1], device=d), out=x[:6]
+            )
+        )(_arange10(d)),
+    ),
+    "index_select_resized_onto_self_passes": (
+        False,
+        lambda d: (
+            lambda x: torch.index_select(
+                x[1:3], 0, torch.tensor([0, 1], device=d), out=x[:0]
+            )
+        )(_arange10(d)),
+    ),
+    # scatter family: meta checks before resize, then copy_(self) after it.
+    "scatter_add_out_copies_self": (
+        True,
+        lambda d: (
+            lambda x: torch.scatter_add(
+                x[2:6],
+                0,
+                torch.tensor([0], device=d),
+                torch.ones(1, device=d),
+                out=x[:0],
+            )
+        )(_arange10(d)),
+    ),
+    "scatter_add_out_is_self_passes": (
+        False,
+        lambda d: (
+            lambda x: torch.scatter_add(
+                x, 0, torch.tensor([0], device=d), torch.ones(1, device=d), out=x
+            )
+        )(_arange10(d)),
+    ),
+    # index_add / index_reduce / index_copy: resize, check, copy_(self).
+    "index_add_out_vs_source": (
+        True,
+        lambda d: (
+            lambda x: torch.index_add(
+                torch.zeros(4, device=d),
+                0,
+                torch.tensor([0, 1], device=d),
+                x[1:3],
+                out=x[:0],
+            )
+        )(_arange10(d)),
+    ),
+    "index_reduce_out_copies_self": (
+        True,
+        lambda d: (
+            lambda x: torch.index_reduce(
+                x[2:6],
+                0,
+                torch.tensor([0, 1], device=d),
+                torch.ones(2, device=d),
+                "prod",
+                out=x[:0],
+            )
+        )(_arange10(d)),
+    ),
+    # index_put_: self vs values.
+    "index_put_values_alias_self": (
+        True,
+        lambda d: (lambda a: a.index_put_((torch.tensor([0, 1], device=d),), a[:2]))(
+            torch.arange(4.0, device=d)
+        ),
+    ),
+    # Same-size nearest2d: resize, then the copy_ shortcut's partial check.
+    "nearest2d_same_size_copy_shortcut": (
+        True,
+        lambda d: (
+            lambda b: _A.upsample_nearest2d.out(
+                b[8:24].view(1, 1, 4, 4), [4, 4], None, None, out=b[:0]
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    # nearest1d: no shortcut, no check.
+    "nearest1d_same_size_no_check": (
+        False,
+        lambda d: (
+            lambda b: _A.upsample_nearest1d.out(
+                b[:16].view(1, 1, 16), [16], None, out=b[8:24].view(1, 1, 16)
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    # Copy-back modes refuse an internally overlapping out; others do not.
+    "nearest2d_expanded_out": (
+        True,
+        lambda d: _A.upsample_nearest2d.out(
+            torch.ones(1, 1, 4, 4, device=d),
+            [6, 6],
+            None,
+            None,
+            out=torch.empty(1, 1, 1, 1, device=d).expand(1, 1, 6, 6),
+        ),
+    ),
+    "nearest1d_expanded_out_passes": (
+        False,
+        lambda d: _A.upsample_nearest1d.out(
+            torch.ones(1, 1, 4, device=d),
+            [6],
+            None,
+            out=torch.empty(1, 1, 1, device=d).expand(1, 1, 6),
+        ),
+    ),
+    # Pad: no check at all.
+    "reflection_pad_partial_passes": (
+        False,
+        lambda d: (
+            lambda b: _A.reflection_pad2d.out(
+                b[:16].view(1, 1, 4, 4), [1, 1, 1, 1], out=b[8:44].view(1, 1, 6, 6)
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+}
+
+
+@pytest.mark.parametrize("row", list(_OVERLAP_ROWS))
+def test_overlap_order_table(mojo_device, row):
+    raises, call = _OVERLAP_ROWS[row]
+    if raises:
+        with pytest.raises(RuntimeError, match="memory location"):
+            call(mojo_device)
+    else:
+        call(mojo_device)
+
+
+def test_bilinear2d_backward_same_tensor_is_zeroed(mojo_device):
+    """CUDA zeroes grad_input before its same-size copy_: a grad_input that
+    IS grad_output ends up zero."""
+    g = torch.ones(1, 1, 4, 4, device=mojo_device)
+    _A.upsample_bilinear2d_backward.grad_input(
+        g, [4, 4], [1, 1, 4, 4], False, None, None, grad_input=g
+    )
+    assert g.cpu().sum().item() == 0.0
+
+
+_OVERLAP_ROWS_MORE = {
+    "index_select_empty_out_onto_self_passes": (
+        False,
+        lambda d: (
+            lambda b: torch.index_select(
+                b[:12].view(3, 4), 0, torch.tensor([0, 1], device=d), out=b[:0]
+            )
+        )(torch.zeros(20, device=d)),
+    ),
+    "index_select_expanded_wrong_shape_out": (
+        True,
+        lambda d: torch.index_select(
+            torch.ones(3, 2, device=d),
+            0,
+            torch.tensor([0, 1], device=d),
+            out=torch.zeros(1, device=d).expand(6),
+        ),
+    ),
+    "linear1d_same_size_partial_passes": (
+        False,
+        lambda d: (
+            lambda b: _A.upsample_linear1d.out(
+                b[:16].view(1, 1, 16), [16], False, None, out=b[8:24].view(1, 1, 16)
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    "bicubic2d_same_size_partial_passes": (
+        False,
+        lambda d: (
+            lambda b: _A.upsample_bicubic2d.out(
+                b[:16].view(1, 1, 4, 4),
+                [4, 4],
+                False,
+                None,
+                None,
+                out=b[8:24].view(1, 1, 4, 4),
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    "nearest3d_same_size_partial_passes": (
+        False,
+        lambda d: (
+            lambda b: _A.upsample_nearest3d.out(
+                b[:16].view(1, 1, 2, 2, 4),
+                [2, 2, 4],
+                None,
+                None,
+                None,
+                out=b[8:24].view(1, 1, 2, 2, 4),
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    "nearest2d_empty_dst_resized_onto_input": (
+        True,
+        lambda d: (
+            lambda b: _A.upsample_nearest2d.out(
+                b[8:24].view(1, 1, 4, 4), [4, 4], None, None, out=b[4:4]
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+    "bilinear2d_same_size_partial": (
+        True,
+        lambda d: (
+            lambda b: _A.upsample_bilinear2d.out(
+                b[:16].view(1, 1, 4, 4),
+                [4, 4],
+                False,
+                None,
+                None,
+                out=b[8:24].view(1, 1, 4, 4),
+            )
+        )(torch.zeros(64, device=d)),
+    ),
+}
+_OVERLAP_ROWS.update(_OVERLAP_ROWS_MORE)
+
+
+@pytest.mark.parametrize("row", list(_OVERLAP_ROWS_MORE))
+def test_overlap_order_table_more(mojo_device, row):
+    test_overlap_order_table(mojo_device, row)
+
+
+# Aliasing outs that pass the checks: ATen's literal sequence (resize, copy
+# self in / zero, then the kernel) on the caller's tensor. Expected values
+# recorded from stock CUDA torch 2.11.
+def _t(d: str, v: list[float] | list[int]) -> torch.Tensor:
+    return torch.tensor(v, device=d)
+
+
+def _alias_scatter_reduce(d: str) -> torch.Tensor:
+    src = _t(d, [2.0, 3.0])
+    torch.scatter_reduce(
+        torch.zeros(2, device=d), 0, _t(d, [0, 1]), src, "sum", out=src[:0]
+    )
+    return src
+
+
+def _alias_scatter_reduce_two_out(d: str) -> torch.Tensor:
+    x = torch.arange(100.0, 105.0, device=d)
+    torch.scatter_reduce(x[2:4] * 0 + 101, 0, _t(d, [0, 1]), x[2:4], "sum", out=x[:0])
+    return x
+
+
+def _alias_bilinear_bwd(d: str) -> torch.Tensor:
+    g = torch.ones(1, 1, 2, 2, device=d)
+    _A.upsample_bilinear2d_backward.grad_input(
+        g, [2, 2], [1, 1, 2, 2], False, None, None, grad_input=g.flatten()[:0]
+    )
+    return g
+
+
+def _alias_scatter_add(d: str) -> torch.Tensor:
+    src = _t(d, [2.0, 3.0])
+    torch.scatter_add(torch.zeros(2, device=d), 0, _t(d, [0, 1]), src, out=src[:0])
+    return src
+
+
+def _alias_scatter_src(d: str) -> torch.Tensor:
+    src = _t(d, [2.0, 3.0])
+    torch.scatter(torch.zeros(2, device=d), 0, _t(d, [1, 0]), src, out=src[:0])
+    return src
+
+
+def _alias_gather(d: str) -> torch.Tensor:
+    x = torch.arange(6.0, device=d)
+    torch.gather(x[3:6], 0, _t(d, [2, 1, 0]), out=x[:0])
+    return x
+
+
+def _alias_index_select(d: str) -> torch.Tensor:
+    x = torch.arange(6.0, device=d)
+    torch.index_select(x[1:4], 0, _t(d, [2, 1, 0]), out=x[:0])
+    return x
+
+
+def _alias_cat(d: str) -> torch.Tensor:
+    """Inputs that share the resized out's storage race with the writes (on
+    CUDA too): only the elements no other write can reach are checked --
+    out[0] (x[0] onto itself), out[3] (x[3] onto itself), and the storage
+    past the out."""
+    x = torch.arange(8.0, device=d)
+    torch.cat([x[::2][:2], x[1::2][:2]], out=x[:0])
+    return x[[0, 3, 4, 5, 6, 7]]
+
+
+def _alias_linear1d_bwd(d: str) -> torch.Tensor:
+    g = torch.ones(1, 1, 4, device=d)
+    _A.upsample_linear1d_backward.grad_input(
+        g, [4], [1, 1, 4], False, None, grad_input=g.flatten()[:0]
+    )
+    return g
+
+
+def _alias_pad_bwd(d: str) -> torch.Tensor:
+    g = torch.ones(1, 1, 4, 4, device=d)
+    _A.reflection_pad2d_backward.grad_input(
+        g, torch.empty(1, 1, 4, 4, device=d), [0, 0, 0, 0], grad_input=g.flatten()[:0]
+    )
+    return g
+
+
+def _alias_nearest2d_bwd_same(d: str) -> torch.Tensor:
+    g = torch.arange(4.0, device=d).view(1, 1, 2, 2)
+    _A.upsample_nearest2d_backward.grad_input(
+        g, [2, 2], [1, 1, 2, 2], None, None, grad_input=g.flatten()[:0]
+    )
+    return g
+
+
+def _alias_nearest1d(d: str) -> torch.Tensor:
+    b = torch.arange(32.0, device=d)
+    _A.upsample_nearest1d.out(b[:8].view(1, 1, 8), [16], None, out=b[:0])
+    return b
+
+
+_ALIASING_ROWS = {
+    "scatter_reduce_copies_self_first": (_alias_scatter_reduce, [0.0, 0.0]),
+    "scatter_reduce_two_out_reads_src_after_copy": (
+        _alias_scatter_reduce_two_out,
+        [203.0, 204.0, 102.0, 103.0, 104.0],
+    ),
+    "bilinear2d_bwd_zeroes_then_copies": (_alias_bilinear_bwd, [0.0] * 4),
+    "scatter_add_out": (_alias_scatter_add, [0.0, 0.0]),
+    "scatter_src_out": (_alias_scatter_src, [0.0, 0.0]),
+    "gather_out": (_alias_gather, [5.0, 4.0, 3.0, 3.0, 4.0, 5.0]),
+    "index_select_small_index_in_order": (
+        _alias_index_select,
+        [3.0, 2.0, 2.0, 3.0, 4.0, 5.0],
+    ),
+    "cat_reads_after_resize": (_alias_cat, [0.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+    "linear1d_bwd_zeroes_aliased_grad": (_alias_linear1d_bwd, [0.0] * 4),
+    "reflection_pad_bwd_zeroes_aliased_grad": (_alias_pad_bwd, [0.0] * 16),
+    "nearest2d_bwd_same_size_copy": (_alias_nearest2d_bwd_same, [0.0, 1.0, 2.0, 3.0]),
+    "nearest1d_reads_after_resize": (
+        _alias_nearest1d,
+        [float(v // 2) for v in range(16)] + [float(v) for v in range(16, 32)],
+    ),
+}
+
+
+@pytest.mark.parametrize("row", list(_ALIASING_ROWS))
+def test_aliasing_out_follows_aten_sequence(mojo_device, row):
+    fn, expected = _ALIASING_ROWS[row]
+    assert fn(mojo_device).cpu().flatten().tolist() == expected

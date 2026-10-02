@@ -74,6 +74,13 @@ COVERS: dict[str, str] = {
     "aten::scatter.value": "test_scatter_value",
     "aten::scatter_add": "test_scatter_add",
     "aten::select_scatter": "test_select_scatter",
+    "aten::scatter_reduce.two": "test_scatter_reduce",
+    "aten::scatter.reduce": (
+        "test_scatter_reduce (reduce='add'/'multiply' are its sum/prod launches)"
+    ),
+    "aten::index_reduce": "test_index_reduce",
+    "aten::_embedding_bag_forward_only": "test_embedding_bag",
+    "aten::_embedding_bag_dense_backward": "test_embedding_bag_backward",
 }
 
 _SAME_KERNEL_OUT = (
@@ -95,6 +102,33 @@ SKIPPED: dict[str, str] = {
     "aten::scatter_.src": _SAME_KERNEL_INPLACE,
     "aten::scatter_add.out": _SAME_KERNEL_OUT,
     "aten::scatter_add_": _SAME_KERNEL_INPLACE,
+    "aten::scatter.value_out": _SAME_KERNEL_OUT,
+    "aten::scatter_.value": _SAME_KERNEL_INPLACE,
+    "aten::scatter.reduce_out": _SAME_KERNEL_OUT,
+    "aten::scatter_.reduce": _SAME_KERNEL_INPLACE,
+    "aten::scatter.value_reduce": (
+        "scatter.reduce with a scalar in place of src: the same launch"
+    ),
+    "aten::scatter.value_reduce_out": _SAME_KERNEL_OUT,
+    "aten::scatter_.value_reduce": _SAME_KERNEL_INPLACE,
+    "aten::scatter_reduce.two_out": _SAME_KERNEL_OUT,
+    "aten::scatter_reduce_.two": _SAME_KERNEL_INPLACE,
+    "aten::index_reduce.out": _SAME_KERNEL_OUT,
+    "aten::index_reduce_": _SAME_KERNEL_INPLACE,
+    "aten::_embedding_bag": (
+        "test_embedding_bag's kernel: the same launch, taken when the weight "
+        "requires grad"
+    ),
+    "aten::_embedding_bag_backward": (
+        "argument checks, then _embedding_bag_dense_backward"
+    ),
+    "aten::_embedding_bag_per_sample_weights_backward": (
+        "index_select / mul / sum through the dispatcher, each benchmarked"
+    ),
+    "aten::embedding_renorm_": (
+        "test_unique's sort and group passes on the indices, then a per-row "
+        "rescale kernel; two small reads dominate"
+    ),
 }
 
 
@@ -309,4 +343,131 @@ def test_select_scatter(
         lambda: torch.select_scatter(x_ref, s_ref, 0, outer // 2),
         lambda: torch.select_scatter(x_our, s_our, 0, outer // 2),
         flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", DIM_INDEX_SHAPES)
+@pytest.mark.parametrize("layout", ("sum", "prod", "amax", "mean_noself"))
+def test_scatter_reduce(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """scatter_add's geometry with each reduction: sum is the atomic add,
+    prod / amax the compare-and-swap loop, and mean without self adds the
+    identity fill, a count scatter and a division."""
+    rows, cols, dim = DIM_INDEX_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    reduce = layout.removesuffix("_noself")
+    include_self = not layout.endswith("_noself")
+    x_ref, x_our = both(torch.randn(rows, cols, dtype=dtype), hw, mojo_device)
+    src_ref, src_our = both(torch.randn(rows, cols, dtype=dtype), hw, mojo_device)
+    idx_ref, idx_our = both(
+        torch.randint(0, (rows, cols)[dim], (rows, cols)), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.scatter_reduce(
+            x_ref, dim, idx_ref, src_ref, reduce, include_self=include_self
+        ),
+        lambda: torch.scatter_reduce(
+            x_our, dim, idx_our, src_our, reduce, include_self=include_self
+        ),
+        flops=float(rows * cols),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", SELECT_SHAPES)
+@pytest.mark.parametrize("layout", ("amax", "mean"))
+def test_index_reduce(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """index_add's geometry with a reduction (more than 16 indices: the
+    atomic route)."""
+    rows, cols, selected, dim = SELECT_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(rows, cols, dtype=dtype), hw, mojo_device)
+    source_shape = (selected, cols) if dim == 0 else (rows, selected)
+    s_ref, s_our = both(torch.randn(source_shape, dtype=dtype), hw, mojo_device)
+    idx_ref, idx_our = both(
+        torch.randint(0, (rows, cols)[dim], (selected,)), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.index_reduce(x_ref, dim, idx_ref, s_ref, layout),
+        lambda: torch.index_reduce(x_our, dim, idx_our, s_our, layout),
+        flops=float(selected * (cols if dim == 0 else rows)),
+    )
+
+
+# (vocab, dim, bags, bag length)
+EMB_BAG_SHAPES: dict[str, tuple[int, int, int, int]] = {
+    "V50304xD768_B1024xL48": (50304, 768, 1024, 48),
+    "V1000xD64_B357xL7": (1000, 64, 357, 7),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", EMB_BAG_SHAPES)
+@pytest.mark.parametrize("layout", ("sum", "mean", "max"))
+@pytest.mark.bench_op("_embedding_bag_forward_only")
+def test_embedding_bag(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    vocab, dim, bags, length = EMB_BAG_SHAPES[shape_id]
+    w_ref, w_our = both(
+        torch.randn(vocab, dim, dtype=DTYPES[dtype_id]), hw, mojo_device
+    )
+    i_ref, i_our = both(torch.randint(0, vocab, (bags * length,)), hw, mojo_device)
+    o_ref, o_our = both(torch.arange(0, bags * length, length), hw, mojo_device)
+    bench.run(
+        lambda: F.embedding_bag(i_ref, w_ref, o_ref, mode=layout),
+        lambda: F.embedding_bag(i_our, w_our, o_our, mode=layout),
+        flops=float(bags * length * dim),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", EMB_BAG_SHAPES)
+@pytest.mark.parametrize("layout", ("sum", "mean"))
+@pytest.mark.bench_op("_embedding_bag_dense_backward")
+def test_embedding_bag_backward(
+    shape_id: str,
+    dtype_id: str,
+    layout: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """The sorted, deterministic weight gradient of sum / mean bags."""
+    vocab, dim, bags, length = EMB_BAG_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    i_ref, i_our = both(torch.randint(0, vocab, (bags * length,)), hw, mojo_device)
+    o2b_ref, o2b_our = both(
+        torch.arange(bags).repeat_interleave(length), hw, mojo_device
+    )
+    bs_ref, bs_our = both(torch.full((bags,), length), hw, mojo_device)
+    g_ref, g_our = both(torch.randn(bags, dim, dtype=dtype), hw, mojo_device)
+    mode = 0 if layout == "sum" else 1
+    bench.run(
+        lambda: torch.ops.aten._embedding_bag_dense_backward(
+            g_ref, i_ref, o2b_ref, bs_ref, bs_ref, vocab, False, mode, None, -1
+        ),
+        lambda: torch.ops.aten._embedding_bag_dense_backward(
+            g_our, i_our, o2b_our, bs_our, bs_our, vocab, False, mode, None, -1
+        ),
+        flops=float(bags * length * dim),
     )

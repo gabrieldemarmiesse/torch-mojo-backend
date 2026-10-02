@@ -22,7 +22,7 @@ The "tf32" dtype id is float32 run at torch.set_float32_matmul_precision
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 import torch
@@ -119,9 +119,43 @@ COVERS: dict[str, str] = {
     "aten::addmm": "test_addmm",
     "aten::linear": "test_linear",
     "aten::linear_backward": "test_linear_backward",
+    # the BLAS family past the plain GEMMs (test_blas)
+    "aten::addmm.dtype": "test_blas",
+    "aten::_addmm_activation": "test_blas",
+    "aten::addmv": "test_blas",
+    "aten::addbmm": "test_blas",
+    "aten::baddbmm": "test_blas",
+    "aten::baddbmm.dtype": "test_blas",
+    "aten::bmm.dtype": "test_blas",
+    "aten::mm.dtype": "test_blas",
+    "aten::_int_mm": "test_blas",
+    "aten::_weight_int8pack_mm": "test_blas",
+    "aten::_weight_int4pack_mm": "test_blas",
 }
 
-SKIPPED: dict[str, str] = {}
+_BLAS_VARIANT = (
+    "the same GEMM and epilogue as its functional overload, which test_blas "
+    "measures, written into the caller's tensor"
+)
+SKIPPED: dict[str, str] = {
+    "aten::addmm_": _BLAS_VARIANT,
+    "aten::addmm.dtype_out": _BLAS_VARIANT,
+    "aten::_addmm_activation.out": _BLAS_VARIANT,
+    "aten::addmv.out": _BLAS_VARIANT,
+    "aten::addmv_": _BLAS_VARIANT,
+    "aten::addbmm.out": _BLAS_VARIANT,
+    "aten::addbmm_": _BLAS_VARIANT,
+    "aten::baddbmm.out": _BLAS_VARIANT,
+    "aten::baddbmm_": _BLAS_VARIANT,
+    "aten::baddbmm.dtype_out": _BLAS_VARIANT,
+    "aten::bmm.dtype_out": _BLAS_VARIANT,
+    "aten::mm.dtype_out": _BLAS_VARIANT,
+    "aten::_int_mm.out": _BLAS_VARIANT,
+    "aten::_convert_weight_to_int4pack": (
+        "a one-time weight repack (a byte copy into the packed tensor), not "
+        "on any step's critical path"
+    ),
+}
 
 BMM_BATCH = 8
 BMM_SHAPES = {
@@ -247,6 +281,117 @@ def test_addmm(
             lambda: torch.addmm(bias_our, a_our, b_our),
             flops=2.0 * m * n * k,
         )
+
+
+# The BLAS family past mm / bmm / addmm: the alpha / beta epilogues, the
+# `.dtype` overloads (half in, float32 out), the integer GEMM and the int8 /
+# int4 weight-only GEMMs. One square and one awkward shape each.
+BLAS_SHAPES = {tag: SHAPES[tag] for tag in ("S1_4096x4096x4096", "S5_357x789x333")}
+BLAS_OPS = (
+    "addmm_scaled",
+    "addmm_dtype",
+    "addmm_relu",
+    "addmv",
+    "addbmm",
+    "baddbmm",
+    "baddbmm_dtype",
+    "bmm_dtype",
+    "mm_dtype",
+    "int_mm",
+    "int8pack",
+    "int4pack",
+)
+BLAS_DTYPES = {"bf16": torch.bfloat16, "f32": torch.float32}
+# Ops whose stock CUDA kernel takes one dtype only.
+_BLAS_ONE_DTYPE = {
+    "addmm_dtype",
+    "baddbmm_dtype",
+    "bmm_dtype",
+    "mm_dtype",
+    "int_mm",
+    "int4pack",
+}
+
+
+def _blas_case(
+    op: str, m: int, n: int, k: int, dtype: torch.dtype, device: str | torch.device
+) -> tuple[Callable[[], torch.Tensor], float]:
+    """(callable, flops) of one BLAS-family case on `device`."""
+    gen = torch.Generator().manual_seed(0)
+
+    def rand(*shape: int, dt: torch.dtype = dtype) -> torch.Tensor:
+        return torch.randn(*shape, generator=gen).to(dt).to(device)
+
+    f32 = torch.float32
+    if op == "addmm_scaled":
+        c, a, b = rand(m, n), rand(m, k), rand(k, n)
+        return (lambda: torch.addmm(c, a, b, beta=0.5, alpha=0.25)), 2.0 * m * n * k
+    if op == "addmm_dtype":
+        c, a, b = rand(n, dt=f32), rand(m, k), rand(k, n)
+        return (lambda: torch.addmm(c, a, b, out_dtype=f32)), 2.0 * m * n * k
+    if op == "addmm_relu":
+        c, a, b = rand(n), rand(m, k), rand(k, n)
+        return (lambda: torch.ops.aten._addmm_activation(c, a, b)), 2.0 * m * n * k
+    if op == "addmv":
+        c, a, v = rand(m), rand(m, k), rand(k)
+        return (lambda: torch.addmv(c, a, v, beta=0.5, alpha=2)), 2.0 * m * k
+    if op == "addbmm":
+        c, a, b = rand(m, n), rand(4, m, k // 4), rand(4, k // 4, n)
+        return (lambda: torch.addbmm(c, a, b, beta=0.5)), 2.0 * m * n * k
+    if op in ("baddbmm", "baddbmm_dtype", "bmm_dtype"):
+        bm = max(m // 8, 1)
+        c = rand(8, bm, n, dt=f32 if op != "baddbmm" else dtype)
+        a, b = rand(8, bm, k), rand(8, k, n)
+        flops = 2.0 * 8 * bm * n * k
+        if op == "baddbmm":
+            return (lambda: torch.baddbmm(c, a, b, beta=0, alpha=0.125)), flops
+        if op == "baddbmm_dtype":
+            return (lambda: torch.baddbmm(c, a, b, out_dtype=f32)), flops
+        return (lambda: torch.bmm(a, b, out_dtype=f32)), flops
+    if op == "mm_dtype":
+        a, b = rand(m, k), rand(k, n)
+        return (lambda: torch.mm(a, b, out_dtype=f32)), 2.0 * m * n * k
+    if op == "int_mm":
+        a = torch.randint(-128, 128, (m, k - k % 8), dtype=torch.int8, generator=gen)
+        b = torch.randint(
+            -128, 128, (k - k % 8, n - n % 8), dtype=torch.int8, generator=gen
+        )
+        a, b = a.to(device), b.to(device)
+        return (lambda: torch._int_mm(a, b)), 2.0 * m * n * k
+    if op == "int8pack":
+        x = rand(m, k)
+        w = torch.randint(-128, 128, (n, k), dtype=torch.int8, generator=gen).to(device)
+        s = rand(n)
+        return (lambda: torch.ops.aten._weight_int8pack_mm(x, w, s)), 2.0 * m * n * k
+    # int4pack: k a multiple of 256 (innerKTiles 8 x 16 and the 128-group)
+    k4 = max(k - k % 256, 256)
+    q = torch.randint(0, 256, (n - n % 8, k4 // 2), dtype=torch.uint8, generator=gen)
+    w4 = torch.ops.aten._convert_weight_to_int4pack(q.to(device), 8)
+    x = rand(m, k4)
+    sz = rand(k4 // 128, n - n % 8, 2)
+    return (
+        lambda: torch.ops.aten._weight_int4pack_mm(x, w4, 128, sz)
+    ), 2.0 * m * n * k4
+
+
+@pytest.mark.parametrize("dtype_id", BLAS_DTYPES)
+@pytest.mark.parametrize("op", BLAS_OPS)
+@pytest.mark.parametrize("shape_id", BLAS_SHAPES)
+def test_blas(
+    shape_id: str,
+    op: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    if op in _BLAS_ONE_DTYPE and dtype_id != "bf16":
+        pytest.skip(f"{op}: stock CUDA takes bfloat16 operands only here")
+    m, n, k = BLAS_SHAPES[shape_id]
+    dtype = BLAS_DTYPES[dtype_id]
+    ref, flops = _blas_case(op, m, n, k, dtype, hw.stock_device)
+    ours, _ = _blas_case(op, m, n, k, dtype, mojo_device)
+    bench.run(ref, ours, flops=flops)
 
 
 # linear has no layout axis: x @ weight.t() + bias with weight stored

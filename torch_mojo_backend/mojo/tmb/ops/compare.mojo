@@ -17,22 +17,29 @@ from tmb.backend.abi import (
     bits_f64,
     Owned,
     T,
+    TAG_BOOL,
     TAG_COMPLEX,
+    TAG_SCALAR_BOOL,
     TAG_SCALAR_DOUBLE,
     Value,
     Values,
     ST_BOOL,
+    ST_FLOAT64,
     default_dtype,
     dtype_code,
+    dtype_name,
     max_dtype,
     new_like,
     new_scalar,
     new_tensor,
+    none_arg,
     own,
+    own_if_new,
     release,
     ret_bool,
     ret_owned,
     ret_ref,
+    int_arg,
     tensor_arg,
     torch_dtype,
     unsupported,
@@ -57,6 +64,7 @@ from tmb.ops.common import (
     contiguous,
     copy_strided_into,
     fill_value,
+    promote_types,
     promoted_pair,
     resize_out,
     scalar_embed,
@@ -99,7 +107,7 @@ def _prepare_out(
     """Get `out_arg` ready to receive a `shape`/`stype` result: raises if
     its dtype doesn't match (fixed per op, never promoted -- matches torch's
     own strict out= dtype check), resizes it in place if its shape doesn't
-    (`resize_out`: no `aten::resize_` kernel exists to do this for us), and
+    (`resize_out`: a boxed kernel gets no resize before dispatch), and
     reports whether the (now correctly shaped) tensor is contiguous.
 
     False means the caller must compute into a temporary and
@@ -260,13 +268,28 @@ def _compare_functional_out(
     ret_ref(rets, 0, out_arg)
 
 
+def _scalar_fill(a: T, v: Value) raises -> Owned:
+    """The Scalar operand as a 0-d tensor of `a`'s dtype. An integer scalar
+    against an integer tensor is filled from its int64 bits (the #606
+    integer-Scalar path, exact past 2**53); everything else goes through
+    `scalar_embed`'s Float64."""
+    var fill = own(new_scalar(a.stype, a.device))
+    if (
+        v_scalar_is_integral(v)
+        and not a.dtype.is_floating_point()
+        and a.dtype != DType.bool
+    ):
+        fill_value(fill.t, v)
+    else:
+        fill_value(fill.t, scalar_embed(v, a.dtype))
+    return fill^
+
+
 def _compare_scalar(op: StaticString, args: Values, rets: Values) raises:
     var a = v_tensor(args[unsafe_offset=0])
     if not a.on_mojo():
         raise Error("expected the mojo device")
-    var value = scalar_embed(args[unsafe_offset=1], a.dtype)
-    var fill = own(new_scalar(a.stype, a.device))
-    fill_value(fill.t, value)
+    var fill = _scalar_fill(a, args[unsafe_offset=1])
     var out = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
     _compare_spec(op, a, fill.t, out.t)
     _ = fill^  # alive past the launch
@@ -279,9 +302,7 @@ def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
         raise Error("expected the mojo device")
     var out_arg = v_tensor(args[unsafe_offset=2])
     _compare_out_guard(out_arg, a, a)
-    var value = scalar_embed(args[unsafe_offset=1], a.dtype)
-    var fill = own(new_scalar(a.stype, a.device))
-    fill_value(fill.t, value)
+    var fill = _scalar_fill(a, args[unsafe_offset=1])
     if out_arg.stype != ST_BOOL:
         var res = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
         _compare_spec(op, a, fill.t, res.t)
@@ -445,19 +466,46 @@ def op_ge_scalar_out(
 
 
 # ---------------------------------------------------------------------------
-# isin.Tensor_Tensor: elementwise membership test (logic IsIn). Ported
-# from `fast_aten_isin` -- int32/int64 operands only, `assume_unique` is
-# ignored (the kernel always does a linear scan), an empty test_elements
-# short-circuits to a constant fill.
+# isin: elementwise membership test (logic IsIn, a linear scan of the test
+# elements per element: CUDA's `isin_default_kernel`; its sorting route for
+# large test sets answers identically, NaN never being a member). Operands
+# promote to their common dtype first; `assume_unique` changes nothing here.
+# The Scalar overloads are ATen's redispatches: Tensor_Scalar is eq / ne,
+# Scalar_Tensor is a 0-d membership test of the scalar.
 # ---------------------------------------------------------------------------
 
 
-def _isin_validate(el: T, te: T) raises -> Bool:
+def _isin_check_dtype(dt: DType) raises:
+    """`check_for_unsupported_isin_dtype` (bool and complex are refused)."""
+    if dt == DType.bool:
+        raise Error("Unsupported input type encountered for isin(): Bool")
+
+
+def _isin_kernel_dtype(dt: DType) -> Bool:
+    return (
+        dt == DType.int64
+        or dt == DType.int32
+        or dt == DType.float32
+        or dt == DType.float16
+        or dt == DType.bfloat16
+        or dt == DType.float64
+    )
+
+
+def _isin_validate(el: T, te: T) raises -> Int32:
+    """The common dtype both operands are scanned in (declines what the
+    kernel lacks)."""
     if not el.on_mojo() or not te.on_mojo() or el.device != te.device:
         raise Error("expected both operands on the same mojo device")
-    return el.dtype == te.dtype and (
-        el.dtype == DType.int64 or el.dtype == DType.int32
-    )
+    _isin_check_dtype(el.dtype)
+    _isin_check_dtype(te.dtype)
+    var common = promote_types(el.stype, te.stype)
+    var cdt = max_dtype(common)
+    if not _isin_kernel_dtype(cdt):
+        unsupported("isin of dtype " + String(cdt))
+    if cdt == DType.float64 and ctx_for(el.device).api() == "metal":
+        unsupported("isin: float64 is unavailable on Apple GPUs")
+    return common
 
 
 def _isin_launch(el: T, te: T, invert: Bool, dst: T) raises:
@@ -485,13 +533,17 @@ def _isin_launch(el: T, te: T, invert: Bool, dst: T) raises:
     _release_if_new(tec, te)
 
 
-def _isin_into(el: T, te: T, invert: Bool, dst: T) raises:
+def _isin_into(el: T, te: T, common: Int32, invert: Bool, dst: T) raises:
     if el.numel == 0:
         return
     if te.numel == 0:
         fill_value(dst, 1.0 if invert else 0.0)
         return
-    _isin_launch(el, te, invert, dst)
+    var elp = own_if_new(cast_to(el, common), el)
+    var tep = own_if_new(cast_to(te, common), te)
+    _isin_launch(elp.t, tep.t, invert, dst)
+    _ = elp^  # alive past the launch
+    _ = tep^
 
 
 # aten::isin.Tensor_Tensor(Tensor elements, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor
@@ -501,10 +553,9 @@ def op_isin_tensor_tensor(
     var el = v_tensor(args[unsafe_offset=0])
     var te = v_tensor(args[unsafe_offset=1])
     var invert = v_bool_or(args[unsafe_offset=3], False)
-    if not _isin_validate(el, te):
-        unsupported("isin: only matching int32/int64 operands are supported")
+    var common = _isin_validate(el, te)
     var out = own(new_tensor(el.shape, el.rank, ST_BOOL, el.device))
-    _isin_into(el, te, invert, out.t)
+    _isin_into(el, te, common, invert, out.t)
     ret_owned(rets, 0, out)
 
 
@@ -516,15 +567,184 @@ def op_isin_tensor_tensor_out(
     var te = v_tensor(args[unsafe_offset=1])
     var invert = v_bool_or(args[unsafe_offset=3], False)
     var out_arg = v_tensor(args[unsafe_offset=4])
-    if not _isin_validate(el, te):
-        unsupported("isin: only matching int32/int64 operands are supported")
-    if _prepare_out(out_arg, el.shape, el.rank, ST_BOOL, el.device):
-        _isin_into(el, te, invert, out_arg)
+    var common = _isin_validate(el, te)
+    var tmp = own(new_tensor(el.shape, el.rank, ST_BOOL, el.device))
+    _isin_into(el, te, common, invert, tmp.t)
+    _ = _prepare_out(out_arg, el.shape, el.rank, ST_BOOL, el.device)
+    assert_no_internal_overlap(out_arg)
+    copy_strided_into(out_arg, tmp.t)
+    _ = tmp^  # alive past the launch
+    ret_ref(rets, 0, out_arg)
+
+
+def _scalar_type_of(v: Value) -> String:
+    if v_scalar_is_integral(v):
+        if v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL:
+            return "Bool"
+        return "Long"
+    return "Double"
+
+
+def _isin_scalar_test(el: T, test: Value) raises:
+    if not el.on_mojo():
+        raise Error("expected a tensor on the mojo device")
+    _isin_check_dtype(el.dtype)
+    if _scalar_type_of(test) == "Bool":
+        raise Error("Unsupported input type encountered for isin(): Bool")
+
+
+# aten::isin.Tensor_Scalar(Tensor elements, Scalar test_element, *, bool assume_unique=False, bool invert=False) -> Tensor
+def op_isin_tensor_scalar(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var el = v_tensor(args[unsafe_offset=0])
+    var test = args[unsafe_offset=1].copy()
+    _isin_scalar_test(el, test)
+    var invert = v_bool_or(args[unsafe_offset=3], False)
+    var r = call_op(
+        "aten::ne" if invert else "aten::eq",
+        "Scalar",
+        [tensor_arg(el), test^],
+        1,
+    )
+    var out = own(r.take_tensor(0))
+    ret_owned(rets, 0, out)
+
+
+# aten::isin.Tensor_Scalar_out(Tensor elements, Scalar test_element, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)
+def op_isin_tensor_scalar_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var el = v_tensor(args[unsafe_offset=0])
+    var test = args[unsafe_offset=1].copy()
+    var out_arg = v_tensor(args[unsafe_offset=4])
+    _isin_scalar_test(el, test)
+    if out_arg.stype != ST_BOOL:
+        raise Error(
+            "Expected out tensor to have dtype bool, but got ",
+            dtype_name(out_arg.stype),
+            " instead",
+        )
+    var invert = v_bool_or(args[unsafe_offset=3], False)
+    _ = call_op(
+        "aten::ne" if invert else "aten::eq",
+        "Scalar_out",
+        [tensor_arg(el), test^, tensor_arg(out_arg)],
+        1,
+    )
+    ret_ref(rets, 0, out_arg)
+
+
+def _float_holds(dt: DType, x: Float64) -> Bool:
+    """Is `x` exactly a value of the float dtype `dt` (NaN counts: it
+    compares unequal either way)?"""
+    comptime for fdt in [DType.float16, DType.bfloat16, DType.float32]:
+        if dt == fdt:
+            var r = Scalar[fdt](x).cast[DType.float64]()
+            return r == x or x != x
+    return True  # float64
+
+
+def _int_range(dt: DType) -> Tuple[Float64, Float64]:
+    comptime for idt in [
+        DType.int8,
+        DType.uint8,
+        DType.int16,
+        DType.int32,
+        DType.int64,
+    ]:
+        if dt == idt:
+            return (
+                Float64(Scalar[idt].MIN_FINITE),
+                Float64(Scalar[idt].MAX_FINITE),
+            )
+    return (Float64(0), Float64(1))  # bool
+
+
+def _isin_scalar_tensor(el: Value, te: T, invert: Bool) raises -> Owned:
+    """The scalar as a 0-d member test: any(test_elements == element).
+
+    ATen wraps the scalar into a 0-d float64 (int64) tensor that its isin
+    kernels treat as an ordinary operand, so the comparison runs in
+    promote_types(float64 or int64, test dtype) -- not in the test dtype,
+    as `eq.Scalar`'s wrapped number would: `isin(1 + 1e-8, float32 [1])` is
+    False. Comparing in the test dtype is the same test once the scalar is
+    known to be one of its values exactly; a scalar no test value can equal
+    finds nothing."""
+    if not te.on_mojo():
+        raise Error("expected a tensor on the mojo device")
+    if _scalar_type_of(el) == "Bool":
+        raise Error("Unsupported input type encountered for isin(): Bool")
+    _isin_check_dtype(te.dtype)
+    var tc = own_if_new(te.copy(), te)
+    var test = el.copy()
+    var possible = True
+    var x = v_f64(el)
+    if te.dtype.is_floating_point():
+        # An integer scalar promotes to the float test dtype (int64 tensor
+        # with a float32 tensor is float32): its rounding is torch's too.
+        if not v_scalar_is_integral(el):
+            possible = _float_holds(te.dtype, x)
     else:
-        var tmp = own(new_tensor(el.shape, el.rank, ST_BOOL, el.device))
-        _isin_into(el, te, invert, tmp.t)
-        copy_strided_into(out_arg, tmp.t)
-        _ = tmp^  # alive past the launch
+        var rng = _int_range(te.dtype)
+        if v_scalar_is_integral(el):
+            # int64 comparison: a scalar outside the dtype matches nothing.
+            var v = v_int(el)
+            possible = Float64(v) >= rng[0] and Float64(v) <= rng[1]
+            if not possible:  # (a stand-in: nothing can match)
+                test = int_arg(0)
+        elif te.dtype == DType.int64 and abs(x) >= 9007199254740992.0:
+            # Past 2**53 several int64 values round to the same double.
+            tc = own(cast_to(te, ST_FLOAT64))
+        else:
+            # float64 comparison: only an integral double in range matches.
+            possible = x == x.__floor__() and x >= rng[0] and x <= rng[1]
+            # (any integer stands in when nothing can match)
+            test = int_arg(Int(x) if possible else 0)
+    var eq = call_op("aten::eq", "Scalar", [tensor_arg(tc.t), test^], 1)
+    _ = tc^  # alive past the call that reads it
+    var eq_t = own(eq.take_tensor(0))
+    var any = call_op("aten::any", "", [tensor_arg(eq_t.t)], 1)
+    _ = eq_t^  # alive past the call that reads it
+    var found = own(any.take_tensor(0))
+    if not possible:
+        # A 0-d False on the device: a bool never differs from itself.
+        var none = call_op(
+            "aten::ne", "Tensor", [tensor_arg(found.t), tensor_arg(found.t)], 1
+        )
+        _ = found^  # alive past the call that reads it
+        found = own(none.take_tensor(0))
+    if not invert:
+        return found^
+    var r = call_op("aten::logical_not", "", [tensor_arg(found.t)], 1)
+    _ = found^  # alive past the call that reads it
+    return own(r.take_tensor(0))
+
+
+# aten::isin.Scalar_Tensor(Scalar element, Tensor test_elements, *, bool assume_unique=False, bool invert=False) -> Tensor
+def op_isin_scalar_tensor(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var out = _isin_scalar_tensor(
+        args[unsafe_offset=0],
+        v_tensor(args[unsafe_offset=1]),
+        v_bool_or(args[unsafe_offset=3], False),
+    )
+    ret_owned(rets, 0, out)
+
+
+# aten::isin.Scalar_Tensor_out(Scalar element, Tensor test_elements, *, bool assume_unique=False, bool invert=False, Tensor(a!) out) -> Tensor(a!)
+def op_isin_scalar_tensor_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var te = v_tensor(args[unsafe_offset=1])
+    var out_arg = v_tensor(args[unsafe_offset=4])
+    var res = _isin_scalar_tensor(
+        args[unsafe_offset=0], te, v_bool_or(args[unsafe_offset=3], False)
+    )
+    _ = _prepare_out(out_arg, res.t.shape, 0, ST_BOOL, te.device)
+    copy_strided_into(out_arg, res.t)
+    _ = res^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 
@@ -1544,9 +1764,32 @@ def op_assert_async_msg(
     )
 
 
+# aten::_functional_assert_async.msg(Tensor self, str assert_msg,
+#   Tensor dep_token) -> Tensor
+def op_functional_assert_async_msg(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """ATen's CPU kernel (the only one upstream has): `_assert_async.msg`,
+    then a fresh copy of the dependency token."""
+    var msg = v_string(args[unsafe_offset=1])
+    _assert_nonzero(
+        v_tensor(args[unsafe_offset=0]),
+        msg if msg.byte_length() > 0 else String("Assertion is failed"),
+    )
+    var token = call_op(
+        "aten::clone",
+        "",
+        [tensor_arg(v_tensor(args[unsafe_offset=2])), none_arg()],
+        1,
+    )
+    var out = own(token.take_tensor(0))
+    ret_owned(rets, 0, out)
+
+
 def register_compare(site: Site) raises:
     impl[op_assert_async, "_assert_async"](site)
     impl[op_assert_async_msg, "_assert_async.msg"](site)
+    impl[op_functional_assert_async_msg, "_functional_assert_async.msg"](site)
     impl[op_eq_tensor, "eq.Tensor"](site)
     impl[op_eq_tensor_out, "eq.Tensor_out"](site)
     impl[op_eq_scalar, "eq.Scalar"](site)
@@ -1571,6 +1814,10 @@ def register_compare(site: Site) raises:
     impl[op_ge_tensor_out, "ge.Tensor_out"](site)
     impl[op_ge_scalar, "ge.Scalar"](site)
     impl[op_ge_scalar_out, "ge.Scalar_out"](site)
+    impl[op_isin_scalar_tensor, "isin.Scalar_Tensor"](site)
+    impl[op_isin_scalar_tensor_out, "isin.Scalar_Tensor_out"](site)
+    impl[op_isin_tensor_scalar, "isin.Tensor_Scalar"](site)
+    impl[op_isin_tensor_scalar_out, "isin.Tensor_Scalar_out"](site)
     impl[op_isin_tensor_tensor, "isin.Tensor_Tensor"](site)
     impl[op_isin_tensor_tensor_out, "isin.Tensor_Tensor_out"](site)
     impl[op_where_self, "where.self"](site)

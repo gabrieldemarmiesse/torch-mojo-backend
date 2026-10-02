@@ -32,6 +32,7 @@ from tmb.backend.abi import (
     dtype_code,
     dtype_itemsize,
     dtype_name,
+    is_dense,
     f64_bits,
     max_dtype,
     new_like,
@@ -142,26 +143,136 @@ def _repeats_elements(t: T) -> Bool:
     return False
 
 
+comptime OVERLAP_NO = 0
+comptime OVERLAP_FULL = 1
+comptime OVERLAP_PARTIAL = 2
+comptime OVERLAP_TOO_HARD = 3
+
+comptime _OVERLAP_MESSAGE = (
+    "unsupported operation: some elements of the input tensor and the"
+    " written-to tensor refer to a single memory location. Please clone()"
+    " the tensor before performing the operation."
+)
+
+
+def _dense(t: T) -> Bool:
+    """`TensorImpl::is_non_overlapping_and_dense_or_false`."""
+    return t.contig or is_dense(t.shape, t.strides, t.rank)
+
+
+def overlap_status(a: T, b: T) -> Int:
+    """`at::get_overlap_status` (ATen/MemoryOverlap.cpp), in its order: the
+    same TensorImpl is FULL; an empty side is NO; a side that is not
+    non-overlapping-and-dense (a broadcast, a strided view such as `x[::2]`)
+    is TOO_HARD; different storages are NO; otherwise the dense byte ranges
+    decide FULL / PARTIAL / NO."""
+    if a.impl() == b.impl():
+        return OVERLAP_FULL
+    if a.numel == 0 or b.numel == 0:
+        return OVERLAP_NO
+    if not _dense(a) or not _dense(b):
+        return OVERLAP_TOO_HARD
+    var storage = a.storage_ptr()
+    if storage == 0 or storage != b.storage_ptr():
+        return OVERLAP_NO
+    var a_end = a.ptr + a.numel * a.itemsize
+    var b_end = b.ptr + b.numel * b.itemsize
+    if a.ptr == b.ptr and a_end == b_end:
+        if a.rank == b.rank:
+            var same = True
+            for i in range(a.rank):
+                if a.stride(i) != b.stride(i):
+                    same = False
+            if same:
+                return OVERLAP_FULL
+        return OVERLAP_PARTIAL
+    if a.ptr < b_end and b.ptr < a_end:
+        return OVERLAP_PARTIAL
+    return OVERLAP_NO
+
+
 def assert_no_overlap(written: T, other: T) raises:
-    """`at::assert_no_overlap`: an `out=` tensor sharing any memory with an
-    input -- the identical view included -- raises before anything is
-    written. A view that repeats elements is what ATen's check calls
-    `TooHard` and lets through, and so does this one."""
-    if written.numel == 0 or other.numel == 0:
-        return
-    var storage = written.storage_ptr()
-    if storage == 0 or storage != other.storage_ptr():
-        return
-    if _repeats_elements(written) or _repeats_elements(other):
-        return
-    var a_end = written.ptr + written.numel * written.itemsize
-    var b_end = other.ptr + other.numel * other.itemsize
-    if written.ptr < b_end and other.ptr < a_end:
-        raise Error(
-            "unsupported operation: some elements of the input tensor and the"
-            " written-to tensor refer to a single memory location. Please"
-            " clone() the tensor before performing the operation."
-        )
+    """`at::assert_no_overlap`: the written tensor may not share any memory
+    with an input, the same tensor included (FULL or PARTIAL raises);
+    TOO_HARD lets the call through, as in torch, so disjoint interleaved
+    views (`x[::2]` written from `x[1::2]`) are accepted."""
+    var status = overlap_status(written, other)
+    if status == OVERLAP_FULL or status == OVERLAP_PARTIAL:
+        raise Error(_OVERLAP_MESSAGE)
+
+
+def assert_no_partial_overlap(written: T, other: T) raises:
+    """`at::assert_no_partial_overlap`: only PARTIAL raises (the same view
+    is fine for an in-place elementwise op)."""
+    if overlap_status(written, other) == OVERLAP_PARTIAL:
+        raise Error(_OVERLAP_MESSAGE)
+
+
+# ---------------------------------------------------------------------------
+# When each out= / in-place op checks overlap, from the ATen v2.14 sources
+# (structured meta, then the CUDA impl). "after resize" checks run here on
+# `resized_geometry(out, ...)` before anything is resized or written: the
+# same verdict, with no input pointer left stale. Status names as in
+# `overlap_status`; "partial" = assert_no_partial_overlap, "overlap" =
+# assert_no_overlap, "internal" = assert_no_internal_overlap.
+#
+#  op (overload)                     | order and checks
+#  ----------------------------------+------------------------------------
+#  cat.out (TensorShape.cpp meta)    | resize, then internal + overlap vs
+#                                    | every input
+#  gather.out (meta)                 | resize, then internal, overlap vs
+#                                    | self, partial vs index
+#  index_select.out (Indexing.cu)    | internal, overlap vs self and index
+#                                    | on the out as given, then resize
+#  scatter.* / scatter_add /         | internal, overlap vs index and src
+#  scatter_reduce out= and in-place  | on the out as given (meta, before
+#  (scatter_meta_impl, scatter_impl) | set_output); then resize; then
+#                                    | `copy_(self)` unless the out IS self:
+#                                    | partial vs self
+#  index_add / index_reduce /        | resize, then internal, overlap vs
+#  index_copy out= and in-place      | index and source (index_func_meta_
+#  (index_func_meta_impl)            | impl); then `copy_(self)` unless the
+#                                    | out IS self: partial vs self
+#  put_ / index_put_                 | overlap of self vs values (self is
+#                                    | never resized)
+#  upsample_nearest2d,               | resize (meta); the kernel's same-
+#  _upsample_nearest_exact2d,        | size shortcut `output.copy_(input)`:
+#  upsample_bilinear2d, fwd and bwd  | internal, then partial vs input
+#  (UpSampleNearest2d.cu,            | (nearest fwd skips it for an empty
+#  UpSampleBilinear2d.cu)            | input, bwd for an empty grad_input;
+#                                    | bilinear bwd zeroes grad_input first)
+#  other upsample modes and sizes    | resize; no input check; internal
+#                                    | only where the kernel copies a
+#                                    | non-contiguous out back (nearest 2-d,
+#                                    | nearest 3-d fwd, bilinear 2-d bwd,
+#                                    | trilinear bwd, antialiased fwd)
+#  reflection / replication pad      | no overlap check at all
+# ---------------------------------------------------------------------------
+
+
+def resized_geometry(dest: T, shape: IndexList[MAX_RANK], rank: Int) -> T:
+    """`dest` as `resize_out(dest, shape, rank)` would leave it -- the same
+    tensor (handle, storage, offset), contiguous at the new shape unless it
+    already has that shape -- for overlap checks that ATen runs after the
+    resize, made before it. Kernel-only: never handed to the dispatcher."""
+    if dest.rank == rank:
+        var same = True
+        for d in range(rank):
+            if dest.dim(d) != shape[MAX_RANK - rank + d]:
+                same = False
+        if same:
+            return dest.copy()
+    var t = dest.copy()
+    # An empty view reports no data pointer; the resize keeps its offset.
+    t.ptr = dest.storage_ptr() + dest.offset * dest.itemsize
+    t.rank = rank
+    t.shape = shape
+    t.strides = contiguous_strides(shape, rank)
+    t.numel = 1
+    for d in range(rank):
+        t.numel *= shape[MAX_RANK - rank + d]
+    t.contig = True
+    return t^
 
 
 def shares_storage(a: T, b: T) -> Bool:
@@ -244,12 +355,25 @@ def check_out_as(dest: T, stype: Int32, like: T) raises:
         )
 
 
+def resize_storage_bytes(t: T, nbytes: Int) raises:
+    """`resize_bytes_cuda`: reallocate `t`'s storage to `nbytes`, keeping the
+    bytes up to the smaller size -- refused for a storage that is not
+    resizable (a DLPack import, a `from_blob` view), as CUDA refuses it."""
+    if external_call["tmb_tensor_storage_resizable", Int32](t.h) == 0:
+        raise Error("Trying to resize storage that is not resizable")
+    check(
+        external_call["tmb_storage_resize", Int32](t.h, Int64(nbytes)),
+        "tmb_storage_resize",
+    )
+
+
 def resize_out(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
     """torch's `resize_output` for a caller's `out=` tensor, in place.
 
-    A backend with no `aten::resize_` kernel of its own gets no resize
-    before dispatch, so every `out=` op here does this itself. Two halves,
-    both of `at::native::resize_impl`:
+    Boxed kernels get no resize before dispatch, so every `out=` op here
+    does this itself; `aten::resize_` (tmb/ops/data_movement.mojo) is this
+    too, after its argument checks. Two halves, both of
+    `at::native::resize_impl`:
 
     * **An `out` that already has this logical shape is left alone** --
       strides and storage offset included. `out=base[4:8]` or a transposed
@@ -282,11 +406,9 @@ def resize_out(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
         numel *= shape[MAX_RANK - rank + i]
     var offset = t.offset
     var nbytes = (offset + numel) * t.itemsize
-    if nbytes > t.storage_nbytes():
-        check(
-            external_call["tmb_storage_resize", Int32](t.h, Int64(nbytes)),
-            "tmb_storage_resize",
-        )
+    # `maybe_resize_storage_cuda`: an empty result never touches the storage.
+    if numel > 0 and nbytes > t.storage_nbytes():
+        resize_storage_bytes(t, nbytes)
     set_sizes_strides(t, shape, contiguous_strides(shape, rank), rank, offset)
     t = T(t.h)
 
@@ -440,6 +562,8 @@ def is_cast_dtype(dt: DType) -> Bool:
         or dt == DType.float64
         or dt == DType.int64
         or dt == DType.int32
+        or dt == DType.int16
+        or dt == DType.int8
         or dt == DType.uint8
         or dt == DType.bool
     )

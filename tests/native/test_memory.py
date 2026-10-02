@@ -651,23 +651,20 @@ def test_storage_extent_offset_and_materialization(mojo_device: str):
     _assert_shared(mojo_device, base)
 
 
-def test_unsupported_tensor_resize_preserves_storage(mojo_device: str):
-    """22: tensor resize_ is not registered (storage resize_ IS supported).
-
-    Pin a clean decline instead of adding unrelated operator support here.
-    """
+def test_tensor_resize_shrinks_in_place_and_grows_the_storage(mojo_device: str):
+    """22: tensor resize_ keeps the storage when shrinking and enlarges it,
+    keeping its prefix, when growing."""
     reference = torch.arange(513, dtype=torch.float32)
     _settle(mojo_device)
     base = device_module.memory_allocated(mojo_device)
     x = reference.to(mojo_device)
-    _settle(mojo_device)
-    before = device_module.memory_stats(mojo_device)
-    for size in (7, 0, 513, 1031):
-        with pytest.raises(NotImplementedError, match="aten::resize_"):
-            x.resize_(size)
+    for size in (7, 0, 513):
+        x.resize_(size)
         assert x.untyped_storage().nbytes() == 513 * 4
-        assert device_module.memory_stats(mojo_device) == before
     torch.testing.assert_close(x.cpu(), reference)
+    x.resize_(1031)
+    assert x.untyped_storage().nbytes() == 1031 * 4
+    torch.testing.assert_close(x[:513].cpu(), reference)
     del x
     _settle(mojo_device)
     _assert_shared(mojo_device, base)

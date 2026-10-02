@@ -914,6 +914,7 @@ comptime SPEC_MAXROWS_DTYPES: List[DType] = [
     DType.bfloat16,
     DType.int64,
     DType.int32,
+    DType.float64,
 ]
 
 

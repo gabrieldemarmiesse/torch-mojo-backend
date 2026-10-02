@@ -71,6 +71,7 @@ from tmb.kernels.reduction.reduce_skeleton import (
     NormPOp,
     ProdOp,
     SumOp,
+    XorSumOp,
     _rowred_arg_spec_into_go,
     _rowred_spec_into_go,
 )
@@ -211,9 +212,9 @@ def _moment_finish[
     var m2 = q - s * s / nf
     if m2 < 0:  # a few ulps below zero on a constant slice; nan passes through
         m2 = Float32(0)
-    var divisor = nf - correction
-    if divisor < 0:
-        divisor = Float32(0)
+    # CUDA's `nf > correction ? nf - correction : 0` (a NaN correction
+    # divides by 0).
+    var divisor = nf - correction if nf > correction else Float32(0)
     return (m2 / divisor).cast[dtype]()
 
 
@@ -1068,6 +1069,17 @@ comptime SPEC_ROWRED_DTYPES: List[DType] = [
     DType.int32,
 ]
 
+# The (value, index) ops (argmin, min.dim, max.dim) also select in float64:
+# selection is exact, and the op side declines float64 on Apple GPUs.
+comptime SPEC_ARGRED_DTYPES: List[DType] = [
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+    DType.int64,
+    DType.int32,
+    DType.float64,
+]
+
 
 def _argmin_spec_into_go(
     a_o: Arg,
@@ -1077,11 +1089,39 @@ def _argmin_spec_into_go(
 ) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
-    if not _dtype_supported[SPEC_ROWRED_DTYPES](a.dtype):
+    if not _dtype_supported[SPEC_ARGRED_DTYPES](a.dtype):
         raise Error("mojo spec argmin: unsupported dtype ", a.dtype)
     if a.numel == 0:
         raise Error("mojo spec argmin: empty input")
-    _argreduce_spec_into[SPEC_ROWRED_DTYPES, True](a, out, rdims_t, a.ctx())
+    _argreduce_spec_into[SPEC_ARGRED_DTYPES, True](a, out, rdims_t, a.ctx())
+
+
+def _minmax_dim_spec_into[
+    is_min: Bool
+](a_o: Arg, rdims_t: Arg, out_v_o: Arg, out_i_o: Arg,) raises:
+    """aten::min.dim / max.dim values+indices in one call — the multi-output
+    protocol: the op allocates both outputs and passes their specs as the
+    last two arguments, so one boundary call still fills both.
+
+    The payload is a (value, index) pair, which is the arg-reduction's payload
+    with the value kept instead of dropped, so this is `_argreduce_spec_into`
+    with `with_values` on rather than a hand-written row kernel — and it
+    inherits that mechanism's split path (a full-length row no longer runs in
+    one block), its strided-axis kernel (a `dim=0` reduction no longer
+    materializes a transposed copy) and its NaN rule (torch propagates NaN
+    through min.dim / max.dim)."""
+    ref a = _spec_ptr(a_o)[]
+    ref out_v = _spec_ptr(out_v_o)[]
+    ref out_i = _spec_ptr(out_i_o)[]
+    if not _dtype_supported[SPEC_ARGRED_DTYPES](a.dtype):
+        raise Error("mojo spec min/max.dim: unsupported dtype ", a.dtype)
+    if a.numel == 0:
+        raise Error("mojo spec min/max.dim: empty input")
+    if out_v.dtype != a.dtype:
+        raise Error("mojo spec min/max.dim into: output dtype mismatch")
+    _argreduce_spec_into[SPEC_ARGRED_DTYPES, is_min, with_values=True](
+        a, out_i, rdims_t, a.ctx(), out_v.ptr, out_v.numel
+    )
 
 
 def _min_dim_spec_into_go(
@@ -1091,29 +1131,17 @@ def _min_dim_spec_into_go(
     out_v_o: Arg,
     out_i_o: Arg,
 ) raises:
-    """aten::min.dim values+indices in one call — the multi-output protocol:
-    Python allocates both outputs and passes their specs as the last two
-    arguments, so one boundary call still fills both.
+    _minmax_dim_spec_into[True](a_o, rdims_t, out_v_o, out_i_o)
 
-    The payload is a (value, index) pair, which is the arg-reduction's payload
-    with the value kept instead of dropped, so this is `_argreduce_spec_into`
-    with `with_values` on rather than a fifth hand-written row kernel — and it
-    inherits that mechanism's split path (a full-length row no longer runs in
-    one block), its strided-axis kernel (a `dim=0` min.dim no longer
-    materializes a transposed copy) and its NaN rule (torch propagates NaN
-    through min.dim; the old kernel's plain `<` silently did not)."""
-    ref a = _spec_ptr(a_o)[]
-    ref out_v = _spec_ptr(out_v_o)[]
-    ref out_i = _spec_ptr(out_i_o)[]
-    if not _dtype_supported[SPEC_ROWRED_DTYPES](a.dtype):
-        raise Error("mojo spec min.dim: unsupported dtype ", a.dtype)
-    if a.numel == 0:
-        raise Error("mojo spec min.dim: empty input")
-    if out_v.dtype != a.dtype:
-        raise Error("mojo spec min.dim into: output dtype mismatch")
-    _argreduce_spec_into[SPEC_ROWRED_DTYPES, True, with_values=True](
-        a, out_i, rdims_t, a.ctx(), out_v.ptr, out_v.numel
-    )
+
+def _max_dim_spec_into_go(
+    a_o: Arg,
+    rdims_t: Arg,
+    keepdim_o: Arg,
+    out_v_o: Arg,
+    out_i_o: Arg,
+) raises:
+    _minmax_dim_spec_into[False](a_o, rdims_t, out_v_o, out_i_o)
 
 
 def _var_spec_into_go(
@@ -1235,6 +1263,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["MinDimSpec"]():
             _spec_dispatcher5[_min_dim_spec_into_go, "MinDimSpec"](argv, argc)
             return 0
+        comptime if _op_on["MaxDimSpec"]():
+            _spec_dispatcher5[_max_dim_spec_into_go, "MaxDimSpec"](argv, argc)
+            return 0
         comptime if _op_on["VarSpec"]():
             _spec_dispatcher5[_var_spec_into_go, "VarSpec"](argv, argc)
             return 0
@@ -1282,6 +1313,11 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["NormPSpec"]():
             _spec_dispatcher5[
                 _rowred_arg_spec_into_go[NormPOp], "a scalar-reduction spec op"
+            ](argv, argc)
+            return 0
+        comptime if _op_on["XorSumSpec"]():
+            _spec_dispatcher4[
+                _rowred_spec_into_go[XorSumOp], "a scalar-reduction spec op"
             ](argv, argc)
             return 0
         comptime if _op_on["ProdSpec"]():

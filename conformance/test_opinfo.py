@@ -338,6 +338,9 @@ _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
                 "nn_functional_batch_norm",
                 "nn_functional_conv2d",
                 "nn_functional_instance_norm",
+                # one f16 ulp (1.8e-4 on 0.08): Metal's linear rounds the
+                # product before its bias add, where CPU's addmm rounds once.
+                "nn_functional_linear",
             )
             for dtype in (torch.bfloat16, torch.float16)
         }
@@ -349,10 +352,13 @@ _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
     # express and CPU-only CI never sees.
     "sm_90a": frozenset(
         {
+            ("__rmatmul__", torch.float32),
             ("__rpow__", torch.float32),
+            ("addbmm", torch.float32),
             ("addr", torch.bfloat16),
             ("addr", torch.float16),
             ("bmm", torch.float32),
+            ("matmul", torch.float32),
             ("log_softmax", torch.bfloat16),
             ("log_softmax", torch.float16),
             ("masked_log_softmax", torch.bfloat16),
@@ -397,6 +403,23 @@ _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
 _FP64_ANCHORED = _FP64_ANCHORED | _FP64_ANCHORED_BY_ACCELERATOR.get(
     known_unsupported.accelerator_key(), frozenset()
 )
+
+
+def _is_async_download(op: OpInfo, sample: SampleInput, result: object) -> bool:
+    """Whether this call asked for a `non_blocking=True` copy to the host.
+
+    `non_blocking` is a keyword for most ops; `Tensor.to`'s samples pass it
+    positionally, as the first bool of every overload (`to(device, dtype,
+    non_blocking, copy)`, `to(dtype, ...)`, `to(other, ...)`).
+    """
+    if not isinstance(result, torch.Tensor) or result.device.type != "cpu":
+        return False
+    if sample.kwargs.get("non_blocking") is True:
+        return True
+    if op.name == "to":
+        flags = [a for a in sample.args if isinstance(a, bool)]
+        return bool(flags) and flags[0]
+    return False
 
 
 def _to_float64(sample: SampleInput) -> SampleInput:
@@ -450,6 +473,12 @@ class TestOpInfoConformance(TestCase):
                 placement = placements[index]
             moved = _to_device(sample, device, placement)
             actual = op(moved.input, *moved.args, **moved.kwargs)
+            if _is_async_download(op, moved, actual):
+                # The host tensor's copy is still in flight: reading it
+                # before a sync is a race on any accelerator, CUDA included.
+                # Every other result is read through `.cpu()`, which orders
+                # itself, so a missing dependency elsewhere still shows.
+                torch.accelerator.synchronize()
             expected = op(sample.input, *sample.args, **sample.kwargs)
             if (
                 (op.formatted_name, dtype) in _FP64_ANCHORED

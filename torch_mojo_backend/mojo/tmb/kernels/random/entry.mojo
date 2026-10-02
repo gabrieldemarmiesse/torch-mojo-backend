@@ -1,7 +1,8 @@
 # ===----------------------------------------------------------------------=== #
 # C entry of the on-device random generators (kernels: distribution_kernels.mojo,
-# multinomial_kernels.mojo, curand_philox.mojo). Slots are unpacked here and nothing is read from the
-# host or synchronized: the generator state was reserved before the call.
+# multinomial_kernels.mojo, sampler_kernels.mojo, stateless_philox_kernels.mojo,
+# philox.mojo). Slots are unpacked here and nothing is read from the host or
+# synchronized: the generator state was reserved before the call.
 # ===----------------------------------------------------------------------=== #
 
 from tmb.kernels.random.distribution_kernels import (
@@ -29,6 +30,13 @@ from tmb.kernels.random.sampler_kernels import (
     enqueue_prob_check,
     enqueue_sampler,
 )
+from tmb.kernels.random.stateless_philox_kernels import (
+    PHILOX_NORMAL,
+    PHILOX_UNIFORM,
+    enqueue_key_fold_in,
+    enqueue_key_split,
+    enqueue_stateless_dist,
+)
 from tmb.kernels.random.multinomial_kernels import (
     enqueue_multinomial_check,
     enqueue_multinomial_draw,
@@ -43,7 +51,9 @@ from tmb.kernels.common.op_utils import (
     _raw_tuple_int,
     _raw_tuple_len,
     _spec_dispatcher4,
+    _spec_dispatcher5,
     _spec_dispatcher6,
+    _spec_dispatcher7,
     _spec_dispatcher10,
     _spec_dispatcher12,
     _spec_dispatcher15,
@@ -407,6 +417,69 @@ def _prob_check_go(
         raise Error("prob check: no dtype compiled into this module")
 
 
+def _philox_key_split_go(
+    keys_obj: Arg,
+    out_obj: Arg,
+    num_keys_obj: Arg,
+    splits_obj: Arg,
+    ctx_obj: Arg,
+) raises:
+    enqueue_key_split(
+        _raw_ctx(ctx_obj),
+        _raw_int(keys_obj),
+        _raw_int(out_obj),
+        _raw_int(num_keys_obj),
+        _raw_int(splits_obj),
+    )
+
+
+def _philox_fold_in_go(
+    keys_obj: Arg,
+    out_obj: Arg,
+    num_keys_obj: Arg,
+    data_lo_obj: Arg,
+    data_hi_obj: Arg,
+    data_addr_obj: Arg,
+    ctx_obj: Arg,
+) raises:
+    enqueue_key_fold_in(
+        _raw_ctx(ctx_obj),
+        _raw_int(keys_obj),
+        _raw_int(out_obj),
+        _raw_int(num_keys_obj),
+        _join_u64(_raw_int(data_lo_obj), _raw_int(data_hi_obj)),
+        _raw_int(data_addr_obj),
+    )
+
+
+def _philox_dist_go[
+    KIND: Int
+](
+    out_obj: Arg,
+    keys_obj: Arg,
+    num_keys_obj: Arg,
+    epk_obj: Arg,
+    p0_obj: Arg,
+    p1_obj: Arg,
+    ctx_obj: Arg,
+) raises:
+    var handled = False
+    comptime for dt in SAMPLER_DTYPES:
+        comptime if _dtype_out_on[0, dt]():
+            enqueue_stateless_dist[dt, KIND](
+                _raw_ctx(ctx_obj),
+                _raw_int(out_obj),
+                _raw_int(keys_obj),
+                _raw_int(num_keys_obj),
+                _raw_int(epk_obj),
+                _raw_f64(p0_obj),
+                _raw_f64(p1_obj),
+            )
+            handled = True
+    if not handled:
+        raise Error("stateless philox: no dtype compiled into this module")
+
+
 @export
 def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     try:
@@ -488,6 +561,24 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["Binomial"]():
             _spec_dispatcher10[_sampler_go[SAMPLE_BINOMIAL], "Binomial"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["PhiloxKeySplit"]():
+            _spec_dispatcher5[_philox_key_split_go, "PhiloxKeySplit"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["PhiloxFoldIn"]():
+            _spec_dispatcher7[_philox_fold_in_go, "PhiloxFoldIn"](argv, argc)
+            return 0
+        comptime if _op_on["PhiloxUniform"]():
+            _spec_dispatcher7[_philox_dist_go[PHILOX_UNIFORM], "PhiloxUniform"](
+                argv, argc
+            )
+            return 0
+        comptime if _op_on["PhiloxNormal"]():
+            _spec_dispatcher7[_philox_dist_go[PHILOX_NORMAL], "PhiloxNormal"](
                 argv, argc
             )
             return 0

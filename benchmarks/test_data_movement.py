@@ -145,6 +145,7 @@ COVERS |= {
     "aten::index_copy_": "test_index_copy (the same scatter, into self)",
     "aten::index_copy.out": "test_index_copy (a copy of self, then the same scatter)",
     "aten::masked_scatter_": "test_masked_scatter",
+    "aten::_unique2": "test_unique",
     "aten::repeat_interleave.Tensor": "test_repeat_interleave",
     "aten::unfold_backward": "test_unfold_backward",
     "aten::linspace.out": "test_linspace",
@@ -180,6 +181,42 @@ SKIPPED: dict[str, str] = {
         "benchmarked in their own families"
     ),
     "aten::vdot": "dot for the real dtypes: mul + sum, both benchmarked",
+    "aten::tril.out": _PAD_OUT.replace("resample", "TriangularCopy"),
+    "aten::triu.out": _PAD_OUT.replace("resample", "TriangularCopy"),
+    "aten::tril_": "test_tril's TriangularCopy, then a strided copy into self",
+    "aten::triu_": "test_triu's TriangularCopy, then a strided copy into self",
+    "aten::range.out": (
+        "the Arange kernel test_arange measures, with an inclusive end"
+    ),
+    "aten::randperm.generator_out": (
+        "random_ (test_inplace) and sort.stable (test_reduction) through the "
+        "dispatcher: no kernel of its own"
+    ),
+    "aten::nonzero.out": (
+        "nonzero's host round trip (no device kernel), copied into out"
+    ),
+    "aten::nonzero_static": (
+        "nonzero's host round trip (no device kernel), a fill and a memcpy"
+    ),
+    "aten::nonzero_static.out": ("nonzero_static, copied into the caller's out"),
+    "aten::index.Tensor_out": (
+        "index.Tensor (test_embedding's test_index), copied into out"
+    ),
+    "aten::narrow_copy.out": (
+        "a narrow view's strided copy (test_copy_row_strided's kernel), copied into out"
+    ),
+    "aten::_unique": "test_unique's kernels without the counts",
+    "aten::unique_dim": (
+        "one stable sort per column plus test_unique's group passes: the "
+        "sorts dominate, and they are the reductions suite's"
+    ),
+    "aten::unique_consecutive": "test_unique's group passes without the sort",
+    "aten::unique_dim_consecutive": (
+        "test_unique's group passes over rows, then index_select"
+    ),
+    "aten::fill_.Tensor": (
+        "a one-element read of the value, then fill_.Scalar's fill kernel"
+    ),
     **{
         f"aten::{m}_pad{r}d{suffix}": _PAD_OUT
         for m in PAD_MODES
@@ -966,4 +1003,27 @@ def test_eye(
         lambda: torch.eye(n, m, dtype=dtype, device=hw.stock_device),
         lambda: torch.eye(n, m, dtype=dtype, device=mojo_device),
         flops=float(n * m),
+    )
+
+
+UNIQUE_SHAPES: dict[str, tuple[int, int]] = {
+    "N_16777216_K1000000": (16_777_216, 1_000_000),
+    "N_357789_K97": (357_789, 97),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("i64", "f32"))
+@pytest.mark.parametrize("shape_id", UNIQUE_SHAPES)
+@pytest.mark.bench_op("_unique2")
+def test_unique(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """Sorted unique with inverse and counts: the sort, the group passes and
+    the one read of the group count, on both legs."""
+    n, k = UNIQUE_SHAPES[shape_id]
+    x_ref, x_our = both(torch.randint(0, k, (n,)).to(DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.unique(x_ref, return_inverse=True, return_counts=True),
+        lambda: torch.unique(x_our, return_inverse=True, return_counts=True),
+        flops=float(n),
     )

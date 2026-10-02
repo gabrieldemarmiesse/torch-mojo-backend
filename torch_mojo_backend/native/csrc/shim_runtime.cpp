@@ -622,6 +622,8 @@ void* tmb_tensor_storage_ctx(TmbTensor t) {
   return dp.get_deleter() == &MojoAllocator::deleter ? dp.get_context() : nullptr;
 }
 int64_t tmb_tensor_storage_nbytes(TmbTensor t) { return static_cast<int64_t>(T(t).storage().nbytes()); }
+void* tmb_tensor_storage_impl(TmbTensor t) { return T(t).storage().unsafeGetStorageImpl(); }
+int32_t tmb_tensor_storage_resizable(TmbTensor t) { return T(t).storage().resizable() ? 1 : 0; }
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
 int32_t tmb_tensor_is_neg(TmbTensor t) { return T(t).is_neg(); }
 void* tmb_tensor_impl(TmbTensor t) { return T(t).unsafeGetTensorImpl(); }
@@ -636,6 +638,7 @@ int32_t tmb_float32_matmul_precision(void) {
   return static_cast<int32_t>(at::globalContext().float32MatmulPrecision());
 }
 int32_t tmb_grad_enabled(void) { return c10::GradMode::is_enabled() ? 1 : 0; }
+int32_t tmb_deterministic_algorithms(void) { return at::globalContext().deterministicAlgorithms() ? 1 : 0; }
 int32_t tmb_cuda_is_pinned_ptr(const void* ptr) {
   return at::globalContext().isPinnedPtr(ptr, c10::DeviceType::CUDA) ? 1 : 0;
 }
@@ -822,6 +825,10 @@ int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16) {
     tmb_set_error(e.what());
     return 1;
   }
+}
+
+int32_t tmb_deterministic_fill_uninitialized(void) {
+  return at::globalContext().deterministicAlgorithms() && at::globalContext().deterministicFillUninitializedMemory();
 }
 
 int32_t tmb_default_dtype(void) { return static_cast<int32_t>(c10::typeMetaToScalarType(c10::get_default_dtype())); }

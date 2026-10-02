@@ -371,20 +371,53 @@ def test_reflection_pad_backward_checks_the_padding(mojo_device):
         torch.ops.aten.reflection_pad1d_backward(g, x, [3, 1])
 
 
-def test_out_overlap_raises(mojo_device):
-    x = torch.randn(1, 1, 4, 4).to(mojo_device)
+def test_out_overlap_follows_torch(mojo_device):
+    """torch's pad and upsample kernels check no overlap with the input
+    (upsample's out still refuses internal overlap). An overlapping out gets
+    the result computed as if the input were read first."""
+    x = torch.randn(1, 1, 4, 4)
+    xm = x.to(mojo_device)
+    # Pad: an expanded out is accepted (torch writes it racily; the values
+    # are not checked).
     expanded = torch.empty(1, 1, 1, 1, device=mojo_device).expand(1, 1, 6, 6)
+    torch.ops.aten.replication_pad2d.out(xm, [1, 1, 1, 1], out=expanded)
+    # Upsample: an expanded out still raises.
     with pytest.raises(RuntimeError, match="more than one element"):
-        torch.ops.aten.replication_pad2d.out(x, [1, 1, 1, 1], out=expanded)
-    with pytest.raises(RuntimeError, match="single memory location"):
-        torch.ops.aten.upsample_nearest1d.out(x[0], [2], None, out=x[0][..., :2])
-    # A partially overlapping dense view: the input's second half is the
-    # start of the output.
+        torch.ops.aten.upsample_nearest2d.out(xm, [6, 6], None, None, out=expanded)
+    # A strided (non-dense) out is TooHard for ATen's overlap check: allowed.
+    torch.ops.aten.upsample_nearest1d.out(xm[0], [2], None, out=xm[0][..., :2])
+    # A partially overlapping dense out: accepted. The kernel reads the
+    # input while writing the out (a race on CUDA too), so only what does
+    # not depend on that order is checked: the shape, and the storage
+    # outside the out left untouched.
+    for op, extra in (
+        (torch.ops.aten.reflection_pad2d.out, ([1, 1, 1, 1],)),
+        (torch.ops.aten.upsample_nearest2d.out, ([6, 6], None, None)),
+    ):
+        buf = torch.arange(64.0)
+        dev = buf.to(mojo_device)
+        res = op(dev[:16].view(1, 1, 4, 4), *extra, out=dev[8:44].view(1, 1, 6, 6))
+        assert res.shape == (1, 1, 6, 6) and res.dtype == torch.float32
+        got = dev.cpu()
+        torch.testing.assert_close(got[:8], buf[:8], atol=0, rtol=0)
+        torch.testing.assert_close(got[44:], buf[44:], atol=0, rtol=0)
+
+
+def test_same_size_upsample_out_partial_overlap_raises(mojo_device):
+    """CUDA's same-size shortcut is `output.copy_(input)`: a partially
+    overlapping out raises, forward and backward; pad has no such check."""
     buf = torch.zeros(64, device=mojo_device)
+    src = buf[:16].view(1, 1, 4, 4)
+    dst = buf[8:24].view(1, 1, 4, 4)
     with pytest.raises(RuntimeError, match="single memory location"):
-        torch.ops.aten.reflection_pad2d.out(
-            buf[:16].view(1, 1, 4, 4), [1, 1, 1, 1], out=buf[8:44].view(1, 1, 6, 6)
+        torch.ops.aten.upsample_nearest2d.out(src, [4, 4], None, None, out=dst)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.ops.aten.upsample_bilinear2d.out(src, [4, 4], False, None, None, out=dst)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.ops.aten.upsample_nearest2d_backward.grad_input(
+            src, [4, 4], [1, 1, 4, 4], None, None, grad_input=dst
         )
+    torch.ops.aten.reflection_pad2d.out(src, [0, 0, 0, 0], out=dst)
 
 
 def test_unchanged_size_out_is_the_input(mojo_device):

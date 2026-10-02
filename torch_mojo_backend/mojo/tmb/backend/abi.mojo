@@ -320,6 +320,12 @@ def set_shim_error(msg: String):
     external_call["tmb_set_error", NoneType](tmp.as_c_string_span().ptr())
 
 
+def deterministic_algorithms() -> Bool:
+    """`torch.are_deterministic_algorithms_enabled()`: ops with a
+    nondeterministic fast path take CUDA's deterministic route instead."""
+    return external_call["tmb_deterministic_algorithms", Int32]() != 0
+
+
 def alert_not_deterministic(var caller: String) raises:
     check(
         external_call["tmb_alert_not_deterministic", Int32](

@@ -14,7 +14,7 @@
 # cvt.rni.s32) are emitted verbatim as inline PTX.
 #
 # Portability: the routines whose libdevice body is pure IEEE arithmetic
-# (nv_logf, nv_exp, nv_log1pf, nv_sincospi) run the ported body on every target
+# (nv_logf, nv_exp, nv_log1pf, nv_sincospi, nv_sincos) run the ported body on every target
 # and are bit-exact everywhere.  The routines that depend on an NVIDIA hardware
 # approximation instruction (nv_expf, nv_log, nv_log1p, nv_tanf, nv_tan,
 # nv_fast_sincosf) fall back to std.math off NVIDIA and are NOT bit-exact
@@ -897,6 +897,72 @@ def nv_tan(a: Float64) -> Float64:
         w = fma(rr, d, w)
         r = fma(w, rr, rr)
     return r
+
+
+# --------------------------------------------------------------------------- #
+# __nv_sincos
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def nv_sincos(a: Float64) -> Tuple[Float64, Float64]:
+    """`__nv_sincos` (libdevice.10.bc): (sin(a), cos(a)) from `__nv_tan`'s
+    Cody-Waite / Payne-Hanek reduction and `__nv_sincospi`'s polynomials.
+
+    Pure IEEE apart from cvt.rni (`_d2i_rn` has a portable fallback): exact
+    everywhere.
+    """
+    var z: Float64
+    var i = Int32(0)
+    if (_hi(a) & Int32(2147483647)) == Int32(2146435072) and _lo(a) == Int32(0):
+        z = a * Float64(0.0)
+    else:
+        var q = _d2i_rn(a * Float64(from_bits=UInt64(0x3FE45F306DC9C883)))
+        var qf = q.cast[DType.float64]()
+        var t = fma(-qf, Float64(from_bits=UInt64(0x3FF921FB54442D18)), a)
+        t = fma(-qf, Float64(from_bits=UInt64(0x3C91A62633145C00)), t)
+        t = fma(-qf, Float64(from_bits=UInt64(0x397B839A252049C0)), t)
+        i = q
+        if _fabs_d(a) >= Float64(from_bits=UInt64(0x41E0000000000000)):
+            var rq = _trig_reduction_slowpath_d(a, q)
+            t = rq[0]
+            i = rq[1]
+        z = t
+
+    var x2 = z * z
+    var c = fma(
+        Float64(from_bits=UInt64(0xBDA8FF8320FD8164)),
+        x2,
+        Float64(from_bits=UInt64(0x3E21EEA7C1EF8528)),
+    )
+    c = fma(c, x2, Float64(from_bits=UInt64(0xBE927E4F8E06E6D9)))
+    c = fma(c, x2, Float64(from_bits=UInt64(0x3EFA01A019DDBCE9)))
+    c = fma(c, x2, Float64(from_bits=UInt64(0xBF56C16C16C15D47)))
+    c = fma(c, x2, Float64(from_bits=UInt64(0x3FA5555555555551)))
+    c = fma(c, x2, Float64(-0.5))
+    c = fma(c, x2, Float64(1.0))
+
+    var sp = fma(
+        Float64(from_bits=UInt64(0x3DE5DB65F9785EBA)),
+        x2,
+        Float64(from_bits=UInt64(0xBE5AE5F12CB0D246)),
+    )
+    sp = fma(sp, x2, Float64(from_bits=UInt64(0x3EC71DE369ACE392)))
+    sp = fma(sp, x2, Float64(from_bits=UInt64(0xBF2A01A019DB62A1)))
+    sp = fma(sp, x2, Float64(from_bits=UInt64(0x3F81111111110818)))
+    sp = fma(sp, x2, Float64(from_bits=UInt64(0xBFC5555555555554)))
+    sp = fma(sp, x2, Float64(0.0))
+    var s = fma(sp, z, z)
+
+    var sv = s
+    var cv = c
+    if (i & Int32(1)) != Int32(0):
+        sv = c
+        cv = _i2d(_lo(s), _hi(s) ^ Int32(-2147483648))
+    if (i & Int32(2)) != Int32(0):
+        sv = _i2d(_lo(sv), _hi(sv) ^ Int32(-2147483648))
+        cv = _i2d(_lo(cv), _hi(cv) ^ Int32(-2147483648))
+    return (sv, cv)
 
 
 # --------------------------------------------------------------------------- #

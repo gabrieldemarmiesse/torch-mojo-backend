@@ -29,6 +29,7 @@ from tmb.backend.abi import (
     ST_INT32,
     ST_INT64,
     ST_UINT8,
+    ST_UINT64,
     T,
     Value,
     Values,
@@ -39,6 +40,8 @@ from tmb.backend.abi import (
     index_error,
     int_arg,
     contiguous_strides,
+    dense_strides_like,
+    is_dense,
     new_like,
     new_scalar,
     new_strided,
@@ -67,6 +70,7 @@ from tmb.ops.common import (
     cast_to,
     contiguous,
     copy_strided_into,
+    device_str,
     fill_value,
     philox_reserve,
     resize_out,
@@ -1740,6 +1744,330 @@ def op_binomial(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+# ---------------------------------------------------------------------------
+# Stateless Philox (`torch.func` random keys): aten/src/ATen/native/cuda/
+# PhiloxKeySplit.cu and PhiloxDistribution.cu at v2.14.0. No generator: a key
+# tensor of uint64 (seed, offset) pairs carries all the state.
+# ---------------------------------------------------------------------------
+
+
+def _philox_dtype_name(dt: DType) -> String:
+    if dt == DType.uint16:
+        return "UInt16"
+    if dt == DType.uint32:
+        return "UInt32"
+    if dt == DType.uint64:
+        return "UInt64"
+    return _scalar_type_name(dt)
+
+
+def _int_list_str(t: T, n: Int) -> String:
+    """The first `n` sizes of `t` as torch prints an IntArrayRef."""
+    var s = String("[")
+    for i in range(n):
+        if i:
+            s += ", "
+        s += String(t.dim(i))
+    return s + "]"
+
+
+def _philox_key_check(key: T, what: StaticString) raises:
+    if not (key.rank >= 1 and key.dim(key.rank - 1) == 2):
+        raise Error(
+            what,
+            ": key must have shape (*batch, 2), got shape ",
+            _int_list_str(key, key.rank),
+        )
+    if key.stype != ST_UINT64:
+        raise Error(
+            what,
+            ": key must have dtype uint64, got ",
+            _philox_dtype_name(key.dtype),
+        )
+
+
+# aten::_philox_key_split(Tensor key, int num_splits) -> Tensor
+def op_philox_key_split(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var key = v_tensor(args[unsafe_offset=0])
+    var num_splits = v_int(args[unsafe_offset=1])
+    _philox_key_check(key, "_philox_key_split")
+    if num_splits <= 0:
+        raise Error(
+            "_philox_key_split: num_splits must be positive, got ", num_splits
+        )
+    if key.rank + 1 > MAX_RANK:
+        unsupported("_philox_key_split: key rank above the mojo device limit")
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - key.rank - 1] = num_splits
+    for i in range(key.rank):
+        shape[MAX_RANK - key.rank + i] = key.dim(i)
+    var out = own(new_tensor(shape, key.rank + 1, ST_UINT64, key.device))
+    var num_keys = key.numel // 2
+    if num_keys > 0:
+        var src = own_if_new(contiguous(key), key)
+        var ctx = ctx_for(key.device)
+        var call = KernelCall("random", "PhiloxKeySplit")
+        call.int(src.t.ptr)
+        call.int(out.t.ptr)
+        call.int(num_keys)
+        call.int(num_splits)
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+        _ = src^
+    ret_owned(rets, 0, out)
+
+
+def _philox_fold_in(key: T, data: UInt64, data_addr: Int, rets: Values) raises:
+    # CUDA's `at::empty_like(key)` (preserve_format), written in memory order
+    # from the contiguous keys: a transposed key gets a transposed output whose
+    # bytes are laid out as the contiguous result's, exactly as on CUDA.
+    var strides = key.strides if is_dense(
+        key.shape, key.strides, key.rank
+    ) else dense_strides_like(key.shape, key.strides, key.rank)
+    var out = own(
+        new_strided(key.shape, strides, key.rank, key.stype, key.device)
+    )
+    var num_keys = key.numel // 2
+    if num_keys > 0:
+        var src = own_if_new(contiguous(key), key)
+        var ctx = ctx_for(key.device)
+        var call = KernelCall("random", "PhiloxFoldIn")
+        call.int(src.t.ptr)
+        call.int(out.t.ptr)
+        call.int(num_keys)
+        call.int(Int(data & 0xFFFFFFFF))
+        call.int(Int((data >> 32) & 0xFFFFFFFF))
+        call.int(data_addr)
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+        _ = src^
+    ret_owned(rets, 0, out)
+
+
+# aten::_philox_key_fold_in(Tensor key, int data) -> Tensor
+def op_philox_key_fold_in(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var key = v_tensor(args[unsafe_offset=0])
+    _philox_key_check(key, "_philox_key_fold_in")
+    # The int64 schema argument reinterpreted as uint64.
+    var data = UInt64(Int64(v_int(args[unsafe_offset=1])))
+    _philox_fold_in(key, data, 0, rets)
+
+
+# aten::_philox_key_fold_in.Tensor(Tensor key, Tensor data) -> Tensor
+def op_philox_key_fold_in_tensor(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var key = v_tensor(args[unsafe_offset=0])
+    var data = v_tensor(args[unsafe_offset=1])
+    _philox_key_check(key, "_philox_key_fold_in")
+    if data.stype != ST_UINT64:
+        raise Error(
+            "_philox_key_fold_in: data must have dtype uint64, got ",
+            _philox_dtype_name(data.dtype),
+        )
+    if data.numel != 1:
+        raise Error(
+            "_philox_key_fold_in: data must be a single value, got ",
+            data.numel,
+            " elements",
+        )
+    if data.on_mojo():
+        if data.device != key.device:
+            raise Error(
+                "_philox_key_fold_in: expected data on ",
+                device_str(key),
+                ", got ",
+                device_str(data),
+            )
+        # Read on the device, like CUDA's kernel: no host sync.
+        _philox_fold_in(key, 0, data.ptr, rets)
+        return
+    if not data.on_cpu():
+        unsupported("_philox_key_fold_in: data on a foreign device")
+    var value = Pointer[UInt64, MutUntrackedOrigin](
+        unsafe_from_address=data.ptr
+    )[]
+    _philox_fold_in(key, value, 0, rets)
+
+
+def _philox_distribution(
+    args: Values, rets: Values, op: StaticString, what: StaticString
+) raises:
+    var self_t = v_tensor(args[unsafe_offset=0])
+    var key = v_tensor(args[unsafe_offset=1])
+    var a = v_f64(args[unsafe_offset=2])
+    var b = v_f64(args[unsafe_offset=3])
+    var dt = self_t.dtype
+    if not dt.is_floating_point():
+        raise Error(
+            what,
+            ": self must be a floating point tensor, got ",
+            _philox_dtype_name(dt),
+        )
+    if key.stype != ST_UINT64:
+        raise Error(
+            what,
+            ": key must have dtype uint64, got ",
+            _philox_dtype_name(key.dtype),
+        )
+    if key.device_type != self_t.device_type or key.device != self_t.device:
+        raise Error(
+            what,
+            ": self and key must be on the same device, got ",
+            device_str(self_t),
+            " and ",
+            device_str(key),
+        )
+    if not (key.rank >= 1 and key.dim(key.rank - 1) == 2):
+        raise Error(
+            what,
+            ": key must have shape (2,) or (*batch, 2), got shape ",
+            _int_list_str(key, key.rank),
+        )
+    if key.rank > 1:
+        if key.rank != self_t.rank + 1:
+            raise Error(
+                what,
+                (
+                    ": batched key must have ndim == output ndim + 1, got key"
+                    " shape "
+                ),
+                _int_list_str(key, key.rank),
+                " with output shape ",
+                _int_list_str(self_t, self_t.rank),
+            )
+        for i in range(self_t.rank):
+            if key.dim(i) != 1 and key.dim(i) != self_t.dim(i):
+                raise Error(
+                    what,
+                    ": key batch shape ",
+                    _int_list_str(key, self_t.rank),
+                    " is not broadcastable with output shape ",
+                    _int_list_str(self_t, self_t.rank),
+                )
+    if self_t.numel == 0:
+        ret_ref(rets, 0, self_t)
+        return
+    # CUDA fills a contiguous copy, then `self.copy_(output)`, which refuses a
+    # self whose elements share memory (an expanded tensor).
+    assert_no_internal_overlap(self_t)
+    if not (
+        dt == DType.float32
+        or dt == DType.float16
+        or dt == DType.bfloat16
+        or dt == DType.float64
+    ):
+        unsupported(String(what) + ": dtype " + String(dt))
+
+    # Keys flattened to (num_keys, 2), one per block of `epk` output elements
+    # (PhiloxStatelessRNG.cpp's flattening; CUDA's OffsetCalculator reads
+    # the same keys in the same order).
+    var num_keys = 1
+    var epk = self_t.numel
+    var flat: Owned
+    if key.rank == 1:
+        flat = own_if_new(contiguous(key), key)
+    else:
+        var key_dims = self_t.rank
+        epk = 1
+        for i in range(self_t.rank - 1, -1, -1):
+            if key.dim(i) != 1:
+                break
+            epk *= self_t.dim(i)
+            key_dims -= 1
+        num_keys = self_t.numel // epk
+        var shape = IndexList[MAX_RANK](1)
+        var strides = IndexList[MAX_RANK](0)
+        var pad = MAX_RANK - key_dims - 1
+        for i in range(key_dims):
+            shape[pad + i] = self_t.dim(i)
+            strides[pad + i] = key.stride(i) if key.dim(i) != 1 else 0
+        shape[MAX_RANK - 1] = 2
+        strides[MAX_RANK - 1] = key.stride(key.rank - 1)
+        var view = own(
+            view_strided(key, shape, strides, key_dims + 1, key.offset)
+        )
+        flat = own_if_new(contiguous(view.t), view.t)
+        _ = view^
+
+    # The parameters as ATen rounds them: uniform's `lo`/`hi` are scalar_t
+    # and `hi - lo` is scalar_t arithmetic (at::Half / BFloat16 round it);
+    # normal's mean / std are the accumulation type's.
+    var p0: Float64
+    var p1: Float64
+    if op == "PhiloxUniform":
+        if dt == DType.float64:
+            p0 = a
+            p1 = b - a
+        elif dt == DType.float32:
+            var lo = a.cast[DType.float32]()
+            p0 = lo.cast[DType.float64]()
+            p1 = (b.cast[DType.float32]() - lo).cast[DType.float64]()
+        else:
+            # static_cast<at::Half>(double) goes through float first.
+            var lo32 = _round_through(a.cast[DType.float32](), dt)
+            var hi32 = _round_through(b.cast[DType.float32](), dt)
+            p0 = lo32.cast[DType.float64]()
+            p1 = _round_through(hi32 - lo32, dt).cast[DType.float64]()
+    else:
+        if dt == DType.float64:
+            p0 = a
+            p1 = b
+        else:
+            p0 = a.cast[DType.float32]().cast[DType.float64]()
+            p1 = b.cast[DType.float32]().cast[DType.float64]()
+
+    var dense = own_if_new(
+        self_t.copy() if self_t.contig else new_like(self_t), self_t
+    )
+    var ctx = ctx_for(self_t.device)
+    var call = KernelCall("random", op)
+    call.out_dtype(dt)
+    call.int(dense.t.ptr)
+    call.int(flat.t.ptr)
+    call.int(num_keys)
+    call.int(epk)
+    call.f64(p0)
+    call.f64(p1)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+    _ = flat^
+    if dense.t.h != self_t.h:
+        copy_strided_into(self_t, dense.t)
+    _ = dense^
+    ret_ref(rets, 0, self_t)
+
+
+def _round_through(x: Float32, dt: DType) -> Float32:
+    """`x` rounded to the half dtype `dt` and widened back."""
+    if dt == DType.float16:
+        return x.cast[DType.float16]().cast[DType.float32]()
+    return x.cast[DType.bfloat16]().cast[DType.float32]()
+
+
+# aten::_philox_uniform_(Tensor(a!) self, Tensor key, float low=0,
+#   float high=1) -> Tensor(a!)
+def op_philox_uniform_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _philox_distribution(args, rets, "PhiloxUniform", "_philox_uniform_")
+
+
+# aten::_philox_normal_(Tensor(a!) self, Tensor key, float mean=0,
+#   float std=1) -> Tensor(a!)
+def op_philox_normal_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _philox_distribution(args, rets, "PhiloxNormal", "_philox_normal_")
+
+
 def register_random(site: Site) raises:
     impl[op_uniform_, "uniform_"](site)
     impl[op_normal_, "normal_"](site)
@@ -1761,6 +2089,11 @@ def register_random(site: Site) raises:
     impl[op_poisson, "poisson"](site)
     impl[op_standard_gamma, "_standard_gamma"](site)
     impl[op_binomial, "binomial"](site)
+    impl[op_philox_key_split, "_philox_key_split"](site)
+    impl[op_philox_key_fold_in, "_philox_key_fold_in"](site)
+    impl[op_philox_key_fold_in_tensor, "_philox_key_fold_in.Tensor"](site)
+    impl[op_philox_uniform_, "_philox_uniform_"](site)
+    impl[op_philox_normal_, "_philox_normal_"](site)
     impl[op_random_from, "random_.from"](site)
     impl[op_random_to, "random_.to"](site)
     impl[op_random_, "random_"](site)

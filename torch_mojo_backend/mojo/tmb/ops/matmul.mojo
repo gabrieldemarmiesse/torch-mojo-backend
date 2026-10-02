@@ -1,5 +1,7 @@
-"""ATen ops: matmul group — mm, bmm, addmm, linear, linear_backward, addr and
-the convolution forward and backward.
+"""ATen ops: matmul group — mm, bmm, addmm, addmv, baddbmm, addbmm (with
+alpha / beta, their `.dtype` overloads, _addmm_activation), _int_mm,
+_weight_int8pack_mm, linear, linear_backward, addr and the convolution
+forward and backward.
 
 The route cascade is the old fast path's (aten_fast.py), unchanged:
 
@@ -24,7 +26,15 @@ from max.gpu.host import DeviceAttribute
 from tmb.backend.abi import (
     IntList,
     Owned,
+    ST_BFLOAT16,
+    ST_FLOAT16,
+    ST_FLOAT32,
+    ST_FLOAT64,
+    ST_INT32,
+    ST_INT8,
+    ST_UINT8,
     T,
+    TAG_DTYPE,
     TAG_BOOL_LIST,
     TAG_DOUBLE,
     TAG_NONE,
@@ -35,8 +45,12 @@ from tmb.backend.abi import (
     UNSUPPORTED_PREFIX,
     Value,
     Values,
+    bits_f64,
+    call_op,
     contiguous_strides,
     dtype_code,
+    dtype_name,
+    max_dtype,
     new_tensor,
     own,
     own_if_new,
@@ -44,25 +58,46 @@ from tmb.backend.abi import (
     ret_owned,
     ret_ref,
     ret_tensor,
+    tensor_arg,
     unsupported,
     v_bool,
+    v_dtype_or,
     v_f64,
     v_int,
     v_scalar_is_bool,
+    v_scalar_is_integral,
     v_tensor,
     view_strided,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall, loader
 from tmb.kernels.common.op_utils import MAX_RANK
+from tmb.ops.binary import Res, _b_no_partial_overlap, _b_tside
 from tmb.ops.common import (
+    assert_no_internal_overlap,
     call_op_raw,
+    can_cast,
+    cast_into,
+    cast_to,
     check_out,
+    check_out_as,
     contiguous,
     copy_strided_into,
+    device_str,
     fill_value,
+    is_float_stype,
+    is_int_stype,
+    promote_types,
     resize_out,
+    result_type,
+    same_view,
+    scalar_to_float,
+    scalar_to_int,
+    shares_storage,
 )
+from tmb.ops.data_movement import _scalar_type_name
+from tmb.ops.pointwise import _none_side, _p, _pw_run
+from tmb.ops.unary import _direct_unary_out, _gelu_spec, _unary_out
 from tmb.backend.registry import Site, impl
 
 
@@ -1203,25 +1238,6 @@ def _store_out(rets: Values, dest: T, var result: T) raises:
 
 
 # aten::mm(Tensor self, Tensor mat2) -> Tensor
-def op_mm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
-    var out = _mm_route(a, b)
-    if not out:
-        unsupported("aten::mm with these operands")
-    ret_tensor(rets, 0, out.value())
-
-
-# aten::mm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)
-def op_mm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
-    var dest = v_tensor(args[unsafe_offset=2])
-    check_out(dest, a)  # TORCH_META_FUNC(mm) sets the output from `self`
-    var out = _mm_route(a, b)
-    if not out:
-        unsupported("aten::mm.out with these operands")
-    _store_out(rets, dest, out.value().copy())
 
 
 def _bmm_route(a: T, b: T) raises -> Optional[T]:
@@ -1232,31 +1248,6 @@ def _bmm_route(a: T, b: T) raises -> Optional[T]:
     if t:
         return t.value().copy()
     return _spec_matmul("BmmSpec", a, b, None, 0)
-
-
-# aten::bmm(Tensor self, Tensor mat2) -> Tensor
-def op_bmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
-    var out = _bmm_route(a, b)
-    if not out:
-        unsupported("aten::bmm with these operands")
-    ret_tensor(rets, 0, out.value())
-
-
-# aten::bmm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)
-def op_bmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
-    var dest = v_tensor(args[unsafe_offset=2])
-    check_out(dest, b)  # common_checks_baddbmm_bmm uses `batch2.options()`
-    var out = _bmm_route(a, b)
-    if not out:
-        unsupported("aten::bmm.out with these operands")
-    _store_out(rets, dest, out.value().copy())
-
-
-# --- aten::addmm --------------------------------------------------------------
 
 
 def _addmm_route(bias: T, mat1: T, mat2: T) raises -> Optional[T]:
@@ -1298,43 +1289,2095 @@ def _addmm_route(bias: T, mat1: T, mat2: T) raises -> Optional[T]:
     return _spec_matmul("MatmulBiasSpec", mat1, mat2, opt_bias, 0)
 
 
-def _addmm_unit_scaling(beta: Value, alpha: Value) raises:
-    if v_f64(beta) != 1.0 or v_f64(alpha) != 1.0:
-        # beta/alpha scaling is not implemented by the fast path.
-        unsupported("aten::addmm with beta != 1 or alpha != 1")
+# --- the BLAS family: alpha / beta, out_dtype, empty and integer operands -----
+#
+# mm, bmm, addmm, addmv, baddbmm, addbmm and their `.out` / in-place /
+# `.dtype` overloads are one computation:
+#
+#     out = beta * self + alpha * (A @ B)          (beta == 0: self unread)
+#
+# run as the GEMM routes above (`_product`) followed by one fused pointwise
+# epilogue (`blas_scale` / `blas_axpby` in tmb/kernels/pointwise), the
+# cuBLAS `alpha * acc + beta * C` of aten/src/ATen/native/cuda/Blas.cpp in
+# the compute type -- float for float and the half types, double for double,
+# scalar_t for integers -- rounded once. A float16 / bfloat16 call that
+# needs an epilogue therefore computes its product in float32 (from exact
+# float32 copies of the operands), so the result rounds where cuBLAS rounds
+# instead of once more after the product. A bare product (mm, bmm, alpha 1
+# with beta 0) runs the half-precision routes directly.
+#
+# Integer operands (CPU torch's mm / bmm / addmm on integers, and
+# aten::_int_mm's int8 -> int32) run the tiled kernel with an integer
+# accumulator (`IntMmSpec`); stock CUDA has no integer GEMM but these.
+
+
+def _dims_str(dims: List[Int]) -> String:
+    var s = String("[")
+    for i in range(len(dims)):
+        if i:
+            s += ", "
+        s += String(dims[i])
+    return s + "]"
+
+
+def _matrix_str(t: T) -> String:
+    return String(t.dim(0), "x", t.dim(1))
+
+
+def _check_same_device(ts: List[T]) raises:
+    """checkAllSameGPU: every operand on one device, and that one ours."""
+    for i in range(1, len(ts)):
+        if (
+            ts[i].device_type != ts[0].device_type
+            or ts[i].device != ts[0].device
+        ):
+            raise Error(
+                (
+                    "Expected all tensors to be on the same device, but found"
+                    " at least two devices, "
+                ),
+                device_str(ts[0]),
+                " and ",
+                device_str(ts[i]),
+                "!",
+            )
+    if not ts[0].on_mojo():
+        unsupported("a matmul whose operands are not on the mojo device")
+
+
+def _check_expand(self: T, dims: List[Int], fname: StaticString) raises:
+    """`expand_size(self, dims, fn)`: self broadcasts to `dims` (it may only
+    add leading dimensions and stretch size-1 ones)."""
+    var r = len(dims)
+    if self.rank > r:
+        raise Error(
+            "expand(",
+            fname,
+            "): the number of sizes provided (",
+            r,
+            (
+                ") must be greater or equal to the number of dimensions in the"
+                " tensor ("
+            ),
+            self.rank,
+            ")",
+        )
+    for i in range(self.rank):
+        var d = r - self.rank + i
+        var s = self.dim(i)
+        if s != 1 and s != dims[d]:
+            raise Error(
+                "The expanded size of the tensor (",
+                dims[d],
+                ") must match the existing size (",
+                s,
+                ") at non-singleton dimension ",
+                d,
+                ".  Target sizes: ",
+                _dims_str(dims),
+                ".  Tensor sizes: ",
+                _dims_str(self.logical_shape()),
+            )
+
+
+def _check_inplace(self: T, dims: List[Int]) raises:
+    """A structured in-place op's output is `self`, never resized."""
+    var same = self.rank == len(dims)
+    if same:
+        for i in range(self.rank):
+            if self.dim(i) != dims[i]:
+                same = False
+    if not same:
+        raise Error(
+            "Bad in-place call: input tensor size ",
+            _dims_str(self.logical_shape()),
+            " and output tensor size ",
+            _dims_str(dims),
+            " should match",
+        )
+
+
+@fieldwise_init
+struct _Coef(Copyable, ImplicitlyCopyable, Movable):
+    """alpha or beta as the kernel applies it: `Scalar::to<opmath_t>()` (a
+    float, or double for double operands) or `to<scalar_t>()` for integer
+    operands."""
+
+    var f: Float64
+    var i: Int
+    var integral: Bool
+
+    def zero(self) -> Bool:
+        return self.i == 0 if self.integral else self.f == 0.0
+
+    def one(self) -> Bool:
+        return self.i == 1 if self.integral else self.f == 1.0
+
+    def param(self) -> Float64:
+        """The pointwise slot: an integer travels as its int64 bits."""
+        return bits_f64(Int64(self.i)) if self.integral else self.f
+
+
+def _unit(st: Int32, value: Int) -> _Coef:
+    return _Coef(Float64(value), value, is_int_stype(st))
+
+
+def _coef(v: Value, st: Int32) raises -> _Coef:
+    """`Scalar::to<opmath_t>()` for operands of dtype `st` (range-checked:
+    a finite value beyond float's range raises as c10's checked_convert)."""
+    if is_int_stype(st):
+        return _Coef(0.0, scalar_to_int(v, st), True)
+    if st == ST_FLOAT64:
+        return _Coef(v_f64(v), 0, False)
+    return _Coef(scalar_to_float(v, ST_FLOAT32), 0, False)
+
+
+def _coef_scalar_t(v: Value, st: Int32) raises -> _Coef:
+    """`Scalar::to<scalar_t>()`: addmv's gemv takes alpha and beta in the
+    tensor's own dtype, so a half call rounds them to half first."""
+    if is_int_stype(st) or st == ST_FLOAT64 or st == ST_FLOAT32:
+        return _coef(v, st)
+    var f = scalar_to_float(v, st)
+    if st == ST_FLOAT16:
+        f = f.cast[DType.float16]().cast[DType.float64]()
+    else:
+        f = f.cast[DType.bfloat16]().cast[DType.float64]()
+    return _Coef(f, 0, False)
+
+
+def _round_to(c: _Coef, st: Int32) -> _Coef:
+    """`scalar_tensor(beta, self.scalar_type())`: beta stored in self's
+    dtype (the k == 0 shortcut of addmm / addmv multiplies by it)."""
+    if c.integral or st == ST_FLOAT64 or st == ST_FLOAT32:
+        return c
+    if st == ST_FLOAT16:
+        return _Coef(c.f.cast[DType.float16]().cast[DType.float64](), 0, False)
+    return _Coef(c.f.cast[DType.bfloat16]().cast[DType.float64](), 0, False)
+
+
+def _mul_scalar(v: Value, st: Int32) raises -> _Coef:
+    """beta as `result.mul_(beta)` applies it: a wrapped double (unchecked)
+    on a floating result; on an integer one a floating Scalar promotes the
+    product to the default float, which the in-place result cannot hold."""
+    if is_int_stype(st):
+        if not v_scalar_is_integral(v):
+            raise Error(
+                "result type Float can't be cast to the desired output type ",
+                _scalar_type_name(max_dtype(st)),
+            )
+        return _Coef(0.0, v_int(v), True)
+    return _Coef(v_f64(v), 0, False)
+
+
+def _raw_zero(v: Value) raises -> Bool:
+    """`scalar.toComplexDouble() == 0`: no range check, nothing converted."""
+    return v_f64(v) == 0.0
+
+
+def _coefs(
+    alpha_v: Value,
+    beta_v: Value,
+    st: Int32,
+    self_st: Int32,
+    numel: Int,
+    k: Int,
+    scalar_t: Bool = False,
+) raises -> Tuple[_Coef, _Coef]:
+    """(alpha, beta) converted only where CUDA converts them: nothing for an
+    empty result; for an empty reduction (k == 0) alpha is never read and
+    beta is `scalar_tensor(beta, self.scalar_type())` (range-checked in
+    self's dtype); otherwise both in opmath (or scalar_t: addmv's gemv)."""
+    var zero = _unit(st, 0)
+    if numel == 0:
+        return (zero, zero)
+    if k == 0:
+        if _raw_zero(beta_v):
+            return (zero, zero)
+        if is_int_stype(self_st):
+            return (zero, _Coef(0.0, scalar_to_int(beta_v, self_st), True))
+        var f = scalar_to_float(beta_v, self_st)
+        return (zero, _round_to(_Coef(f, 0, False), self_st))
+    if scalar_t:
+        return (_coef_scalar_t(alpha_v, st), _coef_scalar_t(beta_v, st))
+    return (_coef(alpha_v, st), _coef(beta_v, st))
+
+
+def _int_product(a: T, b: T, out_stype: Int32) raises -> T:
+    """`a @ b` on integer operands: IntMmSpec over dense copies."""
+    var ca = Tmp(a)
+    var cb = Tmp(b)
+    var dims = _leading_dims(a)
+    dims.append(b.dim(b.rank - 1))
+    var out = own(_new(dims, out_stype, a.device))
+    var ctx = ctx_for(a.device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("matmul", "IntMmSpec")
+    call.arg_dtype(0, a.dtype)
+    call.out_dtype(out.t.dtype)
+    call.spec(ca.t.spec(cp))
+    call.spec(cb.t.spec(cp))
+    call.spec(out.t.spec(cp))
+    call.run()
+    _ = ctx
+    _ = ca^
+    _ = cb^
+    return out.take()
+
+
+def _product_dims(a: T, b: T) -> List[Int]:
+    var dims = _leading_dims(a)
+    dims.append(b.dim(b.rank - 1))
+    return dims^
+
+
+def _product(a: T, b: T, out_stype: Int32) raises -> T:
+    """`a @ b` for rank-2 or batched rank-3 operands of one dtype on one
+    device, as dtype `out_stype`: a's own, or float32 for float16 /
+    bfloat16 operands (computed from exact float32 copies). Empty results
+    and an empty reduction (k == 0: zeros) never reach a kernel."""
+    var dims = _leading_dims(a)
+    dims.append(b.dim(b.rank - 1))
+    if _prod(dims) == 0:
+        return _new(dims, out_stype, a.device)
+    if a.dim(a.rank - 1) == 0:
+        return _zeros(dims, out_stype, a.device)
+    if is_int_stype(a.stype):
+        return _int_product(a, b, out_stype)
+    if out_stype != a.stype:
+        var a32 = own_if_new(cast_to(a, out_stype), a)
+        var b32 = own_if_new(cast_to(b, out_stype), b)
+        var wide = _product(a32.t, b32.t, out_stype)
+        _ = a32^
+        _ = b32^
+        return wide^
+    var r = _bmm_route(a, b) if a.rank == 3 else _mm_route(a, b)
+    if not r:
+        unsupported(
+            "a matmul of " + dtype_name(a.stype) + " operands on this device"
+        )
+    return r.value().copy()
+
+
+def _blas(
+    addend: Optional[T],
+    a: T,
+    b: T,
+    alpha: _Coef,
+    beta: _Coef,
+    out_stype: Int32,
+    dims: List[Int],
+    dst: Optional[T],
+    gemv: Bool = False,
+) raises -> Res:
+    """`beta * addend + alpha * (a @ b)` of shape `dims` (the product's own
+    shape, or addmv's `[m]` view of its `[m, 1]`), stored as `out_stype`:
+    into `dst` when the epilogue can write it directly, else fresh. The
+    caller has validated everything; `addend` broadcasts to `dims`."""
+    var k = a.dim(a.rank - 1)
+    var use_addend = Bool(addend) and not beta.zero()
+    var compute = out_stype
+    if is_float_stype(out_stype) and out_stype != ST_FLOAT64:
+        compute = ST_FLOAT32
+    if not use_addend and (alpha.one() or k == 0):
+        compute = out_stype  # the bare product: no epilogue
+    # alpha == 0, as stock CUDA behaves (measured, torch 2.14 / H100): the
+    # float32 / float64 GEMMs and addmv's gemv never read A or B (a NaN
+    # there does not propagate, the result is `beta * addend`); the float16
+    # / bfloat16 GEMMs (cublasGemmEx, float compute) still form the product,
+    # so `0 * NaN` (or `0 * inf`) is NaN.
+    var half = a.stype == ST_FLOAT16 or a.stype == ST_BFLOAT16
+    var skip = alpha.zero() and (gemv or not half)
+    var product = own(
+        _zeros(_product_dims(a, b), compute, a.device) if skip else _product(
+            a, b, compute
+        )
+    )
+    if not _has_dims(product.t, dims):
+        var shaped = _view(product.t, dims)
+        product = own(shaped^)  # the view keeps the storage alive
+    if compute == out_stype and not use_addend and (alpha.one() or k == 0):
+        return Res(product.take(), True)
+    # k == 0: the product is exactly zero, and alpha (inf or NaN included)
+    # never touches it: CUDA's shortcut is `beta * self` (or zeros).
+    var al = alpha
+    if k == 0:
+        al = _unit(out_stype, 0)
+    var params = _p(al.param(), beta.param())
+    var none = _none_side()
+    var a_side = _b_tside(product.t)
+    var b_side = _b_tside(addend.value()) if use_addend else none.copy()
+    var res: Res
+    if use_addend:
+        res = _pw_run(
+            "blas_axpby",
+            2,
+            a_side,
+            b_side,
+            none,
+            compute,
+            out_stype,
+            params,
+            dst,
+        )
+    else:
+        res = _pw_run(
+            "blas_scale",
+            1,
+            a_side,
+            b_side,
+            none,
+            compute,
+            out_stype,
+            params,
+            dst,
+        )
+    _ = product^  # the epilogue reads it: alive past the launch
+    return res^
+
+
+def _has_dims(t: T, dims: List[Int]) -> Bool:
+    if t.rank != len(dims):
+        return False
+    for i in range(t.rank):
+        if t.dim(i) != dims[i]:
+            return False
+    return True
+
+
+comptime ACT_NONE = 0
+comptime ACT_RELU = 1
+comptime ACT_GELU = 2
+
+
+def _activate(t: T, activation: Int) raises:
+    """`_addmm_activation`'s epilogue as CUDA's non-Lt path runs it: relu_
+    or gelu_(approximate="tanh") over the finished (rounded) result."""
+    if activation == ACT_NONE or t.numel == 0:
+        return
+    var dst = t.copy()
+    if activation == ACT_RELU:
+        _direct_unary_out("ReluSpec", t, dst)
+    else:
+        _unary_out("elementwise", _gelu_spec("tanh"), t, dst, t.dtype)
+
+
+def _hand_back(
+    rets: Values,
+    dest: Optional[T],
+    var res: Res,
+    dims: List[Int],
+    activation: Int,
+) raises:
+    """Return a `_blas` result: as a fresh tensor, or in the caller's
+    `out=` / in-place `self`, resized there like `resize_output` when it is
+    not already `dims` (never an in-place self: its shape was checked)."""
+    if not dest:
+        var fresh = own(res.t.copy())
+        _activate(fresh.t, activation)
+        ret_owned(rets, 0, fresh)
+        return
+    var d = dest.value().copy()
+    if res.owned:
+        var held = own(res.t.copy())
+        if not _has_dims(d, dims):
+            resize_out(d, _index_list(dims), len(dims))
+        copy_strided_into(d, held.t)
+        _ = held^  # alive past the copy's launch
+    _activate(d, activation)
+    ret_ref(rets, 0, d)
+
+
+def _blas_out(
+    rets: Values,
+    addend: Optional[T],
+    a: T,
+    b: T,
+    alpha: _Coef,
+    beta: _Coef,
+    out_stype: Int32,
+    dims: List[Int],
+    dest: Optional[T],
+    activation: Int = ACT_NONE,
+    gemv: Bool = False,
+) raises:
+    """`_blas` into a fresh result or the caller's `dest`.
+
+    The epilogue writes `dest` directly when it already has the result's
+    shape and does not partially overlap the addend (the GEMM operands are
+    consumed into the product before the epilogue runs, so their aliasing
+    `dest` is harmless). A `dest` to be resized is resized first only when
+    it shares no storage with an input -- a resize may move the storage an
+    input still views -- else the result is computed fresh and copied in."""
+    if not dest:
+        _hand_back(
+            rets,
+            None,
+            _blas(addend, a, b, alpha, beta, out_stype, dims, None, gemv),
+            dims,
+            activation,
+        )
+        return
+    var d = dest.value().copy()
+    if not _has_dims(d, dims):
+        var shared = shares_storage(d, a) or shares_storage(d, b)
+        if addend:
+            shared = shared or shares_storage(d, addend.value())
+        if not shared:
+            resize_out(d, _index_list(dims), len(dims))
+    _dest_overlap(Optional[T](d.copy()), dims)
+    var direct = _has_dims(d, dims)
+    if direct and addend:
+        var s = addend.value().copy()
+        if shares_storage(d, s) and not same_view(d, s):
+            direct = False
+    var target = Optional[T](d.copy()) if direct else Optional[T]()
+    _hand_back(
+        rets,
+        Optional[T](d.copy()),
+        _blas(addend, a, b, alpha, beta, out_stype, dims, target, gemv),
+        dims,
+        activation,
+    )
+
+
+def _check_dest(dest: T, stype: Int32, like: T) raises:
+    """An `out=`: the result's dtype and device (its self-aliasing is
+    checked by `_dest_overlap` once any resize has happened)."""
+    check_out_as(dest, stype, like)
+
+
+def _self_partial_overlap(dest: T, self: T, dims: List[Int]) raises:
+    """`result.copy_(self.expand(dims))`'s `assert_no_partial_overlap`: a
+    self that broadcasts (a stride-0 dimension) is ATen's `TooHard` case
+    and passes. The result is checked as the meta's resize leaves it: a
+    `dest` of another shape is re-laid out contiguously at its own storage
+    offset (same storage), and that is the geometry compared."""
+    var r = len(dims)
+    for i in range(r):
+        var d = i - (r - self.rank)
+        if dims[i] > 1 and (d < 0 or self.dim(d) == 1):
+            return
+    if _has_dims(dest, dims):
+        _b_no_partial_overlap(dest, self)
+        return
+    var resized = dest.copy()
+    resized.rank = r
+    resized.shape = _index_list(dims)
+    resized.strides = contiguous_strides(resized.shape, r)
+    resized.numel = _prod(dims)
+    resized.contig = True
+    _b_no_partial_overlap(resized, self)
+
+
+def _dest_overlap(dest: Optional[T], dims: List[Int]) raises:
+    """`assert_no_internal_overlap` of the tensor written, as the structured
+    kernels run it: after the meta's resize, so only a destination that
+    already has the result's shape (and will be written as it lies) can
+    alias itself. An in-place self always has it."""
+    if dest and _has_dims(dest.value(), dims):
+        assert_no_internal_overlap(dest.value())
+
+
+def _float_out_dtype_ok(in_st: Int32, out_dtype: Int32) -> Bool:
+    """The `.dtype` overloads: the input dtype itself, or float32 out of
+    float16 / bfloat16 inputs."""
+    return out_dtype == in_st or (
+        out_dtype == ST_FLOAT32
+        and (in_st == ST_FLOAT16 or in_st == ST_BFLOAT16)
+    )
+
+
+# --- aten::mm -----------------------------------------------------------------
+
+
+def _mm_checks(a: T, b: T) raises:
+    """TORCH_META_FUNC(mm), then addmm_out_cuda_impl's dtype check."""
+    if a.rank != 2:
+        raise Error("self must be a matrix")
+    if b.rank != 2:
+        raise Error("mat2 must be a matrix")
+    if a.dim(1) != b.dim(0):
+        raise Error(
+            "mat1 and mat2 shapes cannot be multiplied (",
+            _matrix_str(a),
+            " and ",
+            _matrix_str(b),
+            ")",
+        )
+    if a.stype != b.stype:
+        raise Error(
+            "expected mat1 and mat2 to have the same dtype, but got: ",
+            dtype_name(a.stype),
+            " != ",
+            dtype_name(b.stype),
+        )
+    _check_same_device([a.copy(), b.copy()])
+
+
+# aten::mm(Tensor self, Tensor mat2) -> Tensor
+def op_mm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    _mm_checks(a, b)
+    _blas_out(
+        rets,
+        None,
+        a,
+        b,
+        _unit(a.stype, 1),
+        _unit(a.stype, 0),
+        a.stype,
+        [a.dim(0), b.dim(1)],
+        None,
+    )
+
+
+# aten::mm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)
+def op_mm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var dest = v_tensor(args[unsafe_offset=2])
+    _mm_checks(a, b)
+    _check_dest(dest, a.stype, a)  # TORCH_META_FUNC(mm): `self.options()`
+    _blas_out(
+        rets,
+        None,
+        a,
+        b,
+        _unit(a.stype, 1),
+        _unit(a.stype, 0),
+        a.stype,
+        [a.dim(0), b.dim(1)],
+        Optional[T](dest.copy()),
+    )
+
+
+def _mm_dtype_checks(a: T, b: T, out_dtype: Int32) raises:
+    """_mm_dtype_out_cuda (cuda/Blas.cpp), less its `out` checks."""
+    if a.rank != 2:
+        raise Error("self must be a matrix, got ", a.rank, "-D tensor")
+    if b.rank != 2:
+        raise Error("mat2 must be a matrix, got ", b.rank, "-D tensor")
+    if a.dim(1) != b.dim(0):
+        raise Error(
+            "mat1 and mat2 shapes cannot be multiplied (",
+            _matrix_str(a),
+            " and ",
+            _matrix_str(b),
+            ")",
+        )
+    if a.stype != b.stype:
+        raise Error("input dtypes must be the same")
+    if not _float_out_dtype_ok(a.stype, out_dtype):
+        raise Error(
+            "out_dtype must be the same as input dtype or fp32 for fp16/bf16"
+            " inputs"
+        )
+
+
+def _same_shape_out(dest: T, a: T, b: T) raises:
+    """addmm_out_cuda_impl when `result.is_same(self)` (the `.dtype_out`
+    overloads pass their `out` as self): never resized."""
+    if dest.rank != 2:
+        raise Error("tensors must be 2-D")
+    if dest.dim(0) != a.dim(0):
+        raise Error("self dim 0 must match mat1 dim 0")
+    if dest.dim(1) != b.dim(1):
+        raise Error("self dim 1 must match mat2 dim 1")
+
+
+# aten::mm.dtype(Tensor self, Tensor mat2, ScalarType out_dtype) -> Tensor
+def op_mm_dtype(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var out_dtype = v_dtype_or(args[unsafe_offset=2], a.stype)
+    _mm_dtype_checks(a, b, out_dtype)
+    _check_same_device([a.copy(), b.copy()])
+    _blas_out(
+        rets,
+        None,
+        a,
+        b,
+        _unit(a.stype, 1),
+        _unit(a.stype, 0),
+        out_dtype,
+        [a.dim(0), b.dim(1)],
+        None,
+    )
+
+
+# aten::mm.dtype_out(Tensor self, Tensor mat2, ScalarType out_dtype, *,
+#                    Tensor(a!) out) -> Tensor(a!)
+def op_mm_dtype_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var out_dtype = v_dtype_or(args[unsafe_offset=2], a.stype)
+    var dest = v_tensor(args[unsafe_offset=3])
+    _mm_dtype_checks(a, b, out_dtype)
+    if dest.stype != out_dtype:
+        raise Error(
+            "out_dtype must be the same as the dtype of the provided out tensor"
+        )
+    _same_shape_out(dest, a, b)
+    _check_same_device([dest.copy(), a.copy(), b.copy()])
+    _blas_out(
+        rets,
+        None,
+        a,
+        b,
+        _unit(a.stype, 1),
+        _unit(a.stype, 0),
+        out_dtype,
+        [a.dim(0), b.dim(1)],
+        Optional[T](dest.copy()),
+    )
+
+
+# --- aten::bmm ----------------------------------------------------------------
+
+
+def _bmm_dims(b1: T, b2: T) raises -> List[Int]:
+    """common_checks_baddbmm_bmm (LinearAlgebra.cpp): the shapes."""
+    if b1.rank != 3:
+        raise Error("batch1 must be a 3D tensor")
+    if b2.rank != 3:
+        raise Error("batch2 must be a 3D tensor")
+    var bs = b1.dim(0)
+    var k = b1.dim(2)
+    if b2.dim(0) != bs or b2.dim(1) != k:
+        raise Error(
+            "Expected size for first two dimensions of batch2 tensor to be: [",
+            bs,
+            ", ",
+            k,
+            "] but got: [",
+            b2.dim(0),
+            ", ",
+            b2.dim(1),
+            "].",
+        )
+    return [bs, b1.dim(1), b2.dim(2)]
+
+
+def _bmm_same_dtype(b1: T, b2: T) raises:
+    """baddbmm_out_cuda_impl reads batch2 as batch1's scalar_t."""
+    if b1.stype != b2.stype:
+        raise Error(
+            "expected scalar type ",
+            _scalar_type_name(b1.dtype),
+            " but found ",
+            _scalar_type_name(b2.dtype),
+        )
+
+
+# aten::bmm(Tensor self, Tensor mat2) -> Tensor
+def op_bmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var dims = _bmm_dims(a, b)
+    _bmm_same_dtype(a, b)
+    _check_same_device([a.copy(), b.copy()])
+    _blas_out(
+        rets,
+        None,
+        a,
+        b,
+        _unit(a.stype, 1),
+        _unit(a.stype, 0),
+        a.stype,
+        dims,
+        None,
+    )
+
+
+# aten::bmm.out(Tensor self, Tensor mat2, *, Tensor(a!) out) -> Tensor(a!)
+def op_bmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var dest = v_tensor(args[unsafe_offset=2])
+    var dims = _bmm_dims(a, b)
+    _check_dest(dest, b.stype, b)  # common_checks: `batch2.options()`
+    _bmm_same_dtype(a, b)
+    _check_same_device([dest.copy(), a.copy(), b.copy()])
+    _blas_out(
+        rets,
+        None,
+        a,
+        b,
+        _unit(a.stype, 1),
+        _unit(a.stype, 0),
+        a.stype,
+        dims,
+        Optional[T](dest.copy()),
+    )
+
+
+def _bmm_dtype_checks(b1: T, b2: T, out_dtype: Int32) raises -> List[Int]:
+    """baddbmm_bmm_out_dtype_checks (cuda/Blas.cpp)."""
+    var dims = _bmm_dims(b1, b2)
+    if b1.stype != b2.stype:
+        raise Error("batch1 and batch2 must have the same dtype")
+    if not _float_out_dtype_ok(b1.stype, out_dtype):
+        raise Error(
+            "out_dtype must be the same as input dtype or fp32 for fp16/bf16"
+            " inputs"
+        )
+    return dims^
+
+
+# aten::bmm.dtype(Tensor self, Tensor mat2, ScalarType out_dtype) -> Tensor
+def op_bmm_dtype(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var out_dtype = v_dtype_or(args[unsafe_offset=2], a.stype)
+    var dims = _bmm_dtype_checks(a, b, out_dtype)
+    _check_same_device([a.copy(), b.copy()])
+    _blas_out(
+        rets,
+        None,
+        a,
+        b,
+        _unit(a.stype, 1),
+        _unit(a.stype, 0),
+        out_dtype,
+        dims,
+        None,
+    )
+
+
+# aten::bmm.dtype_out(Tensor self, Tensor mat2, ScalarType out_dtype, *,
+#                     Tensor(a!) out) -> Tensor(a!)
+def op_bmm_dtype_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var out_dtype = v_dtype_or(args[unsafe_offset=2], a.stype)
+    var dest = v_tensor(args[unsafe_offset=3])
+    var dims = _bmm_dtype_checks(a, b, out_dtype)
+    if dest.stype != out_dtype:
+        raise Error(
+            "out_dtype must be the same as the dtype of the provided out tensor"
+        )
+    _check_same_device([dest.copy(), a.copy(), b.copy()])
+    _blas_out(
+        rets,
+        None,
+        a,
+        b,
+        _unit(a.stype, 1),
+        _unit(a.stype, 0),
+        out_dtype,
+        dims,
+        Optional[T](dest.copy()),
+    )
+
+
+# --- aten::addmm / aten::_addmm_activation ------------------------------------
+
+
+def _addmm_meta(self: T, mat1: T, mat2: T, dtype_overload: Bool) raises:
+    """ADDMM_META (LinearAlgebra.cpp); the `.dtype` overloads instead let
+    self be the out dtype (checked by their caller)."""
+    if not dtype_overload and self.stype != mat2.stype:
+        raise Error(
+            "self and mat2 must have the same dtype, but got ",
+            _scalar_type_name(self.dtype),
+            " and ",
+            _scalar_type_name(mat2.dtype),
+        )
+    if mat1.rank != 2:
+        raise Error("mat1 must be a matrix, got ", mat1.rank, "-D tensor")
+    if mat2.rank != 2:
+        raise Error("mat2 must be a matrix, got ", mat2.rank, "-D tensor")
+    if mat1.dim(1) != mat2.dim(0):
+        raise Error(
+            "mat1 and mat2 shapes cannot be multiplied (",
+            _matrix_str(mat1),
+            " and ",
+            _matrix_str(mat2),
+            ")",
+        )
+    if mat1.stype != mat2.stype:
+        raise Error(
+            "mat1 and mat2 must have the same dtype, but got ",
+            _scalar_type_name(mat1.dtype),
+            " and ",
+            _scalar_type_name(mat2.dtype),
+        )
+
+
+def _addmm_run(
+    rets: Values,
+    self: T,
+    mat1: T,
+    mat2: T,
+    beta_v: Value,
+    alpha_v: Value,
+    out_stype: Int32,
+    dest: Optional[T],
+    activation: Int,
+) raises:
+    """addmm_out_cuda_impl after the meta checks: `self` broadcast to the
+    result (checked only when beta != 0: CUDA never reads it otherwise),
+    the k == 0 shortcut `beta * self` with beta in self's dtype, and the
+    bias-fused GEMM routes for the common unit-scaled call."""
+    var ts = List[T]()
+    if dest:
+        ts.append(dest.value().copy())
+    ts.append(self.copy())
+    ts.append(mat1.copy())
+    ts.append(mat2.copy())
+    _check_same_device(ts)
+    var m = mat1.dim(0)
+    var k = mat1.dim(1)
+    var n = mat2.dim(1)
+    var dims: List[Int] = [m, n]
+    if not _raw_zero(beta_v):
+        _check_expand(self, dims, "addmm")
+    var coefs = _coefs(alpha_v, beta_v, mat1.stype, self.stype, m * n, k)
+    var alpha = coefs[0]
+    var beta = coefs[1]
+    var act = activation
+    if k == 0:
+        # CUDA's k == 0 shortcut returns `beta * self` before the epilogue
+        # that would apply _addmm_activation's relu / gelu.
+        act = ACT_NONE
+    _dest_overlap(dest, dims)
+    # The unit-scaled call keeps the GEMM routes (a bias vector fused, any
+    # other self added after the tensor-core product: two roundings, the
+    # routes' long-standing speed). What they decline takes the cuBLAS-style
+    # epilogue below, which adds self in the compute type before the one
+    # rounding.
+    if (
+        alpha.one()
+        and beta.one()
+        and out_stype == mat1.stype
+        and self.stype == mat1.stype
+        and _is_float(mat1.dtype)
+        and m > 0
+        and n > 0
+        and k > 0
+    ):
+        var fused = _addmm_route(self, mat1, mat2)
+        if fused:
+            _hand_back(rets, dest, Res(fused.value().copy(), True), dims, act)
+            return
+    _blas_out(
+        rets,
+        Optional[T](self.copy()),
+        mat1,
+        mat2,
+        alpha,
+        beta,
+        out_stype,
+        dims,
+        dest,
+        act,
+    )
 
 
 # aten::addmm(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1,
 #             Scalar alpha=1) -> Tensor
 def op_addmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _addmm_unit_scaling(args[unsafe_offset=3], args[unsafe_offset=4])
-    var out = _addmm_route(
-        v_tensor(args[unsafe_offset=0]),
-        v_tensor(args[unsafe_offset=1]),
-        v_tensor(args[unsafe_offset=2]),
+    var self = v_tensor(args[unsafe_offset=0])
+    var mat1 = v_tensor(args[unsafe_offset=1])
+    var mat2 = v_tensor(args[unsafe_offset=2])
+    _addmm_meta(self, mat1, mat2, False)
+    _addmm_run(
+        rets,
+        self,
+        mat1,
+        mat2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        mat1.stype,
+        None,
+        ACT_NONE,
     )
-    if not out:
-        unsupported("aten::addmm with these operands")
-    ret_tensor(rets, 0, out.value())
 
 
 # aten::addmm.out(Tensor self, Tensor mat1, Tensor mat2, *, Scalar beta=1,
 #                 Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
 def op_addmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
     var mat1 = v_tensor(args[unsafe_offset=1])
+    var mat2 = v_tensor(args[unsafe_offset=2])
     var dest = v_tensor(args[unsafe_offset=5])
-    # ADDMM_META sets the output from `mat1.options()`, and the meta function
-    # runs before the kernel -- so the out= contract outranks the decline.
-    check_out(dest, mat1)
-    _addmm_unit_scaling(args[unsafe_offset=3], args[unsafe_offset=4])
-    var out = _addmm_route(
-        v_tensor(args[unsafe_offset=0]),
+    _addmm_meta(self, mat1, mat2, False)
+    # ADDMM_META sets the output from `mat1.options()`.
+    _check_dest(dest, mat1.stype, mat1)
+    _addmm_run(
+        rets,
+        self,
         mat1,
-        v_tensor(args[unsafe_offset=2]),
+        mat2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        mat1.stype,
+        Optional[T](dest.copy()),
+        ACT_NONE,
     )
-    if not out:
-        unsupported("aten::addmm.out with these operands")
-    _store_out(rets, dest, out.value().copy())
+
+
+# aten::addmm_(Tensor(a!) self, Tensor mat1, Tensor mat2, *, Scalar beta=1,
+#              Scalar alpha=1) -> Tensor(a!)
+def op_addmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var mat1 = v_tensor(args[unsafe_offset=1])
+    var mat2 = v_tensor(args[unsafe_offset=2])
+    _addmm_meta(self, mat1, mat2, False)
+    _check_inplace(self, [mat1.dim(0), mat2.dim(1)])
+    _addmm_run(
+        rets,
+        self,
+        mat1,
+        mat2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        mat1.stype,
+        Optional[T](self.copy()),
+        ACT_NONE,
+    )
+
+
+def _addmm_dtype_checks(self: T, mat1: T, mat2: T, out_dtype: Int32) raises:
+    """_addmm_dtype_out_cuda (cuda/Blas.cpp), less its `out` check."""
+    _addmm_meta(self, mat1, mat2, True)
+    if not _float_out_dtype_ok(mat1.stype, out_dtype):
+        raise Error(
+            "out_dtype must be the same as input dtype or fp32 for fp16/bf16"
+            " inputs"
+        )
+
+
+def _addmm_dtype_self(self: T, mat1: T, out_dtype: Int32) raises:
+    if self.stype != out_dtype and self.stype != mat1.stype:
+        raise Error("self dtype must match either out_dtype or mat1 dtype")
+
+
+# aten::addmm.dtype(Tensor self, Tensor mat1, Tensor mat2,
+#                   ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1)
+#                   -> Tensor
+def op_addmm_dtype(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var mat1 = v_tensor(args[unsafe_offset=1])
+    var mat2 = v_tensor(args[unsafe_offset=2])
+    var out_dtype = v_dtype_or(args[unsafe_offset=3], mat1.stype)
+    _addmm_dtype_checks(self, mat1, mat2, out_dtype)
+    _addmm_dtype_self(self, mat1, out_dtype)
+    _addmm_run(
+        rets,
+        self,
+        mat1,
+        mat2,
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        out_dtype,
+        None,
+        ACT_NONE,
+    )
+
+
+# aten::addmm.dtype_out(Tensor self, Tensor mat1, Tensor mat2,
+#                       ScalarType out_dtype, *, Scalar beta=1,
+#                       Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
+def op_addmm_dtype_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var mat1 = v_tensor(args[unsafe_offset=1])
+    var mat2 = v_tensor(args[unsafe_offset=2])
+    var out_dtype = v_dtype_or(args[unsafe_offset=3], mat1.stype)
+    var dest = v_tensor(args[unsafe_offset=6])
+    _addmm_dtype_checks(self, mat1, mat2, out_dtype)
+    if dest.stype != out_dtype:
+        raise Error(
+            "out_dtype must be the same as the dtype of the provided out tensor"
+        )
+    _addmm_dtype_self(self, mat1, out_dtype)
+    _addmm_run(
+        rets,
+        self,
+        mat1,
+        mat2,
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        out_dtype,
+        Optional[T](dest.copy()),
+        ACT_NONE,
+    )
+
+
+# aten::_addmm_activation(Tensor self, Tensor mat1, Tensor mat2, *,
+#                         Scalar beta=1, Scalar alpha=1, bool use_gelu=False)
+#                         -> Tensor
+def op_addmm_activation(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var mat1 = v_tensor(args[unsafe_offset=1])
+    var mat2 = v_tensor(args[unsafe_offset=2])
+    _addmm_meta(self, mat1, mat2, False)
+    _addmm_run(
+        rets,
+        self,
+        mat1,
+        mat2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        mat1.stype,
+        None,
+        ACT_GELU if v_bool(args[unsafe_offset=5]) else ACT_RELU,
+    )
+
+
+# aten::_addmm_activation.out(Tensor self, Tensor mat1, Tensor mat2, *,
+#                             Scalar beta=1, Scalar alpha=1,
+#                             bool use_gelu=False, Tensor(a!) out)
+#                             -> Tensor(a!)
+def op_addmm_activation_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var mat1 = v_tensor(args[unsafe_offset=1])
+    var mat2 = v_tensor(args[unsafe_offset=2])
+    var dest = v_tensor(args[unsafe_offset=6])
+    _addmm_meta(self, mat1, mat2, False)
+    _check_dest(dest, mat1.stype, mat1)
+    _addmm_run(
+        rets,
+        self,
+        mat1,
+        mat2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        mat1.stype,
+        Optional[T](dest.copy()),
+        ACT_GELU if v_bool(args[unsafe_offset=5]) else ACT_RELU,
+    )
+
+
+# --- aten::baddbmm ------------------------------------------------------------
+
+
+def _baddbmm_run(
+    rets: Values,
+    self: T,
+    b1: T,
+    b2: T,
+    beta_v: Value,
+    alpha_v: Value,
+    out_stype: Int32,
+    dims: List[Int],
+    dest: Optional[T],
+) raises:
+    """baddbmm_out_cuda_impl: alpha and beta as opmath (the k == 0 shortcut
+    multiplies by the unrounded beta, unlike addmm's)."""
+    _bmm_same_dtype(b1, b2)
+    var ts = List[T]()
+    if dest:
+        ts.append(dest.value().copy())
+    ts.append(self.copy())
+    ts.append(b1.copy())
+    ts.append(b2.copy())
+    _check_same_device(ts)
+    if dest and not _raw_zero(beta_v):
+        # the meta's `result.copy_(self)`
+        _self_partial_overlap(dest.value(), self, dims)
+    var zero = _unit(b1.stype, 0)
+    var alpha = zero
+    var beta = zero
+    var k = b1.dim(2)
+    if _prod(dims) > 0:
+        if k > 0:
+            alpha = _coef(alpha_v, b1.stype)
+            beta = _coef(beta_v, b1.stype)
+        elif not _raw_zero(beta_v):
+            beta = _mul_scalar(beta_v, b1.stype)
+    _blas_out(
+        rets,
+        Optional[T](self.copy()),
+        b1,
+        b2,
+        alpha,
+        beta,
+        out_stype,
+        dims,
+        dest,
+    )
+
+
+def _baddbmm_meta(self: T, b1: T, b2: T) raises -> List[Int]:
+    """TORCH_META_FUNC(baddbmm): self broadcasts to the result whatever
+    beta is, and must have batch1's dtype."""
+    if b1.rank == 3 and b2.rank == 3:
+        _check_expand(self, [b1.dim(0), b1.dim(1), b2.dim(2)], "baddbmm")
+    if self.stype != b1.stype:
+        raise Error(
+            "Input dtypes must be the same, got: input ",
+            dtype_name(self.stype),
+            ", batch1: ",
+            dtype_name(b1.stype),
+            ", batch2: ",
+            dtype_name(b2.stype),
+        )
+    return _bmm_dims(b1, b2)
+
+
+# aten::baddbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1,
+#               Scalar alpha=1) -> Tensor
+def op_baddbmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var b1 = v_tensor(args[unsafe_offset=1])
+    var b2 = v_tensor(args[unsafe_offset=2])
+    var dims = _baddbmm_meta(self, b1, b2)
+    _baddbmm_run(
+        rets,
+        self,
+        b1,
+        b2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        b2.stype,
+        dims,
+        None,
+    )
+
+
+# aten::baddbmm.out(Tensor self, Tensor batch1, Tensor batch2, *,
+#                   Scalar beta=1, Scalar alpha=1, Tensor(a!) out)
+#                   -> Tensor(a!)
+def op_baddbmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var b1 = v_tensor(args[unsafe_offset=1])
+    var b2 = v_tensor(args[unsafe_offset=2])
+    var dest = v_tensor(args[unsafe_offset=5])
+    var dims = _baddbmm_meta(self, b1, b2)
+    _check_dest(dest, b2.stype, b2)
+    _baddbmm_run(
+        rets,
+        self,
+        b1,
+        b2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        b2.stype,
+        dims,
+        Optional[T](dest.copy()),
+    )
+
+
+# aten::baddbmm_(Tensor(a!) self, Tensor batch1, Tensor batch2, *,
+#                Scalar beta=1, Scalar alpha=1) -> Tensor(a!)
+def op_baddbmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var b1 = v_tensor(args[unsafe_offset=1])
+    var b2 = v_tensor(args[unsafe_offset=2])
+    var dims = _baddbmm_meta(self, b1, b2)
+    if not _has_dims(self, dims):
+        raise Error(
+            "Expected an output tensor with shape ",
+            _dims_str(dims),
+            " but got shape ",
+            _dims_str(self.logical_shape()),
+        )
+    _baddbmm_run(
+        rets,
+        self,
+        b1,
+        b2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        b2.stype,
+        dims,
+        Optional[T](self.copy()),
+    )
+
+
+def _baddbmm_dtype_out_checks(
+    self: T, b1: T, b2: T, out_dtype: Int32, out_rank: Int, out_dims: List[Int]
+) raises -> List[Int]:
+    """baddbmm_bmm_out_dtype_checks with `out` as its self_baddbmm, then
+    `out.copy_(self)`: self broadcasts to the result whatever beta is."""
+    var dims = _bmm_dtype_checks(b1, b2, out_dtype)
+    if out_rank != 3:
+        raise Error("self must be a 3D tensor")
+    if out_dims != dims:
+        raise Error("self must have the same shape as the output")
+    _check_expand(self, dims, "copy_")
+    return dims^
+
+
+# aten::baddbmm.dtype(Tensor self, Tensor batch1, Tensor batch2,
+#                     ScalarType out_dtype, *, Scalar beta=1, Scalar alpha=1)
+#                     -> Tensor
+def op_baddbmm_dtype(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var b1 = v_tensor(args[unsafe_offset=1])
+    var b2 = v_tensor(args[unsafe_offset=2])
+    var out_dtype = v_dtype_or(args[unsafe_offset=3], b1.stype)
+    if self.stype != out_dtype and self.stype != b1.stype:
+        raise Error("self dtype must match either out_dtype or batch1 dtype")
+    var dims = _bmm_dims(b1, b2)
+    _ = _baddbmm_dtype_out_checks(self, b1, b2, out_dtype, 3, dims)
+    _baddbmm_run(
+        rets,
+        self,
+        b1,
+        b2,
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        out_dtype,
+        dims,
+        None,
+    )
+
+
+# aten::baddbmm.dtype_out(Tensor self, Tensor batch1, Tensor batch2,
+#                         ScalarType out_dtype, *, Scalar beta=1,
+#                         Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
+def op_baddbmm_dtype_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var b1 = v_tensor(args[unsafe_offset=1])
+    var b2 = v_tensor(args[unsafe_offset=2])
+    var out_dtype = v_dtype_or(args[unsafe_offset=3], b1.stype)
+    var dest = v_tensor(args[unsafe_offset=6])
+    var dims = _baddbmm_dtype_out_checks(
+        self, b1, b2, out_dtype, dest.rank, dest.logical_shape()
+    )
+    if dest.stype != out_dtype:
+        raise Error(
+            "out_dtype must be the same as the dtype of the provided out tensor"
+        )
+    _baddbmm_run(
+        rets,
+        self,
+        b1,
+        b2,
+        args[unsafe_offset=4],
+        args[unsafe_offset=5],
+        out_dtype,
+        dims,
+        Optional[T](dest.copy()),
+    )
+
+
+# --- aten::addbmm -------------------------------------------------------------
+
+
+def _addbmm_checks(self: T, b1: T, b2: T, result_st: Int32) raises -> List[Int]:
+    """addbmm_impl_ (LinearAlgebra.cpp) and the addmm_ it runs per batch
+    into `result` (self's dtype for the functional form, the caller's `out`
+    otherwise): only a batch's addmm_ compares dtypes, so an empty batch
+    list takes any, and self is merely copied (cast) into the result."""
+    if b1.rank != 3:
+        raise Error("batch1 must be a 3D tensor")
+    if b2.rank != 3:
+        raise Error("batch2 must be a 3D tensor")
+    if b1.dim(0) != b2.dim(0):
+        raise Error(
+            "batch1 and batch2 must have same number of batches, got ",
+            b1.dim(0),
+            " and ",
+            b2.dim(0),
+        )
+    if b1.dim(2) != b2.dim(1):
+        raise Error(
+            "Incompatible matrix sizes for bmm (",
+            b1.dim(1),
+            "x",
+            b1.dim(2),
+            " and ",
+            b2.dim(1),
+            "x",
+            b2.dim(2),
+            ")",
+        )
+    var dims: List[Int] = [b1.dim(1), b2.dim(2)]
+    _check_expand(self, dims, "addbmm_out")
+    if b1.dim(0) == 0:
+        return dims^
+    if result_st != b2.stype:
+        raise Error(
+            "self and mat2 must have the same dtype, but got ",
+            _scalar_type_name(max_dtype(result_st)),
+            " and ",
+            _scalar_type_name(b2.dtype),
+        )
+    if b1.stype != b2.stype:
+        raise Error(
+            "mat1 and mat2 must have the same dtype, but got ",
+            _scalar_type_name(b1.dtype),
+            " and ",
+            _scalar_type_name(b2.dtype),
+        )
+    return dims^
+
+
+def _batch_matrix(t: T, i: Int) raises -> T:
+    """`t[i]` of a rank-3 tensor: a rank-2 view (an owned handle)."""
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 2] = t.dim(1)
+    shape[MAX_RANK - 1] = t.dim(2)
+    var strides = IndexList[MAX_RANK](0)
+    strides[MAX_RANK - 2] = t.stride(1)
+    strides[MAX_RANK - 1] = t.stride(2)
+    return view_strided(t, shape, strides, 2, t.offset + i * t.stride(0))
+
+
+def _addbmm_run(
+    rets: Values,
+    self: T,
+    b1: T,
+    b2: T,
+    beta_v: Value,
+    alpha_v: Value,
+    dims: List[Int],
+    dest: Optional[T],
+) raises:
+    """addbmm_impl_ (LinearAlgebra.cpp, CUDA's too): one addmm_ per batch
+    into the result, beta on the first and 1 after, so a float result is
+    rounded once per batch exactly where torch rounds it. Integer sums are
+    exact in any order: one GEMM over the batches laid side by side along
+    k, `[m, B*k] @ [B*k, n]` -- as is the batch-free `beta * self`."""
+    var ts = List[T]()
+    if dest:
+        ts.append(dest.value().copy())
+    ts.append(self.copy())
+    ts.append(b1.copy())
+    ts.append(b2.copy())
+    _check_same_device(ts)
+    var nb = b1.dim(0)
+    var m = b1.dim(1)
+    var k = b1.dim(2)
+    var n = b2.dim(2)
+    _dest_overlap(dest, dims)
+    if dest and not _raw_zero(beta_v):
+        # addbmm_impl_'s `result.copy_(self)` (skipped when they are one).
+        _self_partial_overlap(dest.value(), self, dims)
+    # `result.copy_(self)`: self cast into the result's dtype first.
+    var rst = dest.value().stype if dest else self.stype
+    var cast_self = own_if_new(cast_to(self, rst), self)
+    var addend = Optional[T](cast_self.t.copy())
+    var alpha = _unit(rst, 0)
+    var beta = alpha
+    if nb == 0:
+        if m * n > 0 and not _raw_zero(beta_v):
+            beta = _mul_scalar(beta_v, rst)
+    else:
+        # The first batch's addmm_ (its k == 0 shortcut included).
+        var coefs = _coefs(alpha_v, beta_v, b1.stype, rst, m * n, k)
+        alpha = coefs[0]
+        beta = coefs[1]
+    if nb > 0 and not is_int_stype(b1.stype):
+        var a0 = own(_batch_matrix(b1, 0))
+        var c0 = own(_batch_matrix(b2, 0))
+        var first = _blas(
+            addend,
+            a0.t,
+            c0.t,
+            alpha,
+            beta,
+            b1.stype,
+            dims,
+            None,
+        )
+        _ = a0^
+        _ = c0^
+        var acc = own(first.t.copy())
+        if k > 0:
+            for i in range(1, nb):
+                var ai = own(_batch_matrix(b1, i))
+                var ci = own(_batch_matrix(b2, i))
+                _ = _blas(
+                    Optional[T](acc.t.copy()),
+                    ai.t,
+                    ci.t,
+                    alpha,
+                    _unit(b1.stype, 1),
+                    b1.stype,
+                    dims,
+                    Optional[T](acc.t.copy()),
+                )
+                _ = ai^
+                _ = ci^
+        _hand_back(rets, dest, Res(acc.take(), True), dims, ACT_NONE)
+        _ = cast_self^
+        return
+    # batch1 as [m, B, k] (a permuted view), made dense, then [m, B*k].
+    var pshape = IndexList[MAX_RANK](1)
+    pshape[MAX_RANK - 3] = m
+    pshape[MAX_RANK - 2] = nb
+    pshape[MAX_RANK - 1] = k
+    var pstrides = IndexList[MAX_RANK](0)
+    pstrides[MAX_RANK - 3] = b1.stride(1)
+    pstrides[MAX_RANK - 2] = b1.stride(0)
+    pstrides[MAX_RANK - 1] = b1.stride(2)
+    var perm = own(view_strided(b1, pshape, pstrides, 3, b1.offset))
+    var a_dense = own_if_new(contiguous(perm.t), perm.t)
+    var a2 = own(_view(a_dense.t, [m, nb * k]))
+    var b_dense = own_if_new(contiguous(b2), b2)
+    var b2v = own(_view(b_dense.t, [nb * k, n]))
+    _blas_out(
+        rets,
+        addend,
+        a2.t,
+        b2v.t,
+        alpha,
+        beta,
+        rst,
+        dims,
+        dest,
+    )
+    _ = a2^
+    _ = b2v^
+    _ = a_dense^
+    _ = b_dense^
+    _ = perm^
+    _ = cast_self^
+
+
+# aten::addbmm(Tensor self, Tensor batch1, Tensor batch2, *, Scalar beta=1,
+#              Scalar alpha=1) -> Tensor
+def op_addbmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var b1 = v_tensor(args[unsafe_offset=1])
+    var b2 = v_tensor(args[unsafe_offset=2])
+    var dims = _addbmm_checks(self, b1, b2, self.stype)
+    _addbmm_run(
+        rets,
+        self,
+        b1,
+        b2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        dims,
+        None,
+    )
+
+
+# aten::addbmm.out(Tensor self, Tensor batch1, Tensor batch2, *,
+#                  Scalar beta=1, Scalar alpha=1, Tensor(a!) out)
+#                  -> Tensor(a!)
+def op_addbmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var b1 = v_tensor(args[unsafe_offset=1])
+    var b2 = v_tensor(args[unsafe_offset=2])
+    var dest = v_tensor(args[unsafe_offset=5])
+    var dims = _addbmm_checks(self, b1, b2, dest.stype)
+    _addbmm_run(
+        rets,
+        self,
+        b1,
+        b2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        dims,
+        Optional[T](dest.copy()),
+    )
+
+
+# aten::addbmm_(Tensor(a!) self, Tensor batch1, Tensor batch2, *,
+#               Scalar beta=1, Scalar alpha=1) -> Tensor(a!)
+def op_addbmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var b1 = v_tensor(args[unsafe_offset=1])
+    var b2 = v_tensor(args[unsafe_offset=2])
+    # Composite in ATen (`addbmm_out(self, ..., self)`): a broadcastable
+    # self is computed fresh, then resized to the result and written; a
+    # self already of the result's shape is accumulated in place.
+    var dims = _addbmm_checks(self, b1, b2, self.stype)
+    _addbmm_run(
+        rets,
+        self,
+        b1,
+        b2,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        dims,
+        Optional[T](self.copy()),
+    )
+
+
+# --- aten::addmv --------------------------------------------------------------
+
+
+def _addmv_meta(self: T, mat: T, vec: T) raises:
+    """TORCH_META_FUNC(addmv) (Blas.cpp)."""
+    if not (mat.rank == 2 and vec.rank == 1 and self.rank <= 1):
+        raise Error(
+            "vector + matrix @ vector expected, got ",
+            self.rank,
+            ", ",
+            mat.rank,
+            ", ",
+            vec.rank,
+        )
+    if mat.dim(1) != vec.dim(0) or (
+        mat.dim(0) != self.numel and self.numel != 1
+    ):
+        raise Error(
+            "size mismatch, got input (",
+            self.dim(0) if self.rank == 1 else self.numel,
+            "), mat (",
+            _matrix_str(mat),
+            "), vec (",
+            vec.dim(0),
+            ")",
+        )
+    if self.stype != mat.stype or mat.stype != vec.stype:
+        raise Error(
+            "addmv input tensors must have the same dtype, but got ",
+            _scalar_type_name(self.dtype),
+            ", ",
+            _scalar_type_name(mat.dtype),
+            ", and ",
+            _scalar_type_name(vec.dtype),
+        )
+
+
+def _addmv_run(
+    rets: Values,
+    self: T,
+    mat: T,
+    vec: T,
+    beta_v: Value,
+    alpha_v: Value,
+    dest: Optional[T],
+) raises:
+    """addmv_out_cuda: `mat @ vec` as the GEMM `[m, k] @ [k, 1]` (vec's
+    own strides, viewed), alpha and beta in scalar_t like its gemv."""
+    var ts = List[T]()
+    if dest:
+        ts.append(dest.value().copy())
+    ts.append(self.copy())
+    ts.append(mat.copy())
+    ts.append(vec.copy())
+    _check_same_device(ts)
+    var k = vec.dim(0)
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 2] = k
+    var strides = IndexList[MAX_RANK](0)
+    strides[MAX_RANK - 2] = vec.stride(0)
+    strides[MAX_RANK - 1] = 1
+    var col = own(view_strided(vec, shape, strides, 2, vec.offset))
+    var beta_zero = _raw_zero(beta_v)
+    if dest and not beta_zero:
+        # `copy_(result, self_)` / `mul_out(result, self, beta)` assert the
+        # self being read does not partially overlap the result.
+        _self_partial_overlap(dest.value(), self, [mat.dim(0)])
+    if mat.numel == 0 and not beta_zero:
+        # addmv_out_cuda's empty-matrix shortcut: `mul_out(result, self,
+        # scalar_tensor(beta, self.scalar_type()))` -- the result takes
+        # self's own (unexpanded) shape.
+        var coefs0 = _coefs(alpha_v, beta_v, mat.stype, self.stype, 1, 0)
+        var sdims = self.logical_shape()
+        _dest_overlap(dest, sdims)
+        var none = _none_side()
+        var compute = self.stype
+        if is_float_stype(compute) and compute != ST_FLOAT64:
+            compute = ST_FLOAT32
+        var res = _pw_run(
+            "blas_scale",
+            1,
+            _b_tside(self),
+            none,
+            none.copy(),
+            compute,
+            self.stype,
+            _p(coefs0[1].param()),
+            None,
+        )
+        _hand_back(rets, dest, res^, sdims, ACT_NONE)
+        _ = col^
+        return
+    var coefs = _coefs(
+        alpha_v, beta_v, mat.stype, self.stype, mat.dim(0), mat.numel, True
+    )
+    _blas_out(
+        rets,
+        Optional[T](self.copy()),
+        mat,
+        col.t,
+        coefs[0],
+        coefs[1],
+        vec.stype,
+        [mat.dim(0)],
+        dest,
+        gemv=True,
+    )
+    _ = col^
+
+
+# aten::addmv(Tensor self, Tensor mat, Tensor vec, *, Scalar beta=1,
+#             Scalar alpha=1) -> Tensor
+def op_addmv(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var mat = v_tensor(args[unsafe_offset=1])
+    var vec = v_tensor(args[unsafe_offset=2])
+    _addmv_meta(self, mat, vec)
+    _addmv_run(
+        rets,
+        self,
+        mat,
+        vec,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        None,
+    )
+
+
+# aten::addmv.out(Tensor self, Tensor mat, Tensor vec, *, Scalar beta=1,
+#                 Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
+def op_addmv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var mat = v_tensor(args[unsafe_offset=1])
+    var vec = v_tensor(args[unsafe_offset=2])
+    var dest = v_tensor(args[unsafe_offset=5])
+    _addmv_meta(self, mat, vec)
+    _check_dest(dest, vec.stype, vec)  # the meta's `vec.options()`
+    _addmv_run(
+        rets,
+        self,
+        mat,
+        vec,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        Optional[T](dest.copy()),
+    )
+
+
+# aten::addmv_(Tensor(a!) self, Tensor mat, Tensor vec, *, Scalar beta=1,
+#              Scalar alpha=1) -> Tensor(a!)
+def op_addmv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    var mat = v_tensor(args[unsafe_offset=1])
+    var vec = v_tensor(args[unsafe_offset=2])
+    _addmv_meta(self, mat, vec)
+    _check_inplace(self, [mat.dim(0)])
+    _addmv_run(
+        rets,
+        self,
+        mat,
+        vec,
+        args[unsafe_offset=3],
+        args[unsafe_offset=4],
+        Optional[T](self.copy()),
+    )
+
+
+# --- aten::_int_mm / aten::_weight_int8pack_mm --------------------------------
+
+
+def _expect_dtype(t: T, stype: Int32) raises:
+    """`Tensor::data_ptr<scalar_t>()`'s check."""
+    if t.stype != stype:
+        raise Error(
+            "expected scalar type ",
+            _scalar_type_name(max_dtype(stype)),
+            " but found ",
+            _scalar_type_name(t.dtype),
+        )
+
+
+def _int_mm_checks(a: T, b: T) raises:
+    """_int_mm_out_cuda (cuda/Blas.cpp): cuBLASLt's int8 GEMM limits."""
+    if a.rank != 2:
+        raise Error("Expected self to be of dimension 2 but got ", a.rank)
+    if b.rank != 2:
+        raise Error("Expected mat2 to be of dimension 2 but got ", b.rank)
+    if a.dim(0) <= 16:
+        raise Error(
+            "self.size(0) needs to be greater than 16, but got ", a.dim(0)
+        )
+    if a.dim(1) <= 0 or a.dim(1) % 8 != 0:
+        raise Error(
+            (
+                "self.size(1) needs to be greater than 0 and a multiple of 8,"
+                " but got "
+            ),
+            a.dim(1),
+        )
+    if a.dim(1) != b.dim(0):
+        raise Error(
+            "self.size(1) needs to match mat2.size(0) but got ",
+            a.dim(1),
+            " and ",
+            b.dim(0),
+        )
+    if b.dim(1) <= 0 or b.dim(1) % 8 != 0:
+        raise Error(
+            (
+                "mat2.size(1) needs to be greater than 0 and a multiple of 8,"
+                " but got "
+            ),
+            b.dim(1),
+        )
+    _expect_dtype(a, ST_INT8)
+    _expect_dtype(b, ST_INT8)
+
+
+# aten::_int_mm(Tensor self, Tensor mat2) -> Tensor
+def op_int_mm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    _int_mm_checks(a, b)
+    _check_same_device([a.copy(), b.copy()])
+    var out = own(_int_product(a, b, ST_INT32))
+    ret_owned(rets, 0, out)
+
+
+# aten::_int_mm.out(Tensor self, Tensor mat2, *, Tensor(a!) out)
+#                   -> Tensor(a!)
+def op_int_mm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var dest = v_tensor(args[unsafe_offset=2])
+    _int_mm_checks(a, b)
+    if dest.stype != ST_INT32:
+        raise Error(
+            "Expected result dtype to be of type kInt but got ",
+            dtype_name(dest.stype),
+        )
+    if dest.rank != 2:
+        raise Error("Expected result to be of dimension 2 but got ", dest.rank)
+    if dest.dim(0) != a.dim(0):
+        raise Error(
+            "Expected result.size(0) to be ",
+            a.dim(0),
+            " but got ",
+            dest.dim(0),
+        )
+    if dest.dim(1) != b.dim(1):
+        raise Error(
+            "Expected result.size(1) to be ",
+            b.dim(1),
+            " but got ",
+            dest.dim(1),
+        )
+    if not dest.contig:
+        raise Error("Expected result to be contiguous.")
+    _check_same_device([dest.copy(), a.copy(), b.copy()])
+    var out = own(_int_product(a, b, ST_INT32))
+    copy_strided_into(dest, out.t)
+    _ = out^
+    ret_ref(rets, 0, dest)
+
+
+# aten::_weight_int8pack_mm(Tensor self, Tensor mat2, Tensor scales)
+#                           -> Tensor
+def op_weight_int8pack_mm(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """_weight_int8pack_mm_cuda (cuda/int8mm.cu): `x @ w.T` in float32 --
+    x and the int8 weight widened exactly, a strict-fp32 dot per output --
+    times the float32 per-row scale, then cast to x's dtype."""
+    var x = v_tensor(args[unsafe_offset=0])
+    var w = v_tensor(args[unsafe_offset=1])
+    var scales = v_tensor(args[unsafe_offset=2])
+    if x.rank != 2:
+        raise Error("x must be 2D")
+    if w.rank != 2:
+        raise Error("w must be 2D")
+    if scales.rank != 1:
+        raise Error("scale must be 1D")
+    if x.dim(1) != w.dim(1):
+        raise Error("K dimension mismatch: x.size(1) != w.size(1)")
+    if w.dim(0) != scales.dim(0):
+        raise Error("Output dim mismatch: w.size(0) != scale.size(0)")
+    if not is_float_stype(x.stype):
+        raise Error("expected x to be f32/f16/bf16, got ", dtype_name(x.stype))
+    _expect_dtype(w, ST_INT8)
+    if not is_float_stype(scales.stype):
+        raise Error(
+            "expected scales to be floating point, got ",
+            dtype_name(scales.stype),
+        )
+    _check_same_device([x.copy(), w.copy(), scales.copy()])
+    var m = x.dim(0)
+    var n = w.dim(0)
+    var k = x.dim(1)
+    if m == 0 or n == 0:
+        var r = own(_zeros([m, n], x.stype, x.device))
+        ret_owned(rets, 0, r)
+        return
+    var x32 = own_if_new(cast_to(x, ST_FLOAT32), x)
+    var none = _none_side()
+    var w32 = own(
+        _pw_run(
+            "widen",
+            1,
+            _b_tside(w),
+            none,
+            none.copy(),
+            ST_INT8,
+            ST_FLOAT32,
+            _p(),
+            None,
+        ).t.copy()
+    )
+    # k == 0: a zero accumulator, still scaled (a NaN / inf scale gives NaN).
+    var p: Optional[T]
+    if k == 0:
+        p = Optional[T](_zeros([m, n], ST_FLOAT32, x.device))
+    else:
+        p = _spec_matmul("MatmulSpec", x32.t, w32.t, None, 1)
+    _ = x32^
+    _ = w32^
+    if not p:
+        unsupported("aten::_weight_int8pack_mm on this device")
+    var prod = own(p.value().copy())
+    var res = _pw_run(
+        "masked_scale",
+        2,
+        _b_tside(prod.t),
+        _b_tside(scales),
+        none,
+        ST_FLOAT32,
+        x.stype,
+        _p(1.0),
+        None,
+    )
+    _ = prod^
+    ret_tensor(rets, 0, res.t)
+
+
+# --- aten::_convert_weight_to_int4pack / aten::_weight_int4pack_mm ------------
+#
+# The packed weight is opaque: only _weight_int4pack_mm reads it. Its layout
+# here is this backend's own -- the `[n, k / 2]` uint8 input's bytes as they
+# are (two int4 values per byte, the even k in the high nibble), rows padded
+# with zeros to a multiple of 8 -- stored in the int32 tensor of the shape
+# torch's meta function gives every device, `[ceil(n / 8), k / (innerKTiles
+# * 16), 32, innerKTiles / 2]`, so torch.compile's fake tensors agree. The
+# matmul dequantizes the weight as tinygemm does (cuda/int4mm.cu: `(q - 8) *
+# scale + zero` per group, rounded once to the activation dtype) and runs
+# the GEMM routes on it.
+
+
+def _torch_check(ok: Bool, cond: StaticString) raises:
+    """A bare TORCH_CHECK(cond)'s message."""
+    if not ok:
+        raise Error(
+            "Expected ",
+            cond,
+            (
+                " to be true, but got false.  (Could this error message be"
+                " improved?  If so, please report an enhancement request to"
+                " PyTorch.)"
+            ),
+        )
+
+
+def _as_bytes(t: T) raises -> T:
+    """`t.view(torch.uint8)` of a contiguous tensor, flattened to 1-D (an
+    owned handle)."""
+    var r = call_op(
+        "aten::view",
+        "dtype",
+        [tensor_arg(t), Value(TAG_DTYPE, 0, Int64(ST_UINT8), 0)],
+        1,
+    )
+    var bytes = own(r.take_tensor(0))
+    var flat = _view(bytes.t, [bytes.t.numel])
+    _ = bytes^
+    return flat^
+
+
+# aten::_convert_weight_to_int4pack(Tensor self, int innerKTiles) -> Tensor
+def op_convert_weight_to_int4pack(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var w = v_tensor(args[unsafe_offset=0])
+    var inner_k_tiles = v_int(args[unsafe_offset=1])
+    _torch_check(w.rank == 2, "in.dim() == 2")
+    _torch_check(w.stype == ST_UINT8, "in.dtype() == at::kByte")
+    _torch_check(w.contig, "in.is_contiguous()")
+    _torch_check(
+        inner_k_tiles == 2 or inner_k_tiles == 4 or inner_k_tiles == 8,
+        "innerKTiles == 2 || innerKTiles == 4 || innerKTiles == 8",
+    )
+    var n = w.dim(0)
+    var half_k = w.dim(1)
+    _torch_check(
+        (half_k * 2) % (inner_k_tiles * 16) == 0,
+        "isEvenDivisor(in.size(1) * 2, innerKTiles * kKTileSize)",
+    )
+    if not w.on_mojo():
+        unsupported("_convert_weight_to_int4pack of a tensor off the device")
+    var n_tiles = (n + 7) // 8
+    var out = own(
+        _zeros(
+            [
+                n_tiles,
+                half_k * 2 // (inner_k_tiles * 16),
+                32,
+                inner_k_tiles // 2,
+            ],
+            ST_INT32,
+            w.device,
+        )
+    )
+    if n > 0 and half_k > 0:
+        var bytes = own(_as_bytes(out.t))
+        var rows = own(_view(bytes.t, [n_tiles * 8, half_k]))
+        var dst = own(
+            view_strided(rows.t, w.shape, w.strides, 2, rows.t.offset)
+        )
+        copy_strided_into(dst.t, w)
+        _ = dst^
+        _ = rows^
+        _ = bytes^
+    ret_owned(rets, 0, out)
+
+
+# aten::_weight_int4pack_mm(Tensor self, Tensor mat2, int qGroupSize,
+#                           Tensor qScaleAndZeros) -> Tensor
+def op_weight_int4pack_mm(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var x = v_tensor(args[unsafe_offset=0])
+    var packed = v_tensor(args[unsafe_offset=1])
+    var group = v_int(args[unsafe_offset=2])
+    var qsz = v_tensor(args[unsafe_offset=3])
+    _check_same_device([x.copy(), packed.copy(), qsz.copy()])
+    _torch_check(packed.rank == 4, "B.dim() == 4")
+    var inner_k_tiles = packed.dim(3) * 2
+    _torch_check(
+        inner_k_tiles == 2 or inner_k_tiles == 4 or inner_k_tiles == 8,
+        "B_innerKTiles == 2 || B_innerKTiles == 4 || B_innerKTiles == 8",
+    )
+    if not is_float_stype(x.stype) or x.stype == ST_FLOAT64:
+        raise Error("expected x to be f32/f16/bf16, got ", dtype_name(x.stype))
+    _torch_check(x.rank == 2, "A.dim() == 2")
+    _torch_check(packed.stype == ST_INT32, "B.dtype() == at::kInt")
+    _torch_check(packed.contig, "B.is_contiguous()")
+    var m = x.dim(0)
+    var k = x.dim(1)
+    var n = packed.dim(0) * 8
+    _torch_check(
+        packed.dim(1) * inner_k_tiles * 16 == k,
+        "B.size(1) == k / (B_innerKTiles * kKTileSize)",
+    )
+    _torch_check(packed.dim(2) == 32, "B.size(2) == 32")
+    _torch_check(
+        group == 32 or group == 64 or group == 128 or group == 256,
+        (
+            "qGroupSize == 32 || qGroupSize == 64 || qGroupSize == 128 ||"
+            " qGroupSize == 256"
+        ),
+    )
+    _torch_check(qsz.rank == 3, "qScaleAndZeros.dim() == 3")
+    _torch_check(
+        k >= group and k % group == 0,
+        (
+            "kTiles * kKTileSize >= qGroupSize && isEvenDivisor(kTiles *"
+            " kKTileSize, qGroupSize)"
+        ),
+    )
+    _torch_check(
+        qsz.dim(0) == k // group, "qScaleAndZeros.size(0) == k / qGroupSize"
+    )
+    _torch_check(qsz.dim(1) == n, "qScaleAndZeros.size(1) == n")
+    _torch_check(qsz.dim(2) == 2, "qScaleAndZeros.size(2) == 2")
+    if qsz.stype != x.stype:
+        raise Error(
+            "expected qScaleAndZeros to have dtype ",
+            dtype_name(x.stype),
+            ", got ",
+            dtype_name(qsz.stype),
+        )
+    if m == 0 or n == 0 or k == 0:
+        var r = own(_zeros([m, n], x.stype, x.device))
+        ret_owned(rets, 0, r)
+        return
+    var groups = k // group
+    # The packed bytes, each read twice: [n, k / 2, 2] with a zero stride.
+    var bytes = own(_as_bytes(packed))
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 3] = n
+    shape[MAX_RANK - 2] = k // 2
+    shape[MAX_RANK - 1] = 2
+    var strides = IndexList[MAX_RANK](0)
+    strides[MAX_RANK - 3] = k // 2
+    strides[MAX_RANK - 2] = 1
+    var twice = own(view_strided(bytes.t, shape, strides, 3, bytes.t.offset))
+    var parity = own(_zeros([2], ST_UINT8, x.device))  # [0, 1]
+    var odd = own(_view(parity.t, [1]))
+    var odd_one = own(
+        view_strided(
+            parity.t, odd.t.shape, odd.t.strides, 1, parity.t.offset + 1
+        )
+    )
+    fill_value(odd_one.t, 1.0)
+    _ = odd_one^
+    _ = odd^
+    var none = _none_side()
+    var q = own(
+        _pw_run(
+            "int4_nibble",
+            2,
+            _b_tside(twice.t),
+            _b_tside(parity.t),
+            none,
+            ST_UINT8,
+            ST_UINT8,
+            _p(),
+            None,
+        ).t.copy()
+    )
+    _ = twice^
+    _ = bytes^
+    _ = parity^
+    var qg = own(_view(q.t, [n, groups, group]))
+    # scale / zero of (row, group) at qScaleAndZeros[group, row, 0 / 1].
+    var gshape = IndexList[MAX_RANK](1)
+    gshape[MAX_RANK - 3] = n
+    gshape[MAX_RANK - 2] = groups
+    gshape[MAX_RANK - 1] = group
+    var gstrides = IndexList[MAX_RANK](0)
+    gstrides[MAX_RANK - 3] = qsz.stride(1)
+    gstrides[MAX_RANK - 2] = qsz.stride(0)
+    var scale = own(view_strided(qsz, gshape, gstrides, 3, qsz.offset))
+    var zero = own(
+        view_strided(qsz, gshape, gstrides, 3, qsz.offset + qsz.stride(2))
+    )
+    var w = own(
+        _pw_run(
+            "int4_dequant",
+            3,
+            _b_tside(qg.t),
+            _b_tside(scale.t),
+            _b_tside(zero.t),
+            ST_FLOAT32,
+            x.stype,
+            _p(),
+            None,
+        ).t.copy()
+    )
+    _ = qg^
+    _ = q^
+    _ = scale^
+    _ = zero^
+    # x @ w.T: the transposed view of the dequantized [n, k] weight.
+    var wshape = IndexList[MAX_RANK](1)
+    wshape[MAX_RANK - 2] = k
+    wshape[MAX_RANK - 1] = n
+    var wstrides = IndexList[MAX_RANK](0)
+    wstrides[MAX_RANK - 2] = 1
+    wstrides[MAX_RANK - 1] = k
+    var wt = own(view_strided(w.t, wshape, wstrides, 2, w.t.offset))
+    var out = own(_product(x, wt.t, x.stype))
+    _ = wt^
+    _ = w^
+    ret_owned(rets, 0, out)
 
 
 # --- aten::linear -------------------------------------------------------------
@@ -1393,17 +3436,157 @@ def _linear_vector(a: T, w: T, bias: Optional[T]) raises -> Optional[T]:
 
 # aten::linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
 def op_linear(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """ATen's `linear` (Linear.cpp), branch for branch: a 2-D input with a
+    bias is `addmm(bias, input, weight.t())`; a bias that is a contiguous
+    vector (after squeezing) over a contiguous input is the same addmm on
+    the flattened input; everything else is `matmul(input, weight.t())`
+    followed by `output.add_(bias)`. The bias-fused GEMM routes serve the
+    addmm branches whose bias is a vector, and the bias-free product."""
     var a = v_tensor(args[unsafe_offset=0])
     var w = v_tensor(args[unsafe_offset=1])
     var bias = _opt_tensor_arg(args[unsafe_offset=2])
-    var out = _linear_route(a, w, bias)
-    if out:
-        ret_tensor(rets, 0, out.value())
-        return
-    var vec = _linear_vector(a, w, bias)
-    if not vec:
-        unsupported("aten::linear with these operands")
-    ret_tensor(rets, 0, vec.value())
+    if a.rank == 0 or w.rank == 0:
+        raise Error(
+            "both arguments to linear need to be at least 1D, but they are ",
+            a.rank,
+            "D and ",
+            w.rank,
+            "D",
+        )
+    var addmm_branch = False
+    if bias:
+        var b = bias.value().copy()
+        var squeezed = 0
+        for i in range(b.rank):
+            if b.dim(i) != 1:
+                squeezed += 1
+        var fusable = (b.rank == 1 or squeezed == 1) and b.contig
+        addmm_branch = a.rank == 2 or (fusable and a.contig)
+    # The GEMM routes (bias-free, a fused bias vector, or the tensor-core
+    # product plus a same-dtype broadcast add, as they always ran) serve any
+    # bias they can add without promoting or enlarging the output; what they
+    # decline takes the ATen-shaped branches below.
+    var fast = not bias
+    if bias:
+        var b = bias.value().copy()
+        fast = b.stype == a.stype and b.rank <= a.rank
+        if fast and w.rank == 2:
+            for i in range(b.rank):
+                var od = a.rank - b.rank + i
+                var want = w.dim(0) if od == a.rank - 1 else a.dim(od)
+                if b.dim(i) != 1 and b.dim(i) != want:
+                    fast = False
+    if fast:
+        var out = _linear_route(a, w, bias)
+        if out:
+            ret_tensor(rets, 0, out.value())
+            return
+        var vec = _linear_vector(a, w, bias)
+        if vec:
+            ret_tensor(rets, 0, vec.value())
+            return
+    _linear_general(rets, a, w, bias, addmm_branch)
+
+
+def _linear_general(
+    rets: Values, a: T, w: T, bias: Optional[T], addmm_branch: Bool
+) raises:
+    """The branches the fused routes decline, through the BLAS family's
+    GEMM + epilogue on the input flattened to `[rows, k]`, viewed back."""
+    if w.rank != 2:
+        unsupported("aten::linear with a weight of rank " + String(w.rank))
+    var k = a.dim(a.rank - 1)
+    var n = w.dim(0)
+    var lead = _leading_dims(a)
+    var rows = _prod(lead)
+    if w.dim(1) != k:
+        raise Error(
+            "mat1 and mat2 shapes cannot be multiplied (",
+            rows,
+            "x",
+            k,
+            " and ",
+            w.dim(1),
+            "x",
+            n,
+            ")",
+        )
+    if a.stype != w.stype:
+        raise Error(
+            "mat1 and mat2 must have the same dtype, but got ",
+            _scalar_type_name(a.dtype),
+            " and ",
+            _scalar_type_name(w.dtype),
+        )
+    var ts: List[T] = [a.copy(), w.copy()]
+    var dims: List[Int] = [rows, n]
+    var addend = Optional[T]()
+    if addmm_branch:
+        # addmm's ADDMM_META and expand_size, on the flattened input
+        var b = bias.value().copy()
+        if b.stype != w.stype:
+            raise Error(
+                "self and mat2 must have the same dtype, but got ",
+                _scalar_type_name(b.dtype),
+                " and ",
+                _scalar_type_name(w.dtype),
+            )
+        _check_expand(b, dims, "addmm")
+        ts.append(b.copy())
+        addend = b^
+    _check_same_device(ts)
+    var dense = own_if_new(contiguous(a), a)
+    var a2 = own(_view(dense.t, [rows, k]))
+    var wshape = IndexList[MAX_RANK](1)
+    wshape[MAX_RANK - 2] = k
+    wshape[MAX_RANK - 1] = n
+    var wstrides = IndexList[MAX_RANK](0)
+    wstrides[MAX_RANK - 2] = w.stride(1)
+    wstrides[MAX_RANK - 1] = w.stride(0)
+    var wt = own(view_strided(w, wshape, wstrides, 2, w.offset))
+    var one = _unit(a.stype, 1)
+    var res = _blas(addend, a2.t, wt.t, one, one, a.stype, dims, None)
+    _ = a2^
+    _ = wt^
+    _ = dense^
+    var flat = own(res.t.copy())
+    var shape = lead.copy()
+    shape.append(n)
+    var shaped = own(_view(flat.t, shape))
+    _ = flat^
+    if bias and not addmm_branch:
+        # `output.add_(bias)`: in place, so the output keeps its shape (a
+        # bias that would enlarge it raises) and dtype -- the sum is formed
+        # in `result_type(output, bias)` (a 0-d bias does not promote a
+        # dimensioned output) and cast back.
+        var bias_t = bias.value().copy()
+        var common = result_type(shaped.t, bias_t)
+        if not can_cast(common, shaped.t.stype):
+            raise Error(
+                "result type ",
+                _scalar_type_name(max_dtype(common)),
+                " can't be cast to the desired output type ",
+                _scalar_type_name(shaped.t.dtype),
+            )
+        var acc = own_if_new(cast_to(shaped.t, common), shaped.t)
+        # TensorIterator computes in `common`, the operands cast to it.
+        var bias_c = own_if_new(cast_to(bias_t, common), bias_t)
+        var added = call_op(
+            "aten::add_",
+            "Tensor",
+            [
+                tensor_arg(acc.t),
+                tensor_arg(bias_c.t),
+                Value(TAG_SCALAR_INT, 0, 1, 0),
+            ],
+            1,
+        )
+        _ = added^
+        _ = bias_c^
+        if acc.t.h != shaped.t.h:
+            cast_into(shaped.t, acc.t)
+        _ = acc^
+    ret_owned(rets, 0, shaped)
 
 
 # --- aten::linear_backward ----------------------------------------------------
@@ -2288,14 +4471,39 @@ def op_convolution_backward(
 
 
 def register_matmul(site: Site) raises:
+    impl[op_addbmm, "addbmm"](site)
+    impl[op_addbmm_out, "addbmm.out"](site)
+    impl[op_addbmm_, "addbmm_"](site)
     impl[op_addmm, "addmm"](site)
     impl[op_addmm_out, "addmm.out"](site)
+    impl[op_addmm_, "addmm_"](site)
+    impl[op_addmm_dtype, "addmm.dtype"](site)
+    impl[op_addmm_dtype_out, "addmm.dtype_out"](site)
+    impl[op_addmm_activation, "_addmm_activation"](site)
+    impl[op_addmm_activation_out, "_addmm_activation.out"](site)
+    impl[op_addmv, "addmv"](site)
+    impl[op_addmv_out, "addmv.out"](site)
+    impl[op_addmv_, "addmv_"](site)
     impl[op_addr, "addr"](site)
+    impl[op_baddbmm, "baddbmm"](site)
+    impl[op_baddbmm_out, "baddbmm.out"](site)
+    impl[op_baddbmm_, "baddbmm_"](site)
+    impl[op_baddbmm_dtype, "baddbmm.dtype"](site)
+    impl[op_baddbmm_dtype_out, "baddbmm.dtype_out"](site)
     impl[op_bmm, "bmm"](site)
     impl[op_bmm_out, "bmm.out"](site)
+    impl[op_bmm_dtype, "bmm.dtype"](site)
+    impl[op_bmm_dtype_out, "bmm.dtype_out"](site)
+    impl[op_convert_weight_to_int4pack, "_convert_weight_to_int4pack"](site)
+    impl[op_int_mm, "_int_mm"](site)
+    impl[op_int_mm_out, "_int_mm.out"](site)
+    impl[op_weight_int4pack_mm, "_weight_int4pack_mm"](site)
+    impl[op_weight_int8pack_mm, "_weight_int8pack_mm"](site)
     impl[op_convolution, "convolution"](site)
     impl[op_convolution_backward, "convolution_backward"](site)
     impl[op_linear, "linear"](site)
     impl[op_linear_backward, "linear_backward"](site)
     impl[op_mm, "mm"](site)
     impl[op_mm_out, "mm.out"](site)
+    impl[op_mm_dtype, "mm.dtype"](site)
+    impl[op_mm_dtype_out, "mm.dtype_out"](site)

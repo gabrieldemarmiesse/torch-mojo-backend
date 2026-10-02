@@ -253,6 +253,38 @@ def test_kernel_call_defines_and_owned_spec_lifetimes(tmp_path):
     subprocess.run([str(binary)], check=True, timeout=30)
 
 
+def test_build_key_is_the_hash_of_the_compiled_snapshot(tmp_path):
+    """A source edited after the process memoized its key must not be built
+    and cached under the old key: a build compiles a snapshot and is keyed by
+    the snapshot's hash (tmb/backend/loader.mojo `snapshot`)."""
+    tree = Path(
+        shutil.copytree(_WORKTREE / "torch_mojo_backend/mojo", tmp_path / "src")
+    )
+    binary = tmp_path / "loader_snapshot_probe"
+    subprocess.run(
+        [
+            "mojo",
+            "build",
+            str(Path(__file__).with_name("loader_snapshot_probe.mojo")),
+            "-I",
+            str(_WORKTREE / "torch_mojo_backend/mojo"),
+            "-o",
+            str(binary),
+        ],
+        env=native.compiler_env(),
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    env = dict(os.environ)
+    env["TMPDIR"] = str(tmp_path)
+    proc = subprocess.run(
+        [str(binary), str(tree)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode == 0 and "OK" in proc.stdout, proc.stdout + proc.stderr
+
+
 def test_werror_flag_reaches_every_python_driven_mojo_build(monkeypatch, tmp_path):
     """TORCH_MOJO_BACKEND_WERROR=1 (what conftest sets) turns compiler warnings
     into build failures; unset, a user's build must not carry --Werror. The

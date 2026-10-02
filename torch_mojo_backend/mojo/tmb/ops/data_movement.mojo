@@ -22,6 +22,7 @@ did, via `cpu_empty` + `copy_to_host` + a plain host loop + `copy_from_host`.
 from std.ffi import external_call
 from std.memory import unsafe_memcpy
 from std.utils import IndexList
+from std.utils.numerics import nan
 
 from tmb.backend.abi import (
     DEVICE_TYPE_CPU,
@@ -30,6 +31,8 @@ from tmb.backend.abi import (
     ST_INT32,
     ST_INT64,
     TAG_NONE,
+    TAG_DEVICE,
+    TAG_INT,
     TAG_INT_LIST,
     TAG_BOOL,
     TAG_SCALAR_DOUBLE,
@@ -37,6 +40,7 @@ from tmb.backend.abi import (
     IntList,
     Owned,
     StorageArg,
+    deterministic_algorithms,
     dtype_name,
     T,
     Value,
@@ -59,6 +63,7 @@ from tmb.backend.abi import (
     own,
     own_if_new,
     release,
+    ret_bool,
     ret_owned,
     ret_ref,
     set_sizes_strides,
@@ -66,6 +71,8 @@ from tmb.backend.abi import (
     strides_for_memory_format,
     unsupported,
     tensor_arg,
+    bool_arg,
+    none_arg,
     v_bool,
     v_device_index,
     v_bool_or,
@@ -94,7 +101,16 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_internal_overlap,
+    assert_no_overlap,
+    assert_no_partial_overlap,
+    is_int_stype,
+    resized_geometry,
+    shares_storage,
+    scalar_to_float,
+    scalar_to_int,
     broadcast_shape,
+    check_out,
     is_cast_dtype_on,
     cast_into,
     device_str,
@@ -104,6 +120,7 @@ from tmb.ops.common import (
     copy_strided_into,
     release_if_new,
     resize_out,
+    resize_storage_bytes,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import (
@@ -517,6 +534,19 @@ def _download_to_cpu(
     return out.take()
 
 
+def _download_to_cpu_as(
+    t: T, stype: Int32, want: IndexList[MAX_RANK]
+) raises -> T:
+    """`t` cast to `stype` and laid out in `want`'s order, on the host
+    (blocking)."""
+    var staged = own(_to_copy_same_device(t, stype, want))
+    var host = own(_download_to_cpu(staged.t))
+    _ = staged^
+    if not strides_equal(want, contiguous_strides(t.shape, t.rank), t.rank):
+        set_sizes_strides(host.t, t.shape, want, t.rank, 0)
+    return host.take()
+
+
 def _upload_cross_device(t: T, target_device: Int) raises -> T:
     var out = own(new_tensor(t.shape, t.rank, t.stype, target_device))
     copy_between_devices(out.t, t)
@@ -623,6 +653,42 @@ def _upload_from_cpu(
     return out^
 
 
+# aten::from_file(str filename, bool? shared=None, int? size=0, *,
+#   ScalarType? dtype=None, Layout? layout=None, Device? device=None,
+#   bool? pin_memory=None) -> Tensor
+def op_from_file(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """Upstream has only a CPU kernel: read the file there, then upload.
+    `shared=True` maps the file into host memory so writes reach it; a device
+    copy cannot keep that promise, so it is declined."""
+    if v_bool_or(args[unsafe_offset=1], False):
+        unsupported(
+            "from_file: shared=True maps the file into host memory, which"
+            " the mojo device cannot share"
+        )
+    if v_bool_or(args[unsafe_offset=6], False):
+        raise Error("Only dense CPU tensors can be pinned")
+    var index = v_device_index(args[unsafe_offset=5])
+    var target = index if index >= 0 else current_device()
+    var read = call_op(
+        "aten::from_file",
+        "",
+        [
+            args[unsafe_offset=0].copy(),
+            bool_arg(False),
+            args[unsafe_offset=2].copy(),
+            args[unsafe_offset=3].copy(),
+            args[unsafe_offset=4].copy(),
+            Value(TAG_DEVICE, 0, Int64(DEVICE_TYPE_CPU), -1),
+            none_arg(),
+        ],
+        1,
+    )
+    var host = own(read.take_tensor(0))
+    var out = own(_upload_from_cpu(host.t, host.t.stype, target, False))
+    _ = host^  # read by the upload above
+    ret_owned(rets, 0, out)
+
+
 # aten::_to_copy(Tensor self, *, ScalarType? dtype=None, Layout? layout=None,
 #   Device? device=None, bool? pin_memory=None, bool non_blocking=False,
 #   MemoryFormat? memory_format=None) -> Tensor
@@ -648,9 +714,33 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         and dev_type != DEVICE_TYPE_CPU
         and dev_type != DEVICE_TYPE_PRIVATEUSE1
     ):
-        unsupported(
-            "aten::_to_copy to a device type this backend does not know"
+        # Another backend's device (`cuda` on a CUDA wheel): the
+        # PrivateUse1 key outranks it, so a mojo -> cuda move lands here.
+        # Bounce through the host: our own download, then that backend's
+        # `_to_copy` from the CPU.
+        if not t.on_mojo():
+            unsupported(
+                "aten::_to_copy to a device type this backend does not know"
+            )
+        var on_host = own(_download_to_cpu_as(t, stype, want))
+        var moved = call_op(
+            "aten::_to_copy",
+            "",
+            [
+                tensor_arg(on_host.t),
+                none_arg(),
+                layout^,
+                dev_v^,
+                args[unsafe_offset=4].copy(),
+                args[unsafe_offset=5].copy(),
+                args[unsafe_offset=6].copy(),
+            ],
+            1,
         )
+        _ = on_host^  # read by the call above
+        var foreign = own(moved.take_tensor(0))
+        ret_owned(rets, 0, foreign)
+        return
 
     if (
         t.on_mojo()
@@ -678,7 +768,39 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # key) -- so a plain `cpu_tensor.to(mojo_device)` lands here just
         # like a same-device dtype cast does.
         if not t.on_cpu():
-            unsupported("aten::_to_copy from a non-cpu, non-mojo device")
+            # Another backend's tensor (`cuda` on a CUDA wheel) moving onto
+            # the mojo device: that backend's `_to_copy` brings it to the
+            # host (cast and laid out there), then one upload.
+            if dev_type != DEVICE_TYPE_PRIVATEUSE1:
+                unsupported("aten::_to_copy from a non-cpu, non-mojo device")
+            var on_host = call_op(
+                "aten::_to_copy",
+                "",
+                [
+                    tensor_arg(t),
+                    args[unsafe_offset=1].copy(),
+                    layout^,
+                    Value(TAG_DEVICE, 0, Int64(DEVICE_TYPE_CPU), -1),
+                    none_arg(),
+                    bool_arg(False),
+                    args[unsafe_offset=6].copy(),
+                ],
+                1,
+            )
+            var host = own(on_host.take_tensor(0))
+            var index = v_device_index(dev_v)
+            var up = own(
+                _upload_from_cpu(
+                    host.t,
+                    host.t.stype,
+                    index if index >= 0 else current_device(),
+                    non_blocking,
+                )
+            )
+            _ = host^  # read by the upload above
+            var landed = own(_relayout_owned(up^, want))
+            ret_owned(rets, 0, landed)
+            return
         if dev_type != DEVICE_TYPE_PRIVATEUSE1:
             raise Error(
                 "aten::_to_copy: self is a cpu tensor with no mojo target"
@@ -1245,6 +1367,23 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         unsupported("aten::cat.out of only legacy-empty tensors")
     var rank = real[0].rank
     var dim = dim_in + rank if dim_in < 0 else dim_in
+    # cat's meta (TensorShape.cpp) resizes the out first -- a resize keeps
+    # its storage and offset, so `out=x[:2]` still shares `x` -- then checks
+    # it against every input. The checks run here on the out's post-resize
+    # geometry, before any resize or write: the same verdict, with no input
+    # pointer left stale.
+    if dim >= 0 and dim < rank:
+        var along = 0
+        for x in real:
+            if x.rank == rank:
+                along += x.dim(dim)
+        var shape = IndexList[MAX_RANK](1)
+        for d in range(rank):
+            shape[MAX_RANK - rank + d] = along if d == dim else real[0].dim(d)
+        var target = resized_geometry(out, shape, rank)
+        assert_no_internal_overlap(target)
+        for x in all_tensors:
+            assert_no_overlap(target, x)
     if _cat_out_batched(real, dim, out):
         ret_ref(rets, 0, out)
         return
@@ -1261,6 +1400,39 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # to the front of `base`.
     if not out.same_shape(result.t):
         resize_out(out, result.t.shape, result.t.rank)
+        # ATen reads the inputs after this resize (one kernel over all of
+        # them): an input sharing the out's storage is re-read, and the
+        # concatenation redone from what it holds now.
+        var shared = False
+        for x in real:
+            if shares_storage(out, x):
+                shared = True
+        if shared:
+            # An input sharing the out's storage races with the writes on
+            # CUDA (parallel_cat copies contiguous inputs in one launch);
+            # here the inputs are copied into their slices one after another,
+            # one of the outcomes that race allows, read after the resize.
+            _ = result^
+            var at = 0
+            for x in real:
+                var xi = T(x.h)
+                var sh = out.shape
+                sh[MAX_RANK - rank + dim] = xi.dim(dim)
+                var piece = own(
+                    view_strided(
+                        out,
+                        sh,
+                        out.strides,
+                        rank,
+                        out.offset + at * out.stride(dim),
+                    )
+                )
+                if xi.numel > 0:
+                    _device_copy(piece.t, xi)
+                _ = piece^
+                at += xi.dim(dim)
+            ret_ref(rets, 0, out)
+            return
     # copy_'s route: pairs the device cast lacks (int8/int16, float64 on
     # Apple GPUs) convert on the host.
     _device_copy(out, result.t)
@@ -1418,13 +1590,18 @@ def op_repeat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def _triangular(t: T, diagonal: Int, upper: Int) raises -> Owned:
+def _triangular(t: T, diagonal_in: Int, upper: Int) raises -> Owned:
     if t.rank < 2:
-        unsupported("aten::tril/triu on a tensor with fewer than 2 dims")
+        raise Error(
+            "triu" if upper else "tril",
+            ": input tensor must have at least 2 dimensions",
+        )
     var out = own(new_like(t))
     if out.t.numel > 0:
         var rows = t.dim(-2)
         var cols = t.dim(-1)
+        # ATen clamps k to [-n, m] so `i + k` cannot overflow.
+        var diagonal = min(max(diagonal_in, -rows), cols)
         var batch = t.numel // (rows * cols)
         var src = contiguous(t)
         var ctx = ctx_for(t.device)
@@ -1461,6 +1638,49 @@ def op_triu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var diagonal = v_int_or(args[unsafe_offset=1], 0)
     var out = _triangular(t, diagonal, 1)
     ret_owned(rets, 0, out)
+
+
+def _triangular_out(
+    args: Values, rets: Values, upper: Int, in_place: Bool
+) raises:
+    """tril/triu `.out` and in-place: the result is computed into a fresh
+    tensor first, so an `out` aliasing self (or being resized) cannot
+    corrupt the read, then written where the caller's tensor lives."""
+    var t = v_tensor(args[unsafe_offset=0])
+    var diagonal = v_int_or(args[unsafe_offset=1], 0)
+    var dest = t.copy()
+    if not in_place:
+        dest = v_tensor(args[unsafe_offset=2])
+        check_out(dest, t)
+    var res = _triangular(t, diagonal, upper)
+    if not in_place:
+        resize_out(dest, res.t.shape, res.t.rank)
+    if res.t.numel > 0:
+        copy_strided_into(dest, res.t)
+    _ = res^
+    ret_ref(rets, 0, dest)
+
+
+# aten::tril.out(Tensor self, SymInt diagonal=0, *, Tensor(a!) out)
+#   -> Tensor(a!)
+def op_tril_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _triangular_out(args, rets, 0, False)
+
+
+# aten::triu.out(Tensor self, SymInt diagonal=0, *, Tensor(a!) out)
+#   -> Tensor(a!)
+def op_triu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _triangular_out(args, rets, 1, False)
+
+
+# aten::tril_(Tensor(a!) self, SymInt diagonal=0) -> Tensor(a!)
+def op_tril_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _triangular_out(args, rets, 0, True)
+
+
+# aten::triu_(Tensor(a!) self, SymInt diagonal=0) -> Tensor(a!)
+def op_triu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _triangular_out(args, rets, 1, True)
 
 
 # ---------------------------------------------------------------------------
@@ -1588,9 +1808,19 @@ def _scatter_launch(
     value: Float64,
     accumulate: Bool,
     what: String,
+    rop: Int = 0,
+    identity: Bool = False,
+    ordered: Bool = False,
+    int_value: Optional[Int] = None,
 ) raises:
     """One ScatterDim / ScatterAddDim launch over the rank-<=4 index space
     `dims` (every stride list has its length), then the bad-index report.
+    `rop` (the kernel family's `ROP_*`: 2 prod, 3 amax, 4 amin) makes it a
+    ScatterReduceDim read-modify-write; `identity` writes that reduction's
+    identity instead of src / `value` (`include_self=False`). `ordered`
+    walks `dim` in index order per thread, without atomics (the index must
+    be broadcast off `dim`; see the kernel). `int_value` carries an integer
+    dtype's scalar exactly (`value` is a double).
 
     The kernel skips a write whose index falls outside [0, dim_size) and
     raises an int32 flag; the read back is one 4-byte D2H, after which a bad
@@ -1611,9 +1841,14 @@ def _scatter_launch(
     var ctx = ctx_for(dest.device)
     var flag = own(new_tensor(IndexList[MAX_RANK](1), 1, ST_INT32, dest.device))
     fill_value(flag.t, 0.0)
-    var call = KernelCall(
-        "data_movement", "ScatterAddDim" if accumulate else "ScatterDim"
-    )
+    var op = String("ScatterDim")
+    if identity:
+        op = "ScatterDim"
+    elif rop >= 2:
+        op = "ScatterReduceDim"
+    elif accumulate:
+        op = "ScatterAddDim"
+    var call = KernelCall("data_movement", op)
     call.arg_dtype(0, dest.dtype)
     call.arg_dtype(1, index.dtype)
     call.arg_dtype(2, src_dtype)
@@ -1623,10 +1858,14 @@ def _scatter_launch(
     call.int(src_ptr)
     call.tuple(params)
     call.int(flag.t.ptr)
-    call.int(1 if is_value else 0)
+    call.int(2 if identity else (1 if is_value else 0))
     call.f64(value)
     call.int(dtype_code(dest.dtype))
     call.int(ctx_ptr(ctx))
+    call.int(rop)
+    call.int(1 if ordered else 0)
+    call.int(1 if int_value else 0)
+    call.int(int_value.value() if int_value else 0)
     call.run()
     var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
     copy_to_host(ctx, flag.t.ptr, host_flag.t.ptr, 4)
@@ -1649,6 +1888,136 @@ def _scatter_launch(
             ),
             dim_size,
         )
+
+
+def _index_put_warp(device: Int) raises -> Int:
+    """The warp of index_put's sorted route on this accelerator (32 on
+    CUDA, 64 on ROCm): it rounds per addition for slices wider than this
+    (indexing_backward_kernel vs _small_stride / _stride_1) and sums
+    width-1 runs with that many lanes."""
+    return 64 if ctx_for(device).api() == "hip" else 32
+
+
+def index_put_slice(target: T, index: T, dim: Int) -> Int:
+    """The `sliceSize` CUDA's deterministic `_scatter_via_index_put` hands
+    index_put: the extent after `dim` when self is 1-D or the index is
+    broadcast (stride 0) off `dim` (it indexes `dim` alone), else 1 (every
+    dim is indexed)."""
+    var broadcast = True
+    for d in range(index.rank):
+        if d != dim and index.stride(d) != 0:
+            broadcast = False
+    if target.rank > 1 and not broadcast:
+        return 1
+    return trailing_size(target, dim)
+
+
+def trailing_size(t: T, dim: Int) -> Int:
+    """The product of `t`'s extents after `dim`."""
+    var n = 1
+    for d in range(dim + 1, t.rank):
+        n *= t.dim(d)
+    return n
+
+
+def scatter_add_sorted(
+    target: T,
+    index: T,
+    idx_strides: List[Int],
+    src: T,
+    src_strides: List[Int],
+    dims: List[Int],
+    dim: Int,
+    dim_size: Int,
+    what: String,
+    slice_size: Int,
+) raises:
+    """`target[...] += src[...]` like `_scatter_launch(accumulate=True)`, but
+    ordered and deterministic: the targets are stably sorted and every run
+    of equal targets is summed in index-space order (data_movement
+    ScatterTargets + SortedSegmentAdd; ATen's `_scatter_via_index_put`).
+    Floating dtypes only."""
+    var total = 1
+    for d in dims:
+        total *= d
+    if total == 0:
+        return
+    var pad = 4 - len(dims)
+    var params = _pad4(dims, 1)
+    params += _pad4(_strides_of(target), 0)
+    params += _pad4(src_strides, 0)
+    params += _pad4(idx_strides, 0)
+    params.append(dim + pad)
+    params.append(dim_size)
+    var ctx = ctx_for(target.device)
+    var flat = IndexList[MAX_RANK](1)
+    flat[MAX_RANK - 1] = total
+    var tgt = own(new_tensor(flat, 1, ST_INT64, target.device))
+    var srcoff = own(new_tensor(flat, 1, ST_INT64, target.device))
+    var flag = own(
+        new_tensor(IndexList[MAX_RANK](1), 1, ST_INT32, target.device)
+    )
+    fill_value(flag.t, 0.0)
+    var tc = KernelCall("data_movement", "ScatterTargets")
+    tc.int(tgt.t.ptr)
+    tc.int(srcoff.t.ptr)
+    tc.int(index.ptr)
+    tc.tuple(params)
+    tc.int(flag.t.ptr)
+    tc.int(ctx_ptr(ctx))
+    tc.run()
+    var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
+    copy_to_host(ctx, flag.t.ptr, host_flag.t.ptr, 4)
+    var bad_index = (
+        Pointer[Int32, MutUntrackedOrigin](
+            unsafe_from_address=host_flag.t.ptr
+        )[]
+        != 0
+    )
+    _ = host_flag^
+    _ = flag^
+    if bad_index:
+        raise Error(
+            "index out of range in aten::",
+            what,
+            (
+                ": every index must be in [0, self.size(dim)) with"
+                " self.size(dim) = "
+            ),
+            dim_size,
+        )
+    var r = call_op(
+        "aten::sort",
+        "stable",
+        [
+            tensor_arg(tgt.t),
+            Value(TAG_BOOL, 0, 1, 0),
+            Value(TAG_INT, 0, 0, 0),
+            Value(TAG_BOOL, 0, 0, 0),
+        ],
+        2,
+    )
+    var sorted = own(r.take_tensor(0))
+    var perm = own(r.take_tensor(1))
+    var sc = KernelCall("data_movement", "SortedSegmentAdd")
+    sc.arg_dtype(0, target.dtype)
+    sc.int(target.ptr)
+    sc.int(sorted.t.ptr)
+    sc.int(perm.t.ptr)
+    sc.int(srcoff.t.ptr)
+    sc.int(src.ptr)
+    var warp = _index_put_warp(target.device)
+    var mode = 2 if slice_size > warp else (1 if slice_size > 1 else 0)
+    sc.tuple([total, 0, mode, warp])
+    sc.f64(0.0)
+    sc.int(dtype_code(target.dtype))
+    sc.int(ctx_ptr(ctx))
+    sc.run()
+    _ = perm^
+    _ = sorted^
+    _ = srcoff^
+    _ = tgt^
+    _ = ctx
 
 
 def _dim_or1(t: T, d: Int) -> Int:
@@ -1682,8 +2051,8 @@ def _scatter_validate(
         )
     if index.numel == 0:
         return dim
-    if index.dtype != DType.int64:
-        raise Error(what, "(): Expected dtype int64 for index")
+    if index.dtype != DType.int64 and index.dtype != DType.int32:
+        raise Error(what, "(): Expected dtype int32/int64 for index")
     if index.device != a.device or (src and src.value().device != a.device):
         unsupported("aten::" + what + " with operands on different devices")
     if max(index.rank, 1) != rank:
@@ -1726,10 +2095,12 @@ def _scatter_into(
     value: Float64,
     is_value: Bool,
     accumulate: Bool,
+    int_value: Optional[Int] = None,
 ) raises:
     """Scatter into `target` (shaped like self, any strides), which already
-    holds self's values."""
-    var idx_c = own_if_new(contiguous(index), index)
+    holds self's values. `int_value`: an integer dtype's scalar, exact."""
+    var idx64 = own_if_new(cast_to(index, ST_INT64), index)
+    var idx_c = own_if_new(contiguous(idx64.t), idx64.t)
     var src_ptr = target.ptr
     var src_dtype = target.dtype
     var src_strides = List[Int]()
@@ -1740,23 +2111,45 @@ def _scatter_into(
         src_ptr = src.value().ptr
         src_dtype = src.value().dtype
         src_strides = _strides_of(src.value())
-    _scatter_launch(
-        target,
-        _strides_of(target),
-        idx_c.t,
-        _strides_of(idx_c.t),
-        src_ptr,
-        src_dtype,
-        src_strides,
-        _dims_of(idx_c.t),
-        dim,
-        dim_size,
-        is_value,
-        value,
-        accumulate,
-        String("scatter_add") if accumulate else String("scatter"),
-    )
+    if (
+        accumulate
+        and src
+        and target.dtype.is_floating_point()
+        and deterministic_algorithms()
+    ):
+        # CUDA's deterministic scatter_add: `_scatter_via_index_put`.
+        scatter_add_sorted(
+            target,
+            idx_c.t,
+            _strides_of(idx_c.t),
+            src.value(),
+            src_strides,
+            _dims_of(idx_c.t),
+            dim,
+            dim_size,
+            "scatter_add",
+            index_put_slice(target, index, dim),
+        )
+    else:
+        _scatter_launch(
+            target,
+            _strides_of(target),
+            idx_c.t,
+            _strides_of(idx_c.t),
+            src_ptr,
+            src_dtype,
+            src_strides,
+            _dims_of(idx_c.t),
+            dim,
+            dim_size,
+            is_value,
+            value,
+            accumulate,
+            String("scatter_add") if accumulate else String("scatter"),
+            int_value=int_value,
+        )
     _ = idx_c^
+    _ = idx64^
 
 
 def _scatter_common(
@@ -1766,13 +2159,35 @@ def _scatter_common(
     src: Optional[T],
     value: Float64,
     is_value: Bool,
+    int_value: Optional[Int] = None,
 ) raises -> Owned:
     var dim = _scatter_validate(a, dim_in, index, src, False)
     var out = own(_materialize_contiguous(a))
     _scatter_into(
-        out.t, dim, _dim_or1(a, dim), index, src, value, is_value, False
+        out.t,
+        dim,
+        _dim_or1(a, dim),
+        index,
+        src,
+        value,
+        is_value,
+        False,
+        int_value,
     )
     return out^
+
+
+def scatter_scalar(a: T, v: Value) raises -> Tuple[Float64, Optional[Int]]:
+    """A Scalar as `a`'s dtype will hold it, range-checked like
+    `Scalar::to<scalar_t>()`: the double for the kernel's float path, and
+    the exact integer for an integral dtype (a double rounds int64 values
+    beyond 2**53)."""
+    if is_int_stype(a.stype):
+        var i = scalar_to_int(v, a.stype)
+        return (Float64(i), Optional[Int](i))
+    if a.dtype == DType.bool:
+        return (1.0 if v_f64(v) != 0.0 else 0.0, Optional[Int](None))
+    return (scalar_to_float(v, a.stype), Optional[Int](None))
 
 
 # aten::scatter.src(Tensor self, int dim, Tensor index, Tensor src) -> Tensor
@@ -1798,6 +2213,10 @@ def op_scatter_src_(
     var dim = _scatter_validate(
         a, v_int(args[unsafe_offset=1]), index, src.copy(), False
     )
+    # scatter_meta_impl's overlap checks: the output is self.
+    assert_no_internal_overlap(a)
+    assert_no_overlap(a, index)
+    assert_no_overlap(a, src)
     _scatter_into(a, dim, _dim_or1(a, dim), index, src^, 0.0, False, False)
     ret_ref(rets, 0, a)
 
@@ -1814,7 +2233,15 @@ def op_scatter_src_out(
     var dim = _scatter_validate(
         a, v_int(args[unsafe_offset=1]), index, src.copy(), False
     )
+    # scatter_meta_impl on the out as given, then scatter_impl's copy_.
+    assert_no_internal_overlap(out)
+    assert_no_overlap(out, index)
+    assert_no_overlap(out, src)
+    check_self_copy(out, a)
     _copy_self_into_out(out, a, "scatter")
+    a = T(a.h)
+    index = T(index.h)
+    src = T(src.h)
     _scatter_into(out, dim, _dim_or1(a, dim), index, src^, 0.0, False, False)
     ret_ref(rets, 0, out)
 
@@ -1826,10 +2253,8 @@ def op_scatter_value(
     var a = v_tensor(args[unsafe_offset=0])
     var dim = v_int(args[unsafe_offset=1])
     var index = v_tensor(args[unsafe_offset=2])
-    var value = v_f64(args[unsafe_offset=3])
-    if a.dtype == DType.bool:
-        value = 1.0 if value != 0.0 else 0.0
-    var out = _scatter_common(a, dim, index, None, value, True)
+    var value = scatter_scalar(a, args[unsafe_offset=3])
+    var out = _scatter_common(a, dim, index, None, value[0], True, value[1])
     ret_owned(rets, 0, out)
 
 
@@ -1996,8 +2421,15 @@ def op_gather_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var index = v_tensor(args[unsafe_offset=2])
     var out = v_tensor(args[unsafe_offset=4])
     var shape = _gather_check(a, dim, index)
+    # gather's meta: after the resize, no internal overlap, no overlap with
+    # self, no partial overlap with the index.
+    var post = resized_geometry(out, shape, index.rank)
+    assert_no_internal_overlap(post)
+    assert_no_overlap(post, a)
+    assert_no_partial_overlap(post, index)
     _out_target(out, shape, index.rank, a, "gather")
-    _gather_into(out, a, dim, index, "gather")
+    # Re-read the inputs: the resize may have moved a storage they share.
+    _gather_into(out, T(a.h), dim, T(index.h), "gather")
     ret_ref(rets, 0, out)
 
 
@@ -2110,8 +2542,48 @@ def op_index_select_out(
     var index = v_tensor(args[unsafe_offset=2])
     var out = v_tensor(args[unsafe_offset=3])
     var shape = _index_select_shape(a, dim, index)
+    # index_select_out_cuda checks the out as given, then resizes it.
+    assert_no_internal_overlap(out)
+    assert_no_overlap(out, a)
+    assert_no_overlap(out, index)
     _out_target(out, shape, a.rank, a, "index_select")
-    _index_select_into(out, a, dim, index)
+    # Re-read the inputs: the resize may have moved a storage they share.
+    var a2 = T(a.h)
+    var index2 = T(index.h)
+    if shares_storage(out, a2) and index2.numel <= 16 and index2.numel > 1:
+        # CUDA's small-index kernel (<= 16 indices) walks the indices in
+        # order: a slice read after an earlier one was written sees it.
+        var d = _norm_dim(dim, a2.rank, "index_select")
+        for i in range(index2.numel):
+            var ish = IndexList[MAX_RANK](1)
+            var ist = IndexList[MAX_RANK](0)
+            var one = own(
+                view_strided(
+                    index2,
+                    ish,
+                    ist,
+                    1,
+                    index2.offset
+                    + i * (index2.stride(0) if index2.rank > 0 else 0),
+                )
+            )
+            var osh = out.shape
+            osh[MAX_RANK - out.rank + d] = 1
+            var piece = own(
+                view_strided(
+                    out,
+                    osh,
+                    out.strides,
+                    out.rank,
+                    out.offset + i * out.stride(d),
+                )
+            )
+            _index_select_into(piece.t, a2, dim, one.t)
+            _ = piece^
+            _ = one^
+        ret_ref(rets, 0, out)
+        return
+    _index_select_into(out, a2, dim, index2)
     ret_ref(rets, 0, out)
 
 
@@ -2139,16 +2611,31 @@ def op_scatter_add_(
     var index = v_tensor(args[unsafe_offset=2])
     var src = v_tensor(args[unsafe_offset=3])
     var dim = _scatter_add_check(a, v_int(args[unsafe_offset=1]), index, src)
+    # scatter_meta_impl's overlap checks: the output is self.
+    assert_no_internal_overlap(a)
+    assert_no_overlap(a, index)
+    assert_no_overlap(a, src)
     _scatter_into(a, dim, _dim_or1(a, dim), index, src^, 0.0, False, True)
     ret_ref(rets, 0, a)
 
 
-def _copy_self_into_out(mut out: T, a: T, what: String) raises:
-    """`out = self.clone()` for the out= overload of an accumulating op:
-    resize `out` to self's shape when it differs, then copy self over unless
-    `out` IS self."""
-    _out_target(out, a.shape, a.rank, a, what)
-    if out.ptr == a.ptr and strides_equal(out.strides, a.strides, a.rank):
+def check_self_copy(dest: T, a: T) raises:
+    """`if (!result.is_same(self)) result.copy_(self)` after the out took
+    self's shape: copy_'s partial-overlap check, on the post-resize
+    geometry (scatter / index_add / index_reduce out= overloads)."""
+    if dest.impl() != a.impl():
+        assert_no_partial_overlap(resized_geometry(dest, a.shape, a.rank), a)
+
+
+def _copy_self_into_out(mut out: T, a_in: T, what: String) raises:
+    """ATen's sequence for the out= overload of a scatter / index op: resize
+    `out` to self's shape (structured meta), then `if (!out.is_same(self))
+    out.copy_(self)` -- on the caller's tensor, with self re-read after the
+    resize (it may have moved a storage self shares). The caller re-reads
+    its other inputs too."""
+    _out_target(out, a_in.shape, a_in.rank, a_in, what)
+    var a = T(a_in.h)
+    if out.impl() == a.impl():
         return
     if a.numel > 0:
         copy_strided_into(out, a)
@@ -2164,17 +2651,22 @@ def op_scatter_add_out(
     var src = v_tensor(args[unsafe_offset=3])
     var out = v_tensor(args[unsafe_offset=4])
     var dim = _scatter_add_check(a, v_int(args[unsafe_offset=1]), index, src)
+    # scatter_meta_impl checks the out as given, before setting its shape.
+    assert_no_internal_overlap(out)
+    assert_no_overlap(out, index)
+    assert_no_overlap(out, src)
+    check_self_copy(out, a)
     _copy_self_into_out(out, a, "scatter_add")
+    a = T(a.h)
+    index = T(index.h)
+    src = T(src.h)
     _scatter_into(out, dim, _dim_or1(a, dim), index, src^, 0.0, False, True)
     ret_ref(rets, 0, out)
 
 
-def _index_add_into(
-    target: T, a: T, dim_in: Int, index: T, source: T, alpha: Value
-) raises:
-    """`target[..., index[i], ...] += alpha * source[..., i, ...]` along
-    `dim`: ScatterAddDim over source's index space with the 1-D index
-    broadcast (stride 0) across every other coordinate."""
+def _index_add_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
+    """index_add's argument checks (index_func_meta_impl's), before any
+    overlap check or write; returns the normalized dim."""
     var dim = _norm_dim(dim_in, a.rank, "index_add")
     var rank = max(a.rank, 1)
     _check_index(index, a, "index_add")
@@ -2219,6 +2711,17 @@ def _index_add_into(
     _ = ctx
     if metal and a.dtype == DType.float64:
         unsupported("aten::index_add of " + String(a.dtype) + " on Apple GPU")
+    return dim
+
+
+def _index_add_into(
+    target: T, a: T, dim_in: Int, index: T, source: T, alpha: Value
+) raises:
+    """`target[..., index[i], ...] += alpha * source[..., i, ...]` along
+    `dim`: ScatterAddDim over source's index space with the 1-D index
+    broadcast (stride 0) across every other coordinate."""
+    var dim = _index_add_check(a, dim_in, index, source)
+    var rank = max(a.rank, 1)
     if source.numel == 0:
         return
     # `alpha * source` through the dispatcher when alpha is not 1 (autograd's
@@ -2236,22 +2739,38 @@ def _index_add_into(
     var idx_strides = List[Int](capacity=rank)
     for d in range(rank):
         idx_strides.append(idx_stride if d == dim else 0)
-    _scatter_launch(
-        target,
-        _strides_of(target),
-        idx.t,
-        idx_strides,
-        src.ptr,
-        src.dtype,
-        _strides_of(src),
-        _dims_of(src),
-        dim,
-        _dim_or1(a, dim),
-        False,
-        0.0,
-        True,
-        "index_add",
-    )
+    if target.dtype.is_floating_point() and deterministic_algorithms():
+        # CUDA's deterministic index_add: index_put_(accumulate=True).
+        scatter_add_sorted(
+            target,
+            idx.t,
+            idx_strides,
+            src,
+            _strides_of(src),
+            _dims_of(src),
+            dim,
+            _dim_or1(a, dim),
+            "index_add",
+            # index_put_ over [None] * dim + [index]: the slices after dim.
+            trailing_size(target, dim),
+        )
+    else:
+        _scatter_launch(
+            target,
+            _strides_of(target),
+            idx.t,
+            idx_strides,
+            src.ptr,
+            src.dtype,
+            _strides_of(src),
+            _dims_of(src),
+            dim,
+            _dim_or1(a, dim),
+            False,
+            0.0,
+            True,
+            "index_add",
+        )
     _ = idx^
     _ = scaled^
 
@@ -2276,6 +2795,10 @@ def op_index_add(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 #   Scalar alpha=1) -> Tensor(a!)
 def op_index_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
+    # index_func_meta_impl's overlap checks: the output is self.
+    assert_no_internal_overlap(a)
+    assert_no_overlap(a, v_tensor(args[unsafe_offset=2]))
+    assert_no_overlap(a, v_tensor(args[unsafe_offset=3]))
     _index_add_into(
         a,
         a,
@@ -2294,10 +2817,22 @@ def op_index_add_out(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=5])
+    _ = _index_add_check(
+        a,
+        v_int(args[unsafe_offset=1]),
+        v_tensor(args[unsafe_offset=2]),
+        v_tensor(args[unsafe_offset=3]),
+    )
+    # index_func_meta_impl sets the out's shape, then checks it.
+    var post = resized_geometry(out, a.shape, a.rank)
+    assert_no_internal_overlap(post)
+    assert_no_overlap(post, v_tensor(args[unsafe_offset=2]))
+    assert_no_overlap(post, v_tensor(args[unsafe_offset=3]))
+    check_self_copy(out, a)
     _copy_self_into_out(out, a, "index_add")
     _index_add_into(
         out,
-        a,
+        T(a.h),
         v_int(args[unsafe_offset=1]),
         v_tensor(args[unsafe_offset=2]),
         v_tensor(args[unsafe_offset=3]),
@@ -2547,8 +3082,11 @@ def op_index_put_impl_(
     var present = v_opt_tensor_list_present(args[unsafe_offset=1])
     var indices = v_tensor_list(args[unsafe_offset=1])
     var values = v_tensor(args[unsafe_offset=2])
-    # accumulate=True sums colliding writes with ScatterAddDim's atomics
-    # (unspecified order, like torch's CUDA index_put_ with accumulate).
+    # accumulate=True sums colliding writes with ScatterAddDim's atomics, in
+    # an unspecified order. CUDA's index_put_ with accumulate always takes
+    # its sorted route (`index_put_with_sort_kernel`, deterministic, with the
+    # per-slice-width rounding of `scatter_add_sorted`); matching it would
+    # put a sort on this hot path, so it is left as a known difference.
     var accumulate = v_bool(args[unsafe_offset=3])
     if (
         len(indices) == 1
@@ -2613,6 +3151,9 @@ def op_index_put_impl_(
         unsupported(
             "_index_put_impl_: values rank exceeds the indexed result rank"
         )
+    # _index_put_impl_'s `assert_no_overlap(self, value)`: a RuntimeError,
+    # before the narrower decline below.
+    assert_no_overlap(target, values)
     if _overlaps_contiguous_target(
         target, values
     ) or _overlaps_contiguous_target(target, index):
@@ -2969,6 +3510,144 @@ def op_set_source_tensor(
     ret_ref(rets, 0, self_t)
 
 
+# aten::set_(Tensor(a!) self) -> Tensor(a!)
+def op_set_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """ATen's `set_cuda_`: a fresh zero-byte storage on self's device, sizes
+    [0], strides [1], offset 0; the dtype is kept."""
+    var self_t = v_tensor(args[unsafe_offset=0])
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = 0
+    var fresh = own(new_tensor(shape, 1, self_t.stype, self_t.device))
+    check(
+        external_call["tmb_tensor_set_storage", Int32](self_t.h, fresh.t.h),
+        "tmb_tensor_set_storage",
+    )
+    _ = fresh^
+    set_sizes_strides(self_t, shape, contiguous_strides(shape, 1), 1, 0)
+    ret_ref(rets, 0, self_t)
+
+
+# aten::is_set_to(Tensor self, Tensor tensor) -> bool
+def op_is_set_to(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """TensorProperties.cpp: the same StorageImpl, storage offset, sizes and
+    strides."""
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var same = (
+        external_call["tmb_tensor_storage_impl", Int](a.h)
+        == external_call["tmb_tensor_storage_impl", Int](b.h)
+        and a.offset == b.offset
+        and a.rank == b.rank
+    )
+    if same:
+        for d in range(a.rank):
+            if a.dim(d) != b.dim(d) or a.stride(d) != b.stride(d):
+                same = False
+                break
+    ret_bool(rets, 0, same)
+
+
+comptime _INT64_MAX = 9223372036854775807
+
+
+# aten::resize_(Tensor(a!) self, SymInt[] size, *,
+#   MemoryFormat? memory_format=None) -> Tensor(a!)
+def op_resize_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """ATen's `resize_cuda_` (cuda/Resize.cpp, Resize.h): a new shape keeps
+    the storage offset and takes contiguous strides, growing the storage
+    (bytes kept up to the old size) only when the elements reach past its
+    end; an unchanged shape keeps its strides. A memory format then restrides
+    (`empty_tensor_restride`)."""
+    var self_t = v_tensor(args[unsafe_offset=0])
+    var sizes = IntList(args[unsafe_offset=1])
+    var rank = len(sizes)
+    if rank > MAX_RANK:
+        unsupported("resize_: rank above the mojo device limit")
+    var shape = IndexList[MAX_RANK](1)
+    for i in range(rank):
+        shape[MAX_RANK - rank + i] = sizes[i]
+    var offset = self_t.offset
+    var old_nbytes = self_t.storage_nbytes()
+    # c10's safe_compute_numel (a negative extent is a huge uint64), then
+    # computeStorageNbytesContiguous -- checked before anything changes.
+    var numel = 1
+    var overflow = False
+    var has_zero = False
+    for i in range(rank):
+        var e = sizes[i]
+        if e == 0:
+            has_zero = True
+        elif e < 0 or numel > _INT64_MAX // e:
+            overflow = True
+        else:
+            numel *= e
+    if not has_zero and overflow:
+        raise Error("numel: integer multiplication overflow")
+    if not has_zero and numel > (_INT64_MAX // self_t.itemsize) - offset:
+        raise Error(
+            "Storage size calculation overflowed with sizes=", _sizes_str(sizes)
+        )
+    var t = self_t.copy()
+    resize_out(t, shape, rank)
+    var mf_v = args[unsafe_offset=2].copy()
+    if mf_v.tag != TAG_NONE:
+        var mf = v_memory_format_or(mf_v, MEMORY_FORMAT_PRESERVE)
+        if mf == MEMORY_FORMAT_PRESERVE:
+            raise Error("Unsupported memory formatPreserve")
+        set_sizes_strides(
+            self_t,
+            shape,
+            strides_for_memory_format(shape, rank, mf),
+            rank,
+            offset,
+        )
+    if external_call["tmb_deterministic_fill_uninitialized", Int32]() != 0:
+        _fill_resize_deterministic(self_t, old_nbytes)
+    ret_ref(rets, 0, self_t)
+
+
+def _fill_resize_deterministic(t: T, old_nbytes: Int) raises:
+    """ResizeCommon.h's `fill_resize_deterministic_`: the elements a resize
+    added to the storage get NaN (floating) or the dtype's max (integral,
+    bool), as `fill_empty_deterministic_` fills a fresh `empty`."""
+    var old_numel = old_nbytes // t.itemsize
+    var new_numel = t.storage_nbytes() // t.itemsize
+    if new_numel <= old_numel:
+        return
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = new_numel - old_numel
+    var tail = own(
+        view_strided(t, shape, contiguous_strides(shape, 1), 1, old_numel)
+    )
+    if t.dtype.is_floating_point():
+        fill_value(tail.t, Float64(nan[DType.float64]()))
+    else:
+        fill_value(tail.t, Value(TAG_SCALAR_INT, 0, _int_max_bits(t.dtype), 0))
+    _ = tail^
+
+
+def _int_max_bits(dt: DType) -> Int64:
+    """`std::numeric_limits<scalar_t>::max()`, as the bits an integral fill
+    stores (uint64's max is all ones, i.e. -1)."""
+    if dt == DType.bool:
+        return 1
+    if dt == DType.uint8:
+        return 255
+    if dt == DType.int8:
+        return 127
+    if dt == DType.int16:
+        return 32767
+    if dt == DType.uint16:
+        return 65535
+    if dt == DType.int32:
+        return 2147483647
+    if dt == DType.uint32:
+        return 4294967295
+    if dt == DType.uint64:
+        return -1
+    return 9223372036854775807
+
+
 def _set_storage(
     self_t: T,
     source: StorageArg,
@@ -3006,10 +3685,7 @@ def _set_storage(
     )
     var nbytes = (offset + needed + 1) * self_t.itemsize if numel > 0 else 0
     if nbytes > source.nbytes:
-        check(
-            external_call["tmb_storage_resize", Int32](self_t.h, Int64(nbytes)),
-            "tmb_storage_resize",
-        )
+        resize_storage_bytes(self_t, nbytes)
     set_sizes_strides(self_t, shape, strides, rank, offset)
 
 
@@ -3144,6 +3820,10 @@ def register_data_movement(site: Site) raises:
     impl[op_repeat, "repeat"](site)
     impl[op_tril, "tril"](site)
     impl[op_triu, "triu"](site)
+    impl[op_tril_out, "tril.out"](site)
+    impl[op_triu_out, "triu.out"](site)
+    impl[op_tril_, "tril_"](site)
+    impl[op_triu_, "triu_"](site)
     impl[op_select_scatter, "select_scatter"](site)
     impl[op_scatter_src, "scatter.src"](site)
     impl[op_scatter_src_, "scatter_.src"](site)
@@ -3165,6 +3845,10 @@ def register_data_movement(site: Site) raises:
     impl[op_masked_select, "masked_select"](site)
     impl[op_masked_select_out, "masked_select.out"](site)
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
+    impl[op_set_, "set_"](site)
+    impl[op_is_set_to, "is_set_to"](site)
+    impl[op_resize_, "resize_"](site)
+    impl[op_from_file, "from_file"](site)
     impl[op_set_source_storage, "set_.source_Storage"](site)
     impl[op_set_source_storage_offset, "set_.source_Storage_storage_offset"](
         site

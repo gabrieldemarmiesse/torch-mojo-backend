@@ -3148,8 +3148,8 @@ def test_copy_into_mojo_from_another_backend(mojo_gpu):
 )
 @pytest.mark.xfail(
     strict=False,
-    raises=NotImplementedError,
-    reason="not ported yet: copies from another accelerator to the mojo device",
+    raises=AssertionError,
+    reason="copies between CUDA and the mojo device go through the host for now",
 )
 def test_same_gpu_transfer_skips_the_host(mojo_gpu):
     """The transfer must not go through host memory when both live on one GPU.

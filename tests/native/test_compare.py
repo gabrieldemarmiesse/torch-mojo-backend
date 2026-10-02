@@ -236,11 +236,69 @@ def test_isin_out(mojo_gpu: str, call_checker: CallChecker):
     torch.testing.assert_close(out.cpu(), torch.tensor([False, True, False, True]))
 
 
+@pytest.mark.parametrize("n", [1, 50])
+def test_isin_scalar_compares_in_the_promoted_dtype(mojo_gpu: str, n: int):
+    """isin(Scalar, Tensor) wraps the scalar as a float64 (int64) tensor, so
+    CUDA compares in promote_types(float64, test dtype): a scalar that is not
+    exactly one of the test dtype's values matches nothing (the results
+    below are CUDA's, for both of its isin kernels)."""
+    d = mojo_gpu
+    i32 = torch.full((n,), 3, dtype=torch.int32, device=d)
+    cases = [
+        (torch.isin(1 + 1e-8, torch.ones(n, device=d)), False),
+        (torch.isin(1 + 1e-4, torch.ones(n, dtype=torch.float16, device=d)), False),
+        (torch.isin(1e300, torch.full((n,), float("inf"), device=d)), False),
+        (torch.isin(3.0000001, i32), False),
+        (torch.isin(3 + 2**40, i32), False),
+        (torch.isin(3.0, i32), True),
+        (torch.isin(1.0, torch.ones(n, device=d), invert=True), False),
+        (torch.isin(1 + 1e-8, torch.ones(n, device=d), invert=True), True),
+    ]
+    for got, want in cases:
+        assert got.device.type == torch.device(d).type
+        assert got.item() is want
+
+
+def test_integer_scalar_past_2_53_compares_exactly(mojo_gpu: str):
+    """An int scalar against an integer tensor travels as int64 bits."""
+    big = 2**53 + 1
+    t = torch.tensor([big, 3], device=mojo_gpu)
+    assert torch.isin(big, t).item() is True
+    assert torch.isin(2**53, t).item() is False
+    assert torch.eq(t, big).cpu().tolist() == [True, False]
+    assert torch.ne(t, big).cpu().tolist() == [False, True]
+    assert torch.isin(t, big).cpu().tolist() == [True, False]
+
+
+def test_isin_float_and_mixed_dtypes(mojo_gpu: str):
+    elements = torch.tensor([1.0, 2.0, float("nan"), -0.0])
+    test_elements = torch.tensor([1.0, float("nan"), 0.0])
+    torch.testing.assert_close(
+        torch.isin(elements.to(mojo_gpu), test_elements.to(mojo_gpu)).cpu(),
+        torch.isin(elements, test_elements),
+    )
+    ints = torch.tensor([1, 2, 3])
+    torch.testing.assert_close(
+        torch.isin(ints.to(mojo_gpu), test_elements.to(mojo_gpu)).cpu(),
+        torch.isin(ints, test_elements),
+    )
+
+
+def test_isin_float_scalar_against_integers(mojo_gpu: str):
+    t = torch.tensor([1, 2, 3])
+    for el in (2.0, 2.5):
+        torch.testing.assert_close(
+            torch.isin(el, t.to(mojo_gpu)).cpu(), torch.isin(el, t)
+        )
+
+
 def test_isin_unsupported_dtype_raises(mojo_gpu: str):
-    elements = torch.tensor([1.0, 2.0]).to(mojo_gpu)
-    test_elements = torch.tensor([1.0]).to(mojo_gpu)
+    elements = torch.tensor([1, 2], dtype=torch.uint8).to(mojo_gpu)
+    test_elements = torch.tensor([1], dtype=torch.uint8).to(mojo_gpu)
     with pytest.raises(NotImplementedError):
         torch.isin(elements, test_elements)
+    with pytest.raises(RuntimeError, match="Unsupported input type"):
+        torch.isin(elements.bool(), test_elements.bool())
 
 
 # ---------------------------------------------------------------------------
@@ -880,3 +938,28 @@ def test_assert_async(mojo_gpu):
         aten._assert_async(torch.ones(0, device=mojo_gpu))
     with pytest.raises(RuntimeError, match="more than one value is ambiguous"):
         aten._assert_async(torch.ones(2, device=mojo_gpu))
+
+
+def test_functional_assert_async_and_dep_token(mojo_gpu):
+    """ATen has CPU kernels only (CUDA raises NotImplementedError); the mojo
+    device runs them the same way."""
+    aten = torch.ops.aten
+    token = aten._make_dep_token(device=mojo_gpu)
+    reference = aten._make_dep_token()
+    assert (token.shape, token.dtype, token.device) == (
+        reference.shape,
+        reference.dtype,
+        torch.device(mojo_gpu),
+    )
+    assert aten._make_dep_token(dtype=torch.int64, device=mojo_gpu).dtype == torch.int64
+    out = aten._functional_assert_async.msg(
+        torch.tensor(True, device=mojo_gpu), "never", token
+    )
+    assert out.device == token.device and out.shape == token.shape
+    assert out.data_ptr() != token.data_ptr()
+    with pytest.raises(RuntimeError, match="boom"):
+        aten._functional_assert_async.msg(
+            torch.tensor(0, device=mojo_gpu), "boom", token
+        )
+    with pytest.raises(RuntimeError, match="Assertion is failed"):
+        aten._functional_assert_async.msg(torch.tensor(0.0, device=mojo_gpu), "", token)

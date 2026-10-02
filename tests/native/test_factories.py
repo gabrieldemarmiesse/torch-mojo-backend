@@ -1432,3 +1432,87 @@ def test_bernoulli_rejects_probabilities_outside_0_1(mojo_gpu, bad):
         device=mojo_gpu,
     )
     assert torch.bernoulli(ok).cpu().tolist() == [0.0, 1.0]
+
+
+# ---------------------------------------------------------------------------
+# range.out / randperm.generator_out
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.filterwarnings("ignore:torch.range is deprecated")
+@pytest.mark.parametrize(
+    ("start", "end", "step", "dtype"),
+    [
+        (0, 5, 1, torch.float32),
+        (1, 4, 0.5, torch.float32),
+        (0, 1, 0.1, torch.float32),
+        (0, 10, 3, torch.int64),
+        (10, -3, -4, torch.int32),
+        (2.7, 9.1, 1.3, torch.int64),
+        (5, -2, -1.5, torch.float64),
+        (0, 1, 0.25, torch.float16),
+        (3, 3, 1, torch.float32),
+    ],
+)
+def test_range_out(mojo_gpu, start, end, step, dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    ran = _op_count_delta("aten::range.out")
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    torch.range(start, end, step, out=out)
+    assert ran()
+    torch.testing.assert_close(out.cpu(), torch.range(start, end, step, dtype=dtype))
+    # A non-contiguous out of the right length is written where it lives.
+    n = out.numel()
+    base = torch.zeros(2 * n, dtype=dtype, device=mojo_gpu)
+    torch.range(start, end, step, out=base[::2])
+    torch.testing.assert_close(
+        base[::2].cpu(), torch.range(start, end, step, dtype=dtype)
+    )
+
+
+@pytest.mark.filterwarnings("ignore:torch.range is deprecated")
+def test_range_errors(mojo_gpu):
+    out = torch.empty(0, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="step must be nonzero"):
+        torch.range(0, 1, 0, out=out)
+    with pytest.raises(RuntimeError, match="inconsistent with step sign"):
+        torch.range(0, 1, -1, out=out)
+    with pytest.raises(RuntimeError, match="unsupported range"):
+        torch.range(0, float("inf"), 1, out=out)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.int64, torch.int32, torch.float32, torch.float16]
+)
+@pytest.mark.parametrize("n", [0, 1, 5, 1000])
+def test_randperm(mojo_gpu, dtype, n):
+    ran = _op_count_delta("aten::randperm.generator_out")
+    p = torch.randperm(n, dtype=dtype, device=mojo_gpu)
+    assert ran()
+    assert p.dtype == dtype and p.shape == (n,)
+    torch.testing.assert_close(p.cpu().sort().values, torch.arange(n, dtype=dtype))
+
+
+def test_randperm_generator_out_and_errors(mojo_gpu):
+    g = torch.Generator(device=mojo_gpu)
+    g.manual_seed(7)
+    a = torch.randperm(50, generator=g, device=mojo_gpu).cpu()
+    g.manual_seed(7)
+    b = torch.randperm(50, generator=g, device=mojo_gpu).cpu()
+    assert torch.equal(a, b)
+    assert not torch.equal(a, torch.arange(50))
+    out = torch.empty(3, dtype=torch.int64, device=mojo_gpu)
+    torch.randperm(20, out=out)
+    torch.testing.assert_close(out.cpu().sort().values, torch.arange(20))
+    with pytest.raises(RuntimeError, match="n must be non-negative"):
+        torch.randperm(-1, out=out)
+    with pytest.raises(RuntimeError, match="2049 for Half"):
+        torch.randperm(3000, dtype=torch.float16, device=mojo_gpu)
+
+
+@pytest.mark.filterwarnings("ignore:torch.range is deprecated")
+def test_range_out_beyond_exact_double(mojo_gpu):
+    out = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    torch.range(2**53 + 1, 2**53 + 3, 1, out=out)
+    assert out.cpu().tolist() == [2**53 + 1, 2**53 + 2, 2**53 + 3]

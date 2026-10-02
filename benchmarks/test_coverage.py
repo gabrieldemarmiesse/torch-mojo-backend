@@ -123,6 +123,10 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::empty_permuted": _ALLOC,
     # -- alloc + fill -----------------------------------------------------
     "aten::zero_": _FILL + " (delegates to fill_)",
+    "aten::fill_.Tensor": (
+        "fill_ with a 0-d tensor value: a broadcast copy_ (test_data_movement's "
+        "strided copy) or, for a host value, fill_.Scalar's fill kernel"
+    ),
     "aten::fill.Scalar": _FILL,
     # -- transfers / sync -------------------------------------------------
     "aten::_local_scalar_dense": (
@@ -147,6 +151,39 @@ SKIPPED_OPS: dict[str, str] = {
         "lays a tensor over an existing Storage (torch.load's tensor "
         "rebuild): storage swap plus TensorImpl metadata, no kernel"
     ),
+    "aten::set_": (
+        "points a tensor at a fresh zero-byte storage: TensorImpl metadata, no kernel"
+    ),
+    "aten::resize_": (
+        "metadata plus, when it grows, one storage reallocation and a "
+        "byte-preserving device copy: the allocator and memcpy, no kernel of "
+        "its own"
+    ),
+    "aten::is_set_to": "compares storage identity and metadata: no kernel",
+    "aten::_copy_from_and_resize": (
+        "resize_ then copy_ (the CPU-fallback write-back): the copies "
+        "test_data_movement already measures"
+    ),
+    "aten::from_file": (
+        "a host file read (ATen's CPU kernel) then one upload: I/O and a "
+        "memcpy, no kernel"
+    ),
+    "aten::_make_dep_token": _ALLOC + " (a 0-d placeholder)",
+    "aten::_functional_assert_async.msg": (
+        "_assert_async.msg plus a clone of a 0-d token: the cost is the sync"
+    ),
+    # -- stateless Philox (torch >= 2.13) ----------------------------------
+    "aten::_philox_key_split": (
+        "one Philox block per key: a few hundred bytes of keys, nothing to "
+        "time, and stock torch 2.11 (this suite's reference) has no such op"
+    ),
+    "aten::_philox_key_fold_in": "same as _philox_key_split",
+    "aten::_philox_key_fold_in.Tensor": "same as _philox_key_split",
+    "aten::_philox_uniform_": (
+        "stock torch 2.11, the reference this suite pins, has no such op (it "
+        "appeared in 2.13), so there is no reference leg to compare against"
+    ),
+    "aten::_philox_normal_": "same as _philox_uniform_",
     # -- dispatch decision, not compute -----------------------------------
     "aten::_fused_sdp_choice": (
         "returns which SDPA backend to use as an int; the attention kernel "

@@ -23,6 +23,7 @@ from tmb.ops.composed import register_composed
 from tmb.ops.core import register_core
 from tmb.ops.data_movement import register_data_movement
 from tmb.ops.deform_conv import register_deform_conv
+from tmb.ops.embedding_bag import register_embedding_bag
 from tmb.ops.factories import register_factories
 from tmb.ops.foreach import register_foreach
 from tmb.ops.indexing import register_indexing
@@ -37,8 +38,11 @@ from tmb.ops.reductions import register_reductions
 from tmb.ops.resample import register_resample
 from tmb.ops.rnn import register_rnn
 from tmb.ops.roi import register_roi
+from tmb.ops.scans import register_scans
+from tmb.ops.stats import register_stats
 from tmb.ops.transformer import register_transformer
 from tmb.ops.unary import register_unary
+from tmb.ops.unique import register_unique
 from tmb.backend.pg import pg_vtable
 from tmb.backend.registry import Lib, RegisterFn, Site
 
@@ -58,12 +62,16 @@ def _register_ops(lib: Int) raises:
     _group[register_data_movement](lib)
     _group[register_factories](lib)
     _group[register_indexing](lib)
+    _group[register_unique](lib)
     _group[register_random](lib)
     _group[register_reductions](lib)
+    _group[register_scans](lib)
+    _group[register_stats](lib)
     _group[register_matmul](lib)
     _group[register_nn](lib)
     _group[register_loss](lib)
     _group[register_batch_norm](lib)
+    _group[register_embedding_bag](lib)
     _group[register_pooling](lib)
     _group[register_pointwise](lib)
     _group[register_attention](lib)
