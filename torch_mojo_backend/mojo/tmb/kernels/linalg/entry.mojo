@@ -1058,7 +1058,16 @@ def _gesvdj_kernel[
                 break
             if tid == 0:
                 flag[unsafe_offset=0] = 0
-            barrier()
+            # The largest column norm, this sweep: a column below
+            # tol_conv of it is numerically zero (dgesvj), still rotated
+            # but never what keeps the sweeps going -- the noise columns
+            # of a rank-deficient matrix would otherwise rotate forever.
+            var cmax = Scalar[dt](0)
+            idx = tid
+            while idx < n:
+                cmax = _nan_max(cmax, _pair_stats[dt](u, ub, m, idx, idx)[0])
+                idx += nt
+            var negligible = tol_conv * _block_max[dt](cmax)
             for rnd in range(mm - 1):
                 var t = tid
                 while t < pairs:
@@ -1094,7 +1103,7 @@ def _gesvdj_kernel[
                                 tau = -tau
                             var tt = r * tau
                             c = 1 / sqrt(1 + tt * tt)
-                            if _abs(cs) > tol_conv:
+                            if _abs(cs) > tol_conv and min(np, nq) > negligible:
                                 flag[unsafe_offset=0] = 1
                     ws[unsafe_offset=wsb + 4 * t] = c
                     ws[unsafe_offset=wsb + 4 * t + 1] = tau

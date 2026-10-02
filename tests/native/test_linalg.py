@@ -750,3 +750,44 @@ def test_svd_float64_accuracy_tall(mojo_gpu: str):
     U0, S0, Vh0 = torch.linalg.svd(a, full_matrices=False)
     cpu_err = (U0 @ torch.diag(S0) @ Vh0 - a).abs().max()
     assert err <= 10 * cpu_err, (err, cpu_err)
+
+
+# --- round-5 review regressions -----------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("n", [64, 128, 256])
+@pytest.mark.parametrize("rank", [1, 2])
+def test_svd_outer_products_converge(
+    mojo_gpu: str, dtype: torch.dtype, n: int, rank: int
+):
+    """Rank-1/2 outer products: n - rank singular values are rounding noise,
+    which must not keep the sweeps going."""
+    _dtype_or_skip(mojo_gpu, dtype)
+    for seed in range(3):
+        torch.manual_seed(seed)
+        a = torch.randn(n, rank, dtype=dtype) @ torch.randn(rank, n, dtype=dtype)
+        for x in (a, a.mT):
+            U, S, Vh = torch.linalg.svd(x.to(mojo_gpu))
+            U, S, Vh = U.cpu(), S.cpu(), Vh.cpu()
+            exact = torch.linalg.svdvals(x.double())
+            torch.testing.assert_close(
+                S[:rank].double(), exact[:rank], rtol=1e-4, atol=0.0
+            )
+            assert (U @ torch.diag(S) @ Vh - x).abs().max() <= 1e-4 * x.abs().max()
+
+
+def test_svd_tall_float32(mojo_gpu: str):
+    """A tall float32 matrix (on Metal too): the thresholds that scale with
+    the row count stay capped, so the pairs still rotate."""
+    m = 1 << 16
+    s = torch.linalg.svdvals(torch.ones(m, 2).to(mojo_gpu)).cpu()
+    torch.testing.assert_close(
+        s, torch.tensor([float(2 * m) ** 0.5, 0.0]), rtol=1e-5, atol=1e-3
+    )
+    torch.manual_seed(24)
+    a = torch.randn(m, 1) @ torch.randn(1, 4) + 1e-3 * torch.randn(m, 4)
+    s = torch.linalg.svdvals(a.to(mojo_gpu)).cpu().double()
+    torch.testing.assert_close(
+        s, torch.linalg.svdvals(a.double()), rtol=1e-4, atol=1e-4
+    )
