@@ -944,3 +944,17 @@ def test_upsample_aa_keeps_channels_last(mojo_device, op):
     got = fn(x.to(mojo_device), [5, 6], False)
     assert got.stride() == want.stride()
     torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)
+
+
+def test_upsample_aa_keeps_sliced_channels_last(mojo_device):
+    """suggest_memory_format's stride heuristic: a sliced NHWC view still
+    suggests channels_last."""
+    base = torch.randn(2, 3, 18, 8).to(memory_format=torch.channels_last)
+    x = base[:, :, ::2, :]
+    xm = base.to(mojo_device)[:, :, ::2, :]
+    assert xm.stride() == x.stride()
+    want = torch.ops.aten._upsample_bilinear2d_aa(x, [5, 6], False)
+    got = torch.ops.aten._upsample_bilinear2d_aa(xm, [5, 6], False)
+    assert want.is_contiguous(memory_format=torch.channels_last)
+    assert got.stride() == want.stride()
+    torch.testing.assert_close(got.cpu(), want, atol=1e-5, rtol=1e-5)

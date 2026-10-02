@@ -3131,3 +3131,101 @@ def test_gemm16_sched_slot_is_stable_across_many_launches(mojo_h100):
     first, last, rel = float(first), float(last), float(rel)
     assert last < 1.5 * first, f"per-launch {first * 1e6:.0f} -> {last * 1e6:.0f} us"
     assert rel < _bf16_bound(8192), f"relative error {rel}"
+
+
+@pytest.mark.parametrize(
+    "name,args",
+    [
+        ("slow_conv_dilated2d", ([3, 3], None, [1, 1], [0, 0], [1, 1])),
+        ("slow_conv_dilated3d", ([1, 3, 3], None, [1, 1, 1], [0, 0, 0], [1, 1, 1])),
+        ("conv_depthwise3d", ([1, 3, 3], None, [1, 1, 1], [0, 0, 0], [1, 1, 1])),
+    ],
+)
+def test_conv_entry_point_out_rejects_self_overlap(mojo_device, name, args):
+    """An out that overlaps itself would have several results race for one
+    address: refused, as torch's copy into it does."""
+    depthwise = name.startswith("conv_depthwise")
+    spatial = (1, 5, 5) if name.endswith("3d") else (5, 5)
+    x = torch.randn(1, 1, *spatial, device=mojo_device)
+    w = torch.randn(1, 1, *args[0], device=mojo_device)
+    out_shape = (1, 1, *[e - k + 1 for e, k in zip(spatial, args[0], strict=True)])
+    out = torch.empty(1, device=mojo_device).expand(out_shape)
+    op = getattr(torch.ops.aten, name).out
+    if depthwise:
+        w = w[:, :1]
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        op(x, w, *args, out=out)
+
+
+def test_slow_conv2d_backward_out_rejects_overlapping_outs(mojo_device):
+    x = torch.randn(1, 2, 5, 5, device=mojo_device)
+    w = torch.randn(3, 2, 3, 3, device=mojo_device)
+    go = torch.randn(1, 3, 3, 3, device=mojo_device)
+    args = ([3, 3], [1, 1], [0, 0])
+    gw = torch.empty(3, 2, 3, 3, device=mojo_device)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.ops.aten._slow_conv2d_backward.grad_input(
+            go,
+            x,
+            w,
+            *args,
+            grad_input=torch.empty(1, device=mojo_device).expand(1, 2, 5, 5),
+            grad_weight=gw,
+            grad_bias=torch.empty(3, device=mojo_device),
+        )
+    with pytest.raises(RuntimeError, match="unsupported operation|overlap"):
+        torch.ops.aten._slow_conv2d_backward.grad_input(
+            go,
+            x,
+            w,
+            *args,
+            grad_input=torch.empty(1, 2, 5, 5, device=mojo_device),
+            grad_weight=gw,
+            grad_bias=gw.view(-1)[:3],
+        )
+
+
+@pytest.mark.parametrize(
+    "name,args,match",
+    [
+        (
+            "slow_conv_transpose2d",
+            ([3, 3], None, [1], [0, 0], [0, 0], [1, 1]),
+            "It is expected stride equals to 2, but got size 1",
+        ),
+        (
+            "slow_conv_dilated2d",
+            ([3, 3], None, [1, 1], [0], [1, 1]),
+            "pads length should be 2, but got 1",
+        ),
+    ],
+)
+def test_conv_entry_points_take_full_length_lists(mojo_device, name, args, match):
+    """Unlike aten::convolution, the entry points do not expand a one-element
+    list: upstream's checks and words."""
+    x = torch.randn(1, 2, 5, 5)
+    w = torch.randn(2, 2, 3, 3)
+    op = getattr(torch.ops.aten, name)
+    with pytest.raises(RuntimeError, match=match):
+        op(x.to(mojo_device), w.to(mojo_device), *args)
+    with pytest.raises(RuntimeError, match=match):
+        op(x, w, *args)
+
+
+def test_convolution_error_wording(mojo_device):
+    """CUDA's wording: legacy tensor type names, a comma between the
+    dilation axes."""
+    x = torch.randn(1, 2, 5, 5, device=mojo_device)
+    w = torch.randn(3, 2, 3, 3, device=mojo_device)
+    with pytest.raises(
+        RuntimeError,
+        match=re.escape(
+            "Input type (torch.mojo.FloatTensor) and weight type "
+            "(torch.mojo.HalfTensor) should be the same"
+        ),
+    ):
+        F.conv2d(x, w.half())
+    with pytest.raises(
+        RuntimeError, match="but got dilation_height: 0, dilation_width: 0"
+    ):
+        F.conv2d(x, w, dilation=0)

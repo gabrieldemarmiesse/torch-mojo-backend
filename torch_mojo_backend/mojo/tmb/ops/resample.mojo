@@ -541,15 +541,28 @@ def op_upsample[
 
 
 def _suggests_channels_last(t: T) -> Bool:
-    """c10's `suggest_memory_format` == ChannelsLast for a rank-4 tensor:
-    not contiguous, and strided like NHWC (size-1 dims carry no stride)."""
-    if t.rank != 4 or t.contig:
+    """c10's `suggest_memory_format() == ChannelsLast` for a rank-4 tensor:
+    `is_channels_last_strides_2d_s4` (c10/core/MemoryFormat.h), the stride
+    heuristic torch caches as `is_strides_like_channels_last`, so a sliced
+    or otherwise non-dense NHWC view counts too."""
+    if t.rank != 4:
         return False
-    var want = _channels_last_strides(t.shape, 4)
-    for i in range(4):
-        var p = MAX_RANK - 4 + i
-        if t.shape[p] > 1 and t.strides[p] != want[p]:
+    var o = MAX_RANK - 4
+    if t.strides[o + 1] == 0:
+        return False
+    var min_s = 0
+    for d in [1, 3, 2, 0]:
+        var size = t.shape[o + d]
+        var stride = t.strides[o + d]
+        if size == 0:
             return False
+        if stride < min_s:
+            return False
+        if d == 0 and min_s == t.strides[o + 1]:
+            return False
+        min_s = stride
+        if size > 1:
+            min_s *= size
     return True
 
 

@@ -234,11 +234,12 @@ def test_pdist_zero_columns_and_grad_stride(mojo_gpu):
     # A strided grad: `_pdist_backward` reads grad[k * stride].
     x = torch.randn(6, 3)
     dist = aten._pdist_forward(x, 2.0)
-    grad = torch.randn(2 * dist.numel())[::2]
-    want = aten._pdist_backward(grad, x, 2.0, dist)
-    got = aten._pdist_backward(
-        grad.to(mojo_gpu), x.to(mojo_gpu), 2.0, dist.to(mojo_gpu)
-    )
+    full = torch.randn(2 * dist.numel())
+    want = aten._pdist_backward(full[::2], x, 2.0, dist)
+    # Sliced on the device: `.to()` of a CPU slice would make it dense.
+    grad = full.to(mojo_gpu)[::2]
+    assert not grad.is_contiguous() and grad.stride() == (2,)
+    got = aten._pdist_backward(grad, x.to(mojo_gpu), 2.0, dist.to(mojo_gpu))
     torch.testing.assert_close(got.cpu(), want)
 
 

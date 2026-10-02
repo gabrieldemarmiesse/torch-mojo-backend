@@ -76,6 +76,7 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.binary import Res, _b_no_partial_overlap, _b_tside
 from tmb.ops.common import (
     assert_no_internal_overlap,
+    assert_no_overlap,
     call_op_raw,
     can_cast,
     cast_into,
@@ -4108,16 +4109,22 @@ def _conv_args(
     )
 
 
-def _axes_str(name: StaticString, xs: List[Int]) -> String:
-    """` name_height: a name_width: b` (with `name_depth` for three axes), the
-    way CUDA's THNN shape checks print a per-axis parameter. A 1-D
+def _axes_str(name: StaticString, xs: List[Int], sep: StaticString) -> String:
+    """` name_height: a<sep>name_width: b` (with `name_depth` first for three
+    axes), the way CUDA's THNN shape checks print a per-axis parameter
+    (`sep` is ", " in their dilation message, " " elsewhere). A 1-D
     convolution runs as 2-D with a unit height, as ATen views it."""
     var full = _unit_pad(xs, len(xs), 1 if name != "output_padding" else 0)
-    var out = String()
+    var parts = List[String]()
     if len(xs) == 3:
-        out += " " + String(name) + "_depth: " + String(full[0])
-    out += " " + String(name) + "_height: " + String(full[1])
-    out += " " + String(name) + "_width: " + String(full[2])
+        parts.append(String(name) + "_depth: " + String(full[0]))
+    parts.append(String(name) + "_height: " + String(full[1]))
+    parts.append(String(name) + "_width: " + String(full[2]))
+    var out = String(" ")
+    for i in range(len(parts)):
+        if i:
+            out += String(sep)
+        out += parts[i]
     return out
 
 
@@ -4131,7 +4138,7 @@ def _check_conv_backend(input: T, p: ConvArgs) raises:
         if p.dilation[i] == 0:
             raise Error(
                 "dilation should be greater than zero, but got",
-                _axes_str("dilation", p.dilation),
+                _axes_str("dilation", p.dilation, ", "),
             )
     if p.transposed:
         for i in range(len(p.output_padding)):
@@ -4144,10 +4151,41 @@ def _check_conv_backend(input: T, p: ConvArgs) raises:
                         "output padding must be smaller than either stride or"
                         " dilation, but got"
                     ),
-                    _axes_str("output_padding", p.output_padding),
-                    _axes_str("stride", p.stride),
-                    _axes_str("dilation", p.dilation),
+                    _axes_str("output_padding", p.output_padding, " "),
+                    _axes_str("stride", p.stride, " "),
+                    _axes_str("dilation", p.dilation, " "),
                 )
+
+
+def _tensor_type_str(t: T) -> String:
+    """`Tensor::toString()`: the legacy type name torch prints in
+    `check_input_same_type_as_parameters` (`torch.mojo.FloatTensor`)."""
+    var base = String("torch.") + ("mojo." if t.on_mojo() else "")
+    var st = t.stype
+    var name: String
+    if st == Int32(6):
+        name = "Float"
+    elif st == Int32(5):
+        name = "Half"
+    elif st == Int32(15):
+        name = "BFloat16"
+    elif st == Int32(7):
+        name = "Double"
+    elif st == Int32(4):
+        name = "Long"
+    elif st == Int32(3):
+        name = "Int"
+    elif st == Int32(2):
+        name = "Short"
+    elif st == Int32(1):
+        name = "Char"
+    elif st == Int32(0):
+        name = "Byte"
+    elif st == Int32(11):
+        name = "Bool"
+    else:
+        return base + dtype_name(st) + "Tensor"
+    return base + name + "Tensor"
 
 
 def _check_conv_shapes(
@@ -4281,9 +4319,9 @@ def _check_conv_shapes(
     if input.stype != weight.stype or input.device != weight.device:
         raise Error(
             "Input type (",
-            dtype_name(input.stype),
+            _tensor_type_str(input),
             ") and weight type (",
-            dtype_name(weight.stype),
+            _tensor_type_str(weight),
             ") should be the same",
         )
     if bias and (
@@ -4291,9 +4329,9 @@ def _check_conv_shapes(
     ):
         raise Error(
             "Input type (",
-            dtype_name(input.stype),
+            _tensor_type_str(input),
             ") and bias type (",
-            dtype_name(bias.value().stype),
+            _tensor_type_str(bias.value()),
             ") should be the same",
         )
 
@@ -5038,6 +5076,93 @@ comptime _UNBATCHED_KEEP = 1
 comptime _UNBATCHED_SQUEEZE = 2
 
 
+def _length_error(msg: String, ok: Bool) raises:
+    if not ok:
+        raise Error(msg)
+
+
+def _check_entry_lengths(
+    name: StaticString,
+    spatial: Int,
+    k: Int,
+    st: Int,
+    pad: Int,
+    dil: Int,
+    opad: Int,
+) raises:
+    """Each entry point's own argument-length checks, in upstream's order
+    and words: an int[N] list given one element is NOT expanded here, unlike
+    `aten::convolution`'s `expand_param_if_needed`."""
+    var n = String(spatial)
+    if name.startswith("slow_conv_transpose") or name == "slow_conv3d":
+        # NaiveConvolutionTranspose{2d.cpp,3d.cu}, ConvolutionMM3d.cpp. The
+        # output_padding message says "stride" upstream.
+        var lists: List[Tuple[String, Int]] = [
+            ("kernel_size", k),
+            ("dilation", dil),
+            ("padding", pad),
+            ("stride", st),
+            ("stride", opad),
+        ]
+        if name == "slow_conv3d":
+            lists = [("kernel_size", k), ("padding", pad), ("stride", st)]
+        for e in lists:
+            _length_error(
+                String(
+                    "It is expected ",
+                    e[0],
+                    " equals to ",
+                    n,
+                    ", but got size ",
+                    e[1],
+                ),
+                e[1] == spatial,
+            )
+    elif name.startswith("slow_conv_dilated"):
+        var lists: List[Tuple[String, Int]] = [
+            ("kernel sizes", k),
+            ("strides", st),
+            ("dilations", dil),
+            ("pads", pad),
+        ]
+        for e in lists:
+            _length_error(
+                String(e[0], " length should be ", n, ", but got ", e[1]),
+                e[1] == spatial,
+            )
+    elif name == "conv_depthwise3d":
+        var lists: List[Tuple[String, Int]] = [
+            ("kernel size", k),
+            ("stride", st),
+            ("padding", pad),
+            ("dilation", dil),
+        ]
+        for e in lists:
+            _length_error(
+                String(e[0], " length should be ", n, ", but got ", e[1]),
+                e[1] == spatial,
+            )
+    else:
+        # CUDA's THNN 2-D and depthwise 2-D: bare TORCH_CHECKs.
+        var lists: List[Tuple[String, Int]] = [
+            ("kernel_size", k),
+            ("stride", st),
+            ("padding", pad),
+            ("dilation", dil),
+        ]
+        for e in lists:
+            _length_error(
+                String(
+                    "Expected ",
+                    e[0],
+                    ".size() == ",
+                    n,
+                    " to be true, but got false.",
+                ),
+                e[1] == spatial,
+            )
+
+
 def _entry_conv(
     args: Values,
     spatial: Int,
@@ -5065,6 +5190,15 @@ def _entry_conv(
         output_padding.append(0)
     if has_dilation:
         dilation = IntList(args[unsafe_offset=next]).to_list()
+    _check_entry_lengths(
+        name,
+        spatial,
+        len(kernel_size),
+        len(stride),
+        len(padding),
+        len(dilation) if has_dilation else spatial,
+        len(output_padding) if transposed else spatial,
+    )
     _check_kernel_size(weight, kernel_size, spatial)
     # An unbatched (C, spatial...) input runs as (1, C, ...). What comes
     # back differs per kernel, as upstream's do (`unbatched`): REJECT it
@@ -5137,6 +5271,10 @@ def _out_dest(args: Values, slot: Int) raises -> T:
     kernel runs."""
     var dest = v_tensor(args[unsafe_offset=slot])
     check_out(dest, v_tensor(args[unsafe_offset=0]))
+    # The result is computed into a fresh tensor and copied, so an `out`
+    # aliasing an input reads nothing stale; one that overlaps ITSELF would
+    # have several results race for one address.
+    assert_no_internal_overlap(dest)
     return dest^
 
 
@@ -5415,6 +5553,9 @@ def op_slow_conv2d_backward_out(
     for i in range(3):
         var d = v_tensor(args[unsafe_offset=6 + i])
         check_out(d, input)
+        assert_no_internal_overlap(d)
+        for j in range(len(outs)):
+            assert_no_overlap(d, outs[j])
         outs.append(d^)
     var gi = own(_empty_result(input.stype, input.device))
     var gw = own(_empty_result(input.stype, input.device))

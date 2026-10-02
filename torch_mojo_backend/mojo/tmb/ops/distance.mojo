@@ -427,7 +427,9 @@ def _cdist_backward(args: Values) raises -> Owned:
     if total > 0:
         slices = min((131072 + total - 1) // total, (r2 + 15) // 16, 1024)
         slices = max(slices, 1)
-    var ws = own(new_tensor(_shape_of([], 1, 1), 2, x1.stype, x1.device))
+    # The slice workspace exists only when there is more than one slice;
+    # slot 0 tells the kernel family to write grad_x1 directly.
+    var ws = Optional[Owned](None)
     if slices > 1:
         ws = own(
             new_tensor(_shape_of([], slices, total), 2, x1.stype, x1.device)
@@ -447,7 +449,7 @@ def _cdist_backward(args: Values) raises -> Owned:
     call.int(r2)
     call.int(c1)
     call.int(ctx_ptr(ctx))
-    call.int(ws.t.ptr)
+    call.int(ws.value().t.ptr if ws else 0)
     call.int(slices)
     call.run()
     _ = ctx
