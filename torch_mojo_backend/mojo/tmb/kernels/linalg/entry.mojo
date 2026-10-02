@@ -43,6 +43,7 @@ from std.sys.info import has_accelerator
 from std.utils.static_tuple import StaticTuple
 
 from tmb.kernels.common.block_reduce import block_sum
+from tmb.kernels.common.libdevice_port import nv_log, nv_logf
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
@@ -1250,6 +1251,52 @@ def _pivsign_kernel[
         t += Int(grid_dim.x) * Int(block_dim.x)
 
 
+@__name(t"linalg_lu_slogdet_{dt}_t{LA_THREADS}")
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(LA_THREADS))
+)
+def _slogdet_kernel[
+    dt: DType
+](
+    lu: FPtr[dt],
+    piv: IPtr,
+    sign: FPtr[dt],
+    logabs: FPtr[dt],
+    n64: Int64,
+    rs64: Int64,
+    cs64: Int64,
+    bs64: Int64,
+    batch64: Int64,
+):
+    """sign and log|det| of a getrf factorization: det(P) times the signs
+    of U's diagonal (torch's `sgn`: 0 for 0 and NaN), and the sum of the
+    logs of its magnitudes."""
+    var n = Int(n64)
+    var rs = Int(rs64)
+    var cs = Int(cs64)
+    var bs = Int(bs64)
+    var batch = Int(batch64)
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    while t < batch:
+        var sg = Scalar[dt](1)
+        var acc = Scalar[dt](0)
+        for i in range(n):
+            if Int(piv[unsafe_offset=t * n + i]) != i + 1:
+                sg = -sg
+            var d = lu[unsafe_offset=t * bs + i * rs + i * cs]
+            var ds = Scalar[dt](1) if d > 0 else (
+                Scalar[dt](-1) if d < 0 else Scalar[dt](0)
+            )
+            sg = sg * ds
+            comptime if dt == DType.float64:
+                acc += nv_log(_abs(d).cast[DType.float64]()).cast[dt]()
+            else:
+                acc += nv_logf(_abs(d).cast[DType.float32]()).cast[dt]()
+        sign[unsafe_offset=t] = sg
+        logabs[unsafe_offset=t] = acc
+        t += Int(grid_dim.x) * Int(block_dim.x)
+
+
 # ---------------------------------------------------------------------------
 # Host side: one launcher per op, all behind one slot layout
 #   (p0, p1, p2, p3, p4, ints, ctx), ints = [dtype code, op params...]
@@ -1478,6 +1525,24 @@ def _launch[
                 _ti(ints, 8),
                 _ti(ints, 9),
             )
+        elif _op_on["Slogdet"]():
+            # n, rs, cs, bs, batch; p0 lu, p1 piv, p2 sign, p3 logabs
+            _enqueue_cached[_slogdet_kernel[dt]](
+                ctx,
+                _blocks((Int(_ti(ints, 4)) + LA_THREADS - 1) // LA_THREADS),
+                1,
+                1,
+                LA_THREADS,
+                _fp[dt](p0),
+                _ip(p1),
+                _fp[dt](p2),
+                _fp[dt](p3),
+                _ti(ints, 0),
+                _ti(ints, 1),
+                _ti(ints, 2),
+                _ti(ints, 3),
+                _ti(ints, 4),
+            )
         elif _op_on["PivSign"]():
             # k, batch
             _enqueue_cached[_pivsign_kernel[dt]](
@@ -1555,6 +1620,7 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             or _op_on["Sytf2"]()
             or _op_on["Sytrs"]()
             or _op_on["PivSign"]()
+            or _op_on["Slogdet"]()
         ):
             _spec_dispatcher7[_linalg_go, "linalg"](argv, argc)
             return 0

@@ -239,6 +239,17 @@ _ACCELERATOR_DELTAS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
     "4-metal4": {
         "test_matches_cpu": {
             "float_power": ("float32", "bfloat16", "float16", "int64", "bool"),
+            # torch's composites build a float64 0-d tolerance tensor the
+            # float32 singular values are compared against.
+            "linalg_matrix_rank": ("float32",),
+            "linalg_matrix_rank_hermitian": ("float32",),
+            "linalg_pinv": ("float32",),
+            "linalg_pinv_hermitian": ("float32",),
+            "pinverse": ("float32",),
+            "linalg_tensorsolve": (),
+            # Metal's float32 GEMM: 2.6x CPU's error from float64 on one
+            # element of a 5x5 exponential with entries near 2000.
+            "matrix_exp": ("float32", "bfloat16", "float16"),
             # dtype=torch.float64 in every sample: no float64 on Metal.
             "log_softmax_with_dtype": (
                 "float32",

@@ -1538,14 +1538,28 @@ def _slogdet(A: T) raises -> Tuple[Owned, Owned, Owned, Owned]:
     _check_square(A, "linalg.slogdet")
     _check_float(A, "linalg.slogdet", False)
     var f = _det_lu(A, "linalg.slogdet")
-    var psign = _pivot_sign(f[1].t, A)
-    var d = own(_diagonal(f[0].t))
-    var sg = _unary("aten::sgn", d.t)
-    var sp = _reduce_last("aten::prod", sg.t)
-    var sign = _binary("aten::mul", sp.t, psign.t)
-    var ab = _unary("aten::abs", d.t)
-    var lg = _unary("aten::log", ab.t)
-    var logabs = _reduce_last("aten::sum", lg.t)
+    var sign = own(_new_c(_batch_dims(A), A.stype, A.device))
+    var logabs = own(_new_c(_batch_dims(A), A.stype, A.device))
+    var batch = _batch_count(A)
+    if batch > 0:
+        var LU = f[0].t.copy()
+        var l = List[Int]()
+        l.append(A.dim(-1))
+        l.append(LU.stride(-2))
+        l.append(LU.stride(-1))
+        l.append(_bstride(LU))
+        l.append(batch)
+        _launch(
+            "Slogdet",
+            A.dtype,
+            A.device,
+            LU.ptr,
+            f[1].t.ptr,
+            sign.t.ptr,
+            logabs.t.ptr,
+            0,
+            l,
+        )
     return (sign^, logabs^, own(f[0].take()), own(f[1].take()))
 
 
