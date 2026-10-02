@@ -727,3 +727,26 @@ def test_svd_tiny_singular_values_survive(mojo_gpu: str):
     torch.testing.assert_close(s, torch.tensor([1.0, 1e-25, 1e-36]))
     U, S, Vh = torch.linalg.svd(a.to(mojo_gpu))
     _close(U.cpu().abs(), torch.eye(3), torch.float32)
+
+
+# --- round-4 review regressions -----------------------------------------------------
+
+
+def test_svd_norm_ratio_beyond_range_float64(mojo_gpu: str):
+    skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    a = torch.tensor([[1e70, 1e-250], [0.0, 1e-250]], dtype=torch.float64)
+    s = torch.linalg.svdvals(a.to(mojo_gpu)).cpu()
+    torch.testing.assert_close(s, torch.linalg.svdvals(a), rtol=1e-12, atol=0.0)
+
+
+def test_svd_float64_accuracy_tall(mojo_gpu: str):
+    """Rotating down to dgesvj's sqrt(m) * eps keeps a tall float64 SVD's
+    reconstruction within a small factor of LAPACK's."""
+    skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    torch.manual_seed(23)
+    a = torch.randn(1000, 50, dtype=torch.float64)
+    U, S, Vh = torch.linalg.svd(a.to(mojo_gpu), full_matrices=False)
+    err = (U.cpu() @ torch.diag(S.cpu()) @ Vh.cpu() - a).abs().max()
+    U0, S0, Vh0 = torch.linalg.svd(a, full_matrices=False)
+    cpu_err = (U0 @ torch.diag(S0) @ Vh0 - a).abs().max()
+    assert err <= 10 * cpu_err, (err, cpu_err)

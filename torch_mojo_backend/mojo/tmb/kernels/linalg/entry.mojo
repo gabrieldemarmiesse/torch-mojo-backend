@@ -922,6 +922,20 @@ def _syevj_kernel[
 
 
 @always_inline
+def _svd_tols[dt: DType](m: Int) -> Tuple[Scalar[dt], Scalar[dt]]:
+    """(rotate, converged) cosine thresholds of the one-sided Jacobi SVD
+    over m-row columns. A pair rotates above sqrt(m) * eps (dgesvj's
+    tolerance: accuracy), but only a cosine above m * eps -- the rounding
+    bound of an m-term inner product, below which a cosine may be noise --
+    keeps the sweeps going (termination). Both capped at 2^-10, far below
+    1, so a huge m still rotates."""
+    var eps = _eps[dt]()
+    var cap = Scalar[dt](0.0009765625)
+    var mm = Scalar[dt](max(m, 1))
+    return (min(sqrt(mm) * eps, cap), min(mm * eps, cap))
+
+
+@always_inline
 def _pair_stats[
     dt: DType
 ](u: FPtr[dt], ub: Int, m: Int, p: Int, q: Int) -> Tuple[
@@ -1002,9 +1016,9 @@ def _gesvdj_kernel[
     ]()
     var mm = n + (n % 2)
     var pairs = mm // 2
-    # The rounding bound of an m-term inner product: below it a cosine is
-    # noise, and rotating on noise never converges.
-    var tol = _eps[dt]() * Scalar[dt](max(m, 1))
+    var tols = _svd_tols[dt](m)
+    var tol_rot = tols[0]
+    var tol_conv = tols[1]
     var b = Int(block_idx.x)
     while b < batch:
         var ub = b * m * n
@@ -1052,33 +1066,40 @@ def _gesvdj_kernel[
                     var p = pq[0]
                     var q = pq[1]
                     var c = Scalar[dt](1)
-                    var s = Scalar[dt](0)
+                    var tau = Scalar[dt](0)
+                    var np = Scalar[dt](0)
+                    var nq = Scalar[dt](0)
                     if q < n:
                         var st = _pair_stats[dt](u, ub, m, p, q)
-                        var np = st[0]
-                        var nq = st[1]
+                        np = st[0]
+                        nq = st[1]
                         var cs = st[2]
                         # dgesvj: rotate on the normalized inner product
                         # (the cosine of the columns' angle); a zero column
                         # is orthogonal to everything.
-                        if np > 0 and nq > 0 and _abs(cs) > tol:
-                            # zeta = (nq^2 - np^2) / (2 <a_p, a_q>), from
-                            # the norms' ratio so nothing overflows.
-                            var d = nq / np - np / nq
-                            var tt: Scalar[dt]
-                            if 2 * _abs(cs) < _abs(d) * _eps[dt]():
-                                tt = cs / d
-                            else:
-                                var zeta = d / (2 * cs)
-                                tt = 1 / (_abs(zeta) + sqrt(1 + zeta * zeta))
-                                if zeta < 0:
-                                    tt = -tt
+                        if np > 0 and nq > 0 and _abs(cs) > tol_rot:
+                            # With r = small norm / large norm <= 1 and
+                            # A = (1 - r^2) / 2cs (sign set by which column
+                            # is larger), the tangent is t = r * tau,
+                            # tau = sign(A) / (|A| + sqrt(r^2 + A^2)): finite
+                            # even when r underflows, and the large column's
+                            # share of the small one's update is formed as
+                            # tau * small_norm * (large / large_norm).
+                            var r = nq / np if np >= nq else np / nq
+                            var a_ = (1 - r * r) / (2 * cs)
+                            if np >= nq:
+                                a_ = -a_
+                            tau = 1 / (_abs(a_) + sqrt(r * r + a_ * a_))
+                            if a_ < 0:
+                                tau = -tau
+                            var tt = r * tau
                             c = 1 / sqrt(1 + tt * tt)
-                            s = tt * c
-                            if s != 0:
+                            if _abs(cs) > tol_conv:
                                 flag[unsafe_offset=0] = 1
-                    ws[unsafe_offset=wsb + 2 * t] = c
-                    ws[unsafe_offset=wsb + 2 * t + 1] = s
+                    ws[unsafe_offset=wsb + 4 * t] = c
+                    ws[unsafe_offset=wsb + 4 * t + 1] = tau
+                    ws[unsafe_offset=wsb + 4 * t + 2] = np
+                    ws[unsafe_offset=wsb + 4 * t + 3] = nq
                     t += nt
                 barrier()
                 idx = tid
@@ -1086,22 +1107,38 @@ def _gesvdj_kernel[
                 while idx < rows * pairs:
                     var r = idx % rows
                     var pt = idx // rows
-                    var s = ws[unsafe_offset=wsb + 2 * pt + 1]
-                    if s != 0:
-                        var c = ws[unsafe_offset=wsb + 2 * pt]
+                    var tau = ws[unsafe_offset=wsb + 4 * pt + 1]
+                    if tau != 0:
+                        var c = ws[unsafe_offset=wsb + 4 * pt]
+                        var np = ws[unsafe_offset=wsb + 4 * pt + 2]
+                        var nq = ws[unsafe_offset=wsb + 4 * pt + 3]
+                        var p_big = np >= nq
+                        var tt = (nq / np if p_big else np / nq) * tau
                         var pq = _rr_pair(rnd, pt, mm)
                         var p = pq[0]
                         var q = pq[1]
+                        # p' = c (p - t q), q' = c (q + t p); the term the
+                        # large column adds to the small one is scaled
+                        # through its norm so it neither over- nor
+                        # underflows.
                         if r < m:
                             var x = u[unsafe_offset=ub + r + p * m]
                             var y = u[unsafe_offset=ub + r + q * m]
-                            u[unsafe_offset=ub + r + p * m] = c * x - s * y
-                            u[unsafe_offset=ub + r + q * m] = s * x + c * y
+                            var tq: Scalar[dt]
+                            var tp: Scalar[dt]
+                            if p_big:
+                                tq = tt * y
+                                tp = tau * nq * (x / np)
+                            else:
+                                tq = tau * np * (y / nq)
+                                tp = tt * x
+                            u[unsafe_offset=ub + r + p * m] = c * (x - tq)
+                            u[unsafe_offset=ub + r + q * m] = c * (y + tp)
                         if want_uv and r < n:
                             var x = vw[unsafe_offset=vb + r + p * n]
                             var y = vw[unsafe_offset=vb + r + q * n]
-                            vw[unsafe_offset=vb + r + p * n] = c * x - s * y
-                            vw[unsafe_offset=vb + r + q * n] = s * x + c * y
+                            vw[unsafe_offset=vb + r + p * n] = c * (x - tt * y)
+                            vw[unsafe_offset=vb + r + q * n] = c * (y + tt * x)
                     idx += nt
                 barrier()
             var rotated = flag[unsafe_offset=0]
