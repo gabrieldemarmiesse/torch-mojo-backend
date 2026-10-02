@@ -131,7 +131,7 @@ def test_both_walkers_agree_on_the_real_tree(cache_probe: Path, tmp_path: Path):
         "from std.sys import argv\n\n"
         "def main() raises:\n"
         '    var loader = Loader(argv()[1], "", "", "test", False)\n'
-        "    for f in loader._closure(argv()[2]):\n"
+        "    for f in loader._closure_texts(argv()[2])[0]:\n"
         "        print(f)\n"
     )
     executable = tmp_path / "closure_probe"
