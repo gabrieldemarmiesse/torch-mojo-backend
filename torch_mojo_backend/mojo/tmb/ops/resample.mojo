@@ -1185,8 +1185,10 @@ def _copy_to_out(mut dst: T, src: T, dims: List[Int], name: String) raises:
     then the generated `copy_arg`, which requires the result's exact dtype
     and device (no cast), into an `out` that does not overlap itself."""
     check_out_as(dst, src.stype, src)
-    assert_no_internal_overlap(dst)
+    # ATen's order: resize first (a wrongly shaped out gets a fresh layout),
+    # then the overlap check on the final one.
     resize_out(dst, _shape(dims), len(dims))
+    assert_no_internal_overlap(dst)
     if dst.numel == 0:
         return
     copy_strided_into(dst, src)

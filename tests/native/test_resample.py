@@ -968,13 +968,13 @@ def test_grid_sample_backward_out_shared_storage_resize(mojo_device):
     want = torch.ops.aten.grid_sampler_2d_backward(
         go, x, grid, 0, 0, False, [True, True]
     )
-    # Resizing out0 to (1, 1, 3, 3) grows the 5-element storage; out1, a
-    # stale view of it until re-read, is then resized and written. The two
-    # overlap after the resizes, so (as on CPU) out1 is written last and is
-    # the one whose values survive.
-    base = torch.zeros(5, device=mojo_device)
-    out0 = base[:1]
-    out1 = base[1:5]
+    # out1 already has its shape (no resize, so nothing refreshes its
+    # pointer); resizing out0, an empty view at the end of the same 8-element
+    # storage, grows that storage to 17 elements and moves it. out1 must be
+    # read after that resize, or it writes into the freed buffer.
+    base = torch.zeros(8, device=mojo_device)
+    out0 = base[8:]
+    out1 = base.view(1, 2, 2, 2)
     torch.ops.aten.grid_sampler_2d_backward.out(
         go.to(mojo_device),
         x.to(mojo_device),
@@ -986,5 +986,32 @@ def test_grid_sample_backward_out_shared_storage_resize(mojo_device):
         out0=out0,
         out1=out1,
     )
-    assert out0.shape == want[0].shape
+    torch.testing.assert_close(out0.cpu(), want[0], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out1.cpu(), want[1], atol=1e-5, rtol=1e-5)
+    # out1 still views the (moved) storage it shares with out0.
+    assert out1.untyped_storage().data_ptr() == out0.untyped_storage().data_ptr()
+
+
+def test_grid_sample_backward_out_resizes_before_the_overlap_check(mojo_device):
+    """An expanded out of the wrong shape is resized to fresh storage first,
+    then checked, as torch does: accepted."""
+    x, grid = _grid_inputs((1, 1, 3, 3), (2, 2), torch.float32)
+    go = torch.randn(1, 1, 2, 2)
+    want = torch.ops.aten.grid_sampler_2d_backward(
+        go, x, grid, 0, 0, False, [True, True]
+    )
+    out0 = torch.empty(1, device=mojo_device).expand(2)
+    out1 = torch.empty(1, device=mojo_device).expand(2)
+    torch.ops.aten.grid_sampler_2d_backward.out(
+        go.to(mojo_device),
+        x.to(mojo_device),
+        grid.to(mojo_device),
+        0,
+        0,
+        False,
+        [True, True],
+        out0=out0,
+        out1=out1,
+    )
+    torch.testing.assert_close(out0.cpu(), want[0], atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(out1.cpu(), want[1], atol=1e-5, rtol=1e-5)
