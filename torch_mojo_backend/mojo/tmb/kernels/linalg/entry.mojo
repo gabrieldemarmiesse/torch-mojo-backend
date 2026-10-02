@@ -1058,16 +1058,20 @@ def _gesvdj_kernel[
                 break
             if tid == 0:
                 flag[unsafe_offset=0] = 0
-            # The largest column norm, this sweep: a column below
-            # tol_conv of it is numerically zero (dgesvj), still rotated
-            # but never what keeps the sweeps going -- the noise columns
-            # of a rank-deficient matrix would otherwise rotate forever.
+            # The largest column norm, this sweep: a column below n * eps
+            # of it is numerically zero (dgesvj) -- the roundoff level a
+            # sweep's n rotations leave in a column, which is where the
+            # noise columns of a rank-deficient matrix sit. It is still
+            # rotated but never what keeps the sweeps going (it would
+            # otherwise rotate forever).
             var cmax = Scalar[dt](0)
             idx = tid
             while idx < n:
                 cmax = _nan_max(cmax, _pair_stats[dt](u, ub, m, idx, idx)[0])
                 idx += nt
-            var negligible = tol_conv * _block_max[dt](cmax)
+            var negligible = (
+                _eps[dt]() * Scalar[dt](max(n, 1)) * _block_max[dt](cmax)
+            )
             for rnd in range(mm - 1):
                 var t = tid
                 while t < pairs:

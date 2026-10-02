@@ -791,3 +791,14 @@ def test_svd_tall_float32(mojo_gpu: str):
     torch.testing.assert_close(
         s, torch.linalg.svdvals(a.double()), rtol=1e-4, atol=1e-4
     )
+
+
+def test_svd_graded_columns_keep_converging(mojo_gpu: str):
+    """Columns well above roundoff but far below the largest one must keep
+    the sweeps going until they are orthogonal (on Metal too)."""
+    torch.manual_seed(0)
+    a = torch.zeros(4096, 9)
+    a[0, 0] = 1
+    a[1:9, 1:9] = 1e-4 * torch.randn(8, 8)
+    s = torch.linalg.svdvals(a.to(mojo_gpu)).cpu().double()
+    torch.testing.assert_close(s, torch.linalg.svdvals(a.double()), rtol=1e-3, atol=0.0)
