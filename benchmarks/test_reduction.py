@@ -912,6 +912,7 @@ def test_linear_combination(
         lambda: torch.ops.aten._compute_linear_combination(i_ref, c_ref),
         lambda: torch.ops.aten._compute_linear_combination(i_our, c_our),
         flops=float(i_ref.numel() * 8),
+    )
 
 
 def _cdist_case(
