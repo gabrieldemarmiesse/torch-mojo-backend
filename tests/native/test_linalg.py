@@ -671,3 +671,59 @@ def test_matrix_exp_huge_norm_scaling(mojo_gpu: str):
     a = torch.diag(torch.tensor([-3e38, -3e38]))
     got = torch.linalg.matrix_exp(a.to(mojo_gpu)).cpu()
     assert torch.equal(got, torch.zeros(2, 2)), got
+
+
+# --- round-3 review regressions -----------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_svd_converges_on_exactly_rank_deficient(mojo_gpu: str, dtype: torch.dtype):
+    _dtype_or_skip(mojo_gpu, dtype)
+    shapes = [(m, n) for m in (1, 2, 5, 12, 23, 37, 70) for n in (1, 3, 12, 22, 33)]
+    for m, n in shapes:
+        a = torch.ones(m, n, dtype=dtype)
+        s = torch.linalg.svdvals(a.to(mojo_gpu)).cpu()
+        assert abs(s[0].item() - (m * n) ** 0.5) <= 1e-4 * (m * n) ** 0.5, (m, n)
+        assert (
+            s[1:].abs().max().item() <= 1e-4 * (m * n) ** 0.5 if s.numel() > 1 else True
+        )
+    torch.manual_seed(22)
+    for m, n, r in ((40, 30, 3), (17, 50, 1), (64, 64, 10)):
+        a = (
+            torch.randn(m, r, dtype=torch.float64)
+            @ torch.randn(r, n, dtype=torch.float64)
+        ).to(dtype)
+        U, S, Vh = torch.linalg.svd(a.to(mojo_gpu), full_matrices=False)
+        U, S, Vh = U.cpu(), S.cpu(), Vh.cpu()
+        _close(
+            S[:r], torch.linalg.svdvals(a)[:r], dtype
+        ) if dtype == torch.float64 else None
+        recon = U @ torch.diag(S) @ Vh
+        assert (recon - a).abs().max() <= 1e-4 * a.abs().max(), (m, n, r)
+    batch = torch.stack(
+        [torch.ones(23, 22, dtype=dtype), torch.eye(23, 22, dtype=dtype)]
+    )
+    s = torch.linalg.svdvals(batch.to(mojo_gpu)).cpu()
+    _close(s[1], torch.ones(22, dtype=dtype), dtype)
+
+
+def test_eigh_negligible_off_diagonal_float64(mojo_gpu: str):
+    skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    a = torch.tensor([[1e100, 1e-250], [1e-250, 0.0]], dtype=torch.float64)
+    w = torch.linalg.eigvalsh(a.to(mojo_gpu)).cpu()
+    assert w.tolist() == [0.0, 1e100]
+
+
+def test_svd_tiny_singular_values_survive(mojo_gpu: str):
+    if not is_metal(mojo_gpu):
+        for vals in ((2.0**-400, 2.0**-600), (1.0, 1e-170)):
+            a = torch.diag(torch.tensor(vals, dtype=torch.float64))
+            s = torch.linalg.svdvals(a.to(mojo_gpu)).cpu()
+            torch.testing.assert_close(
+                s, torch.tensor(sorted(vals, reverse=True), dtype=torch.float64)
+            )
+    a = torch.diag(torch.tensor([1.0, 1e-25, 1e-36]))
+    s = torch.linalg.svdvals(a.to(mojo_gpu)).cpu()
+    torch.testing.assert_close(s, torch.tensor([1.0, 1e-25, 1e-36]))
+    U, S, Vh = torch.linalg.svd(a.to(mojo_gpu))
+    _close(U.cpu().abs(), torch.eye(3), torch.float32)

@@ -793,11 +793,16 @@ def _syevj_kernel[
                         if _abs(apq) > _sfmin[dt]() and _abs(apq) > tol * sqrt(
                             _abs(app)
                         ) * sqrt(_abs(aqq)):
-                            var theta = (aqq - app) / (2 * apq)
+                            # tan of the angle; theta = (aqq - app) / 2apq
+                            # is never formed when it would overflow: past
+                            # 1/eps the tangent is 1 / (2 theta) =
+                            # apq / (aqq - app) (Rutishauser).
+                            var d = aqq - app
                             var tt: Scalar[dt]
-                            if _abs(theta) > 1 / tol:
-                                tt = 1 / (2 * theta)
+                            if 2 * _abs(apq) < _abs(d) * tol:
+                                tt = apq / d
                             else:
+                                var theta = d / (2 * apq)
                                 tt = 1 / (_abs(theta) + sqrt(1 + theta * theta))
                                 if theta < 0:
                                     tt = -tt
@@ -810,7 +815,12 @@ def _syevj_kernel[
                             # the pair rotating forever).
                             app = app - tt * apq
                             aqq = aqq + tt * apq
-                            flag[unsafe_offset=0] = 1
+                            if s != 0:
+                                flag[unsafe_offset=0] = 1
+                            else:
+                                # A rotation that underflows changes
+                                # nothing: apq is negligible; drop it.
+                                c = 2
                         ws[unsafe_offset=wsb + 4 * t + 2] = app
                         ws[unsafe_offset=wsb + 4 * t + 3] = aqq
                     ws[unsafe_offset=wsb + 4 * t] = c
@@ -858,7 +868,10 @@ def _syevj_kernel[
                 barrier()
                 t = tid
                 while t < pairs:
-                    if ws[unsafe_offset=wsb + 4 * t + 1] != 0:
+                    if (
+                        ws[unsafe_offset=wsb + 4 * t + 1] != 0
+                        or ws[unsafe_offset=wsb + 4 * t] == 2
+                    ):
                         var pq = _rr_pair(rnd, t, mm)
                         var p = pq[0]
                         var q = pq[1]
@@ -908,6 +921,40 @@ def _syevj_kernel[
         b += Int(grid_dim.x)
 
 
+@always_inline
+def _pair_stats[
+    dt: DType
+](u: FPtr[dt], ub: Int, m: Int, p: Int, q: Int) -> Tuple[
+    Scalar[dt], Scalar[dt], Scalar[dt]
+]:
+    """(||u_p||, ||u_q||, cos(u_p, u_q)) of two columns of the m-row
+    column-major `u`, each column scaled by its largest magnitude first (as
+    dnrm2), so no square over- or underflows. Zero norms give cos 0."""
+    var mp = Scalar[dt](0)
+    var mq = Scalar[dt](0)
+    for r in range(m):
+        mp = _nan_max(mp, _abs(u[unsafe_offset=ub + r + p * m]))
+        mq = _nan_max(mq, _abs(u[unsafe_offset=ub + r + q * m]))
+    if not (mp > 0) or not (mq > 0):
+        return (
+            mp if mp != mp else Scalar[dt](0),
+            mq if mq != mq else Scalar[dt](0),
+            Scalar[dt](0),
+        )
+    var sa = Scalar[dt](0)
+    var sb = Scalar[dt](0)
+    var sg = Scalar[dt](0)
+    for r in range(m):
+        var x = u[unsafe_offset=ub + r + p * m] / mp
+        var y = u[unsafe_offset=ub + r + q * m] / mq
+        sa += x * x
+        sb += y * y
+        sg += x * y
+    var ra = sqrt(sa)
+    var rb = sqrt(sb)
+    return (mp * ra, mq * rb, sg / ra / rb)
+
+
 @__name(t"linalg_gesvj_{dt}_t{LA_THREADS}")
 @__llvm_metadata(
     MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(LA_THREADS))
@@ -955,7 +1002,9 @@ def _gesvdj_kernel[
     ]()
     var mm = n + (n % 2)
     var pairs = mm // 2
-    var tol = _eps[dt]() * sqrt(Scalar[dt](max(m, 1)))
+    # The rounding bound of an m-term inner product: below it a cosine is
+    # noise, and rotating on noise never converges.
+    var tol = _eps[dt]() * Scalar[dt](max(m, 1))
     var b = Int(block_idx.x)
     while b < batch:
         var ub = b * m * n
@@ -1005,29 +1054,29 @@ def _gesvdj_kernel[
                     var c = Scalar[dt](1)
                     var s = Scalar[dt](0)
                     if q < n:
-                        var alpha = Scalar[dt](0)
-                        var beta = Scalar[dt](0)
-                        var gamma = Scalar[dt](0)
-                        for r in range(m):
-                            var x = u[unsafe_offset=ub + r + p * m]
-                            var y = u[unsafe_offset=ub + r + q * m]
-                            alpha += x * x
-                            beta += y * y
-                            gamma += x * y
-                        if _abs(gamma) > _sfmin[dt]() and _abs(
-                            gamma
-                        ) > tol * sqrt(alpha) * sqrt(beta):
-                            var zeta = (beta - alpha) / (2 * gamma)
+                        var st = _pair_stats[dt](u, ub, m, p, q)
+                        var np = st[0]
+                        var nq = st[1]
+                        var cs = st[2]
+                        # dgesvj: rotate on the normalized inner product
+                        # (the cosine of the columns' angle); a zero column
+                        # is orthogonal to everything.
+                        if np > 0 and nq > 0 and _abs(cs) > tol:
+                            # zeta = (nq^2 - np^2) / (2 <a_p, a_q>), from
+                            # the norms' ratio so nothing overflows.
+                            var d = nq / np - np / nq
                             var tt: Scalar[dt]
-                            if _abs(zeta) > 1 / _eps[dt]():
-                                tt = 1 / (2 * zeta)
+                            if 2 * _abs(cs) < _abs(d) * _eps[dt]():
+                                tt = cs / d
                             else:
+                                var zeta = d / (2 * cs)
                                 tt = 1 / (_abs(zeta) + sqrt(1 + zeta * zeta))
                                 if zeta < 0:
                                     tt = -tt
                             c = 1 / sqrt(1 + tt * tt)
                             s = tt * c
-                            flag[unsafe_offset=0] = 1
+                            if s != 0:
+                                flag[unsafe_offset=0] = 1
                     ws[unsafe_offset=wsb + 2 * t] = c
                     ws[unsafe_offset=wsb + 2 * t + 1] = s
                     t += nt
@@ -1069,12 +1118,11 @@ def _gesvdj_kernel[
         # ascending order), then the scatter.
         idx = tid
         while idx < n:
-            var acc = Scalar[dt](0)
-            for r in range(m):
-                var x = u[unsafe_offset=ub + r + idx * m]
-                acc += x * x
-            # kept scaled: U divides by it before any unscaling
-            ws[unsafe_offset=wsb + n + 2 + idx] = sqrt(acc)
+            # dnrm2-style, so a tiny column keeps its norm; kept in the
+            # matrix's scaling: U divides by it before any unscaling.
+            ws[unsafe_offset=wsb + n + 2 + idx] = _pair_stats[dt](
+                u, ub, m, idx, idx
+            )[0]
             idx += nt
         barrier()
         idx = tid
