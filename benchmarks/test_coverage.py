@@ -254,6 +254,7 @@ SKIPPED_OPS: dict[str, str] = {
     "aten::log1p.out": _OUT,
     "aten::logical_not.out": _OUT,
     "aten::logit.out": _OUT,
+    "aten::logit_": _OUT,
     "aten::lt.Scalar_out": _OUT,
     "aten::lt.Tensor_out": _OUT,
     "aten::masked_fill.Scalar_out": _OUT,
