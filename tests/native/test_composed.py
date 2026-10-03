@@ -828,7 +828,9 @@ def test_linalg_cross_special_values(mojo_gpu):
     got = torch.linalg.cross(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
     expected = torch.linalg.cross(x, y)
     torch.testing.assert_close(got, expected, equal_nan=True)
-    assert torch.equal(torch.signbit(got), torch.signbit(expected))
+    # the sign of zeros (a NaN's sign bit is unspecified and differs by GPU)
+    real = ~expected.isnan()
+    assert torch.equal(torch.signbit(got[real]), torch.signbit(expected[real]))
 
 
 def test_linalg_cross_errors(mojo_gpu):
