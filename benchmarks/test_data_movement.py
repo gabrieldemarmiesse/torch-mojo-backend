@@ -181,6 +181,23 @@ SKIPPED: dict[str, str] = {
         "benchmarked in their own families"
     ),
     "aten::vdot": "dot for the real dtypes: mul + sum, both benchmarked",
+    "aten::linalg_cross": (
+        "six mul.Tensor, three sub.Tensor and three strided copies through "
+        "the dispatcher, each benchmarked in its own family"
+    ),
+    "aten::linalg_cross.out": "linalg_cross, written into the caller's out",
+    **{
+        f"aten::{name}{suffix}": (
+            "torch's test-only op (TestOps.cpp): a host loop, or a clone"
+        )
+        for name in (
+            "_test_optional_intlist",
+            "_test_optional_filled_intlist",
+            "_test_optional_floatlist",
+            "_test_functorch_fallback",
+        )
+        for suffix in ("", ".out")
+    },
     "aten::tril.out": _PAD_OUT.replace("resample", "TriangularCopy"),
     "aten::triu.out": _PAD_OUT.replace("resample", "TriangularCopy"),
     "aten::tril_": "test_tril's TriangularCopy, then a strided copy into self",

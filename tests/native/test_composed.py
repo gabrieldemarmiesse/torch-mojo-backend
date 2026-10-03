@@ -5,6 +5,7 @@ import contextlib
 import pytest
 import torch
 
+from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import native
 from torch_mojo_backend.native import device_module
 
@@ -749,3 +750,160 @@ def test_dot_errors(mojo_gpu):
         torch.dot(torch.ones(9, device=mojo_gpu), a)
     with pytest.raises(RuntimeError, match="not implemented for 'Bool'"):
         torch.dot(a.bool(), a.bool())
+
+
+# ---------------------------------------------------------------------------
+# linalg_cross (and cross, a composite over it)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+        torch.float64,
+        torch.int64,
+        torch.int32,
+    ],
+)
+@pytest.mark.parametrize(
+    ("xs", "ys", "dim"),
+    [
+        ((5, 3), (5, 3), -1),
+        ((3, 4), (3, 4), 0),
+        ((2, 1, 3, 6), (1, 4, 3, 6), 2),  # batch dims broadcast
+        ((0, 3), (1, 3), 1),
+    ],
+)
+def test_linalg_cross(mojo_gpu, dtype, xs, ys, dim):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    g = torch.Generator().manual_seed(0)
+    x = (torch.randn(xs, generator=g) * 8).to(dtype)
+    y = (torch.randn(ys, generator=g) * 8).to(dtype)
+    with assert_ran("aten::linalg_cross"):
+        got = torch.linalg.cross(x.to(mojo_gpu), y.to(mojo_gpu), dim=dim)
+    # CPU's cross computes in the operand type like CUDA's `cross_kernel`
+    # (c10::Half / BFloat16 round each product and the difference).
+    expected = torch.linalg.cross(x, y, dim=dim)
+    assert got.dtype == dtype and got.shape == expected.shape
+    torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-4)
+
+
+def test_linalg_cross_strided_out_and_cross(mojo_gpu):
+    g = torch.Generator().manual_seed(1)
+    base = torch.randn(4, 3, 10, generator=g)
+    x = base[:, :, ::3].transpose(0, 2)  # (4, 3, 4) non-contiguous
+    y = torch.randn(3, 4, generator=g).t().unsqueeze(0)  # (1, 4, 3)
+    xm, ym = base.to(mojo_gpu)[:, :, ::3].transpose(0, 2), y.to(mojo_gpu)
+    expected = torch.linalg.cross(x, y.transpose(1, 2).expand(4, 3, 4), dim=1)
+    got = torch.linalg.cross(xm, ym.transpose(1, 2), dim=1)
+    torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-5)
+    # out=: an empty out is resized, a transposed out of the right shape is
+    # written in place
+    out = torch.empty(0, device=mojo_gpu)
+    with assert_ran("aten::linalg_cross.out"):
+        r = torch.linalg.cross(xm, ym.transpose(1, 2), dim=1, out=out)
+    assert r is out
+    torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-5)
+    out_t = torch.empty(4, 4, 3, device=mojo_gpu).transpose(1, 2)
+    torch.linalg.cross(xm, ym.transpose(1, 2), dim=1, out=out_t)
+    assert out_t.stride() == (12, 1, 3)
+    torch.testing.assert_close(out_t.cpu(), expected, rtol=1e-5, atol=1e-5)
+    # torch.cross picks the first dim of size 3 when dim is omitted
+    a = torch.randn(3, 5, generator=g)
+    torch.testing.assert_close(
+        torch.cross(a.to(mojo_gpu), a.flip(1).to(mojo_gpu), dim=0).cpu(),
+        torch.cross(a, a.flip(1), dim=0),
+    )
+
+
+def test_linalg_cross_special_values(mojo_gpu):
+    x = torch.tensor(
+        [[float("inf"), 0.0, 1.0], [float("nan"), 1.0, 2.0], [-0.0, 0.0, 0.0]]
+    )
+    y = torch.tensor([[0.0, 1.0, 2.0], [1.0, 1.0, 1.0], [0.0, -0.0, 1.0]])
+    got = torch.linalg.cross(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
+    expected = torch.linalg.cross(x, y)
+    torch.testing.assert_close(got, expected, equal_nan=True)
+    assert torch.equal(torch.signbit(got), torch.signbit(expected))
+
+
+def test_linalg_cross_errors(mojo_gpu):
+    a = torch.ones(4, 3, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="same number of dimensions"):
+        torch.linalg.cross(a, torch.ones(2, 4, 3, device=mojo_gpu))
+    with pytest.raises(
+        RuntimeError, match="dimension 0 must have length 3. Got 4 and 4"
+    ):
+        torch.linalg.cross(a, a, dim=0)
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        torch.linalg.cross(a, a, dim=2)
+    with pytest.raises(RuntimeError, match="must match the size of tensor b"):
+        torch.linalg.cross(a, torch.ones(5, 3, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="Found dtype Double but expected Float"):
+        torch.linalg.cross(a, a.double())
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        torch.linalg.cross(
+            a, a, out=torch.empty(4, 3, device=mojo_gpu, dtype=torch.half)
+        )
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.linalg.cross(a, a, out=a)
+    with pytest.raises(NotImplementedError, match="not implemented for 'Bool'"):
+        torch.linalg.cross(a.bool(), a.bool())
+    # an empty result never reaches the dtype dispatch, as on CUDA
+    e = torch.ones(0, 3, device=mojo_gpu, dtype=torch.bool)
+    assert torch.linalg.cross(e, e).shape == (0, 3)
+
+
+# ---------------------------------------------------------------------------
+# torch's test-only ops (CPU-only upstream; TestOps.cpp semantics)
+# ---------------------------------------------------------------------------
+
+
+def test_test_optional_lists(mojo_gpu):
+    ops = torch.ops.aten
+    v = torch.tensor([1, 2, 3, -2147483647], dtype=torch.int32)
+    vm = v.to(mojo_gpu)
+    with assert_ran("aten::_test_optional_intlist"):
+        got = ops._test_optional_intlist(vm, [1, 2, 3, -2])
+    assert torch.equal(got.cpu(), ops._test_optional_intlist(v, [1, 2, 3, -2]))
+    assert ops._test_optional_intlist(vm, None) is vm
+    assert torch.equal(
+        ops._test_optional_filled_intlist(vm[:2], 5).cpu(),
+        ops._test_optional_filled_intlist(v[:2], 5),
+    )
+    f = torch.tensor([1.0, 2.5, 3.0, 1e8, 4.0])
+    fm = f.to(mojo_gpu)
+    for addends in ([0.5, 1e-9, -2.0, 3.0, 7.0], [0.1] * 6):
+        assert torch.equal(
+            ops._test_optional_floatlist(fm[::2], addends).cpu(),
+            ops._test_optional_floatlist(f[::2], addends),
+        )
+    out = torch.empty(7, dtype=torch.int32, device=mojo_gpu)
+    r = ops._test_optional_intlist.out(vm, [1, 1, 1, 1], out=out)
+    assert r is out and torch.equal(out.cpu(), v + 1)
+    ops._test_optional_intlist.out(vm, None, out=out)
+    assert torch.equal(out.cpu(), v)
+    with pytest.raises(RuntimeError, match="ArrayRef: invalid index Index = 2"):
+        ops._test_optional_intlist(vm, [1, 2])
+    with pytest.raises(RuntimeError, match="expected scalar type Int but found Float"):
+        ops._test_optional_intlist(fm, [1] * 5)
+    with pytest.raises(RuntimeError, match=r"Expected values.dim\(\) == 1"):
+        ops._test_optional_intlist(vm.view(2, 2), [1])
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        ops._test_optional_intlist.out(vm, None, out=out.long())
+
+
+def test_test_functorch_fallback(mojo_gpu):
+    ops = torch.ops.aten
+    x = torch.randn(3, 4)
+    xm = x.to(mojo_gpu)
+    with assert_ran("aten::_test_functorch_fallback"):
+        got = ops._test_functorch_fallback(xm.t(), xm)
+    assert torch.equal(got.cpu(), x.t()) and got.data_ptr() != xm.data_ptr()
+    out = torch.empty(0, device=mojo_gpu)
+    assert ops._test_functorch_fallback.out(xm, xm, out=out) is out
+    assert torch.equal(out.cpu(), x)

@@ -4059,6 +4059,42 @@ def aten_lgamma(x: MaxTensor) -> MaxTensor:
     return custom_mojo_ops.elementwise(x, "lgamma")
 
 
+# linalg_cross(Tensor self, Tensor other, *, int dim=-1) -> Tensor
+@map_to(aten.linalg_cross)
+def aten_linalg_cross(input: MaxTensor, other: MaxTensor, dim: int = -1) -> MaxTensor:
+    """CUDA's `cross_kernel`: each component is `x[i]*y[j] - x[j]*y[i]` in
+    the operand dtype, the batch dims broadcast (native/Cross.cpp meta)."""
+    rank = len(input.shape)
+    if rank != len(other.shape):
+        raise RuntimeError(
+            "linalg.cross: inputs must have the same number of dimensions."
+        )
+    if not -rank <= dim < rank:
+        raise IndexError(
+            f"Dimension out of range (expected to be in range of [{-rank}, {rank - 1}], "
+            f"but got {dim})"
+        )
+    d = dim % rank
+    sizes = (input.shape[d], other.shape[d])
+    if not all(isinstance(s, StaticDim) and int(s) == 3 for s in sizes):
+        raise RuntimeError(
+            f"linalg.cross: inputs dimension {dim} must have length 3. "
+            f"Got {sizes[0]} and {sizes[1]}"
+        )
+    if input.dtype != other.dtype:
+        raise RuntimeError(
+            f"Found dtype {_scalar_type_name(other.dtype)} but expected "
+            f"{_scalar_type_name(input.dtype)}"
+        )
+    x = [aten_slice(input, d, i, i + 1) for i in range(3)]
+    y = [aten_slice(other, d, i, i + 1) for i in range(3)]
+    parts = [
+        x[(c + 1) % 3] * y[(c + 2) % 3] - x[(c + 2) % 3] * y[(c + 1) % 3]
+        for c in range(3)
+    ]
+    return F.concat(parts, axis=d)
+
+
 # linear(Tensor input, Tensor weight, Tensor? bias=None) -> Tensor
 @map_to(aten.linear)
 def aten_linear(

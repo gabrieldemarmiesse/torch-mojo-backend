@@ -242,17 +242,22 @@ def test_call_cuda_needs_a_mojo_tensor():
         cuda_interop.call_cuda(torch.add, 1, 2)
 
 
+def _fake_quantize(t: torch.Tensor) -> torch.Tensor:
+    return torch.fake_quantize_per_tensor_affine(t, 0.1, 3, -128, 127)
+
+
 def test_fallback_runs_an_op_the_mojo_device_lacks(gpu):
-    """`aten::linalg_cross` has no mojo kernel: without the fallback it
-    raises, with it the CUDA kernel runs on the mojo tensors."""
-    a, b = torch.randn(4, 3), torch.randn(4, 3)
-    x, y = a.to(gpu), b.to(gpu)
+    """`aten::fake_quantize_per_tensor_affine_cachemask` (quantization is
+    out of the mojo device's scope) has no mojo kernel: without the fallback
+    it raises, with it the CUDA kernel runs on the mojo tensors."""
+    a = torch.randn(4, 3)
+    x = a.to(gpu)
     with pytest.raises(NotImplementedError):
-        torch.linalg.cross(x, y)
+        _fake_quantize(x)
     with cuda_interop.cuda_fallback():
-        out = torch.linalg.cross(x, y)
+        out = _fake_quantize(x)
     assert out.device.type == "mojo"
-    torch.testing.assert_close(out.cpu(), torch.linalg.cross(a, b))
+    torch.testing.assert_close(out.cpu(), _fake_quantize(a))
 
 
 def test_fallback_carries_autograd(gpu):
@@ -317,9 +322,9 @@ def test_fallback_is_only_a_fallback(gpu):
 def test_the_fallback_goes_away_with_its_block(gpu):
     x = torch.randn(4, 3, device=gpu)
     with cuda_interop.cuda_fallback():
-        torch.linalg.cross(x, x)
+        _fake_quantize(x)
     with pytest.raises(NotImplementedError):
-        torch.linalg.cross(x, x)
+        _fake_quantize(x)
 
 
 def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
