@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from tests.native.conftest import is_metal, skip_if_metal
+from tests.native.conftest import flush_subnormals_on_metal, is_metal, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 
 
@@ -406,8 +406,18 @@ def _check_scalar_mul_peel(
     output = destination[destination_offset : destination_offset + size]
     before, pointer = output._version, output.data_ptr()
     assert torch.mul(value, scalar, out=output) is output
+    # Apple GPUs flush subnormal operands, and products tiny before rounding,
+    # to zero (as MPS does): build the exact product in float64, then round.
+    flushed_scalar = flush_subnormals_on_metal(
+        torch.tensor(scalar, dtype=torch.float32), device
+    ).item()
+    operand = flush_subnormals_on_metal(
+        host[source_offset : source_offset + size], device
+    )
     expected[destination_offset : destination_offset + size] = (
-        host[source_offset : source_offset + size] * scalar
+        flush_subnormals_on_metal(
+            operand.double() * flushed_scalar, device, torch.float32
+        ).float()
     )
     actual = destination.cpu()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
