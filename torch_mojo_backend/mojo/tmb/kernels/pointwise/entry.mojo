@@ -182,6 +182,8 @@ comptime KINDS_3 = [
     "clamp",
     "dirichlet_grad",
     "glu_backward_b",
+    "glu_jvp",
+    "glu_jvp_res",
     "huber_backward",
     "int4_dequant",
     "lerp",
@@ -209,6 +211,8 @@ def _heavy_kind[kind: StaticString]() -> Bool:
         or kind == "glu"
         or kind == "glu_backward_a"
         or kind == "glu_backward_b"
+        or kind == "glu_jvp"
+        or kind == "glu_jvp_res"
         or kind == "softplus_backward"
         or kind == "log_sigmoid_backward"
         or kind == "gelu_backward_none"

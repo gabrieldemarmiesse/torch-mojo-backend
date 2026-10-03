@@ -19,6 +19,7 @@ import sys
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from torch_mojo_backend import cuda_interop
 
@@ -242,32 +243,29 @@ def test_call_cuda_needs_a_mojo_tensor():
 
 
 def test_fallback_runs_an_op_the_mojo_device_lacks(gpu):
-    """`aten::linalg_cholesky_ex` has no mojo kernel: without the fallback it
+    """`aten::linalg_cross` has no mojo kernel: without the fallback it
     raises, with it the CUDA kernel runs on the mojo tensors."""
-    a = torch.randn(5, 5)
-    spd = a @ a.T + 5 * torch.eye(5)
-    x = spd.to(gpu)
+    a, b = torch.randn(4, 3), torch.randn(4, 3)
+    x, y = a.to(gpu), b.to(gpu)
     with pytest.raises(NotImplementedError):
-        torch.linalg.cholesky(x)
+        torch.linalg.cross(x, y)
     with cuda_interop.cuda_fallback():
-        out = torch.linalg.cholesky(x)
+        out = torch.linalg.cross(x, y)
     assert out.device.type == "mojo"
-    torch.testing.assert_close(out.cpu(), torch.linalg.cholesky(spd))
+    torch.testing.assert_close(out.cpu(), torch.linalg.cross(a, b))
 
 
 def test_fallback_carries_autograd(gpu):
-    """`grid_sampler_2d` has no mojo kernel in either direction: forward and
-    backward both go through CUDA, on an autograd graph that never leaves
-    mojo tensors."""
+    """`multilabel_margin_loss_forward` has no mojo kernel in either
+    direction: forward and backward both go through CUDA, on an autograd
+    graph that never leaves mojo tensors."""
     torch.manual_seed(0)
-    x = torch.randn(1, 2, 4, 5, device=gpu, requires_grad=True)
-    grid = torch.rand(1, 3, 3, 2, device=gpu) * 2 - 1
+    x = torch.randn(3, 5, device=gpu, requires_grad=True)
+    target = torch.tensor([[3, 0, -1, 1, 0], [1, 2, 4, -1, 0], [0, -1, 2, 2, 2]])
     with cuda_interop.cuda_fallback():
-        torch.nn.functional.grid_sample(x, grid, align_corners=False).sum().backward()
+        F.multilabel_margin_loss(x, target.to(gpu)).backward()
     xc = x.detach().cpu().requires_grad_()
-    torch.nn.functional.grid_sample(
-        xc, grid.cpu(), align_corners=False
-    ).sum().backward()
+    F.multilabel_margin_loss(xc, target).backward()
     assert x.grad is not None and xc.grad is not None
     torch.testing.assert_close(x.grad.cpu(), xc.grad)
 
@@ -299,12 +297,12 @@ def test_conv2d_trains_natively_under_the_fallback(gpu):
 def test_a_registered_op_that_declines_does_not_reach_the_fallback(gpu):
     """The boundary of the design: the dispatcher picks a fallback only where
     no kernel is registered, so an op the backend registers and then declines
-    at run time (here `aten::convolution` with transposed=True) still raises.
+    at run time (here `aten::convolution` of int64 operands) still raises.
     """
-    x = torch.randn(2, 3, 8, 8, device=gpu)
-    w = torch.randn(3, 4, 3, 3, device=gpu)
+    x = torch.ones(2, 3, 8, 8, device=gpu, dtype=torch.int64)
+    w = torch.ones(4, 3, 3, 3, device=gpu, dtype=torch.int64)
     with cuda_interop.cuda_fallback(), pytest.raises(NotImplementedError):
-        torch.nn.functional.conv_transpose2d(x, w, stride=2)
+        torch.nn.functional.conv2d(x, w)
 
 
 def test_fallback_is_only_a_fallback(gpu):
@@ -317,11 +315,11 @@ def test_fallback_is_only_a_fallback(gpu):
 
 
 def test_the_fallback_goes_away_with_its_block(gpu):
-    x = torch.eye(4, device=gpu)
+    x = torch.randn(4, 3, device=gpu)
     with cuda_interop.cuda_fallback():
-        torch.linalg.cholesky(x)
+        torch.linalg.cross(x, x)
     with pytest.raises(NotImplementedError):
-        torch.linalg.cholesky(x)
+        torch.linalg.cross(x, x)
 
 
 def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
@@ -337,10 +335,9 @@ def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
         "cuda_interop.enable_cuda_fallback()\n"
         "cuda_interop.enable_cuda_fallback()  # idempotent\n"
         "gc.collect()\n"
-        "x = torch.randn(1, 2, 4, 5, device='mojo:0', requires_grad=True)\n"
-        "grid = torch.rand(1, 3, 3, 2, device='mojo:0') * 2 - 1\n"
-        "torch.nn.functional.grid_sample(x, grid, align_corners=False)"
-        ".sum().backward()\n"
+        "x = torch.randn(3, 5, device='mojo:0', requires_grad=True)\n"
+        "t = torch.tensor([[3, 0, -1, 1, 0]] * 3, device='mojo:0')\n"
+        "torch.nn.functional.multilabel_margin_loss(x, t).backward()\n"
         "w = torch.randn(4, 3, 3, 3, device='mojo:0', requires_grad=True)\n"
         "a = torch.randn(2, 3, 16, 16, device='mojo:0', requires_grad=True)\n"
         "torch.nn.functional.conv2d(a, w, padding=1).sum().backward()\n"

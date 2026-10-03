@@ -8,7 +8,8 @@
 # shapes, over contiguous (N*C, D, H, W) planes.
 #
 # Window and index math follow torch's CUDA kernels (aten/src/ATen/native/
-# cuda at v2.14.0): DilatedMaxPool{2,3}d.cu, AveragePool{2,3}d.cu,
+# cuda at v2.14.0): DilatedMaxPool{2,3}d.cu, FractionalMaxPool{2,3}d.cu,
+# AveragePool{2,3}d.cu,
 # AdaptiveAveragePooling{,3d}.cu, AdaptiveMaxPooling{2,3}d.cu,
 # MaxUnpooling.cu and im2col.cuh. Max pooling lets NaN win (the last NaN of
 # the window, as CUDA's `val > max || isnan(val)`), and its index starts at
@@ -316,6 +317,97 @@ def _max_pool_backward[
         gin_ptr[unsafe_offset=i] = total.cast[dtype]()
 
     _parallel_for_dt[dtype, func](g[G_PLANES] * _in_plane(g), ctx)
+
+
+# ---------------------------------------------------------------------------
+# Fractional max pooling (FractionalMaxPool{2,3}d.cu): pseudo-random window
+# starts from one sample in [0, 1) per (plane, axis), int64 indices into the
+# flattened (D, H, W) input plane. The backward is the scatter below.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _frac_interval[
+    acc_t: DType
+](
+    sample: Scalar[acc_t], index: Int, in_size: Int, out_size: Int, pool: Int
+) -> Int:
+    """get_interval(s): the window start of output `index`, the last one
+    flush with the input's end."""
+    if index == out_size - 1:
+        return in_size - pool
+    var alpha = Scalar[acc_t](in_size - pool) / Scalar[acc_t](out_size - 1)
+    return Int((Scalar[acc_t](index) + sample) * alpha) - Int(sample * alpha)
+
+
+def _fractional_max_pool[
+    dtype: DType
+](
+    out_addr: Int,
+    idx_addr: Int,
+    in_addr: Int,
+    samples_addr: Int,
+    g: Geom,
+    ctx: DeviceContext,
+) raises:
+    """`samples` is the contiguous (N, C, 2 | 3) `_random_samples`: plane p
+    reads row p, (W, H) for the 2-D op, (T, H, W) for the 3-D one."""
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var idx_ptr = _make_ptr[DType.int64](idx_addr)
+    var in_ptr = _make_ptr[dtype](in_addr)
+    var smp_ptr = _make_ptr[dtype](samples_addr)
+    comptime acc_t = _acc[dtype]()
+
+    @always_inline
+    @__parameter
+    @__copy_capture(out_ptr, idx_ptr, in_ptr, smp_ptr, g)
+    def func[width: Int, alignment: Int = 1](idx: Coord):
+        var i = Int(idx[0].value())
+        var o = _split_out(g, i)
+        var three = g[G_3D] != 0
+        var row = o[0] * (3 if three else 2)
+        var sd = Scalar[acc_t](0)
+        var sh: Scalar[acc_t]
+        var sw: Scalar[acc_t]
+        if three:
+            sd = smp_ptr[unsafe_offset=row].cast[acc_t]()
+            sh = smp_ptr[unsafe_offset=row + 1].cast[acc_t]()
+            sw = smp_ptr[unsafe_offset=row + 2].cast[acc_t]()
+        else:
+            sw = smp_ptr[unsafe_offset=row].cast[acc_t]()
+            sh = smp_ptr[unsafe_offset=row + 1].cast[acc_t]()
+        var in_d = g[G_IN]
+        var in_h = g[G_IN + 1]
+        var in_w = g[G_IN + 2]
+        var pd = _frac_interval[acc_t](sd, o[1], in_d, g[G_OUT], g[G_K])
+        var ph = _frac_interval[acc_t](sh, o[2], in_h, g[G_OUT + 1], g[G_K + 1])
+        var pw = _frac_interval[acc_t](sw, o[3], in_w, g[G_OUT + 2], g[G_K + 2])
+        var base = o[0] * _in_plane(g)
+        var best = min_or_neg_inf[dtype]()
+        var best_idx = (pd * in_h + ph) * in_w + pw
+        for d in range(pd, pd + g[G_K]):
+            for h in range(ph, ph + g[G_K + 1]):
+                for w in range(pw, pw + g[G_K + 2]):
+                    # A sample outside [0, 1) can push a window off the
+                    # input (CUDA reads out of bounds): skip those taps.
+                    if (
+                        d < 0
+                        or d >= in_d
+                        or h < 0
+                        or h >= in_h
+                        or w < 0
+                        or w >= in_w
+                    ):
+                        continue
+                    var at = (d * in_h + h) * in_w + w
+                    var v = in_ptr[unsafe_offset=base + at]
+                    if v > best or v != v:
+                        best = v
+                        best_idx = at
+        out_ptr[unsafe_offset=i] = best
+        idx_ptr[unsafe_offset=i] = Int64(best_idx)
+
+    _parallel_for_dt[dtype, func](g[G_PLANES] * _out_plane(g), ctx)
 
 
 @always_inline
@@ -829,6 +921,8 @@ def _col2im[
 # ---------------------------------------------------------------------------
 # C entry. Slots per op (pointers are data addresses, offset applied):
 #   MaxPool / AdaptiveMaxPool:          out, indices, input, geom, ctx
+#   FractionalMaxPool:                  out, indices, input, samples, geom,
+#                                       ctx
 #   MaxPoolBackward (2-D gather):       grad_in, grad_out, indices, geom, ctx
 #   MaxPoolScatter:                     workspace, grad_out, indices, count,
 #                                       out_plane, in_plane, ctx
@@ -848,6 +942,15 @@ def _launch[dtype: DType](argv: Argv, argc: Int) raises:
             _raw_int(argv[unsafe_offset=2]),
             _geom(argv[unsafe_offset=3]),
             _raw_ctx(argv[unsafe_offset=4]),
+        )
+    elif _op_on["FractionalMaxPool"]():
+        _fractional_max_pool[dtype](
+            _raw_int(argv[unsafe_offset=0]),
+            _raw_int(argv[unsafe_offset=1]),
+            _raw_int(argv[unsafe_offset=2]),
+            _raw_int(argv[unsafe_offset=3]),
+            _geom(argv[unsafe_offset=4]),
+            _raw_ctx(argv[unsafe_offset=5]),
         )
     elif _op_on["MaxPoolBackward"]():
         _max_pool_backward[dtype](

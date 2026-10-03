@@ -287,6 +287,15 @@ def _cross_device_comparison_skip_reason(op: OpInfo, dtype: torch.dtype) -> str 
 _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
     {
         ("nn_functional_conv2d", torch.float32),
+        # conv_transpose in half precision: cuDNN (CUDA's route) and we
+        # accumulate the whole output pixel in float and round once; CPU
+        # torch rounds the GEMM's columns to the 16-bit type before col2im
+        # sums them, so its result is the one farther from float64.
+        *(
+            (f"nn_functional_conv_transpose{k}d", dtype)
+            for k in (1, 2, 3)
+            for dtype in (torch.bfloat16, torch.float16)
+        ),
         # rsub with alpha on float16: CUDA's (and our) sub kernel computes
         # other - alpha * self as one fma in float; CPU torch rounds
         # alpha * self to float16 first, one or two ulps farther from the
@@ -302,6 +311,30 @@ _FP64_ANCHORED: frozenset[tuple[str, torch.dtype]] = frozenset(
         ("nn_functional_adaptive_avg_pool3d", torch.float16),
         ("nn_functional_interpolate_area", torch.bfloat16),
         ("nn_functional_interpolate_area", torch.float16),
+        # grid_sample in half precision: CUDA's (and our) forward computes
+        # the source index and the blend in float and rounds once; CPU torch
+        # works in the 16-bit type itself, farther from float64.
+        *(
+            (name, dtype)
+            for name in (
+                "grid_sampler_2d",
+                "grid_sampler_3d",
+                "nn_functional_grid_sample",
+            )
+            for dtype in (torch.bfloat16, torch.float16)
+        ),
+        # interpolate(mode="bicubic" | "linear" | "trilinear") in half
+        # precision: our kernels are bit-identical to CUDA's (checked on
+        # every OpInfo sample), which interpolate in float and round once;
+        # CPU torch rounds intermediate products to the half dtype and lands
+        # farther from float64 (bf16 bicubic (2, 3, 4, 4) x1.7: CPU max
+        # error 0.046, CUDA / ours 0.028).
+        ("nn_functional_interpolate_bicubic", torch.bfloat16),
+        ("nn_functional_interpolate_bicubic", torch.float16),
+        ("nn_functional_interpolate_linear", torch.bfloat16),
+        ("nn_functional_interpolate_linear", torch.float16),
+        ("nn_functional_interpolate_trilinear", torch.bfloat16),
+        ("nn_functional_interpolate_trilinear", torch.float16),
     }
 )
 
@@ -370,6 +403,11 @@ _FP64_ANCHORED_BY_ACCELERATOR: dict[str, frozenset[tuple[str, torch.dtype]]] = {
             ("nn_functional_instance_norm", torch.bfloat16),
             ("nn_functional_instance_norm", torch.float16),
             ("pow", torch.float32),
+            # Scaling and squaring of a batch with 1-norms near 27 (five
+            # squarings) amplifies float32 GEMM summation order: on the
+            # sample this node holds, 0.016 from the float64 answer against
+            # CPU torch's own 0.050.
+            ("matrix_exp", torch.float32),
         }
     ),
     "gfx942": frozenset(
@@ -480,13 +518,22 @@ class TestOpInfoConformance(TestCase):
                 # itself, so a missing dependency elsewhere still shows.
                 torch.accelerator.synchronize()
             expected = op(sample.input, *sample.args, **sample.kwargs)
+            # What upstream's own CPU-vs-device test (test_ops.py,
+            # `test_compare_cpu`) compares: the outputs after the sample's
+            # `output_process_fn_grad`, which the linalg OpInfos use to drop
+            # what is not unique (the signs of singular and eigenvectors, the
+            # columns `full_matrices` adds). Applied to both legs, on the CPU.
+            actual = sample.output_process_fn_grad(_to_cpu(actual))
+            expected = sample.output_process_fn_grad(expected)
             if (
                 (op.formatted_name, dtype) in _FP64_ANCHORED
                 and isinstance(actual, torch.Tensor)
                 and isinstance(expected, torch.Tensor)
             ):
                 exact = _to_float64(sample)
-                reference = op(exact.input, *exact.args, **exact.kwargs)
+                reference = sample.output_process_fn_grad(
+                    op(exact.input, *exact.args, **exact.kwargs)
+                )
                 assert isinstance(reference, torch.Tensor)
                 cpu_actual = _to_cpu(actual)
                 assert isinstance(cpu_actual, torch.Tensor)

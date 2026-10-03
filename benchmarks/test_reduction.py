@@ -55,7 +55,25 @@ SORT_SHAPES: dict[str, tuple[tuple[int, ...], bool]] = {
     "A_357x789": ((357, 789), False),
 }
 
+# Pairwise distances: (x1 rows, x2 rows, columns) and p folded into the shape
+# id. p = 2 is timed on CUDA's direct kernel (compute_mode 2): with more than
+# 25 rows the default mode takes the matmul route, which test_gemm measures.
+CDIST_SHAPES: dict[str, tuple[int, int, int, float]] = {
+    "S_1024x1024x64_p1": (1024, 1024, 64, 1.0),
+    "S_1024x1024x64_p2": (1024, 1024, 64, 2.0),
+    "A_357x789x33_p3": (357, 789, 33, 3.0),
+    "A_357x789x33_pinf": (357, 789, 33, float("inf")),
+}
+PDIST_SHAPES: dict[str, tuple[int, int, float]] = {
+    "S_1024x64_p2": (1024, 64, 2.0),
+    "A_357x789_p1": (357, 789, 1.0),
+}
+
 COVERS: dict[str, str] = {
+    "aten::_cdist_forward": "test_cdist",
+    "aten::_cdist_backward": "test_cdist_backward",
+    "aten::_pdist_forward": "test_pdist",
+    "aten::_pdist_backward": "test_pdist_backward",
     "aten::sum": "test_sum (full-reduction case)",
     "aten::sum.dim_IntList": "test_sum (dim cases)",
     "aten::nansum": "test_nansum (same kernel as sum, NaN-zeroing map)",
@@ -116,6 +134,10 @@ _SAME_KERNEL_OUT = (
     "written straight into (or copied into) the caller's tensors"
 )
 SKIPPED: dict[str, str] = {
+    "aten::_cdist_forward.out": _SAME_KERNEL_OUT,
+    "aten::_cdist_backward.out": _SAME_KERNEL_OUT,
+    "aten::_pdist_forward.out": _SAME_KERNEL_OUT,
+    "aten::_pdist_backward.out": _SAME_KERNEL_OUT,
     "aten::max.unary_out": _SAME_KERNEL_OUT,
     "aten::sum.IntList_out": _SAME_KERNEL_OUT,
     "aten::topk.values": _SAME_KERNEL_OUT,
@@ -890,4 +912,77 @@ def test_linear_combination(
         lambda: torch.ops.aten._compute_linear_combination(i_ref, c_ref),
         lambda: torch.ops.aten._compute_linear_combination(i_our, c_our),
         flops=float(i_ref.numel() * 8),
+    )
+
+
+def _cdist_case(
+    shape_id: str, hw: Hardware, mojo: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    r1, r2, m, p = CDIST_SHAPES[shape_id]
+    a_ref, a_our = both(unit_interval((r1, m), torch.float32), hw, mojo)
+    b_ref, b_our = both(unit_interval((r2, m), torch.float32), hw, mojo)
+    return a_ref, b_ref, a_our, b_our, p
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", CDIST_SHAPES)
+def test_cdist(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    a_ref, b_ref, a_our, b_our, p = _cdist_case(shape_id, hw, mojo_device)
+    bench.run(
+        lambda: torch.cdist(a_ref, b_ref, p, "donot_use_mm_for_euclid_dist"),
+        lambda: torch.cdist(a_our, b_our, p, "donot_use_mm_for_euclid_dist"),
+        flops=float(a_ref.shape[0] * b_ref.shape[0] * a_ref.shape[1]),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", CDIST_SHAPES)
+def test_cdist_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    a_ref, b_ref, a_our, b_our, p = _cdist_case(shape_id, hw, mojo_device)
+    d_ref = torch.ops.aten._cdist_forward(a_ref, b_ref, p, 2)
+    d_our = torch.ops.aten._cdist_forward(a_our, b_our, p, 2)
+    g_ref, g_our = both(
+        unit_interval(tuple(d_ref.shape), torch.float32), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.ops.aten._cdist_backward(g_ref, a_ref, b_ref, p, d_ref),
+        lambda: torch.ops.aten._cdist_backward(g_our, a_our, b_our, p, d_our),
+        flops=float(a_ref.shape[0] * b_ref.shape[0] * a_ref.shape[1]),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", PDIST_SHAPES)
+def test_pdist(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, m, p = PDIST_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval((n, m), torch.float32), hw, mojo_device)
+    bench.run(
+        lambda: torch.ops.aten._pdist_forward(x_ref, p),
+        lambda: torch.ops.aten._pdist_forward(x_our, p),
+        flops=float(n * (n - 1) // 2 * m),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", PDIST_SHAPES)
+def test_pdist_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, m, p = PDIST_SHAPES[shape_id]
+    x_ref, x_our = both(unit_interval((n, m), torch.float32), hw, mojo_device)
+    d_ref = torch.ops.aten._pdist_forward(x_ref, p)
+    d_our = torch.ops.aten._pdist_forward(x_our, p)
+    g_ref, g_our = both(
+        unit_interval(tuple(d_ref.shape), torch.float32), hw, mojo_device
+    )
+    bench.run(
+        lambda: torch.ops.aten._pdist_backward(g_ref, x_ref, p, d_ref),
+        lambda: torch.ops.aten._pdist_backward(g_our, x_our, p, d_our),
+        flops=float(n * (n - 1) // 2 * m),
     )

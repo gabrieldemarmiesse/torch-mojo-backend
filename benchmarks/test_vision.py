@@ -4,10 +4,10 @@ Driven through the public functional entry points (F.conv2d,
 F.max_pool2d, F.interpolate, ...), which reach the registered aten ops:
 convolution, convolution_backward (called directly), max_pool2d_with_indices (max_pool2d is composite over it),
 _adaptive_avg_pool2d, avg_pool2d, upsample_bilinear2d, upsample_nearest2d,
-the 3-D and adaptive-max pools, max_unpool and im2col / col2im
-(F.unfold / F.fold). The pooling backwards are called as aten ops.
+the 3-D, adaptive-max and fractional max pools, max_unpool and im2col /
+col2im (F.unfold / F.fold). The pooling backwards are called as aten ops.
 The other upsampling ops (1-d, 3-d, nearest-exact, bicubic, antialiased
-bilinear) and every upsampling backward are called directly as aten ops,
+bilinear and bicubic) and every upsampling backward are called directly as aten ops,
 one test per spatial rank with the op as a parametrize axis.
 Shape tokens fold the kernel/stride/output configuration in.
 """
@@ -34,6 +34,17 @@ CONV1D_SHAPES: dict[str, tuple[int, int, int, int, int, int, int]] = {
     "N4xC80xL3000_K384k3s1": (4, 80, 3000, 384, 3, 1, 1),
     "N8xC256xL357_K512k5s2": (8, 256, 357, 512, 5, 2, 2),
 }
+# (N, C_in, H, W, C_out, kernel, stride, padding, output_padding): a
+# transposed convolution is col2im(weight^T @ x), the conv data gradient.
+CONV_T_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int, int]] = {
+    "N16xC128x28x28_K64k4s2": (16, 128, 28, 28, 64, 4, 2, 1, 0),
+    "N4xC64x37x29_K32k3s2op1": (4, 64, 37, 29, 32, 3, 2, 1, 1),
+}
+# (N, C_in, D, H, W, C_out, kernel, stride, padding): the volumetric im2col.
+CONV3D_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int, int]] = {
+    "N4xC32x16x28x28_K64k3s1": (4, 32, 16, 28, 28, 64, 3, 1, 1),
+    "N2xC16x9x21x33_K24k3s2": (2, 16, 9, 21, 33, 24, 3, 2, 1),
+}
 # conv2d backward: the two forward geometries plus an awkward mid-network
 # shape and the deepest ResNet stage, where K = C*KH*KW outgrows N*OH*OW.
 CONV_BACKWARD_SHAPES: dict[str, tuple[int, int, int, int, int, int, int, int]] = {
@@ -48,6 +59,16 @@ CONV_BACKWARD_GRADS: dict[str, list[bool]] = {
     "dgrad": [True, False, False],
     "wgrad": [False, True, False],
     "bgrad": [False, False, True],
+}
+# (N, C, H, W, kernel, output) / (N, C, D, H, W, kernel, output) for the
+# fractional max pools; one awkward size each.
+FRACTIONAL_SHAPES: dict[str, tuple[int, int, int, int, int, int]] = {
+    "N32xC64x112x112_k2o56": (32, 64, 112, 112, 2, 56),
+    "N8xC256x29x29_k3o13": (8, 256, 29, 29, 3, 13),
+}
+FRACTIONAL3D_SHAPES: dict[str, tuple[int, int, int, int, int, int, int]] = {
+    "N4xC32x16x28x28_k2o8": (4, 32, 16, 28, 28, 2, 8),
+    "N2xC16x9x21x33_k2o4": (2, 16, 9, 21, 33, 2, 4),
 }
 # (N, C, H, W, output)
 ADAPTIVE_SHAPES: dict[str, tuple[int, int, int, int, int]] = {
@@ -99,6 +120,7 @@ UPSAMPLE2D_OPS = {
     "_upsample_nearest_exact2d": 2,
     "upsample_bicubic2d": 2,
     "_upsample_bilinear2d_aa": 2,
+    "_upsample_bicubic2d_aa": 2,
 }
 UPSAMPLE3D_OPS = {
     "upsample_nearest3d": 3,
@@ -111,6 +133,16 @@ UPSAMPLE2D_BACKWARD_OPS = {
     for name in ("upsample_nearest2d", "upsample_bilinear2d", *UPSAMPLE2D_OPS)
 }
 UPSAMPLE3D_BACKWARD_OPS = {f"{name}_backward": 3 for name in UPSAMPLE3D_OPS}
+# grid_sampler: (N, C, H, W) input, (oH, oW) grid; (N, C, D, H, W) input,
+# (oD, oH, oW) grid. One awkward shape each.
+GRID2D_SHAPES: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
+    "N8xC64x56x56_o56x56": ((8, 64, 56, 56), (56, 56)),
+    "N2xC3x257x311_o199x173": ((2, 3, 257, 311), (199, 173)),
+}
+GRID3D_SHAPES: dict[str, tuple[tuple[int, ...], tuple[int, ...]]] = {
+    "N2xC16x16x32x32_o16x32x32": ((2, 16, 16, 32, 32), (16, 32, 32)),
+    "N1xC3x13x27x35_o9x21x17": ((1, 3, 13, 27, 35), (9, 21, 17)),
+}
 _UPSAMPLE_TESTS = {
     "test_upsample1d": UPSAMPLE1D_OPS,
     "test_upsample2d": UPSAMPLE2D_OPS,
@@ -121,7 +153,9 @@ _UPSAMPLE_TESTS = {
 }
 
 COVERS: dict[str, str] = {
-    "aten::convolution": "test_conv2d, test_conv1d (rank 3)",
+    "aten::convolution": (
+        "test_conv2d, test_conv1d (rank 3), test_conv_transpose2d, test_conv3d"
+    ),
     "aten::convolution_backward": "test_conv2d_backward",
     "aten::_adaptive_avg_pool2d": "test_adaptive_avg_pool2d",
     "aten::avg_pool2d": "test_avg_pool2d",
@@ -146,8 +180,16 @@ COVERS: dict[str, str] = {
     "aten::adaptive_max_pool3d_backward": "test_adaptive_max_pool3d_backward",
     "aten::max_unpool2d": "test_max_unpool2d",
     "aten::max_unpool3d": "test_max_unpool3d",
+    "aten::fractional_max_pool2d": "test_fractional_max_pool2d",
+    "aten::fractional_max_pool2d_backward": "test_fractional_max_pool2d_backward",
+    "aten::fractional_max_pool3d": "test_fractional_max_pool3d",
+    "aten::fractional_max_pool3d_backward": "test_fractional_max_pool3d_backward",
     "aten::im2col": "test_im2col (F.unfold)",
     "aten::col2im": "test_col2im (F.fold)",
+    "aten::grid_sampler_2d": "test_grid_sampler (rank 2)",
+    "aten::grid_sampler_3d": "test_grid_sampler (rank 3)",
+    "aten::grid_sampler_2d_backward": "test_grid_sampler_backward (rank 2)",
+    "aten::grid_sampler_3d_backward": "test_grid_sampler_backward (rank 3)",
 }
 
 _UPSAMPLE_OUT = (
@@ -159,7 +201,35 @@ _OUT = (
     "out-variant plumbing over the benchmarked functional op (compute, then "
     "copy into the caller's tensor)"
 )
+_CONV_ENTRY = (
+    "a backend-specific convolution entry point (fixed groups / dilation / "
+    "transposition): the same im2col + GEMM route as aten::convolution, which "
+    "test_conv2d, test_conv3d and test_conv_transpose2d measure"
+)
 SKIPPED: dict[str, str] = {
+    **{
+        f"aten::{name}": _CONV_ENTRY
+        for name in (
+            "_conv_depthwise2d",
+            "_conv_depthwise2d.out",
+            "conv_depthwise3d",
+            "conv_depthwise3d.out",
+            "_slow_conv2d_forward",
+            "_slow_conv2d_forward.output",
+            "_slow_conv2d_backward.output_mask",
+            "_slow_conv2d_backward.grad_input",
+            "slow_conv3d_forward",
+            "slow_conv3d_forward.output",
+            "slow_conv_dilated2d",
+            "slow_conv_dilated2d.out",
+            "slow_conv_dilated3d",
+            "slow_conv_dilated3d.out",
+            "slow_conv_transpose2d",
+            "slow_conv_transpose2d.out",
+            "slow_conv_transpose3d",
+            "slow_conv_transpose3d.out",
+        )
+    },
     **{
         f"aten::{name}{suffix}": _UPSAMPLE_OUT
         for name in (
@@ -193,8 +263,30 @@ SKIPPED: dict[str, str] = {
             "aten::max_pool3d_with_indices_backward.grad_input",
             "aten::max_unpool2d.out",
             "aten::max_unpool3d.out",
+            "aten::grid_sampler_2d.out",
+            "aten::grid_sampler_3d.out",
+            "aten::grid_sampler_2d_backward.out",
+            "aten::grid_sampler_3d_backward.out",
+            "aten::fractional_max_pool2d.output",
+            "aten::fractional_max_pool2d_backward.grad_input",
+            "aten::fractional_max_pool3d.output",
+            "aten::fractional_max_pool3d_backward.grad_input",
+            "aten::max_pool2d_backward.out",
         )
     },
+    **{
+        f"aten::_upsample_lanczos2d_aa{suffix}": (
+            "CPU-only upstream (torch 2.14+): no stock CUDA / ROCm / MPS kernel "
+            "to compare against; the resample kernel test_upsample2d measures "
+            "for _upsample_bicubic2d_aa, with the lanczos filter"
+        )
+        for suffix in ("", ".out", "_backward", "_backward.grad_input")
+    },
+    "aten::max_pool2d_backward": (
+        "MPS-only upstream (no CUDA / ROCm reference): max_pool2d_with_indices "
+        "then its backward, both measured by test_max_pool2d / "
+        "test_max_pool2d_backward"
+    ),
 }
 
 
@@ -283,6 +375,49 @@ def test_conv1d(
     bench.run(
         lambda: F.conv1d(x_ref, w_ref, b_ref, stride, pad),
         lambda: F.conv1d(x_our, w_our, b_our, stride, pad),
+        flops=flops,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", CONV_T_SHAPES)
+@pytest.mark.bench_op("convolution")
+def test_conv_transpose2d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c_in, h, w, c_out, k, stride, pad, opad = CONV_T_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(n, c_in, h, w, dtype=dtype), hw, mojo_device)
+    w_ref, w_our = both(
+        torch.randn(c_in, c_out, k, k, dtype=dtype) * 0.1, hw, mojo_device
+    )
+    b_ref, b_our = both(torch.randn(c_out, dtype=dtype), hw, mojo_device)
+    flops = 2.0 * n * c_in * h * w * c_out * k * k
+    bench.run(
+        lambda: F.conv_transpose2d(x_ref, w_ref, b_ref, stride, pad, opad),
+        lambda: F.conv_transpose2d(x_our, w_our, b_our, stride, pad, opad),
+        flops=flops,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", CONV3D_SHAPES)
+@pytest.mark.bench_op("convolution")
+def test_conv3d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c_in, d, h, w, c_out, k, stride, pad = CONV3D_SHAPES[shape_id]
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(n, c_in, d, h, w, dtype=dtype), hw, mojo_device)
+    w_ref, w_our = both(
+        torch.randn(c_out, c_in, k, k, k, dtype=dtype) * 0.1, hw, mojo_device
+    )
+    b_ref, b_our = both(torch.randn(c_out, dtype=dtype), hw, mojo_device)
+    outs = [(e + 2 * pad - k) // stride + 1 for e in (d, h, w)]
+    flops = 2.0 * n * c_out * math.prod(outs) * c_in * k**3
+    bench.run(
+        lambda: F.conv3d(x_ref, w_ref, b_ref, stride, pad),
+        lambda: F.conv3d(x_our, w_our, b_our, stride, pad),
         flops=flops,
     )
 
@@ -768,6 +903,105 @@ def test_adaptive_max_pool3d_backward(
     )
 
 
+def _fractional_operands(
+    shape: tuple[int, ...],
+    n: int,
+    dtype_id: str,
+    hw: Hardware,
+    mojo_device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(x_ref, x_our, samples_ref, samples_our): one sample per plane and
+    spatial axis, shared by both legs."""
+    dtype = DTYPES[dtype_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=dtype), hw, mojo_device)
+    s_ref, s_our = both(torch.rand(*shape[:2], n, dtype=dtype), hw, mojo_device)
+    return x_ref, x_our, s_ref, s_our
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", FRACTIONAL_SHAPES)
+@pytest.mark.bench_op("fractional_max_pool2d")
+def test_fractional_max_pool2d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, k, o = FRACTIONAL_SHAPES[shape_id]
+    x_ref, x_our, s_ref, s_our = _fractional_operands(
+        (n, c, h, w), 2, dtype_id, hw, mojo_device
+    )
+    op = torch.ops.aten.fractional_max_pool2d
+    bench.run(
+        lambda: op(x_ref, [k, k], [o, o], s_ref),
+        lambda: op(x_our, [k, k], [o, o], s_our),
+        flops=float(n * c * o * o * k * k),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", FRACTIONAL_SHAPES)
+@pytest.mark.bench_op("fractional_max_pool2d_backward")
+def test_fractional_max_pool2d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, h, w, k, o = FRACTIONAL_SHAPES[shape_id]
+    x_ref, x_our, s_ref, s_our = _fractional_operands(
+        (n, c, h, w), 2, dtype_id, hw, mojo_device
+    )
+    op = torch.ops.aten.fractional_max_pool2d
+    out_ref, idx_ref = op(x_ref, [k, k], [o, o], s_ref)
+    _, idx_our = op(x_our, [k, k], [o, o], s_our)
+    g_ref, g_our = both(
+        torch.randn(out_ref.shape, dtype=out_ref.dtype), hw, mojo_device
+    )
+    bwd = torch.ops.aten.fractional_max_pool2d_backward
+    bench.run(
+        lambda: bwd(g_ref, x_ref, [k, k], [o, o], idx_ref),
+        lambda: bwd(g_our, x_our, [k, k], [o, o], idx_our),
+        flops=float(x_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", FRACTIONAL3D_SHAPES)
+@pytest.mark.bench_op("fractional_max_pool3d")
+def test_fractional_max_pool3d(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, k, o = FRACTIONAL3D_SHAPES[shape_id]
+    x_ref, x_our, s_ref, s_our = _fractional_operands(
+        (n, c, d, h, w), 3, dtype_id, hw, mojo_device
+    )
+    op = torch.ops.aten.fractional_max_pool3d
+    bench.run(
+        lambda: op(x_ref, [k] * 3, [o] * 3, s_ref),
+        lambda: op(x_our, [k] * 3, [o] * 3, s_our),
+        flops=float(n * c * o**3 * k**3),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", FRACTIONAL3D_SHAPES)
+@pytest.mark.bench_op("fractional_max_pool3d_backward")
+def test_fractional_max_pool3d_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    n, c, d, h, w, k, o = FRACTIONAL3D_SHAPES[shape_id]
+    x_ref, x_our, s_ref, s_our = _fractional_operands(
+        (n, c, d, h, w), 3, dtype_id, hw, mojo_device
+    )
+    op = torch.ops.aten.fractional_max_pool3d
+    out_ref, idx_ref = op(x_ref, [k] * 3, [o] * 3, s_ref)
+    _, idx_our = op(x_our, [k] * 3, [o] * 3, s_our)
+    g_ref, g_our = both(
+        torch.randn(out_ref.shape, dtype=out_ref.dtype), hw, mojo_device
+    )
+    bwd = torch.ops.aten.fractional_max_pool3d_backward
+    bench.run(
+        lambda: bwd(g_ref, x_ref, [k] * 3, [o] * 3, idx_ref),
+        lambda: bwd(g_our, x_our, [k] * 3, [o] * 3, idx_our),
+        flops=float(x_ref.numel()),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", POOL_SHAPES)
 @pytest.mark.bench_op("max_unpool2d")
@@ -842,4 +1076,60 @@ def test_col2im(
         lambda: F.fold(c_ref, (h, w), k, padding=pad, stride=stride),
         lambda: F.fold(c_our, (h, w), k, padding=pad, stride=stride),
         flops=float(cols.numel()),
+    )
+
+
+def _grid_operands(
+    shape_id: str, dtype_id: str
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """The input, a grid reaching slightly past [-1, 1] (so the zero padding
+    is exercised) and the spatial rank, from either shape table."""
+    shapes = GRID2D_SHAPES if shape_id in GRID2D_SHAPES else GRID3D_SHAPES
+    in_shape, out_spatial = shapes[shape_id]
+    rank = len(in_shape) - 2
+    dtype = DTYPES[dtype_id]
+    x = torch.randn(in_shape, dtype=dtype)
+    grid = (torch.rand(in_shape[0], *out_spatial, rank) * 2.2 - 1.1).to(dtype)
+    return x, grid, rank
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", [*GRID2D_SHAPES, *GRID3D_SHAPES])
+def test_grid_sampler(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """Bilinear, zero padding, align_corners=False (F.grid_sample's default)."""
+    x, grid, rank = _grid_operands(shape_id, dtype_id)
+    op = torch.ops.aten.grid_sampler_2d if rank == 2 else torch.ops.aten.grid_sampler_3d
+    x_ref, x_our = both(x, hw, mojo_device)
+    g_ref, g_our = both(grid, hw, mojo_device)
+    out_numel = x.shape[0] * x.shape[1] * math.prod(grid.shape[1:-1])
+    bench.run(
+        lambda: op(x_ref, g_ref, 0, 0, False),
+        lambda: op(x_our, g_our, 0, 0, False),
+        flops=float(out_numel) * 2.0 * 2**rank,
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
+@pytest.mark.parametrize("shape_id", [*GRID2D_SHAPES, *GRID3D_SHAPES])
+def test_grid_sampler_backward(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    """Both gradients (input and grid), bilinear, zero padding."""
+    x, grid, rank = _grid_operands(shape_id, dtype_id)
+    op = (
+        torch.ops.aten.grid_sampler_2d_backward
+        if rank == 2
+        else torch.ops.aten.grid_sampler_3d_backward
+    )
+    out_shape = [x.shape[0], x.shape[1], *grid.shape[1:-1]]
+    gout = torch.randn(out_shape, dtype=x.dtype)
+    x_ref, x_our = both(x, hw, mojo_device)
+    g_ref, g_our = both(grid, hw, mojo_device)
+    o_ref, o_our = both(gout, hw, mojo_device)
+    bench.run(
+        lambda: op(o_ref, x_ref, g_ref, 0, 0, False, [True, True]),
+        lambda: op(o_our, x_our, g_our, 0, 0, False, [True, True]),
+        flops=float(gout.numel()) * 4.0 * 2**rank,
     )

@@ -1,7 +1,7 @@
 # ===----------------------------------------------------------------------=== #
 # Resampling kernels for mojo_device: reflection / replication padding and
-# nearest / nearest-exact / linear / cubic / antialiased bilinear upsampling,
-# forward and backward,
+# nearest / nearest-exact / linear / cubic / antialiased bilinear, bicubic
+# and lanczos upsampling, forward and backward,
 # over 1 to 3 spatial dims.
 #
 # Every kernel sees a contiguous (planes, D, H, W) tensor; a 1-d or 2-d op is
@@ -33,6 +33,7 @@ from max.gpu.host import DeviceContext
 from std.utils.coord import Coord
 from std.utils.index import IndexList
 
+from tmb.kernels.common.pointwise_math import _psin
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
@@ -53,8 +54,9 @@ from tmb.kernels.common.variant_gates import (
 )
 
 # Interpolation mode of the Upsample* ops: 0 nearest, 1 nearest-exact,
-# 2 linear, 3 cubic, 4 antialiased bilinear. RANK is the number of spatial dims (1..3). REFLECT picks
-# reflection (1) or replication (0) padding for the Pad* ops.
+# 2 linear, 3 cubic, 4 / 5 / 6 antialiased bilinear / bicubic / lanczos.
+# RANK is the number of spatial dims (1..3). REFLECT picks reflection (1) or
+# replication (0) padding for the Pad* ops.
 comptime MODE = get_defined_int["MODE", 0]()
 comptime RANK = get_defined_int["RANK", 1]()
 comptime REFLECT = get_defined_int["REFLECT", 0]()
@@ -258,28 +260,81 @@ def _interp_taps[
 
 
 # ---------------------------------------------------------------------------
-# Antialiased bilinear (UpSample.cuh's upsample_antialias, bilinear filter):
-# output i averages the inputs within `support` of its center, with weights
-# rounded to the tensor dtype and normalized, as the CUDA kernel keeps them
-# in shared memory.
+# Antialiased bilinear / bicubic / lanczos (UpSample.cuh's
+# upsample_antialias, UpSampleKernel.cpp's HelperInterpLanczos): output i
+# averages the inputs within `support` of its center, with weights rounded
+# to the tensor dtype and normalized, as the CUDA kernel keeps them in
+# shared memory. Lanczos has no CUDA kernel; CPU's separable kernel is the
+# same computation in the dtype (it has no half kernel).
 # ---------------------------------------------------------------------------
+
+comptime AA_BILINEAR = 4
+comptime AA_BICUBIC = 5
+comptime AA_LANCZOS = 6
+
+
+@always_inline
+def _aa_half_size() -> Int:
+    """`interp_filter.size * 0.5`: half the filter's tap count."""
+    comptime if MODE == AA_BICUBIC:
+        return 2
+    elif MODE == AA_LANCZOS:
+        return 3
+    else:
+        return 1
+
+
+@always_inline
+def _sinc[acc: DType](x: Scalar[acc]) -> Scalar[acc]:
+    """HelperInterpLanczos::sinc_filter: sin(pi x) / (pi x), 1 at 0."""
+    if x == 0:
+        return 1
+    var px = x * Scalar[acc](3.14159265358979323846)
+    var sn: Scalar[acc]
+    comptime if acc == DType.float64:
+        sn = _psin[DType.float64](px.cast[DType.float64]()).cast[acc]()
+    else:
+        sn = _psin[DType.float32](px.cast[DType.float32]()).cast[acc]()
+    return sn / px
 
 
 @always_inline
 def _aa_filter[acc: DType](x: Scalar[acc]) -> Scalar[acc]:
-    """BilinearFilterFunctor: the tent 1 - |x| on (-1, 1)."""
+    """BilinearFilterFunctor (the tent 1 - |x| on (-1, 1)),
+    BicubicFilterFunctor (Keys' cubic, a = -0.5, with nvcc's fma
+    contractions) or HelperInterpLanczos::aa_filter (sinc(x) sinc(x / 3) on
+    (-3, 3))."""
     var a = -x if x < 0 else x
-    return Scalar[acc](1) - a if a < 1 else Scalar[acc](0)
+    comptime if MODE == AA_BICUBIC:
+        if a < 1:
+            return fma(fma(a, Scalar[acc](1.5), Scalar[acc](-2.5)) * a, a, 1)
+        if a < 2:
+            var r = fma(a - 5, a, Scalar[acc](8))
+            return fma(r, a, Scalar[acc](-4)) * Scalar[acc](-0.5)
+        return 0
+    elif MODE == AA_LANCZOS:
+        if a < 3:
+            return _sinc[acc](a) * _sinc[acc](a / 3)
+        return 0
+    else:
+        return Scalar[acc](1) - a if a < 1 else Scalar[acc](0)
 
 
 @always_inline
 def _aa_span[
     acc: DType
-](i: Int, in_size: Int, scale: Scalar[acc]) -> Tuple[Int, Int, Scalar[acc]]:
+](i: Int, in_size: Int, scale: Scalar[acc], same: Bool = False) -> Tuple[
+    Int, Int, Scalar[acc]
+]:
     """_compute_weights_span: (xmin, xsize, xmin - center) of output `i`,
     with nvcc's contractions: `center -/+ support` and `xmin - center` are
-    each one fma over the unrounded center `scale * (i + 0.5)`."""
-    var support = scale if scale >= 1 else Scalar[acc](1)
+    each one fma over the unrounded center `scale * (i + 0.5)`. `same`: an
+    axis CPU's lanczos kernel leaves alone (its size is unchanged), output i
+    reads input i alone."""
+    if same:
+        return (i, 1, Scalar[acc](0))
+    comptime half_size = Scalar[acc](_aa_half_size())
+    var support = half_size * scale if scale >= 1 else half_size
     var half_i = Scalar[acc](i) + 0.5
     var xmin = max(Int(fma(half_i, scale, -support) + 0.5), 0)
     var xsize = min(Int(fma(half_i, scale, support) + 0.5), in_size) - xmin
@@ -312,9 +367,13 @@ def _aa_weight[
     span: Tuple[Int, Int, Scalar[acc]],
     scale: Scalar[acc],
     total: Scalar[acc],
+    same: Bool = False,
 ) -> Scalar[acc]:
     """Weight j of a span, rounded to `dtype` before and after the
-    normalization (`wt_ptr[j] = scalar_t(w)`, then `wt_ptr[j] /= total_w`)."""
+    normalization (`wt_ptr[j] = scalar_t(w)`, then `wt_ptr[j] /= total_w`).
+    An unchanged lanczos axis (`same`) weighs its one tap 1."""
+    if same:
+        return 1
     var xmc = span[2]
     var w = _aa_filter[acc](
         (Scalar[acc](j) + xmc + 0.5) * _aa_invscale[acc](scale)
@@ -457,14 +516,17 @@ def _upsample_fwd[
                     var dl0 = Scalar[acc](1) - dl1
                     val = fma(dl0, plane2(d0), dl1 * plane2(d0 + dp))
             out_ptr[unsafe_offset=i] = val.cast[dtype]()
-        elif MODE == 4:
-            # Antialiased bilinear (RANK 2): a weighted row sum along W per
-            # input row of the span, each rounded to the dtype (CUDA's
-            # scalar_t buffer), then the weighted sum of those along H.
+        elif MODE >= AA_BILINEAR:
+            # Antialiased (RANK 2): a weighted row sum along W per input row
+            # of the span, each rounded to the dtype (CUDA's scalar_t
+            # buffer, CPU's horizontal pass), then the weighted sum of those
+            # along H. CPU's lanczos skips an axis whose size is unchanged.
             var sh_a = sh
             var sw_a = sw
-            var xs = _aa_span[acc](ow, in_w, sw_a)
-            var ys = _aa_span[acc](oh, in_h, sh_a)
+            var same_w = MODE == AA_LANCZOS and in_w == out_w
+            var same_h = MODE == AA_LANCZOS and in_h == out_h
+            var xs = _aa_span[acc](ow, in_w, sw_a, same_w)
+            var ys = _aa_span[acc](oh, in_h, sh_a, same_h)
             var xt = _aa_total[acc](xs, sw_a)
             var yt = _aa_total[acc](ys, sh_a)
             var val = Scalar[acc](0)
@@ -473,11 +535,13 @@ def _upsample_fwd[
                 for x in range(xs[1]):
                     rowv = fma(
                         at(0, ys[0] + y, xs[0] + x),
-                        _aa_weight[dtype, acc](x, xs, sw_a, xt),
+                        _aa_weight[dtype, acc](x, xs, sw_a, xt, same_w),
                         rowv,
                     )
                 rowv = rowv.cast[dtype]().cast[acc]()
-                val = fma(rowv, _aa_weight[dtype, acc](y, ys, sh_a, yt), val)
+                val = fma(
+                    rowv, _aa_weight[dtype, acc](y, ys, sh_a, yt, same_h), val
+                )
             out_ptr[unsafe_offset=i] = val.cast[dtype]()
         else:
             # Bicubic (RANK 2): four cubic row interpolations along W, then
@@ -582,7 +646,7 @@ def _upsample_bwd[
                     var row = obase + (d * out_h + h) * out_w
                     for w in range(w_lo, w_hi):
                         total += gout[unsafe_offset=row + w].cast[acc]()
-        elif MODE == 4:
+        elif MODE >= AA_BILINEAR:
             var sh_a = sh
             var sw_a = sw
             var h_lo = _aa_first_past[acc, True](ih, sh_a, in_h, out_h)

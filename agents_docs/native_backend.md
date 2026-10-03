@@ -954,7 +954,7 @@ same conversion as a `PrivateUse1` dispatcher fallback, so every op with a
 CUDA kernel and no Mojo op runs this way — `take`, `kthvalue`, `mode`,
 … forward and backward. The fallback only fires where *no* kernel is
 registered, so an op the backend registers and then declines at run time
-(`aten::convolution` with `transposed=True`) still raises — the dispatcher
+(`aten::convolution` of int64 operands) still raises — the dispatcher
 already found a kernel.
 
 Measured on an H100 (torch 2.11+cu128, causal-conv1d 1.7.0): `as_cuda` 3.6 µs,

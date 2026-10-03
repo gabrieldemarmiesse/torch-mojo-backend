@@ -1,11 +1,15 @@
 """ATen ops: resample group (see agents_docs/native_backend.md).
 
 Reflection / replication padding (1-d, 2-d, 3-d) and nearest, nearest-exact,
-linear, bilinear, bicubic, trilinear and antialiased bilinear upsampling,
+linear, bilinear, bicubic, trilinear and antialiased bilinear / bicubic /
+lanczos upsampling,
 each with its `.out` overload, its backward and the backward's
 `.grad_input` overload -- the ops behind `F.pad(mode="reflect" |
 "replicate")` and `F.interpolate`. The `.vec`
 overloads are CompositeImplicitAutograd over these and need nothing here.
+Also `grid_sampler_2d` / `grid_sampler_3d` (F.grid_sample), their `.out`,
+backwards and backward `.out`, on their own family `grid_sample`
+(tmb/kernels/grid_sample/entry.mojo); see the section at the bottom.
 
 One kernel family, `resample` (tmb/kernels/resample/entry.mojo), serves all
 of them: every op views its operands as contiguous (planes, D, H, W) with the
@@ -24,13 +28,20 @@ from std.utils import IndexList
 from tmb.backend.abi import (
     Owned,
     ST_UINT8,
+    TAG_BOOL_LIST,
+    TAG_NONE,
     T,
     Value,
     Values,
     IntList,
+    alert_not_deterministic,
+    index_error,
     is_floating,
+    _channels_last_strides,
     new_like,
+    new_strided,
     new_tensor,
+    release,
     own,
     own_if_new,
     ret_owned,
@@ -38,17 +49,23 @@ from tmb.backend.abi import (
     unsupported,
     v_bool,
     v_f64,
+    v_int,
     v_is_none,
     v_tensor,
 )
-from tmb.backend.device import ctx_for, ctx_ptr
+from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK, _f64_slot
 from tmb.ops.common import (
     OVERLAP_FULL,
     OVERLAP_PARTIAL,
     assert_no_internal_overlap,
+    assert_no_overlap,
     assert_no_partial_overlap,
+    cast_to,
+    check_out,
+    check_out_as,
+    device_str,
     fill_value,
     overlap_status,
     resized_geometry,
@@ -59,6 +76,7 @@ from tmb.ops.common import (
     copy_strided_into,
     resize_out,
 )
+from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 
 comptime NEAREST = 0
@@ -66,6 +84,8 @@ comptime NEAREST_EXACT = 1
 comptime LINEAR = 2
 comptime CUBIC = 3
 comptime BILINEAR_AA = 4
+comptime BICUBIC_AA = 5
+comptime LANCZOS_AA = 6
 
 
 def _sizes_str(t: T) -> String:
@@ -190,6 +210,10 @@ def _up_name[MODE: Int, RANK: Int]() -> String:
         return String("upsample_bicubic2d")
     elif MODE == BILINEAR_AA:
         return String("_upsample_bilinear2d_aa")
+    elif MODE == BICUBIC_AA:
+        return String("_upsample_bicubic2d_aa")
+    elif MODE == LANCZOS_AA:
+        return String("_upsample_lanczos2d_aa")
     else:
         comptime if RANK == 1:
             return String("upsample_linear1d")
@@ -405,7 +429,9 @@ def _is_identity[
     the linear 1-d, trilinear and bicubic kernels, and the antialiased
     backward's. The nearest 1-d / 3-d kernels have no shortcut, but at an
     unchanged size with a unit scale their source index is the identity.
-    The antialiased forward has none."""
+    The antialiased CUDA forward has none; lanczos, a CPU-only kernel,
+    copies in its forward (upsample_separable_Nd_kernel_impl) and not in its
+    backward."""
     for k in range(RANK):
         if in_dims[2 + k] != out_dims[2 + k]:
             return False
@@ -418,7 +444,9 @@ def _is_identity[
             ):
                 return False
         return True
-    elif MODE == BILINEAR_AA:
+    elif MODE == LANCZOS_AA:
+        return not BACKWARD
+    elif MODE >= BILINEAR_AA:
         return BACKWARD
     else:
         return True
@@ -493,8 +521,49 @@ def op_upsample[
                 dst, src.t, identity, in_dims, out_dims, align, scales
             )
             _ = src^
+        comptime if MODE >= BILINEAR_AA:
+            # The antialiased kernels' meta allocates the output in the
+            # input's `suggest_memory_format()`: channels_last stays
+            # channels_last.
+            if _suggests_channels_last(a):
+                var cl = new_strided(
+                    dst.shape,
+                    _channels_last_strides(dst.shape, dst.rank),
+                    dst.rank,
+                    dst.stype,
+                    dst.device,
+                )
+                copy_strided_into(cl, dst)
+                release(dst.h)
+                dst = cl^
         var o = own(dst^)
         ret_owned(rets, 0, o)
+
+
+def _suggests_channels_last(t: T) -> Bool:
+    """c10's `suggest_memory_format() == ChannelsLast` for a rank-4 tensor:
+    `is_channels_last_strides_2d_s4` (c10/core/MemoryFormat.h), the stride
+    heuristic torch caches as `is_strides_like_channels_last`, so a sliced
+    or otherwise non-dense NHWC view counts too."""
+    if t.rank != 4:
+        return False
+    var o = MAX_RANK - 4
+    if t.strides[o + 1] == 0:
+        return False
+    var min_s = 0
+    for d in [1, 3, 2, 0]:
+        var size = t.shape[o + d]
+        var stride = t.strides[o + d]
+        if size == 0:
+            return False
+        if stride < min_s:
+            return False
+        if d == 0 and min_s == t.strides[o + 1]:
+            return False
+        min_s = stride
+        if size > 1:
+            min_s *= size
+    return True
 
 
 def op_upsample_backward[
@@ -917,6 +986,368 @@ def op_pad_backward[
         ret_owned(rets, 0, o)
 
 
+# ---------------------------------------------------------------------------
+# grid_sampler_2d / grid_sampler_3d (F.grid_sample) and their backwards
+# ---------------------------------------------------------------------------
+#
+# Kernels: tmb/kernels/grid_sample/entry.mojo (a port of GridSampler.cu).
+# Checks and messages: GridSamplerUtils.h's check_grid_sampler_* at v2.14.0,
+# then the CUDA launcher's dtype dispatch and data_ptr<scalar_t>() checks.
+# Every operand is read through its own strides; the outputs are contiguous
+# (grad_input: zeros_like(input, LEGACY_CONTIGUOUS), grad_grid: empty_like
+# (grid, LEGACY_CONTIGUOUS)), as on CUDA. The `.out` overloads are torch's
+# autogenerated ones: compute, then resize `out` and copy (casting) into it.
+
+
+def _grid_float_ok(t: T) raises -> Bool:
+    if t.dtype == DType.float64:
+        return dev(t.device)[].api != "metal"
+    return (
+        t.dtype == DType.float32
+        or t.dtype == DType.float16
+        or t.dtype == DType.bfloat16
+    )
+
+
+def _grid_check[
+    RANK: Int
+](input: T, grid: T, interp: Int, pad: Int, name: String) raises:
+    """check_grid_sampler_common + check_grid_sampler_{2,3}d, then the mode
+    and dtype gates of the CUDA launcher."""
+    if input.device_type != grid.device_type or input.device != grid.device:
+        raise Error(
+            (
+                "grid_sampler(): expected input and grid to be on same device,"
+                " but input is on "
+            ),
+            device_str(input),
+            " and grid is on ",
+            device_str(grid),
+        )
+    if not input.on_mojo():
+        unsupported(name + ": input is not on the mojo device")
+    if input.rank == 0 or grid.rank == 0:
+        index_error("dimension specified as 0 but tensor has no dimensions")
+    if input.dim(0) != grid.dim(0):
+        raise Error(
+            (
+                "grid_sampler(): expected grid and input to have same batch"
+                " size, but got input with sizes "
+            ),
+            _sizes_str(input),
+            " and grid with sizes ",
+            _sizes_str(grid),
+        )
+    if grid.dim(-1) != input.rank - 2:
+        raise Error(
+            "grid_sampler(): expected grid to have size ",
+            input.rank - 2,
+            " in last dimension, but got grid with sizes ",
+            _sizes_str(grid),
+        )
+    for i in range(2, input.rank):
+        if input.dim(i) <= 0:
+            raise Error(
+                (
+                    "grid_sampler(): expected input to have non-empty spatial"
+                    " dimensions, but input has sizes "
+                ),
+                _sizes_str(input),
+                " with dimension ",
+                i,
+                " being empty",
+            )
+    if input.rank != RANK + 2 or grid.rank != input.rank:
+        raise Error(
+            "grid_sampler(): expected ",
+            RANK + 2,
+            (
+                "D input and grid with same number of dimensions, but got input"
+                " with sizes "
+            ),
+            _sizes_str(input),
+            " and grid with sizes ",
+            _sizes_str(grid),
+        )
+    comptime if RANK == 3:
+        if interp == 2:
+            raise Error(
+                "grid_sampler(): bicubic interpolation only supports 4D input"
+            )
+    if interp < 0 or interp > 2:
+        raise Error(
+            name, ": unknown interpolation_mode ", interp, " (expected 0..2)"
+        )
+    if pad < 0 or pad > 2:
+        raise Error(name, ": unknown padding_mode ", pad, " (expected 0..2)")
+
+
+def _grid_dtype_check(
+    input: T, others: List[T], count: Int, name: String
+) raises:
+    """AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16) over the input, then
+    each operand's `data_ptr<scalar_t>()` (only reached when count > 0)."""
+    if (
+        input.dtype != DType.float32
+        and input.dtype != DType.float16
+        and input.dtype != DType.bfloat16
+        and input.dtype != DType.float64
+    ):
+        unsupported(
+            String(
+                '"',
+                name,
+                "_cuda\" not implemented for '",
+                _scalar_type_name(input.dtype),
+                "'",
+            )
+        )
+    if not _grid_float_ok(input):
+        unsupported(name + ": float64 is unavailable on Apple GPUs")
+    if count == 0:
+        return
+    for k in range(len(others)):
+        if others[k].stype != input.stype:
+            raise Error(
+                "expected scalar type ",
+                _scalar_type_name(input.dtype),
+                " but found ",
+                _scalar_type_name(others[k].dtype),
+            )
+
+
+def _grid_geometry[
+    RANK: Int
+](
+    input: T,
+    grid: T,
+    strided: T,
+    interp: Int,
+    pad: Int,
+    align: Bool,
+    input_grad: Bool,
+) -> List[Int]:
+    """The kernel's geometry tuple (see G_* in the kernel family): sizes,
+    the strides of input, grid and `strided` (output / grad_output), modes.
+    A 2-d op has unit D extents and zero D strides."""
+    var g = List[Int]()
+    var count = input.dim(0)
+    g.append(input.dim(0))
+    g.append(input.dim(1))
+    comptime if RANK == 2:
+        g.append(1)
+    for i in range(2, RANK + 2):
+        g.append(input.dim(i))
+    comptime if RANK == 2:
+        g.append(1)
+    for i in range(1, RANK + 1):
+        g.append(grid.dim(i))
+        count *= grid.dim(i)
+    # input strides N, C, D, H, W
+    g.append(input.stride(0))
+    g.append(input.stride(1))
+    comptime if RANK == 2:
+        g.append(0)
+    for i in range(2, RANK + 2):
+        g.append(input.stride(i))
+    # grid strides N, D, H, W, coordinate
+    g.append(grid.stride(0))
+    comptime if RANK == 2:
+        g.append(0)
+    for i in range(1, RANK + 2):
+        g.append(grid.stride(i))
+    # output / grad_output strides N, C, D, H, W
+    g.append(strided.stride(0))
+    g.append(strided.stride(1))
+    comptime if RANK == 2:
+        g.append(0)
+    for i in range(2, RANK + 2):
+        g.append(strided.stride(i))
+    g.append(interp)
+    g.append(pad)
+    g.append(1 if align else 0)
+    g.append(1 if input_grad else 0)
+    g.append(count)
+    return g^
+
+
+def _grid_out_shape[RANK: Int](input: T, grid: T) -> List[Int]:
+    var dims = List[Int]()
+    dims.append(input.dim(0))
+    dims.append(input.dim(1))
+    for i in range(1, RANK + 1):
+        dims.append(grid.dim(i))
+    return dims^
+
+
+def _copy_to_out(mut dst: T, src: T, dims: List[Int], name: String) raises:
+    """torch's autogenerated `.out`: `resize_output(out, result.sizes())`
+    then the generated `copy_arg`, which requires the result's exact dtype
+    and device (no cast), into an `out` that does not overlap itself."""
+    check_out_as(dst, src.stype, src)
+    # ATen's order: resize first (a wrongly shaped out gets a fresh layout),
+    # then the overlap check on the final one.
+    resize_out(dst, _shape(dims), len(dims))
+    assert_no_internal_overlap(dst)
+    if dst.numel == 0:
+        return
+    copy_strided_into(dst, src)
+
+
+def op_grid_sampler[
+    RANK: Int, OUT: Bool
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """aten::grid_sampler_{2,3}d(Tensor input, Tensor grid,
+    int interpolation_mode, int padding_mode, bool align_corners) -> Tensor,
+    and `.out(..., *, Tensor(a!) out)`."""
+    comptime name = String("grid_sampler_", RANK, "d")
+    var input = v_tensor(args[unsafe_offset=0])
+    var grid = v_tensor(args[unsafe_offset=1])
+    var interp = v_int(args[unsafe_offset=2])
+    var pad = v_int(args[unsafe_offset=3])
+    var align = v_bool(args[unsafe_offset=4])
+    _grid_check[RANK](input, grid, interp, pad, name)
+    var dims = _grid_out_shape[RANK](input, grid)
+    var count = input.dim(0)
+    for i in range(1, RANK + 1):
+        count *= grid.dim(i)
+    _grid_dtype_check(input, [grid.copy()], count, name)
+    var out = own(new_tensor(_shape(dims), RANK + 2, input.stype, input.device))
+    if count > 0 and out.t.numel > 0:
+        var geom = _grid_geometry[RANK](
+            input, grid, out.t, interp, pad, align, False
+        )
+        var ctx = ctx_for(input.device)
+        var call = KernelCall(
+            "grid_sample", "GridSampler2d" if RANK == 2 else "GridSampler3d"
+        )
+        call.arg_dtype(0, input.dtype)
+        call.int(out.t.ptr)
+        call.int(input.ptr)
+        call.int(grid.ptr)
+        call.tuple(geom)
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+    comptime if OUT:
+        var dst = v_tensor(args[unsafe_offset=5])
+        _copy_to_out(dst, out.t, dims, name)
+        _ = out^
+        ret_ref(rets, 0, dst)
+    else:
+        ret_owned(rets, 0, out)
+
+
+def _mask_list(v: Value) raises -> List[Bool]:
+    """A borrowed `bool[2]` argument (uint8 per element in the call arena)."""
+    if v.tag != TAG_BOOL_LIST:
+        raise Error("expected a bool[] argument, got record tag ", v.tag)
+    var out = List[Bool]()
+    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
+    for i in range(Int(v.len)):
+        out.append(p[unsafe_offset=i] != 0)
+    return out^
+
+
+def op_grid_sampler_backward[
+    RANK: Int, OUT: Bool
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """aten::grid_sampler_{2,3}d_backward(Tensor grad_output, Tensor input,
+    Tensor grid, int interpolation_mode, int padding_mode,
+    bool align_corners, bool[2] output_mask) -> (Tensor, Tensor), and
+    `.out(..., *, Tensor(a!) out0, Tensor(b!) out1)`. grad_input is computed
+    only when output_mask[0] (else undefined); grad_grid always."""
+    comptime name = String("grid_sampler_", RANK, "d_backward")
+    var grad = v_tensor(args[unsafe_offset=0])
+    var input = v_tensor(args[unsafe_offset=1])
+    var grid = v_tensor(args[unsafe_offset=2])
+    var interp = v_int(args[unsafe_offset=3])
+    var pad = v_int(args[unsafe_offset=4])
+    var align = v_bool(args[unsafe_offset=5])
+    var mask = _mask_list(args[unsafe_offset=6])
+    if len(mask) != 2:
+        raise Error(name, ": output_mask must have 2 entries")
+    var need_in = mask[0]
+    _grid_check[RANK](input, grid, interp, pad, name)
+    # check_grid_sampler_backward (a ValueError in torch).
+    var expected = _grid_out_shape[RANK](input, grid)
+    var shape_ok = grad.rank == len(expected)
+    if shape_ok:
+        for k in range(len(expected)):
+            if grad.dim(k) != expected[k]:
+                shape_ok = False
+    if not shape_ok:
+        raise Error(
+            "grid_sampler(): expected grad_output to have sizes ",
+            _list_str(expected),
+            " but got grad_output with sizes ",
+            _sizes_str(grad),
+        )
+    if not grad.on_mojo() or grad.device != input.device:
+        unsupported(name + ": grad_output must be on the input's mojo device")
+    # Nondeterministic because of atomicAdd usage (raised before the
+    # launcher's count check, as on CUDA).
+    alert_not_deterministic(name + "_cuda")
+    var count = input.dim(0)
+    for i in range(1, RANK + 1):
+        count *= grid.dim(i)
+    _grid_dtype_check(input, [grad.copy(), grid.copy()], count, name)
+    var gi_dims = List[Int]()
+    for i in range(input.rank):
+        gi_dims.append(input.dim(i))
+    var gg_dims = List[Int]()
+    for i in range(grid.rank):
+        gg_dims.append(grid.dim(i))
+    var gi = own(
+        new_tensor(
+            _shape(gi_dims) if need_in else IndexList[MAX_RANK](0),
+            RANK + 2 if need_in else 1,
+            input.stype,
+            input.device,
+        )
+    )
+    var gg = own(new_tensor(_shape(gg_dims), RANK + 2, grid.stype, grid.device))
+    if (need_in and gi.t.numel > 0) or gg.t.numel > 0:
+        var geom = _grid_geometry[RANK](
+            input, grid, grad, interp, pad, align, need_in
+        )
+        var ctx = ctx_for(input.device)
+        var call = KernelCall(
+            "grid_sample",
+            "GridSampler2dBackward" if RANK == 2 else "GridSampler3dBackward",
+        )
+        call.arg_dtype(0, input.dtype)
+        call.int(gi.t.ptr if need_in else 0)
+        call.int(gg.t.ptr)
+        call.int(grad.ptr)
+        call.int(input.ptr)
+        call.int(grid.ptr)
+        call.tuple(geom)
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+    comptime if OUT:
+        if need_in:
+            var d0 = v_tensor(args[unsafe_offset=7])
+            _copy_to_out(d0, gi.t, gi_dims, name)
+            ret_ref(rets, 0, d0)
+        else:
+            ret_ref(rets, 0, v_tensor(args[unsafe_offset=7]))
+        # Read out1 only now: resizing out0 can move a storage the two share,
+        # and every pointer must be taken after the resizes before it.
+        var d1 = v_tensor(args[unsafe_offset=8])
+        _copy_to_out(d1, gg.t, gg_dims, name)
+        ret_ref(rets, 1, d1)
+        _ = gi^
+        _ = gg^
+    else:
+        if need_in:
+            ret_owned(rets, 0, gi)
+        else:
+            rets[unsafe_offset=0] = Value(TAG_NONE, 0, 0, 0)
+        ret_owned(rets, 1, gg)
+
+
 def register_resample(site: Site) raises:
     impl[op_upsample[NEAREST, 1, False], "upsample_nearest1d"](site)
     impl[op_upsample[NEAREST, 1, True], "upsample_nearest1d.out"](site)
@@ -1033,6 +1464,28 @@ def register_resample(site: Site) raises:
         op_upsample_backward[BILINEAR_AA, 2, True],
         "_upsample_bilinear2d_aa_backward.grad_input",
     ](site)
+    impl[op_upsample[BICUBIC_AA, 2, False], "_upsample_bicubic2d_aa"](site)
+    impl[op_upsample[BICUBIC_AA, 2, True], "_upsample_bicubic2d_aa.out"](site)
+    impl[
+        op_upsample_backward[BICUBIC_AA, 2, False],
+        "_upsample_bicubic2d_aa_backward",
+    ](site)
+    impl[
+        op_upsample_backward[BICUBIC_AA, 2, True],
+        "_upsample_bicubic2d_aa_backward.grad_input",
+    ](site)
+    # Lanczos is in torch from 2.14: on an older torch these register
+    # against a schema that never appears, and are never called.
+    impl[op_upsample[LANCZOS_AA, 2, False], "_upsample_lanczos2d_aa"](site)
+    impl[op_upsample[LANCZOS_AA, 2, True], "_upsample_lanczos2d_aa.out"](site)
+    impl[
+        op_upsample_backward[LANCZOS_AA, 2, False],
+        "_upsample_lanczos2d_aa_backward",
+    ](site)
+    impl[
+        op_upsample_backward[LANCZOS_AA, 2, True],
+        "_upsample_lanczos2d_aa_backward.grad_input",
+    ](site)
     impl[op_pad[True, 1, False], "reflection_pad1d"](site)
     impl[op_pad[True, 1, True], "reflection_pad1d.out"](site)
     impl[op_pad_backward[True, 1, False], "reflection_pad1d_backward"](site)
@@ -1069,3 +1522,15 @@ def register_resample(site: Site) raises:
     impl[
         op_pad_backward[False, 3, True], "replication_pad3d_backward.grad_input"
     ](site)
+    impl[op_grid_sampler[2, False], "grid_sampler_2d"](site)
+    impl[op_grid_sampler[2, True], "grid_sampler_2d.out"](site)
+    impl[op_grid_sampler[3, False], "grid_sampler_3d"](site)
+    impl[op_grid_sampler[3, True], "grid_sampler_3d.out"](site)
+    impl[op_grid_sampler_backward[2, False], "grid_sampler_2d_backward"](site)
+    impl[op_grid_sampler_backward[2, True], "grid_sampler_2d_backward.out"](
+        site
+    )
+    impl[op_grid_sampler_backward[3, False], "grid_sampler_3d_backward"](site)
+    impl[op_grid_sampler_backward[3, True], "grid_sampler_3d_backward.out"](
+        site
+    )

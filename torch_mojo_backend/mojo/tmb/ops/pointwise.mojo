@@ -20,6 +20,8 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    is_dense,
+    new_strided,
     ST_BFLOAT16,
     ST_BOOL,
     ST_FLOAT16,
@@ -113,6 +115,7 @@ from tmb.ops.common import (
 from tmb.ops.random import _draw, _sample, _sampler_dtype_check
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.core import cast_for_copy
+from tmb.ops.distance import store_autogen_out
 from tmb.ops.reductions import _scalar_reduction
 from tmb.ops.unary import op_gelu_backward
 
@@ -2128,6 +2131,261 @@ def op_glu_backward_grad_input(
     _glu_backward(args, rets, 3)
 
 
+def _glu_wrap_dim(dim: Int, rank: Int) raises -> Int:
+    """`maybe_wrap_dim(dim, rank)` (a 0-d tensor wraps as 1-d)."""
+    var r = max(rank, 1)
+    if dim < -r or dim >= r:
+        raise Error(
+            "Dimension out of range (expected to be in range of [",
+            -r,
+            ", ",
+            r - 1,
+            "], but got ",
+            dim,
+            ")",
+        )
+    return dim + r if dim < 0 else dim
+
+
+def _glu_narrow(t: T, d: Int, start: Int, length: Int) raises -> T:
+    """`t.narrow(d, start, length)`: a view over t's storage."""
+    if d >= t.rank:
+        raise Error(
+            "Dimension out of range (expected to be in range of [",
+            -max(t.rank, 1),
+            ", ",
+            max(t.rank, 1) - 1,
+            "], but got ",
+            d,
+            ")",
+        )
+    var p = MAX_RANK - t.rank + d
+    if start + length > t.shape[p]:
+        raise Error(
+            "start (",
+            start,
+            ") + length (",
+            length,
+            ") exceeds dimension size (",
+            t.shape[p],
+            ").",
+        )
+    var shape = t.shape
+    shape[p] = length
+    return view_strided(
+        t, shape, t.strides, t.rank, t.offset + start * t.strides[p]
+    )
+
+
+def _glu_jvp(args: Values) raises -> Owned:
+    """GatedLinearUnit.cpp's glu_jvp over ActivationGluKernel.cu's
+    glu_jvp_kernel: da * sig_b + res * (db - sig_b * db) in opmath, rounded
+    once. The pointwise family takes three operands, so the second term is
+    one launch into an opmath buffer and the sum a second."""
+    var glu = v_tensor(args[unsafe_offset=0])
+    var x = v_tensor(args[unsafe_offset=1])
+    var dx = v_tensor(args[unsafe_offset=2])
+    var d = _glu_wrap_dim(v_int(args[unsafe_offset=3]), x.rank)
+    if d >= glu.rank:
+        raise Error(
+            "Dimension out of range (expected to be in range of [",
+            -max(glu.rank, 1),
+            ", ",
+            max(glu.rank, 1) - 1,
+            "], but got ",
+            d,
+            ")",
+        )
+    var n = glu.dim(d)
+    var b = own(_glu_narrow(x, d, n, n))
+    var da = own(_glu_narrow(dx, d, 0, n))
+    var db = own(_glu_narrow(dx, d, n, n))
+    var operands = [x.copy(), dx.copy()]
+    for t in operands:
+        if t.stype != glu.stype:
+            raise Error(
+                "Found dtype ",
+                _scalar_type_name(t.dtype),
+                " but expected ",
+                _scalar_type_name(glu.dtype),
+            )
+    # The result takes the broadcast shape of glu, b, da and db, as the
+    # TensorIterator over `empty_like(glu)` resizes its output to.
+    if not _pw_is_float(glu.stype):
+        raise Error(
+            '"glu_cuda" not implemented for \'',
+            _scalar_type_name(glu.dtype),
+            "'",
+        )
+    var opmath = ST_FLOAT64 if glu.stype == ST_FLOAT64 else ST_FLOAT32
+    var res_term = own(
+        _pw_run(
+            "glu_jvp_res",
+            3,
+            _b_tside(glu),
+            _b_tside(b.t),
+            _b_tside(db.t),
+            opmath,
+            opmath,
+            _p(),
+            None,
+        ).t.copy()
+    )
+    _ = db^
+    var out = _pw_run(
+        "glu_jvp",
+        3,
+        _b_tside(da.t),
+        _b_tside(b.t),
+        _b_tside(res_term.t),
+        opmath,
+        glu.stype,
+        _p(),
+        None,
+    )
+    _ = res_term^
+    _ = b^
+    _ = da^
+    var fresh = own(out.t.copy())  # a fresh tensor (no `out=` passed above)
+    # `empty_like(glu)` preserves a dense glu's strides (channels_last, a
+    # transpose); the iterator keeps them when no broadcast resizes it.
+    if (
+        not glu.contig
+        and fresh.t.same_shape(glu)
+        and is_dense(glu.shape, glu.strides, glu.rank)
+    ):
+        var kept = own(
+            new_strided(glu.shape, glu.strides, glu.rank, glu.stype, glu.device)
+        )
+        copy_strided_into(kept.t, fresh.t)
+        _ = fresh^
+        return kept^
+    return fresh^
+
+
+def _glu_bjvp_bin(name: StaticString, a: Owned, b: Owned) raises -> Owned:
+    var args = List[Value]()
+    args.append(tensor_arg(a.t))
+    args.append(tensor_arg(b.t))
+    if name != "aten::mul":
+        args.append(Value(TAG_SCALAR_INT, 0, 1, 0))
+    var r = call_op(String(name), "Tensor", args^, 1)
+    return own(r.take_tensor(0))
+
+
+def _glu_bjvp_view(t: T) raises -> Owned:
+    return own(view_strided(t, t.shape, t.strides, t.rank, t.offset))
+
+
+def _glu_backward_jvp(args: Values) raises -> Owned:
+    """GatedLinearUnit.cpp's glu_backward_jvp, the same composite of
+    registered ops (sigmoid, mul, sub, add) through the dispatcher, the two
+    halves written into one result as its final `cat` does."""
+    var grad_x = v_tensor(args[unsafe_offset=0])
+    var grad_glu = v_tensor(args[unsafe_offset=1])
+    var x = v_tensor(args[unsafe_offset=2])
+    var dgrad_glu = _glu_bjvp_view(v_tensor(args[unsafe_offset=3]))
+    var dx = v_tensor(args[unsafe_offset=4])
+    var d = _glu_wrap_dim(v_int(args[unsafe_offset=5]), x.rank)
+    if d >= grad_glu.rank:
+        raise Error(
+            "Dimension out of range (expected to be in range of [",
+            -max(grad_glu.rank, 1),
+            ", ",
+            max(grad_glu.rank, 1) - 1,
+            "], but got ",
+            d,
+            ")",
+        )
+    var n = grad_glu.dim(d)
+    var a = own(_glu_narrow(x, d, 0, n))
+    var b = own(_glu_narrow(x, d, n, n))
+    var da = own(_glu_narrow(dx, d, 0, n))
+    var db = own(_glu_narrow(dx, d, n, n))
+    var gxa = own(_glu_narrow(grad_x, d, 0, n))
+    var r = call_op("aten::sigmoid", "", [tensor_arg(b.t)], 1)
+    var sig_b = own(r.take_tensor(0))
+    _ = b^  # alive across the sigmoid call
+    var glu = _glu_bjvp_bin("aten::mul", a, sig_b)
+    var db_neg_sig_b = _glu_bjvp_bin(
+        "aten::sub", db, _glu_bjvp_bin("aten::mul", db, sig_b)
+    )
+    var dgxa = _glu_bjvp_bin(
+        "aten::add",
+        _glu_bjvp_bin("aten::mul", dgrad_glu, sig_b),
+        _glu_bjvp_bin("aten::mul", gxa, db_neg_sig_b),
+    )
+    var inner = _glu_bjvp_bin(
+        "aten::sub",
+        _glu_bjvp_bin("aten::sub", da, _glu_bjvp_bin("aten::mul", da, sig_b)),
+        _glu_bjvp_bin("aten::mul", glu, db_neg_sig_b),
+    )
+    var dgxb = _glu_bjvp_bin(
+        "aten::add",
+        _glu_bjvp_bin("aten::mul", dgxa, _glu_bjvp_bin("aten::sub", a, glu)),
+        _glu_bjvp_bin("aten::mul", gxa, inner),
+    )
+    # at::cat({dgrad_x_a, dgrad_x_b}, dim)
+    var st = promote_types(dgxa.t.stype, dgxb.t.stype)
+    if not dgxa.t.same_shape(dgxb.t):
+        raise Error(
+            "Sizes of tensors must match except in dimension ",
+            d,
+        )
+    # The halves take the broadcast length along `dim`, which is not
+    # grad_glu's when it broadcasts against dgrad_glu.
+    var shape = dgxa.t.shape
+    var p = MAX_RANK - dgxa.t.rank + d
+    var half_len = shape[p]
+    shape[p] = 2 * half_len
+    var out = own(new_tensor(shape, dgxa.t.rank, st, dgxa.t.device))
+    var halves = [dgxa.t.copy(), dgxb.t.copy()]
+    for k in range(2):
+        var half = own(_glu_narrow(out.t, d, k * half_len, half_len))
+        var src = own(cast_to(halves[k], st)) if halves[
+            k
+        ].stype != st else _glu_bjvp_view(halves[k])
+        copy_strided_into(half.t, src.t)
+        _ = half^  # alive past the copy
+        _ = src^
+    _ = halves^
+    _ = dgxa^
+    _ = dgxb^
+    return out^
+
+
+def _glu_jvp_out(rets: Values, out_value: Value, var result: Owned) raises:
+    var out = store_autogen_out(v_tensor(out_value), result.t)
+    _ = result^  # alive past the copy
+    ret_ref(rets, 0, out)
+
+
+# aten::glu_jvp(Tensor glu, Tensor x, Tensor dx, int dim) -> Tensor
+def op_glu_jvp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var r = _glu_jvp(args)
+    ret_owned(rets, 0, r)
+
+
+# aten::glu_jvp.out(Tensor glu, Tensor x, Tensor dx, int dim, *, Tensor(a!) out) -> Tensor(a!)
+def op_glu_jvp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _glu_jvp_out(rets, args[unsafe_offset=4], _glu_jvp(args))
+
+
+# aten::glu_backward_jvp(Tensor grad_x, Tensor grad_glu, Tensor x, Tensor dgrad_glu, Tensor dx, int dim) -> Tensor
+def op_glu_backward_jvp(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var r = _glu_backward_jvp(args)
+    ret_owned(rets, 0, r)
+
+
+# aten::glu_backward_jvp.out(..., int dim, *, Tensor(a!) out) -> Tensor(a!)
+def op_glu_backward_jvp_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _glu_jvp_out(rets, args[unsafe_offset=6], _glu_backward_jvp(args))
+
+
 # aten::gelu_backward.grad_input(Tensor grad_output, Tensor self, *, str approximate='none', Tensor(a!) grad_input) -> Tensor(a!)
 def op_gelu_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -3957,6 +4215,10 @@ def register_pointwise(site: Site) raises:
     impl[op_glu_out, "glu.out"](site)
     impl[op_glu_backward, "glu_backward"](site)
     impl[op_glu_backward_grad_input, "glu_backward.grad_input"](site)
+    impl[op_glu_jvp, "glu_jvp"](site)
+    impl[op_glu_jvp_out, "glu_jvp.out"](site)
+    impl[op_glu_backward_jvp, "glu_backward_jvp"](site)
+    impl[op_glu_backward_jvp_out, "glu_backward_jvp.out"](site)
     impl[op_silu_backward, "silu_backward"](site)
     impl[op_silu_backward_grad_input, "silu_backward.grad_input"](site)
     impl[op_softplus, "softplus"](site)

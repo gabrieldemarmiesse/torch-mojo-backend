@@ -575,6 +575,7 @@ INPLACE_OVERLOADS = [
     "ldexp_.default",
     "leaky_relu_.default",
     "lerp_.Scalar",
+    "logit_.default",
     "mul_.Scalar",
     "mul_.Tensor",
     "rad2deg_.default",

@@ -119,6 +119,22 @@ ACT_BACKWARD_OPS = {
     "glu_backward": lambda g, x: torch.ops.aten.glu_backward(
         g[..., : x.shape[-1] // 2], x[..., : x.shape[-1] // 2 * 2], -1
     ),
+    # glu's forward-mode derivatives over the same halving: `g`'s half
+    # stands in for glu's output / grad, `x` for the input and its tangent.
+    "glu_jvp": lambda g, x: torch.ops.aten.glu_jvp(
+        g[..., : x.shape[-1] // 2],
+        x[..., : x.shape[-1] // 2 * 2],
+        x[..., : x.shape[-1] // 2 * 2],
+        -1,
+    ),
+    "glu_backward_jvp": lambda g, x: torch.ops.aten.glu_backward_jvp(
+        x[..., : x.shape[-1] // 2 * 2],
+        g[..., : x.shape[-1] // 2],
+        x[..., : x.shape[-1] // 2 * 2],
+        g[..., : x.shape[-1] // 2],
+        x[..., : x.shape[-1] // 2 * 2],
+        -1,
+    ),
     "hardshrink_backward": lambda g, x: torch.ops.aten.hardshrink_backward(g, x, 0.5),
     "hardsigmoid_backward": torch.ops.aten.hardsigmoid_backward,
     "hardswish_backward": torch.ops.aten.hardswish_backward,
@@ -288,6 +304,8 @@ SKIPPED: dict[str, str] = {
     "aten::gcd.out": _OUT,
     "aten::gelu_backward.grad_input": _OUT,
     "aten::glu_backward.grad_input": _OUT,
+    "aten::glu_jvp.out": _OUT,
+    "aten::glu_backward_jvp.out": _OUT,
     "aten::hardshrink_backward.grad_input": _OUT,
     "aten::hardsigmoid_backward.grad_input": _OUT,
     "aten::hardtanh_backward.grad_input": _OUT,

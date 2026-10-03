@@ -64,6 +64,7 @@ from tmb.ops.common import (
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import cast_for_copy
+from tmb.ops.data_movement import _scalar_type_name
 
 
 # ---------------------------------------------------------------------------
@@ -1651,6 +1652,40 @@ def op_logit_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, dst)
 
 
+# aten::logit_(Tensor(a!) self, float? eps=None) -> Tensor(a!)
+#
+# Unlike every other unary_float_op in this file, logit has no generic
+# dispatch fallback for an out-of-tree backend: native_functions.yaml gives
+# logit_ its own per-backend `dispatch: CPU, CUDA, XPU: logit_` instead of
+# leaving it structured, so there is no CompositeExplicitAutogradNonFunctional
+# (or CompositeImplicitAutograd) alias for PrivateUse1 to fall through to --
+# confirmed with `torch._C._dispatch_dump("aten::logit_")`, which lists only
+# the three named backends. Every other op in this file's in-place family
+# (acos_, sin_, sigmoid_, ...) already works on this device without a
+# registration of its own, through exactly that alias; logit_ is the one
+# exception, so it alone needs `_param_unary_out` wired up directly, the same
+# way `op_round__decimals` does for round_.decimals.
+def op_logit_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var t = v_tensor(args[unsafe_offset=0])
+    var eps = _logit_eps(args[unsafe_offset=1])
+    var src = own_if_new(_promote(t), t)
+    if _is_bitwise_dtype(t.dtype):
+        # CUDA's order: the cast check on self fires before any dtype support
+        # check of the promoted result (a float64 default dtype included).
+        raise Error(
+            "result type ",
+            _scalar_type_name(src.t.dtype),
+            " can't be cast to the desired output type ",
+            _scalar_type_name(t.dtype),
+        )
+    _require_float("logit", src.t.dtype)
+    var b = _logit_bounds(eps, src.t.dtype)
+    var dst = t.copy()
+    _param_unary_out("LogitSpec", src.t, dst, eps, b[0], b[1], cast_ok=True)
+    _ = src^
+    ret_ref(rets, 0, t)
+
+
 def _polygamma_check(n: Int, t: T) raises:
     if n < 0:
         raise Error("polygamma(n, x) does not support negative n.")
@@ -2266,6 +2301,7 @@ def register_unary(site: Site) raises:
     impl[op_log2_out, "log2.out"](site)
     impl[op_logit, "logit"](site)
     impl[op_logit_out, "logit.out"](site)
+    impl[op_logit_, "logit_"](site)
     impl[op_mvlgamma, "mvlgamma"](site)
     impl[op_mvlgamma_out, "mvlgamma.out"](site)
     impl[op_nan_to_num, "nan_to_num"](site)

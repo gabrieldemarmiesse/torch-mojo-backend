@@ -1,13 +1,14 @@
 """ATen ops: pooling group (see agents_docs/native_backend.md).
 
-Max / average / adaptive pooling in 2-D and 3-D with their backwards, max
-unpooling, and im2col / col2im (nn.Unfold / nn.Fold). ATen's 1-D pooling
+Max / fractional max / average / adaptive pooling in 2-D and 3-D with their
+backwards, max_pool2d_backward (the indices-free gradient), max unpooling, and im2col / col2im (nn.Unfold / nn.Fold). ATen's 1-D pooling
 ops are composites over the 2-D ones, and `F.interpolate(mode="area")` over
 the adaptive average.
 
 Every op validates its arguments the way torch's meta / CUDA host code does
 (aten/src/ATen/native/Pool.h, DilatedMaxPool2d.cpp, AveragePool2d.cpp,
-AveragePool3d.cpp, AdaptiveMaxPooling{2,3}d.cpp, cuda/DilatedMaxPool3d.cu,
+AveragePool3d.cpp, AdaptiveMaxPooling{2,3}d.cpp, FractionalMaxPool{2,3}d.cpp,
+FractionalMaxPooling.h, cuda/DilatedMaxPool3d.cu,
 cuda/AdaptiveAveragePooling{,3d}.cu, cuda/MaxUnpooling.cu,
 im2col_shape_check.h at v2.14.0), makes its input contiguous and runs one
 generic kernel of the `pool` family (tmb/kernels/pool/entry.mojo): the 2-D
@@ -692,16 +693,16 @@ def _max_pool_backward[
     var x = v_tensor(args[unsafe_offset=1])
     var indices = v_tensor(args[unsafe_offset=7])
     comptime name: StaticString = "max_pool2d" if n == 2 else "max_pool3d"
-    var w = Window(
-        n,
-        name,
-        IntList(args[unsafe_offset=2]),
-        IntList(args[unsafe_offset=3]),
-        IntList(args[unsafe_offset=4]),
-        IntList(args[unsafe_offset=5]),
-        True,
-        v_bool(args[unsafe_offset=6]),
-    )
+    var w = _max_window[n](x, args, 2, name)
+    return _max_pool_backward_with[n](grad, x, w, indices, dest)
+
+
+def _max_pool_backward_with[
+    n: Int
+](
+    grad: T, x: T, w: Window, indices: T, dest: Optional[T] = None
+) raises -> Owned:
+    comptime name: StaticString = "max_pool2d" if n == 2 else "max_pool3d"
     if grad.stype != x.stype:
         raise Error(
             "expected dtype ",
@@ -772,6 +773,43 @@ def op_max_pool_backward_out[
     var dest = v_tensor(args[unsafe_offset=8])
     check_out(dest, v_tensor(args[unsafe_offset=1]))
     _store(rets, 0, dest, _max_pool_backward[n](args, dest.copy()))
+
+
+def _max_pool2d_backward(
+    args: Values, dest: Optional[T] = None
+) raises -> Owned:
+    """aten::max_pool2d_backward: max_pool2d's gradient without saved
+    indices (only MPS implements it upstream, from MPSGraph's pooling
+    gradient). The forward runs again for its argmax, then the
+    max_pool2d_with_indices backward routes the gradient by it."""
+    var grad = v_tensor(args[unsafe_offset=0])
+    var x = v_tensor(args[unsafe_offset=1])
+    var w = _max_window[2](x, args, 2, "max_pool2d")
+    var outs = _max_pool_check[2](x, w, _max_pool_name[2]())
+    _check_dtype(x, "max_pool2d")
+    var r = _max_pool[2](x, w, outs)
+    var gin = _max_pool_backward_with[2](grad, x, w, r[1].t, dest)
+    _ = r^
+    return gin^
+
+
+# aten::max_pool2d_backward(Tensor grad_output, Tensor self,
+#   int[2] kernel_size, int[2] stride=[], int[2] padding=0,
+#   int[2] dilation=1, bool ceil_mode=False) -> Tensor
+def op_max_pool2d_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var gin = _max_pool2d_backward(args)
+    ret_owned(rets, 0, gin)
+
+
+# aten::max_pool2d_backward.out(..., *, Tensor(a!) out) -> Tensor(a!)
+def op_max_pool2d_backward_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = v_tensor(args[unsafe_offset=7])
+    check_out(dest, v_tensor(args[unsafe_offset=1]))
+    _store(rets, 0, dest, _max_pool2d_backward(args, dest.copy()))
 
 
 def _scatter_backward(
@@ -1360,6 +1398,343 @@ def op_adaptive_max_pool_backward_out[
 
 
 # ---------------------------------------------------------------------------
+# Fractional max pooling
+# ---------------------------------------------------------------------------
+
+
+def _frac_name[n: Int]() -> StaticString:
+    return "fractional_max_pool2d" if n == 2 else "fractional_max_pool3d"
+
+
+def _frac_check[
+    n: Int
+](x: T, pool_l: IntList, out_l: IntList) raises -> Tuple[
+    IndexList[3], IndexList[3]
+]:
+    """FractionalMaxPool{2,3}d.cpp's meta checks: (pool size, output size)
+    as (D, H, W), D = 1 for the 2-D op."""
+    comptime name = _frac_name[n]()
+    comptime fn3 = "fractional_max_pool3d_out()"
+    if len(pool_l) != n:
+        raise Error(
+            name,
+            ": kernel_size must either be a single Int or tuple of ",
+            "Ints" if n == 2 else "three Ints",
+        )
+    if len(out_l) != n:
+        raise Error(
+            name,
+            ": output_size must either be a single Int or tuple of ",
+            "Ints" if n == 2 else "three Ints",
+        )
+    var pool = IndexList[3](1)
+    var outs = IndexList[3](1)
+    for i in range(n):
+        pool[3 - n + i] = pool_l[i]
+        outs[3 - n + i] = out_l[i]
+    var positive = True
+    for i in range(3 - n, 3):
+        if pool[i] <= 0:
+            positive = False
+    if not positive:
+        var k = String(pool[3 - n])
+        for i in range(4 - n, 3):
+            k += "x" + String(pool[i])
+        raise Error(
+            name, "(): kernel size should be greater than zero, but got ", k
+        )
+    var lead = String(name) + "()" if n == 2 else String(fn3)
+    if x.rank != n + 1 and x.rank != n + 2:
+        raise Error(
+            lead,
+            ": Expected ",
+            n + 1,
+            "D or ",
+            n + 2,
+            "D tensor, but got: ",
+            _sizes(x),
+        )
+    for i in range(1, x.rank):
+        if x.dim(i) <= 0:
+            raise Error(
+                lead,
+                (
+                    ": Expected input to have non-zero size for non-batch"
+                    " dimensions, but got"
+                ),
+                _sizes(x),
+                " with dimension ",
+                i,
+                " being empty.",
+            )
+    var ins = _in_spatial(x, n)
+    if n == 2:
+        if outs[1] + pool[1] - 1 > ins[1]:
+            raise Error(
+                lead,
+                ": pool height ",
+                pool[1],
+                " too large relative to input height ",
+                ins[1],
+            )
+        if outs[2] + pool[2] - 1 > ins[2]:
+            raise Error(
+                lead,
+                ": pool width ",
+                pool[2],
+                " too large relative to input width ",
+                ins[2],
+            )
+    else:
+        # 3-D asks strictly less (the 2-D op allows equality).
+        var labels = ["time", "width", "height"]
+        var axes = [0, 2, 1]
+        for j in range(3):
+            var a = axes[j]
+            if pool[a] > ins[a] or outs[a] + pool[a] - 1 >= ins[a]:
+                raise Error(
+                    lead,
+                    ": pool ",
+                    labels[j],
+                    " ",
+                    pool[a],
+                    " too large relative to input ",
+                    labels[j],
+                    " ",
+                    ins[a],
+                )
+    for i in range(3 - n, 3):
+        if outs[i] < 0:
+            raise Error(
+                "Trying to create tensor with negative dimension ",
+                outs[i],
+                ": ",
+                _sizes(x),
+            )
+    return (pool, outs)
+
+
+def _frac_samples_check[n: Int](x: T, samples: T) raises:
+    """fractional_max_pool_check_shape (FractionalMaxPooling.h)."""
+    if samples.stype != x.stype:
+        raise Error("Expect _random_samples to have the same dtype as input")
+    if samples.rank != 3:
+        raise Error(
+            "Expect _random_samples to have 3 dimensions, got ", samples.rank
+        )
+    var batch = 1 if x.rank == n + 1 else x.dim(0)
+    var channels = x.dim(0) if x.rank == n + 1 else x.dim(1)
+    if samples.dim(0) < batch:
+        raise Error(
+            "Expect _random_samples.size(0) no less then input batch size."
+        )
+    if samples.dim(1) != channels:
+        raise Error(
+            "Expect _random_samples.size(1) equals to input channel size."
+        )
+    if samples.dim(2) != n:
+        raise Error(
+            "Expect _random_samples.size(2) equals to ",
+            n,
+            "; got ",
+            samples.dim(2),
+            ".",
+        )
+    _same_device(x, samples, _frac_name[n]())
+
+
+def _fractional_max_pool[
+    n: Int
+](
+    args: Values,
+    dest: Optional[T] = None,
+    dest_indices: Optional[T] = None,
+) raises -> List[Owned]:
+    var x = v_tensor(args[unsafe_offset=0])
+    var samples = v_tensor(args[unsafe_offset=3])
+    var po = _frac_check[n](
+        x, IntList(args[unsafe_offset=1]), IntList(args[unsafe_offset=2])
+    )
+    _check_dtype(x, _frac_name[n]())
+    _frac_samples_check[n](x, samples)
+    var r = _outputs(x, n, po[1], dest, dest_indices)
+    if r[0].t.numel:
+        var xc = own_if_new(contiguous(_fresh(x)), x)
+        var sc = own_if_new(contiguous(_fresh(samples)), samples)
+        var ctx = ctx_for(x.device)
+        var call = KernelCall("pool", "FractionalMaxPool")
+        call.arg_dtype(0, x.dtype)
+        call.int(r[0].t.ptr)
+        call.int(r[1].t.ptr)
+        call.int(xc.t.ptr)
+        call.int(sc.t.ptr)
+        call.tuple(
+            _geom(
+                _planes(x, n),
+                _in_spatial(x, n),
+                po[1],
+                po[0],
+                IndexList[3](1),
+                IndexList[3](0),
+                IndexList[3](1),
+                False,
+                0,
+                n,
+            )
+        )
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+        _ = xc^
+        _ = sc^
+    return r^
+
+
+# aten::fractional_max_pool{2,3}d(Tensor self, int[N] kernel_size,
+#   int[N] output_size, Tensor random_samples) -> (Tensor, Tensor)
+def op_fractional_max_pool[
+    n: Int
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var r = _fractional_max_pool[n](args)
+    ret_owned(rets, 0, r[0])
+    ret_owned(rets, 1, r[1])
+    _ = r^
+
+
+# aten::fractional_max_pool{2,3}d.output(..., *, Tensor(a!) output,
+#   Tensor(b!) indices) -> (Tensor(a!), Tensor(b!))
+def op_fractional_max_pool_out[
+    n: Int
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var x = v_tensor(args[unsafe_offset=0])
+    var out = v_tensor(args[unsafe_offset=4])
+    var indices = v_tensor(args[unsafe_offset=5])
+    check_out(out, x)
+    check_out_as(indices, ST_INT64, x)
+    var r = _fractional_max_pool[n](args, out.copy(), indices.copy())
+    _store(rets, 1, indices, r.pop())
+    _store(rets, 0, out, r.pop())
+
+
+def _fractional_max_pool_backward[
+    n: Int
+](args: Values, dest: Optional[T] = None) raises -> Owned:
+    """The gradient scattered to each output's saved index, as CUDA's
+    atomic backward does (FractionalMaxPool{2,3}d.cu)."""
+    var grad = v_tensor(args[unsafe_offset=0])
+    var x = v_tensor(args[unsafe_offset=1])
+    var out_l = IntList(args[unsafe_offset=3])
+    var indices = v_tensor(args[unsafe_offset=4])
+    comptime name = _frac_name[n]()
+    if x.rank != n + 1 and x.rank != n + 2:
+        raise Error(
+            name,
+            "_backward(): Expected ",
+            n + 1,
+            "D or ",
+            n + 2,
+            "D tensor, but got: ",
+            _sizes(x),
+        )
+    if len(out_l) != n:
+        raise Error(name, ": output_size must have ", n, " elements")
+    var outs = IndexList[3](1)
+    for i in range(n):
+        outs[3 - n + i] = out_l[i]
+    comptime if n == 2:
+        # The structured meta compares whole shapes.
+        var ok_g = grad.rank == x.rank
+        var ok_i = indices.rank == x.rank
+        for i in range(x.rank):
+            var want = (
+                x.dim(i) if i < x.rank - n else outs[3 - n + i - (x.rank - n)]
+            )
+            if ok_g and grad.dim(i) != want:
+                ok_g = False
+            if ok_i and indices.dim(i) != want:
+                ok_i = False
+        if not ok_g:
+            raise Error(
+                "fractional_max_pool2d_backward(): gradOutput sizes unexpected"
+            )
+        if not ok_i:
+            raise Error(
+                "fractional_max_pool2d_backward(): indices sizes unexpected"
+            )
+    else:
+        # CUDA checks only the pooled extents and would scatter past
+        # gradInput for a grad with more batches or planes than `self`; the
+        # leading dims are checked here so that cannot happen.
+        var lead_ok = grad.rank == x.rank
+        for i in range(x.rank - 3):
+            if lead_ok and grad.dim(i) != x.dim(i):
+                lead_ok = False
+        if not lead_ok:
+            raise Error(
+                "fractional_max_pool3d_backward_out_cuda_template(): "
+                "gradOutput sizes unexpected"
+            )
+        var labels = ["time", "height", "width"]
+        for i in range(3):
+            var d = x.rank - 3 + i
+            if d >= grad.rank or grad.dim(d) != outs[i]:
+                raise Error(
+                    (
+                        "fractional_max_pool3d_backward_out_cuda_template(): "
+                        "gradOutput "
+                    ),
+                    labels[i],
+                    " unexpected",
+                )
+        if not indices.same_shape(grad):
+            raise Error(
+                "fractional_max_pool3d_backward(): indices sizes unexpected"
+            )
+    _check_dtype(x, name)
+    _same_device(x, grad, name)
+    _same_device(x, indices, name)
+    if grad.stype != x.stype:
+        raise Error(
+            "expected dtype ",
+            x.dtype,
+            " for `gradOutput` but got dtype ",
+            grad.dtype,
+        )
+    if indices.stype != ST_INT64:
+        raise Error("indices must be an int64 tensor")
+    comptime if n == 2:
+        alert_not_deterministic("fractional_max_pool2d_backward_cuda")
+    else:
+        alert_not_deterministic(
+            "fractional_max_pool3d_backward_out_cuda" if dest else "fractional_max_pool3d_backward_cuda"
+        )
+    var gin = _alloc(
+        dest, x.shape, x.rank, x.stype, x.device, [grad.copy(), indices.copy()]
+    )
+    _scatter_backward(gin.t, grad, indices, x, _numel(outs), n)
+    return gin^
+
+
+# aten::fractional_max_pool{2,3}d_backward(Tensor grad_output, Tensor self,
+#   int[N] kernel_size, int[N] output_size, Tensor indices) -> Tensor
+def op_fractional_max_pool_backward[
+    n: Int
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var gin = _fractional_max_pool_backward[n](args)
+    ret_owned(rets, 0, gin)
+
+
+# aten::fractional_max_pool{2,3}d_backward.grad_input(..., *,
+#   Tensor(a!) grad_input) -> Tensor(a!)
+def op_fractional_max_pool_backward_out[
+    n: Int
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var dest = v_tensor(args[unsafe_offset=5])
+    check_out(dest, v_tensor(args[unsafe_offset=1]))
+    _store(rets, 0, dest, _fractional_max_pool_backward[n](args, dest.copy()))
+
+
+# ---------------------------------------------------------------------------
 # Max unpooling
 # ---------------------------------------------------------------------------
 
@@ -1932,6 +2307,18 @@ comptime op_max_pool3d_with_indices_backward = op_max_pool_backward[3]
 comptime op_max_pool3d_with_indices_backward_grad_input = op_max_pool_backward_out[
     3
 ]
+comptime op_fractional_max_pool2d = op_fractional_max_pool[2]
+comptime op_fractional_max_pool2d_output = op_fractional_max_pool_out[2]
+comptime op_fractional_max_pool2d_backward = op_fractional_max_pool_backward[2]
+comptime op_fractional_max_pool2d_backward_grad_input = op_fractional_max_pool_backward_out[
+    2
+]
+comptime op_fractional_max_pool3d = op_fractional_max_pool[3]
+comptime op_fractional_max_pool3d_output = op_fractional_max_pool_out[3]
+comptime op_fractional_max_pool3d_backward = op_fractional_max_pool_backward[3]
+comptime op_fractional_max_pool3d_backward_grad_input = op_fractional_max_pool_backward_out[
+    3
+]
 comptime op_max_unpool2d = op_max_unpool[2]
 comptime op_max_unpool2d_out = op_max_unpool_out[2]
 comptime op_max_unpool3d = op_max_unpool[3]
@@ -1987,6 +2374,26 @@ def register_pooling(site: Site) raises:
     impl[
         op_max_pool2d_with_indices_backward_grad_input,
         "max_pool2d_with_indices_backward.grad_input",
+    ](site)
+    impl[op_max_pool2d_backward, "max_pool2d_backward"](site)
+    impl[op_max_pool2d_backward_out, "max_pool2d_backward.out"](site)
+    impl[op_fractional_max_pool2d, "fractional_max_pool2d"](site)
+    impl[op_fractional_max_pool2d_output, "fractional_max_pool2d.output"](site)
+    impl[op_fractional_max_pool2d_backward, "fractional_max_pool2d_backward"](
+        site
+    )
+    impl[
+        op_fractional_max_pool2d_backward_grad_input,
+        "fractional_max_pool2d_backward.grad_input",
+    ](site)
+    impl[op_fractional_max_pool3d, "fractional_max_pool3d"](site)
+    impl[op_fractional_max_pool3d_output, "fractional_max_pool3d.output"](site)
+    impl[op_fractional_max_pool3d_backward, "fractional_max_pool3d_backward"](
+        site
+    )
+    impl[
+        op_fractional_max_pool3d_backward_grad_input,
+        "fractional_max_pool3d_backward.grad_input",
     ](site)
     impl[op_max_pool3d_with_indices, "max_pool3d_with_indices"](site)
     impl[op_max_pool3d_with_indices_out, "max_pool3d_with_indices.out"](site)
