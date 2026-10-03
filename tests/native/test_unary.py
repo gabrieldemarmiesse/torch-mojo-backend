@@ -377,9 +377,10 @@ def test_unary_launcher_log1p_near_zero(mojo_gpu: str, dtype: torch.dtype, offse
     actual = torch.log1p(storage[offset:]).cpu()
     expected = torch.log1p(cpu.double()).to(dtype)
     if dtype == torch.bfloat16:
-        # Apple GPUs flush bfloat16's (float32-range) subnormals when they
-        # widen it to float32, as MPS does; a float32 tiny input is returned
-        # as is (no arithmetic touches it), there and on MPS.
+        # On Apple GPUs the float32 -> bfloat16 output cast flushes
+        # subnormal results to zero, as MPS's cast does; a float32 tiny
+        # input is returned as is (no arithmetic touches it), there and on
+        # MPS.
         flushed = flush_subnormals_on_metal(cpu, mojo_gpu)
         expected = flush_subnormals_on_metal(
             torch.log1p(flushed.double()).to(dtype), mojo_gpu
