@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
-from tests.native.conftest import skip_if_metal
+from tests.native.conftest import flush_subnormals_on_metal, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 
 
@@ -376,11 +376,24 @@ def test_unary_launcher_log1p_near_zero(mojo_gpu: str, dtype: torch.dtype, offse
     storage = torch.cat((torch.zeros(offset, dtype=dtype), cpu)).to(mojo_gpu)
     actual = torch.log1p(storage[offset:]).cpu()
     expected = torch.log1p(cpu.double()).to(dtype)
+    if dtype == torch.bfloat16:
+        # On Apple GPUs the float32 -> bfloat16 output cast flushes
+        # subnormal results to zero, as MPS's cast does; a float32 tiny
+        # input is returned as is (no arithmetic touches it), there and on
+        # MPS.
+        flushed = flush_subnormals_on_metal(cpu, mojo_gpu)
+        expected = flush_subnormals_on_metal(
+            torch.log1p(flushed.double()).to(dtype), mojo_gpu
+        )
     torch.testing.assert_close(
         actual, expected, rtol=log1p_rtol(dtype), atol=0, equal_nan=True
     )
-    zeros = cpu == 0
-    torch.testing.assert_close(torch.signbit(actual[zeros]), torch.signbit(cpu[zeros]))
+    # every expected zero keeps its sign (log1p(-0) = -0; a flushed negative
+    # tiny result is -0 too)
+    zeros = expected == 0
+    torch.testing.assert_close(
+        torch.signbit(actual[zeros]), torch.signbit(expected[zeros])
+    )
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
@@ -1178,7 +1191,12 @@ def test_sqrt_ieee_spans(
     assert out._version == version + 1
     expected = host.clone() if alias else torch.full_like(host, 17)
     expected[destination_offset : destination_offset + count] = (
-        host[source_offset : source_offset + count].double().sqrt().float()
+        # Apple GPUs flush subnormal inputs to zero (as MPS does), so
+        # sqrt(-subnormal) is -0 there rather than NaN.
+        flush_subnormals_on_metal(host[source_offset : source_offset + count], mojo_gpu)
+        .double()
+        .sqrt()
+        .float()
     )
     actual = storage.cpu()
     nan = torch.isnan(expected)

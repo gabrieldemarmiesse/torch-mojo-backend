@@ -35,6 +35,34 @@ def is_metal(device: str) -> bool:
     return idx < len(accelerators) and accelerators[idx].api == "metal"
 
 
+def flush_subnormals_on_metal(
+    t: torch.Tensor, device: str, dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """`t` with its float32 / bfloat16 subnormals replaced by zeros of the
+    same sign when `device` is an Apple GPU, unchanged otherwise.
+
+    Apple GPUs flush float32 subnormals to zero, on the operands and on the
+    result of float arithmetic, whatever the compile options: torch MPS's own
+    kernels and a `torch.mps.compile_shader` kernel built in
+    `MTLMathModeSafe` with `metal::precise::sqrt` give the same zeros as the
+    mojo device (bit for bit: `x * 0.5`, `x * 1`, `x + 0` and `sqrt(x)` over
+    +-1, +-2, +-0x7FFFFF and the smallest normals, measured on an M4).
+    bfloat16 is computed in float32 there, so its subnormals flush too;
+    float16 subnormals are normal float32 values and survive. The result is
+    flushed when its exact value is tiny, before rounding: 0x3F7FFFFF times
+    the smallest normal is 0 there, where IEEE rounds it up to that normal.
+    So pass the exact result in float64 with `dtype` the result dtype, then
+    round: `flush(flush(a).double() * b, device, torch.float32).float()`.
+    Only arithmetic flushes: a kernel that selects or copies its input
+    (log1p's tiny-input path) hands a float32 subnormal through unchanged.
+    """
+    dtype = t.dtype if dtype is None else dtype
+    if not is_metal(device) or dtype not in (torch.float32, torch.bfloat16):
+        return t
+    subnormal = (t != 0) & (t.abs() < torch.finfo(dtype).tiny)
+    return torch.where(subnormal, t * 0, t)
+
+
 def skip_if_metal(device: str, reason: str):
     """Skip a case that is correct and by design on Apple's Metal backend.
 

@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from tests.native.conftest import skip_if_metal
+from tests.native.conftest import flush_subnormals_on_metal, is_metal, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 
 
@@ -95,10 +95,15 @@ def test_div_int_by_float_scalar_uses_the_default_dtype(mojo_gpu):
 
 def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
     """`promote_integer_inputs_to_float` reads `torch.get_default_dtype()`:
-    an integer numerator is lifted into float64 when that is the default."""
+    an integer numerator is lifted into float64 when that is the default.
+    Apple GPUs have no float64, so there the op declines."""
     cpu, a = _both((6,), torch.int64, mojo_gpu)
     torch.set_default_dtype(torch.float64)
     try:
+        if is_metal(mojo_gpu):
+            with pytest.raises(NotImplementedError):
+                _ = a / a
+            return
         got = (a / a).cpu()
         expected = cpu / cpu
     finally:
@@ -401,8 +406,18 @@ def _check_scalar_mul_peel(
     output = destination[destination_offset : destination_offset + size]
     before, pointer = output._version, output.data_ptr()
     assert torch.mul(value, scalar, out=output) is output
+    # Apple GPUs flush subnormal operands, and products tiny before rounding,
+    # to zero (as MPS does): build the exact product in float64, then round.
+    flushed_scalar = flush_subnormals_on_metal(
+        torch.tensor(scalar, dtype=torch.float32), device
+    ).item()
+    operand = flush_subnormals_on_metal(
+        host[source_offset : source_offset + size], device
+    )
     expected[destination_offset : destination_offset + size] = (
-        host[source_offset : source_offset + size] * scalar
+        flush_subnormals_on_metal(
+            operand.double() * flushed_scalar, device, torch.float32
+        ).float()
     )
     actual = destination.cpu()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)

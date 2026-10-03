@@ -27,11 +27,13 @@ from max.gpu.host import DeviceContext
 from std.math import ceildiv
 from std.memory import bitcast
 from std.utils.numerics import isnan
+from std.sys import is_amd_gpu, is_nvidia_gpu, llvm_intrinsic
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
 from std.utils import IndexList
 
+from tmb.kernels.common.cuda_math import _add_rn, _mul_rn
 from tmb.kernels.common.div_math import floor_div, trunc_div
 from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.pow_math import torch_pow
@@ -1320,6 +1322,126 @@ def _ternary_bcast_dispatcher[op_code: Int](argv: Argv, argc: Int) raises:
 
 
 # ---------------------------------------------------------------------------
+# linalg_cross: CUDA's `cross_kernel` (native/cuda/CrossKernel.cu) over
+# contiguous [outer, 3, inner] operands of the result's shape. Each component
+# is `x[i]*y[j] - x[j]*y[i]` computed the way nvcc compiles it: float32 and
+# float64 contract to `fma(x[i], y[j], -(x[j]*y[i]))` (sm_90 SASS of
+# cross_kernel<float>: FMUL then FFMA ..., -R), c10::Half / BFloat16 round
+# each product and the difference to the dtype, integers wrap in the dtype.
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _cross_round[dtype: DType](x: Float32) -> Scalar[dtype]:
+    """`x` rounded to `dtype`, kept rounded: the fast-math GPU build would
+    otherwise narrow the float arithmetic around it to half instructions,
+    which ptxas then contracts into an fma (the products and the difference
+    feeding it are `mul.rn` / `add.rn` on NVIDIA for the same reason)."""
+    var r = x.cast[dtype]()
+    comptime if is_nvidia_gpu():
+        return r
+    elif is_amd_gpu():
+        return llvm_intrinsic[
+            "llvm.arithmetic.fence", Scalar[dtype], has_side_effect=False
+        ](r)
+    else:
+        var ptr = Pointer(to=r)
+        ptr.unsafe_store[volatile=True](0, r)
+        return ptr.unsafe_load[volatile=True](0)
+
+
+@always_inline
+def _cross_term[
+    dtype: DType
+](
+    a: Scalar[dtype], b: Scalar[dtype], c: Scalar[dtype], d: Scalar[dtype]
+) -> Scalar[dtype]:
+    """`a*b - c*d` as cross_kernel<dtype> evaluates it."""
+    comptime if dtype == DType.float32 or dtype == DType.float64:
+        return a.fma(b, -(c * d))
+    elif dtype == DType.float16 or dtype == DType.bfloat16:
+        # c10::Half / BFloat16 operators: each product (exact in float) and
+        # the difference round to the dtype
+        var p = _cross_round[dtype](
+            _mul_rn(a.cast[DType.float32](), b.cast[DType.float32]())
+        )
+        var q = _cross_round[dtype](
+            _mul_rn(c.cast[DType.float32](), d.cast[DType.float32]())
+        )
+        return _cross_round[dtype](
+            _add_rn(p.cast[DType.float32](), -q.cast[DType.float32]())
+        )
+    else:
+        return a * b - c * d
+
+
+def _cross_go[
+    dtype: DType
+](
+    out_addr: Int,
+    x_addr: Int,
+    y_addr: Int,
+    outer: Int,
+    inner: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dtype](out_addr)
+    var x_ptr = _make_ptr[dtype](x_addr)
+    var y_ptr = _make_ptr[dtype](y_addr)
+
+    @always_inline
+    @__parameter
+    @__copy_capture(out_ptr, x_ptr, y_ptr, inner)
+    def func[width: Int, alignment: Int = 1](idx: Coord):
+        var i = Int(idx[0].value())
+        var o = i // inner
+        var base = o * 3 * inner + (i - o * inner)
+        var x0 = x_ptr[unsafe_offset=base]
+        var x1 = x_ptr[unsafe_offset=base + inner]
+        var x2 = x_ptr[unsafe_offset=base + 2 * inner]
+        var y0 = y_ptr[unsafe_offset=base]
+        var y1 = y_ptr[unsafe_offset=base + inner]
+        var y2 = y_ptr[unsafe_offset=base + 2 * inner]
+        out_ptr[unsafe_offset=base] = _cross_term(x1, y2, x2, y1)
+        out_ptr[unsafe_offset=base + inner] = _cross_term(x2, y0, x0, y2)
+        out_ptr[unsafe_offset=base + 2 * inner] = _cross_term(x0, y1, x1, y0)
+
+    _parallel_for[func](outer * inner, ctx)
+
+
+def _cross_dispatcher(argv: Argv, argc: Int) raises:
+    """Slots: out, x, y, outer, inner, dtype code, ctx."""
+    var args = argv
+    var dtype_val = _raw_dtype_int(args[unsafe_offset=5])
+    var ctx = _raw_ctx(args[unsafe_offset=6])
+    var handled = False
+    comptime for dt in [
+        DType.float32,
+        DType.float64,
+        DType.float16,
+        DType.bfloat16,
+        DType.int8,
+        DType.int16,
+        DType.int32,
+        DType.int64,
+        DType.uint8,
+    ]:
+        comptime if _dtype_arg_on[0, dt]():
+            if dtype_val == dt:
+                _cross_go[dt](
+                    _raw_int(args[unsafe_offset=0]),
+                    _raw_int(args[unsafe_offset=1]),
+                    _raw_int(args[unsafe_offset=2]),
+                    _raw_int(args[unsafe_offset=3]),
+                    _raw_int(args[unsafe_offset=4]),
+                    ctx,
+                )
+                handled = True
+    if not handled:
+        raise Error("unsupported dtype for cross: " + String(dtype_val))
+
+
+# ---------------------------------------------------------------------------
 # addr: out = beta*self + alpha*outer(vec1, vec2); self: (n, m) (any
 # strides), vec1: (n,), vec2: (m,). A dedicated 2-D kernel rather than a new
 # `_ternary_bcast` op_code: PyTorch's own vec1.reshape({n, 1}) broadcast
@@ -1849,6 +1971,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["AddcdivBcast"]():
             _ternary_bcast_dispatcher[TOP_ADDCDIV](argv, argc)
+            return 0
+        comptime if _op_on["Cross"]():
+            _cross_dispatcher(argv, argc)
             return 0
         comptime if _op_on["AddrBcast"]():
             _addr_bcast_dispatcher(argv, argc)

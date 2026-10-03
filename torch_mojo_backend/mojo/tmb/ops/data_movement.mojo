@@ -1275,6 +1275,12 @@ def _scalar_type_name(dt: DType) -> String:
         return "Byte"
     if dt == DType.bool:
         return "Bool"
+    if dt == DType.uint16:
+        return "UInt16"
+    if dt == DType.uint32:
+        return "UInt32"
+    if dt == DType.uint64:
+        return "UInt64"
     return String(dt)
 
 

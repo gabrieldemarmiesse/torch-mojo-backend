@@ -28,8 +28,14 @@ from tmb.backend.abi import (
     ST_INT64,
     Value,
     Values,
+    DoubleList,
+    IntList,
+    ST_INT32,
     contiguous_strides,
+    cpu_empty,
+    dtype_code,
     f64_bits,
+    index_error,
     new_like,
     new_tensor,
     own,
@@ -48,17 +54,29 @@ from tmb.backend.abi import (
     view_strided,
 )
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.backend.device import ctx_for, ctx_ptr, dev
+from tmb.backend.device import (
+    copy_from_host,
+    copy_to_host,
+    ctx_for,
+    ctx_ptr,
+    dev,
+)
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.matmul import _sm90_cuda
 from tmb.ops.common import (
+    assert_no_internal_overlap,
+    assert_no_overlap,
+    assert_no_partial_overlap,
     call_op,
+    check_out,
     cast_to,
+    contiguous,
     copy_strided_into,
     device_str,
     fill_value,
     like_layout,
     resize_out,
+    same_view,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
@@ -1210,6 +1228,345 @@ def op_vdot(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _dot(args, rets)
 
 
+# ---------------------------------------------------------------------------
+# linalg_cross -- ATen's structured `linalg_cross` (native/Cross.cpp meta and
+# impl) over CUDA's `cross_kernel` (native/cuda/CrossKernel.cu), the logic
+# family's `Cross` kernel: one thread per vector, its three components
+# computed as nvcc compiles cross_kernel (see `_cross_term` there). The
+# kernel takes contiguous [outer, 3, inner] operands of the result's shape:
+# a broadcast or strided input is materialized first, a strided `out` is
+# written through a temporary.
+# ---------------------------------------------------------------------------
+
+
+def _expanded_contiguous(
+    t: T, shape: IndexList[MAX_RANK], rank: Int
+) raises -> Owned:
+    """`t.expand(shape).contiguous()` (`t` itself when that is a no-op)."""
+    var strides = IndexList[MAX_RANK](0)
+    for i in range(MAX_RANK - rank, MAX_RANK):
+        strides[i] = 0 if t.shape[i] != shape[i] else t.strides[i]
+    var view = own(view_strided(t, shape, strides, rank, t.offset))
+    var dense = own_if_new(contiguous(view.t), view.t)
+    if dense.live:
+        return dense^
+    _ = dense^
+    return view^
+
+
+def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
+    var x = v_tensor(args[unsafe_offset=0])
+    var y = v_tensor(args[unsafe_offset=1])
+    var dim = v_int(args[unsafe_offset=2])
+    if x.rank != y.rank:
+        raise Error(
+            "linalg.cross: inputs must have the same number of dimensions."
+        )
+    if x.rank == 0:
+        index_error(
+            String("dimension specified as ")
+            + String(dim)
+            + " but tensor has no dimensions"
+        )
+    if dim < -x.rank or dim >= x.rank:
+        index_error(
+            String("Dimension out of range (expected to be in range of [")
+            + String(-x.rank)
+            + ", "
+            + String(x.rank - 1)
+            + "], but got "
+            + String(dim)
+            + ")"
+        )
+    var d = dim + x.rank if dim < 0 else dim
+    if x.dim(d) != 3 or y.dim(d) != 3:
+        raise Error(
+            "linalg.cross: inputs dimension ",
+            dim,
+            " must have length 3. Got ",
+            x.dim(d),
+            " and ",
+            y.dim(d),
+        )
+    var shape = IndexList[MAX_RANK](1)
+    for i in range(x.rank):
+        var a = x.dim(i)
+        var b = y.dim(i)
+        if a != b and a != 1 and b != 1:
+            raise Error(
+                "The size of tensor a (",
+                a,
+                ") must match the size of tensor b (",
+                b,
+                ") at non-singleton dimension ",
+                i,
+            )
+        shape[MAX_RANK - x.rank + i] = b if a == 1 else a
+    if x.device_type != y.device_type or x.device != y.device:
+        raise Error(
+            (
+                "Expected all tensors to be on the same device, but found at"
+                " least two devices, "
+            ),
+            device_str(x),
+            " and ",
+            device_str(y),
+            "!",
+        )
+    var out: T
+    var fresh: Owned
+    if has_out:
+        out = v_tensor(args[unsafe_offset=3])
+        # the structured wrapper: dtype/device, then resize; the impl then
+        # checks overlap on the resized out. A resize may move a storage an
+        # input shares: re-read both afterwards.
+        check_out(out, x)
+        resize_out(out, shape, x.rank)
+        x = T(x.h)
+        y = T(y.h)
+        assert_no_internal_overlap(out)
+        assert_no_overlap(out, x)
+        assert_no_overlap(out, y)
+        fresh = _hold(out)
+    else:
+        fresh = own(new_tensor(shape, x.rank, x.stype, x.device))
+        out = fresh.t.copy()
+    # TensorIterator(check_all_same_dtype): out, then x, then y
+    if y.stype != x.stype:
+        raise Error(
+            "Found dtype ",
+            _scalar_type_name(y.dtype),
+            " but expected ",
+            _scalar_type_name(x.dtype),
+        )
+    if out.numel > 0:
+        # AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND2(kHalf, kBFloat16), reached
+        # only for a non-empty result
+        if (
+            x.dtype == DType.bool
+            or x.dtype == DType.uint16
+            or x.dtype == DType.uint32
+            or x.dtype == DType.uint64
+        ):
+            unsupported(
+                '"cross_cuda" not implemented for \''
+                + _scalar_type_name(x.dtype)
+                + "'"
+            )
+        if x.dtype == DType.float64 and dev(x.device)[].api == "metal":
+            unsupported("cross of float64 on an Apple GPU (no float64)")
+        var xc = _expanded_contiguous(x, shape, x.rank)
+        var yc = _expanded_contiguous(y, shape, x.rank)
+        var target = own_if_new(
+            out.copy() if out.contig else new_like(out), out
+        )
+        var inner = 1
+        for i in range(d + 1, x.rank):
+            inner *= out.dim(i)
+        var ctx = ctx_for(x.device)
+        var call = KernelCall("logic", "Cross")
+        call.arg_dtype(0, x.dtype)
+        call.int(target.t.ptr)
+        call.int(xc.t.ptr)
+        call.int(yc.t.ptr)
+        call.int(out.numel // (3 * inner))
+        call.int(inner)
+        call.int(dtype_code(x.dtype))
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+        _ = xc^  # read by the kernel
+        _ = yc^
+        if target.live:
+            copy_strided_into(out, target.t)
+    if has_out:
+        ret_ref(rets, 0, out)
+        return
+    ret_owned(rets, 0, fresh)
+
+
+# aten::linalg_cross(Tensor self, Tensor other, *, int dim=-1) -> Tensor
+def op_linalg_cross(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _linalg_cross(args, rets, False)
+
+
+# aten::linalg_cross.out(Tensor self, Tensor other, *, int dim=-1,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_linalg_cross_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _linalg_cross(args, rets, True)
+
+
+# ---------------------------------------------------------------------------
+# torch's test-only ops (native/TestOps.cpp, native/prim_native_functions.cpp)
+# -- CPU-only upstream; here so torch's own dispatcher tests can run on the
+# device. The list adds are a host loop exactly like the CPU kernels (an
+# `accessor<int, 1>` / `accessor<float, 1>` walk), uploaded once. Each
+# autogenerated `.out` is the functional result resized into and copied to
+# `out`.
+# ---------------------------------------------------------------------------
+
+
+def _test_list_add[floating: Bool](values: T, addends: Value) raises -> Owned:
+    """`values + addends` elementwise, as `_test_optional_intlist` /
+    `_test_optional_floatlist` compute it (int + int64 truncated back to int;
+    float + double rounded back to float)."""
+    if values.rank != 1:
+        raise Error(
+            "Expected values.dim() == 1 to be true, but got false.  (Could"
+            " this error message be improved?  If so, please report an"
+            " enhancement request to PyTorch.)"
+        )
+    comptime want = ST_FLOAT32 if floating else ST_INT32
+    if values.stype != want:
+        raise Error(
+            "expected scalar type ",
+            "Float" if floating else "Int",
+            " but found ",
+            _scalar_type_name(values.dtype),
+        )
+    var n = values.dim(0)
+    var count = DoubleList(addends).n if floating else IntList(addends).n
+    if n > count:
+        raise Error(
+            "ArrayRef: invalid index Index = ",
+            count,
+            "; Length = ",
+            count,
+        )
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = n
+    var dense = own_if_new(contiguous(values), values)
+    var host = own(cpu_empty(shape, 1, want))
+    var ctx = ctx_for(values.device)
+    copy_to_host(ctx, dense.t.ptr, host.t.ptr, n * 4)
+    _ = dense^  # read by the download
+    comptime if floating:
+        var p = Pointer[Float32, MutUntrackedOrigin](
+            unsafe_from_address=host.t.ptr
+        )
+        var add = DoubleList(addends)
+        for i in range(n):
+            p[unsafe_offset=i] = Float32(Float64(p[unsafe_offset=i]) + add[i])
+    else:
+        var p = Pointer[Int32, MutUntrackedOrigin](
+            unsafe_from_address=host.t.ptr
+        )
+        var add = IntList(addends)
+        for i in range(n):
+            p[unsafe_offset=i] = (
+                Int64(p[unsafe_offset=i]) + Int64(add[i])
+            ).cast[DType.int32]()
+    var out = own(new_tensor(shape, 1, want, values.device))
+    copy_from_host(values.device, ctx, out.t.ptr, host.t.ptr, n * 4)
+    _ = host^  # read by the upload
+    _ = ctx
+    return out^
+
+
+def _test_optional_list[
+    floating: Bool
+](args: Values, rets: Values, has_out: Bool) raises:
+    var values = v_tensor(args[unsafe_offset=0])
+    var r: Owned
+    if v_is_none(args[unsafe_offset=1]):
+        if not has_out:
+            ret_ref(rets, 0, values)  # CPU hands `values` itself back
+            return
+        r = _hold(values)
+    else:
+        r = _test_list_add[floating](values, args[unsafe_offset=1])
+    if not has_out:
+        ret_owned(rets, 0, r)
+        return
+    var out = v_tensor(args[unsafe_offset=2])
+    _copy_result_out(out, r)
+    ret_ref(rets, 0, out)
+
+
+def _copy_result_out(mut out: T, r: Owned) raises:
+    """An autogenerated `.out` kernel (CompositeViewCopyKernels.cpp):
+    `resize_output(out)`, then `copy_arg`'s dtype and device checks, then
+    `out.copy_(result)` -- a no-op when both are the same view, else
+    TensorIterator's internal and partial overlap checks before the copy.
+    The result is re-read after the resize: it may be `values` itself, and
+    a resize can move the storage the two share."""
+    resize_out(out, r.t.shape, r.t.rank)
+    var src = T(r.t.h)
+    check_out(out, src)
+    if same_view(out, src):
+        return
+    assert_no_internal_overlap(out)
+    assert_no_partial_overlap(out, src)
+    copy_strided_into(out, src)
+
+
+# aten::_test_optional_intlist(Tensor values, int[]? addends) -> Tensor
+def op_test_optional_intlist(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _test_optional_list[False](args, rets, False)
+
+
+# aten::_test_optional_intlist.out(Tensor values, int[]? addends, *,
+#   Tensor(a!) out) -> Tensor(a!)
+# (and the `int[2]?` twins `_test_optional_filled_intlist(.out)`)
+def op_test_optional_intlist_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _test_optional_list[False](args, rets, True)
+
+
+# aten::_test_optional_floatlist(Tensor values, float[]? addends) -> Tensor
+def op_test_optional_floatlist(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _test_optional_list[True](args, rets, False)
+
+
+# aten::_test_optional_floatlist.out(Tensor values, float[]? addends, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_test_optional_floatlist_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _test_optional_list[True](args, rets, True)
+
+
+# aten::_test_functorch_fallback(Tensor self, Tensor other) -> Tensor
+def op_test_functorch_fallback(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """`self.clone()`; `other` is never read."""
+    var r = own(
+        _dispatch(
+            "aten::clone",
+            "",
+            [args[unsafe_offset=0].copy(), Value(TAG_NONE, 0, 0, 0)],
+        )
+    )
+    ret_owned(rets, 0, r)
+
+
+# aten::_test_functorch_fallback.out(Tensor self, Tensor other, *,
+#   Tensor(a!) out) -> Tensor(a!)
+def op_test_functorch_fallback_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var r = own(
+        _dispatch(
+            "aten::clone",
+            "",
+            [args[unsafe_offset=0].copy(), Value(TAG_NONE, 0, 0, 0)],
+        )
+    )
+    var out = v_tensor(args[unsafe_offset=2])
+    _copy_result_out(out, r)
+    ret_ref(rets, 0, out)
+
+
 def register_composed(site: Site) raises:
     impl[op_threshold_backward, "threshold_backward"](site)
     impl[op_threshold_backward_grad_input, "threshold_backward.grad_input"](
@@ -1226,3 +1583,15 @@ def register_composed(site: Site) raises:
     impl[op_trace, "trace"](site)
     impl[op_dot, "dot"](site)
     impl[op_vdot, "vdot"](site)
+    impl[op_linalg_cross, "linalg_cross"](site)
+    impl[op_linalg_cross_out, "linalg_cross.out"](site)
+    impl[op_test_optional_intlist, "_test_optional_intlist"](site)
+    impl[op_test_optional_intlist_out, "_test_optional_intlist.out"](site)
+    impl[op_test_optional_intlist, "_test_optional_filled_intlist"](site)
+    impl[op_test_optional_intlist_out, "_test_optional_filled_intlist.out"](
+        site
+    )
+    impl[op_test_optional_floatlist, "_test_optional_floatlist"](site)
+    impl[op_test_optional_floatlist_out, "_test_optional_floatlist.out"](site)
+    impl[op_test_functorch_fallback, "_test_functorch_fallback"](site)
+    impl[op_test_functorch_fallback_out, "_test_functorch_fallback.out"](site)

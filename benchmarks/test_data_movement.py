@@ -124,6 +124,7 @@ COVERS: dict[str, str] = {
     **{f"aten::{name}": "test_pad2d_backward" for name in PAD2D_BACKWARD_OPS},
     **{f"aten::{name}": "test_pad3d_backward" for name in PAD3D_BACKWARD_OPS},
     "aten::masked_select": "test_masked_select",
+    "aten::linalg_cross": "test_linalg_cross",
     "aten::masked_select.out": (
         "test_masked_select (same kernels, the result copied into out)"
     ),
@@ -181,6 +182,19 @@ SKIPPED: dict[str, str] = {
         "benchmarked in their own families"
     ),
     "aten::vdot": "dot for the real dtypes: mul + sum, both benchmarked",
+    "aten::linalg_cross.out": "test_linalg_cross's Cross kernel, into the caller's out",
+    **{
+        f"aten::{name}{suffix}": (
+            "torch's test-only op (TestOps.cpp): a host loop, or a clone"
+        )
+        for name in (
+            "_test_optional_intlist",
+            "_test_optional_filled_intlist",
+            "_test_optional_floatlist",
+            "_test_functorch_fallback",
+        )
+        for suffix in ("", ".out")
+    },
     "aten::tril.out": _PAD_OUT.replace("resample", "TriangularCopy"),
     "aten::triu.out": _PAD_OUT.replace("resample", "TriangularCopy"),
     "aten::tril_": "test_tril's TriangularCopy, then a strided copy into self",
@@ -1003,6 +1017,29 @@ def test_eye(
         lambda: torch.eye(n, m, dtype=dtype, device=hw.stock_device),
         lambda: torch.eye(n, m, dtype=dtype, device=mojo_device),
         flops=float(n * m),
+    )
+
+
+# (shape, dim): the vectors along the last dim (inner = 1) and along a middle
+# dim of an awkward shape (the strided [outer, 3, inner] regime).
+CROSS_SHAPES: dict[str, tuple[tuple[int, ...], int]] = {
+    "N_4194304x3": ((4_194_304, 3), -1),
+    "A_357x3x789": ((357, 3, 789), 1),
+}
+
+
+@pytest.mark.parametrize("dtype_id", ("f32", "bf16"))
+@pytest.mark.parametrize("shape_id", CROSS_SHAPES)
+def test_linalg_cross(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    shape, dim = CROSS_SHAPES[shape_id]
+    x_ref, x_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    y_ref, y_our = both(torch.randn(shape, dtype=DTYPES[dtype_id]), hw, mojo_device)
+    bench.run(
+        lambda: torch.linalg.cross(x_ref, y_ref, dim=dim),
+        lambda: torch.linalg.cross(x_our, y_our, dim=dim),
+        flops=float(3 * x_ref.numel()),
     )
 
 
