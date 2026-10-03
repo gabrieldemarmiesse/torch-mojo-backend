@@ -792,6 +792,33 @@ def test_linalg_cross(mojo_gpu, dtype, xs, ys, dim):
     torch.testing.assert_close(got.cpu(), expected, rtol=1e-5, atol=1e-4)
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float64, torch.float16, torch.bfloat16]
+)
+def test_linalg_cross_rounds_like_cuda(mojo_gpu, dtype):
+    """Bit for bit against CUDA's cross_kernel: nvcc contracts float32 and
+    float64 to fma(a, b, -(c*d)), the half types round every product. Near-
+    parallel vectors are where the contraction shows (a zero here, the
+    product's rounding error there)."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a working CUDA build of torch")
+    g = torch.Generator().manual_seed(3)
+    x = torch.randn(4096, 3, generator=g, dtype=torch.float64)
+    y = torch.cat([x[:2048] * 3.7, torch.randn(2048, 3, generator=g).double()])
+    x, y = x.to(dtype), y.to(dtype)
+    got = torch.linalg.cross(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
+    cuda = torch.linalg.cross(x.cuda(), y.cuda()).cpu()
+    torch.testing.assert_close(got, cuda, rtol=0, atol=0)
+
+
+def test_linalg_cross_bfloat16_rounds_each_product(mojo_gpu):
+    x = torch.tensor([[0.0, 129.0, 128.0]], dtype=torch.bfloat16)
+    y = torch.tensor([[0.0, 130.0, 129.0]], dtype=torch.bfloat16)
+    got = torch.linalg.cross(x.to(mojo_gpu), y.to(mojo_gpu)).cpu()
+    assert torch.equal(got, torch.linalg.cross(x, y))
+    assert torch.equal(got, torch.zeros(1, 3, dtype=torch.bfloat16))
+
+
 def test_linalg_cross_strided_out_and_cross(mojo_gpu):
     g = torch.Generator().manual_seed(1)
     base = torch.randn(4, 3, 10, generator=g)
@@ -897,6 +924,20 @@ def test_test_optional_lists(mojo_gpu):
         ops._test_optional_intlist(vm.view(2, 2), [1])
     with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
         ops._test_optional_intlist.out(vm, None, out=out.long())
+    # copy_'s overlap checks: an expanded out, an out partially over values
+    with pytest.raises(RuntimeError, match="more than one element"):
+        ops._test_optional_intlist.out(
+            vm, None, out=torch.zeros(1, dtype=torch.int32, device=mojo_gpu).expand(4)
+        )
+    base = torch.arange(6, dtype=torch.int32)
+    bm = base.to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        ops._test_optional_intlist.out(bm[:4], None, out=bm[1:5])
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        ops._test_optional_intlist.out(base[:4], None, out=base[1:5])
+    # the same view is a no-op copy
+    assert ops._test_optional_intlist.out(vm, None, out=vm) is vm
+    assert torch.equal(vm.cpu(), v)
 
 
 def test_test_functorch_fallback(mojo_gpu):

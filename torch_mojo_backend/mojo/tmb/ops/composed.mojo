@@ -33,6 +33,7 @@ from tmb.backend.abi import (
     ST_INT32,
     contiguous_strides,
     cpu_empty,
+    dtype_code,
     f64_bits,
     index_error,
     new_like,
@@ -65,6 +66,7 @@ from tmb.ops.matmul import _sm90_cuda
 from tmb.ops.common import (
     assert_no_internal_overlap,
     assert_no_overlap,
+    assert_no_partial_overlap,
     call_op,
     check_out,
     cast_to,
@@ -74,8 +76,7 @@ from tmb.ops.common import (
     fill_value,
     like_layout,
     resize_out,
-    resized_geometry,
-    shares_storage,
+    same_view,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
@@ -1229,42 +1230,28 @@ def op_vdot(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # ---------------------------------------------------------------------------
 # linalg_cross -- ATen's structured `linalg_cross` (native/Cross.cpp meta and
-# impl) over CUDA's `cross_kernel` (native/cuda/CrossKernel.cu):
-#   out[0] = x[1]*y[2] - x[2]*y[1], out[1] = x[2]*y[0] - x[0]*y[2],
-#   out[2] = x[0]*y[1] - x[1]*y[0]
-# along `dim`, the batch dims broadcast. Each component is two registered
-# muls and a sub on size-1 views of the operands. The kernel computes in the
-# operand type `T` (c10::Half / BFloat16 round every product and the
-# difference), which is exactly what the half-type mul and sub kernels do.
-# All three components are computed before `out` is resized or written.
+# impl) over CUDA's `cross_kernel` (native/cuda/CrossKernel.cu), the logic
+# family's `Cross` kernel: one thread per vector, its three components
+# computed as nvcc compiles cross_kernel (see `_cross_term` there). The
+# kernel takes contiguous [outer, 3, inner] operands of the result's shape:
+# a broadcast or strided input is materialized first, a strided `out` is
+# written through a temporary.
 # ---------------------------------------------------------------------------
 
 
-def _component(t: T, d: Int, i: Int) raises -> Owned:
-    """`t.narrow(d, i, 1)`: the i-th vector component, size 1 along `d`."""
-    var shape = t.shape
-    shape[MAX_RANK - t.rank + d] = 1
-    return own(
-        view_strided(t, shape, t.strides, t.rank, t.offset + i * t.stride(d))
-    )
-
-
-def _cross_term(x: T, y: T, d: Int, i: Int, j: Int) raises -> Owned:
-    """`x[i] * y[j] - x[j] * y[i]` along `d`."""
-    var xi = _component(x, d, i)
-    var xj = _component(x, d, j)
-    var yi = _component(y, d, i)
-    var yj = _component(y, d, j)
-    var p = _mul(xi, yj)
-    var q = _mul(xj, yi)
-    _ = xi^  # read by the products
-    _ = xj^
-    _ = yi^
-    _ = yj^
-    var r = _sub(p, q)
-    _ = p^  # read by the difference
-    _ = q^
-    return r^
+def _expanded_contiguous(
+    t: T, shape: IndexList[MAX_RANK], rank: Int
+) raises -> Owned:
+    """`t.expand(shape).contiguous()` (`t` itself when that is a no-op)."""
+    var strides = IndexList[MAX_RANK](0)
+    for i in range(MAX_RANK - rank, MAX_RANK):
+        strides[i] = 0 if t.shape[i] != shape[i] else t.strides[i]
+    var view = own(view_strided(t, shape, strides, rank, t.offset))
+    var dense = own_if_new(contiguous(view.t), view.t)
+    if dense.live:
+        return dense^
+    _ = dense^
+    return view^
 
 
 def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
@@ -1326,14 +1313,24 @@ def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
             device_str(y),
             "!",
         )
+    var out: T
+    var fresh: Owned
     if has_out:
-        var given = v_tensor(args[unsafe_offset=3])
-        check_out(given, x)
-        # structured: the meta resizes `out`, then the impl checks overlap
-        var resized = resized_geometry(given, shape, x.rank)
-        assert_no_internal_overlap(resized)
-        assert_no_overlap(resized, x)
-        assert_no_overlap(resized, y)
+        out = v_tensor(args[unsafe_offset=3])
+        # the structured wrapper: dtype/device, then resize; the impl then
+        # checks overlap on the resized out. A resize may move a storage an
+        # input shares: re-read both afterwards.
+        check_out(out, x)
+        resize_out(out, shape, x.rank)
+        x = T(x.h)
+        y = T(y.h)
+        assert_no_internal_overlap(out)
+        assert_no_overlap(out, x)
+        assert_no_overlap(out, y)
+        fresh = _hold(out)
+    else:
+        fresh = own(new_tensor(shape, x.rank, x.stype, x.device))
+        out = fresh.t.copy()
     # TensorIterator(check_all_same_dtype): out, then x, then y
     if y.stype != x.stype:
         raise Error(
@@ -1342,15 +1339,7 @@ def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
             " but expected ",
             _scalar_type_name(x.dtype),
         )
-    var out = v_tensor(args[unsafe_offset=3]) if has_out else new_tensor(
-        shape, x.rank, x.stype, x.device
-    )
-    var fresh = Owned(out.copy())
-    fresh.live = not has_out
-    var numel = 1
-    for i in range(x.rank):
-        numel *= shape[MAX_RANK - x.rank + i]
-    if numel > 0:
+    if out.numel > 0:
         # AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND2(kHalf, kBFloat16), reached
         # only for a non-empty result
         if (
@@ -1364,19 +1353,32 @@ def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
                 + _scalar_type_name(x.dtype)
                 + "'"
             )
-        var r0 = _cross_term(x, y, d, 1, 2)
-        var r1 = _cross_term(x, y, d, 2, 0)
-        var r2 = _cross_term(x, y, d, 0, 1)
-        if has_out:
-            resize_out(out, shape, x.rank)
-        var o0 = _component(out, d, 0)
-        var o1 = _component(out, d, 1)
-        var o2 = _component(out, d, 2)
-        _copy_into(o0.t, r0)
-        _copy_into(o1.t, r1)
-        _copy_into(o2.t, r2)
-    elif has_out:
-        resize_out(out, shape, x.rank)
+        if x.dtype == DType.float64 and dev(x.device)[].api == "metal":
+            unsupported("cross of float64 on an Apple GPU (no float64)")
+        var xc = _expanded_contiguous(x, shape, x.rank)
+        var yc = _expanded_contiguous(y, shape, x.rank)
+        var target = own_if_new(
+            out.copy() if out.contig else new_like(out), out
+        )
+        var inner = 1
+        for i in range(d + 1, x.rank):
+            inner *= out.dim(i)
+        var ctx = ctx_for(x.device)
+        var call = KernelCall("logic", "Cross")
+        call.arg_dtype(0, x.dtype)
+        call.int(target.t.ptr)
+        call.int(xc.t.ptr)
+        call.int(yc.t.ptr)
+        call.int(out.numel // (3 * inner))
+        call.int(inner)
+        call.int(dtype_code(x.dtype))
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+        _ = xc^  # read by the kernel
+        _ = yc^
+        if target.live:
+            copy_strided_into(out, target.t)
     if has_out:
         ret_ref(rets, 0, out)
         return
@@ -1486,18 +1488,20 @@ def _test_optional_list[
 
 
 def _copy_result_out(mut out: T, r: Owned) raises:
-    """An autogenerated `.out` kernel: `resize_out_helper` then `copy_`."""
-    check_out(out, r.t)
-    if shares_storage(out, r.t):
-        # a resize could reallocate the storage `r` reads (the `values`
-        # handed back as is): copy it out first
-        var tmp = own(new_like(r.t))
-        _copy_into(tmp.t, r)
-        resize_out(out, tmp.t.shape, tmp.t.rank)
-        _copy_into(out, tmp)
-        return
+    """An autogenerated `.out` kernel (CompositeViewCopyKernels.cpp):
+    `resize_output(out)`, then `copy_arg`'s dtype and device checks, then
+    `out.copy_(result)` -- a no-op when both are the same view, else
+    TensorIterator's internal and partial overlap checks before the copy.
+    The result is re-read after the resize: it may be `values` itself, and
+    a resize can move the storage the two share."""
     resize_out(out, r.t.shape, r.t.rank)
-    _copy_into(out, r)
+    var src = T(r.t.h)
+    check_out(out, src)
+    if same_view(out, src):
+        return
+    assert_no_internal_overlap(out)
+    assert_no_partial_overlap(out, src)
+    copy_strided_into(out, src)
 
 
 # aten::_test_optional_intlist(Tensor values, int[]? addends) -> Tensor

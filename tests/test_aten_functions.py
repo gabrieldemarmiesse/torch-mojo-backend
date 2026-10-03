@@ -6945,23 +6945,6 @@ def test_aten_sum_integral_dtypes(
     check_outputs(fn, conf, [x])
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.int64])
-@pytest.mark.parametrize(
-    ("xs", "ys", "dim"), [((5, 3), (5, 3), -1), ((2, 3, 4), (1, 3, 4), 1)]
-)
-def test_aten_linalg_cross(
-    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, xs, ys, dim: int
-):
-    call_checker.register(aten_functions.aten_linalg_cross)
-
-    def fn(x, y):
-        return aten.linalg_cross(x, y, dim=dim)
-
-    x = (torch.randn(xs) * 8).to(dtype)
-    y = (torch.randn(ys) * 8).to(dtype)
-    check_outputs(fn, conf, [x, y])
-
-
 @pytest.mark.parametrize("with_bias", [True, False])
 def test_aten_linear(conf: Conf, with_bias: bool, call_checker: CallChecker):
     """Test aten.linear (input @ weight^T + bias) with 2D input"""
