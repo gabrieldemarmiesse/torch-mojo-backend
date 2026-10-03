@@ -28,7 +28,7 @@ this file.
 import pytest
 import torch
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import is_metal, ran, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.testing import CallChecker
 
@@ -44,6 +44,13 @@ def _watch(op_name: str):
 
 def _assert_ran(op_name: str):
     assert native.op_count(op_name) > 0, f"{op_name} did not run natively"
+
+
+def _sequential_copies(device: str, pairs: int) -> int:
+    """The `aten::_copy_from` calls a batchable `_foreach_copy_` makes: none
+    where the batched kernel runs, one per pair on Apple GPUs, which do not
+    take that route yet (see `_batched_copy_device` in tmb/ops/foreach.mojo)."""
+    return pairs if is_metal(device) else 0
 
 
 _COPY_CAST_LISTS = [
@@ -163,6 +170,8 @@ def _batch_copy_source(n: int, src: torch.dtype, dst: torch.dtype) -> torch.Tens
 @pytest.mark.parametrize(("src_dtype", "dst_dtype"), _BATCH_COPY_PAIRS, ids=str)
 @pytest.mark.parametrize("offsets", [(0, 0), (1, 3)])
 def test_foreach_copy_batched_dtypes(mojo_gpu: str, src_dtype, dst_dtype, offsets):
+    if torch.float64 in (src_dtype, dst_dtype):
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
     source_offset, destination_offset = offsets
     hosts = [_batch_copy_source(n + 8, src_dtype, dst_dtype) for n in _BATCH_COPY_SIZES]
     sources = [host.to(mojo_gpu) for host in hosts]
@@ -177,7 +186,9 @@ def test_foreach_copy_batched_dtypes(mojo_gpu: str, src_dtype, dst_dtype, offset
     _watch("aten::_foreach_copy_")
     torch._foreach_copy_(dsts, srcs)
     _assert_ran("aten::_foreach_copy_")
-    assert native.op_count("aten::_copy_from") == 0, "took the per-pair fallback"
+    assert native.op_count("aten::_copy_from") == _sequential_copies(
+        mojo_gpu, len(dsts)
+    ), "took the wrong route"
     for host, guard, n, dst, version in zip(
         hosts, guards, _BATCH_COPY_SIZES, dsts, versions, strict=True
     ):
@@ -213,7 +224,8 @@ def test_foreach_copy_batched_interleaved_views(mojo_gpu: str, shift: int):
         destination.copy_(source)
     _watch("aten::_foreach_copy_")
     torch._foreach_copy_(*views(base))
-    assert native.op_count("aten::_copy_from") == (0 if shift == 0 else slots // 2)
+    sequential = slots // 2 if shift else _sequential_copies(mojo_gpu, slots // 2)
+    assert native.op_count("aten::_copy_from") == sequential
     torch.testing.assert_close(base.cpu(), host, rtol=0, atol=0)
 
 

@@ -70,6 +70,7 @@ from tmb.kernels.common.op_utils import (
     _transpose2d_kernel,
 )
 
+from tmb.kernels.common.dtype_convert import f32_to_bf16
 from tmb.kernels.data_movement.batched_copy import copy_batched
 from tmb.kernels.data_movement.masked_select import (
     masked_select_compact_dispatcher,
@@ -2274,6 +2275,11 @@ def _cast_elem[
         var mid = v.cast[DType.int64]()
         var mid_bits = bitcast[DType.int64, width](mid)
         return bitcast[DType.int64, width](mid_bits).cast[dst]()
+    elif src == DType.float32 and dst == DType.bfloat16:
+        # Apple's hardware conversion flushes subnormals (see f32_to_bf16).
+        return rebind[SIMD[dst, width]](
+            f32_to_bf16(rebind[SIMD[DType.float32, width]](v))
+        )
     else:
         return v.cast[dst]()
 

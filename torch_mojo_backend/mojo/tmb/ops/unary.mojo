@@ -30,6 +30,7 @@ from tmb.backend.abi import (
     dtype_code,
     dtype_name,
     is_dense,
+    max_dtype,
     new_like,
     new_tensor,
     own,
@@ -1668,16 +1669,18 @@ def op_logit_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_logit_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var eps = _logit_eps(args[unsafe_offset=1])
-    var src = own_if_new(_promote(t), t)
     if _is_bitwise_dtype(t.dtype):
         # CUDA's order: the cast check on self fires before any dtype support
-        # check of the promoted result (a float64 default dtype included).
+        # check of the promoted result (a float64 default dtype included), so
+        # it runs before the promotion casts anything (Apple GPUs would
+        # otherwise refuse the float64 cast first).
         raise Error(
             "result type ",
-            _scalar_type_name(src.t.dtype),
+            _scalar_type_name(max_dtype(default_dtype())),
             " can't be cast to the desired output type ",
             _scalar_type_name(t.dtype),
         )
+    var src = own_if_new(_promote(t), t)
     _require_float("logit", src.t.dtype)
     var b = _logit_bounds(eps, src.t.dtype)
     var dst = t.copy()

@@ -174,6 +174,8 @@ def _check_tanh_backward_f32(
 )
 @pytest.mark.parametrize("layout", ["transpose", "broadcast", "resize", "strided_out"])
 def test_tanh_backward_generic_fallback(mojo_gpu, dtype, layout):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
     g = torch.linspace(-0.5, 0.5, 35).reshape(5, 7).to(dtype)
     y = torch.linspace(-0.75, 0.75, 35).reshape(5, 7).to(dtype)
     gm, ym = g.to(mojo_gpu), y.to(mojo_gpu)
