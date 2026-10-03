@@ -388,8 +388,12 @@ def test_unary_launcher_log1p_near_zero(mojo_gpu: str, dtype: torch.dtype, offse
     torch.testing.assert_close(
         actual, expected, rtol=log1p_rtol(dtype), atol=0, equal_nan=True
     )
-    zeros = cpu == 0
-    torch.testing.assert_close(torch.signbit(actual[zeros]), torch.signbit(cpu[zeros]))
+    # every expected zero keeps its sign (log1p(-0) = -0; a flushed negative
+    # tiny result is -0 too)
+    zeros = expected == 0
+    torch.testing.assert_close(
+        torch.signbit(actual[zeros]), torch.signbit(expected[zeros])
+    )
 
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32))
