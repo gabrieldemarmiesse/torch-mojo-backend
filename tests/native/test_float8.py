@@ -2,12 +2,13 @@
 fnuz variants and float8_e8m0fnu) and torch._scaled_mm / _scaled_mm_v2.
 
 Stock CUDA's set is the oracle: allocation, conversions (c10's bit-exact
-float8 <-> float32 functions, no saturation), fills, `.item()`, the
-dtype-agnostic data movement CUDA dispatches over AT_FLOAT8_TYPES, eq / ne,
-and the scaled GEMMs. Arithmetic CUDA has no float8 kernel for is declined.
-References are CPU torch (identical to CUDA for every conversion, measured on
-torch 2.11 / H100) and, for the GEMMs, a float64 product of the dequantized
-operands.
+float8 <-> float32 functions; stock CUDA's sm_89+ e4m3fn saturation on
+copies), fills, `.item()`, the dtype-agnostic data movement CUDA dispatches
+over AT_FLOAT8_TYPES, eq / ne / where and their type promotion, and the
+scaled GEMMs. Arithmetic CUDA has no float8 kernel for is declined.
+References are CPU torch, with the stock-CUDA saturation rule applied where
+it differs (`_stock_cast`), and, for the GEMMs, a float64 product of the
+dequantized operands.
 """
 
 import itertools

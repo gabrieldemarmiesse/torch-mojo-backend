@@ -371,6 +371,14 @@ none. Every source goes through float32 on its way in (double rounding for
 float64 and int64 sources, as c10 does), every float8 through float32 on its
 way out. A Scalar fill checks `c10::overflows` the way `Scalar::to<>` does.
 
+One exception follows stock CUDA rather than c10: torch >= 2.12 on CUDA 13
+converts float / half / bfloat16 to e4m3fn on sm_89+ with the saturating
+intrinsic (Copy.cu, #177870), so a device-side copy of that kind (CastSpec,
+`.to()`, non-blocking transfers, `where`'s `.to(result_type)`) clamps an
+overflow to +-448 on those GPUs. Blocking host <-> device transfers convert
+on the CPU and type promotions (comparison operands) never saturate, as in
+stock torch.
+
 `torch._scaled_mm`, `_scaled_mm_v2` and the rowwise `_scaled_grouped_mm[_v2]`
 are `tmb/ops/scaled_mm.mojo`: dequantize to float32 (`scaled_mm` family,
 `Dequant`), the float32 GEMM of `ops/matmul.mojo` (the TF32 bridge for the
