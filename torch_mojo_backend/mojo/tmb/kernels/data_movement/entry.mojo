@@ -2344,8 +2344,8 @@ def _cast_float8[
     value goes through float32 (c10's `Float8_*(float)` / `operator float()`,
     tmb/kernels/common/float8.mojo), and so does every source on its way into
     a float8 (int and float64 round to float32 first, as `static_cast<float>`
-    does). From float32 on, the destination takes the float32 path of
-    `_cast_elem`, so float8 -> int narrows exactly like float32 -> int."""
+    does). From float32 on, an integer destination takes CUDA's cvt rules
+    (`_f32_to_int_cuda`), any other the float32 path of `_cast_elem`."""
     var f: SIMD[DType.float32, width]
     comptime if is_float8(src):
         f = fp8_to_f32[src](bitcast[DType.uint8, width](v))
@@ -2382,23 +2382,25 @@ def _f32_to_int_cuda[
     dst: DType, w: Int
 ](f: SIMD[DType.float32, w]) -> SIMD[dst, w]:
     """float32 -> integer as CUDA's `static_cast` compiles (cvt.rzi.sat),
-    measured on stock torch: a NaN is 0 for int32 / uint32, INT64_MIN for
-    int64, 2**63 for uint64; out-of-range values saturate; uint16 is the
-    uint32 result truncated, uint8 / int8 / int16 the int64 one (torch's
-    narrowing chain). Spelled out on the bits: the float8 NaNs are
+    measured on stock torch for every float8 bit pattern: a NaN is 0 for
+    int32 / uint32, INT64_MIN for int64, 2**63 for uint64; out-of-range
+    values saturate; int8 / int16 are the saturated int32 result
+    truncated, uint16 the uint32 one, uint8 the int64 one. Spelled out on the bits: the float8 NaNs are
     signalling (0x7F800001), which the plain cast does not map like PTX."""
     var bits = bitcast[DType.uint32, w](f)
     var nan = (bits & 0x7FFFFFFF).gt(0x7F800000)
     var g = nan.select(SIMD[DType.float32, w](0), f)
-    comptime if dst == DType.int32:
+    comptime if dst == DType.int32 or dst == DType.int8 or dst == DType.int16:
         var c = g.lt(-2147483648.0).select(
             SIMD[DType.float32, w](-2147483648.0), g
         )
         var hi = c.ge(2147483648.0)
         var r = hi.select(SIMD[DType.float32, w](0), c).cast[DType.int32]()
-        return rebind[SIMD[dst, w]](
-            hi.select(SIMD[DType.int32, w](Int32.MAX), r)
-        )
+        r = hi.select(SIMD[DType.int32, w](Int32.MAX), r)
+        comptime if dst == DType.int32:
+            return rebind[SIMD[dst, w]](r)
+        else:
+            return bitcast[DType.uint32, w](r).cast[dst]()
     elif dst == DType.uint32 or dst == DType.uint16:
         var c = g.lt(0.0).select(SIMD[DType.float32, w](0), g)
         var hi = c.ge(4294967296.0)

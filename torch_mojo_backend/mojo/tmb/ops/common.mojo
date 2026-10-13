@@ -1048,7 +1048,7 @@ def scalar_type_name(dt: DType) -> String:
     return String(dt)
 
 
-def decline_float8(dt: DType, kernel: StaticString) raises:
+def decline_float8(dt: DType, kernel: String) raises:
     """Refuse a float8 operand the way stock CUDA does, naming the CUDA
     kernel whose AT_DISPATCH has no float8 case (NotImplementedError)."""
     if is_float8(dt):

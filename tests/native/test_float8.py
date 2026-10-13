@@ -755,3 +755,112 @@ def test_float8_refusals_wait_for_empty_inputs(mojo_device):
     ):
         with pytest.raises(NotImplementedError):
             op(e)
+
+
+def _cuda_f2i(f: float, dt: str) -> int:
+    """Stock CUDA's float -> integer conversion, measured on every float8 code
+    (torch 2.11 / H100): PTX's saturating truncation to int32 (NaN 0) narrowed
+    by truncation for int8 / int16; to uint32 (NaN 0) narrowed for uint16; to
+    int64 (NaN INT64_MIN) narrowed for uint8; uint64 saturates (NaN 2**63)."""
+
+    def sat(lo: int, hi: int) -> int:
+        return lo if f <= lo else hi if f >= hi else int(f)
+
+    nan = f != f
+    if dt in ("int32", "int16", "int8"):
+        bits = {"int32": 32, "int16": 16, "int8": 8}[dt]
+        r = (0 if nan else sat(-(2**31), 2**31 - 1)) & ((1 << bits) - 1)
+        return r - (1 << bits) if r >= 1 << (bits - 1) else r
+    if dt in ("uint32", "uint16"):
+        r = 0 if nan else sat(0, 2**32 - 1)
+        return r & (0xFFFF if dt == "uint16" else 0xFFFFFFFF)
+    if dt == "uint64":
+        return 2**63 if nan else sat(0, 2**64 - 1)
+    r = -(2**63) if nan else sat(-(2**63), 2**63 - 1)
+    return r if dt == "int64" else r & 0xFF
+
+
+_INTS = ["int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"]
+
+
+@pytest.mark.parametrize("dt", _INTS)
+@pytest.mark.parametrize("src", FP8, ids=FP8_IDS)
+def test_float8_all_codes_to_int_match_stock_cuda(mojo_device, src, dt):
+    """Every float8 code, e8m0's [2**31, 2**127] range included: int8 / int16
+    narrow the saturated int32 result, not the int64 one."""
+    codes = _all_codes(src)
+    want = [_cuda_f2i(f, dt) for f in codes.float().tolist()]
+    assert codes.to(mojo_device).to(getattr(torch, dt)).cpu().tolist() == want
+
+
+def test_float8_mask_assign_overlapping_mask_raises(mojo_device):
+    """index_put_ checks the mask for overlap with self too, whatever it
+    selects (stock CUDA)."""
+    t = torch.zeros(4).to(torch.float8_e4m3fn).to(mojo_device)
+    v = torch.tensor(2.0).to(torch.float8_e4m3fn).to(mojo_device)
+    with pytest.raises(RuntimeError, match="single memory location|overlap"):
+        t[t.view(torch.bool)] = v
+
+
+@pytest.mark.parametrize(
+    "op,kernel",
+    [
+        (lambda x: torch.nn.functional.pad(x, (1, 1), "reflect"), "reflection_pad"),
+        (lambda x: torch.nn.functional.pad(x, (1, 1), "replicate"), "replication_pad"),
+        (lambda x: torch.copysign(x, x), "copysign_cuda"),
+        (lambda x: torch.unique(x), "unique"),
+        (lambda x: torch.unique(x[:0]), "unique"),
+        (lambda x: torch._foreach_zero_([x]), "foreach_zero_cuda_"),
+    ],
+    ids=["reflect", "replicate", "copysign", "unique", "unique_empty", "foreach_zero"],
+)
+def test_float8_more_refusals_name_cuda_kernels(mojo_device, op, kernel):
+    x = _x(torch.float8_e4m3fn).to(mojo_device)
+    with pytest.raises(NotImplementedError, match=kernel):
+        op(x)
+
+
+def test_float8_e8m0_foreach_copy_refused(mojo_device):
+    dst = torch.ones(3).to(torch.float8_e8m0fnu).to(mojo_device)
+    src = torch.ones(3, device=mojo_device)
+    with pytest.raises(NotImplementedError, match="foreach_tensor_copy"):
+        torch._foreach_copy_([dst], [src])
+
+
+def test_float8_tril_out_resized_before_refusal(mojo_device):
+    x = _x(torch.float8_e4m3fn).to(mojo_device)
+    out = torch.empty(0, dtype=x.dtype, device=mojo_device)
+    with pytest.raises(NotImplementedError, match="triu_tril_cuda_template"):
+        torch.tril(x, out=out)
+    assert out.shape == x.shape
+
+
+def test_float8_runtime_errors_come_before_the_refusal(mojo_device):
+    """CUDA's argument checks run before its float8 dispatch."""
+    x = _x(torch.float8_e4m3fn).to(mojo_device)
+    with pytest.raises(RuntimeError, match="long tensor"):
+        x.take(torch.tensor([0], dtype=torch.int32, device=mojo_device))
+    with pytest.raises(RuntimeError, match="masked_scatter_"):
+        x.clone().masked_scatter_(torch.ones_like(x, dtype=torch.bool), x.float())
+
+
+def test_index_put_check_order(mojo_device):
+    """Overlap, then mask shape, then dtype (stock CUDA)."""
+    dev = mojo_device
+    t = torch.zeros(3).to(torch.float8_e4m3fn).to(dev)
+    bad_mask = torch.tensor([True, False], device=dev)
+    with pytest.raises((IndexError, RuntimeError), match="does not match the shape"):
+        t[bad_mask] = torch.tensor(2.0, dtype=torch.float64, device=dev)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        t[bad_mask] = t[0]
+
+
+@pytest.mark.parametrize("hit", [True, False])
+def test_float8_mask_assign_into_expanded_self(mojo_device, hit):
+    """CUDA's index_put kernel writes the selected elements, so every alias
+    of an expanded self sees the value (or none does)."""
+    dev = mojo_device
+    t = torch.ones(1).to(torch.float8_e4m3fn).to(dev).expand(3)
+    mask = torch.tensor([hit, False, False], device=dev)
+    t[mask] = torch.tensor(3.0).to(torch.float8_e4m3fn).to(dev)
+    assert t.view(torch.uint8).cpu().tolist() == [68 if hit else 56] * 3

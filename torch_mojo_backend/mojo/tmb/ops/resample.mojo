@@ -55,8 +55,10 @@ from tmb.backend.abi import (
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
+from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK, _f64_slot
 from tmb.ops.common import (
+    decline_float8,
     OVERLAP_FULL,
     OVERLAP_PARTIAL,
     assert_no_internal_overlap,
@@ -891,6 +893,21 @@ def op_pad[
     var out_dims = _pad_geom[REFLECT, RANK](a, padding)
     if a.dtype == DType.bool:
         unsupported(String(name, ": bool"))
+    if is_float8(a.dtype):
+        # The CUDA pad kernels dispatch no float8 (the byte-width gate the
+        # Pad kernel shares with copies would otherwise let it through).
+        comptime if REFLECT:
+            comptime kernel = "reflection_pad1d_out" if RANK == 1 else (
+                "reflection_pad2d_out_template" if RANK
+                == 2 else "reflection_pad3d_out_cuda"
+            )
+            decline_float8(a.dtype, kernel)
+        else:
+            comptime kernel = "replication_pad1d_cuda" if RANK == 1 else (
+                "replication_pad2d_cuda" if RANK
+                == 2 else "replication_pad3d_cuda"
+            )
+            decline_float8(a.dtype, kernel)
     var in_dims = List[Int]()
     for k in range(a.rank):
         in_dims.append(a.dim(k))

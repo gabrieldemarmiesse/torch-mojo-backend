@@ -581,8 +581,6 @@ def op_channel_shuffle(
 
 
 def _take_checks(a: T, index: T, dest: T) raises:
-    if index.numel > 0:  # an empty take never reaches CUDA's dispatch
-        decline_float8(a.dtype, "take_cuda")
     if index.dtype != DType.int64:
         raise Error(
             "take(): Expected a long tensor for index, but got ",
@@ -604,6 +602,8 @@ def _take_checks(a: T, index: T, dest: T) raises:
         )
     if a.numel == 0 and index.numel != 0:
         raise Error("take(): tried to take from an empty tensor")
+    if index.numel > 0:  # after CUDA's checks; an empty take never dispatches
+        decline_float8(a.dtype, "take_cuda")
 
 
 def _take_into(dst: T, a: T, index: T) raises:
@@ -1085,8 +1085,6 @@ def op_masked_scatter_(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     var source = v_tensor(args[unsafe_offset=2])
-    if a.numel > 0:  # an empty self never reaches CUDA's dispatch
-        decline_float8(a.dtype, "masked_scatter_")
     assert_no_internal_overlap(a)
     if a.stype != source.stype:
         raise Error(
@@ -1135,6 +1133,8 @@ def op_masked_scatter_(
     if a.numel == 0:
         ret_ref(rets, 0, a)
         return
+    # CUDA's float8 refusal comes after its checks and empty early return.
+    decline_float8(a.dtype, "masked_scatter_")
     var n = a.numel
     # The broadcast mask, dense in self's logical order.
     var m = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))

@@ -69,6 +69,7 @@ from tmb.backend.abi import (
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
+from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.binary import (
     Res,
@@ -98,6 +99,7 @@ from tmb.ops.binary import (
     op_rsub_out,
 )
 from tmb.ops.common import (
+    scalar_type_name,
     ST_UNDEFINED,
     assert_no_internal_overlap,
     combine_categories as _pw_combine,
@@ -364,6 +366,7 @@ def _pw_run(
     """One launch of `kind` over (a, b, c) computed in `compute`, stored as
     `out_stype`: into `dst` when it already has the result's dtype, shape
     and a dense layout, else into a fresh tensor."""
+    _pw_no_float8(kind, a, b, c)
     var device = _pw_device(a, b, c)
     var bs = _pw_broadcast(a, b, c, arity)
     var shape = bs[0]
@@ -479,6 +482,22 @@ def _pw_inplace_self(
         if side.is_t:
             _b_inplace_operand(self, side.t.value())
     return self^
+
+
+def _pw_no_float8(kind: StaticString, a: Side, b: Side, c: Side) raises:
+    """CUDA's pointwise math kernels dispatch no float8 operand (empty ones
+    included): refuse with the `<op>_cuda` name its error uses."""
+    for side in [a.copy(), b.copy(), c.copy()]:
+        if side.is_t:
+            var dt = side.t.value().dtype
+            if is_float8(dt):
+                unsupported(
+                    '"'
+                    + String(kind)
+                    + "_cuda\" not implemented for '"
+                    + scalar_type_name(dt)
+                    + "'"
+                )
 
 
 def _pw_math(

@@ -72,7 +72,7 @@ from tmb.kernels.optimizer.foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
-from tmb.ops.common import copy_strided_into
+from tmb.ops.common import copy_strided_into, decline_float8, fill_value
 from tmb.ops.data_movement import _scalar_type_name
 
 
@@ -746,6 +746,19 @@ def _copy_adjacent_views(dsts: List[T], srcs: List[T]) raises -> Bool:
 
 
 # aten::_foreach_copy_(Tensor(a!)[] self, Tensor[] src, bool non_blocking=False) -> ()
+# aten::_foreach_zero_(Tensor(a!)[] self) -> ()
+def op_foreach_zero_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """ATen's composite would zero a float8 tensor; CUDA's kernel has no
+    float8 case (empty tensors included), so refuse those first."""
+    var ts = v_tensor_list(args[unsafe_offset=0])
+    for i in range(len(ts)):
+        decline_float8(ts[i].dtype, "foreach_zero_cuda_")
+    for i in range(len(ts)):
+        fill_value(ts[i], 0.0)
+
+
 def op_foreach_copy_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
@@ -755,6 +768,10 @@ def op_foreach_copy_(
         raise Error("Tensor list must have at least one tensor.")
     if len(srcs) != len(dsts):
         raise Error("Tensor lists must have the same number of tensors.")
+    for i in range(len(dsts)):
+        # CUDA's foreach copy dispatches float8 except e8m0, empty included.
+        if dsts[i].dtype == DType.float8_e8m0fnu:
+            decline_float8(dsts[i].dtype, "foreach_tensor_copy")
     if _copy_adjacent_views(dsts, srcs):
         return
     if _copy_batch_qualifies(dsts, srcs):
@@ -1451,6 +1468,7 @@ def register_foreach(site: Site) raises:
     ](site)
     impl[op_amp_update_scale_, "_amp_update_scale_"](site)
     impl[op_foreach_copy_, "_foreach_copy_"](site)
+    impl[op_foreach_zero_, "_foreach_zero_"](site)
     impl[op_foreach_add_scalar_, "_foreach_add_.Scalar"](site)
     impl[op_foreach_addcmul_scalar_, "_foreach_addcmul_.Scalar"](site)
     impl[op_foreach_lerp_scalar_, "_foreach_lerp_.Scalar"](site)

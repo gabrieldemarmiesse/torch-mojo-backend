@@ -30,6 +30,7 @@ from tmb.backend.abi import (
     MEMORY_FORMAT_PRESERVE,
     ST_INT32,
     ST_INT64,
+    ST_UINT8,
     TAG_NONE,
     TAG_DEVICE,
     TAG_INT,
@@ -73,6 +74,7 @@ from tmb.backend.abi import (
     tensor_arg,
     bool_arg,
     none_arg,
+    int_arg,
     v_bool,
     v_device_index,
     v_bool_or,
@@ -1620,6 +1622,9 @@ def _triangular_out(
     if not in_place:
         dest = v_tensor(args[unsafe_offset=2])
         check_out(dest, t)
+        if is_float8(t.dtype) and t.numel > 0:
+            # CUDA's structured out= resizes before the kernel refuses.
+            resize_out(dest, t.shape, t.rank)
     var res = _triangular(t, diagonal, upper)
     if not in_place:
         resize_out(dest, res.t.shape, res.t.rank)
@@ -3014,7 +3019,19 @@ def _overlaps_contiguous_target(target: T, source: T) -> Bool:
     )
 
 
-def _index_put_mask_fill(target: T, mask: T, values: T) raises:
+def _index_put_dtype_error(target: T, values: T) raises:
+    raise Error(
+        "Index put requires the source and destination dtypes match, got ",
+        _scalar_type_name(target.dtype),
+        " for the destination and ",
+        _scalar_type_name(values.dtype),
+        " for the source.",
+    )
+
+
+def _index_put_mask_fill(
+    target: T, mask: T, values: T, check_dtype: Bool
+) raises:
     """`self[mask] = v` with a one-element `v`: what ATen's own
     `_index_put_impl_` re-routes to `masked_fill_` (canDispatchToMaskedFill),
     the one boolean-mask form whose work is not data dependent.
@@ -3032,6 +3049,8 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
                 d,
                 " does not match the shape of the indexed tensor",
             )
+    if check_dtype:
+        _index_put_dtype_error(target, values)
     var shape = IndexList[MAX_RANK](1)
     var strides = IndexList[MAX_RANK](0)
     var pad = MAX_RANK - target.rank
@@ -3056,35 +3075,6 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
             [tensor_arg(target), tensor_arg(mask_view.t), scalar^],
             1,
         )
-    elif is_float8(target.dtype):
-        # A device value never takes ATen's masked_fill route
-        # (canDispatchToMaskedFill wants a CPU value) and CUDA's masked_fill
-        # has no float8 kernel; its index_put kernel does (the dtype and
-        # overlap checks ran in the caller). Same result as a select:
-        # self = where(mask, value, self).
-        var value0 = own(
-            view_strided(
-                values,
-                IndexList[MAX_RANK](1),
-                IndexList[MAX_RANK](0),
-                0,
-                values.offset,
-            )
-        )
-        var picked = call_op(
-            "aten::where",
-            "self",
-            [tensor_arg(mask_view.t), tensor_arg(value0.t), tensor_arg(target)],
-            1,
-        )
-        _ = call_op(
-            "aten::copy_",
-            "",
-            [tensor_arg(target), picked[0].copy(), bool_arg(False)],
-            1,
-        )
-        _ = picked^
-        _ = value0^
     else:
         var value0 = own(
             view_strided(
@@ -3095,12 +3085,44 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
                 values.offset,
             )
         )
-        _ = call_op(
-            "aten::masked_fill_",
-            "Tensor",
-            [tensor_arg(target), tensor_arg(mask_view.t), tensor_arg(value0.t)],
-            1,
-        )
+        if is_float8(target.dtype):
+            # A device value never takes ATen's masked_fill route
+            # (canDispatchToMaskedFill wants a CPU value) and CUDA's
+            # masked_fill has no float8 kernel; its index_put kernel does
+            # (the dtype and overlap checks ran in the caller). Storing a
+            # value is pure data movement, so the same fill over the bytes
+            # (uint8 views) is bit-exact, expanded selves included.
+            var t8 = call_op(
+                "aten::view",
+                "dtype",
+                [tensor_arg(target), int_arg(Int(ST_UINT8))],
+                1,
+            )
+            var v8 = call_op(
+                "aten::view",
+                "dtype",
+                [tensor_arg(value0.t), int_arg(Int(ST_UINT8))],
+                1,
+            )
+            _ = call_op(
+                "aten::masked_fill_",
+                "Tensor",
+                [t8[0].copy(), tensor_arg(mask_view.t), v8[0].copy()],
+                1,
+            )
+            _ = t8^
+            _ = v8^
+        else:
+            _ = call_op(
+                "aten::masked_fill_",
+                "Tensor",
+                [
+                    tensor_arg(target),
+                    tensor_arg(mask_view.t),
+                    tensor_arg(value0.t),
+                ],
+                1,
+            )
         _ = value0^
     _ = mask_view^
 
@@ -3120,22 +3142,16 @@ def op_index_put_impl_(
     # per-slice-width rounding of `scatter_add_sorted`); matching it would
     # put a sort on this hot path, so it is left as a known difference.
     var accumulate = v_bool(args[unsafe_offset=3])
+    var check_dtype = False
     if not values.on_cpu():
-        # index_put_'s own checks (TensorAdvancedIndexing.cpp), before any
-        # route: a device value must match self's dtype and not overlap it.
-        # (A CPU value is converted -- ATen's masked_fill route or `.to`.)
-        if values.dtype != target.dtype:
-            raise Error(
-                (
-                    "Index put requires the source and destination dtypes"
-                    " match, got "
-                ),
-                _scalar_type_name(target.dtype),
-                " for the destination and ",
-                _scalar_type_name(values.dtype),
-                " for the source.",
-            )
+        # index_put_'s own checks (TensorAdvancedIndexing.cpp), in its order,
+        # before any route: no overlap of self with the value or an index,
+        # then (TensorIterator, after the index shapes) matching dtypes. A
+        # CPU value is converted instead (ATen's masked_fill route / `.to`).
         assert_no_overlap(target, values)
+        for i in range(len(indices)):
+            assert_no_overlap(target, indices[i])
+        check_dtype = not accumulate and values.dtype != target.dtype
     if (
         len(indices) == 1
         and len(present) >= 1
@@ -3144,9 +3160,11 @@ def op_index_put_impl_(
         and not accumulate
         and values.numel == 1
     ):
-        _index_put_mask_fill(target, indices[0], values)
+        _index_put_mask_fill(target, indices[0], values, check_dtype)
         ret_ref(rets, 0, target)
         return
+    if check_dtype:
+        _index_put_dtype_error(target, values)
     if target.rank == 0 or target.rank > 4 or not target.contig:
         unsupported(
             "_index_put_impl_: requires a contiguous rank-1 to rank-4"

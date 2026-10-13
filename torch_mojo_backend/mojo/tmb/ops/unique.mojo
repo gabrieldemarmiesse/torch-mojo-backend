@@ -52,7 +52,7 @@ from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import call_op, contiguous
+from tmb.ops.common import call_op, contiguous, decline_float8
 
 
 def _vec(n: Int) -> IndexList[MAX_RANK]:
@@ -261,6 +261,8 @@ def run_bounds(sorted: T) raises -> RunBounds:
 
 def _check_dtype(t: T, what: String) raises:
     var dt = t.dtype
+    # CUDA's unique kernels dispatch no float8, empty input included.
+    decline_float8(dt, "unique")
     if not (
         dt.is_floating_point()
         or dt == DType.int64
