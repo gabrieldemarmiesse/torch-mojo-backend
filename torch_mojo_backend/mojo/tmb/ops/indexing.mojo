@@ -36,6 +36,7 @@ handed to kernels, never to the dispatcher.
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    v_bool_or,
     IntList,
     Owned,
     ST_BOOL,
@@ -76,6 +77,7 @@ from tmb.backend.device import (
     ctx_for,
 )
 from tmb.backend.registry import Site, impl
+from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     assert_no_internal_overlap,
@@ -1326,6 +1328,16 @@ def _reduction(reduce: String, new_options: Bool) raises -> Int:
 
 
 def _reduce_dtype_check(a: T, red: Int, what: String) raises:
+    if is_float8(a.dtype):
+        # The message CUDA's reducing scatter gives for float8 (index_reduce
+        # names its own kernels, in `_index_reduce_op`).
+        if what == "index_reduce":
+            return
+        unsupported(
+            '"cuda_scatter_gather_base_kernel_func" not implemented for \''
+            + _scalar_type_name(a.dtype)
+            + "'"
+        )
     if not _is_scatter_add_dtype(a.dtype):
         unsupported(
             "aten::"
@@ -1585,7 +1597,9 @@ def _scatter_reduce_op(
     if include_self_pos >= 0:
         include_self = v_bool(args[unsafe_offset=include_self_pos])
     var dim = _scatter_validate(a, dim_in, index, src, False)
-    if red != 0:
+    if red != 0 and not (is_float8(a.dtype) and index.numel == 0):
+        # (A float8 reduce over an empty index never reaches CUDA's dtype
+        # dispatch: an unchanged copy of self.)
         _reduce_dtype_check(a, red, what)
         # CUDA's alerts: prod always; the legacy add / multiply kernel
         # unless a floating add takes the deterministic index_put route
@@ -1913,6 +1927,18 @@ def _index_reduce_op(
         source,
         v_string(args[unsafe_offset=4]),
     )
+    if is_float8(a.dtype):
+        # CUDA's two index_reduce kernels, neither with a float8 case.
+        var kernel = String("index_reduce") if v_bool_or(
+            args[unsafe_offset=5], True
+        ) else String("index_reduce_func_cuda_exclude_input_init")
+        unsupported(
+            '"'
+            + kernel
+            + "\" not implemented for '"
+            + _scalar_type_name(a.dtype)
+            + "'"
+        )
     var dim = checked[0]
     var red = checked[1]
     var include_self = v_bool(args[unsafe_offset=5])

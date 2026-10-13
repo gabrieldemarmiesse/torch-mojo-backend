@@ -352,6 +352,25 @@ are reads of registration state and never reach the runtime, and forked
 workers that only touch CPU tensors run normally
 (`tests/native/test_fork.py`).
 
+### Float8
+
+The five torch float8 dtypes (`float8_e4m3fn`, `float8_e5m2`, the two
+`fnuz` variants, `float8_e8m0fnu`) live on the device with the op set stock
+CUDA dispatches over `AT_FLOAT8_TYPES`: allocation, fills, `.item()`,
+conversions to and from every other dtype (CastSpec), the byte-moving data
+movement ops (every family gated by `_dtype_arg_width_on[i, 8]`, the uint8
+scatter / index_put routes) and `eq` / `ne` / `isnan` (through an exact
+float32 copy). Arithmetic is declined, as CUDA has no float8 kernels for it.
+
+Conversions are `tmb/kernels/common/float8.mojo`: c10's
+`Float8_*(float)` / `operator float()` ported bit for bit (round to nearest
+even, overflow to NaN for e4m3fn and the fnuz types, to inf for e5m2, no
+saturation; e8m0 rounds its exponent half-up and drops the sign). Not the
+hardware: PTX only has `.satfinite` float8 conversions and the Apple GPU has
+none. Every source goes through float32 on its way in (double rounding for
+float64 and int64 sources, as c10 does), every float8 through float32 on its
+way out. A Scalar fill checks `c10::overflows` the way `Scalar::to<>` does.
+
 ## Test support
 
 `native.op_counting(True)`, `native.op_count("aten::add.Tensor")` count

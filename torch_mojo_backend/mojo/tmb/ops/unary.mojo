@@ -20,8 +20,10 @@ old NOT_HANDLED convention.
 """
 from std.ffi import external_call
 
+from tmb.kernels.common.float8 import is_float8
 from tmb.backend.abi import (
     Owned,
+    ST_FLOAT32,
     ST_FLOAT64,
     T,
     Value,
@@ -2046,7 +2048,13 @@ def op_gelu_backward(
 # aten::isnan(Tensor self) -> Tensor
 def op_isnan(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_bool_unary("IsNanSpec", t))
+    # float8: ATen's isnan is `self != self`, which CUDA runs for float8;
+    # its exact float32 copy has the same NaNs.
+    var src = own_if_new(
+        cast_to(t, ST_FLOAT32) if is_float8(t.dtype) else t.copy(), t
+    )
+    var out = own(_bool_unary("IsNanSpec", src.t))
+    _ = src^
     ret_owned(rets, 0, out)
 
 
@@ -2054,7 +2062,11 @@ def op_isnan(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_isnan_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _bool_unary_out("IsNanSpec", t, dst)
+    var src = own_if_new(
+        cast_to(t, ST_FLOAT32) if is_float8(t.dtype) else t.copy(), t
+    )
+    _bool_unary_out("IsNanSpec", src.t, dst)
+    _ = src^
     ret_ref(rets, 0, dst)
 
 

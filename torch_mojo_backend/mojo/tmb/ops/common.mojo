@@ -52,6 +52,7 @@ from tmb.backend.abi import (
 from tmb.backend.device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
+from tmb.kernels.common.float8 import f64_to_fp8_bits, is_float8
 
 # `call_op` / `call_op_raw` live in abi.mojo (one implementation, shared with
 # the ops that import them from there); they are re-exported here because most
@@ -479,12 +480,74 @@ def fill_value(t: T, value: Float64) raises:
 
 def fill_value(t: T, value: Value) raises:
     """Constant fill from an ATen `Scalar` argument record, tag kept."""
-    _fill(t, FillScalar(value))
+    var s = FillScalar(value)
+    if is_float8(t.dtype):
+        check_float8_scalar(s, t.dtype, t.stype)
+    _fill(t, s)
+
+
+def _float8_max(dt: DType) -> Float64:
+    """`std::numeric_limits<c10::Float8_*>::max()`."""
+    if dt == DType.float8_e4m3fn:
+        return 448.0
+    if dt == DType.float8_e4m3fnuz:
+        return 240.0
+    if dt == DType.float8_e8m0fnu:
+        return 1.7014118346046923e38  # 2**127
+    return 57344.0  # e5m2, e5m2fnuz
+
+
+def check_float8_scalar(s: FillScalar, dt: DType, stype: Int32) raises:
+    """`Scalar::to<c10::Float8_*>()`'s overflow check (c10::overflows): an
+    integer outside [lowest, max] -- never for e8m0fnu, an unsigned type
+    that lets a negative integer wrap -- and a float outside [lowest, max]
+    raise, except an infinity for e5m2 (the one float8 with inf) and NaN
+    (every float8 has one). e8m0fnu's lowest is 2**-127, so a float zero or
+    negative overflows it while an integer zero does not."""
+    var top = _float8_max(dt)
+    var low = -top
+    if dt == DType.float8_e8m0fnu:
+        low = 5.877471754111438e-39  # 2**-127
+    var bad: Bool
+    if s.integral:
+        bad = dt != DType.float8_e8m0fnu and (
+            Float64(s.i) < low or Float64(s.i) > top
+        )
+    else:
+        var f = s.f
+        var is_inf = f == f and f - f != 0.0  # inf - inf is NaN
+        bad = (f < low or f > top) and not (is_inf and dt == DType.float8_e5m2)
+    if bad:
+        raise Error(
+            "value cannot be converted to type ",
+            dtype_name(stype),
+            " without overflow",
+        )
 
 
 def _fill(t: T, s: FillScalar) raises:
     """A memset when contiguous, else the strided fill kernel."""
     if t.numel == 0:
+        return
+    if is_float8(t.dtype):
+        # One byte, computed here the way c10 converts (through float32):
+        # a byte memset, or the strided fill of that byte as uint8.
+        var bits = f64_to_fp8_bits(t.dtype, s.f)
+        if t.contig:
+            var ctx = ctx_for(t.device)
+            memset_bytes(ctx, t.ptr, bits, t.numel)
+            _ = ctx
+            return
+        var fctx = ctx_for(t.device)
+        var fcall = KernelCall("memory", "StridedFill")
+        fcall.int(t.ptr)
+        fcall.f64(Float64(bits))
+        fcall.tuple(_padded(t.shape))
+        fcall.tuple(_padded(t.strides))
+        fcall.int(dtype_code(DType.uint8))
+        fcall.int(ctx_ptr(fctx))
+        fcall.run()
+        _ = fctx
         return
     if t.contig:
         _fill_contiguous(t, s)
@@ -566,6 +629,7 @@ def is_cast_dtype(dt: DType) -> Bool:
         or dt == DType.int8
         or dt == DType.uint8
         or dt == DType.bool
+        or is_float8(dt)
     )
 
 
@@ -583,8 +647,13 @@ def is_cast_dtype_on(dt: DType, t: T) raises -> Bool:
     return is_cast_dtype(dt)
 
 
-def cast_into(dst: T, src: T) raises:
-    """dst = src.to(dst.dtype) for a contiguous dst (data_movement CastSpec)."""
+def cast_into(dst: T, src: T, saturate: Bool = True) raises:
+    """dst = src.to(dst.dtype) for a contiguous dst (data_movement CastSpec).
+
+    `saturate` is copy_ / to()'s float -> e4m3fn rule on an sm_89+ NVIDIA
+    GPU (stock torch's SATFINITE intrinsic, see the kernel); a type
+    promotion (a comparison's operand, ...) converts like c10 instead and
+    passes False."""
     if src.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -592,6 +661,8 @@ def cast_into(dst: T, src: T) raises:
     var call = KernelCall("data_movement", "CastSpec")
     call.arg_dtype(0, src.dtype)
     call.out_dtype(dst.dtype)
+    if not saturate and dst.dtype == DType.float8_e4m3fn:
+        call.flag("FP8_NOSAT", 1)
     call.spec(src.spec(cp))
     call.int(dtype_code(dst.dtype))
     call.spec(dst.spec(cp))
@@ -599,14 +670,14 @@ def cast_into(dst: T, src: T) raises:
     _ = ctx
 
 
-def cast_to(t: T, stype: Int32) raises -> T:
+def cast_to(t: T, stype: Int32, saturate: Bool = True) raises -> T:
     """A contiguous copy of `t` in dtype `stype` (t itself when unchanged).
     Both the output and the intermediate are released if the cast raises."""
     if t.stype == stype:
         return t.copy()
     var out = own(new_like_dtype(t, stype))
     var src = own_if_new(contiguous(t), t)
-    cast_into(out.t, src.t)
+    cast_into(out.t, src.t, saturate)
     _ = src^  # alive past the launch (its last use above is the pointer read)
     return out.take()
 
@@ -919,6 +990,47 @@ def result_type(a: T, b: T) raises -> Int32:
     return combine_categories(dim, zero)
 
 
+def scalar_type_name(dt: DType) -> String:
+    """How torch names a ScalarType in an error message (`c10::toString`)."""
+    if dt == DType.float64:
+        return "Double"
+    if dt == DType.float32:
+        return "Float"
+    if dt == DType.float16:
+        return "Half"
+    if dt == DType.bfloat16:
+        return "BFloat16"
+    if dt == DType.int64:
+        return "Long"
+    if dt == DType.int32:
+        return "Int"
+    if dt == DType.int16:
+        return "Short"
+    if dt == DType.int8:
+        return "Char"
+    if dt == DType.uint8:
+        return "Byte"
+    if dt == DType.bool:
+        return "Bool"
+    if dt == DType.uint16:
+        return "UInt16"
+    if dt == DType.uint32:
+        return "UInt32"
+    if dt == DType.uint64:
+        return "UInt64"
+    if dt == DType.float8_e4m3fn:
+        return "Float8_e4m3fn"
+    if dt == DType.float8_e5m2:
+        return "Float8_e5m2"
+    if dt == DType.float8_e4m3fnuz:
+        return "Float8_e4m3fnuz"
+    if dt == DType.float8_e5m2fnuz:
+        return "Float8_e5m2fnuz"
+    if dt == DType.float8_e8m0fnu:
+        return "Float8_e8m0fnu"
+    return String(dt)
+
+
 def binary_promotion(a: T, b: T) raises -> DType:
     """torch's promotion for a binary pair, restricted to what the
     broadcast-strided spec kernels cover: equal dtypes; bool with any
@@ -942,6 +1054,18 @@ def binary_promotion(a: T, b: T) raises -> DType:
     var b_dtype = b.dtype
     if a_dtype == b_dtype:
         return a_dtype
+    if is_float8(a_dtype) or is_float8(b_dtype):
+        # c10::promoteTypes: float8 promotes with no other dtype (bool
+        # included, which the castable-bool branch below would allow).
+        raise Error(
+            (
+                "Promotion for Float8 Types is not supported, attempted to"
+                " promote "
+            ),
+            scalar_type_name(a_dtype),
+            " and ",
+            scalar_type_name(b_dtype),
+        )
     if a_dtype == DType.bool and is_cast_dtype_on(b_dtype, b):
         return b_dtype
     if b_dtype == DType.bool and is_cast_dtype_on(a_dtype, a):

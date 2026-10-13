@@ -100,7 +100,9 @@ from tmb.backend.device import (
 )
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
+from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.ops.common import (
+    scalar_type_name,
     assert_no_internal_overlap,
     assert_no_overlap,
     assert_no_partial_overlap,
@@ -125,6 +127,7 @@ from tmb.ops.common import (
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import (
     _device_copy,
+    _host_copy,
     cast_for_copy,
     copy_between_devices,
     record_tensor_stream,
@@ -297,64 +300,14 @@ def _read_f64_at(ptr: Int, i: Int, dt: DType) raises -> Float64:
                 unsafe_offset=i
             ]
         )
+    if is_float8(dt):
+        return fp8_bits_to_f64(
+            dt,
+            Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=ptr)[
+                unsafe_offset=i
+            ],
+        )
     raise Error("unsupported dtype in a host round trip")
-
-
-def _write_f64_at(ptr: Int, i: Int, v: Float64, dt: DType) raises:
-    if dt == DType.float32:
-        Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = Float32(v)
-    elif dt == DType.bfloat16:
-        Pointer[BFloat16, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = BFloat16(v)
-    elif dt == DType.float16:
-        Pointer[Float16, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = Float16(v)
-    elif dt == DType.float64:
-        Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = v
-    elif dt == DType.int64:
-        Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = Int64(Int(v))
-    elif dt == DType.int32:
-        Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = Int32(Int(v))
-    elif dt == DType.int16:
-        Pointer[Int16, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = Int16(Int(v))
-    elif dt == DType.int8:
-        Pointer[Int8, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = Int8(Int(v))
-    elif dt == DType.uint8:
-        Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = UInt8(Int(v))
-    elif dt == DType.bool:
-        Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = UInt8(1) if v != 0.0 else UInt8(0)
-    elif dt == DType.uint16:
-        Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = UInt16(Int(v))
-    elif dt == DType.uint32:
-        Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = UInt32(Int(v))
-    elif dt == DType.uint64:
-        Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=ptr)[
-            unsafe_offset=i
-        ] = UInt64(Int(v))
-    else:
-        raise Error("unsupported dtype in a host round trip")
 
 
 # ---------------------------------------------------------------------------
@@ -628,23 +581,38 @@ def _upload_from_cpu(
             non_blocking,
         )
         _ = ctx
+    elif (
+        non_blocking
+        and is_cast_dtype_on(t.dtype, out)
+        and is_cast_dtype_on(max_dtype(stype), out)
+    ):
+        # Copy.cu: a non-blocking transfer converts on the GPU (the float ->
+        # e4m3fn conversion saturates there on sm_89+, see CastSpec).
+        var raw = own(new_tensor(t.shape, t.rank, t.stype, target_device))
+        var ctx3 = ctx_for(target_device)
+        copy_from_host(
+            target_device,
+            ctx3,
+            raw.t.ptr,
+            contiguous_cpu.t.ptr,
+            t.numel * t.itemsize,
+            False,
+        )
+        cast_into(out, raw.t)
+        _ = ctx3
+        _ = raw^  # alive past the launch
     else:
-        var dst_dtype = max_dtype(stype)
+        # A blocking transfer converts on the CPU, through CPU torch's own
+        # copy_ (exact for every dtype pair, float8 included).
         var casted = own(cpu_empty(t.shape, t.rank, stype))
-        for i in range(t.numel):
-            _write_f64_at(
-                casted.t.ptr,
-                i,
-                _read_f64_at(contiguous_cpu.t.ptr, i, t.dtype),
-                dst_dtype,
-            )
+        _host_copy(casted.t, contiguous_cpu.t)
         var ctx2 = ctx_for(target_device)
         copy_from_host(
             target_device,
             ctx2,
             out.ptr,
             casted.t.ptr,
-            t.numel * dtype_itemsize(dst_dtype),
+            casted.t.numel * casted.t.itemsize,
             non_blocking,
         )
         _ = ctx2
@@ -831,6 +799,30 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         _ = dense^
         var result = own(_relayout_owned(moved^, want))
         ret_owned(rets, 0, result)
+        return
+    if (
+        dev_type == DEVICE_TYPE_CPU
+        and stype != t.stype
+        and not non_blocking
+        and is_float8(max_dtype(stype))
+    ):
+        # Copy.cu: a blocking download converts on the CPU -- c10's float8
+        # conversion, which never saturates (the GPU one, taken for a
+        # non-blocking download below, does on sm_89+).
+        var raw = own(_to_copy_same_device(t, t.stype, want))
+        var host_raw = own(_download_to_cpu(raw.t))
+        _ = raw^
+        var flat_shape = IndexList[MAX_RANK](1)
+        flat_shape[MAX_RANK - 1] = t.numel
+        var flat_strides = IndexList[MAX_RANK](0)
+        flat_strides[MAX_RANK - 1] = 1
+        # Both dense in `want`'s order: convert them as flat buffers.
+        set_sizes_strides(host_raw.t, flat_shape, flat_strides, 1, 0)
+        var conv = own(cpu_empty(flat_shape, 1, stype))
+        _host_copy(conv.t, host_raw.t)
+        _ = host_raw^
+        set_sizes_strides(conv.t, t.shape, want, t.rank, 0)
+        ret_owned(rets, 0, conv)
         return
     # Downloads materialize the requested memory order before copying bytes.
     var staged = own(_to_copy_same_device(t, stype, want))
@@ -1255,33 +1247,7 @@ def _can_cast(src: DType, dst: DType) -> Bool:
 
 def _scalar_type_name(dt: DType) -> String:
     """How torch names a ScalarType in an error message."""
-    if dt == DType.float64:
-        return "Double"
-    if dt == DType.float32:
-        return "Float"
-    if dt == DType.float16:
-        return "Half"
-    if dt == DType.bfloat16:
-        return "BFloat16"
-    if dt == DType.int64:
-        return "Long"
-    if dt == DType.int32:
-        return "Int"
-    if dt == DType.int16:
-        return "Short"
-    if dt == DType.int8:
-        return "Char"
-    if dt == DType.uint8:
-        return "Byte"
-    if dt == DType.bool:
-        return "Bool"
-    if dt == DType.uint16:
-        return "UInt16"
-    if dt == DType.uint32:
-        return "UInt32"
-    if dt == DType.uint64:
-        return "UInt64"
-    return String(dt)
+    return scalar_type_name(dt)
 
 
 def _cat_out_batched(ins: List[T], dim: Int, out_t: T) raises -> Bool:
@@ -1854,24 +1820,46 @@ def _scatter_launch(
         op = "ScatterReduceDim"
     elif accumulate:
         op = "ScatterAddDim"
+    # float8 moves as its bytes: a uint8 scatter (scatter.src only).
+    var kdt = dest.dtype
+    var ksrc = src_dtype
+    var kvalue = value
+    var kint = int_value.copy()
+    if is_float8(dest.dtype):
+        if is_value or accumulate or rop >= 2 or identity:
+            # CUDA's scatter fill and reducing scatter kernels have no float8
+            # case; only the plain scatter.src copy (AT_FLOAT8_TYPES) does.
+            # Name the kernel CUDA's error names.
+            var kernel = String(
+                "cuda_scatter_fill_base_kernel_func"
+            ) if is_value else String("cuda_scatter_gather_base_kernel_func")
+            unsupported(
+                '"'
+                + kernel
+                + "\" not implemented for '"
+                + _scalar_type_name(dest.dtype)
+                + "'"
+            )
+        kdt = DType.uint8
+        ksrc = DType.uint8
     var call = KernelCall("data_movement", op)
-    call.arg_dtype(0, dest.dtype)
+    call.arg_dtype(0, kdt)
     call.arg_dtype(1, index.dtype)
-    call.arg_dtype(2, src_dtype)
-    call.out_dtype(dest.dtype)
+    call.arg_dtype(2, ksrc)
+    call.out_dtype(kdt)
     call.int(dest.ptr)
     call.int(index.ptr)
     call.int(src_ptr)
     call.tuple(params)
     call.int(flag.t.ptr)
     call.int(2 if identity else (1 if is_value else 0))
-    call.f64(value)
-    call.int(dtype_code(dest.dtype))
+    call.f64(kvalue)
+    call.int(dtype_code(kdt))
     call.int(ctx_ptr(ctx))
     call.int(rop)
     call.int(1 if ordered else 0)
-    call.int(1 if int_value else 0)
-    call.int(int_value.value() if int_value else 0)
+    call.int(1 if kint else 0)
+    call.int(kint.value() if kint else 0)
     call.run()
     var host_flag = own(cpu_empty(IndexList[MAX_RANK](1), 1, ST_INT32))
     copy_to_host(ctx, flag.t.ptr, host_flag.t.ptr, 4)
@@ -2047,9 +2035,22 @@ def _scatter_validate(
         raise Error(what, ": dim out of range")
     if src and src.value().dtype != a.dtype:
         raise Error(what, "(): Expected self.dtype to be equal to src.dtype")
-    if not _is_scatter_dtype(a.dtype):
+    if is_float8(a.dtype) and accumulate and index.numel > 0:
+        # (An empty index never reaches CUDA's dtype dispatch: an unchanged
+        # copy of self, as below.)
+        unsupported(
+            '"cuda_scatter_gather_base_kernel_func" not implemented for \''
+            + _scalar_type_name(a.dtype)
+            + "'"
+        )
+    # A float8 scatter (CUDA dispatches AT_FLOAT8_TYPES) is a byte move.
+    if not _is_scatter_dtype(a.dtype) and not is_float8(a.dtype):
         unsupported("aten::" + what + " of dtype " + String(a.dtype))
-    if accumulate and not _is_scatter_add_dtype(a.dtype):
+    if (
+        accumulate
+        and not _is_scatter_add_dtype(a.dtype)
+        and not is_float8(a.dtype)
+    ):
         unsupported(
             "aten::scatter_add of dtype "
             + String(a.dtype)
@@ -3142,7 +3143,10 @@ def op_index_put_impl_(
         unsupported(
             "_index_put_impl_: all tensors must be on the same mojo device"
         )
-    if not _is_scatter_dtype(target.dtype) or values.dtype != target.dtype:
+    var byte_move = is_float8(target.dtype) and not accumulate
+    if (
+        not _is_scatter_dtype(target.dtype) and not byte_move
+    ) or values.dtype != target.dtype:
         unsupported(
             "_index_put_impl_: requires matching supported source and"
             " destination dtypes"
@@ -3286,10 +3290,11 @@ def op_index_put_impl_(
     var call = KernelCall(
         "data_movement", "ScatterAddDim" if accumulate else "ScatterDim"
     )
-    call.arg_dtype(0, target.dtype)
+    var kdt = DType.uint8 if byte_move else target.dtype
+    call.arg_dtype(0, kdt)
     call.arg_dtype(1, index.dtype)
-    call.arg_dtype(2, values.dtype)
-    call.out_dtype(target.dtype)
+    call.arg_dtype(2, kdt)
+    call.out_dtype(kdt)
     call.int(target.ptr)
     call.int(index.ptr)
     call.int(values.ptr)
@@ -3297,7 +3302,7 @@ def op_index_put_impl_(
     call.int(0)
     call.int(0)
     call.f64(0.0)
-    call.int(dtype_code(target.dtype))
+    call.int(dtype_code(kdt))
     call.int(ctx_ptr(ctx))
     call.run()
     _ = ctx
@@ -3308,6 +3313,12 @@ def op_index_put_impl_(
 # aten::nonzero(Tensor self) -> Tensor
 def op_nonzero(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
+    if is_float8(t.dtype):
+        unsupported(
+            '"nonzero_cuda" not implemented for \''
+            + _scalar_type_name(t.dtype)
+            + "'"
+        )
     # A 0-d tensor has one element and no coordinates: ATen scans it like a
     # one-element tensor but reports the result as (n, 0), one empty
     # coordinate row per non-zero element.
