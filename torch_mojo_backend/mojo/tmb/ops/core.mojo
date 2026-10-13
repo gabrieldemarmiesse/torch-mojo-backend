@@ -94,6 +94,8 @@ from tmb.backend.device import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    assert_no_internal_overlap,
+    assert_no_partial_overlap,
     cx_unary_into,
     fill_complex,
     cast_complex,
@@ -440,6 +442,22 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
     fresh tensor. Each step re-enters copy_ with one bit fewer. (The
     Conjugate and Negative keys let `_copy_from` through with its bits for
     mojo tensors: shim_views.cpp.)"""
+    var bits = (
+        (dst.is_complex() and dst.is_conj())
+        or dst.is_neg()
+        or (input.is_complex() and input.is_conj())
+        or input.is_neg()
+    )
+    if not bits:
+        return False
+    if dst.on_mojo() and input.on_mojo() and dst.device == input.device:
+        # copy_'s TensorIterator checks, on the operands as given (before a
+        # bit is resolved into a fresh tensor that overlaps nothing)
+        if dst.h == input.h:
+            pass
+        else:
+            assert_no_internal_overlap(dst)
+            assert_no_partial_overlap(dst, input)
     if dst.is_complex() and dst.is_conj():
         _copy_through_toggled("aten::_conj", input, dst, non_blocking)
         return True

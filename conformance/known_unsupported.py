@@ -165,7 +165,7 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "gradient": ("complex64",),
     "histc": ("bfloat16", "float16"),
     "index_fill": ("complex64",),
-    "index_put": ("float32", "bfloat16", "float16", "int64", "bool", "complex64"),
+    "index_put": ("float32", "bfloat16", "float16", "int64", "bool"),
     "inner": ("complex64",),
     "isclose": ("complex64",),
     "isfinite": ("complex64",),

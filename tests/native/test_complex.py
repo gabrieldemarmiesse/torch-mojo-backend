@@ -617,3 +617,144 @@ def test_boolean_mask_assignment(mojo_gpu: str):
         d[u8.to(mojo_gpu)] = 2j  # ty: ignore[invalid-assignment]
         x[u8.bool()] = 2j  # ty: ignore[invalid-assignment]
     assert torch.equal(d.cpu(), x)
+
+
+# --- round-4 review fixes -------------------------------------------------------
+
+
+def test_in_place_logical_ops_never_resize_self(mojo_gpu: str):
+    x = torch.tensor([1j], device=mojo_gpu)
+    other = torch.tensor([1j, 0j], device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        x.logical_and_(other)
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        x.logical_or_(torch.tensor([1j, 0j, 1], device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        torch.logical_and(other, x, out=x)
+
+
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
+def test_unsigned_cpu_scalars(mojo_gpu: str, dtype: torch.dtype):
+    z = torch.tensor([256 + 0j, 70000 + 0j], device=mojo_gpu)
+    s = torch.tensor(256, dtype=dtype)
+    assert (z == s).cpu().tolist() == [True, False]
+    got = torch.where(torch.tensor([True, False], device=mojo_gpu), z, s)
+    assert got.cpu().tolist() == [256 + 0j, 256 + 0j]
+
+
+@pytest.mark.parametrize("dtype", CDTYPES)
+def test_index_add_multiplies_like_complex(mojo_gpu: str, dtype: torch.dtype):
+    _skip_c128(mojo_gpu, dtype)
+    src = torch.tensor([complex(float("inf"), 2)], dtype=dtype)
+    idx = torch.tensor([0])
+    for kw in ({}, {"alpha": 2}):
+        got = torch.zeros(1, dtype=dtype, device=mojo_gpu).index_add(
+            0, idx.to(mojo_gpu), src.to(mojo_gpu), **kw
+        )
+        # CUDA: self + alpha * source, a complex multiply even for alpha=1
+        assert got.cpu()[0].real.item() == float("inf")
+        assert got.cpu()[0].imag.isnan()
+    x = _rand(2, dtype=dtype)
+    s = _rand(2, dtype=dtype)
+    i2 = torch.tensor([0, 1])
+    _close(
+        x.to(mojo_gpu).index_add(0, i2.to(mojo_gpu), s.to(mojo_gpu), alpha=1 - 2j),
+        x.index_add(0, i2, s, alpha=1 - 2j),
+    )
+
+
+def test_outs_check_overlap_with_the_original_operands(mojo_gpu: str):
+    z = torch.tensor([1j, 0j, 2 + 0j], device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.logical_not(z, out=z.view(torch.float32)[1:4])
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.masked_select(
+            z, torch.tensor([True, False, True], device=mojo_gpu), out=z[:2]
+        )
+    w = torch.tensor([1j, 2j, 3j, 4j], device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        w[:3].copy_(w[1:].conj())
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        w[:3].copy_(torch._neg_view(w[1:]))
+
+
+def test_masked_fill_out_needs_the_exact_dtype(mojo_gpu: str):
+    x = torch.tensor([1j, 2j], device=mojo_gpu)
+    m = torch.tensor([True, False], device=mojo_gpu)
+    out = torch.empty(2, dtype=torch.complex128, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        torch.ops.aten.masked_fill.Scalar_out(x, m, 3.0, out=out)
+
+
+def test_cat_of_real_inputs_into_a_complex_out(mojo_gpu: str):
+    out = torch.empty(1, dtype=torch.complex128, device=mojo_gpu)
+    torch.cat([torch.tensor([16777217], device=mojo_gpu)], out=out)
+    assert out.cpu().real.item() == 16777217
+    out = torch.empty(2, dtype=torch.complex64, device=mojo_gpu)
+    torch.cat(
+        [torch.tensor([1.5], device=mojo_gpu), torch.tensor([2.0], device=mojo_gpu)],
+        out=out,
+    )
+    assert out.cpu().tolist() == [1.5 + 0j, 2 + 0j]
+    # (CUDA raises ValueError; this device can only raise RuntimeError)
+    with pytest.raises((RuntimeError, ValueError), match="non-empty list"):
+        torch.cat([], out=out)
+
+
+def test_index_put_general(mojo_gpu: str):
+    x = _rand(3, 4)
+    d = x.to(mojo_gpu)
+    i = torch.tensor([0, 2])
+    # a CPU scalar value and CPU indices
+    d.index_put_((i.to(mojo_gpu),), torch.tensor(1j))
+    x.index_put_((i,), torch.tensor(1j))
+    assert torch.equal(d.cpu(), x)
+    d[torch.tensor([1])] = 2j  # ty: ignore[invalid-assignment]
+    x[torch.tensor([1])] = 2j  # ty: ignore[invalid-assignment]
+    assert torch.equal(d.cpu(), x)
+    # a non-leading index, a 2-d index, a column mask
+    c = torch.tensor([1, 3])
+    d[:, c.to(mojo_gpu)] = 2j  # ty: ignore[invalid-assignment]
+    x[:, c] = 2j  # ty: ignore[invalid-assignment]
+    assert torch.equal(d.cpu(), x)
+    i2 = torch.tensor([[0, 1], [2, 3]])
+    v = torch.arange(12.0).reshape(3, 2, 2).to(torch.complex64)
+    d[:, i2.to(mojo_gpu)] = v.to(mojo_gpu)
+    x[:, i2] = v
+    assert torch.equal(d.cpu(), x)
+    cm = torch.tensor([True, False, True, False])
+    d[:, cm.to(mojo_gpu)] = 5j  # ty: ignore[invalid-assignment]
+    x[:, cm] = 5j  # ty: ignore[invalid-assignment]
+    assert torch.equal(d.cpu(), x)
+    # rank 5, a middle index; a transposed (non-contiguous) self
+    y = _rand(2, 3, 2, 2, 2)
+    e = y.to(mojo_gpu)
+    e[:, :, torch.tensor([1], device=mojo_gpu)] = 9j  # ty: ignore[invalid-assignment]
+    y[:, :, torch.tensor([1])] = 9j  # ty: ignore[invalid-assignment]
+    assert torch.equal(e.cpu(), y)
+    t = _rand(4, 3)
+    f = t.to(mojo_gpu).t()
+    f[torch.tensor([0, 2], device=mojo_gpu)] = 7j  # ty: ignore[invalid-assignment]
+    tt = t.t()
+    tt[torch.tensor([0, 2])] = 7j  # ty: ignore[invalid-assignment]
+    assert torch.equal(f.cpu(), tt)
+    # accumulate with duplicates
+    a = torch.zeros(3, dtype=torch.complex64)
+    g = a.to(mojo_gpu)
+    k = torch.tensor([1, 1, 2])
+    g.index_put_(
+        (k.to(mojo_gpu),), torch.tensor(1 + 1j, device=mojo_gpu), accumulate=True
+    )
+    a.index_put_((k,), torch.tensor(1 + 1j), accumulate=True)
+    assert torch.equal(g.cpu(), a)
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        d[:, c.to(mojo_gpu)] = torch.ones(3, dtype=torch.complex64, device=mojo_gpu)
+
+
+def test_index_put_on_an_expanded_self(mojo_gpu: str):
+    # deprecated, but CUDA writes the shared row: every row reads 7j
+    x = torch.zeros(1, 4, dtype=torch.complex64, device=mojo_gpu).expand(3, 4)
+    x.index_put_(
+        (torch.tensor([1], device=mojo_gpu),), torch.tensor(7j, device=mojo_gpu)
+    )
+    assert torch.equal(x.cpu(), torch.full((3, 4), 7j))

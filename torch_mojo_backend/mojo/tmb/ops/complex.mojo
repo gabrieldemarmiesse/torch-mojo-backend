@@ -393,15 +393,10 @@ def _store_ew[
     _store_ew_n(args, n_in, dest, res^, rets)
 
 
-def _store_ew_n(
-    args: Values, n_in: Int, mut dest: T, var res: Owned, rets: Values
-) raises:
-    """`_store` for an elementwise op (a TensorIterator in ATen): the out's
-    device, then its memory-overlap checks against itself and against each
-    of the first `n_in` arguments that is a tensor -- made on the out as
-    given, before it is resized, as TensorIterator's compute_mem_overlaps
-    is -- then the cast check, resize and copy."""
-    _same_device(dest, res.t)
+def _ew_overlaps(args: Values, n_in: Int, dest: T) raises:
+    """TensorIterator's compute_mem_overlaps on the out as given: no
+    internal overlap, no partial overlap with any of the first `n_in`
+    arguments that is a tensor (the ORIGINAL ones, before any conversion)."""
     assert_no_internal_overlap(dest)
     for i in range(n_in):
         var v = args[unsafe_offset=i].copy()
@@ -409,6 +404,43 @@ def _store_ew_n(
             var t = v_tensor_c(v)
             if t.on_mojo() and t.device == dest.device:
                 assert_no_partial_overlap(dest, t)
+
+
+def _is_same(a: T, b: T) -> Bool:
+    """Whether two records are the same tensor (TensorBase::is_same: one
+    storage element for element, same geometry and dtype)."""
+    if a.h == b.h:
+        return True
+    if a.ptr != b.ptr or a.stype != b.stype or not a.same_shape(b):
+        return False
+    for d in range(a.rank):
+        if a.stride(d) != b.stride(d):
+            return False
+    return True
+
+
+def _store_ew_n(
+    args: Values, n_in: Int, mut dest: T, var res: Owned, rets: Values
+) raises:
+    """`_store` for an elementwise op (a TensorIterator in ATen): the out's
+    device, then its memory-overlap checks against itself and against each
+    of the first `n_in` arguments that is a tensor -- made on the out as
+    given, before it is resized, as TensorIterator's compute_mem_overlaps
+    is -- then the cast check, resize and copy. An out that IS one of the
+    inputs (an in-place op, or out= aliasing an input) is never resized."""
+    _same_device(dest, res.t)
+    _ew_overlaps(args, n_in, dest)
+    if not dest.same_shape(res.t):
+        for i in range(n_in):
+            var v = args[unsafe_offset=i].copy()
+            if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+                if _is_same(dest, v_tensor_c(v)):
+                    raise Error(
+                        "output with shape ",
+                        shape_str(dest),
+                        " doesn't match the broadcast shape ",
+                        shape_str(res.t),
+                    )
     _store(dest, res^, rets)
 
 
@@ -575,6 +607,29 @@ def _host_value(t: T) raises -> Tuple[Float64, Float64]:
             Float64(Pointer[Int8, MutUntrackedOrigin](unsafe_from_address=p)[]),
             0.0,
         )
+    if dt == DType.uint16:
+        return (
+            Float64(
+                Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=p)[]
+            ),
+            0.0,
+        )
+    if dt == DType.uint32:
+        return (
+            Float64(
+                Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=p)[]
+            ),
+            0.0,
+        )
+    if dt == DType.uint64:
+        return (
+            Float64(
+                Pointer[UInt64, MutUntrackedOrigin](unsafe_from_address=p)[]
+            ),
+            0.0,
+        )
+    if dt != DType.uint8 and dt != DType.bool:
+        unsupported("a CPU scalar of dtype " + dtype_name(t.stype))
     var b = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=p)[]
     return (Float64(b), 0.0)
 
@@ -1053,6 +1108,19 @@ def _list_has_complex(v: Value) -> Bool:
     return False
 
 
+def routed_list_out[
+    real_op: OpFn, complex_op: OpFn, out_idx: Int
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`routed_list` that also takes the complex route for a complex out
+    (cat of real inputs into a complex out converts each input to it)."""
+    if _list_has_complex(args[unsafe_offset=0]) or v_is_complex(
+        args[unsafe_offset=out_idx]
+    ):
+        complex_op(args, n_args, rets, n_rets)
+        return
+    real_op(args, n_args, rets, n_rets)
+
+
 def routed_list[
     real_op: OpFn, complex_op: OpFn
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -1306,12 +1374,13 @@ def cx_index_put_impl_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     """_index_put_impl_(self, Tensor?[] indices, Tensor values, bool
-    accumulate, bool unsafe) with ONE leading index (an integer tensor, or a
-    bool / byte mask over the leading dims, turned into its nonzero
-    positions as ATen does), the values of self's own dtype. Self is
-    collapsed to [leading, rest] (a contiguous working copy when it is not
-    contiguous), so the real op sees at most a rank-3 real view whatever
-    self's rank."""
+    accumulate, bool unsafe) of a complex self, any indices the real op
+    takes. The indices pick STORAGE positions: a real int64 tensor of self's
+    geometry holding each element's storage offset (arange over the span
+    self covers, as_strided like self) is indexed with them, then the real
+    index_put_ writes view_as_real of the span at those positions -- so an
+    expanded self writes where CUDA does (its rows share the elements) and
+    no working copy of self is ever made."""
     var self = v_tensor_c(args[unsafe_offset=0])
     var values = v_tensor_c(args[unsafe_offset=2])
     _check_index_count(self, args[unsafe_offset=1])
@@ -1325,17 +1394,44 @@ def cx_index_put_impl_(
             _st_name(values.stype),
             " for the source.",
         )
+    if self.rank == 0:
+        index_error("too many indices for tensor of dimension 0")
+    # a 0-d CPU value is a scalar (copied over); any other must be here
+    var vals: Owned
+    if values.on_cpu() and values.rank == 0:
+        var hv = _host_value(values)
+        vals = own(new_tensor(values.shape, 0, values.stype, self.device))
+        fill_complex(
+            vals.t, Value(TAG_COMPLEX, 0, f64_bits(hv[0]), f64_bits(hv[1]))
+        )
+    else:
+        _require_same_device(values, self.device, "values")
+        vals = own(values.copy())
+        vals.live = False
+    # the one advanced index (a run of present entries: an integer
+    # tensor, or a bool / byte mask over as many dims), at dim `p`
     var present = v_opt_tensor_list_present(args[unsafe_offset=1])
     var given = v_tensor_list_c(args[unsafe_offset=1])
-    if len(given) != 1 or not present[0] or self.rank == 0:
-        unsupported("complex index_put_ with other than one leading index")
+    if len(given) == 0:
+        unsupported("complex index_put_ without an advanced index")
+    var p = -1
+    var gi = 0
     var index = given[0].copy()
-    _require_same_device(values, self.device, "values")
+    var n_present = 0
+    for i in range(len(present)):
+        if present[i]:
+            n_present += 1
+            if p < 0:
+                p = i
+                index = given[gi].copy()
+            gi += 1
+    if n_present != 1:
+        unsupported("complex index_put_ with other than one advanced index")
     var mask = index.stype == ST_BOOL or index.stype == ST_UINT8
-    var lead_dims = index.rank if mask else 1
+    var m = index.rank if mask else 1
     if mask:
         for d in range(index.rank):
-            if index.dim(d) != self.dim(d):
+            if index.dim(d) != self.dim(p + d):
                 index_error(
                     "The shape of the mask "
                     + shape_str(index)
@@ -1344,74 +1440,178 @@ def cx_index_put_impl_(
                     + " does not match the shape of the indexed tensor "
                     + shape_str(self)
                     + " at index "
-                    + String(d)
+                    + String(p + d)
                 )
-    elif index.rank != 1:
-        unsupported("complex index_put_ with a multi-dimensional index")
-    var lead = 1
-    for d in range(lead_dims):
-        lead *= self.dim(d)
-    var rest = List[Int]()
-    var tail = 1
-    for d in range(lead_dims, self.rank):
-        rest.append(self.dim(d))
-        tail *= self.dim(d)
-    # the integer positions
+    var dev_index = own(index.copy())
+    dev_index.live = False
+    if not index.on_mojo():
+        # CPU indices are allowed (index_put_ moves them), as on CUDA
+        dev_index = own(
+            new_tensor(index.shape, index.rank, index.stype, self.device)
+        )
+        var cp = _Call("aten::copy_")
+        cp.t(dev_index.t)
+        cp.t(index)
+        cp.b(False)
+        _ = cp.run(1)
+    elif index.device != self.device:
+        _require_same_device(index, self.device, "indices")
+    index = dev_index.t.copy()
+    # the storage span self covers, and each element's offset in it
+    var span = 1
+    for d in range(self.rank):
+        span += (self.dim(d) - 1) * self.stride(d)
+    if self.numel == 0:
+        span = 0
+    var span_shape = IndexList[MAX_RANK](1)
+    span_shape[MAX_RANK - 1] = span
+    var offs = own(new_tensor(span_shape, 1, ST_INT64, self.device))
+    var sizes = List[Int]()
+    var strides = List[Int]()
+    for d in range(self.rank):
+        sizes.append(self.dim(d))
+        strides.append(self.stride(d))
+    var flat1 = List[Int]()
+    flat1.append(span)
+    var one = List[Int]()
+    one.append(1)
+    var ar = _Call("aten::arange", "start_out")
+    ar.v(Value(TAG_SCALAR_INT, 0, 0, 0))
+    ar.v(Value(TAG_SCALAR_INT, 0, Int64(span), 0))
+    ar.v(Value(TAG_SCALAR_INT, 0, 1, 0))
+    ar.t(offs.t)
+    _ = ar.run(1)
+    var geo = _Call("aten::as_strided")
+    geo.t(offs.t)
+    geo.ints(sizes)
+    geo.ints(strides)
+    geo.i(0)
+    var like = geo.one()
+    # the indexed dims moved to the front, densely, the mask dims as one
+    var src = List[Int]()
+    var dst = List[Int]()
+    for j in range(m):
+        src.append(p + j)
+        dst.append(j)
+    var mv = _Call("aten::movedim", "intlist")
+    mv.t(like.t)
+    mv.ints(src)
+    mv.ints(dst)
+    var moved = mv.one()
+    var lead = own_if_new(contiguous(moved.t), moved.t)
+    var lshape = List[Int]()
+    var lead_n = 1
+    for j in range(m):
+        lead_n *= self.dim(p + j)
+    lshape.append(lead_n)
+    for d in range(self.rank):
+        if d < p or d >= p + m:
+            lshape.append(self.dim(d))
+    var lr = _Call("aten::reshape")
+    lr.t(lead.t)
+    lr.ints(lshape)
+    var leadf = lr.one()
     var pos: Owned
     if mask:
-        var flat_shape = List[Int]()
-        flat_shape.append(-1)
+        var minus1 = List[Int]()
+        minus1.append(-1)
         var rm = _Call("aten::reshape")
         rm.t(index)
-        rm.ints(flat_shape)
-        var flat = rm.one()
+        rm.ints(minus1)
+        var fm = rm.one()
         var nz = _Call("aten::nonzero")
-        nz.t(flat.t)
+        nz.t(fm.t)
         var nzr = nz.one()
-        _ = flat^
+        _ = fm^
         var rp = _Call("aten::reshape")
         rp.t(nzr.t)
-        rp.ints(flat_shape)
+        rp.ints(minus1)
         pos = rp.one()
         _ = nzr^
     else:
         pos = own(index.copy())
         pos.live = False
-    var k = pos.t.numel
-    # the values, broadcast to [k, rest...] and laid out as [k, tail]
-    var vshape = List[Int]()
-    vshape.append(k)
-    for e in rest:
-        vshape.append(e)
-    var ex = _Call("aten::expand")
-    ex.t(values)
-    ex.ints(vshape)
-    ex.b(False)
-    var vexp = ex.one()
-    var vdense = own_if_new(contiguous(vexp.t), vexp.t)
-    var two = List[Int]()
-    two.append(k)
-    two.append(tail)
-    var vr = _Call("aten::reshape")
-    vr.t(vdense.t)
-    vr.ints(two)
-    var v2 = vr.one()
-    # self as [lead, tail], a working copy when not contiguous
-    var work = own_if_new(contiguous(self), self)
-    var tshape = List[Int]()
-    tshape.append(lead)
-    tshape.append(tail)
-    var tv = _Call("aten::view")
-    tv.t(work.t)
-    tv.ints(tshape)
-    var t2 = tv.one()
-    var rt = as_real(t2.t)
-    var rv = as_real(v2.t)
     var idx_list = List[T]()
     idx_list.append(pos.t.copy())
+    var ix = _Call("aten::index", "Tensor")
+    ix.t(leadf.t)
+    _tensor_list_arg(ix, idx_list)
+    ix.vals[len(ix.vals) - 1].tag = TAG_OPT_TENSOR_LIST
+    var sel = ix.one()
+    _ = leadf^
+    _ = lead^
+    _ = moved^
+    _ = like^
+    _ = offs^
+    # the indexing result's shape in torch's order: self's dims before p,
+    # the index's, the dims after the indexed ones
+    var nb = pos.t.rank
+    var rshape = List[Int]()
+    for d in range(p):
+        rshape.append(self.dim(d))
+    for j in range(nb):
+        rshape.append(pos.t.dim(j))
+    for d in range(p + m, self.rank):
+        rshape.append(self.dim(d))
+    var rr = len(rshape)
+    var vr = vals.t.rank
+    var ok = vr <= rr
+    if ok:
+        for i in range(vr):
+            var vd = vals.t.dim(vr - 1 - i)
+            if vd != 1 and vd != rshape[rr - 1 - i]:
+                ok = False
+    if not ok:
+        var rs = String("[")
+        for i in range(rr):
+            rs += String(rshape[i]) + (", " if i + 1 < rr else "")
+        raise Error(
+            "shape mismatch: value tensor of shape ",
+            shape_str(vals.t),
+            " cannot be broadcast to indexing result of shape ",
+            rs + "]",
+        )
+    var ex = _Call("aten::expand")
+    ex.t(vals.t)
+    ex.ints(rshape)
+    ex.b(False)
+    var vexp = ex.one()
+    # the index's dims to the front, as the selection has them
+    var vsrc = List[Int]()
+    var vdst = List[Int]()
+    for j in range(nb):
+        vsrc.append(p + j)
+        vdst.append(j)
+    var vm = _Call("aten::movedim", "intlist")
+    vm.t(vexp.t)
+    vm.ints(vsrc)
+    vm.ints(vdst)
+    var vmoved = vm.one()
+    var vdense = own_if_new(contiguous(vmoved.t), vmoved.t)
+    var k = List[Int]()
+    k.append(sel.t.numel)
+    var vf = _Call("aten::reshape")
+    vf.t(vdense.t)
+    vf.ints(k)
+    var v1 = vf.one()
+    var sf = _Call("aten::reshape")
+    sf.t(sel.t)
+    sf.ints(k)
+    var pos1 = sf.one()
+    # self's span as a 1-d complex view, then its real view
+    var sv = _Call("aten::as_strided")
+    sv.t(self)
+    sv.ints(flat1)
+    sv.ints(one)
+    sv.i(self.offset)
+    var flat = sv.one()
+    var rt = as_real(flat.t)
+    var rv = as_real(v1.t)
+    var idx2 = List[T]()
+    idx2.append(pos1.t.copy())
     var c = _Call("aten::_index_put_impl_")
     c.t(rt.t)
-    _tensor_list_arg(c, idx_list)
+    _tensor_list_arg(c, idx2)
     c.vals[len(c.vals) - 1].tag = TAG_OPT_TENSOR_LIST
     c.t(rv.t)
     c.v(args[unsafe_offset=3])
@@ -1419,14 +1619,16 @@ def cx_index_put_impl_(
     _ = c.run(1)
     _ = rt^
     _ = rv^
-    _ = t2^
-    _ = v2^
+    _ = flat^
+    _ = v1^
+    _ = pos^
+    _ = pos1^
+    _ = vmoved^
+    _ = sel^
     _ = vdense^
     _ = vexp^
-    _ = pos^
-    if work.live:
-        copy_strided_into(self, work.t)
-    _ = work^
+    _ = vals^
+    _ = dev_index^
     ret_ref(rets, 0, self)
 
 
@@ -1472,6 +1674,9 @@ def cx_via_bool[
     var out_idx = n_args - 1
     comptime is_out = overload.endswith("out")
     comptime if is_out:
+        # the overlap checks see the original operands, not the bool
+        # stand-ins the real op gets
+        _ew_overlaps(args, k, v_tensor_c(args[unsafe_offset=out_idx]))
         cx_out = v_is_complex(args[unsafe_offset=out_idx])
         if cx_out and (op == "any" or op == "all"):
             raise Error(
@@ -1672,7 +1877,9 @@ def cx_masked_fill_out(
 ) raises:
     """masked_fill.Scalar_out / .Tensor_out(self, mask, value, *, out)"""
     var dest = v_tensor_c(args[unsafe_offset=3])
-    _store_ew[2](args, dest, _masked_fill(args), rets)
+    var res = _masked_fill(args)
+    _exact_dtype(dest, res.t.stype)  # the generated out= wrapper's check
+    _store_ew[2](args, dest, res^, rets)
 
 
 def cx_masked_fill_(
@@ -1812,37 +2019,72 @@ def cx_masked_select_out(
         raise Error(
             "masked_select(): self and result must have the same scalar type"
         )
+    # masked_select_out_cuda: on the out as given
+    assert_no_internal_overlap(dest)
+    assert_no_overlap(dest, v_tensor_c(args[unsafe_offset=0]))
+    var mask = v_tensor_c(args[unsafe_offset=1])
+    if mask.on_mojo() and mask.device == dest.device:
+        assert_no_overlap(dest, mask)
     _store(dest, _masked_select(args), rets)
+
+
+def _scaled(x: T, a_re: Float64, a_im: Float64) raises -> Owned:
+    """x * (a_re + a_im i) as c10::complex's operator* computes it, one real
+    op per product: (xr ar - xi ai) + (xr ai + xi ar) i -- an infinite part
+    times a zero gives NaN even for alpha = 1, as CUDA's index_add."""
+    var parts = List[Owned]()
+    for which in range(2):
+        var xr = _part(x, 0)
+        var xi = _part(x, 1)
+        var m1 = _Call("aten::mul", "Scalar")
+        m1.t(xr.t)
+        m1.s(a_re if which == 0 else a_im)
+        var p1 = m1.one()
+        var m2 = _Call("aten::mul", "Scalar")
+        m2.t(xi.t)
+        m2.s(a_im if which == 0 else a_re)
+        var p2 = m2.one()
+        var c = _Call("aten::sub" if which == 0 else "aten::add", "Tensor")
+        c.t(p1.t)
+        c.t(p2.t)
+        c.s(1.0)
+        parts.append(c.one())
+        _ = p1^
+        _ = p2^
+        _ = xr^
+        _ = xi^
+    return _from_parts(parts[0].t, parts[1].t, x.stype)
 
 
 def _index_into(op: StaticString, target: T, args: Values, n_args: Int) raises:
     """index_add_ / index_copy_ (self, dim, index, source[, alpha]) into a
     complex `target` (self or a copy of it), one call per part (real /
-    imaginary views of their own shapes): add and copy are per part."""
+    imaginary views of their own shapes). index_add adds alpha * source
+    with a complex multiply first (CUDA multiplies even for alpha = 1)."""
     var source = v_tensor_c(args[unsafe_offset=3])
     var index = v_tensor_c(args[unsafe_offset=2])
     _require_same_device(index, target.device, "index")
     _require_same_device(source, target.device, "source")
     _ = _wrap_dim(Int(args[unsafe_offset=1].a), target.rank)
-    var alpha = 1.0
+    var src = own(source.copy())
+    src.live = False
     if n_args > 4:
         var al = v_complex(args[unsafe_offset=4])
-        if al[1] != 0.0:
-            unsupported("index_add with a complex alpha")
-        alpha = al[0]
+        src = _scaled(source, al[0], al[1])
     for which in range(2):
         var tp = _part(target, which)
-        var sp = _part(source, which)
+        var sp = _part(src.t, which)
         var c = _Call(op)
         c.t(tp.t)
         c.v(args[unsafe_offset=1])
         c.t(index)
         c.t(sp.t)
         if n_args > 4:
-            c.s(alpha)
+            c.s(1.0)
         _ = c.run(1)
         _ = sp^
         _ = tp^
+    _ = src^
 
 
 def _index_func(op: StaticString, args: Values, n_args: Int) raises -> Owned:

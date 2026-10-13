@@ -152,6 +152,7 @@ from tmb.ops.complex import (
     cx_via_bool,
     routed,
     routed_list,
+    routed_list_out,
 )
 from tmb.ops.core import (
     _device_copy,
@@ -3918,7 +3919,7 @@ def register_data_movement(site: Site) raises:
     impl[op_clone, "clone"](site)
     impl[op_to_copy, "_to_copy"](site)
     impl[routed_list[op_cat, cx_cat], "cat"](site)
-    impl[routed_list[op_cat_out, cx_cat_out], "cat.out"](site)
+    impl[routed_list_out[op_cat_out, cx_cat_out, 2], "cat.out"](site)
     impl[routed_list[op_stack, cx_stack], "stack"](site)
     impl[routed[op_repeat, cx_repeat, 1], "repeat"](site)
     impl[routed[op_tril, cx_tril, 1], "tril"](site)
