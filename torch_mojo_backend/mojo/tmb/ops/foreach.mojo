@@ -380,9 +380,9 @@ comptime FOREACH_OVERLOADS: List[ForeachOverload] = [
     _binary("_foreach_add.ScalarList", "_foreach_add_.ScalarList", "add", S_SCALARLIST, "aten::add", "Scalar", "aten::add_", "Scalar", D_ALL, alpha=True),
     _binary("_foreach_add.List", "_foreach_add_.List", "add", S_LIST, "aten::add", "Tensor", "aten::add_", "Tensor", D_ALL, alpha=True),
     _binary("_foreach_add.Tensor", "_foreach_add_.Tensor", "add", S_TENSOR, "aten::add", "Tensor", "aten::add_", "Tensor", D_ALL, alpha=True),
-    _binary("_foreach_sub.Scalar", "_foreach_sub_.Scalar", "sub", S_SCALAR, "aten::sub", "Scalar", "aten::sub_", "Scalar", D_INT, alpha=True),
-    _binary("_foreach_sub.ScalarList", "_foreach_sub_.ScalarList", "sub", S_SCALARLIST, "aten::sub", "Scalar", "aten::sub_", "Scalar", D_INT, alpha=True),
-    _binary("_foreach_sub.List", "_foreach_sub_.List", "sub", S_LIST, "aten::sub", "Tensor", "aten::sub_", "Tensor", D_INT, alpha=True),
+    _binary("_foreach_sub.Scalar", "_foreach_sub_.Scalar", "sub", S_SCALAR, "aten::sub", "Scalar", "aten::sub_", "Scalar", D_ALL, alpha=True),
+    _binary("_foreach_sub.ScalarList", "_foreach_sub_.ScalarList", "sub", S_SCALARLIST, "aten::sub", "Scalar", "aten::sub_", "Scalar", D_ALL, alpha=True),
+    _binary("_foreach_sub.List", "_foreach_sub_.List", "sub", S_LIST, "aten::sub", "Tensor", "aten::sub_", "Tensor", D_ALL, alpha=True),
     _binary("_foreach_mul.Scalar", "_foreach_mul_.Scalar", "mul", S_SCALAR, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL, apple=True),
     _binary("_foreach_mul.ScalarList", "_foreach_mul_.ScalarList", "mul", S_SCALARLIST, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL),
     _binary("_foreach_mul.List", "_foreach_mul_.List", "mul", S_LIST, "aten::mul", "Tensor", "aten::mul_", "Tensor", D_ALL),
@@ -409,6 +409,11 @@ comptime FOREACH_OVERLOADS: List[ForeachOverload] = [
     _binary("_foreach_pow.Scalar", "_foreach_pow_.Scalar", "pow", S_SCALAR, "aten::pow", "Tensor_Scalar", "aten::pow_", "Scalar", D_FLOAT),
     _binary("_foreach_pow.ScalarList", "_foreach_pow_.ScalarList", "pow", S_SCALARLIST, "aten::pow", "Tensor_Scalar", "aten::pow_", "Scalar", D_FLOAT),
     _binary("_foreach_pow.List", "_foreach_pow_.List", "pow", S_LIST, "aten::pow", "Tensor_Tensor", "aten::pow_", "Tensor", D_FLOAT),
+    # An integer exponent list promotes, as result_type and CPU torch say;
+    # stock CUDA truncates the base instead (ForeachBinaryOpScalar.cu:184
+    # takes its fast route without looking at the scalar, :47 converts it
+    # with `scalar.to<opmath_t>()`): _foreach_pow(1.5, [int [1, 2]]) is
+    # int64 [1, 1] there, float32 [1.5, 2.25] here.
     _binary("_foreach_pow.ScalarAndTensor", "", "rpow", S_RPOW, "aten::pow", "Scalar", "", "", D_FLOAT),
     # pointwise: ForeachPointwiseOp.cu (floating lists only).
     _binary("", "_foreach_addcmul_.Scalar", "addcmul", S_PW_SCALAR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT, apple=True),
@@ -775,13 +780,6 @@ def _fast_route(
     if (s == S_LIST or s == S_TENSOR) and e.alpha:
         if not _scalar_keeps_dtype(p.alpha, dt):
             return False
-    if e.kind == "sub":
-        # sub_check: a bool operand raises, which the per-tensor sub does.
-        if v_scalar_is_bool(p.scalar) or v_scalar_is_bool(p.alpha):
-            return False
-        for v in p.scalars:
-            if v_scalar_is_bool(v):
-                return False
     if s == S_TENSOR:
         ref other = p.other[0]
         if other.dtype != dt:
@@ -933,6 +931,23 @@ def _per_tensor(
     ret_tensor_list(rets, 0, result)
 
 
+def _sub_check(t: T, v: Value) raises:
+    """BinaryOps.h's `sub_check(self, scalar)`: no bool on either side."""
+    var bool_self = t.dtype == DType.bool
+    var bool_scalar = v_scalar_is_bool(v)
+    if bool_self and bool_scalar:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if bool_self or bool_scalar:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+
+
 def _scalar_twin(e: ForeachOverload) -> ForeachOverload:
     """The `.Scalar` overload a `.Tensor` row (mul, div) runs when its
     operand is a CPU tensor: ForeachBinaryOpScalarTensor.cu calls
@@ -984,6 +999,17 @@ def _foreach(
             _per_tensor(scalar_row, inplace, p, rets)
         return
     p.check(e)
+    if e.kind == "sub":
+        # ForeachBinaryOpScalar{,List}.cu check before anything runs: the
+        # Scalar overload the first tensor, the ScalarList one every pair.
+        # The List overload checks nothing up front: a bool pair on the
+        # fast route (bool alpha) computes, any other raises in the
+        # per-tensor sub, as on CUDA.
+        if e.shape == S_SCALAR:
+            _sub_check(p.lists[0][0], p.scalar)
+        elif e.shape == S_SCALARLIST:
+            for i in range(len(p.lists[0])):
+                _sub_check(p.lists[0][i], p.scalars[i])
     if e.shape == S_TENSOR:
         ref other = p.other[0]
         if other.rank != 0 or other.numel != 1:

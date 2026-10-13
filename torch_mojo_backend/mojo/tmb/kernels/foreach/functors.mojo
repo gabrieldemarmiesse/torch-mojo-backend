@@ -11,8 +11,9 @@ copy of them:
   * the unary kinds are `unary_math.elementwise_unary` -- `_foreach_exp` and
     `exp` share one definition of exp, with its half-precision rounding point
     (unary ops get the raw dtype vector: that function does its own widening);
-  * maximum / minimum (clamp_min / clamp_max), lerp and pow are
-    `pointwise_math.pointwise` and `pow_math.torch_pow`;
+  * lerp and pow are `pointwise_math.pointwise` and `pow_math.torch_pow`;
+  * maximum / minimum (clamp_min / clamp_max) are ForeachMinMaxFunctors.cuh's
+    own select, which differs from the per-tensor ops on signed zeros;
   * addcmul / addcdiv are `pointwise_math.pointwise_op_impl`, the port of
     DeviceAddCmulCdiv.cuh that CUDA's per-tensor and foreach kernels share;
   * add / sub / mul / div are single opmath instructions (an fma for an
@@ -23,6 +24,8 @@ are already in opmath, whatever they came from (a second / third list, a
 host Scalar, a 0-d device tensor); `alpha` is the opmath scalar parameter
 (add / sub's alpha, addcmul's value), 1 where the overload has none.
 """
+
+from std.utils.numerics import isnan
 
 from tmb.kernels.common.pointwise_math import (
     param_dtype,
@@ -167,11 +170,21 @@ def foreach_math[
         elif kind == "div":
             r = x / b
         elif kind == "maximum" or kind == "minimum":
-            # ForeachMinMaxFunctors.cuh's maximum / minimum: NaN propagating,
-            # what clamp_min / clamp_max compute per tensor.
-            r = pointwise[kind, op, op, n](
-                x, b, b, SIMD[param_dtype[op](), 4](0)
-            )
+            # ForeachMinMaxFunctors.cuh, not the per-tensor clamp: `(isnan(a)
+            # || a > b) ? a : b` (`<` for minimum), so a NaN on either side
+            # propagates and equal operands -- +0 and -0 -- give b, the
+            # Scalar or the other list's element (measured on stock CUDA).
+            # The NaN tests are spelled out: the GPU build's fast-math flags
+            # may fold a comparison with NaN either way.
+            var pick_a: SIMD[DType.bool, n]
+            comptime if kind == "maximum":
+                pick_a = x.gt(b)
+            else:
+                pick_a = x.lt(b)
+            r = pick_a.select(x, b)
+            comptime if op.is_floating_point():
+                r = isnan(b).select(b, r)
+                r = isnan(x).select(x, r)
         elif kind == "pow":
             r = _pow(x, b)
         elif kind == "rpow":
