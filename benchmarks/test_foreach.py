@@ -33,6 +33,7 @@ COVERS: dict[str, str] = {
     "aten::_amp_update_scale_": "test_amp_update_scale_",
     "aten::_foreach_copy_": "test_foreach_copy_cast",
     "aten::_foreach_add_.Scalar": "test_foreach_add_",
+    "aten::_foreach_div_.ScalarList": "test_foreach_div_",
     "aten::_foreach_addcmul_.Scalar": "test_foreach_addcmul_",
     "aten::_foreach_lerp_.Scalar": "test_foreach_lerp_",
     "aten::_foreach_mul_.Scalar": "test_foreach_mul_scalar",
@@ -68,7 +69,17 @@ _UNARY = (
     " log log10 log1p log2 neg reciprocal round rsqrt sigmoid sign sin sinh"
     " sqrt tan tanh trunc"
 ).split()
-_BINARY: dict[str, tuple[str, ...]] = {}
+_BINARY = {
+    "add": ("Scalar", "ScalarList", "List", "Tensor"),
+    "sub": ("Scalar", "ScalarList", "List"),
+    "mul": ("Scalar", "ScalarList", "List", "Tensor"),
+    "div": ("Scalar", "ScalarList", "List", "Tensor"),
+    "clamp_max": ("Scalar", "ScalarList", "List"),
+    "clamp_min": ("Scalar", "ScalarList", "List"),
+    "maximum": ("Scalar", "ScalarList", "List"),
+    "minimum": ("Scalar", "ScalarList", "List"),
+    "pow": ("Scalar", "ScalarList", "List"),
+}
 _TERNARY: dict[str, tuple[str, ...]] = {}
 
 
@@ -119,7 +130,7 @@ def _overload_names() -> list[str]:
     for op, overloads in (_BINARY | _TERNARY).items():
         for overload in overloads:
             names += [f"_foreach_{op}.{overload}", f"_foreach_{op}_.{overload}"]
-
+    names += ["_foreach_pow.ScalarAndTensor"]
     measured = {"_foreach_sqrt"} | {name.removeprefix("aten::") for name in COVERS}
     return [name for name in names if name not in measured]
 

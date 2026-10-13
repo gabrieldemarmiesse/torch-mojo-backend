@@ -29,6 +29,7 @@ from tmb.kernels.common.pointwise_math import (
     pointwise,
     pointwise_op_impl,
 )
+from tmb.kernels.common.pow_math import torch_pow
 from tmb.kernels.common.unary_math import elementwise_unary
 
 
@@ -72,7 +73,13 @@ comptime FOREACH_UNARY_KINDS = [
 comptime FOREACH_OTHER_KINDS = [
     "zero",
     "add",
+    "sub",
     "mul",
+    "div",
+    "maximum",
+    "minimum",
+    "pow",
+    "rpow",
     "addcmul",
     "addcdiv",
     "lerp",
@@ -109,6 +116,24 @@ def foreach_opmath[dtype: DType]() -> DType:
 
 
 @always_inline
+def _pow[w: DType, n: Int](a: SIMD[w, n], b: SIMD[w, n]) -> SIMD[w, n]:
+    """`pow_math.torch_pow` (Pow.cuh's `pow_` in opmath) for the two opmath
+    floats; the foreach pow overloads take floating lists only."""
+    comptime if w == DType.float32:
+        comptime f = DType.float32
+        return rebind[SIMD[w, n]](
+            torch_pow(rebind[SIMD[f, n]](a), rebind[SIMD[f, n]](b))
+        )
+    elif w == DType.float64:
+        comptime f = DType.float64
+        return rebind[SIMD[w, n]](
+            torch_pow(rebind[SIMD[f, n]](a), rebind[SIMD[f, n]](b))
+        )
+    else:
+        comptime assert False, "foreach pow takes floating lists"
+
+
+@always_inline
 def foreach_math[
     kind: StaticString, dtype: DType, n: Int
 ](
@@ -132,8 +157,26 @@ def foreach_math[
                 r = SIMD[op, n](alpha).fma(b, x)
             else:
                 r = x + alpha * b
+        elif kind == "sub":
+            comptime if op.is_floating_point():
+                r = SIMD[op, n](-alpha).fma(b, x)
+            else:
+                r = x - alpha * b
         elif kind == "mul" or kind == "nonfinite_unscale":
             r = x * b
+        elif kind == "div":
+            r = x / b
+        elif kind == "maximum" or kind == "minimum":
+            # ForeachMinMaxFunctors.cuh's maximum / minimum: NaN propagating,
+            # what clamp_min / clamp_max compute per tensor.
+            r = pointwise[kind, op, op, n](
+                x, b, b, SIMD[param_dtype[op](), 4](0)
+            )
+        elif kind == "pow":
+            r = _pow(x, b)
+        elif kind == "rpow":
+            # reverse_power_functor: the Scalar base `b` to each element.
+            r = _pow(b, x)
         elif kind == "addcmul":
             r = pointwise_op_impl[True](x, b, c, alpha)
         elif kind == "addcdiv":
