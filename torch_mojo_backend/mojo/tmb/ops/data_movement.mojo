@@ -488,7 +488,12 @@ def op_clone(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # Query through the tensor accessor: dispatching is_neg itself would
     # re-enter Negative's clone fallback. Negate only the fresh output.
     if external_call["tmb_tensor_is_neg", Int32](t.h) != 0:
-        _ = call_op("aten::neg_", "", [tensor_arg(out.t)], 1)
+        if t.is_complex():
+            # the complex neg kernel itself: aten::neg_ of a complex tensor
+            # is the arithmetic's (not on this device without it)
+            cx_unary_into("neg", out.t, out.t)
+        else:
+            _ = call_op("aten::neg_", "", [tensor_arg(out.t)], 1)
     ret_owned(rets, 0, out)
 
 
@@ -779,7 +784,12 @@ def _to_copy_complex(t: T, stype: Int32, args: Values, rets: Values) raises:
 def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor_c(args[unsafe_offset=0])
     var stype = v_dtype_or(args[unsafe_offset=1], t.stype)
-    if stype != t.stype and (t.is_complex() or is_complex_stype(stype)):
+    if (
+        stype != t.stype
+        and (t.is_complex() or is_complex_stype(stype))
+        and (t.on_mojo() or t.on_cpu())
+    ):
+        # (another backend's tensor converts on its own device, below)
         _to_copy_complex(t, stype, args, rets)
         return
     var layout = args[unsafe_offset=2].copy()

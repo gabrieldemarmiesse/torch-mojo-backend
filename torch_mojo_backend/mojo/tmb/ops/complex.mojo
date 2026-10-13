@@ -109,6 +109,8 @@ from tmb.ops.common import (
     fill_complex,
     promote_types,
     resize_out,
+    resized_geometry,
+    assert_no_overlap,
     shape_str,
     assert_no_internal_overlap,
     assert_no_partial_overlap,
@@ -293,15 +295,19 @@ def _check_cast(result: Int32, dest: Int32) raises:
 
 
 def _store(mut dest: T, var res: Owned, rets: Values) raises:
-    """A fresh result into a caller's `out=` (or an in-place `self`): resized
-    and copied, converting when the dtypes differ (after TensorIterator's
+    """A fresh result into a caller's `out=` (or an in-place `self`):
+    `resize_output` first, then the internal-overlap check on the resized
+    out (an expanded out of the wrong shape is resized, not refused), then
+    the copy, converting when the dtypes differ (after TensorIterator's
     cast check)."""
     _same_device(dest, res.t)
+    resize_out(dest, res.t.shape, res.t.rank)
+    assert_no_internal_overlap(dest)
     if dest.stype == res.t.stype:
-        store_out(dest, res.take())
+        copy_strided_into(dest, res.t)
+        _ = res^
     else:
         _check_cast(res.t.stype, dest.stype)
-        resize_out(dest, res.t.shape, res.t.rank)
         var c = _Call("aten::copy_")
         c.t(dest)
         c.t(res.t)
@@ -309,6 +315,32 @@ def _store(mut dest: T, var res: Owned, rets: Values) raises:
         _ = c.run(1)
         _ = res^
     ret_ref(rets, 0, dest)
+
+
+def _exact_dtype(dest: T, st: Int32) raises:
+    """An `out=` that must already hold the result's dtype (structured
+    kernels' resize_out: no cast)."""
+    if dest.stype != st:
+        raise Error(
+            "Expected out tensor to have dtype ",
+            dtype_name(st),
+            ", but got ",
+            dtype_name(dest.stype),
+            " instead",
+        )
+
+
+def _require_same_device(t: T, device: Int, what: StaticString) raises:
+    """ATen's device check of an input against the op's device."""
+    if not t.on_mojo() or t.device != device:
+        raise Error(
+            "Expected all tensors to be on the same device, but got ",
+            what,
+            " is on ",
+            device_str(t),
+            ", different from other tensors on mojo:",
+            device,
+        )
 
 
 def _real_out(
@@ -369,6 +401,7 @@ def _store_ew_n(
     of the first `n_in` arguments that is a tensor -- made on the out as
     given, before it is resized, as TensorIterator's compute_mem_overlaps
     is -- then the cast check, resize and copy."""
+    _same_device(dest, res.t)
     assert_no_internal_overlap(dest)
     for i in range(n_in):
         var v = args[unsafe_offset=i].copy()
@@ -376,15 +409,6 @@ def _store_ew_n(
             var t = v_tensor_c(v)
             if t.on_mojo() and t.device == dest.device:
                 assert_no_partial_overlap(dest, t)
-    _store(dest, res^, rets)
-
-
-def _store_red(mut dest: T, var res: Owned, rets: Values) raises:
-    """`_store` for a reduction's `out=` (its dtype already checked):
-    `resize_output` first -- an expanded out of the wrong shape is resized,
-    not refused -- then the copy."""
-    _same_device(dest, res.t)
-    resize_out(dest, res.t.shape, res.t.rank)
     _store(dest, res^, rets)
 
 
@@ -572,7 +596,16 @@ def _operand(v: Value, like: T) raises -> _Operand:
                     st = default_dtype()
                 return _Operand(like, hv[0], hv[1], st, _RANK_WRAPPED)
             return _Operand(like, hv[0], hv[1], t.stype, _RANK_ZERO)
-        unsupported("an operand that is neither a mojo tensor nor a scalar")
+        raise Error(
+            (
+                "Expected all tensors to be on the same device, but found at"
+                " least two devices, "
+            ),
+            device_str(like),
+            " and ",
+            device_str(t),
+            "!",
+        )
     if v.tag == TAG_COMPLEX:
         return _Operand(
             like,
@@ -712,11 +745,9 @@ def _one_device(a: _Operand, b: _Operand) raises -> Int:
     return a.t.device if a.is_t else b.t.device
 
 
-def _binary(
-    kind: StaticString, av: Value, bv: Value, alpha: Value
-) raises -> Owned:
-    """`kind(a, b)` (add / sub / mul / div / pow, or eq / ne) where one side is
-    complex: promoted, broadcast, one launch. `alpha` scales `b` (add, sub)."""
+def _binary(kind: StaticString, av: Value, bv: Value) raises -> Owned:
+    """`kind(a, b)` (eq / ne) where one side is complex: promoted to the
+    common complex dtype, broadcast, one launch of the complex family."""
     var like = _first_tensor(av, bv)
     var a = _operand(av, like)
     var b = _operand(bv, like)
@@ -727,36 +758,9 @@ def _binary(
     var geo = _bshape(a, b)
     var fa = _flatten(a, st, geo[0], geo[1])
     var fb = _flatten(b, st, geo[0], geo[1])
-    var cmp = kind == "eq" or kind == "ne"
-    var out_st = ST_BOOL if cmp else st
-    var out = own(new_tensor(geo[0], geo[1], out_st, device))
-    var component = DType.float32 if st == ST_COMPLEX64 else DType.float64
-    # add / sub: CUDA's a + alpha * b (sub is add with -alpha: a Scalar's
-    # negation, so a real alpha keeps a +0 imaginary part)
-    var p_re = 1.0
-    var p_im = 0.0
-    if alpha.tag != TAG_NONE:
-        var al = v_complex(alpha)
-        p_re = al[0]
-        p_im = al[1]
-    var launch_kind = kind
-    if kind == "div" and fb.mode == CX_HOST:
-        # div_true_kernel_cuda: a CPU-scalar divisor becomes a multiply by
-        # its reciprocal, computed once on the host (1 / (0 + 0i) is
-        # inf + NaN i, so x / 0j is NaN, as on CUDA)
-        var inv = _host_reciprocal[DType.float32](
-            fb.re, fb.im
-        ) if st == ST_COMPLEX64 else _host_reciprocal[DType.float64](
-            fb.re, fb.im
-        )
-        fb = _Flat(CX_HOST, 0, inv[0], inv[1])
-        launch_kind = "mul"
-    if kind == "sub":
-        launch_kind = "add"
-        p_re = -p_re
-        p_im = -p_im if alpha.tag == TAG_COMPLEX else 0.0
+    var out = own(new_tensor(geo[0], geo[1], ST_BOOL, device))
     cx_launch(
-        launch_kind,
+        kind,
         out.t.ptr,
         fa.addr,
         fb.addr,
@@ -767,10 +771,8 @@ def _binary(
         fb.re,
         fb.im,
         out.t.numel,
-        component,
+        DType.float32 if st == ST_COMPLEX64 else DType.float64,
         device,
-        p_re,
-        p_im,
     )
     _ = a^
     _ = b^
@@ -781,45 +783,6 @@ def _ret(rets: Values, var o: Owned):
     ret_owned(rets, 0, o)
 
 
-def _host_reciprocal[
-    dt: DType
-](re: Float64, im: Float64) -> Tuple[Float64, Float64]:
-    """`opmath_t(1) / b` as CUDA's div_true_kernel computes it on the HOST
-    for a CPU-scalar divisor: c10::complex's scaled division in the
-    component precision (gcc's std::abs)."""
-    var c = Scalar[dt](re)
-    var d = Scalar[dt](im)
-    var one = Scalar[dt](1)
-    var zero = Scalar[dt](0)
-    var abs_c = abs(c)
-    var abs_d = abs(d)
-    if abs_c >= abs_d:
-        if abs_c == zero and abs_d == zero:
-            return (Float64(one / abs_c), Float64(zero / abs_d))
-        var rat = d / c
-        var scl = one / (c + d * rat)
-        return (Float64(scl), Float64((zero - rat) * scl))
-    var rat = c / d
-    var scl = one / (d + c * rat)
-    return (Float64(rat * scl), Float64(-scl))
-
-
-def _no_alpha() -> Value:
-    return Value(TAG_NONE, 0, 0, 0)
-
-
-def _inplace(args: Values, mut self: T, var res: Owned, rets: Values) raises:
-    """`self op= other`: the broadcast result must keep self's shape."""
-    if not res.t.same_shape(self):
-        raise Error(
-            "output with shape ",
-            shape_str(self),
-            " doesn't match the broadcast shape ",
-            shape_str(res.t),
-        )
-    _store_ew[2](args, self, res^, rets)
-
-
 # eq / ne --------------------------------------------------------------------
 
 
@@ -827,9 +790,7 @@ def cx_eq(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """eq.Tensor / eq.Scalar(self, other)"""
     _ret(
         rets,
-        _binary(
-            "eq", args[unsafe_offset=0], args[unsafe_offset=1], _no_alpha()
-        ),
+        _binary("eq", args[unsafe_offset=0], args[unsafe_offset=1]),
     )
 
 
@@ -847,9 +808,7 @@ def cx_eq_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _store_ew[2](
         args,
         dest,
-        _binary(
-            "eq", args[unsafe_offset=0], args[unsafe_offset=1], _no_alpha()
-        ),
+        _binary("eq", args[unsafe_offset=0], args[unsafe_offset=1]),
         rets,
     )
 
@@ -857,9 +816,7 @@ def cx_eq_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def cx_ne(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _ret(
         rets,
-        _binary(
-            "ne", args[unsafe_offset=0], args[unsafe_offset=1], _no_alpha()
-        ),
+        _binary("ne", args[unsafe_offset=0], args[unsafe_offset=1]),
     )
 
 
@@ -877,9 +834,7 @@ def cx_ne_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _store_ew[2](
         args,
         dest,
-        _binary(
-            "ne", args[unsafe_offset=0], args[unsafe_offset=1], _no_alpha()
-        ),
+        _binary("ne", args[unsafe_offset=0], args[unsafe_offset=1]),
         rets,
     )
 
@@ -920,13 +875,6 @@ def _unary(kind: StaticString, to: Int, x: T) raises -> Owned:
     )
     _ = dense^
     return out^
-
-
-def cx_unary[
-    kind: StaticString, to: Int
-](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    """`op(self)` of a complex self."""
-    _ret(rets, _unary(kind, to, v_tensor_c(args[unsafe_offset=0])))
 
 
 def cx_unary_out[
@@ -1020,15 +968,29 @@ def _tensor_list_arg(mut c: _Call, ts: List[T]):
     c.vals.append(Value(TAG_TENSOR_LIST, Int32(len(ts)), Int64(addr), 0))
 
 
-def _cat(args: Values, stack: Bool) raises -> Owned:
-    """cat / stack of tensors where one is complex: every input converted to
-    the common complex dtype, the real op on their real views (the pair dim
-    trails, so a non-negative dim is the same dim), viewed back. cat skips
-    the legacy empty 1-D tensors, as ATen does (their real view, [0, 2],
-    would no longer be one)."""
+def _cat(args: Values, stack: Bool, out_st: Int32 = -1) raises -> Owned:
+    """cat / stack of tensors where one is complex: every input converted
+    straight to the result dtype (the out's for cat.out, else the common
+    one -- no detour through a narrower complex type), the real op on their
+    real views (the pair dim trails, so a non-negative dim is the same dim),
+    viewed back. cat skips the legacy empty 1-D tensors, as ATen does."""
     var all_ts = v_tensor_list_c(args[unsafe_offset=0])
     var dim = Int(args[unsafe_offset=1].a)
+    if len(all_ts) == 0:
+        raise Error("torch.cat(): expected a non-empty list of Tensors")
+    var device = all_ts[0].device
+    for i in range(len(all_ts)):
+        _require_same_device(all_ts[i], device, "tensors")
+        if not stack and all_ts[i].rank == 0:
+            raise Error(
+                "zero-dimensional tensor (at position ",
+                i,
+                ") cannot be concatenated",
+            )
     var st = _common_complex(all_ts)
+    if out_st >= 0 and is_complex_stype(out_st):
+        _check_cast(st, out_st)
+        st = out_st
     var ts = List[T]()
     for t in all_ts:
         if stack or not (t.rank == 1 and t.numel == 0):
@@ -1037,7 +999,7 @@ def _cat(args: Values, stack: Bool) raises -> Owned:
         # only legacy empties: an empty result of the common dtype
         var shape = IndexList[MAX_RANK](1)
         shape[MAX_RANK - 1] = 0
-        return own(new_tensor(shape, 1, st, all_ts[0].device))
+        return own(new_tensor(shape, 1, st, device))
     var rank = 0
     for t in ts:
         rank = max(rank, t.rank)
@@ -1059,9 +1021,16 @@ def cx_cat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def cx_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    """cat.out(Tensor[] tensors, int dim=0, *, out)"""
+    """cat.out(Tensor[] tensors, int dim=0, *, out): resize, then the out
+    may not overlap itself or any input (TensorShape.cpp's cat meta)."""
     var dest = v_tensor_c(args[unsafe_offset=2])
-    _store(dest, _cat(args, False), rets)
+    var res = _cat(args, False, dest.stype)
+    _same_device(dest, res.t)
+    var geo = resized_geometry(dest, res.t.shape, res.t.rank)
+    assert_no_internal_overlap(geo)
+    for t in v_tensor_list_c(args[unsafe_offset=0]):
+        assert_no_overlap(geo, t)
+    _store(dest, res^, rets)
 
 
 def cx_stack(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -1166,6 +1135,7 @@ def _dim_args(
 
 def _index_select(args: Values) raises -> Owned:
     var x = v_tensor_c(args[unsafe_offset=0])
+    _require_same_device(v_tensor_c(args[unsafe_offset=2]), x.device, "index")
     if x.rank > 0:
         return _dim_args("aten::index_select", "", args, 1)
     # A 0-d self: its real view's only dim is the pair. Select from it as a
@@ -1205,7 +1175,22 @@ def cx_index_select(
 def cx_index_select_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    """index_select.out(self, dim, index, *, out): the out's exact dtype,
+    and on the out as given (Indexing.cu checks before resizing): no
+    internal overlap, no overlap with self or the index."""
     var dest = v_tensor_c(args[unsafe_offset=3])
+    var x = v_tensor_c(args[unsafe_offset=0])
+    if dest.stype != x.stype:
+        raise Error(
+            "expected scalar type ",
+            _st_name(dest.stype),
+            " but found ",
+            _st_name(x.stype),
+        )
+    _same_device(dest, x)
+    assert_no_internal_overlap(dest)
+    assert_no_overlap(dest, x)
+    assert_no_overlap(dest, v_tensor_c(args[unsafe_offset=2]))
     _store(dest, _index_select(args), rets)
 
 
@@ -1221,6 +1206,14 @@ def cx_flip(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """flip(self, int[] dims)"""
     var x = v_tensor_c(args[unsafe_offset=0])
     var dims = _int_list_dims(args[unsafe_offset=1], x.rank)
+    for i in range(len(dims)):
+        for j in range(i):
+            if dims[i] == dims[j]:
+                raise Error(
+                    "dim ",
+                    dims[i],
+                    " appears multiple times in the list of dims",
+                )
     if x.rank == 0:
         # a 0-d tensor's only "dim" is itself: the real view's would be the
         # pair, which a flip must never reach
@@ -1313,8 +1306,12 @@ def cx_index_put_impl_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     """_index_put_impl_(self, Tensor?[] indices, Tensor values, bool
-    accumulate, bool unsafe): on the real views of self and of the values
-    (of self's own dtype, as torch requires)."""
+    accumulate, bool unsafe) with ONE leading index (an integer tensor, or a
+    bool / byte mask over the leading dims, turned into its nonzero
+    positions as ATen does), the values of self's own dtype. Self is
+    collapsed to [leading, rest] (a contiguous working copy when it is not
+    contiguous), so the real op sees at most a rank-3 real view whatever
+    self's rank."""
     var self = v_tensor_c(args[unsafe_offset=0])
     var values = v_tensor_c(args[unsafe_offset=2])
     _check_index_count(self, args[unsafe_offset=1])
@@ -1328,19 +1325,108 @@ def cx_index_put_impl_(
             _st_name(values.stype),
             " for the source.",
         )
-    var vals = own_if_new(contiguous(values), values)
-    var rself = as_real(self)
-    var rvals = as_real(vals.t)
+    var present = v_opt_tensor_list_present(args[unsafe_offset=1])
+    var given = v_tensor_list_c(args[unsafe_offset=1])
+    if len(given) != 1 or not present[0] or self.rank == 0:
+        unsupported("complex index_put_ with other than one leading index")
+    var index = given[0].copy()
+    _require_same_device(values, self.device, "values")
+    var mask = index.stype == ST_BOOL or index.stype == ST_UINT8
+    var lead_dims = index.rank if mask else 1
+    if mask:
+        for d in range(index.rank):
+            if index.dim(d) != self.dim(d):
+                index_error(
+                    "The shape of the mask "
+                    + shape_str(index)
+                    + " at index "
+                    + String(d)
+                    + " does not match the shape of the indexed tensor "
+                    + shape_str(self)
+                    + " at index "
+                    + String(d)
+                )
+    elif index.rank != 1:
+        unsupported("complex index_put_ with a multi-dimensional index")
+    var lead = 1
+    for d in range(lead_dims):
+        lead *= self.dim(d)
+    var rest = List[Int]()
+    var tail = 1
+    for d in range(lead_dims, self.rank):
+        rest.append(self.dim(d))
+        tail *= self.dim(d)
+    # the integer positions
+    var pos: Owned
+    if mask:
+        var flat_shape = List[Int]()
+        flat_shape.append(-1)
+        var rm = _Call("aten::reshape")
+        rm.t(index)
+        rm.ints(flat_shape)
+        var flat = rm.one()
+        var nz = _Call("aten::nonzero")
+        nz.t(flat.t)
+        var nzr = nz.one()
+        _ = flat^
+        var rp = _Call("aten::reshape")
+        rp.t(nzr.t)
+        rp.ints(flat_shape)
+        pos = rp.one()
+        _ = nzr^
+    else:
+        pos = own(index.copy())
+        pos.live = False
+    var k = pos.t.numel
+    # the values, broadcast to [k, rest...] and laid out as [k, tail]
+    var vshape = List[Int]()
+    vshape.append(k)
+    for e in rest:
+        vshape.append(e)
+    var ex = _Call("aten::expand")
+    ex.t(values)
+    ex.ints(vshape)
+    ex.b(False)
+    var vexp = ex.one()
+    var vdense = own_if_new(contiguous(vexp.t), vexp.t)
+    var two = List[Int]()
+    two.append(k)
+    two.append(tail)
+    var vr = _Call("aten::reshape")
+    vr.t(vdense.t)
+    vr.ints(two)
+    var v2 = vr.one()
+    # self as [lead, tail], a working copy when not contiguous
+    var work = own_if_new(contiguous(self), self)
+    var tshape = List[Int]()
+    tshape.append(lead)
+    tshape.append(tail)
+    var tv = _Call("aten::view")
+    tv.t(work.t)
+    tv.ints(tshape)
+    var t2 = tv.one()
+    var rt = as_real(t2.t)
+    var rv = as_real(v2.t)
+    var idx_list = List[T]()
+    idx_list.append(pos.t.copy())
     var c = _Call("aten::_index_put_impl_")
-    c.t(rself.t)
-    c.v(args[unsafe_offset=1])
-    c.t(rvals.t)
+    c.t(rt.t)
+    _tensor_list_arg(c, idx_list)
+    c.vals[len(c.vals) - 1].tag = TAG_OPT_TENSOR_LIST
+    c.t(rv.t)
     c.v(args[unsafe_offset=3])
     c.v(args[unsafe_offset=4])
     _ = c.run(1)
-    _ = rvals^
-    _ = rself^
-    _ = vals^
+    _ = rt^
+    _ = rv^
+    _ = t2^
+    _ = v2^
+    _ = vdense^
+    _ = vexp^
+    _ = pos^
+    if work.live:
+        copy_strided_into(self, work.t)
+    _ = work^
     ret_ref(rets, 0, self)
 
 
@@ -1377,12 +1463,32 @@ def cx_via_bool[
     """`op` with each complex tensor among the first `k` arguments replaced
     by its truth (`re != 0 or im != 0`, torch's complex-to-bool): the
     logical ops, any / all, nonzero and count_nonzero see nothing else of a
-    complex value."""
+    complex value. An `out=` overload (the out is the last argument) with a complex out: the logical ops compute into a bool out
+    and cast into it (the in-place forms reach here so); any / all require
+    a bool result, as ATen."""
     var keep = List[Owned]()
     var vals = List[Value]()
+    var cx_out = False
+    var out_idx = n_args - 1
+    comptime is_out = overload.endswith("out")
+    comptime if is_out:
+        cx_out = v_is_complex(args[unsafe_offset=out_idx])
+        if cx_out and (op == "any" or op == "all"):
+            raise Error(
+                op,
+                " only supports bool tensor for result, got: ",
+                _st_name(v_tensor_c(args[unsafe_offset=out_idx]).stype),
+            )
     for i in range(n_args):
         var v = args[unsafe_offset=i].copy()
-        if (
+        if cx_out and i == out_idx:
+            var d = v_tensor_c(v)
+            var tmp = own(
+                new_tensor(IndexList[MAX_RANK](1), 1, ST_BOOL, d.device)
+            )
+            vals.append(Value(TAG_TENSOR, 0, Int64(tmp.t.h), 0))
+            keep.append(tmp^)
+        elif (
             i < k
             and (v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF)
             and v_is_complex(v)
@@ -1393,6 +1499,11 @@ def cx_via_bool[
         else:
             vals.append(v^)
     var r = call_op(String("aten::") + op, overload, vals^, n_rets)
+    if cx_out:
+        var dest = v_tensor_c(args[unsafe_offset=out_idx])
+        _store_ew_n(args, k, dest, own(r.take_tensor(0)), rets)
+        _ = keep^
+        return
     for i in range(n_rets):
         var rec = r[i]
         if rec.tag == TAG_TENSOR or rec.tag == TAG_TENSOR_REF:
@@ -1410,9 +1521,7 @@ def cx_equal(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not a.same_shape(b):
         rets[unsafe_offset=0] = Value(TAG_BOOL, 0, 0, 0)
         return
-    var eq = _binary(
-        "eq", args[unsafe_offset=0], args[unsafe_offset=1], _no_alpha()
-    )
+    var eq = _binary("eq", args[unsafe_offset=0], args[unsafe_offset=1])
     var c = _Call("aten::all")
     c.t(eq.t)
     var every = c.one()
@@ -1433,6 +1542,7 @@ def _device_complex(v: Value, st: Int32, like: T) raises -> Owned:
     if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
         var t = v_tensor_c(v)
         if t.on_mojo():
+            _require_same_device(t, like.device, "self")
             return own_if_new(cast_complex(t, st), t)
     var op = _operand(v, like)
     var one = own(new_tensor(IndexList[MAX_RANK](1), 0, st, like.device))
@@ -1442,36 +1552,35 @@ def _device_complex(v: Value, st: Int32, like: T) raises -> Owned:
 
 def _where(args: Values) raises -> Owned:
     """where.self(condition, self, other) with a complex self or other: both
-    sides in the common complex dtype, `where` over their real views with
-    the condition broadcast along the pair dim."""
+    sides in the common complex dtype, then `where` on each part (real /
+    imaginary views, the tensors' own shapes: no pair dim to exceed a
+    kernel's rank limit). The device is the condition's when self and other
+    are both host scalars."""
     var cond = v_tensor_c(args[unsafe_offset=0])
-    var like = _first_tensor(args[unsafe_offset=1], args[unsafe_offset=2])
+    var like: T
+    if cond.on_mojo():
+        like = cond.copy()
+    else:
+        like = _first_tensor(args[unsafe_offset=1], args[unsafe_offset=2])
     var a = _operand(args[unsafe_offset=1], like)
     var b = _operand(args[unsafe_offset=2], like)
     var st = _result_type(a, b)
     var ta = _device_complex(args[unsafe_offset=1], st, like)
     var tb = _device_complex(args[unsafe_offset=2], st, like)
-    var ra = as_real(ta.t)
-    var rb = as_real(tb.t)
-    var u = _Call("aten::unsqueeze")
-    u.t(cond)
-    u.i(-1)
-    var cu = u.one()
-    var w = _Call("aten::where", "self")
-    w.t(cu.t)
-    w.t(ra.t)
-    w.t(rb.t)
-    var r = w.one()
-    _ = cu^
-    _ = ra^
-    _ = rb^
+    var parts = List[Owned]()
+    for which in range(2):
+        var pa = _part(ta.t, which)
+        var pb = _part(tb.t, which)
+        var w = _Call("aten::where", "self")
+        w.t(cond)
+        w.t(pa.t)
+        w.t(pb.t)
+        parts.append(w.one())
+        _ = pa^
+        _ = pb^
     _ = ta^
     _ = tb^
-    var dense = own_if_new(contiguous(r.t), r.t)
-    var cv = as_complex(dense.t)
-    _ = dense^
-    _ = r^
-    return cv^
+    return _from_parts(parts[0].t, parts[1].t, st)
 
 
 def cx_where(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -1482,7 +1591,15 @@ def cx_where(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def cx_where_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """where.self_out(condition, self, other, *, out)"""
     var dest = v_tensor_c(args[unsafe_offset=3])
-    _store_ew[3](args, dest, _where(args), rets)
+    var res = _where(args)
+    if dest.stype != res.t.stype:  # where_self_out: no cast into the out
+        raise Error(
+            "Expected out type to be ",
+            _st_name(res.t.stype),
+            " but got ",
+            _st_name(dest.stype),
+        )
+    _store_ew[3](args, dest, res^, rets)
 
 
 def _masked_fill_into(target: T, mask: Value, value: Value) raises:
@@ -1588,65 +1705,47 @@ def cx_fill(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def _pair_index(index: T) raises -> Owned:
-    """An index for the real view: `index.unsqueeze(-1).expand(..., 2)`
-    (gather / scatter read the trailing coordinate from the position)."""
-    var u = _Call("aten::unsqueeze")
-    u.t(index)
-    u.i(-1)
-    var un = u.one()
-    var shape = index.logical_shape()
-    shape.append(2)
-    var e = _Call("aten::expand")
-    e.t(un.t)
-    e.ints(shape)
-    e.b(False)
-    var ex = e.one()
-    _ = un^
-    return ex^
+def _part(t: T, which: Int) raises -> Owned:
+    """The real (0) or imaginary (1) part of a complex tensor as a strided
+    real VIEW of it (`view_as_real(t)[..., which]`): writable, of t's own
+    shape, so an op on it never meets the real view's extra pair dim (rank
+    limits, 0-d tensors)."""
+    var rv = as_real(t)
+    var c = _Call("aten::select", "int")
+    c.t(rv.t)
+    c.i(-1)
+    c.i(which)
+    var r = c.one()
+    _ = rv^
+    return r^
+
+
+def _from_parts(re: T, im: T, st: Int32) raises -> Owned:
+    """A fresh complex tensor of dtype `st` from its real and imaginary
+    parts (same shape, `st`'s component dtype)."""
+    var out = own(new_tensor(re.shape, re.rank, st, re.device))
+    copy_strided_into(out.t.component(0), re)
+    copy_strided_into(out.t.component(1), im)
+    return out^
 
 
 def _gather(args: Values) raises -> Owned:
+    """gather on each part (strided real views of the tensor's own shape)."""
     var x = v_tensor_c(args[unsafe_offset=0])
     var index = v_tensor_c(args[unsafe_offset=2])
-    var dim = _wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
-    var one = IndexList[MAX_RANK](1)
-    var zero = IndexList[MAX_RANK](0)
-    # A 0-d self or index: gathered as one-element vectors (the real view's
-    # only dim would be the pair), a 0-d index's result viewed back as 0-d.
-    var x1 = own(
-        view_strided(x, one, zero, 1, x.offset)
-    ) if x.rank == 0 else own(x.copy())
-    if x.rank != 0:
-        x1.live = False
-    var i1 = own(
-        view_strided(index, one, zero, 1, index.offset)
-    ) if index.rank == 0 else own(index.copy())
-    if index.rank != 0:
-        i1.live = False
-    var rv = as_real(x1.t)
-    var pi = _pair_index(i1.t)
-    var c = _Call("aten::gather")
-    c.t(rv.t)
-    c.i(dim)
-    c.t(pi.t)
-    c.v(args[unsafe_offset=3])
-    var r = c.one()
-    _ = rv^
-    _ = pi^
-    _ = x1^
-    _ = i1^
-    var dense = own_if_new(contiguous(r.t), r.t)
-    var cv = as_complex(dense.t)
-    _ = dense^
-    _ = r^
-    if index.rank == 0:
-        var shaped = own(
-            view_strided(cv.t, IndexList[MAX_RANK](1), zero, 0, cv.t.offset)
-        )
-        _ = cv^
-        return shaped^
-    return cv^
+    _require_same_device(index, x.device, "index")
+    _ = _wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
+    var parts = List[Owned]()
+    for which in range(2):
+        var p = _part(x, which)
+        var c = _Call("aten::gather")
+        c.t(p.t)
+        c.v(args[unsafe_offset=1])
+        c.t(index)
+        c.v(args[unsafe_offset=3])
+        parts.append(c.one())
+        _ = p^
+    return _from_parts(parts[0].t, parts[1].t, x.stype)
 
 
 def cx_gather(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -1655,9 +1754,19 @@ def cx_gather(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def cx_gather_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    """gather.out(self, dim, index, *, sparse_grad, out)"""
+    """gather.out(self, dim, index, *, sparse_grad, out): the out's exact
+    dtype; resize, then no internal overlap, no overlap with self, no
+    partial overlap with the index (TensorAdvancedIndexing's gather meta)."""
     var dest = v_tensor_c(args[unsafe_offset=4])
-    _store(dest, _gather(args), rets)
+    var x = v_tensor_c(args[unsafe_offset=0])
+    _exact_dtype(dest, x.stype)
+    var res = _gather(args)
+    _same_device(dest, res.t)
+    var geo = resized_geometry(dest, res.t.shape, res.t.rank)
+    assert_no_internal_overlap(geo)
+    assert_no_overlap(geo, x)
+    assert_no_partial_overlap(geo, v_tensor_c(args[unsafe_offset=2]))
+    _store(dest, res^, rets)
 
 
 def _masked_select(args: Values) raises -> Owned:
@@ -1699,47 +1808,41 @@ def cx_masked_select_out(
 ) raises:
     """masked_select.out(self, mask, *, out)"""
     var dest = v_tensor_c(args[unsafe_offset=2])
+    if dest.stype != v_tensor_c(args[unsafe_offset=0]).stype:
+        raise Error(
+            "masked_select(): self and result must have the same scalar type"
+        )
     _store(dest, _masked_select(args), rets)
 
 
 def _index_into(op: StaticString, target: T, args: Values, n_args: Int) raises:
     """index_add_ / index_copy_ (self, dim, index, source[, alpha]) into a
-    complex `target` (self or a copy of it), on the real views."""
+    complex `target` (self or a copy of it), one call per part (real /
+    imaginary views of their own shapes): add and copy are per part."""
     var source = v_tensor_c(args[unsafe_offset=3])
-    var src = own_if_new(contiguous(source), source)
-    var dim = _wrap_dim(Int(args[unsafe_offset=1].a), target.rank)
-    # 0-d self / source: as one-element vectors (the real view's only dim
-    # would be the pair)
-    var one = IndexList[MAX_RANK](1)
-    var zero = IndexList[MAX_RANK](0)
-    var t1 = own(
-        view_strided(target, one, zero, 1, target.offset)
-    ) if target.rank == 0 else own(target.copy())
-    if target.rank != 0:
-        t1.live = False
-    var s1 = own(
-        view_strided(src.t, one, zero, 1, src.t.offset)
-    ) if src.t.rank == 0 else own(src.t.copy())
-    if src.t.rank != 0:
-        s1.live = False
-    var rt = as_real(t1.t)
-    var rs = as_real(s1.t)
-    var c = _Call(op)
-    c.t(rt.t)
-    c.i(dim)
-    c.v(args[unsafe_offset=2])
-    c.t(rs.t)
+    var index = v_tensor_c(args[unsafe_offset=2])
+    _require_same_device(index, target.device, "index")
+    _require_same_device(source, target.device, "source")
+    _ = _wrap_dim(Int(args[unsafe_offset=1].a), target.rank)
+    var alpha = 1.0
     if n_args > 4:
-        var alpha = v_complex(args[unsafe_offset=4])
-        if alpha[1] != 0.0:
+        var al = v_complex(args[unsafe_offset=4])
+        if al[1] != 0.0:
             unsupported("index_add with a complex alpha")
-        c.s(alpha[0])
-    _ = c.run(1)
-    _ = rs^
-    _ = rt^
-    _ = s1^
-    _ = t1^
-    _ = src^
+        alpha = al[0]
+    for which in range(2):
+        var tp = _part(target, which)
+        var sp = _part(source, which)
+        var c = _Call(op)
+        c.t(tp.t)
+        c.v(args[unsafe_offset=1])
+        c.t(index)
+        c.t(sp.t)
+        if n_args > 4:
+            c.s(alpha)
+        _ = c.run(1)
+        _ = sp^
+        _ = tp^
 
 
 def _index_func(op: StaticString, args: Values, n_args: Int) raises -> Owned:
@@ -1770,21 +1873,42 @@ def _index_func(op: StaticString, args: Values, n_args: Int) raises -> Owned:
     return out^
 
 
+def _index_func_store(
+    op: StaticString,
+    args: Values,
+    n_args: Int,
+    dest_idx: Int,
+    rets: Values,
+) raises:
+    """index_add / index_copy into an out (or self, in place): the out's
+    exact dtype; resize, then no internal overlap and no overlap with the
+    index or the source (index_func_meta_impl), and a partial overlap with
+    self only when the out is not self."""
+    var dest = v_tensor_c(args[unsafe_offset=dest_idx])
+    var x = v_tensor_c(args[unsafe_offset=0])
+    _exact_dtype(dest, x.stype)
+    var geo = resized_geometry(dest, x.shape, x.rank)
+    assert_no_internal_overlap(geo)
+    assert_no_overlap(geo, v_tensor_c(args[unsafe_offset=2]))
+    assert_no_overlap(geo, v_tensor_c(args[unsafe_offset=3]))
+    if dest.impl() != x.impl():
+        assert_no_partial_overlap(geo, x)
+    _store(dest, _index_func(op, args, n_args), rets)
+
+
 def cx_index_add(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """index_add(self, dim, index, source, *, alpha)"""
     _ret(rets, _index_func("aten::index_add_", args, 5))
 
 
 def cx_index_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var self = v_tensor_c(args[unsafe_offset=0])
-    _store(self, _index_func("aten::index_add_", args, 5), rets)
+    _index_func_store("aten::index_add_", args, 5, 0, rets)
 
 
 def cx_index_add_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var dest = v_tensor_c(args[unsafe_offset=5])
-    _store(dest, _index_func("aten::index_add_", args, 5), rets)
+    _index_func_store("aten::index_add_", args, 5, 5, rets)
 
 
 def cx_index_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -1793,15 +1917,13 @@ def cx_index_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def cx_index_copy_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var self = v_tensor_c(args[unsafe_offset=0])
-    _store(self, _index_func("aten::index_copy_", args, 4), rets)
+    _index_func_store("aten::index_copy_", args, 4, 0, rets)
 
 
 def cx_index_copy_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var dest = v_tensor_c(args[unsafe_offset=4])
-    _store(dest, _index_func("aten::index_copy_", args, 4), rets)
+    _index_func_store("aten::index_copy_", args, 4, 4, rets)
 
 
 def _tri(op: StaticString, args: Values) raises -> Owned:
@@ -1860,11 +1982,13 @@ def cx_triu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def cx_tril_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor_c(args[unsafe_offset=2])
+    _exact_dtype(dest, v_tensor_c(args[unsafe_offset=0]).stype)
     _store(dest, _tri("aten::tril", args), rets)
 
 
 def cx_triu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor_c(args[unsafe_offset=2])
+    _exact_dtype(dest, v_tensor_c(args[unsafe_offset=0]).stype)
     _store(dest, _tri("aten::triu", args), rets)
 
 

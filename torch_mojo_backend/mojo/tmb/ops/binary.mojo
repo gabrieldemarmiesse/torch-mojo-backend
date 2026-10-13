@@ -3022,14 +3022,14 @@ def register_binary(site: Site) raises:
         "logical_and",
     ](site)
     impl[
-        routed[op_logical_and_out, cx_via_bool["logical_and", "out", 2], 2],
+        routed[op_logical_and_out, cx_via_bool["logical_and", "out", 2], 3],
         "logical_and.out",
     ](site)
     impl[
         routed[op_logical_or, cx_via_bool["logical_or", "", 2], 2], "logical_or"
     ](site)
     impl[
-        routed[op_logical_or_out, cx_via_bool["logical_or", "out", 2], 2],
+        routed[op_logical_or_out, cx_via_bool["logical_or", "out", 2], 3],
         "logical_or.out",
     ](site)
     impl[
@@ -3037,7 +3037,7 @@ def register_binary(site: Site) raises:
         "logical_xor",
     ](site)
     impl[
-        routed[op_logical_xor_out, cx_via_bool["logical_xor", "out", 2], 2],
+        routed[op_logical_xor_out, cx_via_bool["logical_xor", "out", 2], 3],
         "logical_xor.out",
     ](site)
     impl[op_maximum, "maximum"](site)

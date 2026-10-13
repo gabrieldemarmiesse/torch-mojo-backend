@@ -2435,7 +2435,7 @@ def register_unary(site: Site) raises:
         "logical_not",
     ](site)
     impl[
-        routed[op_logical_not_out, cx_via_bool["logical_not", "out", 1], 1],
+        routed[op_logical_not_out, cx_via_bool["logical_not", "out", 1], 2],
         "logical_not.out",
     ](site)
     impl[op_bitwise_not, "bitwise_not"](site)

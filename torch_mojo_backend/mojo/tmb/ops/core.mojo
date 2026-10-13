@@ -403,25 +403,32 @@ def _copy_through_toggled(
     _ = flipped^
 
 
-def _resolved_source(input: T, conj: Bool) raises -> Owned:
-    """A fresh tensor holding `input`'s logical values for one of its math
-    bits (conj, else neg) applied to its raw storage."""
+def _resolved_source(input: T) raises -> Owned:
+    """A fresh tensor holding `input`'s logical values: its math bits (conj
+    on a complex tensor, neg on any) applied to its raw storage."""
+    var conj = input.is_complex() and input.is_conj()
+    var neg = input.is_neg()
     if not input.on_mojo():
-        var r = call_op(
-            "aten::resolve_conj" if conj else "aten::resolve_neg",
-            "",
-            [tensor_arg(input)],
-            1,
-        )
-        return own(r.take_tensor(0))
+        var name = "aten::resolve_conj" if conj else "aten::resolve_neg"
+        var r = call_op(name, "", [tensor_arg(input)], 1)
+        var first = own(r.take_tensor(0))
+        if not (conj and neg):
+            return first^
+        var r2 = call_op("aten::resolve_neg", "", [tensor_arg(first.t)], 1)
+        var both = own(r2.take_tensor(0))
+        _ = first^  # alive through the second call
+        return both^
+    var fresh: Owned
     if conj:
-        return own(conj_copy(input))
-    var fresh = own(new_like(input))
-    copy_strided_into(fresh.t, input)
-    if input.is_complex():
-        cx_unary_into("neg", fresh.t, fresh.t)
+        fresh = own(conj_copy(input))
     else:
-        _ = call_op("aten::neg_", "", [tensor_arg(fresh.t)], 1)
+        fresh = own(new_like(input))
+        copy_strided_into(fresh.t, input)
+    if neg:
+        if input.is_complex():
+            cx_unary_into("neg", fresh.t, fresh.t)
+        else:
+            _ = call_op("aten::neg_", "", [tensor_arg(fresh.t)], 1)
     return fresh^
 
 
@@ -439,10 +446,9 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
     if dst.is_neg():
         _copy_through_toggled("aten::_neg_view", input, dst, non_blocking)
         return True
-    var src_conj = input.is_complex() and input.is_conj()
-    if not src_conj and not input.is_neg():
+    if not (input.is_complex() and input.is_conj()) and not input.is_neg():
         return False
-    var resolved = _resolved_source(input, src_conj)
+    var resolved = _resolved_source(input)
     _ = call_op(
         "aten::copy_",
         "",

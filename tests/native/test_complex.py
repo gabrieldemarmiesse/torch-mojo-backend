@@ -422,3 +422,198 @@ def test_core_ops_run_natively(mojo_gpu: str):
     assert native.op_count("aten::eq.Tensor") == 1
     # the complex cat runs the real one on the pairs: counted twice
     assert native.op_count("aten::cat") == 2
+
+
+# --- round-3 review fixes -------------------------------------------------------
+
+
+def test_cat_converts_each_input_to_the_out_dtype(mojo_gpu: str):
+    # 2**24 + 1 is not a float32: an int64 -> complex64 -> complex128 detour
+    # would round it
+    big = torch.tensor([16777217], dtype=torch.int64)
+    z = torch.tensor([1 + 2j], dtype=torch.complex64)
+    out = torch.empty(2, dtype=torch.complex128, device=mojo_gpu)
+    torch.cat([big.to(mojo_gpu), z.to(mojo_gpu)], out=out)
+    ref = torch.empty(2, dtype=torch.complex128)
+    torch.cat([big, z], out=ref)
+    assert torch.equal(out.cpu(), ref)
+    assert out.cpu()[0].real.item() == 16777217
+
+
+def test_copy_of_a_conj_and_neg_view_keeps_both_bits(mojo_gpu: str):
+    x = _rand(5)
+    v = torch._neg_view(x.to(mojo_gpu).conj())
+    expected = -x.conj()
+    assert torch.equal(v.cpu(), expected)
+    assert torch.equal(v.clone().cpu(), expected)
+    assert torch.equal(v.resolve_neg().resolve_conj().cpu(), expected)
+    # mojo -> mojo and cpu -> mojo copies of a doubly-flagged source
+    dst = torch.empty(5, dtype=torch.complex64, device=mojo_gpu)
+    dst.copy_(v)
+    assert torch.equal(dst.cpu(), expected)
+    dst.copy_(torch._neg_view(x.conj()))
+    assert torch.equal(dst.cpu(), expected)
+
+
+@pytest.mark.parametrize("dtype", CDTYPES)
+def test_clone_of_a_neg_view(mojo_gpu: str, dtype: torch.dtype):
+    _skip_c128(mojo_gpu, dtype)
+    x = _rand(3, 2, dtype=dtype)
+    v = torch._neg_view(x.to(mojo_gpu))
+    assert torch.equal(v.clone().cpu(), -x)
+    assert torch.equal(v.cpu(), -x)
+    assert torch.equal(v.resolve_neg().cpu(), -x)
+
+
+def test_cat_of_zero_dim_and_flip_of_duplicate_dims_raise(mojo_gpu: str):
+    z = torch.tensor(1 + 2j, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="zero-dimensional"):
+        torch.cat([z])
+    with pytest.raises(RuntimeError, match="zero-dimensional"):
+        torch.cat([z, z])
+    with pytest.raises(RuntimeError, match="multiple times"):
+        z.flip([0, 0])
+    with pytest.raises(RuntimeError, match="multiple times"):
+        _rand(2, 3).to(mojo_gpu).flip([1, -1])
+
+
+def test_logical_ops_on_complex(mojo_gpu: str):
+    x = torch.tensor([0j, 1 + 0j, 1j, 0j])
+    y = torch.tensor([1j, 0j, 2 + 0j, 0j])
+    d, e = x.to(mojo_gpu), y.to(mojo_gpu)
+    assert torch.equal(d.clone().logical_not_().cpu(), x.clone().logical_not_())
+    assert torch.equal(d.clone().logical_and_(e).cpu(), x.clone().logical_and_(y))
+    r = torch.tensor([0.0, 2.0, 0.0, 1.0])
+    for fn in (torch.logical_and, torch.logical_or, torch.logical_xor):
+        out = torch.empty(4, dtype=torch.complex64, device=mojo_gpu)
+        ref = torch.empty(4, dtype=torch.complex64)
+        fn(r.to(mojo_gpu), r.to(mojo_gpu), out=out)
+        fn(r, r, out=ref)
+        assert torch.equal(out.cpu(), ref)
+    out = torch.empty(4, dtype=torch.complex64, device=mojo_gpu)
+    torch.logical_not(r.to(mojo_gpu), out=out)
+    assert torch.equal(out.cpu(), torch.logical_not(r).to(torch.complex64))
+    torch.logical_not(d, out=out)
+    assert torch.equal(out.cpu(), torch.logical_not(x).to(torch.complex64))
+    with pytest.raises(RuntimeError, match="only supports bool tensor for result"):
+        torch.any(d, out=torch.empty((), dtype=torch.complex64, device=mojo_gpu))
+
+
+def test_where_device_and_rank(mojo_gpu: str):
+    mask = torch.tensor([True, False, True])
+    got = torch.where(mask.to(mojo_gpu), torch.tensor(1j), torch.tensor(2 + 0j))
+    assert got.device.type == "mojo"
+    assert torch.equal(got.cpu(), torch.where(mask, 1j, 2 + 0j))
+    # rank 4 is the real kernel's limit: the complex path must not add a dim
+    c = torch.rand(2, 2, 2, 2) > 0.5
+    x = _rand(2, 2, 2, 2)
+    assert torch.equal(
+        torch.where(c.to(mojo_gpu), x.to(mojo_gpu), 0j).cpu(), torch.where(c, x, 0j)
+    )
+    x = _rand(2, 2, 2, 3)
+    i = torch.randint(0, 3, (2, 2, 2, 2))
+    assert torch.equal(x.to(mojo_gpu).gather(3, i.to(mojo_gpu)).cpu(), x.gather(3, i))
+    m = torch.rand(2, 2, 2, 2) > 0.5
+    x = _rand(2, 2, 2, 2)
+    assert torch.equal(
+        x.to(mojo_gpu).masked_fill(m.to(mojo_gpu), 1j).cpu(), x.masked_fill(m, 1j)
+    )
+    s = _rand(2, 2, 2, 1)
+    idx = torch.tensor([1])
+    assert torch.equal(
+        x.to(mojo_gpu).index_add(3, idx.to(mojo_gpu), s.to(mojo_gpu)).cpu(),
+        x.index_add(3, idx, s),
+    )
+
+
+def test_data_movement_outs_reject_overlap(mojo_gpu: str):
+    x = _rand(4).to(mojo_gpu)
+    idx = torch.tensor([0, 1], device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.gather(x, 0, idx, out=x[:2])
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.index_select(x, 0, idx, out=x[:2])
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.cat([x[:2], x[2:]], out=x)
+    src = _rand(2).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        x.index_add_(0, idx, x[1:3])
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        x.index_copy_(0, idx, x[1:3])
+    x.index_add_(0, idx, src)  # disjoint operands still work
+
+
+def test_outs_are_resized_before_the_internal_overlap_check(mojo_gpu: str):
+    x = _rand(3, 4)
+    idx = torch.tensor([[0, 1, 2, 0]])
+    out = torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(5)
+    torch.gather(x.to(mojo_gpu), 0, idx.to(mojo_gpu), out=out)
+    assert torch.equal(out.cpu(), x.gather(0, idx))
+    # (a 4-element expanded out of the right shape is not resized: it raises)
+    out = torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(5)
+    a = _rand(2)
+    torch.cat([a.to(mojo_gpu), a.to(mojo_gpu)], out=out)
+    assert torch.equal(out.cpu(), torch.cat([a, a]))
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.cat([a.to(mojo_gpu)] * 2, out=out.view(-1)[:1].expand(4))
+
+
+def test_outs_need_the_exact_dtype(mojo_gpu: str):
+    x = _rand(3, 3).to(mojo_gpu)
+    idx = torch.tensor([0, 2], device=mojo_gpu)
+    out = torch.empty(0, dtype=torch.complex128, device=mojo_gpu)
+    with pytest.raises(RuntimeError):
+        torch.where(x.real > 0, x, x, out=out)
+    with pytest.raises(RuntimeError):
+        torch.where(x.real > 0, x.real, x.real, out=out)
+    with pytest.raises(RuntimeError):
+        torch.gather(x, 0, idx.view(1, 2).expand(3, 2), out=out)
+    with pytest.raises(RuntimeError):
+        torch.index_select(x, 0, idx, out=out)
+    with pytest.raises(RuntimeError):
+        torch.masked_select(x, x.real > 0, out=out)
+    with pytest.raises(RuntimeError):
+        torch.tril(x, out=out)
+
+
+def test_input_device_errors(mojo_gpu: str):
+    x = _rand(4).to(mojo_gpu)
+    with pytest.raises(RuntimeError):
+        x.gather(0, torch.tensor([0, 1]))
+    with pytest.raises(RuntimeError):
+        x.index_select(0, torch.tensor([0, 1]))
+    with pytest.raises(RuntimeError):
+        torch.cat([x, _rand(4)])
+    with pytest.raises(RuntimeError):
+        torch.eq(x, _rand(4))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA torch")
+def test_to_from_a_cuda_tensor_with_a_complex_dtype(mojo_gpu: str):
+    x = torch.randn(5)
+    got = x.cuda().to(mojo_gpu, dtype=torch.complex64)
+    assert got.device.type == "mojo" and got.dtype == torch.complex64
+    assert torch.equal(got.cpu(), x.to(torch.complex64))
+
+
+def test_boolean_mask_assignment(mojo_gpu: str):
+    x = _rand(3, 4)
+    m = torch.rand(3, 4) > 0.5
+    d = x.to(mojo_gpu)
+    d[m.to(mojo_gpu)] = 3j  # ty: ignore[invalid-assignment]
+    x[m] = 3j  # ty: ignore[invalid-assignment]
+    assert torch.equal(d.cpu(), x)
+    rows = torch.tensor([True, False, True])
+    d[rows.to(mojo_gpu)] = torch.tensor(1 + 1j, device=mojo_gpu)
+    x[rows] = 1 + 1j  # ty: ignore[invalid-assignment]
+    assert torch.equal(d.cpu(), x)
+    v = _rand(2, 4)
+    d[rows.to(mojo_gpu)] = v.to(mojo_gpu)
+    x[rows] = v
+    assert torch.equal(d.cpu(), x)
+    u8 = torch.tensor([0, 1, 1], dtype=torch.uint8)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        d[u8.to(mojo_gpu)] = 2j  # ty: ignore[invalid-assignment]
+        x[u8.bool()] = 2j  # ty: ignore[invalid-assignment]
+    assert torch.equal(d.cpu(), x)

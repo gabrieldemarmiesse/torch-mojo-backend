@@ -3620,15 +3620,15 @@ def op_nanmedian(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def register_reductions(site: Site) raises:
     impl[routed[op_all, cx_via_bool["all", "", 1], 1], "all"](site)
     impl[
-        routed[op_all_all_out, cx_via_bool["all", "all_out", 1], 1],
+        routed[op_all_all_out, cx_via_bool["all", "all_out", 1], 2],
         "all.all_out",
     ](site)
     impl[routed[op_all_dim, cx_via_bool["all", "dim", 1], 1], "all.dim"](site)
     impl[routed[op_all_dim, cx_via_bool["all", "dims", 1], 1], "all.dims"](site)
     impl[
-        routed[op_all_out, cx_via_bool["all", "dims_out", 1], 1], "all.dims_out"
+        routed[op_all_out, cx_via_bool["all", "dims_out", 1], 4], "all.dims_out"
     ](site)
-    impl[routed[op_all_out, cx_via_bool["all", "out", 1], 1], "all.out"](site)
+    impl[routed[op_all_out, cx_via_bool["all", "out", 1], 4], "all.out"](site)
     impl[op_amax, "amax"](site)
     impl[op_amax_out, "amax.out"](site)
     impl[op_amin, "amin"](site)
@@ -3639,15 +3639,15 @@ def register_reductions(site: Site) raises:
     impl[op__aminmax_dim, "_aminmax.dim"](site)
     impl[routed[op_any, cx_via_bool["any", "", 1], 1], "any"](site)
     impl[
-        routed[op_any_all_out, cx_via_bool["any", "all_out", 1], 1],
+        routed[op_any_all_out, cx_via_bool["any", "all_out", 1], 2],
         "any.all_out",
     ](site)
     impl[routed[op_any_dim, cx_via_bool["any", "dim", 1], 1], "any.dim"](site)
     impl[routed[op_any_dim, cx_via_bool["any", "dims", 1], 1], "any.dims"](site)
     impl[
-        routed[op_any_out, cx_via_bool["any", "dims_out", 1], 1], "any.dims_out"
+        routed[op_any_out, cx_via_bool["any", "dims_out", 1], 4], "any.dims_out"
     ](site)
-    impl[routed[op_any_out, cx_via_bool["any", "out", 1], 1], "any.out"](site)
+    impl[routed[op_any_out, cx_via_bool["any", "out", 1], 4], "any.out"](site)
     impl[op_argmax, "argmax"](site)
     impl[op_argmax_out, "argmax.out"](site)
     impl[op_argmin, "argmin"](site)
