@@ -341,7 +341,8 @@ def _roll_into(dst: T, src: T, starts: List[Int]) raises:
 # aten::roll(Tensor self, SymInt[1] shifts, int[1] dims=[]) -> Tensor
 def op_roll(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
-    decline_float8(a.dtype, "roll_cuda")
+    if a.numel > 0:  # CUDA returns an empty roll before its dispatch
+        decline_float8(a.dtype, "roll_cuda")
     var shifts = IntList(args[unsafe_offset=1])
     var dims = IntList(args[unsafe_offset=2])
     if len(shifts) == 0:
@@ -580,7 +581,8 @@ def op_channel_shuffle(
 
 
 def _take_checks(a: T, index: T, dest: T) raises:
-    decline_float8(a.dtype, "take_cuda")
+    if index.numel > 0:  # an empty take never reaches CUDA's dispatch
+        decline_float8(a.dtype, "take_cuda")
     if index.dtype != DType.int64:
         raise Error(
             "take(): Expected a long tensor for index, but got ",
@@ -1083,7 +1085,8 @@ def op_masked_scatter_(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     var source = v_tensor(args[unsafe_offset=2])
-    decline_float8(a.dtype, "masked_scatter_")
+    if a.numel > 0:  # an empty self never reaches CUDA's dispatch
+        decline_float8(a.dtype, "masked_scatter_")
     assert_no_internal_overlap(a)
     if a.stype != source.stype:
         raise Error(

@@ -2371,8 +2371,61 @@ def _cast_float8[
         return bitcast[dst, width](f32_to_fp8[dst](f))
     elif dst == DType.float32:
         return rebind[SIMD[dst, width]](f)
+    elif dst.is_integral():
+        return _f32_to_int_cuda[dst, width](f)
     else:
         return _cast_elem[DType.float32, dst, width](f)
+
+
+@always_inline
+def _f32_to_int_cuda[
+    dst: DType, w: Int
+](f: SIMD[DType.float32, w]) -> SIMD[dst, w]:
+    """float32 -> integer as CUDA's `static_cast` compiles (cvt.rzi.sat),
+    measured on stock torch: a NaN is 0 for int32 / uint32, INT64_MIN for
+    int64, 2**63 for uint64; out-of-range values saturate; uint16 is the
+    uint32 result truncated, uint8 / int8 / int16 the int64 one (torch's
+    narrowing chain). Spelled out on the bits: the float8 NaNs are
+    signalling (0x7F800001), which the plain cast does not map like PTX."""
+    var bits = bitcast[DType.uint32, w](f)
+    var nan = (bits & 0x7FFFFFFF).gt(0x7F800000)
+    var g = nan.select(SIMD[DType.float32, w](0), f)
+    comptime if dst == DType.int32:
+        var c = g.lt(-2147483648.0).select(
+            SIMD[DType.float32, w](-2147483648.0), g
+        )
+        var hi = c.ge(2147483648.0)
+        var r = hi.select(SIMD[DType.float32, w](0), c).cast[DType.int32]()
+        return rebind[SIMD[dst, w]](
+            hi.select(SIMD[DType.int32, w](Int32.MAX), r)
+        )
+    elif dst == DType.uint32 or dst == DType.uint16:
+        var c = g.lt(0.0).select(SIMD[DType.float32, w](0), g)
+        var hi = c.ge(4294967296.0)
+        var r = hi.select(SIMD[DType.float32, w](0), c).cast[DType.uint32]()
+        r = hi.select(SIMD[DType.uint32, w](UInt32.MAX), r)
+        return r.cast[dst]()
+    elif dst == DType.uint64:
+        var c = g.lt(0.0).select(SIMD[DType.float32, w](0), g)
+        var hi = c.ge(18446744073709551616.0)
+        var r = hi.select(SIMD[DType.float32, w](0), c).cast[DType.uint64]()
+        r = hi.select(SIMD[DType.uint64, w](UInt64.MAX), r)
+        return rebind[SIMD[dst, w]](
+            nan.select(SIMD[DType.uint64, w](UInt64(1) << 63), r)
+        )
+    else:
+        # int64, and the narrow types through it.
+        var lo = g.lt(-9223372036854775808.0)
+        var hi = g.ge(9223372036854775808.0)
+        var c = (lo | hi).select(SIMD[DType.float32, w](0), g)
+        var r = c.cast[DType.int64]()
+        r = lo.select(SIMD[DType.int64, w](Int64.MIN), r)
+        r = hi.select(SIMD[DType.int64, w](Int64.MAX), r)
+        r = nan.select(SIMD[DType.int64, w](Int64.MIN), r)
+        comptime if dst == DType.int64:
+            return rebind[SIMD[dst, w]](r)
+        else:
+            return bitcast[DType.uint64, w](r).cast[dst]()
 
 
 def _cast_vec_kernel[
@@ -2524,6 +2577,11 @@ comptime CAST_DTYPES = [
     DType.float8_e4m3fnuz,
     DType.float8_e5m2fnuz,
     DType.float8_e8m0fnu,
+    # Only ever paired with a float8 end (the op side gates it): CUDA
+    # converts float8 <-> uint16/32/64 on the device too.
+    DType.uint16,
+    DType.uint32,
+    DType.uint64,
 ]
 
 

@@ -94,6 +94,7 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     is_cast_dtype_on,
+    is_cast_pair_on,
 )
 from tmb.backend.registry import Site, impl
 
@@ -268,8 +269,7 @@ def _device_copy(dst: T, src: T) raises:
         if (
             src.contig
             and dst.contig
-            and is_cast_dtype_on(src.dtype, src)
-            and is_cast_dtype_on(dst.dtype, dst)
+            and is_cast_pair_on(src.dtype, dst.dtype, src)
             and (
                 src.ptr + src.numel * src.itemsize <= dst.ptr
                 or dst.ptr + dst.numel * dst.itemsize <= src.ptr
@@ -343,9 +343,7 @@ def _copy_broadcast_source(src: T, dst: T) raises -> T:
 
 
 def cast_for_copy(src: T, stype: Int32) raises -> T:
-    if is_cast_dtype_on(src.dtype, src) and is_cast_dtype_on(
-        max_dtype(stype), src
-    ):
+    if is_cast_pair_on(src.dtype, max_dtype(stype), src):
         return cast_to(src, stype)
     # CPU torch preserves integer precision for pairs outside CastSpec.
     var host_src = own(cpu_empty(src.shape, src.rank, src.stype))
@@ -389,8 +387,7 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         if (
             non_blocking
             and src.stype != dst.stype
-            and is_cast_dtype_on(src.dtype, dst)
-            and is_cast_dtype_on(dst.dtype, dst)
+            and is_cast_pair_on(src.dtype, dst.dtype, dst)
         ):
             # Copy.cu: a non-blocking transfer converts on the GPU (where
             # float -> e4m3fn saturates on sm_89+), a blocking one on the CPU.
@@ -463,8 +460,7 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         if (
             non_blocking
             and src.stype != dst.stype
-            and is_cast_dtype_on(src.dtype, src)
-            and is_cast_dtype_on(dst.dtype, src)
+            and is_cast_pair_on(src.dtype, dst.dtype, src)
         ):
             # A non-blocking download converts on the GPU (Copy.cu).
             var conv = own(cast_to(dense.t, dst.stype))

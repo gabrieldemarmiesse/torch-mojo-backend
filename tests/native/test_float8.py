@@ -630,8 +630,6 @@ def test_float8_mask_assign_device_value(mojo_device):
     mask = torch.tensor([True, False, True], device=dev)
     t[mask] = torch.tensor(2.0).to(torch.float8_e4m3fn).to(dev)
     assert t.view(torch.uint8).cpu().tolist() == [64, 0, 64]
-    t[mask] = torch.tensor(3.0, device=dev)
-    assert t.cpu().float().tolist() == [3.0, 0.0, 3.0]
 
 
 @pytest.mark.parametrize(
@@ -657,3 +655,103 @@ def test_float8_refusals_name_cuda_kernels(mojo_device, op, kernel):
     x = _x(torch.float8_e4m3fn).to(mojo_device)
     with pytest.raises(NotImplementedError, match=kernel):
         op(x)
+
+
+# Measured on stock CUDA (torch 2.11 / H100): same-device float8 -> integer
+# conversions of _CONV_SOURCES, which go through float32 and PTX's
+# saturating cvt (NaN is 0 for int32 / uint32, INT64_MIN for int64 and the
+# types narrowed from it, 2**63 for uint64).
+_CONV_SOURCES = [
+    float("inf"), float("-inf"), float("nan"), -1.0, -3.5, 300.0, 70000.0,
+    1e9, 3.5, 0.0, -0.0, 57344.0,
+]  # fmt: skip
+_CUDA_FLOAT8_TO_INT = {
+    ("float8_e4m3fn", "uint8"): [0, 0, 0, 255, 253, 32, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fn", "uint16"): [0, 0, 0, 0, 0, 288, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fn", "uint32"): [0, 0, 0, 0, 0, 288, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fn", "uint64"): [9223372036854775808, 9223372036854775808, 9223372036854775808, 0, 0, 288, 9223372036854775808, 9223372036854775808, 3, 0, 0, 9223372036854775808],
+    ("float8_e4m3fn", "int8"): [0, 0, 0, -1, -3, 32, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fn", "int16"): [0, 0, 0, -1, -3, 288, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fn", "int32"): [0, 0, 0, -1, -3, 288, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fn", "int64"): [-9223372036854775808, -9223372036854775808, -9223372036854775808, -1, -3, 288, -9223372036854775808, -9223372036854775808, 3, 0, 0, -9223372036854775808],
+    ("float8_e5m2", "uint8"): [255, 0, 0, 255, 253, 64, 255, 255, 3, 0, 0, 0],
+    ("float8_e5m2", "uint16"): [65535, 0, 0, 0, 0, 320, 65535, 65535, 3, 0, 0, 57344],
+    ("float8_e5m2", "uint32"): [4294967295, 0, 0, 0, 0, 320, 4294967295, 4294967295, 3, 0, 0, 57344],
+    ("float8_e5m2", "uint64"): [18446744073709551615, 0, 9223372036854775808, 0, 0, 320, 18446744073709551615, 18446744073709551615, 3, 0, 0, 57344],
+    ("float8_e5m2", "int8"): [-1, 0, 0, -1, -3, 64, -1, -1, 3, 0, 0, 0],
+    ("float8_e5m2", "int16"): [-1, 0, 0, -1, -3, 320, -1, -1, 3, 0, 0, -8192],
+    ("float8_e5m2", "int32"): [2147483647, -2147483648, 0, -1, -3, 320, 2147483647, 2147483647, 3, 0, 0, 57344],
+    ("float8_e5m2", "int64"): [9223372036854775807, -9223372036854775808, -9223372036854775808, -1, -3, 320, 9223372036854775807, 9223372036854775807, 3, 0, 0, 57344],
+    ("float8_e4m3fnuz", "uint8"): [0, 0, 0, 255, 253, 0, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fnuz", "uint16"): [0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fnuz", "uint32"): [0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fnuz", "uint64"): [9223372036854775808, 9223372036854775808, 9223372036854775808, 0, 0, 9223372036854775808, 9223372036854775808, 9223372036854775808, 3, 0, 0, 9223372036854775808],
+    ("float8_e4m3fnuz", "int8"): [0, 0, 0, -1, -3, 0, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fnuz", "int16"): [0, 0, 0, -1, -3, 0, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fnuz", "int32"): [0, 0, 0, -1, -3, 0, 0, 0, 3, 0, 0, 0],
+    ("float8_e4m3fnuz", "int64"): [-9223372036854775808, -9223372036854775808, -9223372036854775808, -1, -3, -9223372036854775808, -9223372036854775808, -9223372036854775808, 3, 0, 0, -9223372036854775808],
+    ("float8_e5m2fnuz", "uint8"): [0, 0, 0, 255, 253, 64, 0, 0, 3, 0, 0, 0],
+    ("float8_e5m2fnuz", "uint16"): [0, 0, 0, 0, 0, 320, 0, 0, 3, 0, 0, 57344],
+    ("float8_e5m2fnuz", "uint32"): [0, 0, 0, 0, 0, 320, 0, 0, 3, 0, 0, 57344],
+    ("float8_e5m2fnuz", "uint64"): [9223372036854775808, 9223372036854775808, 9223372036854775808, 0, 0, 320, 9223372036854775808, 9223372036854775808, 3, 0, 0, 57344],
+    ("float8_e5m2fnuz", "int8"): [0, 0, 0, -1, -3, 64, 0, 0, 3, 0, 0, 0],
+    ("float8_e5m2fnuz", "int16"): [0, 0, 0, -1, -3, 320, 0, 0, 3, 0, 0, -8192],
+    ("float8_e5m2fnuz", "int32"): [0, 0, 0, -1, -3, 320, 0, 0, 3, 0, 0, 57344],
+    ("float8_e5m2fnuz", "int64"): [-9223372036854775808, -9223372036854775808, -9223372036854775808, -1, -3, 320, -9223372036854775808, -9223372036854775808, 3, 0, 0, 57344],
+    ("float8_e8m0fnu", "uint8"): [0, 0, 0, 1, 4, 0, 0, 0, 4, 0, 0, 0],
+    ("float8_e8m0fnu", "uint16"): [0, 0, 0, 1, 4, 256, 0, 0, 4, 0, 0, 0],
+    ("float8_e8m0fnu", "uint32"): [0, 0, 0, 1, 4, 256, 65536, 1073741824, 4, 0, 0, 65536],
+    ("float8_e8m0fnu", "uint64"): [9223372036854775808, 9223372036854775808, 9223372036854775808, 1, 4, 256, 65536, 1073741824, 4, 0, 0, 65536],
+    ("float8_e8m0fnu", "int8"): [0, 0, 0, 1, 4, 0, 0, 0, 4, 0, 0, 0],
+    ("float8_e8m0fnu", "int16"): [0, 0, 0, 1, 4, 256, 0, 0, 4, 0, 0, 0],
+    ("float8_e8m0fnu", "int32"): [0, 0, 0, 1, 4, 256, 65536, 1073741824, 4, 0, 0, 65536],
+    ("float8_e8m0fnu", "int64"): [-9223372036854775808, -9223372036854775808, -9223372036854775808, 1, 4, 256, 65536, 1073741824, 4, 0, 0, 65536],
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("key", list(_CUDA_FLOAT8_TO_INT), ids=lambda k: "-".join(k))
+def test_float8_to_int_on_device_matches_stock_cuda(mojo_device, key):
+    f8 = getattr(torch, key[0])
+    dt = getattr(torch, key[1])
+    x = torch.tensor(_CONV_SOURCES).to(f8).to(mojo_device)
+    assert x.to(dt).cpu().tolist() == _CUDA_FLOAT8_TO_INT[key]
+
+
+def test_mask_assign_device_value_checks(mojo_device):
+    """index_put_'s checks before any route: a device value must match
+    self's dtype and not overlap self (stock CUDA, any dtype)."""
+    dev = mojo_device
+    mask = torch.tensor([True, False, True], device=dev)
+    for dt in (torch.float8_e4m3fn, torch.float32):
+        t = torch.zeros(3).to(dt).to(dev)
+        with pytest.raises(RuntimeError, match="dtypes match"):
+            t[mask] = torch.tensor(2.0, dtype=torch.float64, device=dev)
+        with pytest.raises(RuntimeError, match="single memory location"):
+            t[mask] = t[0]
+    t = torch.zeros(3, device=dev)
+    t[mask] = torch.tensor(2.0, dtype=torch.float64)  # a CPU value converts
+    assert t.cpu().tolist() == [2.0, 0.0, 2.0]
+
+
+def test_float8_refusals_wait_for_empty_inputs(mojo_device):
+    """CUDA returns empty results before its float8 dispatch for these."""
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    e = torch.empty((0, 2), dtype=f8, device=dev)
+    assert e.roll(1, 0).shape == (0, 2)
+    assert e.tril().shape == (0, 2) and e.triu().shape == (0, 2)
+    assert e.clone().tril_().shape == (0, 2)
+    x = torch.ones(2, 2).to(f8).to(dev)
+    none = torch.zeros(0, dtype=torch.long, device=dev)
+    assert x.take(none).shape == (0,)
+    m = torch.zeros(0, 2, dtype=torch.bool, device=dev)
+    assert e.clone().masked_scatter_(m, e).shape == (0, 2)
+    # ... while these refuse even when empty, as on CUDA.
+    for op in (
+        lambda t: t + t,
+        lambda t: t * t,
+        lambda t: t.nonzero(),
+        lambda t: t < t,
+    ):
+        with pytest.raises(NotImplementedError):
+            op(e)

@@ -647,6 +647,23 @@ def is_cast_dtype_on(dt: DType, t: T) raises -> Bool:
     return is_cast_dtype(dt)
 
 
+def is_cast_pair_on(a: DType, b: DType, t: T) raises -> Bool:
+    """Whether the device cast kernel converts between `a` and `b` on `t`'s
+    device: two `is_cast_dtype_on` dtypes, or a float8 with uint16 / 32 /
+    64 (which CUDA converts on the device; the kernel takes those unsigned
+    types only against a float8 end)."""
+    if is_cast_dtype_on(a, t) and is_cast_dtype_on(b, t):
+        return True
+
+    @__parameter
+    def wide_unsigned(d: DType) -> Bool:
+        return d == DType.uint16 or d == DType.uint32 or d == DType.uint64
+
+    return (is_float8(a) and wide_unsigned(b)) or (
+        is_float8(b) and wide_unsigned(a)
+    )
+
+
 def cast_into(dst: T, src: T, saturate: Bool = True) raises:
     """dst = src.to(dst.dtype) for a contiguous dst (data_movement CastSpec).
 

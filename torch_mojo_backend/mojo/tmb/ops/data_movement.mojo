@@ -115,6 +115,7 @@ from tmb.ops.common import (
     broadcast_shape,
     check_out,
     is_cast_dtype_on,
+    is_cast_pair_on,
     cast_into,
     device_str,
     fill_value,
@@ -432,7 +433,7 @@ def _to_copy_same_device(
     if stype == t.stype:
         return _materialize_as(t, want)
     var dst_dtype = max_dtype(stype)
-    if not (is_cast_dtype_on(t.dtype, t) and is_cast_dtype_on(dst_dtype, t)):
+    if not (is_cast_pair_on(t.dtype, dst_dtype, t)):
         return _relayout_owned(own(_host_cast(t, stype)), want)
     if (
         not strides_equal(want, contiguous_strides(t.shape, t.rank), t.rank)
@@ -582,11 +583,7 @@ def _upload_from_cpu(
             non_blocking,
         )
         _ = ctx
-    elif (
-        non_blocking
-        and is_cast_dtype_on(t.dtype, out)
-        and is_cast_dtype_on(max_dtype(stype), out)
-    ):
+    elif non_blocking and is_cast_pair_on(t.dtype, max_dtype(stype), out):
         # Copy.cu: a non-blocking transfer converts on the GPU (the float ->
         # e4m3fn conversion saturates there on sm_89+, see CastSpec).
         var raw = own(new_tensor(t.shape, t.rank, t.stype, target_device))
@@ -718,8 +715,7 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         and dev_type != DEVICE_TYPE_CPU
         and (dev_type == -1 or v_device_index(dev_v) == t.device)
         and strides_equal(want, contig, t.rank)
-        and is_cast_dtype_on(t.dtype, t)
-        and is_cast_dtype_on(max_dtype(stype), t)
+        and is_cast_pair_on(t.dtype, max_dtype(stype), t)
     ):
         # The hot case of a mixed-precision step: a dense same-device cast
         # whose result is the contiguous layout. `_to_copy_same_device` ends
@@ -842,11 +838,7 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # dtype=torch.float64, non_blocking=True)` returns immediately with
         # the gate still held, exactly like every other dtype pair.
         var async_download = non_blocking and (
-            stype == t.stype
-            or (
-                is_cast_dtype_on(t.dtype, t)
-                and is_cast_dtype_on(max_dtype(stype), t)
-            )
+            stype == t.stype or (is_cast_pair_on(t.dtype, max_dtype(stype), t))
         )
         var host = own(_download_to_cpu(staged.t, async_download, non_blocking))
         _ = staged^
@@ -1570,7 +1562,8 @@ def _triangular(t: T, diagonal_in: Int, upper: Int) raises -> Owned:
             "triu" if upper else "tril",
             ": input tensor must have at least 2 dimensions",
         )
-    decline_float8(t.dtype, "triu_tril_cuda_template")
+    if t.numel > 0:  # CUDA returns an empty tril / triu before dispatch
+        decline_float8(t.dtype, "triu_tril_cuda_template")
     var out = own(new_like(t))
     if out.t.numel > 0:
         var rows = t.dim(-2)
@@ -3066,9 +3059,9 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
     elif is_float8(target.dtype):
         # A device value never takes ATen's masked_fill route
         # (canDispatchToMaskedFill wants a CPU value) and CUDA's masked_fill
-        # has no float8 kernel; its index_put kernel does. Same result as a
-        # select: self = where(mask, value, self), the value cast into self's
-        # dtype the way TensorIterator's kernel cast does (no saturation).
+        # has no float8 kernel; its index_put kernel does (the dtype and
+        # overlap checks ran in the caller). Same result as a select:
+        # self = where(mask, value, self).
         var value0 = own(
             view_strided(
                 values,
@@ -3078,13 +3071,10 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
                 values.offset,
             )
         )
-        var v8 = own_if_new(
-            cast_to(value0.t, target.stype, saturate=False), value0.t
-        )
         var picked = call_op(
             "aten::where",
             "self",
-            [tensor_arg(mask_view.t), tensor_arg(v8.t), tensor_arg(target)],
+            [tensor_arg(mask_view.t), tensor_arg(value0.t), tensor_arg(target)],
             1,
         )
         _ = call_op(
@@ -3094,7 +3084,6 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
             1,
         )
         _ = picked^
-        _ = v8^
         _ = value0^
     else:
         var value0 = own(
@@ -3131,6 +3120,22 @@ def op_index_put_impl_(
     # per-slice-width rounding of `scatter_add_sorted`); matching it would
     # put a sort on this hot path, so it is left as a known difference.
     var accumulate = v_bool(args[unsafe_offset=3])
+    if not values.on_cpu():
+        # index_put_'s own checks (TensorAdvancedIndexing.cpp), before any
+        # route: a device value must match self's dtype and not overlap it.
+        # (A CPU value is converted -- ATen's masked_fill route or `.to`.)
+        if values.dtype != target.dtype:
+            raise Error(
+                (
+                    "Index put requires the source and destination dtypes"
+                    " match, got "
+                ),
+                _scalar_type_name(target.dtype),
+                " for the destination and ",
+                _scalar_type_name(values.dtype),
+                " for the source.",
+            )
+        assert_no_overlap(target, values)
     if (
         len(indices) == 1
         and len(present) >= 1
