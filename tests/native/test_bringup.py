@@ -344,7 +344,7 @@ def test_boxed_adapter_error_kinds(mojo_device):
     serves it since #482), so its bad-shape error is ATen's."""
     a = _arange(6, mojo_device).reshape(2, 3)
     with pytest.raises(NotImplementedError) as declined:
-        torch.empty(2, dtype=torch.complex64, device=mojo_device)
+        torch.empty(2, dtype=torch.complex32, device=mojo_device)
     assert "ScalarType" in str(declined.value)
     assert "aten::empty.memory_format" in str(declined.value)
 

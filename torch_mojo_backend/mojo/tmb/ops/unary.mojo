@@ -64,6 +64,12 @@ from tmb.ops.common import (
     shares_storage,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    cx_conj_physical_out,
+    cx_fill,
+    cx_via_bool,
+    routed,
+)
 from tmb.ops.core import cast_for_copy
 from tmb.ops.data_movement import _scalar_type_name
 
@@ -2311,7 +2317,10 @@ def register_unary(site: Site) raises:
     impl[op_nan_to_num_out, "nan_to_num.out"](site)
     impl[op_neg, "neg"](site)
     impl[op_neg_out, "neg.out"](site)
-    impl[op_conj_physical_out, "conj_physical.out"](site)
+    impl[
+        routed[op_conj_physical_out, cx_conj_physical_out, 1],
+        "conj_physical.out",
+    ](site)
     impl[op_polygamma, "polygamma"](site)
     impl[op_polygamma_out, "polygamma.out"](site)
     impl[op_reciprocal, "reciprocal"](site)
@@ -2421,8 +2430,14 @@ def register_unary(site: Site) raises:
     impl[op_isposinf_out, "isposinf.out"](site)
     impl[op_isneginf, "isneginf"](site)
     impl[op_isneginf_out, "isneginf.out"](site)
-    impl[op_logical_not, "logical_not"](site)
-    impl[op_logical_not_out, "logical_not.out"](site)
+    impl[
+        routed[op_logical_not, cx_via_bool["logical_not", "", 1], 1],
+        "logical_not",
+    ](site)
+    impl[
+        routed[op_logical_not_out, cx_via_bool["logical_not", "out", 1], 1],
+        "logical_not.out",
+    ](site)
     impl[op_bitwise_not, "bitwise_not"](site)
     impl[op_bitwise_not_out, "bitwise_not.out"](site)
-    impl[op_fill_scalar, "fill.Scalar"](site)
+    impl[routed[op_fill_scalar, cx_fill, 1], "fill.Scalar"](site)

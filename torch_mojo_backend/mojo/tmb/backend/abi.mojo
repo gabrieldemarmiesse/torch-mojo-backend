@@ -123,12 +123,14 @@ def supported_stypes(api: String) -> Int64:
     `torch.accelerator.get_device_capability()["supported_dtypes"]`.
 
     That is `max_dtype`'s domain, read off it rather than listed again: a
-    tensor of any other ScalarType (complex, float8, quantized, bit-packed)
-    is declined before it is allocated. Between two of these, `_copy_from`
-    and `_to_copy` convert on the device (CastSpec) or, for the pairs that
-    kernel lacks, through CPU torch (`cast_for_copy`), so every pair
-    converts. float64 is left out on Metal: the Metal shading language has
-    no double, so no kernel (fill, arithmetic) can compute in it there.
+    tensor of any other ScalarType (complex32, float8, quantized,
+    bit-packed) is declined before it is allocated -- plus complex64 and
+    complex128, held as pairs of their component dtype (`elem_dtype`).
+    Between two of these, `_copy_from` and `_to_copy` convert on the device
+    (CastSpec, `cast_complex`) or, for the pairs those kernels lack, through
+    CPU torch (`cast_for_copy`, `host_convert`), so every pair converts.
+    float64 and complex128 are left out on Metal: the Metal shading language
+    has no double, so no kernel (fill, arithmetic) can compute in it there.
     """
     var mask = Int64(0)
     for s in range(64):
@@ -139,9 +141,61 @@ def supported_stypes(api: String) -> Int64:
             held = False  # declined by max_dtype: bit s stays clear
         if held:
             mask |= Int64(1) << Int64(s)
+    # complex64/complex128: not a max_dtype dtype (no MAX/Mojo complex
+    # DType), held as interleaved float32/float64 pairs (`elem_dtype`) and
+    # accepted by the ops that read them with `v_tensor_c`.
+    mask |= Int64(1) << Int64(ST_COMPLEX64)
+    mask |= Int64(1) << Int64(ST_COMPLEX128)
     if api == "metal":
         mask &= ~(Int64(1) << Int64(ST_FLOAT64))
+        mask &= ~(Int64(1) << Int64(ST_COMPLEX128))
     return mask
+
+
+@always_inline
+def is_complex_stype(stype: Int32) -> Bool:
+    """complex64 / complex128: the complex dtypes the mojo device holds
+    (complex32 is not one of them)."""
+    return stype == ST_COMPLEX64 or stype == ST_COMPLEX128
+
+
+def complex_of(stype: Int32) raises -> Int32:
+    """`c10::toComplexType` over the dtypes that have a held complex
+    counterpart: float32 -> complex64, float64 -> complex128 (a complex dtype
+    maps to itself), and bfloat16 -> complex64 (c10 maps it to ComplexFloat:
+    bfloat16 has float32's range). float16's complex32 is not held here."""
+    if stype == ST_FLOAT32 or stype == ST_COMPLEX64 or stype == ST_BFLOAT16:
+        return ST_COMPLEX64
+    if stype == ST_FLOAT64 or stype == ST_COMPLEX128:
+        return ST_COMPLEX128
+    unsupported(
+        "no complex dtype on the mojo device for "
+        + dtype_name(stype)
+        + " (complex32 is not supported)"
+    )
+    return ST_COMPLEX64
+
+
+def real_of(stype: Int32) -> Int32:
+    """`c10::toRealValueType`: complex64 -> float32, complex128 -> float64,
+    any other dtype itself."""
+    if stype == ST_COMPLEX64:
+        return ST_FLOAT32
+    if stype == ST_COMPLEX128:
+        return ST_FLOAT64
+    return stype
+
+
+@always_inline
+def elem_dtype(stype: Int32) raises -> DType:
+    """`max_dtype`, plus the two complex dtypes as their component dtype:
+    the element type a kernel sees of a complex tensor, whose storage is
+    interleaved (re, im) pairs of it."""
+    if stype == ST_COMPLEX64:
+        return DType.float32
+    if stype == ST_COMPLEX128:
+        return DType.float64
+    return max_dtype(stype)
 
 
 def torch_dtype(dt: DType) raises -> Int32:
@@ -221,7 +275,8 @@ def dtype_itemsize(dt: DType) -> Int:
 
 
 def itemsize_of(stype: Int32) raises -> Int:
-    return dtype_itemsize(max_dtype(stype))
+    var n = dtype_itemsize(elem_dtype(stype))
+    return 2 * n if is_complex_stype(stype) else n
 
 
 def is_floating(stype: Int32) -> Bool:
@@ -282,6 +337,10 @@ def dtype_name(stype: Int32) -> String:
             return String("unsigned long long")
         else:
             return String("long unsigned int")
+    if stype == ST_COMPLEX64:
+        return String("c10::complex<float>")
+    if stype == ST_COMPLEX128:
+        return String("c10::complex<double>")
     return String("ScalarType ") + String(stype)
 
 
@@ -627,8 +686,13 @@ struct T(Copyable, Movable):
         self.offset = Int(info[unsafe_offset=INFO_STORAGE_OFFSET])
         self.numel = Int(info[unsafe_offset=INFO_NUMEL])
         self.stype = Int32(info[unsafe_offset=INFO_DTYPE])
-        self.dtype = max_dtype(self.stype)
+        # A complex tensor reads as its component dtype with twice the item
+        # size; `v_tensor` declines it for every op that is not written for
+        # complex (those read it with `v_tensor_c`).
+        self.dtype = elem_dtype(self.stype)
         self.itemsize = dtype_itemsize(self.dtype)
+        if is_complex_stype(self.stype):
+            self.itemsize *= 2
         self.contig = info[unsafe_offset=INFO_CONTIGUOUS] != 0
         self.device = Int(info[unsafe_offset=INFO_DEVICE_INDEX])
         self.device_type = Int(info[unsafe_offset=INFO_DEVICE_TYPE])
@@ -660,6 +724,69 @@ struct T(Copyable, Movable):
 
     def on_mojo(self) -> Bool:
         return self.device_type == DEVICE_TYPE_PRIVATEUSE1
+
+    @always_inline
+    def is_complex(self) -> Bool:
+        return is_complex_stype(self.stype)
+
+    def is_conj(self) -> Bool:
+        """torch's lazy conjugate bit (`Tensor.is_conj()`)."""
+        return external_call["tmb_tensor_is_conj", Int32](self.h) != 0
+
+    def is_neg(self) -> Bool:
+        """torch's lazy negative bit (`Tensor.is_neg()`)."""
+        return external_call["tmb_tensor_is_neg", Int32](self.h) != 0
+
+    def pairs(self) raises -> T:
+        """A complex tensor as the real tensor of its (re, im) components:
+        `view_as_real`'s geometry (one more trailing dim of extent 2 and
+        stride 1, every other stride and the offset doubled), read off the
+        same storage. KERNEL-ONLY: it keeps the complex tensor's handle, so it
+        is for specs, copies and launches, never for the dispatcher or a
+        result record."""
+        if not self.is_complex():
+            raise Error("pairs(): not a complex tensor")
+        if self.rank + 1 > MAX_RANK:
+            unsupported(
+                "complex tensors of rank "
+                + String(self.rank)
+                + " (the mojo device's limit is "
+                + String(MAX_RANK - 1)
+                + " for complex)"
+            )
+        var out = self.copy()
+        out.rank = self.rank + 1
+        out.shape = IndexList[MAX_RANK](1)
+        out.strides = IndexList[MAX_RANK](0)
+        var pad = MAX_RANK - out.rank
+        for i in range(self.rank):
+            out.shape[pad + i] = self.dim(i)
+            out.strides[pad + i] = 2 * self.stride(i)
+        out.shape[MAX_RANK - 1] = 2
+        out.strides[MAX_RANK - 1] = 1
+        out.offset = 2 * self.offset
+        out.numel = 2 * self.numel
+        out.stype = real_of(self.stype)
+        out.itemsize = self.itemsize // 2
+        return out^
+
+    def component(self, which: Int) raises -> T:
+        """The real (`which` 0) or imaginary (1) parts of a complex tensor as
+        a strided real tensor of its shape: `view_as_real(t)[..., which]`.
+        KERNEL-ONLY, like `pairs`."""
+        if not self.is_complex():
+            raise Error("component(): not a complex tensor")
+        var out = self.copy()
+        for i in range(MAX_RANK):
+            out.strides[i] = 2 * self.strides[i]
+        out.offset = 2 * self.offset + which
+        out.stype = real_of(self.stype)
+        out.itemsize = self.itemsize // 2
+        out.ptr = self.ptr + which * out.itemsize
+        # Never contiguous, even with one element: `contiguous()` must copy
+        # it (handing back this view would hand back the complex tensor).
+        out.contig = False
+        return out^
 
     def on_cpu(self) -> Bool:
         return self.device_type == DEVICE_TYPE_CPU
@@ -711,10 +838,42 @@ struct T(Copyable, Movable):
         return out^
 
 
+def no_complex(t: T) raises:
+    """Decline a complex tensor in an op that is not written for one: its
+    kernels would read the interleaved pairs as that many real elements."""
+    if t.is_complex():
+        unsupported(
+            "complex tensors ("
+            + dtype_name(t.stype)
+            + ") are not supported by this op on the mojo device"
+        )
+
+
 def v_tensor(v: Value) raises -> T:
+    """A tensor argument of an op that computes on real dtypes only:
+    complex tensors are declined (`v_tensor_c` accepts them)."""
+    var t = v_tensor_c(v)
+    no_complex(t)
+    return t^
+
+
+def v_tensor_c(v: Value) raises -> T:
+    """A tensor argument, complex64/complex128 accepted: for the ops
+    written for complex tensors (or dtype-agnostic byte movers)."""
     if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
         raise Error("expected a Tensor argument, got record tag ", v.tag)
     return T(Int(v.a))
+
+
+def v_is_complex(v: Value) -> Bool:
+    """Whether a record is a complex tensor or a complex Scalar, read
+    without building a `T` (the routing test of the ops that have a complex
+    route)."""
+    if v.tag == TAG_COMPLEX:
+        return True
+    if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
+        return False
+    return is_complex_stype(external_call["tmb_tensor_dtype", Int32](Int(v.a)))
 
 
 def v_opt_tensor(v: Value) raises -> Optional[T]:
@@ -723,9 +882,24 @@ def v_opt_tensor(v: Value) raises -> Optional[T]:
     return v_tensor(v)
 
 
+def v_opt_tensor_c(v: Value) raises -> Optional[T]:
+    if v.tag == TAG_NONE:
+        return None
+    return v_tensor_c(v)
+
+
 def v_tensor_list(v: Value) raises -> List[T]:
     """`Tensor[]` / `Tensor?[]` (None entries are skipped, see v_opt_tensor_list).
+    Complex tensors are declined (`v_tensor_list_c` accepts them).
     """
+    var out = v_tensor_list_c(v)
+    for t in out:
+        no_complex(t)
+    return out^
+
+
+def v_tensor_list_c(v: Value) raises -> List[T]:
+    """`v_tensor_list`, complex tensors accepted."""
     var out = List[T]()
     if v.tag == TAG_NONE:
         return out^
@@ -785,6 +959,18 @@ def ret_scalar_int(rets: Values, i: Int, x: Int):
 
 def ret_scalar_f64(rets: Values, i: Int, x: Float64):
     rets[unsafe_offset=i] = Value(TAG_SCALAR_DOUBLE, 0, f64_bits(x), 0)
+
+
+def ret_scalar_complex(rets: Values, i: Int, re: Float64, im: Float64):
+    rets[unsafe_offset=i] = Value(TAG_COMPLEX, 0, f64_bits(re), f64_bits(im))
+
+
+def v_complex(v: Value) raises -> Tuple[Float64, Float64]:
+    """A Scalar argument as (re, im): a complex Scalar's two parts, a real
+    one with a zero imaginary part."""
+    if v.tag == TAG_COMPLEX:
+        return (bits_f64(v.a), bits_f64(v.b))
+    return (v_f64(v), 0.0)
 
 
 def ret_scalar_bool(rets: Values, i: Int, x: Bool):
@@ -995,7 +1181,7 @@ def new_strided(
 ) raises -> T:
     # T rejects unsupported ScalarTypes. Validate before creating its owned
     # C++ handle, otherwise a failed T(h) strands that handle and its storage.
-    _ = max_dtype(stype)
+    _ = elem_dtype(stype)
     var sizes = Array[Int64, MAX_RANK](fill=0)
     var strd = Array[Int64, MAX_RANK](fill=0)
     var pad = MAX_RANK - rank

@@ -41,10 +41,11 @@ OPS_DIR = BENCH_DIR.parent / "torch_mojo_backend" / "mojo" / "tmb" / "ops"
 # registration (see agents_docs/native_backend.md): the backend registers its ops
 # from Mojo, so the list is read from the source rather than imported.
 # `impl[op_x, "name.overload"](site)` in each register_<group> (registry.mojo),
-# the op possibly a parametric instance (`op_pad[True, 1, False]`); the
-# formatter may break the call over several lines
+# the op possibly a parametric instance (`op_pad[True, 1, False]`, one level
+# of nesting: `routed[op_any, cx_via_bool["any", "", 1], 1]`); the formatter
+# may break the call over several lines
 _IMPL_RE = re.compile(
-    r'impl\[\s*\w+(?:\[[^\]]*\])?\s*,\s*"([^"]+)"\s*,?\s*\]\s*\(', re.S
+    r'impl\[\s*\w+(?:\[(?:[^\[\]]|\[[^\]]*\])*\])?\s*,\s*"([^"]+)"\s*,?\s*\]\s*\(', re.S
 )
 
 
@@ -108,8 +109,13 @@ _RNG_TRANSFORM = (
 SKIPPED_OPS: dict[str, str] = {
     "aten::log2.out": _OUT,
     "aten::conj_physical.out": (
-        "a copy on every dtype this device holds (no complex): the strided "
-        "copy kernel test_data_movement measures"
+        "a copy on the real dtypes (the strided copy kernel "
+        "test_data_movement measures); one pass of the complex family's "
+        "conj on complex64 / complex128"
+    ),
+    "aten::conj_physical_": (
+        "conj_physical.out's conj pass plus a strided copy back into self "
+        "(a no-op on the real dtypes)"
     ),
     "aten::_assert_async": (
         "a one-element readback and a host check: the cost is the sync"

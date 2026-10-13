@@ -76,6 +76,16 @@ from tmb.backend.device import (
     ctx_for,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    cx_fill_tensor_,
+    cx_flip,
+    cx_index_copy,
+    cx_index_copy_,
+    cx_index_copy_out,
+    cx_roll,
+    cx_via_bool,
+    routed,
+)
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     assert_no_internal_overlap,
@@ -2150,8 +2160,8 @@ def op_fill__tensor(
 
 
 def register_indexing(site: Site) raises:
-    impl[op_flip, "flip"](site)
-    impl[op_roll, "roll"](site)
+    impl[routed[op_flip, cx_flip, 1], "flip"](site)
+    impl[routed[op_roll, cx_roll, 1], "roll"](site)
     impl[op_unfold, "unfold"](site)
     impl[op_unfold_backward, "unfold_backward"](site)
     impl[op_channel_shuffle, "channel_shuffle"](site)
@@ -2160,9 +2170,11 @@ def register_indexing(site: Site) raises:
     impl[op_put_, "put_"](site)
     impl[op_index_fill__int_scalar, "index_fill_.int_Scalar"](site)
     impl[op_index_fill__int_tensor, "index_fill_.int_Tensor"](site)
-    impl[op_index_copy, "index_copy"](site)
-    impl[op_index_copy_, "index_copy_"](site)
-    impl[op_index_copy_out, "index_copy.out"](site)
+    impl[routed[op_index_copy, cx_index_copy, 4], "index_copy"](site)
+    impl[routed[op_index_copy_, cx_index_copy_, 4], "index_copy_"](site)
+    impl[routed[op_index_copy_out, cx_index_copy_out, 4], "index_copy.out"](
+        site
+    )
     impl[op_masked_scatter_, "masked_scatter_"](site)
     impl[op_repeat_interleave_tensor, "repeat_interleave.Tensor"](site)
     impl[op_scatter_value_out, "scatter.value_out"](site)
@@ -2179,9 +2191,12 @@ def register_indexing(site: Site) raises:
     impl[op_index_reduce, "index_reduce"](site)
     impl[op_index_reduce_, "index_reduce_"](site)
     impl[op_index_reduce_out, "index_reduce.out"](site)
-    impl[op_nonzero_out, "nonzero.out"](site)
+    impl[
+        routed[op_nonzero_out, cx_via_bool["nonzero", "out", 1], 1],
+        "nonzero.out",
+    ](site)
     impl[op_nonzero_static, "nonzero_static"](site)
     impl[op_nonzero_static_out, "nonzero_static.out"](site)
     impl[op_index_tensor_out, "index.Tensor_out"](site)
     impl[op_narrow_copy_out, "narrow_copy.out"](site)
-    impl[op_fill__tensor, "fill_.Tensor"](site)
+    impl[routed[op_fill__tensor, cx_fill_tensor_, 2], "fill_.Tensor"](site)

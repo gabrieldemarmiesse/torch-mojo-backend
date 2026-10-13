@@ -115,19 +115,6 @@ def test_scalar_and_zero_storage_history(
     """01/20: a scalar owns one element; fresh empty storages own no bytes."""
     _settle(mojo_device)
     before = device_module.memory_stats(mojo_device)
-    if dtype.is_complex:
-        # Complex ScalarTypes are not supported by the native backend. A
-        # declined factory must not manufacture even a zero-storage charge.
-        for shape in ((), (0,), (4, 0, 7)):
-            with pytest.raises(NotImplementedError, match="dtype.*not supported"):
-                torch.empty(shape, dtype=dtype, device=mojo_device)
-            assert device_module.memory_stats(mojo_device) == before
-            with pytest.raises(NotImplementedError, match="dtype.*not supported"):
-                torch.empty_strided(
-                    shape, (1,) * len(shape), dtype=dtype, device=mojo_device
-                )
-            assert device_module.memory_stats(mojo_device) == before
-        return
     zeros = [
         torch.empty(shape, dtype=dtype, device=mojo_device)
         for shape in ((0,), (4, 0, 7))
@@ -482,14 +469,16 @@ def test_capability_contracts_and_inductor_properties(mojo_device: str):
     index = torch.device(mojo_device).index
     accelerator_capability = torch.accelerator.get_device_capability(index)
     assert set(accelerator_capability) == {"supported_dtypes"}
-    expected = _DEVICE_DTYPES - ({torch.float64} if props.api == "metal" else set())
+    expected = _DEVICE_DTYPES - (
+        {torch.float64, torch.complex128} if props.api == "metal" else set()
+    )
     assert accelerator_capability["supported_dtypes"] == expected
     with torch.accelerator.device_index(index):
         assert torch.accelerator.get_device_capability() == accelerator_capability
 
 
 # What torch.accelerator.get_device_capability() lists on CUDA and HIP; Metal
-# lists the same minus float64.
+# lists the same minus float64 and complex128.
 _DEVICE_DTYPES = {
     torch.bool,
     torch.uint8,
@@ -504,12 +493,12 @@ _DEVICE_DTYPES = {
     torch.bfloat16,
     torch.float32,
     torch.float64,
+    torch.complex64,
+    torch.complex128,
 }
 # Declined on every backend: no mojo tensor of these dtypes can exist.
 _NEVER_ON_DEVICE = (
     torch.complex32,
-    torch.complex64,
-    torch.complex128,
     torch.float8_e4m3fn,
     torch.float8_e5m2,
     torch.float8_e4m3fnuz,
@@ -543,8 +532,9 @@ def test_accelerator_capability_dtypes_allocate_and_convert(mojo_device: str):
     assert not supported.intersection(_NEVER_ON_DEVICE)
     if props.api == "metal":
         assert torch.float64 not in supported
+        assert torch.complex128 not in supported
     with pytest.raises(NotImplementedError):
-        torch.empty(2, dtype=torch.complex64, device=mojo_device)
+        torch.empty(2, dtype=torch.complex32, device=mojo_device)
 
     dtypes = sorted(
         (dtype for dtype in supported if isinstance(dtype, torch.dtype)), key=str

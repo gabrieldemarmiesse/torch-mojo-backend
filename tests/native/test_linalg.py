@@ -654,8 +654,8 @@ def test_lstsq_empty_overdetermined_residuals(mojo_gpu: str):
 
 
 def test_lstsq_complex_out_declines(mojo_gpu: str):
-    # The device holds no complex tensor, so the only complex out that can
-    # arrive is a host one: declined, not refused with a wrong message.
+    # A complex out (here a host one) for a real lstsq: declined, not refused
+    # with a wrong message.
     a = torch.randn(4, 3).to(mojo_gpu)
     outs = (
         torch.empty(0, dtype=torch.complex64),

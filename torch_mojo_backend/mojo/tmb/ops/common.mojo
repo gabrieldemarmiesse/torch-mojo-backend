@@ -18,6 +18,7 @@ from tmb.backend.abi import (
     ST_INT64,
     ST_INT8,
     ST_UINT8,
+    ST_COMPLEX64,
     Owned,
     T,
     Value,
@@ -34,7 +35,12 @@ from tmb.backend.abi import (
     dtype_name,
     is_dense,
     f64_bits,
+    is_complex_stype,
     max_dtype,
+    real_of,
+    cpu_empty,
+    tensor_arg,
+    bool_arg,
     new_like,
     new_like_dtype,
     new_strided,
@@ -48,8 +54,17 @@ from tmb.backend.abi import (
     v_f64,
     v_scalar_is_integral,
     v_int,
+    v_complex,
 )
-from tmb.backend.device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
+from tmb.backend.device import (
+    copy_from_host,
+    copy_to_host,
+    ctx_for,
+    ctx_ptr,
+    dev,
+    memset_bytes,
+    memset_typed,
+)
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 
@@ -95,6 +110,10 @@ def copy_strided_into(dst: T, src: T) raises:
             shape_str(src),
         )
     if dst.numel == 0:
+        return
+    if dst.itemsize == 16:
+        # complex128: no 16-byte element kernel; move the component pairs.
+        copy_strided_into(dst.pairs(), src.pairs())
         return
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
@@ -1078,3 +1097,220 @@ def like_layout(var r: Owned, like: T, any_dense: Bool = False) raises -> Owned:
     copy_strided_into(out.t, r.t)
     _ = r^
     return out^
+
+
+# ---------------------------------------------------------------------------
+# complex dtypes: casts to and from them, and the launch of the complex
+# kernel family (tmb/kernels/complex), shared by the copy paths (core,
+# data_movement) and the complex ops (tmb/ops/complex.mojo).
+# ---------------------------------------------------------------------------
+
+comptime CX_FULL = 0
+comptime CX_DEVICE = 1
+comptime CX_HOST = 2
+
+
+def cx_launch(
+    kind: StaticString,
+    out_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    mode_a: Int,
+    mode_b: Int,
+    a_re: Float64,
+    a_im: Float64,
+    b_re: Float64,
+    b_im: Float64,
+    numel: Int,
+    component: DType,
+    device: Int,
+    p_re: Float64 = 1.0,
+    p_im: Float64 = 0.0,
+) raises:
+    """One elementwise kernel of the complex family over `numel` complex
+    elements (header of tmb/kernels/complex/entry.mojo): flat operands only,
+    each full (dense, the output's extent), one device element or a host
+    value."""
+    if numel == 0:
+        return
+    var ctx = ctx_for(device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("complex", kind)
+    call.arg_dtype(0, component)
+    call.int(out_addr)
+    call.int(a_addr)
+    call.int(b_addr)
+    call.int(mode_a | (mode_b << 2))
+    call.f64(a_re)
+    call.f64(a_im)
+    call.f64(b_re)
+    call.f64(b_im)
+    call.int(numel)
+    call.f64(p_re)
+    call.f64(p_im)
+    call.int(cp)
+    call.run()
+    _ = ctx
+
+
+def cx_unary_into(kind: StaticString, dst: T, src: T) raises:
+    """dst = kind(src) for two DENSE buffers of `src.numel` elements (src
+    complex; dst complex, real or bool by kind)."""
+    cx_launch(
+        kind,
+        dst.ptr,
+        src.ptr,
+        0,
+        CX_FULL,
+        CX_FULL,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        src.numel,
+        src.dtype,
+        src.device,
+    )
+
+
+def warn_complex_to_real() raises:
+    """torch's `TORCH_WARN_ONCE("Casting complex values to real discards the
+    imaginary part")` (Copy.cpp's copy_impl), raised by having CPU torch run
+    the one statement that emits it: a 1-element complex-to-float host copy.
+    Its once-per-process state is torch's own, as on CUDA."""
+    var shape = IndexList[MAX_RANK](1)
+    var src = own(cpu_empty(shape, 1, ST_COMPLEX64))
+    var dst = own(cpu_empty(shape, 1, ST_FLOAT32))
+    _ = call_op(
+        "aten::copy_",
+        "",
+        [
+            tensor_arg(dst.t),
+            tensor_arg(src.t),
+            bool_arg(False),
+        ],
+        1,
+    )
+    _ = src^
+    _ = dst^
+
+
+def host_convert(t: T, stype: Int32) raises -> T:
+    """`t.to(stype)` through CPU torch (a dense download, torch's CPU copy_,
+    one upload): the conversions no device kernel has (the unsigned wide
+    integers, float64 on Metal), with torch's exact semantics."""
+    var dense = own_if_new(contiguous(t), t)
+    var host_src = own(cpu_empty(t.shape, t.rank, t.stype))
+    copy_to_host(
+        ctx_for(t.device), dense.t.ptr, host_src.t.ptr, t.numel * t.itemsize
+    )
+    _ = dense^
+    var host_dst = own(cpu_empty(t.shape, t.rank, stype))
+    _ = call_op(
+        "aten::copy_",
+        "",
+        [tensor_arg(host_dst.t), tensor_arg(host_src.t), bool_arg(False)],
+        1,
+    )
+    _ = host_src^
+    var out = own(new_like_dtype(t, stype))
+    copy_from_host(
+        t.device,
+        ctx_for(t.device),
+        out.t.ptr,
+        host_dst.t.ptr,
+        out.t.numel * out.t.itemsize,
+    )
+    _ = host_dst^
+    return out.take()
+
+
+def cast_complex(t: T, stype: Int32) raises -> T:
+    """`t.to(stype)` on t's device where `t` or `stype` is complex: a
+    contiguous result (t itself when the dtype is unchanged). torch's
+    conversions: real -> complex sets the imaginary part to 0; complex ->
+    real keeps the real part (and warns, as copy_ does); complex -> bool is
+    `re != 0 || im != 0`; complex64 <-> complex128 converts both parts.
+    `t` carries no conj bit (the callers resolve it)."""
+    if t.stype == stype:
+        return t.copy()
+    var src = own_if_new(contiguous(t), t)
+    if src.t.is_complex() and is_complex_stype(stype):
+        if not is_cast_dtype_on(DType.float64, src.t):
+            var converted = own(host_convert(src.t, stype))
+            _ = src^
+            return converted.take()
+        var both = own(new_like_dtype(src.t, stype))
+        cast_into(both.t.pairs(), src.t.pairs())
+        _ = src^
+        return both.take()
+    if is_complex_stype(stype):
+        # real -> complex: zero the pairs, then the real parts in place
+        var part = real_of(stype)
+        if src.t.stype != part and not (
+            is_cast_dtype_on(src.t.dtype, src.t)
+            and is_cast_dtype_on(max_dtype(part), src.t)
+        ):
+            var converted = own(host_convert(src.t, stype))
+            _ = src^
+            return converted.take()
+        var made = own(new_like_dtype(src.t, stype))
+        fill_value(made.t, 0.0)
+        var re = own_if_new(cast_to(src.t, part), src.t)
+        copy_strided_into(made.t.component(0), re.t)
+        _ = re^
+        _ = src^
+        return made.take()
+    # complex -> real
+    if stype == ST_BOOL:
+        var truth = own(new_like_dtype(src.t, ST_BOOL))
+        cx_unary_into("nonzero", truth.t, src.t)
+        _ = src^
+        return truth.take()
+    if stype != real_of(src.t.stype) and not (
+        is_cast_dtype_on(src.t.dtype, src.t)
+        and is_cast_dtype_on(max_dtype(stype), src.t)
+    ):
+        var converted = own(host_convert(src.t, stype))
+        _ = src^
+        return converted.take()
+    warn_complex_to_real()
+    var re = own(contiguous(src.t.component(0)))
+    _ = src^
+    if stype == re.t.stype:
+        return re.take()
+    var out = own(cast_to(re.t, stype))
+    _ = re^
+    return out.take()
+
+
+def conj_copy(t: T) raises -> T:
+    """A fresh contiguous complex tensor holding conj(t's stored values):
+    what resolving a conj bit takes (torch's `conj_physical` of the raw
+    data)."""
+    var dense = own_if_new(contiguous(t), t)
+    var out = own(new_like(dense.t))
+    cx_unary_into("conj", out.t, dense.t)
+    _ = dense^
+    return out.take()
+
+
+def fill_complex(t: T, v: Value) raises:
+    """fill_ of a complex tensor: the two parts of the Scalar (a real one has
+    a zero imaginary part) into the two strided component views; one memset
+    for an all-zero value."""
+    var c = v_complex(v)
+    var re = c[0]
+    var im = c[1]
+    if t.is_conj():
+        im = -im
+    if t.numel == 0:
+        return
+    if f64_bits(re) == 0 and f64_bits(im) == 0:
+        if t.contig:
+            fill_value(t, 0.0)
+        else:
+            fill_value(t.pairs(), 0.0)
+        return
+    fill_value(t.component(0), re)
+    fill_value(t.component(1), im)

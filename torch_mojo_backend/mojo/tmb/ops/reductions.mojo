@@ -95,6 +95,10 @@ from tmb.ops.common import (
 from tmb.ops.core import cast_for_copy
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    cx_via_bool,
+    routed,
+)
 
 # Smallest contiguous inner extent that makes the strided arg-reduction kernel
 # (one thread per output column) worth taking over materializing a transposed
@@ -3614,12 +3618,17 @@ def op_nanmedian(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def register_reductions(site: Site) raises:
-    impl[op_all, "all"](site)
-    impl[op_all_all_out, "all.all_out"](site)
-    impl[op_all_dim, "all.dim"](site)
-    impl[op_all_dim, "all.dims"](site)
-    impl[op_all_out, "all.dims_out"](site)
-    impl[op_all_out, "all.out"](site)
+    impl[routed[op_all, cx_via_bool["all", "", 1], 1], "all"](site)
+    impl[
+        routed[op_all_all_out, cx_via_bool["all", "all_out", 1], 1],
+        "all.all_out",
+    ](site)
+    impl[routed[op_all_dim, cx_via_bool["all", "dim", 1], 1], "all.dim"](site)
+    impl[routed[op_all_dim, cx_via_bool["all", "dims", 1], 1], "all.dims"](site)
+    impl[
+        routed[op_all_out, cx_via_bool["all", "dims_out", 1], 1], "all.dims_out"
+    ](site)
+    impl[routed[op_all_out, cx_via_bool["all", "out", 1], 1], "all.out"](site)
     impl[op_amax, "amax"](site)
     impl[op_amax_out, "amax.out"](site)
     impl[op_amin, "amin"](site)
@@ -3628,17 +3637,27 @@ def register_reductions(site: Site) raises:
     impl[op_aminmax_out, "aminmax.out"](site)
     impl[op__aminmax, "_aminmax"](site)
     impl[op__aminmax_dim, "_aminmax.dim"](site)
-    impl[op_any, "any"](site)
-    impl[op_any_all_out, "any.all_out"](site)
-    impl[op_any_dim, "any.dim"](site)
-    impl[op_any_dim, "any.dims"](site)
-    impl[op_any_out, "any.dims_out"](site)
-    impl[op_any_out, "any.out"](site)
+    impl[routed[op_any, cx_via_bool["any", "", 1], 1], "any"](site)
+    impl[
+        routed[op_any_all_out, cx_via_bool["any", "all_out", 1], 1],
+        "any.all_out",
+    ](site)
+    impl[routed[op_any_dim, cx_via_bool["any", "dim", 1], 1], "any.dim"](site)
+    impl[routed[op_any_dim, cx_via_bool["any", "dims", 1], 1], "any.dims"](site)
+    impl[
+        routed[op_any_out, cx_via_bool["any", "dims_out", 1], 1], "any.dims_out"
+    ](site)
+    impl[routed[op_any_out, cx_via_bool["any", "out", 1], 1], "any.out"](site)
     impl[op_argmax, "argmax"](site)
     impl[op_argmax_out, "argmax.out"](site)
     impl[op_argmin, "argmin"](site)
     impl[op_argmin_out, "argmin.out"](site)
-    impl[op_count_nonzero, "count_nonzero.dim_IntList"](site)
+    impl[
+        routed[
+            op_count_nonzero, cx_via_bool["count_nonzero", "dim_IntList", 1], 1
+        ],
+        "count_nonzero.dim_IntList",
+    ](site)
     impl[op_hash_tensor, "hash_tensor"](site)
     impl[op_hash_tensor_out, "hash_tensor.out"](site)
     impl[op_kthvalue, "kthvalue"](site)

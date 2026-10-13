@@ -443,7 +443,10 @@ bitmask over torch ScalarType values that Mojo computes once per device
 (`supported_stypes` in `tmb/backend/abi.mojo`): the domain of `max_dtype`,
 since a tensor of any other dtype is declined before it is allocated and any
 two of these convert (CastSpec on the device, CPU torch for the pairs it
-lacks), minus `float64` on Metal, which has no double arithmetic.
+lacks), minus `float64` and `complex128` on Metal, which has no double
+arithmetic. complex64 / complex128 are in it too, though `max_dtype` has no
+complex DType: their tensors are held as interleaved float32 / float64 pairs
+(`tmb/ops/complex.mojo`).
 
 There is no counterpart for CUDA allocator snapshots/history
 (`memory_snapshot`, `_record_memory_history`, `_dump_snapshot`), raw caching

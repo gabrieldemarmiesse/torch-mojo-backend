@@ -72,6 +72,18 @@ from tmb.ops.common import (
     scalar_to_int,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    cx_eq,
+    cx_eq_out,
+    cx_equal,
+    cx_masked_fill,
+    cx_masked_fill_,
+    cx_masked_fill_out,
+    cx_ne,
+    cx_ne_out,
+    cx_where,
+    routed,
+)
 from tmb.ops.core import cast_for_copy
 from tmb.ops.binary import _b_out_guard, _b_tside
 
@@ -1790,14 +1802,14 @@ def register_compare(site: Site) raises:
     impl[op_assert_async, "_assert_async"](site)
     impl[op_assert_async_msg, "_assert_async.msg"](site)
     impl[op_functional_assert_async_msg, "_functional_assert_async.msg"](site)
-    impl[op_eq_tensor, "eq.Tensor"](site)
-    impl[op_eq_tensor_out, "eq.Tensor_out"](site)
-    impl[op_eq_scalar, "eq.Scalar"](site)
-    impl[op_eq_scalar_out, "eq.Scalar_out"](site)
-    impl[op_ne_tensor, "ne.Tensor"](site)
-    impl[op_ne_tensor_out, "ne.Tensor_out"](site)
-    impl[op_ne_scalar, "ne.Scalar"](site)
-    impl[op_ne_scalar_out, "ne.Scalar_out"](site)
+    impl[routed[op_eq_tensor, cx_eq, 2], "eq.Tensor"](site)
+    impl[routed[op_eq_tensor_out, cx_eq_out, 3], "eq.Tensor_out"](site)
+    impl[routed[op_eq_scalar, cx_eq, 2], "eq.Scalar"](site)
+    impl[routed[op_eq_scalar_out, cx_eq_out, 3], "eq.Scalar_out"](site)
+    impl[routed[op_ne_tensor, cx_ne, 2], "ne.Tensor"](site)
+    impl[routed[op_ne_tensor_out, cx_ne_out, 3], "ne.Tensor_out"](site)
+    impl[routed[op_ne_scalar, cx_ne, 2], "ne.Scalar"](site)
+    impl[routed[op_ne_scalar_out, cx_ne_out, 3], "ne.Scalar_out"](site)
     impl[op_lt_tensor, "lt.Tensor"](site)
     impl[op_lt_tensor_out, "lt.Tensor_out"](site)
     impl[op_lt_scalar, "lt.Scalar"](site)
@@ -1820,14 +1832,30 @@ def register_compare(site: Site) raises:
     impl[op_isin_tensor_scalar_out, "isin.Tensor_Scalar_out"](site)
     impl[op_isin_tensor_tensor, "isin.Tensor_Tensor"](site)
     impl[op_isin_tensor_tensor_out, "isin.Tensor_Tensor_out"](site)
-    impl[op_where_self, "where.self"](site)
-    impl[op_masked_fill_scalar, "masked_fill.Scalar"](site)
-    impl[op_masked_fill_scalar_out, "masked_fill.Scalar_out"](site)
-    impl[op_masked_fill_tensor, "masked_fill.Tensor"](site)
-    impl[op_masked_fill_tensor_out, "masked_fill.Tensor_out"](site)
-    impl[op_masked_fill__scalar, "masked_fill_.Scalar"](site)
-    impl[op_masked_fill__tensor, "masked_fill_.Tensor"](site)
-    impl[op_equal, "equal"](site)
+    impl[routed[op_where_self, cx_where, 3], "where.self"](site)
+    impl[
+        routed[op_masked_fill_scalar, cx_masked_fill, 1], "masked_fill.Scalar"
+    ](site)
+    impl[
+        routed[op_masked_fill_scalar_out, cx_masked_fill_out, 1],
+        "masked_fill.Scalar_out",
+    ](site)
+    impl[
+        routed[op_masked_fill_tensor, cx_masked_fill, 1], "masked_fill.Tensor"
+    ](site)
+    impl[
+        routed[op_masked_fill_tensor_out, cx_masked_fill_out, 1],
+        "masked_fill.Tensor_out",
+    ](site)
+    impl[
+        routed[op_masked_fill__scalar, cx_masked_fill_, 1],
+        "masked_fill_.Scalar",
+    ](site)
+    impl[
+        routed[op_masked_fill__tensor, cx_masked_fill_, 1],
+        "masked_fill_.Tensor",
+    ](site)
+    impl[routed[op_equal, cx_equal, 2], "equal"](site)
     impl[op_searchsorted_tensor, "searchsorted.Tensor"](site)
     impl[op_searchsorted_tensor_out, "searchsorted.Tensor_out"](site)
     impl[op_searchsorted_scalar, "searchsorted.Scalar"](site)

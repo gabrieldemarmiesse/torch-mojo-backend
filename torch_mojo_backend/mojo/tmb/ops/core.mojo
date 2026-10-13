@@ -31,8 +31,12 @@ from tmb.backend.abi import (
     v_stream,
     v_string,
     v_tensor,
+    v_tensor_c,
     v_opt_tensor,
     v_tensor_list,
+    v_complex,
+    is_complex_stype,
+    ret_scalar_complex,
     ret_tensor,
     ret_ref,
     ret_int,
@@ -67,6 +71,9 @@ from tmb.backend.abi import (
     torch_dtype,
     is_floating,
     MEMORY_FORMAT_CONTIGUOUS,
+    Owned,
+    Results,
+    f64_bits,
     TAG_NONE,
     TAG_TENSOR,
     TAG_TENSOR_REF,
@@ -87,8 +94,12 @@ from tmb.backend.device import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    cx_unary_into,
+    fill_complex,
+    cast_complex,
     cast_into,
     cast_to,
+    conj_copy,
     contiguous,
     copy_strided_into,
     fill_value,
@@ -267,6 +278,8 @@ def _device_copy(dst: T, src: T) raises:
         if (
             src.contig
             and dst.contig
+            and not src.is_complex()
+            and not dst.is_complex()
             and is_cast_dtype_on(src.dtype, src)
             and is_cast_dtype_on(dst.dtype, dst)
             and (
@@ -342,6 +355,8 @@ def _copy_broadcast_source(src: T, dst: T) raises -> T:
 
 
 def cast_for_copy(src: T, stype: Int32) raises -> T:
+    if src.is_complex() or is_complex_stype(stype):
+        return cast_complex(src, stype)
     if is_cast_dtype_on(src.dtype, src) and is_cast_dtype_on(
         max_dtype(stype), src
     ):
@@ -366,11 +381,86 @@ def cast_for_copy(src: T, stype: Int32) raises -> T:
     return out.take()
 
 
+def _copy_through_toggled(
+    op: StaticString, input: T, dst: T, non_blocking: Bool
+) raises:
+    """`dst.copy_(input)` for a `dst` with a math bit: written through its
+    view with the bit toggled off (`_conj` / `_neg_view`), from `input` with
+    the same bit toggled (conj of a real input is the input itself)."""
+    var plain = call_op(op, "", [tensor_arg(dst)], 1)
+    var flipped: Results
+    if op == "aten::_conj" and not input.is_complex():
+        flipped = call_op("aten::alias", "", [tensor_arg(input)], 1)
+    else:
+        flipped = call_op(op, "", [tensor_arg(input)], 1)
+    _ = call_op(
+        "aten::copy_",
+        "",
+        [plain[0].copy(), flipped[0].copy(), bool_arg(non_blocking)],
+        1,
+    )
+    _ = plain^  # their handles are the copy's arguments
+    _ = flipped^
+
+
+def _resolved_source(input: T, conj: Bool) raises -> Owned:
+    """A fresh tensor holding `input`'s logical values for one of its math
+    bits (conj, else neg) applied to its raw storage."""
+    if not input.on_mojo():
+        var r = call_op(
+            "aten::resolve_conj" if conj else "aten::resolve_neg",
+            "",
+            [tensor_arg(input)],
+            1,
+        )
+        return own(r.take_tensor(0))
+    if conj:
+        return own(conj_copy(input))
+    var fresh = own(new_like(input))
+    copy_strided_into(fresh.t, input)
+    if input.is_complex():
+        cx_unary_into("neg", fresh.t, fresh.t)
+    else:
+        _ = call_op("aten::neg_", "", [tensor_arg(fresh.t)], 1)
+    return fresh^
+
+
+def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
+    """`dst.copy_(input)` when either carries a lazy math bit (conj on a
+    complex tensor, neg on any): the stored values end up the logical ones,
+    as copy_impl makes them. True when it handled the copy. A bit on `dst`
+    is written through the toggled view; a bit on `input` is resolved into a
+    fresh tensor. Each step re-enters copy_ with one bit fewer. (The
+    Conjugate and Negative keys let `_copy_from` through with its bits for
+    mojo tensors: shim_views.cpp.)"""
+    if dst.is_complex() and dst.is_conj():
+        _copy_through_toggled("aten::_conj", input, dst, non_blocking)
+        return True
+    if dst.is_neg():
+        _copy_through_toggled("aten::_neg_view", input, dst, non_blocking)
+        return True
+    var src_conj = input.is_complex() and input.is_conj()
+    if not src_conj and not input.is_neg():
+        return False
+    var resolved = _resolved_source(input, src_conj)
+    _ = call_op(
+        "aten::copy_",
+        "",
+        [tensor_arg(dst), tensor_arg(resolved.t), bool_arg(non_blocking)],
+        1,
+    )
+    _ = resolved^
+    return True
+
+
 # aten::_copy_from(Tensor self, Tensor dst, bool non_blocking=False) -> Tensor
 def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var input = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
+    var input = v_tensor_c(args[unsafe_offset=0])
+    var dst = v_tensor_c(args[unsafe_offset=1])
     var non_blocking = v_bool_or(args[unsafe_offset=2], False)
+    if _copy_bits(input, dst, non_blocking):
+        ret_ref(rets, 0, dst)
+        return
     var expanded = own_if_new(_copy_broadcast_source(input, dst), input)
     var src = expanded.t.copy()
     if dst.numel == 0:
@@ -575,7 +665,7 @@ def op_as_strided(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_local_scalar_dense(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var t = v_tensor(args[unsafe_offset=0])
+    var t = v_tensor_c(args[unsafe_offset=0])
     if t.numel != 1:
         raise Error(
             "a Tensor with ", t.numel, " elements cannot be converted to Scalar"
@@ -583,6 +673,19 @@ def op_local_scalar_dense(
     var buf = Array[UInt8, 16](fill=0)
     read_bytes_sync(ctx_for(t.device), t.ptr, Int(buf.unsafe_ptr()), t.itemsize)
     var p = buf.unsafe_ptr()
+    if t.is_complex():
+        var re: Float64
+        var im: Float64
+        if t.dtype == DType.float32:
+            re = Float64(p.unsafe_bitcast[Float32]()[])
+            im = Float64(p.unsafe_bitcast[Float32]()[unsafe_offset=1])
+        else:
+            re = p.unsafe_bitcast[Float64]()[]
+            im = p.unsafe_bitcast[Float64]()[unsafe_offset=1]
+        if t.is_conj():
+            im = -im
+        ret_scalar_complex(rets, 0, re, im)
+        return
     if t.dtype == DType.bool:
         ret_scalar_bool(rets, 0, p[] != 0)
     elif t.dtype.is_floating_point():
@@ -621,7 +724,11 @@ def op_local_scalar_dense(
 def op_fill_scalar_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var t = v_tensor(args[unsafe_offset=0])
+    var t = v_tensor_c(args[unsafe_offset=0])
+    if t.is_complex():
+        fill_complex(t, args[unsafe_offset=1].copy())
+        ret_ref(rets, 0, t)
+        return
     # The Scalar record, not a Float64: a bool tensor fills on nonzero truth
     # and an int64 one keeps every bit (ops_common.FillScalar).
     fill_value(t, args[unsafe_offset=1].copy())
@@ -635,8 +742,8 @@ def op_fill_tensor_(
     """`fill_` with a 0-d tensor value: a host value fills as its Scalar
     (CUDA's `value.item()` route); a device value is broadcast and copied,
     converting to self's dtype like `copy_`."""
-    var t = v_tensor(args[unsafe_offset=0])
-    var value = v_tensor(args[unsafe_offset=1])
+    var t = v_tensor_c(args[unsafe_offset=0])
+    var value = v_tensor_c(args[unsafe_offset=1])
     if value.rank != 0:
         raise Error(
             "fill_ only supports 0-dimension value tensor but got tensor with ",
@@ -648,7 +755,10 @@ def op_fill_tensor_(
         return
     if not value.on_mojo():
         var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
-        fill_value(t, r[0])
+        if t.is_complex():
+            fill_complex(t, r[0])
+        else:
+            fill_value(t, r[0])
         ret_ref(rets, 0, t)
         return
     var expanded = own(
@@ -668,8 +778,11 @@ def op_fill_tensor_(
 
 # aten::zero_(Tensor(a!) self) -> Tensor(a!)
 def op_zero_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    fill_value(t, 0.0)
+    var t = v_tensor_c(args[unsafe_offset=0])
+    if t.is_complex() and not t.contig:
+        fill_value(t.pairs(), 0.0)
+    else:
+        fill_value(t, 0.0)
     ret_ref(rets, 0, t)
 
 
@@ -677,7 +790,7 @@ def op_zero_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_record_stream(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var t = v_tensor(args[unsafe_offset=0])
+    var t = v_tensor_c(args[unsafe_offset=0])
     var st = v_stream(args[unsafe_offset=1])
     var handle = t.storage_ctx()
     if handle != 0:
@@ -704,8 +817,8 @@ def op_copy_from_and_resize(
 ) raises:
     """What a CPU fallback uses to write a result back (MPS's kernel):
     `dst.resize_as_(self)`, then `dst.copy_(self)`."""
-    var src = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
+    var src = v_tensor_c(args[unsafe_offset=0])
+    var dst = v_tensor_c(args[unsafe_offset=1])
     _ = call_op(
         "aten::resize_as_",
         "",
@@ -734,6 +847,8 @@ def register_core(site: Site) raises:
     _aten_view(site, "_unsafe_view")
     _aten_view(site, "_reshape_alias")
     _aten_view(site, "as_strided")
+    _aten_view(site, "view_as_real")
+    _aten_view(site, "view_as_complex")
     impl[op_local_scalar_dense, "_local_scalar_dense"](site)
     impl[op_fill_scalar_, "fill_.Scalar"](site)
     impl[op_fill_tensor_, "fill_.Tensor"](site)

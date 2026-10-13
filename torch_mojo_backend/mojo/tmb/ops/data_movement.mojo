@@ -84,6 +84,8 @@ from tmb.backend.abi import (
     v_memory_format_or,
     v_opt_tensor_list_present,
     v_tensor,
+    v_tensor_c,
+    is_complex_stype,
     v_storage,
     v_tensor_list,
     view_strided,
@@ -101,6 +103,8 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    cast_complex,
+    cx_unary_into,
     assert_no_internal_overlap,
     assert_no_overlap,
     assert_no_partial_overlap,
@@ -123,6 +127,32 @@ from tmb.ops.common import (
     resize_storage_bytes,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    cx_cat,
+    cx_cat_out,
+    cx_gather,
+    cx_gather_out,
+    cx_index,
+    cx_index_add,
+    cx_index_add_,
+    cx_index_add_out,
+    cx_index_put_impl_,
+    cx_index_select,
+    cx_index_select_out,
+    cx_masked_select,
+    cx_masked_select_out,
+    cx_repeat,
+    cx_stack,
+    cx_tril,
+    cx_tril_,
+    cx_tril_out,
+    cx_triu,
+    cx_triu_,
+    cx_triu_out,
+    cx_via_bool,
+    routed,
+    routed_list,
+)
 from tmb.ops.core import (
     _device_copy,
     cast_for_copy,
@@ -401,7 +431,7 @@ def _materialize_contiguous(t: T) raises -> T:
             copy_d2d(ctx, out.ptr, t.ptr, t.numel * t.itemsize)
             _ = ctx
         return out^
-    if t.numel > 0 and t.rank >= 1 and t.rank <= 4:
+    if t.numel > 0 and t.rank >= 1 and t.rank <= 4 and not t.is_complex():
         return _permute_materialize(t)
     var out = new_like(t)
     if t.numel > 0:
@@ -446,9 +476,13 @@ def _materialize_as(t: T, strides: IndexList[MAX_RANK]) raises -> T:
 
 # aten::clone(Tensor self, *, MemoryFormat? memory_format=None) -> Tensor
 def op_clone(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
+    var t = v_tensor_c(args[unsafe_offset=0])
     var mf = v_memory_format_or(args[unsafe_offset=1], MEMORY_FORMAT_PRESERVE)
     var out = own(_materialize_as(t, _wanted_strides(t, mf)))
+    # The Conjugate fallback lets clone through with the bit set (as it does
+    # copy_): the copy is the conjugated values, its storage dense.
+    if t.is_complex() and t.is_conj():
+        cx_unary_into("conj", out.t, out.t)
     # ATen's Negative fallback resolves logical views by calling clone with
     # the bit still set (NegateFallback.cpp). A raw copy loses that transform.
     # Query through the tensor accessor: dispatching is_neg itself would
@@ -689,12 +723,65 @@ def op_from_file(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+def _to_copy_complex(t: T, stype: Int32, args: Values, rets: Values) raises:
+    """`_to_copy` changing to or from a complex dtype: the conversion runs on
+    the tensor's own device (`cast_complex`; CPU torch for a host tensor),
+    laid out as the memory format asks, and the rest of the move (device,
+    pinning, layout) is `_to_copy` again with the dtype already right."""
+    var converted: Owned
+    if t.on_mojo():
+        var mf = v_memory_format_or(
+            args[unsafe_offset=6], MEMORY_FORMAT_PRESERVE
+        )
+        var want = _wanted_strides(t, mf)
+        converted = own(_relayout_owned(own(cast_complex(t, stype)), want))
+    elif t.on_cpu():
+        var on_host = call_op(
+            "aten::_to_copy",
+            "",
+            [
+                tensor_arg(t),
+                args[unsafe_offset=1].copy(),
+                none_arg(),
+                none_arg(),
+                none_arg(),
+                bool_arg(False),
+                args[unsafe_offset=6].copy(),
+            ],
+            1,
+        )
+        converted = own(on_host.take_tensor(0))
+    else:
+        unsupported("aten::_to_copy from a non-cpu, non-mojo device")
+        return
+    var moved = call_op(
+        "aten::_to_copy",
+        "",
+        [
+            tensor_arg(converted.t),
+            none_arg(),
+            args[unsafe_offset=2].copy(),
+            args[unsafe_offset=3].copy(),
+            args[unsafe_offset=4].copy(),
+            args[unsafe_offset=5].copy(),
+            args[unsafe_offset=6].copy(),
+        ],
+        1,
+    )
+    _ = converted^  # read by the call above
+    var result = own(moved.take_tensor(0))
+    ret_owned(rets, 0, result)
+
+
 # aten::_to_copy(Tensor self, *, ScalarType? dtype=None, Layout? layout=None,
 #   Device? device=None, bool? pin_memory=None, bool non_blocking=False,
 #   MemoryFormat? memory_format=None) -> Tensor
 def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
+    var t = v_tensor_c(args[unsafe_offset=0])
     var stype = v_dtype_or(args[unsafe_offset=1], t.stype)
+    if stype != t.stype and (t.is_complex() or is_complex_stype(stype)):
+        _to_copy_complex(t, stype, args, rets)
+        return
     var layout = args[unsafe_offset=2].copy()
     if layout.tag != TAG_NONE and layout.a != 0:
         raise Error(
@@ -3563,8 +3650,8 @@ def op_resize_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     the storage offset and takes contiguous strides, growing the storage
     (bytes kept up to the old size) only when the elements reach past its
     end; an unchanged shape keeps its strides. A memory format then restrides
-    (`empty_tensor_restride`)."""
-    var self_t = v_tensor(args[unsafe_offset=0])
+    (`empty_tensor_restride`). Bytes only: any dtype, complex included."""
+    var self_t = v_tensor_c(args[unsafe_offset=0])
     var sizes = IntList(args[unsafe_offset=1])
     var rank = len(sizes)
     if rank > MAX_RANK:
@@ -3820,16 +3907,16 @@ def register_data_movement(site: Site) raises:
     impl[op_split_with_sizes_copy_out, "split_with_sizes_copy.out"](site)
     impl[op_clone, "clone"](site)
     impl[op_to_copy, "_to_copy"](site)
-    impl[op_cat, "cat"](site)
-    impl[op_cat_out, "cat.out"](site)
-    impl[op_stack, "stack"](site)
-    impl[op_repeat, "repeat"](site)
-    impl[op_tril, "tril"](site)
-    impl[op_triu, "triu"](site)
-    impl[op_tril_out, "tril.out"](site)
-    impl[op_triu_out, "triu.out"](site)
-    impl[op_tril_, "tril_"](site)
-    impl[op_triu_, "triu_"](site)
+    impl[routed_list[op_cat, cx_cat], "cat"](site)
+    impl[routed_list[op_cat_out, cx_cat_out], "cat.out"](site)
+    impl[routed_list[op_stack, cx_stack], "stack"](site)
+    impl[routed[op_repeat, cx_repeat, 1], "repeat"](site)
+    impl[routed[op_tril, cx_tril, 1], "tril"](site)
+    impl[routed[op_triu, cx_triu, 1], "triu"](site)
+    impl[routed[op_tril_out, cx_tril_out, 1], "tril.out"](site)
+    impl[routed[op_triu_out, cx_triu_out, 1], "triu.out"](site)
+    impl[routed[op_tril_, cx_tril_, 1], "tril_"](site)
+    impl[routed[op_triu_, cx_triu_, 1], "triu_"](site)
     impl[op_select_scatter, "select_scatter"](site)
     impl[op_scatter_src, "scatter.src"](site)
     impl[op_scatter_src_, "scatter_.src"](site)
@@ -3838,18 +3925,25 @@ def register_data_movement(site: Site) raises:
     impl[op_scatter_add, "scatter_add"](site)
     impl[op_scatter_add_, "scatter_add_"](site)
     impl[op_scatter_add_out, "scatter_add.out"](site)
-    impl[op_gather, "gather"](site)
-    impl[op_gather_out, "gather.out"](site)
-    impl[op_index_select, "index_select"](site)
-    impl[op_index_select_out, "index_select.out"](site)
-    impl[op_index_add, "index_add"](site)
-    impl[op_index_add_, "index_add_"](site)
-    impl[op_index_add_out, "index_add.out"](site)
-    impl[op_index_tensor, "index.Tensor"](site)
-    impl[op_index_put_impl_, "_index_put_impl_"](site)
-    impl[op_nonzero, "nonzero"](site)
-    impl[op_masked_select, "masked_select"](site)
-    impl[op_masked_select_out, "masked_select.out"](site)
+    impl[routed[op_gather, cx_gather, 1], "gather"](site)
+    impl[routed[op_gather_out, cx_gather_out, 1], "gather.out"](site)
+    impl[routed[op_index_select, cx_index_select, 1], "index_select"](site)
+    impl[
+        routed[op_index_select_out, cx_index_select_out, 1], "index_select.out"
+    ](site)
+    impl[routed[op_index_add, cx_index_add, 4], "index_add"](site)
+    impl[routed[op_index_add_, cx_index_add_, 4], "index_add_"](site)
+    impl[routed[op_index_add_out, cx_index_add_out, 4], "index_add.out"](site)
+    impl[routed[op_index_tensor, cx_index, 1], "index.Tensor"](site)
+    impl[routed[op_index_put_impl_, cx_index_put_impl_, 3], "_index_put_impl_"](
+        site
+    )
+    impl[routed[op_nonzero, cx_via_bool["nonzero", "", 1], 1], "nonzero"](site)
+    impl[routed[op_masked_select, cx_masked_select, 1], "masked_select"](site)
+    impl[
+        routed[op_masked_select_out, cx_masked_select_out, 1],
+        "masked_select.out",
+    ](site)
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
     impl[op_set_, "set_"](site)
     impl[op_is_set_to, "is_set_to"](site)

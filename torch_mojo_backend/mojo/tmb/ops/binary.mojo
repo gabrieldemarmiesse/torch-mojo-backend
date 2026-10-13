@@ -89,6 +89,10 @@ from tmb.ops.common import (
 )
 from tmb.ops.core import cast_for_copy
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    cx_via_bool,
+    routed,
+)
 from tmb.ops.foreach import _foreach_addc_launch, _foreach_lerp_launch
 
 # ---------------------------------------------------------------------------
@@ -797,11 +801,16 @@ def _b_fast_route(
     if not _b_is_tensor_rec(av):
         return False
     var a = T(Int(av.a))
-    if not a.on_mojo() or not a.contig:
+    if not a.on_mojo() or not a.contig or a.is_complex():
         return False
     var bv = args[unsafe_offset=1].copy()
     if _b_is_tensor_rec(bv):
         var b = T(Int(bv.a))
+        if b.is_complex():
+            # a complex operand (a wrapped complex number included): the
+            # real routes would read its pairs as reals; the slow path
+            # declines it (`v_tensor`) where no complex route took it
+            return False
         if b.on_mojo():
             if tt.byte_length() == 0:
                 return False
@@ -1996,11 +2005,16 @@ def _b_fast_div(args: Values, rets: Values, dest_h: Int) raises -> Bool:
     if not _b_is_tensor_rec(av):
         return False
     var a = T(Int(av.a))
-    if not a.on_mojo() or not a.contig:
+    if not a.on_mojo() or not a.contig or a.is_complex():
         return False
     var bv = args[unsafe_offset=1].copy()
     if _b_is_tensor_rec(bv):
         var b = T(Int(bv.a))
+        if b.is_complex():
+            # a complex operand (a wrapped complex number included): the
+            # real routes would read its pairs as reals; the slow path
+            # declines it (`v_tensor`) where no complex route took it
+            return False
         if b.on_mojo():
             if a.stype != b.stype or not _b_is_floating(a.stype):
                 return False
@@ -3003,12 +3017,29 @@ def register_binary(site: Site) raises:
     impl[op_floor_divide, "floor_divide.Scalar"](site)
     impl[op_floor_divide_out, "floor_divide.out"](site)
     impl[op_floor_divide_, "floor_divide_.Tensor"](site)
-    impl[op_logical_and, "logical_and"](site)
-    impl[op_logical_and_out, "logical_and.out"](site)
-    impl[op_logical_or, "logical_or"](site)
-    impl[op_logical_or_out, "logical_or.out"](site)
-    impl[op_logical_xor, "logical_xor"](site)
-    impl[op_logical_xor_out, "logical_xor.out"](site)
+    impl[
+        routed[op_logical_and, cx_via_bool["logical_and", "", 2], 2],
+        "logical_and",
+    ](site)
+    impl[
+        routed[op_logical_and_out, cx_via_bool["logical_and", "out", 2], 2],
+        "logical_and.out",
+    ](site)
+    impl[
+        routed[op_logical_or, cx_via_bool["logical_or", "", 2], 2], "logical_or"
+    ](site)
+    impl[
+        routed[op_logical_or_out, cx_via_bool["logical_or", "out", 2], 2],
+        "logical_or.out",
+    ](site)
+    impl[
+        routed[op_logical_xor, cx_via_bool["logical_xor", "", 2], 2],
+        "logical_xor",
+    ](site)
+    impl[
+        routed[op_logical_xor_out, cx_via_bool["logical_xor", "out", 2], 2],
+        "logical_xor.out",
+    ](site)
     impl[op_maximum, "maximum"](site)
     impl[op_maximum_out, "maximum.out"](site)
     impl[op_minimum, "minimum"](site)
