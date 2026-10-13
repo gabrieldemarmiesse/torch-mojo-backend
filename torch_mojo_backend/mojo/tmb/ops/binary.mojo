@@ -89,7 +89,7 @@ from tmb.ops.common import (
 )
 from tmb.ops.core import cast_for_copy
 from tmb.backend.registry import Site, impl
-from tmb.ops.foreach import _foreach_addc_launch, _foreach_lerp_launch
+from tmb.ops.foreach import foreach_addc_inplace, foreach_lerp_inplace
 
 # ---------------------------------------------------------------------------
 # dtype predicates: the gates of the kernels this file calls
@@ -2740,17 +2740,8 @@ def _b_addc(
             _b_no_partial_overlap(dest, b)
             _b_no_partial_overlap(dest, c)
             if _b_same_tensor(dest, a) and a.dtype == DType.float32:
-                var selves = List[T]()
-                var firsts = List[T]()
-                var seconds = List[T]()
-                selves.append(dest.copy())
-                firsts.append(b.copy())
-                seconds.append(c.copy())
-                var kernel = "ForeachAddcmul"
-                if op == "AddcdivBcast":
-                    kernel = "ForeachAddcdiv"
-                _foreach_addc_launch(
-                    selves, firsts, seconds, s.f, kernel, bump_versions=False
+                foreach_addc_inplace(
+                    dest, b, c, s.f, multiplies=op == "AddcmulBcast"
                 )
                 return Res(dest^, False)
             _b_addc_into(op, a, b, c, merged, s.f, dest)
@@ -2918,13 +2909,9 @@ def _b_lerp(args: Values, dst: Optional[T] = None) raises -> Res:
         ):
             _b_no_partial_overlap(dest, finish)
             # The single-tensor in-place decomposition reaches Scalar_out.
-            # Reuse the existing fused foreach arithmetic for one tensor;
+            # Reuse the foreach multi-tensor apply for one tensor;
             # ADInplaceOrView handles this op's version increment itself.
-            var starts = List[T]()
-            starts.append(dest.copy())
-            var finishes = List[T]()
-            finishes.append(finish.copy())
-            _foreach_lerp_launch(starts, finishes, weight, bump_versions=False)
+            foreach_lerp_inplace(dest, finish, weight)
             return Res(dest^, False)
     var delta = _b_binary(
         "SubSpec", _b_tside(finish), _b_tside(start), Int32(-1), None
