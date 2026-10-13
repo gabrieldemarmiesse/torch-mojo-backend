@@ -142,24 +142,10 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "exp": ("complex64",),
     "exp2": ("complex64",),
     "expm1": ("complex64",),
-    "fft_fft": ("float32", "int64", "bool", "complex64"),
-    "fft_fft2": ("float32", "int64", "bool", "complex64"),
-    "fft_fftn": ("float32", "int64", "bool", "complex64"),
-    "fft_hfft": ("float32", "int64", "bool", "complex64"),
-    "fft_hfft2": ("float32", "int64", "bool", "complex64"),
-    "fft_hfftn": ("float32", "int64", "bool", "complex64"),
-    "fft_ifft": ("float32", "int64", "bool", "complex64"),
-    "fft_ifft2": ("float32", "int64", "bool", "complex64"),
-    "fft_ifftn": ("float32", "int64", "bool", "complex64"),
-    "fft_ihfft": ("float32", "int64", "bool"),
-    "fft_ihfft2": ("float32", "int64", "bool"),
-    "fft_ihfftn": ("float32", "int64", "bool"),
-    "fft_irfft": ("float32", "int64", "bool", "complex64"),
-    "fft_irfft2": ("float32", "int64", "bool", "complex64"),
-    "fft_irfftn": ("float32", "int64", "bool", "complex64"),
-    "fft_rfft": ("float32", "int64", "bool"),
-    "fft_rfft2": ("float32", "int64", "bool"),
-    "fft_rfftn": ("float32", "int64", "bool"),
+    # float32 FFT rounding on a near-zero output of the 3-D sample: 1.4e-7 of
+    # the largest output from float64 (cuFFT 8.6e-8, CPU 8.9e-8); stock CUDA
+    # fails the complex64 node as well.
+    "fft_hfft2": ("int64", "complex64"),
     "float_power": ("complex64",),
     "geqrf": ("complex64",),
     "gradient": ("complex64",),
@@ -318,7 +304,7 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "std_mean": ("complex64",),
     "std_mean_unbiased": ("complex64",),
     "std_unbiased": ("complex64",),
-    "stft": ("float32", "complex64"),
+    "stft": ("complex64",),
     "sub": ("complex64",),
     "sum": ("complex64",),
     "sum_to_size": ("complex64",),
@@ -449,6 +435,9 @@ _ACCELERATOR_DELTAS: dict[str, dict[str, dict[str, tuple[str, ...]]]] = {
                 "int64",
                 "complex64",
             ),
+            # float32 FFT rounding (see the base complex64 entry), 1.6e-5
+            # relative on one near-zero output of the 3-D sample.
+            "fft_hfft2": ("float32", "int64", "complex64"),
             # a float64 operand on the way (no float64 on Metal)
             "nn_functional_l1_loss": ("complex64",),
             "softmax_with_dtype": (
