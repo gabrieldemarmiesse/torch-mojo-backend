@@ -105,6 +105,14 @@ comptime BLOCK_128X128 = 5
 # at::blas::SwizzleType
 comptime SWIZZLE_32_4_4 = 1
 
+# The order the epilogue applies scale_a and scale_b in -- each CUDA path's
+# own, measured on stock CUDA with 1e37 / 1e-37 scales (which overflows):
+# tensorwise is cuBLAS's combined alpha, the grouped CUTLASS epilogue is
+# ScaleB * (ScaleA * acc), rowwise _scaled_mm multiplies by scale_b first.
+comptime ORDER_COMBINED = 0
+comptime ORDER_A_THEN_B = 2
+comptime ORDER_B_THEN_A = 4
+
 # `Dequant`'s recipes (tmb/kernels/scaled_mm/entry.mojo).
 comptime DQ_NONE = 0
 comptime DQ_TENSOR = 1
@@ -351,7 +359,11 @@ def _check_mat_dtypes(
         raise Error(
             "Multiplication of two Float8_e5m2 matrices is not supported"
         )
-    if a.stype == ST_FLOAT8_E8M0FNU or b.stype == ST_FLOAT8_E8M0FNU:
+    # (CUDA reaches this only past its empty-result early return.)
+    var empty = a.numel == 0 or b.numel == 0
+    if (
+        a.stype == ST_FLOAT8_E8M0FNU or b.stype == ST_FLOAT8_E8M0FNU
+    ) and not empty:
         unsupported(
             "_scaled_mm of Float8_e8m0fnu matrices (a scale dtype, not a data"
             " dtype)"
@@ -386,11 +398,9 @@ def _dq_none() -> _Dq:
     return _Dq(DQ_NONE, 0, 0, 0)
 
 
-def _dequant(
-    src: T, rows: Int, cols: Int, rs: Int, cs: Int, dq: _Dq
-) raises -> Owned:
+def _dequant(src: T, rows: Int, cols: Int, rs: Int, cs: Int) raises -> Owned:
     """A contiguous float32 `rows` x `cols` copy of the float8 matrix at
-    `src` (element strides rs, cs), its block scales applied per `dq`."""
+    `src` (element strides rs, cs): exact, unscaled."""
     var out = own(new_tensor(_shape2(rows, cols), 2, ST_FLOAT32, src.device))
     var ctx = ctx_for(src.device)
     var cp = ctx_ptr(ctx)
@@ -402,10 +412,6 @@ def _dequant(
     call.int(cols)
     call.int(rs)
     call.int(cs)
-    call.int(dq.addr)
-    call.int(dq.recipe)
-    call.int(dq.ss0)
-    call.int(dq.ss1)
     call.int(cp)
     call.run()
     _ = ctx
@@ -458,12 +464,12 @@ def _scaled_gemm(
     sb: _Outer,
     bias: Optional[T],
     scale_result: Int = 0,
-    sequential: Bool = False,
+    order: Int = ORDER_COMBINED,
     grouped: Bool = False,
 ) raises:
     """dest (M x N, any strides) = cvt((dequant(a) @ dequant(b) * (sa * sb)
-    + bias) * scale_result), or `(acc * sa) * sb` when `sequential` (the
-    grouped CUTLASS epilogue's order, ScaledGroupMM.cu). `b` is mat2 (K x N); its scale view `dq_b` is
+    + bias) * scale_result), the outer scales applied in `order` (see the
+    ORDER_* constants: each CUDA path has its own). `b` is mat2 (K x N); its scale view `dq_b` is
     indexed (n, k). `scale_result` is a float32 scalar's address (0: none)."""
     var m = a.dim(0)
     var k = a.dim(1)
@@ -483,9 +489,9 @@ def _scaled_gemm(
     elif dq_a.recipe != DQ_NONE or dq_b.recipe != DQ_NONE:
         p = _block_scaled_product(a, b, dq_a, dq_b)
     else:
-        var a32 = _dequant(a, m, k, a.stride(0), a.stride(1), _dq_none())
+        var a32 = _dequant(a, m, k, a.stride(0), a.stride(1))
         # B transposed: row n of B^T is column n of B.
-        var bt32 = _dequant(b, n, k, b.stride(1), b.stride(0), _dq_none())
+        var bt32 = _dequant(b, n, k, b.stride(1), b.stride(0))
         p = _gemm_f32(a32.t, bt32.t, True)
         _ = a32^
         _ = bt32^
@@ -515,13 +521,11 @@ def _scaled_gemm(
     if bias:
         var bv = flat_bias.t.copy()
         call.int(bv.ptr)
-        call.int(
-            (1 if bv.dtype == DType.float16 else 0) | (2 if sequential else 0)
-        )
+        call.int((1 if bv.dtype == DType.float16 else 0) | order)
         call.int(1)
     else:
         call.int(0)
-        call.int(2 if sequential else 0)
+        call.int(order)
         call.int(0)
     call.int(scale_result)
     call.int(dtype_code(dest.dtype))
@@ -566,8 +570,8 @@ def _block_scaled_product(a: T, b: T, dq_a: _Dq, dq_b: _Dq) raises -> Owned:
                 b.offset + k0 * b.stride(0),
             )
         )
-        var a32 = _dequant(av.t, m, kl, a.stride(0), a.stride(1), _dq_none())
-        var bt32 = _dequant(bv.t, n, kl, b.stride(1), b.stride(0), _dq_none())
+        var a32 = _dequant(av.t, m, kl, a.stride(0), a.stride(1))
+        var bt32 = _dequant(bv.t, n, kl, b.stride(1), b.stride(0))
         _ = av^
         _ = bv^
         var part = _gemm_f32(a32.t, bt32.t, True)
@@ -624,7 +628,18 @@ def _run_recipe(
 ) raises:
     var pa = _plan(kind_a, sa, a.dim(0))
     var pb = _plan(kind_b, sb, b.dim(1))
-    _scaled_gemm(dest, a, b, pa[0], pb[0], pa[1], pb[1], bias, scale_result)
+    _scaled_gemm(
+        dest,
+        a,
+        b,
+        pa[0],
+        pb[0],
+        pa[1],
+        pb[1],
+        bias,
+        scale_result,
+        ORDER_B_THEN_A if kind_a == ROW_WISE else ORDER_COMBINED,
+    )
 
 
 # --- aten::_scaled_mm (v1) ---------------------------------------------------
@@ -778,7 +793,9 @@ def _scaled_mm_v1(
     if scale_result:
         devs.append(scale_result.value().copy())
     _check_same_device(devs)
-    _check_out_dtype(dest.stype)
+    if a.numel > 0 and b.numel > 0:
+        # CUDA's output-dtype limits are cuBLAS's, past the empty early return.
+        _check_out_dtype(dest.stype)
     resize_out(dest, _shape2(a.dim(0), n), 2)
     var sb = _sc(scale_b) if kinds[1] == BLOCK_1X32 else _sc_t(scale_b)
     # ScaledBlas.cpp hands scale_result to cuBLAS as the D scale only for a
@@ -855,23 +872,33 @@ def op_scaled_mm_out(
     var dest = v_tensor(args[unsafe_offset=8])
     var has_dt = not v_is_none(args[unsafe_offset=6])
     var out_st = v_dtype_or(args[unsafe_offset=6], dest.stype)
-    var alias = _aliases_any(dest, _arg_tensors(args, [0, 1, 2, 3, 4, 5]))
-    var tmp = own(new_tensor(_shape2(0, 0), 2, dest.stype, dest.device))
-    var target = tmp.t.copy() if alias else dest.copy()
-    _scaled_mm_v1(
-        a,
-        b,
-        v_tensor(args[unsafe_offset=2]),
-        v_tensor(args[unsafe_offset=3]),
-        v_opt_tensor(args[unsafe_offset=4]),
-        v_opt_tensor(args[unsafe_offset=5]),
-        out_st,
-        has_dt,
-        target,
-    )
-    if alias:
-        _land(dest, target)
-    _ = tmp^
+    if _aliases_any(dest, _arg_tensors(args, [0, 1, 2, 3, 4, 5])):
+        var tmp = own(new_tensor(_shape2(0, 0), 2, dest.stype, dest.device))
+        _scaled_mm_v1(
+            a,
+            b,
+            v_tensor(args[unsafe_offset=2]),
+            v_tensor(args[unsafe_offset=3]),
+            v_opt_tensor(args[unsafe_offset=4]),
+            v_opt_tensor(args[unsafe_offset=5]),
+            out_st,
+            has_dt,
+            tmp.t,
+        )
+        _land(dest, tmp.t)
+        _ = tmp^
+    else:
+        _scaled_mm_v1(
+            a,
+            b,
+            v_tensor(args[unsafe_offset=2]),
+            v_tensor(args[unsafe_offset=3]),
+            v_opt_tensor(args[unsafe_offset=4]),
+            v_opt_tensor(args[unsafe_offset=5]),
+            out_st,
+            has_dt,
+            dest,
+        )
     ret_ref(rets, 0, v_tensor(args[unsafe_offset=8]))
 
 
@@ -1283,6 +1310,15 @@ def _scaled_mm_v2(args: Values, mut dest: T) raises:
             and sb.stype == ST_FLOAT32
             and not (kind_a == BLOCK_128X128 and kind_b == BLOCK_128X128)
         )
+    # Every fp8 recipe check (check_*_recipe) wants exactly one scale and
+    # one recipe per side; extra entries select no implementation.
+    if (
+        len(scale_a) != 1
+        or len(scale_b) != 1
+        or len(recipe_a) != 1
+        or len(recipe_b) != 1
+    ):
+        found = False
     if not found:
         _v2_invalid(a, b, sa, sb)
     if kind_a == TENSOR_WISE:
@@ -1603,7 +1639,7 @@ def _grouped_rowwise(
             _Outer(sav.ptr, sav.stride(0) if sav.rank >= 1 else 0),
             _Outer(sbv.ptr, sbv.stride(0) if sbv.rank >= 1 else 0),
             none,
-            sequential=True,
+            order=ORDER_A_THEN_B,
             grouped=True,
         )
 

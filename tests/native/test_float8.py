@@ -1693,3 +1693,106 @@ def test_scaled_grouped_mm_requires_e4m3fn(mojo_device):
             s,
             out_dtype=torch.bfloat16,
         )
+
+
+# ---------------------------------------------------------------------------
+# scaled-mm PR review, round 2
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_scaled_mm_rowwise_scale_order(mojo_device, out_dtype):
+    """Rowwise scales apply one at a time, scale_b first (measured on stock
+    CUDA: 1e-37 / 1e37 overflows, 1e37 / 1e-37 does not), in v1 and v2."""
+    dev = mojo_device
+    m, k, n = 128, 256, 128
+    a = torch.ones(m, k).to(torch.float8_e4m3fn).to(dev)
+    b = torch.ones(n, k).to(torch.float8_e4m3fn).to(dev).t()
+
+    def run(va: float, vb: float, v2: bool) -> float:
+        sa = torch.full((m, 1), va, device=dev)
+        sb = torch.full((1, n), vb, device=dev)
+        if v2:
+            out = torch.nn.functional.scaled_mm(
+                a,
+                b,
+                sa,
+                ScalingType.RowWise,
+                sb,
+                ScalingType.RowWise,
+                output_dtype=out_dtype,
+            )
+        else:
+            out = torch._scaled_mm(a, b, sa, sb, out_dtype=out_dtype)
+        return out[0, 0].float().item()
+
+    for v2 in (False, True):
+        assert run(1e-37, 1e37, v2) == float("inf")
+        assert run(1e37, 1e-37, v2) == 256.0
+        assert run(2.0, 3.0, v2) == 1536.0
+
+
+def test_scaled_mm_v2_deepseek_scale_list_length(mojo_device):
+    """Every recipe takes exactly one scale per side: an extra one selects no
+    implementation (CUDA's invalid-configuration error)."""
+    a, b, _, _, _, v2 = _blockwise_case("1x128", "1x128", 128, 256, 128)
+    dev = mojo_device
+    sa = v2[0].to(dev)
+    with pytest.raises(
+        (RuntimeError, ValueError), match="Invalid scaling configuration"
+    ):
+        torch.ops.aten._scaled_mm_v2(
+            a.to(dev),
+            b.to(dev),
+            [sa, sa],
+            [4],
+            [],
+            [v2[1].to(dev)],
+            [4],
+            [],
+            None,
+            torch.bfloat16,
+            [],
+            False,
+        )
+
+
+def test_scaled_grouped_mm_v2_out_aliasing(mojo_device):
+    if "out" not in torch.ops.aten._scaled_grouped_mm_v2.overloads():
+        pytest.skip("this torch has no _scaled_grouped_mm_v2.out overload")
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    a = torch.ones(2, 16, 32).to(f8).to(dev)
+    b = torch.ones(2, 16, 32).to(f8).to(dev).transpose(1, 2)
+    sa = torch.full((2, 16), 2.0, device=dev)
+    sb = torch.full((2, 16), 3.0, device=dev)
+    alias = sa.view(torch.bfloat16)  # out shares scale_a's storage
+    torch.ops.aten._scaled_grouped_mm_v2.out(
+        a,
+        b,
+        [sa],
+        [1],
+        [],
+        [sb],
+        [1],
+        [],
+        None,
+        None,
+        torch.bfloat16,
+        [],
+        False,
+        out=alias,
+    )
+    assert alias.shape == (2, 16, 16)
+    assert (alias.cpu().float() == 192.0).all()
+
+
+def test_scaled_mm_empty_with_unsupported_dtypes(mojo_device):
+    """CUDA returns an empty / zero result before its output- and
+    matrix-dtype limits apply."""
+    dev = mojo_device
+    one = torch.tensor(1.0, device=dev)
+    a = torch.zeros(0, 16).to(torch.float8_e4m3fn).to(dev)
+    b = torch.zeros(16, 16).to(torch.float8_e4m3fn).to(dev).t()
+    out = torch._scaled_mm(a, b, one, one, out_dtype=torch.float8_e8m0fnu)
+    assert out.shape == (0, 16)

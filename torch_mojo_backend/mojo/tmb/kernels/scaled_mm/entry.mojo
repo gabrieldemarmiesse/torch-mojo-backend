@@ -1,9 +1,9 @@
 # ===----------------------------------------------------------------------=== #
 # The two element-wise halves of torch._scaled_mm around a float32 GEMM.
 #
-#   Dequant   out_f32[r, c] = float(x[r, c]) (* scale(r, c), recipe kept for
-#             completeness; the ops call it unscaled)
-#             x is a float8 matrix of any strides.
+#   Dequant   out_f32[r, c] = float(x[r, c]), x a float8 matrix of any
+#             strides (exact: a float8 value has at most three mantissa
+#             bits).
 #   BlockAccum  acc[i, j] (+)= (p[i, j] * sa(i, kb)) * sb(j, kb)
 #             one K block's partial product folded into the accumulator with
 #             that block's scales, the way cuBLASLt applies 1x128 / 128x128
@@ -38,7 +38,7 @@ from tmb.kernels.common.op_utils import (
     _raw_ctx,
     _raw_dtype_int,
     _raw_int,
-    _spec_dispatcher11,
+    _spec_dispatcher7,
     _spec_dispatcher16,
 )
 from tmb.kernels.common.variant_gates import (
@@ -50,7 +50,7 @@ from tmb.kernels.common.variant_gates import (
     _tmb_entry_error,
 )
 
-# Scale recipes of `Dequant` (the op side spells the same numbers).
+# Block-scale recipes of `BlockAccum` (the op side spells the same numbers).
 comptime RECIPE_NONE = 0
 comptime RECIPE_TENSOR = 1
 comptime RECIPE_ROW = 2
@@ -97,51 +97,19 @@ def _dequant_kernel[
     cols_a: Int64,
     rs_a: Int64,
     cs_a: Int64,
-    scale_ptr: Pointer[Scalar[DType.uint8], ImmutAnyOrigin],
-    recipe_a: Int64,
-    ss0_a: Int64,
-    ss1_a: Int64,
-    scale_e8m0_a: Int64,
 ):
-    var rows = Int(rows_a)
     var cols = Int(cols_a)
-    var total = rows * cols
-    var recipe = Int(recipe_a)
-    var ss0 = Int(ss0_a)
-    var ss1 = Int(ss1_a)
-    var kblocks = (cols + 31) // 32
-    # Typed pointers in, never rebuilt from an integer on the device: Metal
-    # reads nothing through an address an argument smuggled in as an int.
-    var sf = scale_ptr.unsafe_bitcast[Float32]()
+    var total = Int(rows_a) * cols
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var step = Int(grid_dim.x) * Int(block_dim.x)
     while i < total:
         var r = i // cols
         var c = i - r * cols
-        var v = fp8_to_f32[src, 1](
+        out_ptr[unsafe_offset=i] = fp8_to_f32[src, 1](
             SIMD[DType.uint8, 1](
                 in_ptr[unsafe_offset=r * Int(rs_a) + c * Int(cs_a)]
             )
         )[0]
-        if recipe != RECIPE_NONE:
-            var at = 0
-            if recipe == RECIPE_ROW:
-                at = r * ss0
-            elif recipe == RECIPE_BLOCK_1X128:
-                at = r * ss0 + (c // 128) * ss1
-            elif recipe == RECIPE_BLOCK_128X128:
-                at = (r // 128) * ss0 + (c // 128) * ss1
-            elif recipe == RECIPE_MX_SWIZZLED:
-                at = _mx_swizzled_index(r, c // 32, kblocks)
-            var s: Float32
-            if scale_e8m0_a != 0:
-                s = fp8_to_f32[DType.float8_e8m0fnu, 1](
-                    SIMD[DType.uint8, 1](scale_ptr[unsafe_offset=at])
-                )[0]
-            else:
-                s = sf[unsafe_offset=at]
-            v = v * s
-        out_ptr[unsafe_offset=i] = v
         i += step
 
 
@@ -152,15 +120,10 @@ def _dequant_go(
     cols_o: Arg,
     rs_o: Arg,
     cs_o: Arg,
-    scale_o: Arg,
-    recipe_o: Arg,
-    ss0_o: Arg,
-    ss1_o: Arg,
     ctx_o: Arg,
 ) raises:
     """`Dequant`: slots (out f32, in, rows, cols, in row/col strides,
-    scale address, recipe, scale strides, ctx); the scale is float8_e8m0fnu
-    for the MX recipe, float32 otherwise."""
+    ctx). Scales are applied later (`BlockAccum`, `Epilogue`)."""
     var ctx = _raw_ctx(ctx_o)
     var total = _raw_int(rows_o) * _raw_int(cols_o)
     if total == 0:
@@ -184,16 +147,6 @@ def _dequant_go(
                 Int64(_raw_int(cols_o)),
                 Int64(_raw_int(rs_o)),
                 Int64(_raw_int(cs_o)),
-                _make_ptr[DType.uint8](
-                    _raw_int(scale_o) if _raw_int(scale_o)
-                    != 0 else _raw_int(in_o)
-                )
-                .as_unsafe_any_origin()
-                .as_imm(),
-                Int64(_raw_int(recipe_o)),
-                Int64(_raw_int(ss0_o)),
-                Int64(_raw_int(ss1_o)),
-                Int64(1 if _raw_int(recipe_o) == RECIPE_MX_SWIZZLED else 0),
             )
             handled = True
     if not handled:
@@ -374,22 +327,29 @@ def _epilogue_kernel[
     var has_sb = (flags & 2) != 0
     var has_bias = (flags & 4) != 0
     var has_sr = (flags & 8) != 0
-    var sequential = (mode & 2) != 0
+    var a_first = (mode & 2) != 0
+    var b_first = (mode & 4) != 0
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var step = Int(grid_dim.x) * Int(block_dim.x)
     while i < total:
         var r = i // n
         var c = i - r * n
         var v = p_ptr[unsafe_offset=i]
-        # One combined scale, as cuBLAS's alpha * scale_a * scale_b: applying
-        # them one at a time overflows (1e38 then 1e-38) where it must not.
-        # (The grouped CUTLASS epilogue instead multiplies them in one at a
-        # time, ScaleB * (ScaleA * acc): `sequential`, mode bit 1.)
-        if sequential:
+        # The outer scales' order is each CUDA path's own, measured on stock
+        # CUDA with 1e37 / 1e-37 scales (which order overflows):
+        #   tensorwise (cuBLAS alpha)    acc * (sa * sb)     mode 0
+        #   grouped (CUTLASS EVT)        (acc * sa) * sb     mode bit 1
+        #   rowwise _scaled_mm           (acc * sb) * sa     mode bit 2
+        if a_first:
             if has_sa:
                 v = v * sa[unsafe_offset=r * Int(sa_stride)]
             if has_sb:
                 v = v * sb[unsafe_offset=c * Int(sb_stride)]
+        elif b_first:
+            if has_sb:
+                v = v * sb[unsafe_offset=c * Int(sb_stride)]
+            if has_sa:
+                v = v * sa[unsafe_offset=r * Int(sa_stride)]
         else:
             var scale = Float32(1)
             if has_sa:
@@ -440,7 +400,8 @@ def _epilogue_go(
     """`Epilogue`: slots (out, p f32 contiguous, m, n, out row/col strides,
     scale_a address + element stride (0: one scalar), scale_b likewise,
     bias address (0: none), mode (bit 0: a float16 bias, else bfloat16;
-    bit 1: sequential outer scales) and bias stride, scale_result address (0: none),
+    bit 1: scale_a then scale_b, bit 2: scale_b then scale_a, neither: one
+    combined factor) and bias stride, scale_result address (0: none),
     out dtype, ctx)."""
     var ctx = _raw_ctx(ctx_o)
     var total = _raw_int(m_o) * _raw_int(n_o)
@@ -499,7 +460,7 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     """C entry of this family: one kernel per build (see `OP`)."""
     try:
         comptime if _op_on["Dequant"]():
-            _spec_dispatcher11[_dequant_go, "Dequant"](argv, argc)
+            _spec_dispatcher7[_dequant_go, "Dequant"](argv, argc)
             return 0
         elif _op_on["BlockAccum"]():
             _spec_dispatcher16[_block_accum_go, "BlockAccum"](argv, argc)
