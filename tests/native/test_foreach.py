@@ -2319,8 +2319,11 @@ def _one_launch(name: str):
     so the multi-tensor apply took the list."""
     native.op_counting(True)
     native.op_counts_reset()
-    yield
-    counts = native.op_counts()
+    try:
+        yield
+        counts = native.op_counts()
+    finally:
+        native.op_counting(False)
     assert set(counts) == {"aten::" + name}, counts
 
 
@@ -2399,6 +2402,59 @@ def test_mta_core_long_lists_span_several_launches(mojo_gpu: str):
         torch._foreach_addcmul_(dev, dev_o, dev_o, value=0.25)
     expected = [torch.addcmul(a - 0.5, b, b, value=0.25) for a, b in zip(cpu, cpu_o)]
     _assert_lists(dev, expected, **_mta_tol(torch.float32))
+
+
+# (list dtype, CPU `other`): float/int lists against float/int 0-d and
+# one-element 1-d CPU tensors.
+_CPU_SCALARS = [
+    (torch.float32, torch.tensor(3.0)),
+    (torch.float32, torch.tensor(3)),
+    (torch.int64, torch.tensor(3)),
+    (torch.int64, torch.tensor(3.0)),
+    (torch.bfloat16, torch.tensor([0.25], dtype=torch.float64)),
+]
+_CPU_SCALAR_IDS = ["f32-f32", "f32-i64", "i64-i64", "i64-f32", "bf16-f64-1d"]
+_CPU_SCALAR_OPS = ["mul"]
+_CPU_SCALAR_INPLACE = [True]
+
+
+@pytest.mark.parametrize(
+    "inplace", _CPU_SCALAR_INPLACE, ids=lambda b: "inplace" if b else "out"
+)
+@pytest.mark.parametrize(("dtype", "other"), _CPU_SCALARS, ids=_CPU_SCALAR_IDS)
+@pytest.mark.parametrize("op", _CPU_SCALAR_OPS)
+def test_mta_tensor_overload_with_a_cpu_scalar(
+    mojo_gpu: str, op: str, dtype: torch.dtype, other: torch.Tensor, inplace: bool
+):
+    """The `.Tensor` overloads with a CPU `other` (called by schema: Python
+    would pick `.Scalar` for a 0-d tensor). mul / div take its item() and
+    run the Scalar overload of the same op, functional or in place
+    (ForeachBinaryOpScalarTensor.cu); add's, of the list dtype, is refused
+    on device, of another dtype the per-tensor op. Errors match the CPU
+    per-tensor op (an in-place promotion) or CUDA's device check."""
+    cpu = [torch.full((5,), 2, dtype=dtype), (torch.arange(1030) % 9).to(dtype)]
+    dev = [t.to(mojo_gpu) for t in cpu]
+    schema = getattr(torch.ops.aten, f"_foreach_{op}_" if inplace else f"_foreach_{op}")
+    if op == "add" and other.dtype == dtype:
+        word = "is expected" if inplace else "expected"
+        with pytest.raises(RuntimeError, match=f"scalar tensor {word} to be on mojo:0"):
+            schema.Tensor(dev, other)
+        return
+    ref = getattr(torch, op)
+    value = other.item() if op != "add" else other
+    try:
+        expected = (
+            [ref(t, value) for t in cpu]
+            if not inplace
+            else [getattr(t.clone(), f"{op}_")(value) for t in cpu]
+        )
+    except RuntimeError as error:
+        assert "can't be cast" in str(error)
+        with pytest.raises(RuntimeError, match="(?i)can't be cast"):
+            schema.Tensor(dev, other)
+        return
+    result = schema.Tensor(dev, other)
+    _assert_lists(dev if inplace else result, expected)
 
 
 def test_mta_core_argument_errors(mojo_gpu: str):

@@ -727,7 +727,9 @@ def _fast_route(
             # CUDA's fast route does not look at the scalar's device; its
             # kernel then refuses it.
             raise Error(
-                "scalar tensor expected to be on ",
+                "scalar tensor is expected to be on " if inplace else (
+                    "scalar tensor expected to be on "
+                ),
                 device_str(first),
                 " but is on ",
                 device_str(other),
@@ -868,12 +870,29 @@ def _per_tensor(
     ret_tensor_list(rets, 0, result)
 
 
-def _row_named(name: StringSlice) raises -> ForeachOverload:
-    comptime for i in range(len(FOREACH_OVERLOADS)):
-        comptime row = FOREACH_OVERLOADS[i]
-        if row.name == name:
-            return row
-    raise Error("no foreach overload ", name)
+def _scalar_twin(e: ForeachOverload) -> ForeachOverload:
+    """The `.Scalar` overload a `.Tensor` row (mul, div) runs when its
+    operand is a CPU tensor: ForeachBinaryOpScalarTensor.cu calls
+    `foreach_tensor_<op>_scalar_kernel_cuda(tensors, scalar.item())`, and
+    div's Scalar overload is the multiply by the reciprocal. Built from the
+    row itself, so a functional and an in-place row both map to their own
+    form."""
+    var div = e.kind == "div"
+    return ForeachOverload(
+        e.name,
+        e.name_,
+        "mul" if div else e.kind,
+        S_SCALAR,
+        "aten::mul" if div else e.op,
+        "Scalar",
+        "aten::mul_" if div else e.op_,
+        "Scalar",
+        e.dtypes,
+        e.f64,
+        e.alpha,
+        div,
+        e.apple,
+    )
 
 
 def _foreach(
@@ -890,9 +909,7 @@ def _foreach(
                 other.numel,
                 " elements cannot be converted to Scalar",
             )
-        var scalar_row = _row_named(
-            String(e.name).replace(".Tensor", ".Scalar")
-        )
+        var scalar_row = _scalar_twin(e)
         p.scalar = _cpu_element(other, 0)
         p.other = List[T]()
         if scalar_row.reciprocal:
@@ -907,8 +924,17 @@ def _foreach(
     if e.shape == S_TENSOR:
         ref other = p.other[0]
         if other.rank != 0 or other.numel != 1:
+            # The in-place fast kernel words it without "it"
+            # (ForeachBinaryOpScalarTensor.cu's foreach_binary_op_).
+            var fast_inplace = (
+                inplace
+                and other.dtype == p.lists[0][0].dtype
+                and _lists_on_route(p.lists)
+            )
             raise Error(
-                "scalar tensor expected to be 0 dim but it has ",
+                "scalar tensor expected to be 0 dim but has " if fast_inplace else (
+                    "scalar tensor expected to be 0 dim but it has "
+                ),
                 other.rank,
                 " dimensions and ",
                 other.numel,
