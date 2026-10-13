@@ -40,6 +40,7 @@ from tmb.ops.reductions import register_reductions
 from tmb.ops.resample import register_resample
 from tmb.ops.rnn import register_rnn
 from tmb.ops.roi import register_roi
+from tmb.ops.scaled_mm import register_scaled_mm
 from tmb.ops.scans import register_scans
 from tmb.ops.stats import register_stats
 from tmb.ops.transformer import register_transformer
@@ -70,6 +71,7 @@ def _register_ops(lib: Int) raises:
     _group[register_scans](lib)
     _group[register_stats](lib)
     _group[register_matmul](lib)
+    _group[register_scaled_mm](lib)
     _group[register_linalg](lib)
     _group[register_nn](lib)
     _group[register_loss](lib)

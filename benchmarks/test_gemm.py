@@ -131,6 +131,8 @@ COVERS: dict[str, str] = {
     "aten::_int_mm": "test_blas",
     "aten::_weight_int8pack_mm": "test_blas",
     "aten::_weight_int4pack_mm": "test_blas",
+    "aten::_scaled_mm": "test_scaled_mm",
+    "aten::_scaled_grouped_mm": "test_scaled_grouped_mm",
 }
 
 _BLAS_VARIANT = (
@@ -151,6 +153,18 @@ SKIPPED: dict[str, str] = {
     "aten::bmm.dtype_out": _BLAS_VARIANT,
     "aten::mm.dtype_out": _BLAS_VARIANT,
     "aten::_int_mm.out": _BLAS_VARIANT,
+    "aten::_scaled_mm.out": _BLAS_VARIANT,
+    "aten::_scaled_mm_v2": (
+        "the same dequantize / GEMM / epilogue as _scaled_mm, which "
+        "test_scaled_mm measures; only the recipe arguments are packaged "
+        "differently"
+    ),
+    "aten::_scaled_grouped_mm_v2": (
+        "the same per-group rowwise GEMMs as _scaled_grouped_mm, which "
+        "test_scaled_grouped_mm measures"
+    ),
+    "aten::_scaled_mm_v2.out": _BLAS_VARIANT,
+    "aten::_scaled_grouped_mm_v2.out": _BLAS_VARIANT,
     "aten::_convert_weight_to_int4pack": (
         "a one-time weight repack (a byte copy into the packed tensor), not "
         "on any step's critical path"
@@ -553,3 +567,69 @@ def test_addmm_medium_rows(
         lambda: torch.addmm(bias_our, a_our, b_our),
         flops=2.0 * m * n * k,
     )
+
+
+# --- float8 scaled GEMMs ------------------------------------------------------
+# torch._scaled_mm's two common recipes, A row-major x B column-major (the
+# layout cuBLASLt takes) and a bfloat16 result. The recipe is folded into the
+# shape token; every dimension is a multiple of 16, as the op requires.
+SCALED_SHAPES = {
+    f"{tag}_{recipe}": (*SHAPES[tag], recipe)
+    for tag in ("S1_4096x4096x4096", "S9_16384x1600x1600", "S4_1024x1024x8192")
+    for recipe in ("tensorwise", "rowwise")
+}
+SCALED_DTYPES = {"e4m3": torch.float8_e4m3fn}
+
+
+def _scaled_case(
+    recipe: str, m: int, n: int, k: int, dtype: torch.dtype, device: str | torch.device
+) -> Callable[[], torch.Tensor]:
+    a = torch.randn(m, k, device=device).to(dtype)
+    b = torch.randn(n, k, device=device).to(dtype).t()
+    if recipe == "tensorwise":
+        sa = torch.tensor(0.5, device=device)
+        sb = torch.tensor(2.0, device=device)
+    else:
+        sa = torch.rand(m, 1, device=device) + 0.5
+        sb = torch.rand(1, n, device=device) + 0.5
+    return lambda: torch._scaled_mm(a, b, sa, sb, out_dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("dtype_id", SCALED_DTYPES)
+@pytest.mark.parametrize("shape_id", SCALED_SHAPES)
+def test_scaled_mm(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    if not str(hw.stock_device).startswith("cuda"):
+        pytest.skip("torch._scaled_mm is CUDA-only in stock PyTorch")
+    m, n, k, recipe = SCALED_SHAPES[shape_id]
+    dtype = SCALED_DTYPES[dtype_id]
+    bench.run(
+        _scaled_case(recipe, m, n, k, dtype, hw.stock_device),
+        _scaled_case(recipe, m, n, k, dtype, mojo_device),
+        flops=2.0 * m * n * k,
+    )
+
+
+# G groups of M x N x K, rowwise scales, 3d x 3d.
+GROUPED_SHAPES = {"G8_8x2048x1024x1024": (8, 2048, 1024, 1024)}
+
+
+@pytest.mark.parametrize("dtype_id", SCALED_DTYPES)
+@pytest.mark.parametrize("shape_id", GROUPED_SHAPES)
+def test_scaled_grouped_mm(
+    shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
+):
+    if not str(hw.stock_device).startswith("cuda"):
+        pytest.skip("torch._scaled_grouped_mm is CUDA-only in stock PyTorch")
+    g, m, n, k = GROUPED_SHAPES[shape_id]
+    dtype = SCALED_DTYPES[dtype_id]
+
+    def case(device: str | torch.device) -> Callable[[], torch.Tensor]:
+        a = torch.randn(g, m, k, device=device).to(dtype)
+        b = torch.randn(g, n, k, device=device).to(dtype).transpose(1, 2)
+        sa = torch.rand(g, m, device=device) + 0.5
+        sb = torch.rand(g, n, device=device) + 0.5
+        return lambda: torch._scaled_grouped_mm(a, b, sa, sb, out_dtype=torch.bfloat16)
+
+    bench.run(case(hw.stock_device), case(mojo_device), flops=2.0 * g * m * n * k)
