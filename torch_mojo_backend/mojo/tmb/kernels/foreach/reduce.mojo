@@ -24,18 +24,15 @@ from std.utils.numerics import isnan, min_or_neg_inf
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _enqueue_cached, _make_ptr
 from tmb.kernels.foreach.apply import FE_DESC_CAP, FE_THREADS, ForeachDesc
+from tmb.kernels.foreach.contract import (
+    FE_REDUCE_CHUNK,
+    FR_L0,
+    FR_L1,
+    FR_L2,
+    FR_LINF,
+    FR_MAX,
+)
 from tmb.kernels.foreach.functors import foreach_opmath
-
-
-# Elements per chunk: CUDA's kChunkSize. Fixed, so the host can size the
-# partials scratch from the numels alone.
-comptime FE_REDUCE_CHUNK = 65_536
-
-comptime FR_L0 = 0
-comptime FR_L1 = 1
-comptime FR_L2 = 2
-comptime FR_LINF = 3
-comptime FR_MAX = 4
 
 
 @always_inline
@@ -71,6 +68,11 @@ def _max_nan[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def _identity[acc: DType, norm: Int]() -> Scalar[acc]:
     comptime if norm == FR_MAX:
+        # -inf, the identity of max: _foreach_max([-inf]) is -inf, as on CPU
+        # and in the per-tensor max. Stock CUDA seeds with
+        # `std::numeric_limits<T>::lowest()` instead (ForeachReduceOp.cu:77,
+        # :105, :127 and the scratch fill at :192) and returns -3.4028e38
+        # for a float32 list of -inf.
         return min_or_neg_inf[acc]()
     else:
         return 0

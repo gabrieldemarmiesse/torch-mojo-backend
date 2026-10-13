@@ -32,6 +32,9 @@ from std.math import ceildiv
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    ST_COMPLEX32,
+    ST_COMPLEX64,
+    ST_COMPLEX128,
     ST_FLOAT32,
     ST_FLOAT64,
     ST_UINT8,
@@ -80,6 +83,12 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
 from tmb.kernels.foreach.contract import (
+    FE_REDUCE_CHUNK,
+    FR_L0,
+    FR_L1,
+    FR_L2,
+    FR_LINF,
+    FR_MAX,
     FE_ROLE_ALPHA,
     FE_ROLE_B,
     FE_ROLE_C,
@@ -1330,15 +1339,6 @@ def op_foreach_copy_(
 # family's reduction kernels (tmb/kernels/foreach/reduce.mojo) for a list on
 # the fast route, the per-tensor reduction otherwise.
 
-comptime _FR_L0 = 0
-comptime _FR_L1 = 1
-comptime _FR_L2 = 2
-comptime _FR_LINF = 3
-comptime _FR_MAX = 4
-# CUDA's kChunkSize, reduce.mojo's FE_REDUCE_CHUNK: the partials scratch
-# holds one accumulator per chunk.
-comptime _FR_CHUNK = 65_536
-
 
 def _reduce_launch(
     tensors: List[T], norm: Int, root: Bool, out_stype: Int32
@@ -1348,20 +1348,20 @@ def _reduce_launch(
     var metadata = List[Int](capacity=3 * len(tensors))
     for t in tensors:
         outs.append(own(new_scalar(out_stype, t.device)))
-        total_chunks += ceildiv(t.numel, _FR_CHUNK)
+        total_chunks += ceildiv(t.numel, FE_REDUCE_CHUNK)
     for i in range(len(tensors)):
         metadata.append(tensors[i].ptr)
         metadata.append(outs[i].t.ptr)
         metadata.append(tensors[i].numel)
     var dtype = tensors[0].dtype
     var acc = ST_FLOAT64 if out_stype == ST_FLOAT64 else ST_FLOAT32
-    if norm == _FR_MAX:
+    if norm == FR_MAX:
         acc = ST_UINT8 if dtype == DType.bool else tensors[0].stype
     var shape = IndexList[MAX_RANK](1)
     shape[MAX_RANK - 1] = max(total_chunks, 1)
     var partials = own(new_tensor(shape, 1, acc, tensors[0].device))
     var ctx = ctx_for(tensors[0].device)
-    var call = KernelCall("foreach", "max" if norm == _FR_MAX else "norm")
+    var call = KernelCall("foreach", "max" if norm == FR_MAX else "norm")
     call.flag("FE_NORM", norm)
     call.flag("FE_ROOT", 1 if root else 0)
     call.arg_dtype(0, dtype)
@@ -1392,6 +1392,15 @@ def _check_norm_dtype(dtype_v: Value, self_stype: Int32, name: String) raises:
     if dtype_v.tag == TAG_NONE:
         return
     var dt = v_dtype_or(dtype_v, ST_FLOAT32)
+    if dt == ST_COMPLEX32 or dt == ST_COMPLEX64 or dt == ST_COMPLEX128:
+        raise Error(
+            name,
+            ": dtype should be real for real inputs, but got ",
+            "ComplexHalf" if dt
+            == ST_COMPLEX32 else (
+                "ComplexFloat" if dt == ST_COMPLEX64 else "ComplexDouble"
+            ),
+        )
     if not is_float_stype(dt):
         raise Error(
             name,
@@ -1428,8 +1437,13 @@ def _reduce_on_route(tensors: List[T], floating: Bool) raises -> Bool:
             or dt == DType.bfloat16
             or dt == DType.float64
         )
+    # max: the dtypes the reduction builds (float8 and the wide unsigned
+    # types take the per-tensor max).
     return (
-        dt.is_floating_point()
+        dt == DType.float32
+        or dt == DType.float16
+        or dt == DType.bfloat16
+        or dt == DType.float64
         or dt == DType.bool
         or dt == DType.int8
         or dt == DType.int16
@@ -1453,6 +1467,16 @@ def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
     )
     if len(self_list) == 0:
         raise Error("Tensor list must have at least one tensor.")
+    if not root:
+        # The per-tensor linalg__powsum CUDA's slow route runs dispatches on
+        # floating types only (AT_DISPATCH in its powsum kernel).
+        for t in self_list:
+            if not t.dtype.is_floating_point():
+                unsupported(
+                    '"powsum_cuda" not implemented for \''
+                    + _scalar_type_name(t.dtype)
+                    + "'"
+                )
     var inf = Float64.MAX * 2
     if root and p == inf:
         for t in self_list:
@@ -1464,13 +1488,13 @@ def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
                 )
     var norm = -1
     if p == 0 and root:
-        norm = _FR_L0
+        norm = FR_L0
     elif p == 1:
-        norm = _FR_L1
+        norm = FR_L1
     elif p == 2:
-        norm = _FR_L2
+        norm = FR_L2
     elif p == inf and root:
-        norm = _FR_LINF
+        norm = FR_LINF
     if norm >= 0 and _reduce_on_route(self_list, True):
         _check_norm_dtype(dtype_v, self_list[0].stype, name)
         var out_stype = v_dtype_or(dtype_v, self_list[0].stype)
@@ -1532,7 +1556,7 @@ def op_foreach_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         ret_tensor_list(
             rets,
             0,
-            _reduce_launch(self_list, _FR_MAX, False, self_list[0].stype),
+            _reduce_launch(self_list, FR_MAX, False, self_list[0].stype),
         )
         return
     var result = List[Owned]()

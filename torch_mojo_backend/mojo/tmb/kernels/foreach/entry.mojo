@@ -52,10 +52,8 @@ from tmb.kernels.foreach.apply import (
     foreach_apply_enqueue,
     foreach_chunk_elements,
 )
+from tmb.kernels.foreach.contract import FE_REDUCE_CHUNK, FR_L2, FR_MAX
 from tmb.kernels.foreach.reduce import (
-    FE_REDUCE_CHUNK,
-    FR_L2,
-    FR_MAX,
     foreach_reduce_acc,
     foreach_reduce_enqueue,
 )
