@@ -10,10 +10,13 @@ read theirs with `v_tensor_c`.
 Three ways a complex op is computed:
 
 * elementwise kernels on the pairs: the complex kernel family
-  (tmb/kernels/complex), through `cx_launch`;
+  (tmb/kernels/complex), through `cx_launch` -- the arithmetic and math
+  ops are tmb/ops/complex_math.mojo, built on the routing, promotion,
+  operand and `out=` helpers here;
 * an existing real op on `view_as_real` (cat, indexing, the random
-  fills): a complex element is two adjacent reals, so the real op over the
-  trailing pair dimension is the complex op;
+  fills; sum and mean in complex_math): a complex element is two adjacent
+  reals, so the real op over the trailing pair dimension is the complex
+  op;
 * the byte movers (copy, clone, views) need nothing: they move `itemsize`
   bytes per element (tmb/ops/core.mojo, tmb/ops/data_movement.mojo).
 

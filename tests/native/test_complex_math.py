@@ -1,0 +1,454 @@
+"""Tests for the complex arithmetic and math of the mojo device
+(torch_mojo_backend/mojo/tmb/ops/complex_math.mojo): add / sub / mul / div /
+pow, the unary math, complex() / polar(), sum / mean / cumsum.
+
+Public torch API only, compared against CPU torch (or values recorded from
+stock CUDA torch where CPU and CUDA differ). complex128 needs float64, which
+Apple GPUs do not have.
+"""
+
+import warnings
+
+import pytest
+import torch
+
+from tests.native.conftest import skip_if_metal
+from tests.native.test_complex import CDTYPES, _close, _put, _rand, _skip_c128
+from torch_mojo_backend import native
+
+BINARY = [torch.add, torch.sub, torch.mul, torch.div]
+
+
+@pytest.mark.parametrize("dtype", CDTYPES)
+@pytest.mark.parametrize("op", BINARY, ids=lambda f: f.__name__)
+def test_binary(mojo_gpu: str, dtype: torch.dtype, op):
+    _skip_c128(mojo_gpu, dtype)
+    x = _rand(4, 5, dtype=dtype)
+    y = _rand(4, 5, dtype=dtype)
+    d, e = x.to(mojo_gpu), y.to(mojo_gpu)
+    _close(op(d, e), op(x, y))
+    _close(op(d, 2.5), op(x, 2.5))
+    _close(op(d, 1 - 2j), op(x, 1 - 2j))
+    _close(op(d, 3), op(x, 3))
+    # broadcasting, 0-d and real operands
+    r = torch.randn(5)
+    _close(op(d, r.to(mojo_gpu)), op(x, r))
+    _close(op(r.to(mojo_gpu), d), op(r, x))
+    s = _rand(dtype=dtype)
+    _close(op(d, s.to(mojo_gpu)), op(x, s))
+    _close(op(d[:, :1], e), op(x[:, :1], y))
+    # non-contiguous
+    _close(op(d.t(), e.t()), op(x.t(), y.t()))
+    # a real tensor with a complex scalar promotes to complex
+    _close(op(r.to(mojo_gpu), 2j), op(r, 2j))
+    # out= and in-place
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    op(d, e, out=out)
+    _close(out, op(x, y))
+    g = d.clone()
+    getattr(g, op.__name__ + "_")(e)
+    _close(g, op(x, y))
+
+
+def test_binary_promotion(mojo_gpu: str):
+    skip_if_metal(mojo_gpu, "complex128 needs float64")
+    x = _rand(3)
+    d = x.to(mojo_gpu)
+    r64 = torch.randn(3, dtype=torch.float64)
+    assert (d + r64.to(mojo_gpu)).dtype == torch.complex128
+    _close(d * r64.to(mojo_gpu), x * r64)
+    # a 0-d float64 meets a dimensioned complex64 in complex64
+    z = torch.tensor(2.0, dtype=torch.float64)
+    assert (d * z.to(mojo_gpu)).dtype == torch.complex64
+    c128 = torch.randn(3, dtype=torch.complex128)
+    _close(d + c128.to(mojo_gpu), x + c128)
+
+
+def test_add_alpha(mojo_gpu: str):
+    x, y = _rand(6), _rand(6)
+    d, e = x.to(mojo_gpu), y.to(mojo_gpu)
+    _close(torch.add(d, e, alpha=2), torch.add(x, y, alpha=2))
+    _close(torch.add(d, e, alpha=1j), torch.add(x, y, alpha=1j))
+    _close(torch.sub(d, e, alpha=-0.5), torch.sub(x, y, alpha=-0.5))
+
+
+def test_inplace_errors(mojo_gpu: str):
+    r = torch.randn(3).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        r.add_(_rand(3).to(mojo_gpu))
+    d = _rand(3).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        d.add_(_rand(2, 3).to(mojo_gpu))
+
+
+def test_division_special_values(mojo_gpu: str):
+    num = torch.tensor(
+        [1 + 1j, 1e30 + 1e30j, 1e-30 + 1e-30j, 3 - 4j], dtype=torch.complex64
+    )
+    den = torch.tensor(
+        [0 + 0j, 1e30 - 1e30j, 1e-30 + 2e-30j, 1e-20 + 1e20j], dtype=torch.complex64
+    )
+    _close(num.to(mojo_gpu) / den.to(mojo_gpu), num / den, equal_nan=True)
+
+
+UNARY = [
+    torch.exp,
+    torch.log,
+    torch.sqrt,
+    torch.rsqrt,
+    torch.reciprocal,
+    torch.sgn,
+    torch.neg,
+]
+
+
+@pytest.mark.parametrize("dtype", CDTYPES)
+@pytest.mark.parametrize("op", UNARY, ids=lambda f: f.__name__)
+def test_unary(mojo_gpu: str, dtype: torch.dtype, op):
+    _skip_c128(mojo_gpu, dtype)
+    x = _rand(6, 7, dtype=dtype) * 3
+    _put(x, (0, 0), 0)
+    _put(x, (0, 1), 1)
+    _put(x, (0, 2), -1)
+    _put(x, (0, 3), 1j)
+    _put(x, (0, 4), -2 + 0j)
+    d = x.to(mojo_gpu)
+    _close(op(d), op(x), equal_nan=True)
+    _close(op(d.t()), op(x.t()), equal_nan=True)
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    op(d, out=out)
+    _close(out, op(x), equal_nan=True)
+
+
+# sgn and rsqrt: stock CUDA (the reference) and CPU disagree on infinite
+# inputs; checked against CUDA's own values below.
+@pytest.mark.parametrize(
+    "op",
+    [f for f in UNARY if f not in (torch.sgn, torch.rsqrt)],
+    ids=lambda f: f.__name__,
+)
+def test_unary_special_values(mojo_gpu: str, op):
+    inf, nan = float("inf"), float("nan")
+    vals = [
+        complex(a, b)
+        for a in (0.0, -0.0, 1.0, -1.0, inf, -inf, nan)
+        for b in (0.0, -0.0, 2.0, inf, -inf, nan)
+    ]
+    x = torch.tensor(vals, dtype=torch.complex64)
+    got = op(x.to(mojo_gpu)).cpu()
+    want = op(x)
+    # Annex G special values (as glibc and thrust define them); NaN signs and
+    # the sign of a NaN's partner part are unspecified, so compare NaN-ness
+    # and the finite / infinite values.
+    for g, w, v in zip(got.tolist(), want.tolist(), vals, strict=True):
+        if op is torch.reciprocal and v == 0:
+            # 1 / (+-0 + +-0i): c10 divides by std::abs on gcc builds and by
+            # `x < 0 ? -x : x` on clang ones (macOS torch), which flips the
+            # infinity's sign; CUDA's is +inf.
+            assert g.real == float("inf"), (v, g)
+            continue
+        for gp, wp in ((g.real, w.real), (g.imag, w.imag)):
+            if wp != wp:
+                assert gp != gp, (op, v, g, w)
+            else:
+                assert gp == pytest.approx(wp, rel=1e-5, abs=1e-6), (op, v, g, w)
+
+
+def _same(got: complex, want: complex) -> bool:
+    for g, w in ((got.real, want.real), (got.imag, want.imag)):
+        if w != w:
+            if g == g:
+                return False
+        elif g != pytest.approx(w, rel=1e-5, abs=1e-30):
+            return False
+    return True
+
+
+def test_sgn_rsqrt_match_cuda(mojo_gpu: str):
+    """Values stock torch computes on CUDA (its jiterated libc++ complex
+    math), where CPU torch gives NaNs."""
+    inf, nan = float("inf"), float("nan")
+    x = torch.tensor(
+        [complex(-inf, 2), complex(2, -inf), complex(inf, inf), 0j],
+        dtype=torch.complex64,
+    )
+    got = torch.sgn(x.to(mojo_gpu)).cpu().tolist()
+    want = [complex(nan, 0), complex(0, nan), complex(nan, nan), 0j]
+    assert all(_same(g, w) for g, w in zip(got, want, strict=True)), got
+    y = torch.tensor(
+        [complex(0, inf), complex(inf, 0), complex(-inf, 1), complex(1e30, 1e30), 0j],
+        dtype=torch.complex64,
+    )
+    got = torch.rsqrt(y.to(mojo_gpu)).cpu().tolist()
+    want = [
+        -0j,
+        0j,
+        -0j,
+        complex(7.768870254581787e-16, -3.217971340243285e-16),
+        complex(inf, nan),
+    ]
+    assert all(_same(g, w) for g, w in zip(got, want, strict=True)), got
+
+
+@pytest.mark.parametrize("dtype", CDTYPES)
+def test_to_real(mojo_gpu: str, dtype: torch.dtype):
+    _skip_c128(mojo_gpu, dtype)
+    x = _rand(5, 6, dtype=dtype)
+    _put(x, (0, 0), 0)
+    _put(x, (0, 1), -3)
+    _put(x, (0, 2), 4j)
+    _put(x, (1, 0), complex(float("inf"), 1))
+    _put(x, (1, 1), complex(1, float("nan")))
+    d = x.to(mojo_gpu)
+    _close(torch.abs(d), torch.abs(x), equal_nan=True)
+    _close(torch.angle(d), torch.angle(x), equal_nan=True)
+    for f in (torch.isnan, torch.isinf, torch.isfinite):
+        assert torch.equal(f(d).cpu(), f(x))
+    out = torch.empty(0, dtype=x.real.dtype, device=mojo_gpu)
+    torch.abs(d, out=out)
+    _close(out, torch.abs(x), equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", CDTYPES)
+def test_pow(mojo_gpu: str, dtype: torch.dtype):
+    _skip_c128(mojo_gpu, dtype)
+    x = _rand(4, 4, dtype=dtype) + 0.5
+    y = _rand(4, 4, dtype=dtype) * 0.5
+    d, e = x.to(mojo_gpu), y.to(mojo_gpu)
+    rtol, atol = (1e-4, 1e-5) if dtype == torch.complex64 else (1e-10, 1e-12)
+    for p in (2, 3, 0.5, -0.5, -1, 0, 1, 1.7, 0.5 + 1j):
+        _close(d**p, x**p, rtol=rtol, atol=atol)
+    _close(d**e, x**y, rtol=rtol, atol=atol)
+    _close(2**d, 2**x, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_complex_and_polar(mojo_gpu: str, dtype: torch.dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "float64")
+    re = torch.randn(4, 5, dtype=dtype)
+    im = torch.randn(5, dtype=dtype)
+    _close(torch.complex(re.to(mojo_gpu), im.to(mojo_gpu)), torch.complex(re, im))
+    a = torch.rand(4, 5, dtype=dtype)
+    t = torch.randn(4, 5, dtype=dtype) * 4
+    _close(torch.polar(a.to(mojo_gpu), t.to(mojo_gpu)), torch.polar(a, t))
+    out = torch.empty(
+        0,
+        dtype=re.to(
+            torch.complex64 if dtype == torch.float32 else torch.complex128
+        ).dtype,
+        device=mojo_gpu,
+    )
+    torch.complex(re.to(mojo_gpu), im.to(mojo_gpu), out=out)
+    _close(out, torch.complex(re, im))
+    with pytest.raises(RuntimeError):
+        torch.complex(re.to(mojo_gpu), im.to(mojo_gpu).half())
+
+
+@pytest.mark.parametrize("dtype", CDTYPES)
+def test_sum_mean(mojo_gpu: str, dtype: torch.dtype):
+    _skip_c128(mojo_gpu, dtype)
+    x = _rand(3, 4, 5, dtype=dtype)
+    d = x.to(mojo_gpu)
+    _close(d.sum(), x.sum())
+    _close(d.sum(1), x.sum(1))
+    _close(d.sum((0, -1), keepdim=True), x.sum((0, -1), keepdim=True))
+    _close(d.mean(), x.mean())
+    _close(d.mean(-1), x.mean(-1))
+    _close(d[0, 0, 0].sum(), x[0, 0, 0].sum())
+    out = torch.empty(0, dtype=dtype, device=mojo_gpu)
+    torch.sum(d, 2, out=out)
+    _close(out, x.sum(2))
+
+
+def test_ops_run_natively(mojo_gpu: str):
+    native.op_counting(True)
+    native.op_counts_reset()
+    d = _rand(3).to(mojo_gpu)
+    _ = (d * d).abs().sum()
+    assert native.op_count("aten::mul.Tensor") == 1
+    assert native.op_count("aten::abs") + native.op_count("aten::abs.out") >= 1
+
+
+def _special_grid() -> tuple[torch.Tensor, torch.Tensor]:
+    inf, nan = float("inf"), float("nan")
+    vals = [
+        complex(a, b)
+        for a in (0.0, -0.0, 1.0, inf, -inf, nan)
+        for b in (0.0, 3.0, inf, -inf, nan)
+    ]
+    x = torch.tensor([v for v in vals for _ in vals], dtype=torch.complex64)
+    y = torch.tensor([w for _ in vals for w in vals], dtype=torch.complex64)
+    return x, y
+
+
+def _same_values(got: torch.Tensor, want: torch.Tensor):
+    """Equal parts, NaN where the reference has NaN (its sign aside)."""
+    torch.testing.assert_close(
+        torch.view_as_real(got.cpu()),
+        torch.view_as_real(want),
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        lambda a, b: a + b,
+        lambda a, b: a - b,
+        lambda a, b: torch.add(a, b, alpha=2),
+        lambda a, b: torch.add(a, b, alpha=1j),
+        lambda a, b: torch.rsub(a, b),
+        lambda a, b: a - (1 - 2j),
+        lambda a, b: 1 - a,
+    ],
+    ids=["add", "sub", "alpha2", "alpha1j", "rsub", "sub_scalar", "rsub_scalar"],
+)
+def test_add_sub_alpha_special_values(mojo_gpu: str, op):
+    """a + alpha * b with the product always formed (CUDA's AddFunctor and
+    CPU's kernel agree on every pair of this grid), so e.g. 1 - inf i is
+    NaN - inf i."""
+    x, y = _special_grid()
+    _same_values(op(x.to(mojo_gpu), y.to(mojo_gpu)), op(x, y))
+
+
+def test_division_by_a_cpu_scalar_is_a_reciprocal_multiply(mojo_gpu: str):
+    """div_true_kernel_cuda turns a CPU-scalar divisor into a multiply by
+    its reciprocal, computed once on the host: x / 0j is NaN everywhere on
+    CUDA (CPU divides per element and differs)."""
+    x, _ = _special_grid()
+    got = (x.to(mojo_gpu) / 0j).cpu()
+    assert torch.isnan(got.real).all() and torch.isnan(got.imag).all()
+    z = torch.randn(64, dtype=torch.complex64)
+    _close(z.to(mojo_gpu) / (2 - 1j), z * (1 / torch.tensor(2 - 1j)))
+
+
+@pytest.mark.parametrize(
+    "exponent",
+    [0j, 1 + 0j, 2 + 0j, 0.5 + 0j, -1 + 0j, 0.5, -0.5, -1, 2, 0, 1, True, 1.5 - 2j],
+)
+def test_pow_scalar_exponents(mojo_gpu: str, exponent: complex):
+    """Pow.cpp's `Scalar::equal` special cases match complex Scalars too."""
+    x = torch.tensor([0j, 1 + 1j, -2 + 0.5j, 3j, 0.25 - 4j], dtype=torch.complex64)
+    got = (x.to(mojo_gpu) ** exponent).cpu()
+    want = x**exponent
+    torch.testing.assert_close(got, want, equal_nan=True, rtol=1e-5, atol=1e-6)
+
+
+def test_pow_special_cases_on_special_values(mojo_gpu: str):
+    """The special cases are taken for exponents EQUAL to 0 / 1 (complex
+    ones too): 0j ** 0j is 1 and (inf + 1j) ** (1 + 0j) is a copy (stock
+    CUDA's values; the general exp(log(x) * e) gives NaNs there)."""
+    inf = float("inf")
+    x = torch.tensor([0j, complex(inf, 1)], dtype=torch.complex64).to(mojo_gpu)
+    assert (x**0j).cpu().tolist() == [1 + 0j, 1 + 0j]
+    assert (x ** (1 + 0j)).cpu().tolist() == [0j, complex(inf, 1)]
+
+
+def test_pow_scalar_base_one(mojo_gpu: str):
+    x = _rand(4)
+    assert torch.equal(((1 + 0j) ** x.to(mojo_gpu)).cpu(), (1 + 0j) ** x)
+
+
+def test_promotion_with_scalars(mojo_gpu: str):
+    x = _rand(3)
+    d = x.to(mojo_gpu)
+    old = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float64)
+        assert (d ** (2 + 0j)).dtype == torch.complex64
+        assert (d * 1j).dtype == torch.complex64
+        assert (torch.ones(3, dtype=torch.float32).to(mojo_gpu) * 1j).dtype == (
+            torch.complex64
+        )
+        assert (
+            torch.ones(3, dtype=torch.int64).to(mojo_gpu) * 1j
+        ).dtype == torch.complex128
+    finally:
+        torch.set_default_dtype(old)
+    b = torch.ones(3, dtype=torch.bfloat16)
+    got = b.to(mojo_gpu) * (1 + 2j)
+    assert got.dtype == torch.complex64
+    _close(got, b * (1 + 2j))
+    with pytest.raises(NotImplementedError):  # complex32 is not held
+        torch.ones(3, dtype=torch.half).to(mojo_gpu) * 1j
+
+
+def test_reduction_out_and_dtype(mojo_gpu: str):
+    x = torch.tensor([1e8, 1, -1e8], dtype=torch.complex64)
+    out = torch.empty(0, dtype=torch.complex128, device=mojo_gpu)
+    torch.sum(x.to(mojo_gpu), 0, out=out)
+    assert out.item() == 1  # accumulated in the out's complex128
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        torch.sum(x.to(mojo_gpu), 0, dtype=torch.complex64, out=out)
+    y = _rand(3, 4)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _close(y.to(mojo_gpu).sum(dtype=torch.float32), y.sum(dtype=torch.float32))
+        _close(
+            y.to(mojo_gpu).mean(0, dtype=torch.float32), y.mean(0, dtype=torch.float32)
+        )
+        o = torch.empty(0, device=mojo_gpu)
+        torch.sum(y.to(mojo_gpu), 0, out=o)
+        _close(o, torch.sum(y, 0, out=torch.empty(0)))
+    big = torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(3)
+    got = torch.sum(y.to(mojo_gpu), (0, 1), out=big)
+    _close(got, y.sum())
+
+
+def test_elementwise_out_checks(mojo_gpu: str):
+    x = _rand(5)
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.exp(x.to(mojo_gpu), out=torch.empty(0, dtype=torch.complex64))
+    d = x.to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.add(d[:-1], 1, out=d[1:])
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.exp(d[:-1], out=d[1:])
+    e = d.clone()
+    torch.exp(e, out=e)
+    _close(e, torch.exp(x))
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.add(d, 1, out=torch.empty(0, device=mojo_gpu))
+
+
+def test_real_inputs_complex_out(mojo_gpu: str):
+    r = torch.rand(4) + 0.5
+    d = r.to(mojo_gpu)
+    for f in (
+        lambda a, o: torch.add(a, a, out=o),
+        lambda a, o: torch.mul(a, 2, out=o),
+        lambda a, o: torch.div(a, 3, out=o),
+        lambda a, o: torch.exp(a, out=o),
+        lambda a, o: torch.sqrt(a, out=o),
+        lambda a, o: torch.pow(a, 2, out=o),
+        lambda a, o: torch.eq(a, a, out=o),
+    ):
+        o = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+        f(d, o)
+        _close(o, f(r, torch.empty(0, dtype=torch.complex64)))
+
+
+def test_conj_operand(mojo_gpu: str):
+    x, y = _rand(4, 5), _rand(4, 5)
+    _close(x.to(mojo_gpu).conj() + y.to(mojo_gpu), x.conj() + y)
+
+
+def test_scans_and_rsub(mojo_gpu: str):
+    x, y = _rand(3, 4), _rand(3, 4)
+    d, e = x.to(mojo_gpu), y.to(mojo_gpu)
+    _close(torch.rsub(d, e, alpha=2), torch.rsub(x, y, alpha=2))
+    _close(1 - d, 1 - x)
+    _close(torch.cumsum(d, 1), torch.cumsum(x, 1))
+
+
+def test_zero_dim_reductions(mojo_gpu: str):
+    d = torch.tensor(1 + 2j).to(mojo_gpu)
+    for f in (lambda t: t.sum(5), lambda t: t.sum(1), lambda t: t.mean(1)):
+        with pytest.raises(IndexError):
+            f(d)
+    assert d.sum(0).item() == 1 + 2j and d.cumsum(0).item() == 1 + 2j
+    with pytest.raises(IndexError):
+        d.cumsum(1)
