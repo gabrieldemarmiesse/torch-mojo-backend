@@ -131,8 +131,9 @@ def _load[
         if j < in_len:
             var e = lay.at(row, j)
             # the DC entry and, for an even n, the Nyquist one are their own
-            # mirrors, so real: their imaginary parts are dropped, as cuFFT
-            # does (a huge one would otherwise leak through rounding)
+            # mirrors, so real: their imaginary parts are dropped, as
+            # CPU/pocketfft does; cuFFT drops it only up to rounding (a huge
+            # one would otherwise leak through our Bluestein path)
             if j == 0 or 2 * j == n:
                 return (ptr[unsafe_offset=2 * e], Scalar[dt](0))
             return (ptr[unsafe_offset=2 * e], ptr[unsafe_offset=2 * e + 1])

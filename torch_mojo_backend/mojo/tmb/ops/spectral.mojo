@@ -240,6 +240,10 @@ def _keep(key: String, t: T):
     var tables = _tables()
     var size = t.numel * t.itemsize
     var held = tables[].get(_BYTES_KEY).or_else(0)
+    if key in tables[]:
+        # already cached (a partial hit re-uploaded both tables): keep the
+        # cached one; overwriting it would leak its reference
+        return
     if len(tables[]) <= _TABLES_MAX and held + size <= _TABLES_MAX_BYTES:
         tables[][key] = retain(t)
         tables[][_BYTES_KEY] = held + size
@@ -490,7 +494,11 @@ def _bluestein(
         0,
         m,
         False,
-        1.0,
+        # 1/m (a power of two: exact) folded into the chirp's spectrum, not
+        # applied after the inverse transform: the convolution's values
+        # then stay the size of the result, so an input near the dtype's
+        # max does not overflow mid-convolution (CUDA keeps it finite)
+        1.0 / Float64(m),
         complex_st,
         device,
     )
@@ -566,7 +574,7 @@ def _bluestein(
     post.tuple(dst.tup())
     post.int(out_flags)
     post.int(out_len)
-    post.f64(scale / Float64(m))
+    post.f64(scale)
     post.int(cp)
     post.run()
     _ = ctx
@@ -603,6 +611,9 @@ def _transform(
     `in_len_cap` input entries of src's)."""
     var rows = _rows(dst, d)
     if rows == 0 or dst.numel == 0:
+        # an empty batch is an empty result, as CPU torch computes it;
+        # CUDA's CUFFT_INVALID_SIZE there is a cuFFT plan limitation, not
+        # torch semantics
         return
     var in_len = src.dim(d) if in_len_cap < 0 else in_len_cap
     var out_len = dst.dim(d)

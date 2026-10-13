@@ -160,7 +160,9 @@ def test_runs_natively(mojo_gpu: str):
 
 
 def test_empty_batch(mojo_gpu: str):
-    # (CPU torch's MKL path itself refuses an empty batch.)
+    # An empty result, deliberately: CUDA raises CUFFT_INVALID_SIZE here,
+    # a cuFFT plan limitation rather than torch semantics. (CPU torch's MKL
+    # path itself refuses an empty batch.)
     x = torch.randn(0, 8, dtype=torch.complex64)
     got = torch.fft.fft(x.to(mojo_gpu))
     assert got.shape == (0, 8) and got.dtype == torch.complex64
@@ -241,8 +243,8 @@ def test_fft_of_an_infinity_quarter_turns(mojo_gpu: str):
 @pytest.mark.parametrize("n", [8, 9, 130, 131, 262, 255])
 def test_irfft_drops_the_imaginary_dc_and_nyquist(mojo_gpu: str, n: int):
     """The zero (and, for an even n, the Nyquist) entry of a Hermitian input
-    is its own mirror: a c2r transform reads only its real part, as cuFFT
-    does. A huge imaginary part there must not leak through rounding (it did
+    is its own mirror: a c2r transform reads only its real part, as
+    CPU/pocketfft does (cuFFT drops it only up to rounding). A huge imaginary part there must not leak through rounding (it did
     on the Bluestein path: n = 131 gave ~1e11 instead of 1/131)."""
     m = n // 2 + 1
     x = torch.zeros(m, dtype=torch.complex64)
@@ -345,3 +347,39 @@ def test_fft_of_an_infinity_bluestein(mojo_gpu: str, n: int):
     x[0] = float("inf")
     got = torch.fft.fft(x.to(mojo_gpu)).cpu()
     assert torch.isnan(got).all()
+
+
+@pytest.mark.parametrize("n", [131, 262, 1009])
+def test_bluestein_keeps_huge_inputs_finite(mojo_gpu: str, n: int):
+    """The chirp convolution is normalized inside (1/m folded into the
+    chirp's spectrum): an input near float32's max stays finite, as on
+    CUDA. The impulse's transform is 1e36 in every bin."""
+    x = torch.zeros(n, dtype=torch.complex64)
+    x[0] = 1e36
+    got = torch.fft.fft(x.to(mojo_gpu)).cpu()
+    assert torch.isfinite(got).all()
+    torch.testing.assert_close(
+        got, torch.full((n,), 1e36, dtype=torch.complex64), rtol=1e-5, atol=0
+    )
+    y = torch.randn(n, dtype=torch.complex64) * 1e35
+    torch.testing.assert_close(
+        torch.fft.fft(y.to(mojo_gpu)).cpu(), torch.fft.fft(y), rtol=1e-4, atol=1e33
+    )
+
+
+def test_bluestein_tables_do_not_leak(mojo_gpu: str):
+    """A partial cache hit (the chirp cached, the padded chirp not, or the
+    reverse) must not leak the cached reference it re-uploads over."""
+    # (the reviewer's lengths: after 1,049,310 fills most of the table
+    # budget, 1,048,131's chirp still fits but its padded chirp does not)
+    big = torch.ones(1_049_310, dtype=torch.complex64, device=mojo_gpu)
+    torch.fft.fft(big)
+    del big
+    x = torch.ones(1_048_131, dtype=torch.complex64, device=mojo_gpu)
+    torch.fft.fft(x)
+    torch.accelerator.synchronize()
+    before = torch.accelerator.memory_allocated()
+    for _ in range(5):
+        torch.fft.fft(x)
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_allocated() == before
