@@ -26,6 +26,7 @@ this file.
 """
 
 import contextlib
+import math
 from collections.abc import Sequence
 
 import pytest
@@ -2414,8 +2415,8 @@ _CPU_SCALARS = [
     (torch.bfloat16, torch.tensor([0.25], dtype=torch.float64)),
 ]
 _CPU_SCALAR_IDS = ["f32-f32", "f32-i64", "i64-i64", "i64-f32", "bf16-f64-1d"]
-_CPU_SCALAR_OPS = ["mul"]
-_CPU_SCALAR_INPLACE = [True]
+_CPU_SCALAR_OPS = ["mul", "div", "add"]
+_CPU_SCALAR_INPLACE = [False, True]
 
 
 @pytest.mark.parametrize(
@@ -2435,6 +2436,10 @@ def test_mta_tensor_overload_with_a_cpu_scalar(
     cpu = [torch.full((5,), 2, dtype=dtype), (torch.arange(1030) % 9).to(dtype)]
     dev = [t.to(mojo_gpu) for t in cpu]
     schema = getattr(torch.ops.aten, f"_foreach_{op}_" if inplace else f"_foreach_{op}")
+    if op == "add" and other.dim() != 0:
+        with pytest.raises(RuntimeError, match="scalar tensor expected to be 0 dim"):
+            schema.Tensor(dev, other)
+        return
     if op == "add" and other.dtype == dtype:
         word = "is expected" if inplace else "expected"
         with pytest.raises(RuntimeError, match=f"scalar tensor {word} to be on mojo:0"):
@@ -2844,6 +2849,85 @@ def test_mta_pow_scalar_and_tensor(mojo_gpu: str, dtype_id: str):
     with _one_launch("_foreach_pow.ScalarAndTensor"):
         actual = torch._foreach_pow(1.75, dev)
     _assert_lists(actual, [torch.pow(1.75, t) for t in cpu], **_mta_tol(dtype))
+
+
+def test_mta_pow_scalar_and_integer_tensors_promote(mojo_gpu: str):
+    """`_foreach_pow(1.5, int_list)` follows result_type, like CPU torch and
+    the per-tensor `pow(Scalar, Tensor)`: float32 [1.5, 2.25]. Stock CUDA
+    (torch 2.11, H100) returns int64 [1, 1]: its fast route
+    (ForeachBinaryOpScalar.cu:184, `can_use_fast_route(exponent)` without
+    the scalar) keeps the integer list and the functor's
+    `scalar.to<opmath_t>()` (:47) truncates 1.5 to 1. Pinned on purpose."""
+    exponents = [torch.tensor([1, 2]), torch.arange(5)]
+    actual = torch._foreach_pow(1.5, [t.to(mojo_gpu) for t in exponents])
+    _assert_lists(actual, [torch.pow(1.5, t) for t in exponents])
+    assert actual[0].dtype == torch.float32
+    assert actual[0].cpu().tolist() == [1.5, 2.25]
+
+
+_SIGNED_ZEROS = [(0.0, -0.0), (-0.0, 0.0), (0.0, 0.0), (-0.0, -0.0)]
+
+
+@pytest.mark.parametrize("overload", ["Scalar", "ScalarList", "List"])
+@pytest.mark.parametrize("op", ["maximum", "minimum", "clamp_min", "clamp_max"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
+def test_mta_min_max_signed_zeros_and_nan(
+    mojo_gpu: str, dtype: torch.dtype, op: str, overload: str
+):
+    """ForeachMinMaxFunctors.cuh: `(isnan(a) || a > b) ? a : b`. Equal
+    operands give the second one, so maximum(+0, -0) is -0 and
+    maximum(-0, +0) is +0 (measured on stock CUDA, every op, overload and
+    argument order) -- unlike the per-tensor ops; NaN on either side wins."""
+    nan = float("nan")
+    pairs = [*_SIGNED_ZEROS, (nan, 1.0), (1.0, nan), (2.0, 1.0), (1.0, 2.0)]
+    selves = [torch.tensor([a], dtype=dtype, device=mojo_gpu) for a, _ in pairs]
+    others = [b for _, b in pairs]
+    fn = getattr(torch, f"_foreach_{op}")
+    if overload == "Scalar":
+        actual = [fn([t], b)[0] for t, b in zip(selves, others)]
+    elif overload == "ScalarList":
+        actual = fn(selves, others)
+    else:
+        actual = fn(
+            selves, [torch.tensor([b], dtype=dtype, device=mojo_gpu) for b in others]
+        )
+    keep_max = op in ("maximum", "clamp_min")
+    for (a, b), r in zip(pairs, actual, strict=True):
+        if math.isnan(a) or math.isnan(b):
+            want = nan
+        elif a == b:
+            want = b
+        else:
+            want = max(a, b) if keep_max else min(a, b)
+        got = r.item()
+        if math.isnan(want):
+            assert math.isnan(got)
+        else:
+            assert got == want and math.copysign(1, got) == math.copysign(1, want)
+
+
+def test_mta_sub_bool_rules(mojo_gpu: str):
+    """sub_check like CUDA: the ScalarList overload checks every pair before
+    anything runs (the float tensor stays untouched), the Scalar one the
+    first tensor; the List overload computes bool lists with a bool alpha on
+    its fast route and raises in the per-tensor sub otherwise."""
+    a = torch.tensor([10.0], device=mojo_gpu)
+    b = torch.tensor([True], device=mojo_gpu)
+    with pytest.raises((RuntimeError, NotImplementedError), match="with a bool tensor"):
+        torch._foreach_sub_([a, b], [1, 1])
+    assert a.cpu().tolist() == [10.0]
+    with pytest.raises((RuntimeError, NotImplementedError), match="with a bool tensor"):
+        torch._foreach_sub_([b, a], 1)
+    assert a.cpu().tolist() == [10.0]
+    x = torch.tensor([True, False], device=mojo_gpu)
+    y = torch.tensor([True, True], device=mojo_gpu)
+    # Stock CUDA: [False, True] and [True, False].
+    assert torch._foreach_sub([x], [y], alpha=True)[0].cpu().tolist() == [False, True]
+    assert torch._foreach_sub([x], [y], alpha=False)[0].cpu().tolist() == [True, False]
+    # The per-tensor sub.Tensor declines bool operands (CUDA: "two bool
+    # tensors"); either way nothing is computed.
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        torch._foreach_sub([x], [y])
 
 
 def test_mta_dense_non_contiguous_lists(mojo_gpu: str):
