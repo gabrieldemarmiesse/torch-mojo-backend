@@ -104,6 +104,8 @@ def _overload_call(name: str) -> _Call:
         return lambda a, b, c, s: fn(a)
     if overload == "ScalarAndTensor":
         return lambda a, b, c, s: fn(1.0001, a)
+    if op == "powsum":
+        return lambda a, b, c, s: fn(a, 2)
     if op in _TERNARY and op != "lerp":
         args = {
             "Scalar": lambda a: 1e-4,
@@ -135,7 +137,7 @@ def _overload_names() -> list[str]:
     for op, overloads in (_BINARY | _TERNARY).items():
         for overload in overloads:
             names += [f"_foreach_{op}.{overload}", f"_foreach_{op}_.{overload}"]
-    names += ["_foreach_pow.ScalarAndTensor"]
+    names += ["_foreach_pow.ScalarAndTensor", "_foreach_max", "_foreach_powsum.Scalar"]
     measured = {"_foreach_sqrt"} | {name.removeprefix("aten::") for name in COVERS}
     return [name for name in names if name not in measured]
 

@@ -34,6 +34,12 @@ from std.utils import IndexList
 from tmb.backend.abi import (
     ST_FLOAT32,
     ST_FLOAT64,
+    ST_UINT8,
+    TAG_BOOL,
+    TAG_DOUBLE,
+    TAG_INT,
+    max_dtype,
+    new_scalar,
     TAG_BOOL_LIST,
     TAG_COMPLEX,
     TAG_DOUBLE_LIST,
@@ -84,6 +90,8 @@ from tmb.kernels.foreach.contract import (
 from tmb.ops.common import (
     copy_strided_into,
     device_str,
+    is_float_stype,
+    promote_types,
     scalar_to_float,
     scalar_to_int,
 )
@@ -108,14 +116,18 @@ def _none_value() -> Value:
     return Value(TAG_NONE, 0, 0, 0)
 
 
-def _seq_vector_norm(t: T, ord_v: Value, dtype_v: Value) raises -> T:
+def _seq_vector_norm(
+    op: String, t: T, ord_v: Value, dtype_v: Value
+) raises -> T:
+    """`linalg_vector_norm` / `linalg__powsum` of the whole tensor, what
+    ATen's slow `_foreach_norm` / `_foreach_powsum` call per tensor."""
     var args = List[Value](capacity=5)
     args.append(_tensor_value(t))
     args.append(ord_v.copy())
     args.append(_none_value())  # dim=None
-    args.append(Value(TAG_SCALAR_INT, 0, 0, 0))  # keepdim=False
+    args.append(Value(TAG_BOOL, 0, 0, 0))  # keepdim=False
     args.append(dtype_v.copy())
-    var rets = call_op("aten::linalg_vector_norm", "", args^, 1)
+    var rets = call_op(op, "", args^, 1)
     return rets.take_tensor(0)
 
 
@@ -177,7 +189,7 @@ def _qualifies1(a: List[T], allow_half: Bool) raises -> Bool:
     return True
 
 
-# --- _foreach_norm: the optimizer family's ForeachL2Norm ---------------------
+# --- Apple's _foreach_norm: the optimizer family's float32 ForeachL2Norm ------
 
 
 def _foreach_norm_launch(tensors: List[T]) raises -> List[T]:
@@ -1312,26 +1324,227 @@ def op_foreach_copy_(
         _ = call_op("aten::copy_", "", copy_args^, 1)
 
 
+# --- reductions: _foreach_norm, _foreach_powsum, _foreach_max ---------------
+#
+# ForeachReduceOp.cu: one 0-d result per tensor, two launches of the foreach
+# family's reduction kernels (tmb/kernels/foreach/reduce.mojo) for a list on
+# the fast route, the per-tensor reduction otherwise.
+
+comptime _FR_L0 = 0
+comptime _FR_L1 = 1
+comptime _FR_L2 = 2
+comptime _FR_LINF = 3
+comptime _FR_MAX = 4
+# CUDA's kChunkSize, reduce.mojo's FE_REDUCE_CHUNK: the partials scratch
+# holds one accumulator per chunk.
+comptime _FR_CHUNK = 65_536
+
+
+def _reduce_launch(
+    tensors: List[T], norm: Int, root: Bool, out_stype: Int32
+) raises -> List[T]:
+    var outs = List[Owned]()
+    var total_chunks = 0
+    var metadata = List[Int](capacity=3 * len(tensors))
+    for t in tensors:
+        outs.append(own(new_scalar(out_stype, t.device)))
+        total_chunks += ceildiv(t.numel, _FR_CHUNK)
+    for i in range(len(tensors)):
+        metadata.append(tensors[i].ptr)
+        metadata.append(outs[i].t.ptr)
+        metadata.append(tensors[i].numel)
+    var dtype = tensors[0].dtype
+    var acc = ST_FLOAT64 if out_stype == ST_FLOAT64 else ST_FLOAT32
+    if norm == _FR_MAX:
+        acc = ST_UINT8 if dtype == DType.bool else tensors[0].stype
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = max(total_chunks, 1)
+    var partials = own(new_tensor(shape, 1, acc, tensors[0].device))
+    var ctx = ctx_for(tensors[0].device)
+    var call = KernelCall("foreach", "max" if norm == _FR_MAX else "norm")
+    call.flag("FE_NORM", norm)
+    call.flag("FE_ROOT", 1 if root else 0)
+    call.arg_dtype(0, dtype)
+    call.out_dtype(max_dtype(out_stype))
+    call.tuple(metadata)
+    call.int(partials.t.ptr)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = partials  # alive past the launch (its last use above is the pointer read)
+    _ = ctx
+    var result = List[T]()
+    for i in range(len(outs)):
+        result.append(outs[i].take())
+    return result^
+
+
+def _ord_value(ord_v: Value, name: String) raises -> Float64:
+    """`ord.isIntegral(false) ? ord.to<int64_t>() : ord.to<double>()`."""
+    if ord_v.tag == TAG_SCALAR_INT or ord_v.tag == TAG_INT:
+        return Float64(v_int(ord_v))
+    if ord_v.tag == TAG_SCALAR_DOUBLE or ord_v.tag == TAG_DOUBLE:
+        return v_f64(ord_v)
+    raise Error(name, " expects ord to be integer or float")
+
+
+def _check_norm_dtype(dtype_v: Value, self_stype: Int32, name: String) raises:
+    """ForeachReduceOp.cu's `check_foreach_norm_dtype`."""
+    if dtype_v.tag == TAG_NONE:
+        return
+    var dt = v_dtype_or(dtype_v, ST_FLOAT32)
+    if not is_float_stype(dt):
+        raise Error(
+            name,
+            ": dtype should be floating point or complex, but got ",
+            _scalar_type_name(max_dtype(dt)),
+        )
+    if promote_types(self_stype, dt) != dt:
+        raise Error(
+            name,
+            ": the dtype of the input (",
+            _scalar_type_name(max_dtype(self_stype)),
+            (
+                ") should be convertible without narrowing to the specified"
+                " dtype ("
+            ),
+            _scalar_type_name(max_dtype(dt)),
+            ")",
+        )
+
+
+def _reduce_on_route(tensors: List[T], floating: Bool) raises -> Bool:
+    var lists = List[List[T]]()
+    lists.append(tensors.copy())
+    if not _lists_on_route(lists):
+        return False
+    var dt = tensors[0].dtype
+    var api = dev(tensors[0].device)[].api
+    if api == "metal":
+        return False
+    if floating:
+        return (
+            dt == DType.float32
+            or dt == DType.float16
+            or dt == DType.bfloat16
+            or dt == DType.float64
+        )
+    return (
+        dt.is_floating_point()
+        or dt == DType.bool
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
+        or dt == DType.uint8
+    )
+
+
+def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
+    """`_foreach_norm` (root) and `_foreach_powsum`."""
+    var name = String(
+        "_foreach_tensor_norm_cuda" if root else "_foreach_tensor_powsum_cuda"
+    )
+    var self_list = v_tensor_list(args[unsafe_offset=0])
+    var ord_v = args[unsafe_offset=1].copy()
+    var dtype_v = args[unsafe_offset=2].copy()
+    var p = _ord_value(
+        ord_v,
+        "foreach_tensor_norm_cuda" if root else "foreach_tensor_powsum_cuda",
+    )
+    if len(self_list) == 0:
+        raise Error("Tensor list must have at least one tensor.")
+    var inf = Float64.MAX * 2
+    if root and p == inf:
+        for t in self_list:
+            if t.numel == 0:
+                raise Error(
+                    "_foreach_norm cannot compute the infinity norm on an"
+                    " empty tensor because the operation does not have an"
+                    " identity"
+                )
+    var norm = -1
+    if p == 0 and root:
+        norm = _FR_L0
+    elif p == 1:
+        norm = _FR_L1
+    elif p == 2:
+        norm = _FR_L2
+    elif p == inf and root:
+        norm = _FR_LINF
+    if norm >= 0 and _reduce_on_route(self_list, True):
+        _check_norm_dtype(dtype_v, self_list[0].stype, name)
+        var out_stype = v_dtype_or(dtype_v, self_list[0].stype)
+        ret_tensor_list(
+            rets, 0, _reduce_launch(self_list, norm, root, out_stype)
+        )
+        return
+    if (
+        root
+        and p == 2
+        and _qualifies1(self_list, False)
+        and dev(self_list[0].device)[].api == "metal"
+        and (
+            dtype_v.tag == TAG_NONE
+            or v_dtype_or(dtype_v, ST_FLOAT32) == ST_FLOAT32
+        )
+    ):
+        # Apple: the float32 L2 norm's fixed-arity kernels.
+        ret_tensor_list(rets, 0, _foreach_norm_launch(self_list))
+        return
+    var op = String(
+        "aten::linalg_vector_norm" if root else "aten::linalg__powsum"
+    )
+    var result = List[Owned]()
+    for t in self_list:
+        result.append(own(_seq_vector_norm(op, t, ord_v, dtype_v)))
+    var out = List[T]()
+    for i in range(len(result)):
+        out.append(result[i].take())
+    ret_tensor_list(rets, 0, out)
+
+
 # aten::_foreach_norm.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]
 def op_foreach_norm_scalar(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _foreach_lp(args, rets, True)
+
+
+# aten::_foreach_powsum.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]
+def op_foreach_powsum_scalar(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _foreach_lp(args, rets, False)
+
+
+# aten::_foreach_max(Tensor[] self) -> Tensor[]
+def op_foreach_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self_list = v_tensor_list(args[unsafe_offset=0])
     if len(self_list) == 0:
         raise Error("Tensor list must have at least one tensor.")
-    var ord_v = args[unsafe_offset=1].copy()
-    var dtype_v = args[unsafe_offset=2].copy()
-    var ord_is_two = not v_scalar_is_bool(ord_v) and v_f64(ord_v) == 2.0
-    var dtype_ok = (
-        dtype_v.tag == TAG_NONE or v_dtype_or(dtype_v, ST_FLOAT32) == ST_FLOAT32
-    )
-    if ord_is_two and dtype_ok and _qualifies1(self_list, False):
-        ret_tensor_list(rets, 0, _foreach_norm_launch(self_list))
-        return
-    var result = List[T]()
     for t in self_list:
-        result.append(_seq_vector_norm(t, ord_v, dtype_v))
-    ret_tensor_list(rets, 0, result)
+        if t.numel == 0:
+            raise Error(
+                "_foreach_max cannot compute the maximum of an empty tensor;"
+                " max over zero elements is undefined."
+            )
+    if _reduce_on_route(self_list, False):
+        ret_tensor_list(
+            rets,
+            0,
+            _reduce_launch(self_list, _FR_MAX, False, self_list[0].stype),
+        )
+        return
+    var result = List[Owned]()
+    for t in self_list:
+        var one = List[Value](capacity=1)
+        one.append(_tensor_value(t))
+        var r = call_op("aten::max", "", one^, 1)
+        result.append(own(r.take_tensor(0)))
+    var out = List[T]()
+    for i in range(len(result)):
+        out.append(result[i].take())
+    ret_tensor_list(rets, 0, out)
 
 
 def _scalar_f32_tensor(
@@ -1948,6 +2161,8 @@ def register_foreach(site: Site) raises:
     impl[op_amp_update_scale_, "_amp_update_scale_"](site)
     impl[op_foreach_copy_, "_foreach_copy_"](site)
     impl[op_foreach_norm_scalar, "_foreach_norm.Scalar"](site)
+    impl[op_foreach_powsum_scalar, "_foreach_powsum.Scalar"](site)
+    impl[op_foreach_max, "_foreach_max"](site)
     comptime for row in range(len(FOREACH_OVERLOADS)):
         comptime e = FOREACH_OVERLOADS[row]
         comptime if e.name != "":
