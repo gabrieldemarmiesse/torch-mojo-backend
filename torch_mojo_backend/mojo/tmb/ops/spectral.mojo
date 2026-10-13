@@ -65,7 +65,14 @@ from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import contiguous, resize_out
+from tmb.ops.common import (
+    assert_no_internal_overlap,
+    contiguous,
+    device_str,
+    is_float_stype,
+    resize_out,
+)
+from tmb.ops.complex import _st_name
 
 comptime _REAL_IN = 1
 comptime _HERM_IN = 2
@@ -190,6 +197,11 @@ def _upload(values: List[Float64], real_st: Int32, device: Int) raises -> Owned:
 # so two Python threads' FFTs reach this table one at a time.
 comptime _TABLES_GLOBAL = "TMB_FFT_TABLES"
 comptime _TABLES_MAX = 256
+# and at most this many bytes of device memory (a few Bluestein chirps of
+# long lengths would otherwise hold hundreds of MB): past either bound a
+# table is uploaded per call instead
+comptime _TABLES_MAX_BYTES = 64 * 1024 * 1024
+comptime _BYTES_KEY = "#bytes"
 
 
 def _tables() -> Pointer[Dict[String, Int], MutUntrackedOrigin]:
@@ -226,8 +238,11 @@ def _cached(key: String) raises -> Optional[Owned]:
 def _keep(key: String, t: T):
     """Cache `t` under `key` (a reference of the cache's own)."""
     var tables = _tables()
-    if len(tables[]) < _TABLES_MAX:
+    var size = t.numel * t.itemsize
+    var held = tables[].get(_BYTES_KEY).or_else(0)
+    if len(tables[]) <= _TABLES_MAX and held + size <= _TABLES_MAX_BYTES:
         tables[][key] = retain(t)
+        tables[][_BYTES_KEY] = held + size
 
 
 def _unit(num: Int, den: Int) -> Tuple[Float64, Float64]:
@@ -792,9 +807,45 @@ def _c2r(args: Values) raises -> Owned:
     return out^
 
 
-def _store_any(mut dest: T, var res: Owned, rets: Values) raises:
-    """The `_out` kernels of SpectralOps.cpp: `resize_output(out, ...)`,
-    then `out.copy_(result)`."""
+def _check_out(x: T, dest: T) raises:
+    """The device check CUDA's generated `out=` wrapper makes before any
+    work: the out is seen first, so the message names self as the odd one
+    out (a host self reaches this device's kernel through a mojo out)."""
+    if not x.on_mojo() or not dest.on_mojo() or x.device != dest.device:
+        raise Error(
+            "Expected all tensors to be on the same device, but got self is",
+            " on ",
+            device_str(x),
+            ", different from other tensors on ",
+            device_str(dest),
+        )
+
+
+def _store_any(
+    mut dest: T, var res: Owned, rets: Values, resize_first: Bool = False
+) raises:
+    """The `_out` kernels of cuda/SpectralOps.cpp: the unnormalized result,
+    then `at::mul_out(out, result, scale)` -- a TensorIterator, so the out's
+    internal overlap is checked as given, before it is resized (the r2c
+    two-sided path `resize_output`s first and checks a slice of the
+    resized out: `resize_first`), and the result type must be castable to
+    the out's (a complex result into a real out, a real one into an
+    integer out, are refused; a wider out is fine)."""
+    if resize_first:
+        resize_out(dest, res.t.shape, res.t.rank)
+    assert_no_internal_overlap(dest)
+    var cplx = is_complex_stype(res.t.stype)
+    if (cplx and not is_complex_stype(dest.stype)) or (
+        not cplx
+        and not is_float_stype(dest.stype)
+        and not is_complex_stype(dest.stype)
+    ):
+        raise Error(
+            "result type ",
+            _st_name(res.t.stype),
+            " can't be cast to the desired output type ",
+            _st_name(dest.stype),
+        )
     resize_out(dest, res.t.shape, res.t.rank)
     var c = call_op(
         "aten::copy_",
@@ -817,6 +868,7 @@ def op_fft_c2c(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 #   bool forward, *, Tensor(a!) out) -> Tensor(a!)
 def op_fft_c2c_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor_c(args[unsafe_offset=4])
+    _check_out(v_tensor_c(args[unsafe_offset=0]), dest)
     _store_any(dest, _c2c(args), rets)
 
 
@@ -830,7 +882,9 @@ def op_fft_r2c(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 #   bool onesided, *, Tensor(a!) out) -> Tensor(a!)
 def op_fft_r2c_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor_c(args[unsafe_offset=4])
-    _store_any(dest, _r2c(args), rets)
+    _check_out(v_tensor_c(args[unsafe_offset=0]), dest)
+    var onesided = v_bool(args[unsafe_offset=3])
+    _store_any(dest, _r2c(args), rets, not onesided)
 
 
 # aten::_fft_c2r(Tensor self, int[] dim, int normalization,
@@ -844,6 +898,7 @@ def op_fft_c2r(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 #   SymInt last_dim_size, *, Tensor(a!) out) -> Tensor(a!)
 def op_fft_c2r_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor_c(args[unsafe_offset=4])
+    _check_out(v_tensor_c(args[unsafe_offset=0]), dest)
     _store_any(dest, _c2r(args), rets)
 
 

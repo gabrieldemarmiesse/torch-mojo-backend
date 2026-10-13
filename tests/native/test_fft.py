@@ -194,11 +194,112 @@ def test_fft_of_an_infinity(mojo_gpu: str, n: int):
     than a multiply, and primes up to 127 are direct DFT passes, so no NaN
     appears. (CPU agrees for 4..64 and 17 but goes through Bluestein, all
     NaN, at 97 and 127; stock CUDA agrees at 17..127 but has NaNs at the
-    powers of two: 6 of 8 bins at n = 8.)"""
+    powers of two: 6 of 8 bins at n = 8, inf + NaN i at bins 1-3 and 5-7.
+    That is an artifact of cuFFT's private kernels -- a multiply by a unit
+    twiddle -- not something its results let us model in general, so the
+    exact value is kept here; see test_fft_of_an_infinity_quarter_turns.)"""
     x = torch.zeros(n, dtype=torch.complex64)
     x[0] = float("inf")
     got = torch.fft.fft(x.to(mojo_gpu)).cpu()
     assert torch.equal(got, torch.full((n,), complex(float("inf"), 0.0)))
+
+
+_INF = float("inf")
+_NAN = float("nan")
+# torch.fft.fft of zeros(16) with x[3] = inf on stock CUDA (torch 2.11+cu130,
+# H100); CPU torch gives the same
+_CUDA_INF3_N16 = [
+    (_INF, 0.0), (_INF, -_INF), (-_INF, -_INF), (-_INF, _INF),
+    (0.0, _INF), (_INF, _INF), (_INF, -_INF), (-_INF, -_INF),
+    (-_INF, 0.0), (-_INF, _INF), (_INF, _INF), (_INF, -_INF),
+    (0.0, -_INF), (-_INF, -_INF), (-_INF, _INF), (_INF, _INF),
+]  # fmt: skip
+
+
+def test_fft_of_an_infinity_quarter_turns(mojo_gpu: str):
+    """A twiddle between passes that is a quarter turn (-i, -1, +i) is a
+    sign and a swap, not a multiply by a table entry with a zero part, so an
+    infinity stays an infinity. n = 16 (passes of 8 then 2), inf at index 4:
+    every twiddle on its path is a quarter turn, the result is exact (CPU
+    torch agrees; stock CUDA has NaNs in 12 of the 16 bins). Inf at index 3:
+    the even bins match stock CUDA bin for bin (bin 4 was NaN + inf i before
+    quarter turns were special-cased); the odd bins carry the inf - inf of
+    two successive non-quarter rotations of an infinite complex value, which
+    a two-pass transform cannot avoid -- cuFFT does n = 16 in one pass."""
+    x = torch.zeros(16, dtype=torch.complex64)
+    x[4] = _INF
+    got = torch.fft.fft(x.to(mojo_gpu)).cpu()
+    assert torch.equal(got, torch.fft.fft(x))
+    x = torch.zeros(16, dtype=torch.complex64)
+    x[3] = _INF
+    got = torch.fft.fft(x.to(mojo_gpu)).cpu()
+    cuda = torch.tensor([complex(*v) for v in _CUDA_INF3_N16])
+    assert torch.equal(got[0::2], cuda[0::2])
+    assert torch.isinf(got[1::2]).all()
+
+
+@pytest.mark.parametrize("n", [8, 9, 130, 131, 262, 255])
+def test_irfft_drops_the_imaginary_dc_and_nyquist(mojo_gpu: str, n: int):
+    """The zero (and, for an even n, the Nyquist) entry of a Hermitian input
+    is its own mirror: a c2r transform reads only its real part, as cuFFT
+    does. A huge imaginary part there must not leak through rounding (it did
+    on the Bluestein path: n = 131 gave ~1e11 instead of 1/131)."""
+    m = n // 2 + 1
+    x = torch.zeros(m, dtype=torch.complex64)
+    x[0] = torch.tensor(complex(1.0, 1e20))
+    if n % 2 == 0:
+        x[m - 1] = torch.tensor(complex(0.0, 1e20))
+    got = torch.fft.irfft(x.to(mojo_gpu), n=n).cpu()
+    torch.testing.assert_close(got, torch.full((n,), 1.0 / n), rtol=1e-5, atol=1e-7)
+
+
+def test_out_validation(mojo_gpu: str):
+    """The out= overloads follow cuda/SpectralOps.cpp: the generated
+    wrapper's device check first, then at::mul_out into the out, a
+    TensorIterator: the out's internal overlap is checked as given (before
+    any resize), and the result must be castable to its dtype."""
+    x = torch.arange(8.0)
+    xd = x.to(mojo_gpu)
+    c = x.to(torch.complex64)
+    for fn, arg, out in (
+        (torch.fft.fft, c, torch.empty(8, dtype=torch.complex64)),
+        (torch.fft.rfft, x, torch.empty(5, dtype=torch.complex64)),
+        (torch.fft.irfft, c, torch.empty(14)),
+    ):
+        with pytest.raises(RuntimeError, match="same device"):
+            fn(arg.to(mojo_gpu), out=out)
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.ops.aten._fft_c2c.out(
+            c, [0], 0, True, out=torch.empty(8, dtype=torch.complex64, device=mojo_gpu)
+        )
+    for size in (5, 6):  # same shape (no resize) and another shape
+        out = torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(size)
+        with pytest.raises(RuntimeError, match="unsupported operation"):
+            torch.fft.rfft(xd, out=out)
+    out = torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(8)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.fft.fft(c.to(mojo_gpu), out=out)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.ops.aten._fft_c2c.out(
+            c.to(mojo_gpu), [0], 0, True, out=torch.empty(8, device=mojo_gpu)
+        )
+    # a wider out, and an out that is the input itself, are fine
+    out = torch.empty(8, dtype=torch.complex128, device=mojo_gpu)
+    torch.fft.fft(c.to(mojo_gpu), out=out)
+    torch.testing.assert_close(
+        out.cpu(), torch.fft.fft(c).to(torch.complex128), rtol=1e-6, atol=1e-5
+    )
+    z = c.to(mojo_gpu)
+    torch.fft.fft(z, out=z)
+    _check(z, torch.fft.fft(c))
+
+
+def test_table_cache_byte_bound(mojo_gpu: str):
+    """Bluestein lengths whose chirp tables together pass the cache's byte
+    bound: the ones past it are uploaded per call, still correct."""
+    for n in (131 * 8000, 131 * 8001, 131 * 8002, 131 * 8003, 131 * 8000):
+        x = torch.randn(n, dtype=torch.complex64)
+        _check(torch.fft.fft(x.to(mojo_gpu)), torch.fft.fft(x))
 
 
 def test_fft_nan_stays_local(mojo_gpu: str):

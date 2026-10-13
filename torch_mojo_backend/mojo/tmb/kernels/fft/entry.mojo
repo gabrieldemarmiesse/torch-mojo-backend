@@ -130,6 +130,11 @@ def _load[
     if flags & HERM_IN:
         if j < in_len:
             var e = lay.at(row, j)
+            # the DC entry and, for an even n, the Nyquist one are their own
+            # mirrors, so real: their imaginary parts are dropped, as cuFFT
+            # does (a huge one would otherwise leak through rounding)
+            if j == 0 or 2 * j == n:
+                return (ptr[unsafe_offset=2 * e], Scalar[dt](0))
             return (ptr[unsafe_offset=2 * e], ptr[unsafe_offset=2 * e + 1])
         var m = n - j
         if m < in_len:
@@ -158,6 +163,31 @@ def _store[
     else:
         ptr[unsafe_offset=2 * e] = re
         ptr[unsafe_offset=2 * e + 1] = im
+
+
+@always_inline
+def _twiddle_mul[
+    dt: DType
+](
+    xr: Scalar[dt], xi: Scalar[dt], tw: _Ptr[dt], ti: Int, n: Int, inv: Bool
+) -> Tuple[Scalar[dt], Scalar[dt]]:
+    """(xr + i xi) * w^ti, w = e^(-+2 pi i / n). A quarter turn's multiple
+    (-i, -1, +i) is a sign and a swap, as cuFFT applies it, rather than a
+    multiply by a table entry with a zero part: an infinite input then stays
+    infinite instead of picking up a NaN (inf * 0)."""
+    if (4 * ti) % n == 0:
+        var quarter = (4 * ti) // n
+        if quarter == 2:
+            return (-xr, -xi)
+        # forward w^(n/4) = -i, w^(3n/4) = +i; the inverse flips them
+        if (quarter == 1) != inv:
+            return (xi, -xr)
+        return (-xi, xr)
+    var wr = tw[unsafe_offset=2 * ti]
+    var wi = tw[unsafe_offset=2 * ti + 1]
+    if inv:
+        wi = -wi
+    return (xr * wr - xi * wi, xr * wi + xi * wr)
 
 
 @__name(t"fft_stockham_radix{p}_{dt}_t{GS_THREADS}")
@@ -211,14 +241,11 @@ def _stage_kernel[
                 # k == 0: the twiddle is 1, and multiplying by it would turn
                 # an infinite input into NaNs (inf * 0) where cuFFT keeps it
                 if k != 0:
-                    var ti = r * k * tstride
-                    var wr = tw[unsafe_offset=2 * ti]
-                    var wi = tw[unsafe_offset=2 * ti + 1]
-                    if inv:
-                        wi = -wi
-                    var yr = xr * wr - xi * wi
-                    xi = xr * wi + xi * wr
-                    xr = yr
+                    var y = _twiddle_mul[dt](
+                        xr, xi, tw, r * k * tstride, n, inv
+                    )
+                    xr = y[0]
+                    xi = y[1]
             vr[r] = xr
             vi[r] = xi
         var base = (j // ns) * ns * p + k
@@ -319,14 +346,11 @@ def _stage_any_kernel[
                 var xr = x[0]
                 var xi = x[1]
                 if r * k != 0:
-                    var ti = r * k * tstride
-                    var wr = tw[unsafe_offset=2 * ti]
-                    var wi = tw[unsafe_offset=2 * ti + 1]
-                    if inv:
-                        wi = -wi
-                    var yr = xr * wr - xi * wi
-                    xi = xr * wi + xi * wr
-                    xr = yr
+                    var y = _twiddle_mul[dt](
+                        xr, xi, tw, r * k * tstride, n, inv
+                    )
+                    xr = y[0]
+                    xi = y[1]
                 var e = (q * r) % p
                 if e == 0:
                     sr += xr
