@@ -17,9 +17,9 @@ pass applies the outer scales, the bias and the output conversion.
   does. That route takes the TF32 tensor-core bridge whatever
   `torch.get_float32_matmul_precision()` says: it loses nothing here.
 * Block scales (1x128, 128x128 with float32 scales; MX 1x32 with
-  float8_e8m0fnu scales in the SWIZZLE_32_4_4 layout) vary along K, so they
-  are applied in `Dequant` and the GEMM is a strict float32 one, whatever
-  the float32 matmul precision (TF32 would round the scaled operands).
+  float8_e8m0fnu scales in the SWIZZLE_32_4_4 layout) vary along K: like
+  cuBLASLt, each K block's exact partial product is multiplied by that
+  block's scale_a, then scale_b, and accumulated in float32 (`BlockAccum`).
 
 `use_fast_accum` is accepted and ignored (the accumulation is always full
 float32, which the option allows). A float8 output saturates to its largest
@@ -41,6 +41,11 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    TAG_NONE,
+    TAG_OPT_TENSOR_LIST,
+    TAG_TENSOR,
+    TAG_TENSOR_LIST,
+    TAG_TENSOR_REF,
     ST_BFLOAT16,
     ST_FLOAT16,
     ST_FLOAT32,
@@ -75,6 +80,8 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     check_out_as,
     contiguous,
+    copy_strided_into,
+    shares_storage,
     device_str,
     fill_value,
     resize_out,
@@ -452,6 +459,7 @@ def _scaled_gemm(
     bias: Optional[T],
     scale_result: Int = 0,
     sequential: Bool = False,
+    grouped: Bool = False,
 ) raises:
     """dest (M x N, any strides) = cvt((dequant(a) @ dequant(b) * (sa * sb)
     + bias) * scale_result), or `(acc * sa) * sb` when `sequential` (the
@@ -462,17 +470,25 @@ def _scaled_gemm(
     var n = b.dim(1)
     if m == 0 or n == 0:
         return
-    if k == 0:
-        # CUDA: `out.zero_()` and nothing else, bias included.
+    if k == 0 and not grouped:
+        # _scaled_mm: `out.zero_()` and nothing else, bias included.
         fill_value(dest, 0.0)
         return
-    var a32 = _dequant(a, m, k, a.stride(0), a.stride(1), dq_a)
-    # B transposed: row n of B^T is column n of B.
-    var bt32 = _dequant(b, n, k, b.stride(1), b.stride(0), dq_b)
-    var exact = dq_a.recipe == DQ_NONE and dq_b.recipe == DQ_NONE
-    var p = _gemm_f32(a32.t, bt32.t, exact)
-    _ = a32^
-    _ = bt32^
+    var p: Owned
+    if k == 0:
+        # A grouped GEMM's empty-K group still runs its epilogue on a zero
+        # accumulator (0 * inf scale is NaN there, as on CUDA).
+        p = own(new_tensor(_shape2(m, n), 2, ST_FLOAT32, dest.device))
+        fill_value(p.t, 0.0)
+    elif dq_a.recipe != DQ_NONE or dq_b.recipe != DQ_NONE:
+        p = _block_scaled_product(a, b, dq_a, dq_b)
+    else:
+        var a32 = _dequant(a, m, k, a.stride(0), a.stride(1), _dq_none())
+        # B transposed: row n of B^T is column n of B.
+        var bt32 = _dequant(b, n, k, b.stride(1), b.stride(0), _dq_none())
+        p = _gemm_f32(a32.t, bt32.t, True)
+        _ = a32^
+        _ = bt32^
     var ctx = ctx_for(dest.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("scaled_mm", "Epilogue")
@@ -514,6 +530,71 @@ def _scaled_gemm(
     _ = ctx
     _ = p^  # read by the epilogue: alive past the launch
     _ = flat_bias^
+
+
+def _block_scaled_product(a: T, b: T, dq_a: _Dq, dq_b: _Dq) raises -> Owned:
+    """`a @ b` under block scales, the way cuBLASLt computes it: per K
+    block (128 for the float32 1x128 / 128x128 recipes, 32 for MX), an exact
+    partial product of the unscaled float8 values, scaled by that block's
+    scales and added to a float32 accumulator (`BlockAccum`). Pre-scaling
+    the operands instead changes the arithmetic: a 1e37 scale overflows a
+    partial sum on CUDA where it would not in a pre-scaled operand."""
+    var m = a.dim(0)
+    var k = a.dim(1)
+    var n = b.dim(1)
+    var bk = 32 if dq_a.recipe == DQ_MX_SWIZZLED else 128
+    var nkb = _cdiv(k, bk)
+    var acc = own(new_tensor(_shape2(m, n), 2, ST_FLOAT32, a.device))
+    for kb in range(nkb):
+        var k0 = kb * bk
+        var kl = min(bk, k - k0)
+        var av = own(
+            view_strided(
+                a,
+                _shape2(m, kl),
+                _strides2(a.stride(0), a.stride(1)),
+                2,
+                a.offset + k0 * a.stride(1),
+            )
+        )
+        var bv = own(
+            view_strided(
+                b,
+                _shape2(kl, n),
+                _strides2(b.stride(0), b.stride(1)),
+                2,
+                b.offset + k0 * b.stride(0),
+            )
+        )
+        var a32 = _dequant(av.t, m, kl, a.stride(0), a.stride(1), _dq_none())
+        var bt32 = _dequant(bv.t, n, kl, b.stride(1), b.stride(0), _dq_none())
+        _ = av^
+        _ = bv^
+        var part = _gemm_f32(a32.t, bt32.t, True)
+        _ = a32^
+        _ = bt32^
+        var ctx = ctx_for(a.device)
+        var call = KernelCall("scaled_mm", "BlockAccum")
+        call.int(acc.t.ptr)
+        call.int(part.t.ptr)
+        call.int(m)
+        call.int(n)
+        call.int(kb)
+        call.int(1 if kb == 0 else 0)
+        call.int(dq_a.addr)
+        call.int(dq_a.recipe)
+        call.int(dq_a.ss0)
+        call.int(dq_a.ss1)
+        call.int(dq_b.addr)
+        call.int(dq_b.recipe)
+        call.int(dq_b.ss0)
+        call.int(dq_b.ss1)
+        call.int(_cdiv(k, 32))
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+        _ = part^  # read by the launch
+    return acc^
 
 
 def _plan(kind: Int, s: _Sc, outer: Int) -> Tuple[_Dq, _Outer]:
@@ -732,6 +813,39 @@ def op_scaled_mm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_tensor(rets, 0, out.take())
 
 
+def _arg_tensors(args: Values, idxs: List[Int]) raises -> List[T]:
+    """The tensors among the given schema arguments (lists flattened)."""
+    var out = List[T]()
+    for i in idxs:
+        var v = args[unsafe_offset=i].copy()
+        if v.tag == TAG_NONE:
+            continue
+        if v.tag == TAG_TENSOR_LIST or v.tag == TAG_OPT_TENSOR_LIST:
+            for t in v_tensor_list(v):
+                out.append(t.copy())
+        elif v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            out.append(v_tensor(v))
+    return out^
+
+
+def _aliases_any(dest: T, ts: List[T]) -> Bool:
+    """Whether `out` shares storage with an input: resizing it first could
+    reallocate that storage and leave the input's pointer stale (and even
+    without a resize, an input read after part of `out` was written would
+    see the new values)."""
+    for t in ts:
+        if shares_storage(dest, t):
+            return True
+    return False
+
+
+def _land(mut dest: T, res: T) raises:
+    """Hand a result computed into a temporary to the caller's `out`."""
+    resize_out(dest, res.shape, res.rank)
+    if res.numel > 0:
+        copy_strided_into(dest, res)
+
+
 # aten::_scaled_mm.out(..., bool use_fast_accum=False, *, Tensor(a!) out)
 def op_scaled_mm_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -741,6 +855,9 @@ def op_scaled_mm_out(
     var dest = v_tensor(args[unsafe_offset=8])
     var has_dt = not v_is_none(args[unsafe_offset=6])
     var out_st = v_dtype_or(args[unsafe_offset=6], dest.stype)
+    var alias = _aliases_any(dest, _arg_tensors(args, [0, 1, 2, 3, 4, 5]))
+    var tmp = own(new_tensor(_shape2(0, 0), 2, dest.stype, dest.device))
+    var target = tmp.t.copy() if alias else dest.copy()
     _scaled_mm_v1(
         a,
         b,
@@ -750,9 +867,12 @@ def op_scaled_mm_out(
         v_opt_tensor(args[unsafe_offset=5]),
         out_st,
         has_dt,
-        dest,
+        target,
     )
-    ret_ref(rets, 0, dest)
+    if alias:
+        _land(dest, target)
+    _ = tmp^
+    ret_ref(rets, 0, v_tensor(args[unsafe_offset=8]))
 
 
 # --- aten::_scaled_mm_v2 -----------------------------------------------------
@@ -1231,8 +1351,14 @@ def op_scaled_mm_v2_out(
     var dest = v_tensor(args[unsafe_offset=12])
     var out_st = v_dtype_or(args[unsafe_offset=9], a.stype)
     check_out_as(dest, out_st, a)
-    _scaled_mm_v2(args, dest)
-    ret_ref(rets, 0, dest)
+    if _aliases_any(dest, _arg_tensors(args, [0, 1, 2, 5, 8])):
+        var tmp = own(new_tensor(_shape2(0, 0), 2, out_st, a.device))
+        _scaled_mm_v2(args, tmp.t)
+        _land(dest, tmp.t)
+        _ = tmp^
+    else:
+        _scaled_mm_v2(args, dest)
+    ret_ref(rets, 0, v_tensor(args[unsafe_offset=12]))
 
 
 # --- aten::_scaled_grouped_mm (v1, v2) --------------------------------------
@@ -1242,6 +1368,15 @@ def op_scaled_mm_v2_out(
 # `_scaled_gemm` over views, the way ATen's `_grouped_mm_fallback` loops;
 # `offs` is read back to the host once (a synchronizing 4-byte-per-group
 # copy).
+
+
+def _check_grouped_e4m3(a: T, b: T) raises:
+    """_f8_f8_bf16_rowwise_grouped_mm_cuda: both operands e4m3fn (CUDA
+    raises ValueError; RuntimeError here, same text)."""
+    if a.dtype != DType.float8_e4m3fn:
+        raise Error("Expected mat_a to be Float8_e4m3 matrix got ", _tname(a))
+    if b.dtype != DType.float8_e4m3fn:
+        raise Error("Expected mat_b to be Float8_e4m3 matrix got ", _tname(b))
 
 
 def _valid_strides_transposed(m: T) raises -> Bool:
@@ -1469,6 +1604,7 @@ def _grouped_rowwise(
             _Outer(sbv.ptr, sbv.stride(0) if sbv.rank >= 1 else 0),
             none,
             sequential=True,
+            grouped=True,
         )
 
     if a.rank == 3 and b.rank == 3:
@@ -1632,7 +1768,7 @@ def op_scaled_grouped_mm(
             "Only bf16 high precision output types are supported for grouped"
             " gemm"
         )
-    _check_mat_dtypes(a, b, "mat_a", "mat_b")
+    _check_grouped_e4m3(a, b)
     var out = _grouped_out(a, b, offs)
     _grouped_rowwise(a, b, sa, sb, offs, out.t)
     ret_tensor(rets, 0, out.take())
@@ -1688,7 +1824,7 @@ def _grouped_v2_checks(args: Values) raises:
     var mult = offs.value().dim(0) if a.rank == 2 and b.rank == 2 else 1
     _check_rowwise_grouped_scale(a, scale_a[0], 0, 0, mult)
     _check_rowwise_grouped_scale(b, scale_b[0], 1, 1, mult)
-    _check_mat_dtypes(a, b, "mat_a", "mat_b")
+    _check_grouped_e4m3(a, b)
 
 
 # aten::_scaled_grouped_mm_v2(Tensor self, Tensor mat2, Tensor[] scale_a,
@@ -1734,16 +1870,29 @@ def op_scaled_grouped_mm_v2_out(
         dest,
     )
     var dims = _grouped_dims(a, b, offs)
-    resize_out(dest, _grouped_shape(dims), len(dims))
-    _grouped_rowwise(
-        a,
-        b,
-        v_tensor_list(args[unsafe_offset=2])[0],
-        v_tensor_list(args[unsafe_offset=5])[0],
-        offs,
-        dest,
-    )
-    ret_ref(rets, 0, dest)
+    if _aliases_any(dest, _arg_tensors(args, [0, 1, 2, 5, 8])):
+        var tmp = _grouped_out(a, b, offs)
+        _grouped_rowwise(
+            a,
+            b,
+            v_tensor_list(args[unsafe_offset=2])[0],
+            v_tensor_list(args[unsafe_offset=5])[0],
+            offs,
+            tmp.t,
+        )
+        _land(dest, tmp.t)
+        _ = tmp^
+    else:
+        resize_out(dest, _grouped_shape(dims), len(dims))
+        _grouped_rowwise(
+            a,
+            b,
+            v_tensor_list(args[unsafe_offset=2])[0],
+            v_tensor_list(args[unsafe_offset=5])[0],
+            offs,
+            dest,
+        )
+    ret_ref(rets, 0, v_tensor(args[unsafe_offset=13]))
 
 
 def register_scaled_mm(site: Site) raises:

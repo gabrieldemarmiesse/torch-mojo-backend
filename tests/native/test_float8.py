@@ -1610,3 +1610,86 @@ def test_float8_take_out_checks_before_refusal(mojo_device):
     with pytest.raises(NotImplementedError, match="take_cuda"):
         torch.take(x, torch.tensor([0, 1, 2], device=dev), out=out)
     assert out.shape == (3,)
+
+
+# ---------------------------------------------------------------------------
+# scaled-mm PR review
+# ---------------------------------------------------------------------------
+
+
+def test_scaled_mm_out_aliasing_an_input(mojo_device):
+    """out= sharing storage with an input (here scale_a, resized by the call)
+    is computed into a temporary first: 16 * 2 * 3 everywhere, as on CUDA."""
+    dev = mojo_device
+    a = torch.ones(1, 16).to(torch.float8_e4m3fn).to(dev)
+    b = torch.ones(16, 16).to(torch.float8_e4m3fn).to(dev).t()
+    sa = torch.tensor(2.0, device=dev)
+    sb = torch.tensor(3.0, device=dev)
+    r = torch._scaled_mm(a, b, sa, sb, out_dtype=torch.float32, out=sa)
+    assert r.data_ptr() == sa.data_ptr()
+    assert sa.shape == (1, 16) and sa.cpu().tolist() == [[96.0] * 16]
+    sa2 = torch.tensor(2.0, device=dev)
+    out = torch.ops.aten._scaled_mm_v2.out(
+        a, b, [sa2], [0], [], [sb], [0], [], None, torch.float32, [], False, out=sa2
+    )
+    assert out.cpu().tolist() == [[96.0] * 16]
+
+
+def test_scaled_mm_block_scales_apply_per_k_block(mojo_device):
+    """cuBLASLt block scaling: each K block's partial sum, times scale_a,
+    times scale_b, accumulated (measured on stock CUDA: 1e37 then 1e-37
+    overflows to inf; 1e-37 then 1e37 does not)."""
+    dev = mojo_device
+    m, k, n = 128, 256, 128
+    a = torch.ones(m, k).to(torch.float8_e4m3fn).to(dev)
+    b = torch.ones(n, k).to(torch.float8_e4m3fn).to(dev).t()
+
+    def run(va: float, vb: float) -> float:
+        sa = torch.full((k // 128, m), va, device=dev).t()
+        sb = torch.full((k // 128, n), vb, device=dev)  # v1: (kb, N)
+        out = torch._scaled_mm(a, b, sa, sb, out_dtype=torch.float32)
+        return out[0, 0].item()
+
+    assert run(1e37, 1e-37) == float("inf")
+    assert run(1e-37, 1e37) == 256.0
+    assert run(2.0, 3.0) == 1536.0
+
+
+def test_scaled_grouped_mm_empty_k_group_runs_epilogue(mojo_device):
+    """A 2d x 2d group with no K still multiplies its (zero) accumulator by
+    the scales: 0 * inf is NaN, as on CUDA."""
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    a = torch.ones(16, 32).to(f8).to(dev)
+    b = torch.ones(16, 32).to(f8).to(dev).t()
+    offs = torch.tensor([0, 32], dtype=torch.int32, device=dev)
+    sa = torch.ones(32, device=dev)
+    sa[:16] = float("inf")
+    sb = torch.ones(32, device=dev)
+    got = torch._scaled_grouped_mm(a, b, sa, sb, offs=offs, out_dtype=torch.bfloat16)
+    got = got.cpu().float()
+    assert torch.isnan(got[0]).all()
+    assert (got[1] == 32.0).all()
+
+
+def test_scaled_grouped_mm_requires_e4m3fn(mojo_device):
+    dev = mojo_device
+    a = torch.zeros(2, 16, 32).to(torch.float8_e5m2).to(dev)
+    b = torch.zeros(2, 16, 32).to(torch.float8_e4m3fn).to(dev).transpose(1, 2)
+    s = torch.ones(2, 16, device=dev)
+    with pytest.raises(
+        (RuntimeError, ValueError),
+        match="Expected mat_a to be Float8_e4m3 matrix got Float8_e5m2",
+    ):
+        torch._scaled_grouped_mm(a, b, s, s, out_dtype=torch.bfloat16)
+    with pytest.raises(
+        (RuntimeError, ValueError),
+        match="Expected mat_b to be Float8_e4m3 matrix got Float8_e5m2",
+    ):
+        torch._scaled_grouped_mm(
+            b.transpose(1, 2).contiguous(),
+            a.transpose(1, 2),
+            s,
+            s,
+            out_dtype=torch.bfloat16,
+        )

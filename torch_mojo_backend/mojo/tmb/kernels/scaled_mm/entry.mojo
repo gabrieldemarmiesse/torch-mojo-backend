@@ -1,11 +1,15 @@
 # ===----------------------------------------------------------------------=== #
 # The two element-wise halves of torch._scaled_mm around a float32 GEMM.
 #
-#   Dequant   out_f32[r, c] = float(x[r, c]) * scale(r, c)
-#             x is a float8 matrix of any strides; the scale follows one of
-#             torch's recipes (none, tensorwise, rowwise, 1x128 / 128x128
-#             blocks of float32, or MX 1x32 blocks of float8_e8m0fnu in the
-#             SWIZZLE_32_4_4 layout cuBLAS reads them in).
+#   Dequant   out_f32[r, c] = float(x[r, c]) (* scale(r, c), recipe kept for
+#             completeness; the ops call it unscaled)
+#             x is a float8 matrix of any strides.
+#   BlockAccum  acc[i, j] (+)= (p[i, j] * sa(i, kb)) * sb(j, kb)
+#             one K block's partial product folded into the accumulator with
+#             that block's scales, the way cuBLASLt applies 1x128 / 128x128
+#             float32 block scales and MX 1x32 float8_e8m0fnu ones (in the
+#             SWIZZLE_32_4_4 layout): a partial sum per K block, scaled, then
+#             accumulated.
 #   Epilogue  out[i, j] = cvt((p[i, j] * (sa[i] * sb[j]) + bias[j]) * sr)
 #             with sa / sb a scalar, a vector or absent, a float16 /
 #             bfloat16 bias, and a float8 output saturated to its largest
@@ -197,6 +201,119 @@ def _dequant_go(
 
 
 @always_inline
+def _block_scale(
+    ptr: Pointer[Scalar[DType.uint8], ImmutAnyOrigin],
+    recipe: Int,
+    ss0: Int,
+    ss1: Int,
+    row: Int,
+    kb: Int,
+    kblocks: Int,
+) -> Float32:
+    """The scale of (`row`, K block `kb`) under a block recipe."""
+    if recipe == RECIPE_MX_SWIZZLED:
+        var at = _mx_swizzled_index(row, kb, kblocks)
+        return fp8_to_f32[DType.float8_e8m0fnu, 1](
+            SIMD[DType.uint8, 1](ptr[unsafe_offset=at])
+        )[0]
+    var at = row * ss0 + kb * ss1
+    if recipe == RECIPE_BLOCK_128X128:
+        at = (row // 128) * ss0 + kb * ss1
+    return ptr.unsafe_bitcast[Float32]()[unsafe_offset=at]
+
+
+def _block_accum_kernel(
+    acc_ptr: Pointer[Float32, MutAnyOrigin],
+    p_ptr: Pointer[Float32, ImmutAnyOrigin],
+    m_a: Int64,
+    n_a: Int64,
+    kb_a: Int64,
+    first_a: Int64,
+    sa_ptr: Pointer[Scalar[DType.uint8], ImmutAnyOrigin],
+    sa_recipe: Int64,
+    sa_ss0: Int64,
+    sa_ss1: Int64,
+    sb_ptr: Pointer[Scalar[DType.uint8], ImmutAnyOrigin],
+    sb_recipe: Int64,
+    sb_ss0: Int64,
+    sb_ss1: Int64,
+    kblocks_a: Int64,
+):
+    var n = Int(n_a)
+    var total = Int(m_a) * n
+    var kb = Int(kb_a)
+    var kblocks = Int(kblocks_a)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var step = Int(grid_dim.x) * Int(block_dim.x)
+    while i < total:
+        var r = i // n
+        var c = i - r * n
+        var sa = _block_scale(
+            sa_ptr, Int(sa_recipe), Int(sa_ss0), Int(sa_ss1), r, kb, kblocks
+        )
+        var sb = _block_scale(
+            sb_ptr, Int(sb_recipe), Int(sb_ss0), Int(sb_ss1), c, kb, kblocks
+        )
+        # (partial * sa) * sb: measured on stock CUDA, 1x128 scales 1e37
+        # and 1e-37 overflow (inf), 1e-37 and 1e37 do not.
+        var v = (p_ptr[unsafe_offset=i] * sa) * sb
+        if first_a != 0:
+            acc_ptr[unsafe_offset=i] = v
+        else:
+            acc_ptr[unsafe_offset=i] = acc_ptr[unsafe_offset=i] + v
+        i += step
+
+
+def _block_accum_go(
+    acc_o: Arg,
+    p_o: Arg,
+    m_o: Arg,
+    n_o: Arg,
+    kb_o: Arg,
+    first_o: Arg,
+    sa_o: Arg,
+    sar_o: Arg,
+    sa0_o: Arg,
+    sa1_o: Arg,
+    sb_o: Arg,
+    sbr_o: Arg,
+    sb0_o: Arg,
+    sb1_o: Arg,
+    kblocks_o: Arg,
+    ctx_o: Arg,
+) raises:
+    """`BlockAccum`: slots (acc f32, p f32 (both m x n contiguous), m, n,
+    K block, first, then for scale_a and scale_b: address, recipe, row
+    stride, K-block stride; the K-block count (MX layout), ctx)."""
+    var ctx = _raw_ctx(ctx_o)
+    var total = _raw_int(m_o) * _raw_int(n_o)
+    if total == 0:
+        return
+    _enqueue_cached[_block_accum_kernel](
+        ctx,
+        _gs_blocks(total),
+        1,
+        1,
+        GS_THREADS,
+        _make_ptr[DType.float32](_raw_int(acc_o)).as_unsafe_any_origin(),
+        _make_ptr[DType.float32](_raw_int(p_o)).as_unsafe_any_origin().as_imm(),
+        Int64(_raw_int(m_o)),
+        Int64(_raw_int(n_o)),
+        Int64(_raw_int(kb_o)),
+        Int64(_raw_int(first_o)),
+        _make_ptr[DType.uint8](_raw_int(sa_o)).as_unsafe_any_origin().as_imm(),
+        Int64(_raw_int(sar_o)),
+        Int64(_raw_int(sa0_o)),
+        Int64(_raw_int(sa1_o)),
+        _make_ptr[DType.uint8](_raw_int(sb_o)).as_unsafe_any_origin().as_imm(),
+        Int64(_raw_int(sbr_o)),
+        Int64(_raw_int(sb0_o)),
+        Int64(_raw_int(sb1_o)),
+        Int64(_raw_int(kblocks_o)),
+    )
+
+
+@always_inline
 def _or(addr: Int, fallback: Int) -> Int:
     return addr if addr != 0 else fallback
 
@@ -383,6 +500,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     try:
         comptime if _op_on["Dequant"]():
             _spec_dispatcher11[_dequant_go, "Dequant"](argv, argc)
+            return 0
+        elif _op_on["BlockAccum"]():
+            _spec_dispatcher16[_block_accum_go, "BlockAccum"](argv, argc)
             return 0
         elif _op_on["Epilogue"]():
             _spec_dispatcher16[_epilogue_go, "Epilogue"](argv, argc)

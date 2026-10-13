@@ -382,7 +382,9 @@ stock torch.
 `torch._scaled_mm`, `_scaled_mm_v2` and the rowwise `_scaled_grouped_mm[_v2]`
 are `tmb/ops/scaled_mm.mojo`: dequantize to float32 (`scaled_mm` family,
 `Dequant`), the float32 GEMM of `ops/matmul.mojo` (the TF32 bridge for the
-tensorwise / rowwise recipes, where it is exact), one `Epilogue` pass for the
+tensorwise / rowwise recipes, where it is exact; for block scales one exact
+partial product per K block, scaled and accumulated by `BlockAccum` the way
+cuBLASLt does), one `Epilogue` pass for the
 outer scales, the bias and the (saturating, for float8) output conversion.
 A correct, not a fast, route: no float8 tensor-core kernel exists yet.
 
