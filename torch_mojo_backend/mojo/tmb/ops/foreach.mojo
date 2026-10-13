@@ -342,12 +342,44 @@ def _binary(
 # One row per overload pair, one line per row: a table read across.
 # fmt: off
 comptime FOREACH_OVERLOADS: List[ForeachOverload] = [
-    # The overloads the multi-tensor apply started with; the other
-    # families join in the commits that follow.
-    _unary("_foreach_sqrt", "", "sqrt", "aten::sqrt", "aten::sqrt_", D_FLOAT, True, apple=True),
+    # unary: ForeachUnaryOp.cu. Floating lists only, except abs (every
+    # dtype), neg (not bool) and zero_; float64 where the GPU lowers it.
+    _unary("_foreach_abs", "_foreach_abs_", "abs", "aten::abs", "aten::abs_", D_ALL, True),
+    _unary("_foreach_acos", "_foreach_acos_", "acos", "aten::acos", "aten::acos_", D_FLOAT, False),
+    _unary("_foreach_asin", "_foreach_asin_", "asin", "aten::asin", "aten::asin_", D_FLOAT, False),
+    _unary("_foreach_atan", "_foreach_atan_", "atan", "aten::atan", "aten::atan_", D_FLOAT, False),
+    _unary("_foreach_ceil", "_foreach_ceil_", "ceil", "aten::ceil", "aten::ceil_", D_FLOAT, True),
+    _unary("_foreach_cos", "_foreach_cos_", "cos", "aten::cos", "aten::cos_", D_FLOAT, False),
+    _unary("_foreach_cosh", "_foreach_cosh_", "cosh", "aten::cosh", "aten::cosh_", D_FLOAT, False),
+    _unary("_foreach_erf", "_foreach_erf_", "erf", "aten::erf", "aten::erf_", D_FLOAT, False),
+    _unary("_foreach_erfc", "_foreach_erfc_", "erfc", "aten::erfc", "aten::erfc_", D_FLOAT, False),
+    _unary("_foreach_exp", "_foreach_exp_", "exp", "aten::exp", "aten::exp_", D_FLOAT, False),
+    _unary("_foreach_expm1", "_foreach_expm1_", "expm1", "aten::expm1", "aten::expm1_", D_FLOAT, False),
+    _unary("_foreach_floor", "_foreach_floor_", "floor", "aten::floor", "aten::floor_", D_FLOAT, True),
+    _unary("_foreach_frac", "_foreach_frac_", "frac", "aten::frac", "aten::frac_", D_FLOAT, True),
+    _unary("_foreach_lgamma", "_foreach_lgamma_", "lgamma", "aten::lgamma", "aten::lgamma_", D_FLOAT, False),
+    _unary("_foreach_log", "_foreach_log_", "log", "aten::log", "aten::log_", D_FLOAT, False),
+    _unary("_foreach_log10", "_foreach_log10_", "log10", "aten::log10", "aten::log10_", D_FLOAT, False),
+    _unary("_foreach_log1p", "_foreach_log1p_", "log1p", "aten::log1p", "aten::log1p_", D_FLOAT, False),
+    _unary("_foreach_log2", "_foreach_log2_", "log2", "aten::log2", "aten::log2_", D_FLOAT, False),
+    _unary("_foreach_neg", "_foreach_neg_", "neg", "aten::neg", "aten::neg_", D_INT, True),
+    _unary("_foreach_reciprocal", "_foreach_reciprocal_", "reciprocal", "aten::reciprocal", "aten::reciprocal_", D_FLOAT, True),
+    _unary("_foreach_round", "_foreach_round_", "round", "aten::round", "aten::round_", D_FLOAT, True),
+    _unary("_foreach_rsqrt", "_foreach_rsqrt_", "rsqrt", "aten::rsqrt", "aten::rsqrt_", D_FLOAT, False),
+    _unary("_foreach_sigmoid", "_foreach_sigmoid_", "sigmoid", "aten::sigmoid", "aten::sigmoid_", D_FLOAT, False),
+    _unary("_foreach_sign", "_foreach_sign_", "sign", "aten::sign", "aten::sign_", D_FLOAT, True),
+    _unary("_foreach_sin", "_foreach_sin_", "sin", "aten::sin", "aten::sin_", D_FLOAT, False),
+    _unary("_foreach_sinh", "_foreach_sinh_", "sinh", "aten::sinh", "aten::sinh_", D_FLOAT, False),
+    _unary("_foreach_sqrt", "_foreach_sqrt_", "sqrt", "aten::sqrt", "aten::sqrt_", D_FLOAT, True, apple=True),
+    _unary("_foreach_tan", "_foreach_tan_", "tan", "aten::tan", "aten::tan_", D_FLOAT, False),
+    _unary("_foreach_tanh", "_foreach_tanh_", "tanh", "aten::tanh", "aten::tanh_", D_FLOAT, False),
+    _unary("_foreach_trunc", "_foreach_trunc_", "trunc", "aten::trunc", "aten::trunc_", D_FLOAT, True),
+    _unary("", "_foreach_zero_", "zero", "", "aten::zero_", D_ALL, True),
+    # binary: ForeachBinaryOp{Scalar,ScalarList,List,ScalarTensor}.cu.
     _binary("", "_foreach_add_.Scalar", "add", S_SCALAR, "aten::add", "Scalar", "aten::add_", "Scalar", D_ALL, alpha=True, apple=True),
     _binary("", "_foreach_mul_.Scalar", "mul", S_SCALAR, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL, apple=True),
     _binary("", "_foreach_mul_.Tensor", "mul", S_TENSOR, "aten::mul", "Tensor", "aten::mul_", "Tensor", D_ALL, apple=True),
+    # pointwise: ForeachPointwiseOp.cu (floating lists only).
     _binary("", "_foreach_addcmul_.Scalar", "addcmul", S_PW_SCALAR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT, apple=True),
     _binary("", "_foreach_lerp_.Scalar", "lerp", S_LERP_SCALAR, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT, apple=True),
 ]

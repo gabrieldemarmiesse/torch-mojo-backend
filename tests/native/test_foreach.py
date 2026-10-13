@@ -2568,3 +2568,130 @@ def test_mta_torch_optim_foreach_matches_cpu(mojo_gpu: str, make):
         results[device] = [p.detach().cpu() for p in params]
     for a, e in zip(results[mojo_gpu], results["cpu"], strict=True):
         torch.testing.assert_close(a, e, rtol=2e-5, atol=2e-6)
+
+
+# --- unary ---------------------------------------------------------------------
+
+
+_MTA_UNARY = {
+    "abs": (-3, 3),
+    "acos": (-0.99, 0.99),
+    "asin": (-0.99, 0.99),
+    "atan": (-3, 3),
+    "ceil": (-3, 3),
+    "cos": (-3, 3),
+    "cosh": (-3, 3),
+    "erf": (-2, 2),
+    "erfc": (-2, 2),
+    "exp": (-3, 3),
+    "expm1": (-1, 1),
+    "floor": (-3, 3),
+    "frac": (-3, 3),
+    "lgamma": (0.1, 5),
+    "log": (0.1, 5),
+    "log10": (0.1, 5),
+    "log1p": (-0.5, 3),
+    "log2": (0.1, 5),
+    "neg": (-3, 3),
+    "reciprocal": (0.5, 3),
+    "round": (-3, 3),
+    "rsqrt": (0.1, 5),
+    "sigmoid": (-3, 3),
+    "sign": (-3, 3),
+    "sin": (-3, 3),
+    "sinh": (-2, 2),
+    "sqrt": (0, 5),
+    "tan": (-1, 1),
+    "tanh": (-3, 3),
+    "trunc": (-3, 3),
+}
+# The unary kinds whose float64 math lowers on the GPU (the rest decline
+# float64 per tensor too, so their foreach falls back and declines).
+_MTA_UNARY_F64 = {
+    "abs", "ceil", "floor", "frac", "neg", "reciprocal", "round",
+    "sign", "sqrt", "trunc",
+}  # fmt: skip
+_MTA_UNARY_CASES = [
+    (name, dtype_id)
+    for name in _MTA_UNARY
+    for dtype_id in _MTA_FLOATS
+    if dtype_id != "f64" or name in _MTA_UNARY_F64
+]
+
+
+@pytest.mark.parametrize("inplace", [False, True], ids=["out", "inplace"])
+@pytest.mark.parametrize(("name", "dtype_id"), _MTA_UNARY_CASES)
+def test_mta_unary_matches_cpu(mojo_gpu: str, name: str, dtype_id: str, inplace: bool):
+    dtype = _MTA_FLOATS[dtype_id]
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    lo, hi = _MTA_UNARY[name]
+    cpu, dev = _mta_lists(mojo_gpu, dtype, lo, hi, seed=len(name))
+    if inplace:
+        expected = [getattr(torch, name)(t) for t in cpu]
+        before = [t._version for t in dev]
+        with _one_launch(f"_foreach_{name}_"):
+            getattr(torch, f"_foreach_{name}_")(dev)
+        actual = dev
+        assert [t._version - v for t, v in zip(dev, before)] == [1] * len(dev)
+    else:
+        expected = [getattr(torch, name)(t) for t in cpu]
+        with _one_launch(f"_foreach_{name}"):
+            actual = getattr(torch, f"_foreach_{name}")(dev)
+    _assert_lists(actual, expected, **_mta_tol(dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int32, torch.int64, torch.uint8])
+@pytest.mark.parametrize("name", ["abs", "neg"])
+def test_mta_unary_integers(mojo_gpu: str, name: str, dtype: torch.dtype):
+    lo, hi = (0, 200) if dtype == torch.uint8 else (-100, 100)
+    cpu, dev = _mta_lists(mojo_gpu, dtype, lo, hi, seed=3)
+    with _one_launch(f"_foreach_{name}"):
+        actual = getattr(torch, f"_foreach_{name}")(dev)
+    _assert_lists(actual, [getattr(torch, name)(t) for t in cpu])
+
+
+def test_mta_abs_and_zero_on_bool(mojo_gpu: str):
+    """CUDA's abs takes bool (the CPU kernel does not), as the identity."""
+    cpu = [torch.tensor([True, False, True]), torch.zeros(1025, dtype=torch.bool)]
+    dev = [t.to(mojo_gpu) for t in cpu]
+    with _one_launch("_foreach_abs"):
+        actual = torch._foreach_abs(dev)
+    _assert_lists(actual, cpu)
+    with _one_launch("_foreach_zero_"):
+        torch._foreach_zero_(dev)
+    _assert_lists(dev, [torch.zeros_like(t) for t in cpu])
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.float64, torch.int64, torch.bool]
+)
+def test_mta_zero_(mojo_gpu: str, dtype: torch.dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    cpu, dev = _mta_lists(mojo_gpu, dtype, 1, 5, seed=1)
+    with _one_launch("_foreach_zero_"):
+        torch._foreach_zero_(dev)
+    _assert_lists(dev, [torch.zeros_like(t) for t in cpu])
+
+
+def test_mta_unary_fallbacks_match_cpu(mojo_gpu: str):
+    """Lists the fast route does not take still get ATen's answer."""
+    # Mixed dtypes.
+    cpu = [torch.randn(5), torch.randn(9).to(torch.bfloat16)]
+    dev = [t.to(mojo_gpu) for t in cpu]
+    _assert_lists(
+        torch._foreach_exp(dev), [t.exp() for t in cpu], **_mta_tol(torch.bfloat16)
+    )
+    # Not dense.
+    base = torch.randn(40)
+    dev_base = base.to(mojo_gpu)
+    _assert_lists(
+        torch._foreach_sigmoid([dev_base[::2], dev_base[1::4]]),
+        [base[::2].sigmoid(), base[1::4].sigmoid()],
+    )
+    # An integer list: the per-tensor op promotes it.
+    ints = [torch.arange(5), torch.arange(1025) % 7]
+    _assert_lists(
+        torch._foreach_exp([t.to(mojo_gpu) for t in ints]), [t.exp() for t in ints]
+    )
