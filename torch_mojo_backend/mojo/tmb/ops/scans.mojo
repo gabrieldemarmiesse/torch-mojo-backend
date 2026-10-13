@@ -56,6 +56,7 @@ from tmb.ops.complex_math import (
     cx_cumsum,
     cx_cumsum_,
     cx_cumsum_out,
+    routed_red,
 )
 
 
@@ -456,6 +457,6 @@ def register_scans(site: Site) raises:
     impl[op_cumprod, "cumprod"](site)
     impl[op_cumprod_, "cumprod_"](site)
     impl[op_cumprod_out, "cumprod.out"](site)
-    impl[routed[op_cumsum, cx_cumsum, 1], "cumsum"](site)
+    impl[routed_red[op_cumsum, cx_cumsum, 1, 2, -1], "cumsum"](site)
     impl[routed[op_cumsum_, cx_cumsum_, 1], "cumsum_"](site)
-    impl[routed[op_cumsum_out, cx_cumsum_out, 1], "cumsum.out"](site)
+    impl[routed_red[op_cumsum_out, cx_cumsum_out, 1, 2, 3], "cumsum.out"](site)

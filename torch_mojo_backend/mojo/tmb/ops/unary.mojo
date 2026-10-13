@@ -2288,7 +2288,7 @@ def register_unary(site: Site) raises:
     impl[op_acosh, "acosh"](site)
     impl[op_acosh_out, "acosh.out"](site)
     impl[routed[op_angle, cx_angle, 1], "angle"](site)
-    impl[routed[op_angle_out, cx_angle_out, 1], "angle.out"](site)
+    impl[routed[op_angle_out, cx_angle_out, 2], "angle.out"](site)
     impl[op_asin, "asin"](site)
     impl[op_asin_out, "asin.out"](site)
     impl[op_asinh, "asinh"](site)

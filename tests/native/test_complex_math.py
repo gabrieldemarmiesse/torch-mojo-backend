@@ -452,3 +452,137 @@ def test_zero_dim_reductions(mojo_gpu: str):
     assert d.sum(0).item() == 1 + 2j and d.cumsum(0).item() == 1 + 2j
     with pytest.raises(IndexError):
         d.cumsum(1)
+
+
+# --- round-3 review fixes -------------------------------------------------------
+
+
+def test_pow_of_a_huge_base_stays_finite(mojo_gpu: str):
+    # |z| overflows float32 though z is finite: CUDA (thrust's clog) scales
+    x = torch.tensor([3e38 + 3e38j])
+    got = (x.to(mojo_gpu) ** 0.1).cpu()
+    torch.testing.assert_close(got, torch.tensor([7268.1353 + 572.0147j]))
+    got = torch.pow(x.to(mojo_gpu), torch.tensor([0.5 + 0.1j], device=mojo_gpu))
+    torch.testing.assert_close(
+        got.cpu(), torch.tensor([-1.8861e19 + 2.6145e18j]), rtol=1e-4, atol=0
+    )
+    # torch.log keeps libc++'s log(abs(z)): +inf on CUDA too
+    assert torch.log(x.to(mojo_gpu)).cpu().real.isinf().all()
+
+
+def test_pow_with_a_cpu_scalar_tensor_exponent(mojo_gpu: str):
+    # pow_tensor_tensor_kernel: only `equal(2.0)` (square) is special-cased
+    d = torch.tensor([1j], device=mojo_gpu)
+    assert torch.equal(torch.pow(d, torch.tensor(2.0)).cpu(), torch.tensor([-1 + 0j]))
+    big = torch.tensor([1e20j], device=mojo_gpu)
+    got = torch.pow(big, torch.tensor(2)).cpu()
+    assert got.real.item() == float("-inf") and got.imag.item() == 0.0
+    # no 0 / 1 shortcuts on this path: 0 ** 0. is exp(log 0 * 0) = NaN
+    z = torch.tensor([0j, 2 + 1j], device=mojo_gpu)
+    got = torch.pow(z, torch.tensor(0.0)).cpu()
+    assert got[0].real.isnan() and got[1] == 1
+
+
+def test_complex_and_polar_validation(mojo_gpu: str):
+    ones = torch.ones(3)
+    for fn in (torch.complex, torch.polar):
+        with pytest.raises(RuntimeError, match="same device"):
+            fn(ones.to(mojo_gpu), ones)
+        with pytest.raises(RuntimeError, match="same device"):
+            fn(ones.to(mojo_gpu), torch.tensor(1.0))
+        with pytest.raises(RuntimeError, match="same device"):
+            fn(torch.tensor(1.0), ones.to(mojo_gpu))
+    b = torch.ones(3, dtype=torch.bfloat16, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Half, Float or Double"):
+        torch.complex(b, b)
+    h = torch.ones(3, dtype=torch.half, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch.complex(h, h)  # complex32: declined, never garbage
+
+
+def test_cumsum_dtypes_and_outs(mojo_gpu: str):
+    x = _rand(4)
+    d = x.to(mojo_gpu)
+    out = torch.empty(0, dtype=torch.complex128, device=mojo_gpu)
+    torch.cumsum(d, 0, out=out)
+    assert out.dtype == torch.complex128
+    _close(out, torch.cumsum(x.to(torch.complex128), 0))
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        torch.cumsum(
+            d,
+            0,
+            dtype=torch.complex128,
+            out=torch.empty(0, dtype=torch.complex64, device=mojo_gpu),
+        )
+    y = torch.tensor([1 + 1j, 2 + 2j])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _close(
+            torch.cumsum(y.to(mojo_gpu), 0, dtype=torch.float32),
+            torch.tensor([1.0, 3.0]),
+        )
+        rout = torch.empty(0, device=mojo_gpu)
+        torch.cumsum(y.to(mojo_gpu), 0, out=rout)
+        _close(rout, torch.tensor([1.0, 3.0]))
+    # an expanded out is resized before any overlap check
+    ex = torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(5)
+    torch.cumsum(d, 0, out=ex)
+    _close(ex, torch.cumsum(x, 0))
+    # a real self with a complex dtype
+    got = torch.ones(3, device=mojo_gpu).cumsum(0, dtype=torch.cfloat)
+    _close(got, torch.ones(3).cumsum(0, dtype=torch.cfloat))
+
+
+def test_same_dtype_unary_outs(mojo_gpu: str):
+    d = _rand(4).to(mojo_gpu)
+    for fn in (torch.neg, torch.sgn):
+        with pytest.raises(RuntimeError, match="Found dtype"):
+            fn(d, out=torch.empty(0, dtype=torch.complex128, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="Found dtype"):
+        torch.neg(
+            torch.ones(3, device=mojo_gpu),
+            out=torch.empty(0, dtype=torch.complex64, device=mojo_gpu),
+        )
+    r = torch.tensor([-1.0, 2.0])
+    out = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+    torch.angle(r.to(mojo_gpu), out=out)
+    _close(out, torch.angle(r).to(torch.complex64))
+
+
+def test_reduction_dims_and_routing(mojo_gpu: str):
+    x = _rand(3, 4)
+    d = x.to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="multiple times"):
+        d.sum((0, 0))
+    with pytest.raises(RuntimeError, match="multiple times"):
+        d[0].mean((0, -1))  # the same dim of a 1-d tensor
+    with pytest.raises(RuntimeError, match="multiple times"):
+        torch.tensor(1 + 2j, device=mojo_gpu).sum((0, 0))
+    empty = torch.empty(0, dtype=torch.complex64, device=mojo_gpu).mean().cpu()
+    assert empty.real.isnan() and empty.imag == 0
+    _close(
+        torch.ones(3, device=mojo_gpu).sum(dtype=torch.cfloat),
+        torch.ones(3).sum(dtype=torch.cfloat),
+    )
+    _close(
+        torch.arange(4, device=mojo_gpu).mean(dtype=torch.cfloat),
+        torch.arange(4).mean(dtype=torch.cfloat),
+    )
+    r = torch.randn(3, 2)
+    for fn in (torch.sum, torch.mean):
+        out = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+        fn(r.to(mojo_gpu), 0, out=out)
+        _close(out, fn(r, 0).to(torch.complex64))
+
+
+def test_arithmetic_argument_checks(mojo_gpu: str):
+    b = torch.tensor([True, False], device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Subtraction"):
+        _ = b - 1j
+    with pytest.raises(RuntimeError, match="Subtraction"):
+        _ = 1j - b
+    d = _rand(4).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="Boolean alpha"):
+        torch.add(d, d, alpha=True)
+    z = _rand(4)
+    _close(torch.pow(True, z.to(mojo_gpu)), torch.pow(True, z))

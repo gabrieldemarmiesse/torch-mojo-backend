@@ -228,6 +228,16 @@ def clog[dt: DType](z: Cx[dt]) -> Cx[dt]:
     ):
         var t = (big - 1) * (big + 1) + small * small
         return Cx[dt](_rlog1p(t) * Scalar[dt](0.5), ang)
+    if isinf(h) and not isinf(x) and not isinf(y):
+        # |z| overflows the component type though z is finite (thrust's
+        # clog scales): log|z| = log|z / 2| + log 2, so [3e38+3e38j] ** 0.1
+        # stays finite as on CUDA
+        var half = Scalar[dt](0.5)
+        return Cx[dt](
+            _rlog(chypot(x * half, y * half))
+            + Scalar[dt](0.69314718055994530942),
+            ang,
+        )
     return Cx[dt](_rlog(h), ang)
 
 
