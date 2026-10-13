@@ -1102,14 +1102,6 @@ def test_batched_foreach_mixed_dtype_list_falls_back(mojo_gpu: str):
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "unregistered Scalar[] ops (see ops_foreach.mojo module docstring):"
-        " ATen's own sequential decomposition needs div_.Scalar / addcdiv_"
-        " registered by the binary group; not yet present in this worktree"
-    ),
-    strict=False,
-)
 @pytest.mark.parametrize(
     ("op_name", "apply"),
     [
@@ -1122,13 +1114,9 @@ def test_batched_foreach_mixed_dtype_list_falls_back(mojo_gpu: str):
         ),
     ],
 )
-def test_foreach_scalarlist_ops_unregistered_still_correct(
-    mojo_gpu: str, op_name: str, apply
-):
-    """`_foreach_div_.ScalarList` / `_foreach_addcdiv_.ScalarList` are not
-    registered here at all (Scalar[] cannot reach our boxed kernel yet), so
-    these must produce ATen's ordinary answer through its own
-    CompositeExplicitAutograd decomposition end to end."""
+def test_foreach_scalarlist_ops_match_cpu(mojo_gpu: str, op_name: str, apply):
+    """`_foreach_div_.ScalarList` / `_foreach_addcdiv_.ScalarList`: a
+    `Scalar[]` reaches the boxed kernel element by element."""
     cpu_lists = _foreach_lists("cpu")
     mojo_lists = _foreach_lists(mojo_gpu)
     apply(*cpu_lists)
@@ -3023,3 +3011,110 @@ def test_mta_binary_is_bit_exact_with_stock_cuda(mojo_gpu: str, dtype: torch.dty
     """add / sub with an alpha are one fma, div by a Scalar is CUDA's
     multiply by the reciprocal, maximum / minimum propagate NaN."""
     _stock_cuda_parity(dtype, mojo_gpu, _binary_calls)
+
+
+# --- pointwise (addcmul, addcdiv) and ternary (lerp) ---------------------------
+
+
+_MTA_POINTWISE_CASES = [
+    (op, overload, dtype_id)
+    for op in ("addcmul", "addcdiv")
+    for overload in ("Scalar", "ScalarList", "Tensor")
+    for dtype_id in _MTA_FLOATS
+]
+
+
+@pytest.mark.parametrize("inplace", [False, True], ids=["out", "inplace"])
+@pytest.mark.parametrize(("op", "overload", "dtype_id"), _MTA_POINTWISE_CASES)
+def test_mta_pointwise_matches_cpu(
+    mojo_gpu: str, op: str, overload: str, dtype_id: str, inplace: bool
+):
+    dtype = _MTA_FLOATS[dtype_id]
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    cpu, dev = _mta_lists(mojo_gpu, dtype, -3, 3, seed=21)
+    cpu1, dev1 = _mta_lists(mojo_gpu, dtype, -2, 2, seed=22)
+    cpu2, dev2 = _mta_lists(mojo_gpu, dtype, 0.5, 2, seed=23)
+    values = [0.5 - 0.3 * i for i in range(len(cpu))]
+    if overload == "Scalar":
+        arg, per = -0.75, [-0.75] * len(cpu)
+    elif overload == "ScalarList":
+        arg, per = values, values
+    else:
+        arg, per = torch.tensor(values, dtype=torch.float64), values
+    expected = [
+        getattr(torch, op)(t, a, b, value=v)
+        for t, a, b, v in zip(cpu, cpu1, cpu2, per, strict=True)
+    ]
+    name = f"_foreach_{op}_" if inplace else f"_foreach_{op}"
+    with _one_launch(f"{name}.{overload}"):
+        result = getattr(torch, name)(dev, dev1, dev2, arg)
+    _assert_lists(dev if inplace else result, expected, **_mta_tol(dtype))
+
+
+@pytest.mark.parametrize("inplace", [False, True], ids=["out", "inplace"])
+@pytest.mark.parametrize("dtype_id", list(_MTA_FLOATS))
+@pytest.mark.parametrize("overload", ["List", "Scalar", "ScalarList"])
+def test_mta_lerp_matches_cpu(
+    mojo_gpu: str, overload: str, dtype_id: str, inplace: bool
+):
+    dtype = _MTA_FLOATS[dtype_id]
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    cpu, dev = _mta_lists(mojo_gpu, dtype, -3, 3, seed=31)
+    cpu_e, dev_e = _mta_lists(mojo_gpu, dtype, -3, 3, seed=32)
+    cpu_w, dev_w = _mta_lists(mojo_gpu, dtype, -0.5, 1.5, seed=33)
+    weights = [0.1, 0.4999, 0.5, 0.9, -0.25, 1.25, 0.75]
+    if overload == "List":
+        arg, per = dev_w, cpu_w
+    elif overload == "Scalar":
+        arg, per = 0.3, [0.3] * len(cpu)
+    else:
+        arg, per = weights, weights
+    expected = [torch.lerp(t, e, w) for t, e, w in zip(cpu, cpu_e, per)]
+    name = "_foreach_lerp_" if inplace else "_foreach_lerp"
+    with _one_launch(f"{name}.{overload}"):
+        result = getattr(torch, name)(dev, dev_e, arg)
+    _assert_lists(dev if inplace else result, expected, **_mta_tol(dtype))
+
+
+def test_mta_pointwise_long_lists_span_several_launches(mojo_gpu: str):
+    sizes = [(i * 37) % 700 for i in range(130)]
+    cpu, dev = _mta_lists(mojo_gpu, torch.float32, -2, 2, seed=41, sizes=sizes)
+    cpu_o, dev_o = _mta_lists(mojo_gpu, torch.float32, -2, 2, seed=42, sizes=sizes)
+    with _one_launch("_foreach_lerp.List"):
+        actual = torch._foreach_lerp(dev, dev_o, dev_o)
+    _assert_lists(actual, [torch.lerp(a, b, b) for a, b in zip(cpu, cpu_o)])
+    with _one_launch("_foreach_addcdiv_.ScalarList"):
+        torch._foreach_addcdiv_(dev, dev_o, dev, [0.01 * i for i in range(130)])
+    for a, b, i in zip(cpu, cpu_o, range(130)):
+        a.addcdiv_(b, a.clone(), value=0.01 * i)
+    _assert_lists(dev, cpu, **_mta_tol(torch.float32))
+
+
+def test_mta_pointwise_argument_errors(mojo_gpu: str):
+    xs = [torch.ones(3, device=mojo_gpu), torch.ones(4, device=mojo_gpu)]
+    with pytest.raises(RuntimeError, match="Expected scalars to be on CPU"):
+        torch._foreach_addcmul(xs, xs, xs, torch.ones(2, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="Expected length of scalars"):
+        torch._foreach_addcmul(xs, xs, xs, torch.ones(3))
+    with pytest.raises(RuntimeError, match="same number of elements as scalar list"):
+        torch._foreach_lerp(xs, xs, [0.5])
+
+
+def _pointwise_calls(a, b, c, w) -> list[torch.Tensor]:
+    return [
+        *torch._foreach_addcmul(a, b, c, 0.3),
+        *torch._foreach_addcmul(a, b, c),
+        *torch._foreach_addcdiv(a, b, c, [0.1, -0.2, 0.3]),
+        *torch._foreach_addcdiv(a, b, c),
+        *torch._foreach_lerp(a, b, w),
+        *torch._foreach_lerp(a, b, 0.7),
+        *torch._foreach_lerp(a, b, [0.2, 0.5, 0.9]),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_mta_pointwise_is_bit_exact_with_stock_cuda(mojo_gpu: str, dtype: torch.dtype):
+    _stock_cuda_parity(dtype, mojo_gpu, _pointwise_calls)
