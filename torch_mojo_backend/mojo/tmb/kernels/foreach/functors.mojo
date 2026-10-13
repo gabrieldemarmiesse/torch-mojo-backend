@@ -33,12 +33,44 @@ from tmb.kernels.common.unary_math import elementwise_unary
 
 
 # The unary kinds, each `unary_math.elementwise_unary`'s kind of the same name.
-comptime FOREACH_UNARY_KINDS = ["sqrt"]
+comptime FOREACH_UNARY_KINDS = [
+    "abs",
+    "acos",
+    "asin",
+    "atan",
+    "ceil",
+    "cos",
+    "cosh",
+    "erf",
+    "erfc",
+    "exp",
+    "expm1",
+    "floor",
+    "frac",
+    "lgamma",
+    "log",
+    "log10",
+    "log1p",
+    "log2",
+    "neg",
+    "reciprocal",
+    "round",
+    "rsqrt",
+    "sigmoid",
+    "sign",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+    "trunc",
+]
 
 # Everything else `foreach_math` computes. `nonfinite_unscale` is GradScaler's
 # `_amp_foreach_non_finite_check_and_unscale_`, whose flag write the kernel
 # does itself (`apply.mojo`): here it is only the multiply.
 comptime FOREACH_OTHER_KINDS = [
+    "zero",
     "add",
     "mul",
     "addcmul",
@@ -89,6 +121,8 @@ def foreach_math[
     comptime op = foreach_opmath[dtype]()
     comptime if is_foreach_unary[kind]():
         return elementwise_unary[kind](a)
+    elif kind == "zero":
+        return SIMD[dtype, n](0)
     else:
         var x = a.cast[op]()
         var r: SIMD[op, n]
