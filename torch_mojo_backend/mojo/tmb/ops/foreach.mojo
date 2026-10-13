@@ -416,8 +416,16 @@ comptime FOREACH_OVERLOADS: List[ForeachOverload] = [
     # int64 [1, 1] there, float32 [1.5, 2.25] here.
     _binary("_foreach_pow.ScalarAndTensor", "", "rpow", S_RPOW, "aten::pow", "Scalar", "", "", D_FLOAT),
     # pointwise: ForeachPointwiseOp.cu (floating lists only).
-    _binary("", "_foreach_addcmul_.Scalar", "addcmul", S_PW_SCALAR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT, apple=True),
-    _binary("", "_foreach_lerp_.Scalar", "lerp", S_LERP_SCALAR, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT, apple=True),
+    _binary("_foreach_addcmul.Scalar", "_foreach_addcmul_.Scalar", "addcmul", S_PW_SCALAR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT, apple=True),
+    _binary("_foreach_addcmul.ScalarList", "_foreach_addcmul_.ScalarList", "addcmul", S_PW_SCALARLIST, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT),
+    _binary("_foreach_addcmul.Tensor", "_foreach_addcmul_.Tensor", "addcmul", S_PW_TENSOR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT),
+    _binary("_foreach_addcdiv.Scalar", "_foreach_addcdiv_.Scalar", "addcdiv", S_PW_SCALAR, "aten::addcdiv", "", "aten::addcdiv_", "", D_FLOAT),
+    _binary("_foreach_addcdiv.ScalarList", "_foreach_addcdiv_.ScalarList", "addcdiv", S_PW_SCALARLIST, "aten::addcdiv", "", "aten::addcdiv_", "", D_FLOAT),
+    _binary("_foreach_addcdiv.Tensor", "_foreach_addcdiv_.Tensor", "addcdiv", S_PW_TENSOR, "aten::addcdiv", "", "aten::addcdiv_", "", D_FLOAT),
+    # ternary: ForeachTernaryOp.cu (floating lists only).
+    _binary("_foreach_lerp.List", "_foreach_lerp_.List", "lerp", S_LERP_LIST, "aten::lerp", "Tensor", "aten::lerp_", "Tensor", D_FLOAT),
+    _binary("_foreach_lerp.Scalar", "_foreach_lerp_.Scalar", "lerp", S_LERP_SCALAR, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT, apple=True),
+    _binary("_foreach_lerp.ScalarList", "_foreach_lerp_.ScalarList", "lerp", S_LERP_SCALARLIST, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT),
 ]
 # fmt: on
 

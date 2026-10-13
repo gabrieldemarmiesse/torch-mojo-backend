@@ -33,6 +33,7 @@ COVERS: dict[str, str] = {
     "aten::_amp_update_scale_": "test_amp_update_scale_",
     "aten::_foreach_copy_": "test_foreach_copy_cast",
     "aten::_foreach_add_.Scalar": "test_foreach_add_",
+    "aten::_foreach_addcdiv_.ScalarList": "test_foreach_addcdiv_",
     "aten::_foreach_div_.ScalarList": "test_foreach_div_",
     "aten::_foreach_addcmul_.Scalar": "test_foreach_addcmul_",
     "aten::_foreach_lerp_.Scalar": "test_foreach_lerp_",
@@ -80,7 +81,11 @@ _BINARY = {
     "minimum": ("Scalar", "ScalarList", "List"),
     "pow": ("Scalar", "ScalarList", "List"),
 }
-_TERNARY: dict[str, tuple[str, ...]] = {}
+_TERNARY = {
+    "addcmul": ("Scalar", "ScalarList", "Tensor"),
+    "addcdiv": ("Scalar", "ScalarList", "Tensor"),
+    "lerp": ("List", "Scalar", "ScalarList"),
+}
 
 
 _Call = Callable[
