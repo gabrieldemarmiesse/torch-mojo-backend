@@ -1031,6 +1031,19 @@ def scalar_type_name(dt: DType) -> String:
     return String(dt)
 
 
+def decline_float8(dt: DType, kernel: StaticString) raises:
+    """Refuse a float8 operand the way stock CUDA does, naming the CUDA
+    kernel whose AT_DISPATCH has no float8 case (NotImplementedError)."""
+    if is_float8(dt):
+        unsupported(
+            '"'
+            + String(kernel)
+            + "\" not implemented for '"
+            + scalar_type_name(dt)
+            + "'"
+        )
+
+
 def binary_promotion(a: T, b: T) raises -> DType:
     """torch's promotion for a binary pair, restricted to what the
     broadcast-strided spec kernels cover: equal dtypes; bool with any

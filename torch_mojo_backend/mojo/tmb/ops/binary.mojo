@@ -22,6 +22,7 @@ from std.utils import IndexList
 from std.utils.numerics import nan
 
 from tmb.backend.abi import (
+    max_dtype,
     DEVICE_TYPE_CPU,
     ST_BFLOAT16,
     ST_BOOL,
@@ -72,6 +73,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     ST_UNDEFINED,
+    scalar_type_name,
     assert_no_internal_overlap,
     combine_categories,
     known_stype,
@@ -880,6 +882,25 @@ def _b_op_dtype_ok(op: StaticString, st: Int32, is_cmp: Bool) raises:
             unsupported("bool operands for " + String(op))
         return
     if not _b_bcast_dtype(st):
+        if st == 23 or st == 24 or st == 25 or st == 26 or st == 44:
+            # (torch's five float8 ScalarTypes)
+            # CUDA's own refusal for the common float8 arithmetic.
+            var kernel = String(op)
+            if op == "AddSpec" or op == "SubSpec":
+                kernel = "ufunc_add_CUDA"
+            elif op == "MulSpec":
+                kernel = "mul_cuda"
+            elif op == "DivSpec":
+                kernel = "div_true_cuda"
+            elif op == "PowSpec":
+                kernel = "pow_cuda"
+            unsupported(
+                '"'
+                + kernel
+                + "\" not implemented for '"
+                + scalar_type_name(max_dtype(st))
+                + "'"
+            )
         unsupported("dtype " + String(st) + " for " + String(op))
     if op == "DivSpec" or op == "PowSpec":
         if not (_b_float3(st) or st == ST_FLOAT64):

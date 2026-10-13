@@ -102,6 +102,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.ops.common import (
+    decline_float8,
     scalar_type_name,
     assert_no_internal_overlap,
     assert_no_overlap,
@@ -804,11 +805,12 @@ def op_to_copy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         dev_type == DEVICE_TYPE_CPU
         and stype != t.stype
         and not non_blocking
-        and is_float8(max_dtype(stype))
+        and (is_float8(max_dtype(stype)) or is_float8(t.dtype))
     ):
-        # Copy.cu: a blocking download converts on the CPU -- c10's float8
-        # conversion, which never saturates (the GPU one, taken for a
-        # non-blocking download below, does on sm_89+).
+        # Copy.cu: a blocking download converts on the CPU (measured on
+        # stock CUDA for every float8 pair: e5m2 inf -> int32 is INT_MIN, the
+        # CPU's answer; the GPU's, taken for a non-blocking download below,
+        # is INT_MAX -- and a float -> e4m3fn GPU conversion saturates).
         var raw = own(_to_copy_same_device(t, t.stype, want))
         var host_raw = own(_download_to_cpu(raw.t))
         _ = raw^
@@ -1568,6 +1570,7 @@ def _triangular(t: T, diagonal_in: Int, upper: Int) raises -> Owned:
             "triu" if upper else "tril",
             ": input tensor must have at least 2 dimensions",
         )
+    decline_float8(t.dtype, "triu_tril_cuda_template")
     var out = own(new_like(t))
     if out.t.numel > 0:
         var rows = t.dim(-2)
@@ -3060,6 +3063,39 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
             [tensor_arg(target), tensor_arg(mask_view.t), scalar^],
             1,
         )
+    elif is_float8(target.dtype):
+        # A device value never takes ATen's masked_fill route
+        # (canDispatchToMaskedFill wants a CPU value) and CUDA's masked_fill
+        # has no float8 kernel; its index_put kernel does. Same result as a
+        # select: self = where(mask, value, self), the value cast into self's
+        # dtype the way TensorIterator's kernel cast does (no saturation).
+        var value0 = own(
+            view_strided(
+                values,
+                IndexList[MAX_RANK](1),
+                IndexList[MAX_RANK](0),
+                0,
+                values.offset,
+            )
+        )
+        var v8 = own_if_new(
+            cast_to(value0.t, target.stype, saturate=False), value0.t
+        )
+        var picked = call_op(
+            "aten::where",
+            "self",
+            [tensor_arg(mask_view.t), tensor_arg(v8.t), tensor_arg(target)],
+            1,
+        )
+        _ = call_op(
+            "aten::copy_",
+            "",
+            [tensor_arg(target), picked[0].copy(), bool_arg(False)],
+            1,
+        )
+        _ = picked^
+        _ = v8^
+        _ = value0^
     else:
         var value0 = own(
             view_strided(

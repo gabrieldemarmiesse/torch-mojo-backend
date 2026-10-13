@@ -361,12 +361,14 @@ def _compare_functional_out(
     var b0 = v_tensor(args[unsafe_offset=1])
     var out_arg = v_tensor(args[unsafe_offset=2])
     _check_pair_devices(a0, b0)
+    # Overlap / alias checks see the caller's operands, before any cast
+    # temporary exists (`eq(a, b, out=a)` with a cast `a` is still `out=a`).
+    _compare_out_guard(out_arg, a0, b0)
     var stype = torch_dtype(_compare_dtype(a0, b0))
     var ha = _operand_as(a0, b0, stype, False)
     var hb = _operand_as(b0, a0, stype, False)
     var pa = ha.t.copy()
     var pb = hb.t.copy()
-    _compare_out_guard(out_arg, pa, pb)
     var shape = broadcast_shape(pa, pb)
     var rank = max(pa.rank, pb.rank)
     if out_arg.stype != ST_BOOL:

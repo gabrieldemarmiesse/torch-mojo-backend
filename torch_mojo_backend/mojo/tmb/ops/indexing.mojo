@@ -80,6 +80,7 @@ from tmb.backend.registry import Site, impl
 from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    decline_float8,
     assert_no_internal_overlap,
     assert_no_overlap,
     call_op,
@@ -340,6 +341,7 @@ def _roll_into(dst: T, src: T, starts: List[Int]) raises:
 # aten::roll(Tensor self, SymInt[1] shifts, int[1] dims=[]) -> Tensor
 def op_roll(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
+    decline_float8(a.dtype, "roll_cuda")
     var shifts = IntList(args[unsafe_offset=1])
     var dims = IntList(args[unsafe_offset=2])
     if len(shifts) == 0:
@@ -578,6 +580,7 @@ def op_channel_shuffle(
 
 
 def _take_checks(a: T, index: T, dest: T) raises:
+    decline_float8(a.dtype, "take_cuda")
     if index.dtype != DType.int64:
         raise Error(
             "take(): Expected a long tensor for index, but got ",
@@ -1080,6 +1083,7 @@ def op_masked_scatter_(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     var source = v_tensor(args[unsafe_offset=2])
+    decline_float8(a.dtype, "masked_scatter_")
     assert_no_internal_overlap(a)
     if a.stype != source.stype:
         raise Error(
@@ -2156,6 +2160,28 @@ def op_fill__tensor(
             value.rank,
             " dimensions.",
         )
+    if is_float8(t.dtype) and value.on_mojo() and value.device == t.device:
+        # A same-device value is a `copy_` (no range check): for a float8
+        # self that is copy_'s conversion, saturation included, so cast it
+        # on the device and copy that one element everywhere.
+        assert_no_internal_overlap(t)
+        var cv = own_if_new(cast_to(value, t.stype), value)
+        var expanded = own(
+            view_strided(
+                cv.t, t.shape, IndexList[MAX_RANK](0), t.rank, cv.t.offset
+            )
+        )
+        if t.numel > 0:
+            _ = call_op(
+                "aten::copy_",
+                "",
+                [tensor_arg(t), tensor_arg(expanded.t), bool_arg(False)],
+                1,
+            )
+        _ = expanded^
+        _ = cv^
+        ret_ref(rets, 0, t)
+        return
     # The value is read once, on the host (a device value costs one sync,
     # where CUDA copies on the stream), then filled with fill_.Scalar's
     # conversion rules. Reading it first also covers a value aliasing self.

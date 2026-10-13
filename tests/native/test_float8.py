@@ -574,3 +574,86 @@ def test_float8_promotion_error_names_dimensioned_first(mojo_device):
     c = torch.tensor([True, False], device=dev)
     with pytest.raises(RuntimeError, match="promote Int and Float8_e4m3fn"):
         torch.where(c, z8, torch.tensor([1, 2], dtype=torch.int32, device=dev))
+
+
+# ---------------------------------------------------------------------------
+# PR review
+# ---------------------------------------------------------------------------
+
+
+def test_compare_out_alias_checked_on_original_operands(mojo_device):
+    """eq(a, b, out=a) with a half `a` and a float `b`: the overlap / resize
+    rules see the caller's `a`, not a cast copy (stock CUDA raises)."""
+    dev = mojo_device
+    a = torch.tensor([1.0], dtype=torch.half, device=dev)
+    b = torch.tensor([1.0, 2.0], device=dev)
+    with pytest.raises(RuntimeError):
+        torch.eq(a, b, out=a)
+    assert a.cpu().tolist() == [1.0]
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_float8_download_to_int_converts_where_cuda_does(mojo_device, non_blocking):
+    """Measured on stock CUDA: a blocking download with a dtype change
+    converts on the CPU (e5m2 inf / nan -> int32 is INT_MIN), a
+    non-blocking one on the GPU (INT_MAX / 0)."""
+    x = torch.tensor([float("inf"), float("nan"), 512.0, -3.0]).to(torch.float8_e5m2)
+    got = x.to(mojo_device).to("cpu", dtype=torch.int32, non_blocking=non_blocking)
+    torch.accelerator.synchronize()
+    imin, imax = -(2**31), 2**31 - 1
+    want = [imax, 0, 512, -3] if non_blocking else [imin, imin, 512, -3]
+    assert got.tolist() == want
+
+
+def test_float8_fill_tensor_same_device_is_a_copy(mojo_device):
+    """fill_(device tensor) is copy_ (no range check, copy's conversion);
+    fill_(CPU tensor) is fill_(Scalar), which range-checks."""
+    dev = mojo_device
+    for dt, v in (
+        (torch.float8_e4m3fn, 1000.0),
+        (torch.float8_e5m2, 1e6),
+        (torch.float8_e8m0fnu, 0.0),
+    ):
+        got = torch.zeros(3, dtype=dt, device=dev).fill_(torch.tensor(v, device=dev))
+        _assert_same(got, _stock_cast(torch.full((3,), v), dt, dev))
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.zeros(3, dtype=torch.float8_e4m3fn, device=dev).fill_(
+            torch.tensor(1000.0)
+        )
+
+
+def test_float8_mask_assign_device_value(mojo_device):
+    """t[mask] = device value takes CUDA's index_put kernel (float8 ok), not
+    masked_fill (CPU values only, refused for float8)."""
+    dev = mojo_device
+    t = torch.zeros(3).to(torch.float8_e4m3fn).to(dev)
+    mask = torch.tensor([True, False, True], device=dev)
+    t[mask] = torch.tensor(2.0).to(torch.float8_e4m3fn).to(dev)
+    assert t.view(torch.uint8).cpu().tolist() == [64, 0, 64]
+    t[mask] = torch.tensor(3.0, device=dev)
+    assert t.cpu().float().tolist() == [3.0, 0.0, 3.0]
+
+
+@pytest.mark.parametrize(
+    "op,kernel",
+    [
+        (lambda x: x.roll(1, 0), "roll_cuda"),
+        (lambda x: x.take(torch.tensor([0], device=x.device)), "take_cuda"),
+        (lambda x: x.tril(), "triu_tril_cuda_template"),
+        (lambda x: x.triu(), "triu_tril_cuda_template"),
+        (
+            lambda x: x.clone().masked_scatter_(
+                torch.ones_like(x, dtype=torch.bool), x
+            ),
+            "masked_scatter_",
+        ),
+        (lambda x: x + x, "ufunc_add_CUDA"),
+        (lambda x: x - x, "ufunc_add_CUDA"),
+        (lambda x: x * x, "mul_cuda"),
+    ],
+    ids=["roll", "take", "tril", "triu", "masked_scatter", "add", "sub", "mul"],
+)
+def test_float8_refusals_name_cuda_kernels(mojo_device, op, kernel):
+    x = _x(torch.float8_e4m3fn).to(mojo_device)
+    with pytest.raises(NotImplementedError, match=kernel):
+        op(x)
