@@ -30,6 +30,17 @@ from tmb.backend.abi import (
     MEMORY_FORMAT_PRESERVE,
     ST_INT32,
     ST_INT64,
+    ST_BFLOAT16,
+    ST_BOOL,
+    ST_COMPLEX128,
+    ST_COMPLEX64,
+    ST_FLOAT16,
+    ST_FLOAT32,
+    ST_FLOAT64,
+    ST_INT16,
+    ST_INT8,
+    ST_UINT64,
+    ST_UINT8,
     TAG_NONE,
     TAG_DEVICE,
     TAG_INT,
@@ -103,6 +114,7 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    fill_item,
     cast_complex,
     cx_unary_into,
     assert_no_internal_overlap,
@@ -3115,6 +3127,37 @@ def _overlaps_contiguous_target(target: T, source: T) -> Bool:
     )
 
 
+def _ip_st_name(st: Int32) -> String:
+    """c10::toString(ScalarType) for index_put_'s dtype error."""
+    if st == ST_FLOAT32:
+        return "Float"
+    if st == ST_FLOAT64:
+        return "Double"
+    if st == ST_FLOAT16:
+        return "Half"
+    if st == ST_BFLOAT16:
+        return "BFloat16"
+    if st == ST_INT64:
+        return "Long"
+    if st == ST_INT32:
+        return "Int"
+    if st == ST_INT16:
+        return "Short"
+    if st == ST_INT8:
+        return "Char"
+    if st == ST_UINT8:
+        return "Byte"
+    if st == ST_BOOL:
+        return "Bool"
+    if st == ST_UINT64:
+        return "UInt64"
+    if st == ST_COMPLEX64:
+        return "ComplexFloat"
+    if st == ST_COMPLEX128:
+        return "ComplexDouble"
+    return String(st)
+
+
 def _index_put_mask_fill(target: T, mask: T, values: T) raises:
     """`self[mask] = v` with a one-element `v`: what ATen's own
     `_index_put_impl_` re-routes to `masked_fill_` (canDispatchToMaskedFill),
@@ -3143,14 +3186,9 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
         view_strided(mask, shape, strides, target.rank, mask.offset)
     )
     if values.on_cpu():
-        # A python scalar assignment arrives as a one-element CPU tensor;
-        # reading it costs no device sync.
-        var v = _read_f64_at(values.ptr, 0, values.dtype)
-        var scalar = Value(
-            TAG_SCALAR_DOUBLE, 0, f64_bits(v), 0
-        ) if values.dtype.is_floating_point() else Value(
-            TAG_SCALAR_INT, 0, Int64(Int(v)), 0
-        )
+        # A python scalar assignment arrives as a one-element CPU tensor:
+        # its item(), exactly (an int64 past 2**53 or a uint64 kept whole)
+        var scalar = fill_item(values, target.stype, False)
         _ = call_op(
             "aten::masked_fill_",
             "Scalar",
@@ -3158,6 +3196,19 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
             1,
         )
     else:
+        if values.stype != target.stype:
+            # (a device value does not take masked_fill's route on CUDA:
+            # index_put_ checks the dtypes)
+            raise Error(
+                (
+                    "Index put requires the source and destination dtypes"
+                    " match, got "
+                ),
+                _ip_st_name(target.stype),
+                " for the destination and ",
+                _ip_st_name(values.stype),
+                " for the source.",
+            )
         var value0 = own(
             view_strided(
                 values,

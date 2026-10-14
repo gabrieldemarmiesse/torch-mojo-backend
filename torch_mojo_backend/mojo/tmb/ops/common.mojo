@@ -20,6 +20,7 @@ from tmb.backend.abi import (
     ST_FLOAT16,
     ST_FLOAT32,
     ST_FLOAT64,
+    ST_COMPLEX128,
     ST_INT16,
     ST_INT32,
     ST_INT64,
@@ -1452,11 +1453,25 @@ def check_real_scalar_fits(st: Int32, v: Value) raises:
 
 
 def uint64_cross_item(value: T, dst: Int32 = -1) raises -> Value:
-    """A uint64 0-d fill value read on the host for a fill on ANOTHER
-    device (fill_'s Scalar route): below 2**63 an int Scalar; from 2**63 on,
-    declined -- the call boundary carries no unsigned Scalar, and an int64
-    one would be a different number (a same-device value is a copy_ and
-    never comes here)."""
+    """`fill_item(value, dst, False)`: a uint64 value read for a fill on
+    another device."""
+    return fill_item(value, dst, False)
+
+
+def fill_item(value: T, dst: Int32, same_device: Bool) raises -> Value:
+    """`value.item()` as a fill / masked_fill / index_put value for a
+    destination of dtype `dst`, the Scalar CUDA would convert. A uint64
+    value is read unsigned (the call boundary has no unsigned Scalar):
+    below 2**63 an int Scalar, which converts like CUDA's (an integer
+    into a float rounds once); from 2**63 on, into a float or complex dtype
+    the value itself, rounded once into float32 for the single-precision
+    dtypes; into bool its truth; into uint64 the same 64 bits; into any
+    other integer the overflow error. From another device (`same_device`
+    False) a value of 2**63 or more is declined instead, except into uint64.
+    """
+    if value.stype != ST_UINT64:
+        var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+        return r[0].copy()
     var bits: Int64
     if value.on_cpu():
         bits = Pointer[Int64, MutUntrackedOrigin](
@@ -1465,10 +1480,28 @@ def uint64_cross_item(value: T, dst: Int32 = -1) raises -> Value:
     else:
         var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
         bits = r[0].a
-    if bits < 0 and dst != ST_UINT64:
-        # (a uint64 destination takes the same 64 bits: exact)
-        unsupported("a uint64 fill_ value of 2**63 or more from another device")
-    return Value(TAG_SCALAR_INT, 0, bits, 0)
+    if bits >= 0 or dst == ST_UINT64:
+        return Value(TAG_SCALAR_INT, 0, bits, 0)
+    if not same_device:
+        unsupported("a uint64 value of 2**63 or more from another device")
+    var u = UInt64(bits)
+    if dst == ST_BOOL:
+        return Value(TAG_SCALAR_BOOL, 0, 1, 0)
+    if dst == ST_FLOAT64 or dst == ST_COMPLEX128:
+        return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(Float64(u)), 0)
+    if (
+        dst == ST_FLOAT32
+        or dst == ST_FLOAT16
+        or dst == ST_BFLOAT16
+        or dst == ST_COMPLEX64
+    ):
+        var f = Float64(u.cast[DType.float32]())
+        return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(f), 0)
+    raise Error(
+        "value cannot be converted to type ",
+        scalar_type_token(dst),
+        " without overflow",
+    )
 
 
 def check_uint64_fill(st: Int32, v: Value, numel: Int) raises:
@@ -1510,6 +1543,11 @@ def fill_complex(t: T, v: Value) raises:
     var c = v_complex(v)
     var re = c[0]
     var im = c[1]
+    if (
+        v.tag == TAG_SCALAR_INT or v.tag == TAG_INT
+    ) and t.stype == ST_COMPLEX64:
+        # an integer converts to float in one rounding (int64 -> float)
+        re = Float64(Int64(v.a).cast[DType.float32]())
     if t.is_conj():
         im = -im
     if t.numel == 0:

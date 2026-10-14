@@ -56,6 +56,8 @@ from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    device_str,
+    fill_item,
     assert_no_internal_overlap,
     binary_promotion,
     broadcast_shape,
@@ -1043,10 +1045,19 @@ def _shares_storage(dest: T, t: T) -> Bool:
 def _masked_fill_out_dtype(mut out_arg: T, ae: T, a: T) raises:
     """masked_fill's generated out= wrapper: the out is resized to the
     result's shape, then its dtype must be self's (CUDA's order)."""
-    if out_arg.stype == a.stype:
+    var other_device = not out_arg.on_mojo() or out_arg.device != a.device
+    if out_arg.stype == a.stype and not other_device:
         return
     if not _shape_eq(out_arg, ae.shape, ae.rank):
         resize_any(out_arg, ae.shape, ae.rank)
+    if out_arg.stype == a.stype:
+        raise Error(
+            "Expected out tensor to have device ",
+            device_str(a),
+            ", but got ",
+            device_str(out_arg),
+            " instead",
+        )
     raise Error(
         "Expected out tensor to have dtype ",
         dtype_name(a.stype),
@@ -1159,9 +1170,11 @@ def _value_is_direct(a: T, val: T) -> Bool:
     return val.dtype == a.dtype and val.on_mojo() and val.device == a.device
 
 
-def _value_item(val: T) raises -> Value:
-    var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(val)], 1)
-    return r[0]
+def _value_item(val: T, a: T) raises -> Value:
+    """`value.item()` for self `a` (a uint64 value read unsigned)."""
+    return fill_item(
+        val, a.stype, val.on_mojo() and a.on_mojo() and val.device == a.device
+    )
 
 
 # aten::masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor
@@ -1177,7 +1190,7 @@ def op_masked_fill_tensor(
     if _value_is_direct(a, val):
         _masked_fill_where(mask, val, ae, out.t)
     else:
-        _masked_fill_scalar_dispatch(mask, ae, _value_item(val), out.t)
+        _masked_fill_scalar_dispatch(mask, ae, _value_item(val, a), out.t)
     ret_owned(rets, 0, out)
 
 
@@ -1185,7 +1198,7 @@ def _masked_fill_value_into(mask: T, a: T, val: T, dst: T) raises:
     if _value_is_direct(a, val):
         _masked_fill_where(mask, val, a, dst)
     else:
-        _masked_fill_scalar_dispatch(mask, a, _value_item(val), dst)
+        _masked_fill_scalar_dispatch(mask, a, _value_item(val, a), dst)
 
 
 # aten::masked_fill.Tensor_out(Tensor self, Tensor mask, Tensor value, *, Tensor(a!) out) -> Tensor(a!)
@@ -1198,6 +1211,8 @@ def op_masked_fill_tensor_out(
     _masked_fill_validate(a, mask)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
     var ae = _masked_fill_expanded(a, mask)
+    if not _value_is_direct(a, val):
+        _ = scalar_as_fill(_value_item(val, a), a.dtype)  # the value first
     _masked_fill_out_dtype(out_arg, ae, a)
     if (
         _shares_storage(out_arg, a)
