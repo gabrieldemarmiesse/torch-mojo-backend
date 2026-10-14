@@ -49,6 +49,7 @@ from tmb.ops.complex import (
 )
 from tmb.ops.common import (
     scalar_type_token,
+    device_str,
     check_scalar_fits,
     resize_out,
     shape_str,
@@ -676,6 +677,15 @@ def cx_to_real_out[
             _st_name(x.stype),
         )
     if is_complex_stype(dest.stype):
+        if not x.on_mojo():
+            raise Error(
+                (
+                    "Expected all tensors to be on the same device, but found"
+                    " at least two devices, "
+                ),
+                device_str(dest),
+                " and cpu!",
+            )
         if kind == "abs" and dest.stype != x.stype:
             raise Error(
                 "Found dtype ",
@@ -685,7 +695,16 @@ def cx_to_real_out[
             )
         _store_ew[1](args, dest, _unary(kind, _TO_RE, x), rets)
         return
-    var res = _unary(kind, _TO_RE, x)
+    var res: Owned
+    if x.on_mojo():
+        res = _unary(kind, _TO_RE, x)
+    else:
+        # a host self: the functional op runs where self is (CUDA's
+        # at::abs(self)), then the result is resized into and copied to
+        # the out, wherever that is
+        var hc = _Call(String("aten::") + kind)
+        hc.t(x)
+        res = hc.one()
     _check_cast(res.t.stype, dest.stype)
     var sizes = List[Int]()
     for d in range(res.t.rank):
@@ -931,15 +950,6 @@ def _reduce(
                 ),
                 _st_name(asked),
             )
-    var want = v_dtype_or(dtype_v, out_st if out_st >= 0 else x.stype)
-    if out_st >= 0 and dtype_v.tag != TAG_NONE and want != out_st:
-        raise Error(
-            "Expected out tensor to have dtype ",
-            dtype_name(want),
-            ", but got ",
-            dtype_name(out_st),
-            " instead",
-        )
     var dims = _dims_of(dim_v, x.rank)  # validated on the complex rank
     for i in range(len(dims)):
         for j in range(i):
@@ -949,6 +959,15 @@ def _reduce(
                     dims[i],
                     " appears multiple times in the list of dims",
                 )
+    var want = v_dtype_or(dtype_v, out_st if out_st >= 0 else x.stype)
+    if out_st >= 0 and dtype_v.tag != TAG_NONE and want != out_st:
+        raise Error(
+            "Expected out tensor to have dtype ",
+            dtype_name(want),
+            ", but got ",
+            dtype_name(out_st),
+            " instead",
+        )
     if not x.is_complex():
         # a real self reaching here accumulates in a complex dtype= / out=
         var xc = own(cast_complex(x, want))

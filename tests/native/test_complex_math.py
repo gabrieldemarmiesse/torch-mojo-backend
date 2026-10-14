@@ -900,3 +900,45 @@ def test_declines_come_after_cudas_own_checks(mojo_gpu: str):
     with pytest.raises(RuntimeError, match="Optional dtype must be either"):
         torch.mean(x, 1, dtype=torch.bool, out=bout)
     assert bout.shape == (7,)
+
+
+# --- host operands with device outs, and the order of the reduction checks -----
+
+
+def test_abs_angle_of_a_host_tensor_into_a_device_out(mojo_gpu: str):
+    x = torch.tensor([3 + 4j, -1 + 0j])
+    for fn in (torch.abs, torch.angle):
+        for src in (x, x[:1], x[0]):
+            out = torch.empty(0, device=mojo_gpu)
+            fn(src, out=out)
+            ref = fn(src)
+            assert out.device.type == "mojo" and torch.equal(out.cpu(), ref)
+        with pytest.raises(RuntimeError, match="same device"):
+            fn(x, out=torch.empty(0, dtype=torch.complex64, device=mojo_gpu))
+
+
+def test_binary_outs_with_only_host_operands(mojo_gpu: str):
+    x = torch.tensor([1 + 1j, 2j, 3 + 0j])
+    out = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+    for op in (torch.add, torch.mul, torch.div, torch.pow):
+        with pytest.raises(RuntimeError, match="same device"):
+            op(x, x, out=out)
+        with pytest.raises(RuntimeError, match="too many CPU scalars"):
+            op(x[0], x[0], out=out)
+        # a host 0-d operand with a device one is a scalar
+        got = op(
+            x[0],
+            x[0].to(mojo_gpu),
+            out=torch.empty(0, dtype=torch.complex64, device=mojo_gpu),
+        )
+        _close(got, op(x[0], x[0]))
+
+
+def test_reduction_dim_is_checked_before_the_out_dtype(mojo_gpu: str):
+    x = torch.ones(2, 3, dtype=torch.complex64, device=mojo_gpu)
+    out = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+    for fn in (torch.sum, torch.mean):
+        with pytest.raises(IndexError, match="Dimension out of range"):
+            fn(x, 9, dtype=torch.float32, out=out)
+    with pytest.raises(RuntimeError, match="Optional dtype must be either"):
+        torch.mean(x, 9, dtype=torch.bool)
