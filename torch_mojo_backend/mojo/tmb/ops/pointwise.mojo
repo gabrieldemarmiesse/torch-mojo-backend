@@ -3011,7 +3011,7 @@ def _loss_reduce(
     if out_st >= 0 and out_st != loss.t.stype:
         # sum_out / mean_out(result, loss) reduce in result's dtype: the
         # loss is cast to it first (the reduction kernels keep one dtype).
-        var casted = own(cast_for_copy(loss.t, out_st))
+        var casted = own(cast_for_copy(loss.t, out_st, False))
         _ = loss^
         loss = casted^
     var reduced_st = loss.t.stype

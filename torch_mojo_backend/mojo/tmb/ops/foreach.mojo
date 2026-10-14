@@ -72,6 +72,7 @@ from tmb.backend.abi import (
 from tmb.backend.device import ctx_for, ctx_ptr, dev, copy_d2d
 from tmb.kernels.optimizer.foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from tmb.backend.kernel_call import KernelCall
+from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
 from tmb.kernels.foreach.contract import (
@@ -1195,6 +1196,20 @@ def _copy_adjacent_views(dsts: List[T], srcs: List[T]) raises -> Bool:
     return True
 
 
+def _foreach_copy_dtype_check(dt: DType) raises:
+    if (
+        dt == DType.float8_e8m0fnu
+        or dt == DType.uint16
+        or dt == DType.uint32
+        or dt == DType.uint64
+    ):
+        unsupported(
+            '"foreach_tensor_copy" not implemented for \''
+            + _scalar_type_name(dt)
+            + "'"
+        )
+
+
 def _cuda_copy_fast_route(dsts: List[T], srcs: List[T]) -> Bool:
     """The condition of CUDA's `_foreach_copy_` multi_tensor_apply route
     (ForeachBinaryOpList.cu): one device, dense strided tensors, one dtype
@@ -1260,6 +1275,13 @@ def op_foreach_copy_(
         raise Error("Tensor list must have at least one tensor.")
     if len(srcs) != len(dsts):
         raise Error("Tensor lists must have the same number of tensors.")
+    var f8 = is_float8(dsts[0].dtype) or is_float8(srcs[0].dtype)
+    if f8 and _cuda_copy_fast_route(dsts, srcs):
+        # CUDA's multi_tensor_apply route dispatches the destination, then
+        # the source, over the standard dtypes and four float8s: e8m0fnu and
+        # uint16/32/64 refuse there, empty lists included, before writing.
+        _foreach_copy_dtype_check(dsts[0].dtype)
+        _foreach_copy_dtype_check(srcs[0].dtype)
     if _copy_adjacent_views(dsts, srcs):
         return
     if _copy_batch_qualifies(dsts, srcs):

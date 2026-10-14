@@ -989,3 +989,76 @@ def test_float8_clamp_one_tensor_bound_names_cuda_kernel(mojo_device):
         torch.clamp(x, max=x)
     with pytest.raises(NotImplementedError, match="max_elementwise_cuda"):
         torch.clamp(x, min=x, out=torch.empty_like(x))
+
+
+_FOREACH_COPY_REFUSED = [torch.float8_e8m0fnu, torch.uint16, torch.uint32, torch.uint64]
+
+
+@pytest.mark.parametrize("n", [3, 0])
+@pytest.mark.parametrize(
+    "src,dst",
+    [
+        (torch.float8_e8m0fnu, torch.float8_e4m3fn),
+        (torch.uint16, torch.float8_e4m3fn),
+        (torch.uint64, torch.float8_e5m2),
+        (torch.float32, torch.float8_e8m0fnu),
+        (torch.float8_e4m3fn, torch.uint32),
+        (torch.float8_e8m0fnu, torch.float8_e8m0fnu),
+        (torch.float8_e8m0fnu, torch.float32),
+    ],
+    ids=str,
+)
+def test_float8_foreach_copy_refuses_like_cuda(mojo_device, src, dst, n):
+    """CUDA's multi_tensor_apply _foreach_copy_ dispatches dst then src over
+    the standard dtypes and four float8s: e8m0fnu and uint16/32/64 refuse,
+    empty lists too, before anything is written."""
+    dev = mojo_device
+    s = torch.tensor([2.0, 1.0, 0.0])[:n].to(src).to(dev)
+    d = torch.ones(3)[:n].to(dst).to(dev)
+    before = d.cpu().clone()
+    v0 = d._version
+    refused = dst if dst in _FOREACH_COPY_REFUSED else src
+    name = str(refused).removeprefix("torch.").replace("float8", "Float8")
+    name = {"uint16": "UInt16", "uint32": "UInt32", "uint64": "UInt64"}.get(name, name)
+    with pytest.raises(NotImplementedError, match=f"foreach_tensor_copy.*{name}"):
+        torch._foreach_copy_([d], [s])
+    assert d._version == v0
+    assert torch.equal(d.cpu().view(torch.uint8), before.view(torch.uint8))
+
+
+# Measured on stock CUDA (torch 2.11 / H100): a float32 result stored into a
+# float8 out= converts in the kernel (c10's static_cast, no saturation).
+@pytest.mark.parametrize(
+    "fn,dt,want",
+    [
+        (torch.add, torch.float8_e4m3fn, [72, 76, 127]),
+        (torch.mul, torch.float8_e4m3fn, [68, 80, 127]),
+        (torch.copysign, torch.float8_e4m3fn, [56, 64, 124]),
+        (torch.sub, torch.float8_e4m3fn, [192, 192, 121]),
+        (torch.add, torch.float8_e5m2, [68, 70, 96]),
+        (torch.add, torch.float8_e8m0fnu, [129, 130, 136]),
+        (torch.mul, torch.float8_e5m2fnuz, [70, 76, 125]),
+    ],
+    ids=lambda v: getattr(v, "__name__", str(v).removeprefix("torch.")),
+)
+def test_float32_op_into_float8_out(mojo_device, fn, dt, want):
+    dev = mojo_device
+    a = torch.tensor([1.0, 2.0, 400.0], device=dev)
+    b = torch.tensor([3.0, 4.0, 100.0], device=dev)
+    out = torch.empty(3, dtype=dt, device=dev)
+    assert fn(a, b, out=out) is out
+    assert out.view(torch.uint8).cpu().tolist() == want
+
+
+def test_float8_inplace_add_scalar_names_cuda_kernel(mojo_device):
+    t = torch.ones(3).to(torch.float8_e4m3fn).to(mojo_device)
+    with pytest.raises(NotImplementedError, match="ufunc_add_CUDA"):
+        t.add_(1.0)
+
+
+def test_where_float8_out_names_torch_dtypes(mojo_device):
+    dev = mojo_device
+    a = torch.tensor([1.0, 2.0], device=dev)
+    out = torch.empty(2, dtype=torch.float8_e4m3fn, device=dev)
+    with pytest.raises(RuntimeError, match="to be Float but got Float8_e4m3fn"):
+        torch.where(a > 1, a, a, out=out)

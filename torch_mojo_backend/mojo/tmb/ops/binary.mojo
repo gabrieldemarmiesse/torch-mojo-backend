@@ -22,6 +22,7 @@ from std.utils import IndexList
 from std.utils.numerics import nan
 
 from tmb.backend.abi import (
+    is_float8_stype,
     max_dtype,
     DEVICE_TYPE_CPU,
     ST_BFLOAT16,
@@ -160,7 +161,7 @@ def _b_category(st: Int32) -> Int:
     """torch's promotion category: bool < integral < floating."""
     if st == ST_BOOL:
         return 0
-    if _b_float3(st) or st == ST_FLOAT64:
+    if _b_float3(st) or st == ST_FLOAT64 or is_float8_stype(st):
         return 2
     return 1
 
@@ -1225,7 +1226,7 @@ def _b_store_out(
         # cast_for_copy, not cast_to: `_b_can_cast` admits every pair torch's
         # own out= does (int32 into a float64 `out`), CastSpec only its
         # CAST_DTYPES; the rest round-trip through the host like `copy_`.
-        var casted = own(cast_for_copy(held.t, dst.stype))
+        var casted = own(cast_for_copy(held.t, dst.stype, False))
         _b_copy_into(dst, casted.t)
         _ = casted^  # alive past the launch
     _ = held^
@@ -1259,7 +1260,7 @@ def _b_store_inplace(rets: Values, self: T, var res: Res) raises:
                 " can't be cast to the desired output type ",
                 dtype_name(self.stype),
             )
-        var casted = own(cast_for_copy(held.t, self.stype))
+        var casted = own(cast_for_copy(held.t, self.stype, False))
         _b_copy_into(self, casted.t)
         _ = casted^  # alive past the launch
     _ = held^  # alive past the launch

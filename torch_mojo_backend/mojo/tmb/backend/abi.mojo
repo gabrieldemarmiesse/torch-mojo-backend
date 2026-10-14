@@ -259,6 +259,17 @@ def itemsize_of(stype: Int32) raises -> Int:
     return dtype_itemsize(max_dtype(stype))
 
 
+def is_float8_stype(stype: Int32) -> Bool:
+    """torch's five float8 ScalarTypes."""
+    return (
+        stype == ST_FLOAT8_E5M2
+        or stype == ST_FLOAT8_E4M3FN
+        or stype == ST_FLOAT8_E5M2FNUZ
+        or stype == ST_FLOAT8_E4M3FNUZ
+        or stype == ST_FLOAT8_E8M0FNU
+    )
+
+
 def is_floating(stype: Int32) -> Bool:
     return (
         stype == ST_FLOAT32

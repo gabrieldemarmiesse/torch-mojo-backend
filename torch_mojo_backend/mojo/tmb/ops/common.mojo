@@ -8,6 +8,7 @@ from std.ffi import external_call
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    is_float8_stype,
     ST_BFLOAT16,
     ST_BOOL,
     ST_FLOAT16,
@@ -974,8 +975,9 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
 
 
 def combine_categories(higher: Int32, lower: Int32) raises -> Int32:
-    """c10's combine_categories (the ResultTypeState fold)."""
-    if is_float_stype(higher):
+    """c10's combine_categories (the ResultTypeState fold); float8 is a
+    floating category there."""
+    if is_float_stype(higher) or is_float8_stype(higher):
         return higher
     if higher == ST_BOOL or is_float_stype(lower):
         return promote_types(higher, lower)
@@ -988,8 +990,14 @@ def can_cast(src: Int32, dst: Int32) -> Bool:
     """`c10::canCast` over real dtypes: a cast that does not lower the
     category (bool < integral < floating). What TensorIterator's
     `enforce_safe_casting_to_output` asks of an `out=` / in-place output."""
-    var s = 2 if is_float_stype(src) else (0 if src == ST_BOOL else 1)
-    var d = 2 if is_float_stype(dst) else (0 if dst == ST_BOOL else 1)
+    # float8 is floating for canCast (isFloatingType), though no op here
+    # computes in it.
+    var s = 2 if is_float_stype(src) or is_float8_stype(src) else (
+        0 if src == ST_BOOL else 1
+    )
+    var d = 2 if is_float_stype(dst) or is_float8_stype(dst) else (
+        0 if dst == ST_BOOL else 1
+    )
     return s <= d
 
 
