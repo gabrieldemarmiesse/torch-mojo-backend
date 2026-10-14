@@ -22,6 +22,9 @@ from tmb.backend.abi import (
     ST_INT64,
     ST_INT8,
     ST_UINT8,
+    ST_UINT16,
+    ST_UINT32,
+    ST_UINT64,
     ST_COMPLEX64,
     Owned,
     T,
@@ -1320,6 +1323,12 @@ def scalar_type_token(st: Int32) -> String:
         return "int8_t"
     if st == ST_UINT8:
         return "uint8_t"
+    if st == ST_UINT16:
+        return "uint16_t"
+    if st == ST_UINT32:
+        return "uint32_t"
+    if st == ST_UINT64:
+        return "uint64_t"
     if st == ST_COMPLEX64:
         return "c10::complex<float>"
     return "c10::complex<double>"
@@ -1334,6 +1343,22 @@ def check_real_scalar_fits(st: Int32, v: Value) raises:
     dtype also takes -x for x within it, as C++'s wrap)."""
     if st == ST_BOOL or is_complex_stype(st):
         return
+    var known = (
+        st == ST_FLOAT16
+        or st == ST_BFLOAT16
+        or st == ST_FLOAT32
+        or st == ST_FLOAT64
+        or st == ST_UINT8
+        or st == ST_UINT16
+        or st == ST_UINT32
+        or st == ST_UINT64
+        or st == ST_INT8
+        or st == ST_INT16
+        or st == ST_INT32
+        or st == ST_INT64
+    )
+    if not known:
+        return  # (float8 and the rest: the fill kernels decide)
     var bad = False
     var is_int_value = v.tag == TAG_SCALAR_INT or v.tag == TAG_INT
     if v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL:
@@ -1357,9 +1382,24 @@ def check_real_scalar_fits(st: Int32, v: Value) raises:
     elif st != ST_FLOAT64:
         var lo: Float64
         var hi: Float64
+        var unsigned = (
+            st == ST_UINT8
+            or st == ST_UINT16
+            or st == ST_UINT32
+            or st == ST_UINT64
+        )
         if st == ST_UINT8:
             lo = 0.0
             hi = 255.0
+        elif st == ST_UINT16:
+            lo = 0.0
+            hi = 65535.0
+        elif st == ST_UINT32:
+            lo = 0.0
+            hi = 4294967295.0
+        elif st == ST_UINT64:
+            lo = 0.0
+            hi = 18446744073709551615.0
         elif st == ST_INT8:
             lo = -128.0
             hi = 127.0
@@ -1374,8 +1414,13 @@ def check_real_scalar_fits(st: Int32, v: Value) raises:
             hi = 9223372036854775807.0
         if is_int_value:
             var iv = v.a
-            if st == ST_UINT8:
-                bad = bad or iv > 255 or (iv < 0 and -iv > 255)
+            if st == ST_UINT64:
+                pass  # every int64 fits, a negative one by C++'s wrap
+            elif unsigned:
+                # -iv as an unsigned magnitude (INT64_MIN has no int64 -iv)
+                var imax = UInt64(hi)
+                var mag = UInt64(-(iv + 1)) + 1 if iv < 0 else UInt64(iv)
+                bad = bad or mag > imax
             elif st != ST_INT64:
                 bad = bad or re < lo or re > hi
         else:
