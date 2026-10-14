@@ -91,7 +91,7 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     uint64_cross_item,
     check_real_scalar_fits,
-    check_uint64_fill,
+    uint64_fill_value,
     assert_no_internal_overlap,
     assert_no_overlap,
     call_op,
@@ -2185,7 +2185,7 @@ def op_fill__tensor(
         # `fill_(Scalar)`, whose `Scalar::to<scalar_t>()` raises on overflow.
         # (one checked conversion for fill_: the Scalar route's)
         check_real_scalar_fits(t.stype, item)
-        check_uint64_fill(t.stype, item, t.numel)
+        item = uint64_fill_value(t.stype, item)
     fill_value(t, item)
     ret_ref(rets, 0, t)
 

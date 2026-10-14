@@ -2601,8 +2601,9 @@ def _index_into(op: StaticString, target: T, args: Values, n_args: Int) raises:
     var src = own(source.copy())
     src.live = False
     if n_args > 4:
-        var al = v_complex(args[unsafe_offset=4])
-        check_scalar_fits(target.stype, al[0], al[1])  # alpha.to<scalar_t>
+        # alpha.to<scalar_t>(): an integer rounds once into the components
+        var al = scalar_parts(args[unsafe_offset=4], target.stype)
+        check_scalar_fits(target.stype, al[0], al[1])
         src = _scaled(source, al[0], al[1])
     for which in range(2):
         var tp = _part(target, which)
