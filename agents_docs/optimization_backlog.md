@@ -1065,7 +1065,10 @@ descriptor-batched body for the whole family)
   `elementwise_ops`' `ForeachAddScalar`) are gone, as is the hand-tuned
   `foreach_mul_tensor_f32_aligned_streaming_ilp8_t128_v8`. Apple regroups the
   same descriptors into the fixed-arity Metal launches, which is the only
-  part that ever needed to be Metal-specific.
+  part that ever needed to be Metal-specific. (Since generalized: the
+  `foreach` kernel family's multi-tensor apply runs every elementwise
+  `_foreach_*` overload, its element math from the shared unary / pointwise
+  math modules; see `tmb/kernels/foreach/`.)
 * **The Metal gate was not the whole cost.** The chunk size was fixed at
   65_536 elements, which put the 4x1_048_576 list on 64 blocks and the
   16x65_536 list on 16 — on 114 SMs. It is now a runtime launch argument
@@ -1405,7 +1408,7 @@ fallback runs. This is the answer to "which GPUs run an unoptimized path".
 | Fused softmax+dropout forward | `metal` + fp32 | `aten_fast.py:5581` | separate softmax + dropout |
 | Fused 3-way `cat` | `metal` | `aten_fast.py:3621` | 3 `NarrowCopyDst` launches |
 | `fast_aten_add` spec-bypass fast path | `metal` | `aten_fast.py:2364` | spec path |
-| Foreach elementwise family, fixed-arity 8-slot ABI | `has_apple_gpu_accelerator()` | `foreach_batched_kernels.mojo` (`foreach_ew_enqueue`) | the descriptor-batched kernel (same body, same descriptors) |
+| Foreach elementwise family, fixed-arity 8-slot ABI | `has_apple_gpu_accelerator()` | `tmb/kernels/foreach/apply.mojo` (`foreach_apply_enqueue`) | the generic multi-tensor apply (same descriptors) |
 | Apple vectorized D2D copy | `has_apple_gpu_accelerator()` | `tensor_holder.mojo:326` | `enqueue_copy_from` |
 | Apple permute rows4 / rowloop | `has_apple_gpu_accelerator()` | `data_movement_ops.mojo:321` | generic gather ladder |
 | Apple fused AdamW variant | `has_apple_gpu_accelerator()` | `optimizer_kernels.mojo:339` | generic fused AdamW |

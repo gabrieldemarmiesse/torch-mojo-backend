@@ -3,8 +3,8 @@
 Norms use a two-stage reduction. A fixed-size chunk is reduced by one block
 into caller-owned scratch, then one block per tensor reduces its chunk
 partials and writes the ordered scalar result. The rescaling multiply that
-follows a norm is not here: it is `aten::_foreach_mul_.Tensor`, one member of
-the elementwise family `foreach_batched_kernels` serves.
+follows a norm is not here: it is `aten::_foreach_mul_.Tensor`, one overload
+of the foreach family's multi-tensor apply (tmb/kernels/foreach).
 """
 
 from std.collections import Array
@@ -22,7 +22,7 @@ from tmb.kernels.optimizer.foreach_clip_contract import (
     FOREACH_THREADS,
     ForeachDesc,
 )
-from tmb.kernels.optimizer.foreach_elementwise_kernels import (
+from tmb.kernels.foreach.apple_kernels import (
     FOREACH_EW_CHUNK,
     FOREACH_EW_SLOTS,
     _SlotInts,
@@ -132,7 +132,7 @@ def _norm_finalize(
 # pointer-typed *kernel arguments* into valid GPU addresses/bindings; a raw
 # address smuggled as data reads back zeros. So on Apple every tensor pointer
 # is a real kernel argument: FOREACH_EW_SLOTS of them per launch, with
-# per-slot chunk offsets as plain-Int data (see foreach_elementwise_kernels).
+# per-slot chunk offsets as plain-Int data (see foreach/apple_kernels.mojo).
 # Chunking and the two-stage reduction are unchanged, so results stay
 # bitwise identical to the former per-tensor-launch variants.
 # ---------------------------------------------------------------------------

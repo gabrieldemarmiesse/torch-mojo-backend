@@ -3,7 +3,7 @@
 ATen's `amp_update_scale_cuda_kernel` is a <<<1, 1>>> launch; this is the same
 state machine on the same three device scalars, so `GradScaler.update()` never
 reads anything back to the host. The pointers are real kernel arguments, as
-Metal requires (see `foreach_elementwise_kernels`).
+Metal requires (see `foreach/apple_kernels.mojo`).
 """
 
 from max.gpu.host import DeviceContext
