@@ -1837,14 +1837,14 @@ def register_compare(site: Site) raises:
         routed[op_masked_fill_scalar, cx_masked_fill, 3], "masked_fill.Scalar"
     ](site)
     impl[
-        routed[op_masked_fill_scalar_out, cx_masked_fill_out, 1],
+        routed[op_masked_fill_scalar_out, cx_masked_fill_out, 3],
         "masked_fill.Scalar_out",
     ](site)
     impl[
         routed[op_masked_fill_tensor, cx_masked_fill, 3], "masked_fill.Tensor"
     ](site)
     impl[
-        routed[op_masked_fill_tensor_out, cx_masked_fill_out, 1],
+        routed[op_masked_fill_tensor_out, cx_masked_fill_out, 3],
         "masked_fill.Tensor_out",
     ](site)
     impl[
