@@ -1888,3 +1888,92 @@ def test_float8_cuda_data_regenerates_on_stock_cuda():
         assert list(gen(op, "cuda")) == want
     assert list(_r10_lines("cuda")) == _F8_ITER["rules_and_aliasing"]
     assert list(_backward_lines("cuda")) == _F8_ITER["backward_ops"]
+
+
+def _r11_lines(dev):
+    """Out-dtype dispatch converting every operand, the shrink backward ops,
+    a CPU out=, the special polynomials and ldexp's own sequence."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+
+    def run(name, fn, o):
+        r = _r10_res(fn).replace("cuda:0", "DEV").replace("mojo:0", "DEV")
+        return f"{name} {r} {tuple(o.shape)}"
+
+    g = torch.tensor(0.5).to(f8).to(dev)
+    xx = torch.tensor([0.9999], device=dev)
+    for odt in (torch.float16, torch.float32):
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield run(
+            f"hardtanh_b_{odt}",
+            lambda: a.hardtanh_backward.grad_input(g, xx, -1.0, 1.0, grad_input=o),
+            o,
+        )
+        o = torch.empty(0, dtype=odt, device=dev)
+        y3 = torch.tensor([0.33333], device=dev)
+        yield run(
+            f"sigmoid_b_{odt}",
+            lambda: a.sigmoid_backward.grad_input(g, y3, grad_input=o),
+            o,
+        )
+    b = torch.tensor([1.0, 2.0], device=dev)
+    x = torch.tensor([2.0, 3.0], device=dev)
+    for name in ("hardshrink_backward", "softshrink_backward"):
+        f = getattr(a, name)
+        for odt in (f8, torch.float16):
+            o = torch.empty(0, dtype=odt, device=dev)
+            yield run(f"{name}_{odt}", lambda: f.grad_input(b, x, 0.5, grad_input=o), o)
+        yield run(f"{name}_f8", lambda: f(b.to(f8), x.to(f8), 0.5), b)
+        g8 = torch.tensor(0.5, device=dev).to(f8)
+        yield run(f"{name}_f8_0d", lambda: f(g8, x, 0.5), b)
+    ones = torch.ones(2, device=dev)
+    for odt in (f8, torch.int32, torch.float32):
+        o = torch.empty(0, dtype=odt)
+        yield run(
+            f"add_f8_cpuout_{odt}",
+            lambda: torch.add(ones.to(f8), ones.to(f8), out=o),
+            o,
+        )
+        o = torch.empty(0, dtype=odt)
+        yield run(f"neg_f8_cpuout_{odt}", lambda: torch.neg(ones.to(f8), out=o), o)
+    o = torch.empty(0, dtype=f8)
+    yield run("add_f32_cpuout_f8", lambda: torch.add(ones, ones, out=o), o)
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield run(
+        "bessel_k0_out",
+        lambda: torch.special.scaled_modified_bessel_k0(ones.to(f8), out=o),
+        o,
+    )
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield run(
+        "shifted_cheb_t_out",
+        lambda: torch.special.shifted_chebyshev_polynomial_t(
+            ones.to(f8), ones.to(f8), out=o
+        ),
+        o,
+    )
+    f8v = ones.to(f8)
+    for odt in (torch.float32, torch.int32, f8):
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield run(f"ldexp_f32_f8_out_{odt}", lambda: torch.ldexp(ones, f8v, out=o), o)
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield run(f"ldexp_f8_f8_out_{odt}", lambda: torch.ldexp(f8v, f8v, out=o), o)
+    yield run("ldexp_inplace_f32_f8", lambda: ones.clone().ldexp_(f8v), ones)
+    x8 = torch.ones(2, 1).to(f8).to(dev)
+    y13 = torch.ones(1, 3, device=dev)
+    yield run("ldexp_inplace_shape", lambda: x8.clone().ldexp_(y13), x8)
+    yield run("ldexp_f8_f32", lambda: torch.ldexp(f8v, ones), ones)
+    z8 = torch.tensor(1.0).to(f8).to(dev)
+    yield run("ldexp_f8_0d_f32", lambda: torch.ldexp(z8, ones), ones)
+    z32 = torch.tensor(1.0, device=dev)
+    yield run("ldexp_f8_f32_0d", lambda: torch.ldexp(f8v, z32), ones)
+
+
+def test_float8_round11_shapes_match_stock_cuda(mojo_device):
+    _compare(list(_r11_lines(mojo_device)), _F8_ITER["round11"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_float8_round11_data_regenerates_on_stock_cuda():
+    assert list(_r11_lines("cuda")) == _F8_ITER["round11"]

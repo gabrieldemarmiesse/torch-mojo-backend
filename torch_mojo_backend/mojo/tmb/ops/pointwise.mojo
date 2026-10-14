@@ -4505,8 +4505,30 @@ def register_pointwise(site: Site) raises:
         ],
         "hardshrink.out",
     ](site)
-    impl[op_shrink_backward, "hardshrink_backward"](site)
-    impl[op_shrink_backward_grad_input, "hardshrink_backward.grad_input"](site)
+    impl[
+        f8_iter[
+            op_shrink_backward,
+            "shrink_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "hardshrink_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_shrink_backward_grad_input,
+            "shrink_backward_cuda",
+            3,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "hardshrink_backward.grad_input",
+    ](site)
     impl[
         f8_iter[
             op_hardsigmoid, "hardsigmoid_cuda", 1, -1, MODE_FN, False, PRE_NONE
@@ -5022,8 +5044,30 @@ def register_pointwise(site: Site) raises:
         ],
         "softshrink.out",
     ](site)
-    impl[op_shrink_backward, "softshrink_backward"](site)
-    impl[op_shrink_backward_grad_input, "softshrink_backward.grad_input"](site)
+    impl[
+        f8_iter[
+            op_shrink_backward,
+            "shrink_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "softshrink_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_shrink_backward_grad_input,
+            "shrink_backward_cuda",
+            3,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "softshrink_backward.grad_input",
+    ](site)
     _register_special(site)
     impl[op_threshold, "threshold"](site)
     impl[op_threshold_out, "threshold.out"](site)
@@ -5118,7 +5162,15 @@ def _register_special(site: Site) raises:
         "special_chebyshev_polynomial_t",
     ](site)
     impl[
-        op_special_chebyshev_polynomial_t_out,
+        f8_iter[
+            op_special_chebyshev_polynomial_t_out,
+            "chebyshev_polynomial_t_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_chebyshev_polynomial_t.out",
     ](site)
     impl[
@@ -5134,7 +5186,15 @@ def _register_special(site: Site) raises:
         "special_chebyshev_polynomial_u",
     ](site)
     impl[
-        op_special_chebyshev_polynomial_u_out,
+        f8_iter[
+            op_special_chebyshev_polynomial_u_out,
+            "chebyshev_polynomial_u_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_chebyshev_polynomial_u.out",
     ](site)
     impl[
@@ -5150,7 +5210,15 @@ def _register_special(site: Site) raises:
         "special_chebyshev_polynomial_v",
     ](site)
     impl[
-        op_special_chebyshev_polynomial_v_out,
+        f8_iter[
+            op_special_chebyshev_polynomial_v_out,
+            "chebyshev_polynomial_v_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_chebyshev_polynomial_v.out",
     ](site)
     impl[
@@ -5166,7 +5234,15 @@ def _register_special(site: Site) raises:
         "special_chebyshev_polynomial_w",
     ](site)
     impl[
-        op_special_chebyshev_polynomial_w_out,
+        f8_iter[
+            op_special_chebyshev_polynomial_w_out,
+            "chebyshev_polynomial_w_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_chebyshev_polynomial_w.out",
     ](site)
     impl[
@@ -5182,7 +5258,16 @@ def _register_special(site: Site) raises:
         "special_hermite_polynomial_h",
     ](site)
     impl[
-        op_special_hermite_polynomial_h_out, "special_hermite_polynomial_h.out"
+        f8_iter[
+            op_special_hermite_polynomial_h_out,
+            "hermite_polynomial_h_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_hermite_polynomial_h.out",
     ](site)
     impl[
         f8_iter[
@@ -5197,7 +5282,15 @@ def _register_special(site: Site) raises:
         "special_hermite_polynomial_he",
     ](site)
     impl[
-        op_special_hermite_polynomial_he_out,
+        f8_iter[
+            op_special_hermite_polynomial_he_out,
+            "hermite_polynomial_he_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_hermite_polynomial_he.out",
     ](site)
     impl[
@@ -5213,7 +5306,15 @@ def _register_special(site: Site) raises:
         "special_laguerre_polynomial_l",
     ](site)
     impl[
-        op_special_laguerre_polynomial_l_out,
+        f8_iter[
+            op_special_laguerre_polynomial_l_out,
+            "laguerre_polynomial_l_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_laguerre_polynomial_l.out",
     ](site)
     impl[
@@ -5229,39 +5330,111 @@ def _register_special(site: Site) raises:
         "special_legendre_polynomial_p",
     ](site)
     impl[
-        op_special_legendre_polynomial_p_out,
+        f8_iter[
+            op_special_legendre_polynomial_p_out,
+            "legendre_polynomial_p_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_legendre_polynomial_p.out",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_t,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_t,
+            "shifted_chebyshev_polynomial_t_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_t",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_t_out,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_t_out,
+            "shifted_chebyshev_polynomial_t_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_t.out",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_u,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_u,
+            "shifted_chebyshev_polynomial_u_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_u",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_u_out,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_u_out,
+            "shifted_chebyshev_polynomial_u_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_u.out",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_v,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_v,
+            "shifted_chebyshev_polynomial_v_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_v",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_v_out,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_v_out,
+            "shifted_chebyshev_polynomial_v_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_v.out",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_w,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_w,
+            "shifted_chebyshev_polynomial_w_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_w",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_w_out,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_w_out,
+            "shifted_chebyshev_polynomial_w_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_w.out",
     ](site)
     impl[

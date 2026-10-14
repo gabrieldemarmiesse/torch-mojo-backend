@@ -28,6 +28,7 @@ from tmb.backend.abi import (
     TAG_BOOL,
     TAG_SCALAR_BOOL,
     OpFn,
+    ST_FLOAT32,
     Owned,
     T,
     TAG_TENSOR,
@@ -52,6 +53,7 @@ from tmb.ops.common import (
     can_cast,
     cast_to,
     combine_categories,
+    device_str,
     is_float_stype,
     promote_types,
     resize_out,
@@ -161,6 +163,42 @@ def _shape_is(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
     return True
 
 
+def _same_device(args: Values, ins: Int, o: T) raises:
+    """TensorIterator's common device: every operand but a CPU 0-d one, and
+    the out, on one device."""
+    var first = String("")
+    for i in range(_MAX_ARGS):
+        if (ins >> i) & 1 == 0:
+            continue
+        var v = args[unsafe_offset=i].copy()
+        if not _rec_tensor(v):
+            continue
+        var t = T(Int(v.a))
+        if t.on_cpu() and t.rank == 0:
+            continue
+        var d = device_str(t)
+        if first.byte_length() == 0:
+            first = d
+        elif d != first:
+            _device_error(first, d)
+    var od = device_str(o)
+    if first.byte_length() > 0 and od != first:
+        _device_error(first, od)
+
+
+def _device_error(a: String, b: String) raises:
+    raise Error(
+        (
+            "Expected all tensors to be on the same device, but found at least"
+            " two devices, "
+        ),
+        a,
+        " and ",
+        b,
+        "!",
+    )
+
+
 def _shape_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
     var s = String("[")
     for i in range(rank):
@@ -227,23 +265,49 @@ def _pre[
                     _tname(a.stype),
                 )
     elif pre == PRE_LDEXP:
-        # ldexp(self, other) = self * pow(2, other): pow(2, other) runs in
-        # other's dtype first; a dimensioned float8 self then meets that
-        # result's dtype in mul's promotion.
+        # BinaryOps.cpp: ldexp_out rejects an integral out, then computes
+        # mul(self, _pow2(self, other)); _pow2 is pow(2.0, other) for an
+        # integral or float32 self (other's floating dtype, or float32), else
+        # full({}, 2.0, self.dtype).pow(other) with the usual promotion.
         var a = T(Int(args[unsafe_offset=0].a))
         var b = T(Int(args[unsafe_offset=1].a))
         comptime if out_idx >= 0:
             var o = T(Int(args[unsafe_offset=out_idx].a))
-            var common = _common_of(args, 3)
-            if not can_cast(common, o.stype):
+            if not is_float_stype(o.stype) and not is_float8_stype(o.stype):
                 raise Error(
                     "ldexp can't be cast to the desired output type ",
                     _tname(o.stype),
                 )
-        if is_float8_stype(b.stype):
-            _refuse("pow_cuda", b.stype)
-        if is_float8_stype(a.stype) and a.rank > 0 and b.stype != a.stype:
-            _ = promote_types(a.stype, b.stype)
+        var b_float = is_float_stype(b.stype) or is_float8_stype(b.stype)
+        var pdt: Int32
+        if not (is_float_stype(a.stype) or is_float8_stype(a.stype)) or (
+            a.dtype == DType.float32
+        ):
+            pdt = b.stype if b_float else ST_FLOAT32
+        elif b.rank == 0:
+            pdt = promote_types(a.stype, b.stype)
+        else:
+            pdt = combine_categories(b.stype, a.stype)
+        if is_float8_stype(pdt):
+            _refuse("pow_cuda", pdt)
+        # mul(self, p), p of other's rank: a read-write out's shape first.
+        comptime if out_idx == 0:
+            var it = _shape_of(args, 3)
+            if it.shape_ok and not _shape_is(a, it.shape, it.rank):
+                raise Error(
+                    "output with shape ",
+                    _shape_str(a.shape, a.rank),
+                    " doesn't match the broadcast shape ",
+                    _shape_str(it.shape, it.rank),
+                )
+        if a.rank > 0 and b.rank > 0:
+            _ = promote_types(a.stype, pdt)
+        elif a.rank == 0 and b.rank == 0:
+            _ = promote_types(a.stype, pdt)
+        elif a.rank > 0:
+            _ = combine_categories(a.stype, pdt)
+        else:
+            _ = combine_categories(pdt, a.stype)
     elif pre == PRE_LERP:
         # lerp's meta: `end` (and a dimensioned `weight`) must have self's
         # dtype; such a weight joins the all-same-dtype iterator (out must
@@ -350,7 +414,9 @@ def f8_iter[
                 " doesn't match the broadcast shape ",
                 _shape_str(it.shape, it.rank),
             )
-        # (a) + (c)
+        # (a) + (c), with the device check where TensorIterator's
+        # compute_types makes it: after an exact-dtype out's check, before
+        # canCast's.
         var common = _common_of(args, p.ins, p.rev)
         if eff_mode == MODE_SAME:
             if o.stype != common:
@@ -360,7 +426,10 @@ def f8_iter[
                     " but expected ",
                     _tname(common),
                 )
-        elif eff_mode != MODE_NOCHECK:
+        _same_device(args, p.ins, o)
+        if eff_mode == MODE_SAME or eff_mode == MODE_NOCHECK:
+            pass
+        else:
             if not can_cast(common, o.stype):
                 raise Error(
                     "result type ",
@@ -398,7 +467,10 @@ def f8_iter[
     comptime if int_only:
         if is_float_stype(compute):
             _refuse(k, compute)
-    # A float8 operand of a wider computation: converted exactly first.
+    # A float8 operand of a wider computation: converted exactly first. A
+    # kernel dispatched on the out dtype computes in it: every operand is
+    # converted to it, as TensorIterator's common-dtype cast does.
+    var all_ops = eff_mode == MODE_OUTDT
     var recs = List[Value](capacity=n_args)
     var held = List[Owned]()
     for i in range(n_args):
@@ -406,7 +478,10 @@ def f8_iter[
         if i < _MAX_ARGS and (p.ins >> i) & 1 == 1 and _rec_tensor(v):
             var t = T(Int(v.a))
             var swap = i != out_idx
-            if swap and is_float8_stype(t.stype) and not t.on_cpu():
+            var convert = is_float8_stype(t.stype) or (
+                all_ops and t.stype != compute
+            )
+            if swap and convert and not t.on_cpu():
                 held.append(own(cast_to(t, compute, False)))
                 recs.append(tensor_arg(held[len(held) - 1].t))
                 continue
