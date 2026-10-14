@@ -2251,10 +2251,14 @@ def cx_masked_fill_out(
     """masked_fill.Scalar_out / .Tensor_out(self, mask, value, *, out)"""
     var dest = v_tensor_c(args[unsafe_offset=3])
     var res = _masked_fill(args)
-    # the generated out= wrapper: the functional result, its dtype, then
-    # resize and copy (no overlap check against the inputs)
-    _exact_dtype(dest, res.t.stype)
-    _store(dest, res^, rets)
+    # the generated out= wrapper: the functional result, the out resized to
+    # it, then its dtype checked (CUDA resizes before raising), then the copy
+    # (no overlap check against the inputs)
+    _same_device(dest, res.t)
+    resize_out(dest, res.t.shape, res.t.rank)
+    var resized = v_tensor_c(args[unsafe_offset=3])
+    _exact_dtype(resized, res.t.stype)
+    _store(resized, res^, rets)
 
 
 def cx_masked_fill_(
