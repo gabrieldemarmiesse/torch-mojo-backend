@@ -1796,3 +1796,49 @@ def test_scaled_mm_empty_with_unsupported_dtypes(mojo_device):
     b = torch.zeros(16, 16).to(torch.float8_e4m3fn).to(dev).t()
     out = torch._scaled_mm(a, b, one, one, out_dtype=torch.float8_e8m0fnu)
     assert out.shape == (0, 16)
+
+
+def test_scaled_mm_higher_rank_scale_b_refused(mojo_device):
+    """get_joint_scaling transposes scale_b first: a 3-D one raises t()'s
+    error, while a 3-D singleton scale_a is still a tensorwise scale."""
+    dev = mojo_device
+    a = torch.randn(16, 32).to(torch.float8_e4m3fn).to(dev)
+    b = torch.randn(16, 32).to(torch.float8_e4m3fn).to(dev).t()
+    one = torch.ones((), device=dev)
+    three = torch.ones(1, 1, 1, device=dev)
+    with pytest.raises(RuntimeError, match=r"t\(\) expects a tensor with <= 2"):
+        torch._scaled_mm(a, b, one, three, out_dtype=torch.bfloat16)
+    assert torch._scaled_mm(a, b, three, one, out_dtype=torch.bfloat16).shape == (
+        16,
+        16,
+    )
+
+
+def test_scaled_mm_v2_scale_list_lengths(mojo_device):
+    """torch 2.14's structured meta (validate_scaled_mm_v2_inputs) checks the
+    lists before any kernel: an empty or extra scale names the count."""
+    dev = mojo_device
+    a = torch.randn(16, 32).to(torch.float8_e4m3fn).to(dev)
+    b = torch.randn(16, 32).to(torch.float8_e4m3fn).to(dev).t()
+    one = torch.ones((), device=dev)
+    tw, rw = ScalingType.TensorWise.value, ScalingType.RowWise.value
+    ns = SwizzleType.NO_SWIZZLE.value
+
+    def v2(sa, ra, sb, rb):
+        return torch.ops.aten._scaled_mm_v2(
+            a, b, sa, ra, [ns] * len(sa), sb, rb, [ns] * len(sb), None,
+            torch.bfloat16, [], False,
+        )  # fmt: skip
+
+    with pytest.raises(RuntimeError, match="scale_a must have 1 Float element"):
+        v2([], [tw], [one], [tw])
+    with pytest.raises(RuntimeError, match="scale_b must have 1 Float element"):
+        v2([one], [tw], [], [tw])
+    with pytest.raises(RuntimeError, match="scale_a must have 1 Float element"):
+        v2([one, one], [tw], [one], [tw])
+    ra = torch.ones(16, 1, device=dev)
+    rb = torch.ones(1, 16, device=dev)
+    with pytest.raises(RuntimeError, match="scale_a must have 16 Float elements"):
+        v2([ra, ra], [rw], [rb], [rw])
+    with pytest.raises(RuntimeError, match="unsupported recipe"):
+        v2([one, one], [tw, tw], [one], [tw])

@@ -24,9 +24,20 @@ pass applies the outer scales, the bias and the output conversion.
 `use_fast_accum` is accepted and ignored (the accumulation is always full
 float32, which the option allows). A float8 output saturates to its largest
 finite value, as cuBLAS writes one. `scale_result` multiplies a float8
-output (cuBLAS's D scale, torch 2.14's test_float8_scale_result) and is
-ignored for any other. The two outer scales are combined before they meet
-the accumulator, as cuBLAS's alpha is, so 1e38 * 1e-38 does not overflow.
+output (cuBLAS's D scale) and is ignored for any other: torch 2.14
+behaviour (pytorch#190979, test_float8_scale_result); torch 2.11-2.13 ignore
+it for every output. Tensorwise scales are combined before they meet the
+accumulator, as cuBLAS's alpha is, so 1e38 * 1e-38 does not overflow;
+rowwise scales multiply it in turn, scale_b then scale_a, as CUDA's rowwise
+kernel does; block scales are applied per K block (above).
+
+_scaled_mm_v2 validates its scale lists like torch 2.14's structured meta
+(validate_scaled_mm_v2_inputs, which runs before CUDA's kernel): an empty or
+two-entry list for a tensorwise / rowwise recipe raises "scale_a must have 1
+Float element" (resp. "... N Float elements"), and a recipe list of another
+length "unsupported recipe(s)". torch 2.11's kernel reads scale_a[0] of an
+empty list (it aborts) and says "Invalid scaling configuration." for the
+others.
 
 Where this is more permissive than an H100: a rowwise recipe takes a float8
 output (cuBLAS >= 12.9 does too), cuBLASLt's row-major x
@@ -184,8 +195,15 @@ def _sc(t: T) -> _Sc:
     return _Sc(t.rank, d0, d1, s0, s1, t.numel, t.stype, t.contig, t.ptr)
 
 
-def _sc_t(t: T) -> _Sc:
-    """The `.t()` view of a scale tensor of rank <= 2."""
+def _sc_t(t: T) raises -> _Sc:
+    """The `.t()` view of a scale tensor; like `Tensor.t()`, refuses rank > 2
+    (get_joint_scaling transposes scale_b before it checks any recipe)."""
+    if t.rank > 2:
+        raise Error(
+            "t() expects a tensor with <= 2 dimensions, but self is ",
+            t.rank,
+            "D",
+        )
     if t.rank < 2:
         return _sc(t)
     return _Sc(
@@ -1218,7 +1236,7 @@ def _v2_deepseek_checks(
         check_128x128(sb, n, "scale_b")
 
 
-def _v2_scale_view(kind: Int, s: T) -> _Sc:
+def _v2_scale_view(kind: Int, s: T) raises -> _Sc:
     """A v2 scale as `Dequant` indexes it, (outer index or block, K block):
     the 128x128 layout is stored (K blocks, outer blocks), so transposed."""
     if kind == BLOCK_128X128:
