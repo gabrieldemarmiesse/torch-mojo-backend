@@ -1339,3 +1339,62 @@ def test_masked_fill_out_checks_the_value_first_and_resizes_host_outs(mojo_gpu: 
                 torch.zeros(2, dtype=self_dt, device=mojo_gpu), m, 5.0, out=host
             )
         assert host.shape == (2,)
+
+
+# --- values read from uint64 tensors, on every fill entry point -----------------
+
+
+def test_uint64_values_on_every_fill_entry_point(mojo_gpu: str):
+    m = torch.ones(2, dtype=torch.bool, device=mojo_gpu)
+    top = torch.tensor(2**64 - 1, dtype=torch.uint64, device=mojo_gpu)
+    for dt in (torch.complex64, torch.float32):
+        want = torch.tensor(2**64 - 1, dtype=torch.uint64).to(
+            dt
+        )  # CPU torch: read unsigned
+        got = torch.zeros(2, dtype=dt, device=mojo_gpu).masked_fill_(m, top)
+        assert torch.equal(got.cpu(), want.expand(2))
+        got = torch.zeros(2, dtype=dt, device=mojo_gpu).masked_fill(m, top)
+        assert torch.equal(got.cpu(), want.expand(2))
+    with pytest.raises(RuntimeError, match="int64_t without overflow"):
+        torch.zeros(2, dtype=torch.int64, device=mojo_gpu).masked_fill_(m, top)
+    # one rounding from a uint64 below 2**63 into a single-precision dtype
+    mid = torch.tensor(2**62 + 2**38 + 1, dtype=torch.uint64)
+    got = torch.zeros(2, dtype=torch.complex64, device=mojo_gpu).fill_(mid)
+    assert got.cpu()[0].real.item() == 2**62 + 2**39
+    # another device, 2**63 or more: declined before writing
+    t = torch.zeros(2, dtype=torch.complex64, device=mojo_gpu)
+    with pytest.raises(NotImplementedError, match="2\\*\\*63 or more"):
+        t.masked_fill_(m, top.cpu())
+    assert t.cpu().tolist() == [0j, 0j]
+    # an index_put_ mask with a host value: its item() (a uint64 one too)
+    x = torch.zeros(2, dtype=torch.int64, device=mojo_gpu)
+    x[m] = torch.tensor(2**40 + 1)
+    assert x.cpu().tolist() == [2**40 + 1] * 2
+    x[m] = torch.tensor(7, dtype=torch.uint64)
+    assert x.cpu().tolist() == [7, 7]
+    # a device value of another dtype is index_put_'s dtype error, not a fill
+    with pytest.raises(
+        RuntimeError, match="Index put requires the source and destination dtypes match"
+    ):
+        torch.zeros(2, device=mojo_gpu).index_put_(
+            (m,), torch.tensor(5, device=mojo_gpu)
+        )
+
+
+def test_masked_fill_tensor_out_value_first_and_host_out_device(mojo_gpu: str):
+    m = torch.ones(2, dtype=torch.bool, device=mojo_gpu)
+    out = torch.empty(0, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="int8_t without overflow"):
+        torch.ops.aten.masked_fill.Tensor_out(
+            torch.zeros(2, dtype=torch.int8, device=mojo_gpu),
+            m,
+            torch.tensor(1000),
+            out=out,
+        )
+    assert out.shape == (0,)
+    host = torch.empty(0)
+    with pytest.raises(RuntimeError, match="Expected out tensor to have device"):
+        torch.ops.aten.masked_fill.Scalar_out(
+            torch.zeros(2, device=mojo_gpu), m, 5.0, out=host
+        )
+    assert host.shape == (2,)

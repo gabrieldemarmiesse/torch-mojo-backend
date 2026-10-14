@@ -98,7 +98,7 @@ from tmb.backend.device import current_device
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
-    uint64_cross_item,
+    fill_item,
     shares_storage,
     check_real_scalar_fits,
     scalar_type_token,
@@ -1537,9 +1537,8 @@ def _index_put_as_masked_fill(self: T, args: Values, values: T) raises -> Bool:
         u.t(m.t)
         u.i(-1)
         m = u.one()
-    var item = _Call("aten::_local_scalar_dense")
-    item.t(values)
-    var r = item.run(1)
+    var r = List[Value]()
+    r.append(fill_item(values, self.stype, False))
     var iv = v_complex(r[0])
     check_scalar_fits(self.stype, iv[0], iv[1])
     var f = _Call("aten::masked_fill_", "Scalar")
@@ -1851,7 +1850,7 @@ def cx_fill_tensor_(
         # route for a 0-d value on another device)
         var hv: Value
         if value.stype == ST_UINT64:
-            hv = uint64_cross_item(value)
+            hv = fill_item(value, t.stype, False)
         else:
             var it = _Call("aten::_local_scalar_dense")
             it.t(value)
@@ -1896,7 +1895,7 @@ def cx_fill_tensor_(
         return
     var item: Value
     if value.stype == ST_UINT64:
-        item = uint64_cross_item(value)
+        item = fill_item(value, t.stype, False)
     else:
         var c = _Call("aten::_local_scalar_dense")
         c.t(value)
@@ -2178,10 +2177,11 @@ def _masked_fill_into(target: T, mask: Value, value: Value) raises:
                 vt.rank,
                 " dimension(s).",
             )
-        var s = _Call("aten::_local_scalar_dense")
-        s.t(vt)
-        var r = s.run(1)
-        val = r[0].copy()
+        val = fill_item(
+            vt,
+            target.stype,
+            vt.on_mojo() and target.on_mojo() and vt.device == target.device,
+        )
     var parts = v_complex(val)
     # the Scalar's checked conversion, before anything is written
     check_scalar_fits(target.stype, parts[0], parts[1])
@@ -2320,10 +2320,11 @@ def _masked_fill_real_(self: T, args: Values) raises:
                 vt.rank,
                 " dimension(s).",
             )
-        var it = _Call("aten::_local_scalar_dense")
-        it.t(vt)
-        var r = it.run(1)
-        val = r[0].copy()
+        val = fill_item(
+            vt,
+            self.stype,
+            vt.on_mojo() and self.on_mojo() and vt.device == self.device,
+        )
     check_real_scalar_fits(self.stype, val)
     var c = v_complex(val)
     var m = _Call("aten::masked_fill_", "Scalar")
