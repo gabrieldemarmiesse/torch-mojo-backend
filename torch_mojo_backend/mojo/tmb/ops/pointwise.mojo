@@ -89,6 +89,7 @@ from tmb.ops.f8_iter import (
     PRE_SOFTSHRINK,
     PRE_SUB,
     PRE_THRESHOLD,
+    softshrink_check,
 )
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.float8 import is_float8
@@ -1701,19 +1702,10 @@ def _float_max(st: Int32) -> Float64:
 
 
 def _softshrink_check(args: Values) raises:
-    """softshrink's meta: 0 <= lambd <= max of self's dtype (NaN fails)."""
-    var lambd = v_f64(args[unsafe_offset=1])
-    var st = _self_stype(args, 0)
-    var top = _float_max(st)
-    if not (lambd >= 0.0 and lambd <= top):
-        raise Error(
-            "lambda must be in range [0, ",
-            top,
-            "] for input dtype ",
-            dtype_name(st),
-            ", but found ",
-            lambd,
-        )
+    """softshrink's meta (Activation.cpp's softshrink_check)."""
+    softshrink_check(
+        v_tensor(args[unsafe_offset=0]), v_f64(args[unsafe_offset=1])
+    )
 
 
 # aten::hardshrink(Tensor self, Scalar lambd=0.5) -> Tensor
@@ -2613,6 +2605,10 @@ def op_threshold_out(
 
 # aten::threshold_(Tensor(a!) self, Scalar threshold, Scalar value) -> Tensor(a!)
 def op_threshold_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if threshold_into_overlapping(
+        "aten::threshold", args, 3, args[unsafe_offset=0].copy(), rets
+    ):
+        return
     _pw_act_inplace("threshold", args, rets, _threshold_p(args), P_NUMERIC)
 
 

@@ -41,6 +41,7 @@ from tmb.backend.abi import (
     own,
     tensor_arg,
     unsupported,
+    v_f64,
     v_is_none,
     v_string,
 )
@@ -251,6 +252,58 @@ def _device_error(a: String, b: String) raises:
     )
 
 
+def softshrink_check(a: T, lam: Float64) raises:
+    """Activation.cpp's softshrink_check: an AT_DISPATCH over the floating
+    dtypes, then 0 <= lambd <= max of self's dtype (NaN fails)."""
+    if not is_float_stype(a.stype):
+        _refuse("softshrink_check", a.stype)
+    if not (lam >= 0 and lam <= _float_max(a.dtype)):
+        raise Error(
+            "lambda must be in range [0, ",
+            _float_max_str(a.dtype),
+            "] for input dtype ",
+            _tname(a.stype),
+            ", but found ",
+            _fmt_g(lam),
+        )
+
+
+def _float_max(dt: DType) -> Float64:
+    if dt == DType.float16:
+        return 65504.0
+    if dt == DType.bfloat16:
+        return 3.3895313892515355e38
+    if dt == DType.float32:
+        return 3.4028234663852886e38
+    return 1.7976931348623157e308
+
+
+def _float_max_str(dt: DType) -> String:
+    """`std::numeric_limits<scalar_t>::max()` as a C++ stream prints it."""
+    if dt == DType.float16:
+        return "65504"
+    if dt == DType.bfloat16:
+        return "3.38953e+38"
+    if dt == DType.float32:
+        return "3.40282e+38"
+    return "1.79769e+308"
+
+
+def _fmt_g(x: Float64) -> String:
+    """A double as a C++ stream prints it by default (%g, 6 digits): the
+    integral values and the specials this message meets."""
+    if x != x:
+        return "nan"
+    if x == Float64.MAX or x > 1.7976931348623157e308:
+        return "inf"
+    if x < -1.7976931348623157e308:
+        return "-inf"
+    if x == Float64(Int(x)) and abs(x) < 1e6:
+        return String(Int(x))
+    var s = String(x)
+    return s
+
+
 def _shape_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
     var s = String("[")
     for i in range(rank):
@@ -334,7 +387,13 @@ def _pre[
                     _tname(o.stype),
                 )
         var b_float = is_float_stype(b.stype) or is_float8_stype(b.stype)
-        if not b_float and is_float8_stype(a.stype):
+        var fast = not b_float and is_float8_stype(a.stype)
+        comptime if out_idx >= 0:
+            # torch 2.14's fast path also wants out to hold self's dtype.
+            fast = (
+                fast and T(Int(args[unsafe_offset=out_idx].a)).stype == a.stype
+            )
+        if fast:
             # _ldexp_int_exponent: an integral (or bool) exponent of a
             # floating self runs ldexp_cuda's own iterator (out checked and
             # resized first), which has no float8 case.
@@ -423,9 +482,9 @@ def _pre[
         # softshrink_check: an AT_DISPATCH over self's dtype, before the
         # iterator (and its out= checks) exists.
         # AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16).
-        var a = T(Int(args[unsafe_offset=0].a))
-        if not is_float_stype(a.stype):
-            _refuse("softshrink_check", a.stype)
+        softshrink_check(
+            T(Int(args[unsafe_offset=0].a)), v_f64(args[unsafe_offset=1])
+        )
     elif pre == PRE_THRESHOLD:
         # threshold's iterator adds self twice (self, other): a CPU 0-d self
         # is two CPU scalars for a device out.
