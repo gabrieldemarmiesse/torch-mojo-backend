@@ -1616,6 +1616,9 @@ def _reduce_input_ok(dt: DType) -> Bool:
         or dt == DType.int32
         or dt == DType.int64
         or dt == DType.uint8
+        or dt == DType.uint16
+        or dt == DType.uint32
+        or dt == DType.uint64
     )
 
 

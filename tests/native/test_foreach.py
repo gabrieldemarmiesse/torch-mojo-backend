@@ -3264,8 +3264,10 @@ def _reduce_outcome(fn, tensors: list[torch.Tensor], ord_: float, dtype) -> str:
 
 _REDUCE_ORDS = (2, 3, -2, 0, 1, 2.5, -1, float("inf"), float("-inf"), 0.5,
                 float("nan"), 1e100, -1e100, 1e-100, -1 / 3)  # fmt: skip
-_REDUCE_INPUTS = [torch.int64, torch.int32, torch.uint8, torch.bool, torch.float16,
-                  torch.bfloat16, torch.float32]  # fmt: skip
+_REDUCE_INPUTS = [torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8,
+                  torch.uint16, torch.uint32, torch.uint64, torch.bool,
+                  torch.float16, torch.bfloat16, torch.float32,
+                  torch.float64]  # fmt: skip
 _REDUCE_DTYPES = [None, torch.int64, torch.int32, torch.bool, torch.float16,
                   torch.bfloat16, torch.float32, torch.float64, torch.complex64,
                   torch.complex128]  # fmt: skip
@@ -3433,3 +3435,46 @@ def test_mta_powsum_complex_dtype_is_its_real_dtype(
 def test_mta_norm_message_prints_integer_orders_exactly(mojo_gpu: str):
     with pytest.raises(RuntimeError, match="the -9007199254740993 norm"):
         torch._foreach_norm([torch.empty(0, device=mojo_gpu)], -9007199254740993)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
+@pytest.mark.parametrize("input_dtype", _REDUCE_INPUTS, ids=str)
+def test_mta_max_matches_stock_cuda(mojo_gpu: str, input_dtype: torch.dtype):
+    """_foreach_max of every input dtype the device holds, on and off the
+    fast route (dense / strided), against stock CUDA."""
+    if input_dtype == torch.float64 and is_metal(mojo_gpu):
+        pytest.skip("no float64 on Apple GPUs")
+
+    def outcome(tensors: list[torch.Tensor]) -> str:
+        try:
+            (r,) = torch._foreach_max(tensors)
+        except (RuntimeError, NotImplementedError) as error:
+            message = str(error).split(" [aten::")[0].split("\n")[0]
+            return f"{type(error).__name__}: {message}"
+        return f"{r.cpu().item()!r} {r.dtype}"
+
+    for n in (5, 0, 1):
+        base = torch.arange(1, 2 * n + 1).to(input_dtype)
+        for view in (lambda t: t[:n], lambda t: t[::2]):
+            stock, ours = (
+                outcome([view(base.to(device))]) for device in ("cuda", mojo_gpu)
+            )
+            assert ours == stock, n
+
+
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64], ids=str)
+def test_mta_wide_unsigned_norm_and_powsum(mojo_gpu: str, dtype: torch.dtype):
+    """Wide unsigned lists take the same slow route as the other integers:
+    cast to the result dtype, accumulated in its opmath, rounded once (the
+    values stock CUDA returns)."""
+    ones = [torch.ones(2, dtype=dtype, device=mojo_gpu)]
+    (r,) = torch._foreach_powsum(ones, 3, dtype=torch.complex64)
+    assert r.dtype == torch.float32 and r.cpu().item() == 2.0
+    x = [torch.full((1000,), 10000, dtype=dtype, device=mojo_gpu)]
+    (r,) = torch._foreach_powsum(x, -2, dtype=torch.float16)
+    assert r.cpu().item() == 1.0013580322265625e-05
+    with pytest.raises(NotImplementedError, match="not implemented for 'Long'"):
+        torch._foreach_powsum(ones, 2)
+    names = {torch.uint16: "UInt16", torch.uint32: "UInt32", torch.uint64: "UInt64"}
+    with pytest.raises(RuntimeError, match=f"Got {names[dtype]}"):
+        torch._foreach_norm(ones, 2, dtype=torch.float32)

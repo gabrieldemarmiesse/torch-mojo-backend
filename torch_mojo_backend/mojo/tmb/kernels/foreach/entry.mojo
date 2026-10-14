@@ -205,6 +205,23 @@ comptime _MAX_DTYPES = [
     DType.uint8,
 ]
 
+# A norm / powsum reads any of these (cast to the floating result dtype
+# first): every max dtype plus the wide unsigned ones, which max refuses.
+comptime _NORM_INPUT_DTYPES = [
+    DType.float32,
+    DType.float16,
+    DType.bfloat16,
+    DType.float64,
+    DType.int8,
+    DType.int16,
+    DType.int32,
+    DType.int64,
+    DType.uint8,
+    DType.uint16,
+    DType.uint32,
+    DType.uint64,
+]
+
 
 def _reduce_batches[
     dtype: DType, out_dtype: DType, norm: Int
@@ -294,7 +311,7 @@ def _reduce_go[
         # The input: any dtype (an integer or bool list reaches a norm
         # through the slow route with a floating `dtype`); the result: a
         # floating dtype.
-        comptime for dt in _MAX_DTYPES:
+        comptime for dt in _NORM_INPUT_DTYPES:
             comptime if _dtype_arg_on[0, dt]():
                 comptime for odt in _NORM_DTYPES:
                     comptime if _dtype_out_on[0, odt]():
