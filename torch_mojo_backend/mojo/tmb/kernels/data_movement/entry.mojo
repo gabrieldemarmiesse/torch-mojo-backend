@@ -761,7 +761,7 @@ comptime CAT_SEG_CAP = 64
 
 # Metal translates only pointer-TYPED kernel arguments into GPU addresses; a
 # raw address smuggled as data reads back zeros (see the header of
-# foreach_elementwise_kernels.mojo, where the same constraint is documented
+# foreach/apple_kernels.mojo, where the same constraint is documented
 # and verified). Apple therefore takes a variant with real pointer arguments,
 # and correspondingly fewer inputs per launch. `_cat_slots_kernel` and
 # `_cat_pick` write those arguments out one by one, so this count and their
@@ -960,7 +960,7 @@ def _cat_pick[
     p7: Pointer[Scalar[dtype], ImmutAnyOrigin],
 ) -> Pointer[Scalar[dtype], ImmutAnyOrigin]:
     """Select one of the pointer ARGUMENTS (copying them into an array and
-    indexing that miscompiles on Metal -- see foreach_elementwise_kernels)."""
+    indexing that miscompiles on Metal -- see foreach/apple_kernels.mojo)."""
     var selected = p0
     if slot == 1:
         selected = p1
