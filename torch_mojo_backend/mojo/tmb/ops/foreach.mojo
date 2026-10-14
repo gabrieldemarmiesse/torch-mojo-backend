@@ -32,6 +32,7 @@ from std.math import ceildiv
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    ST_FLOAT16,
     ST_INT64,
     ST_COMPLEX32,
     ST_COMPLEX64,
@@ -1599,7 +1600,7 @@ def _ord_text(ord_v: Value, p: Float64) -> String:
     an integer as itself, a double as %g with 6 digits ("-0.333333",
     "-1e+100")."""
     if ord_v.tag == TAG_SCALAR_INT or ord_v.tag == TAG_INT:
-        return String(Int(p))
+        return String(Int(ord_v.a))  # exact, not through the double
     return _format_g(p)
 
 
@@ -1667,6 +1668,15 @@ def _lp_one(
         out_stype = v_dtype_or(
             dtype_v, t.stype if t.dtype.is_floating_point() else ST_INT64
         )
+        # A complex computation dtype computes |x| ** p in its real value
+        # dtype (`toRealValueType`, measured on stock CUDA: dtype=complex64
+        # gives a float32 result).
+        if out_stype == ST_COMPLEX32:
+            out_stype = ST_FLOAT16
+        elif out_stype == ST_COMPLEX64:
+            out_stype = ST_FLOAT32
+        elif out_stype == ST_COMPLEX128:
+            out_stype = ST_FLOAT64
         if not is_float_stype(out_stype):
             if t.numel == 0 and known_stype(out_stype):
                 var zero = new_scalar(out_stype, t.device)
@@ -1697,15 +1707,17 @@ def _lp_one(
     elif root and p == -inf:
         norm = FR_LNEGINF
     var one = List[T]()
-    var dense = t.contig or is_dense(t.shape, t.strides, t.rank)
-    var tmp = own(new_like(t) if not dense else new_scalar(t.stype, t.device))
-    if dense:
+    if t.contig or is_dense(t.shape, t.strides, t.rank):
         one.append(t.copy())
-    else:
-        copy_strided_into(tmp.t, t)
-        one.append(tmp.t.copy())
+        var r = _reduce_launch(
+            one, norm, root, out_stype, p, one_element_abs=root
+        )
+        return r[0].copy()
+    var tmp = own(new_like(t))
+    copy_strided_into(tmp.t, t)
+    one.append(tmp.t.copy())
     var r = _reduce_launch(one, norm, root, out_stype, p, one_element_abs=root)
-    _ = tmp
+    _ = tmp  # alive past the launch
     return r[0].copy()
 
 
@@ -1760,6 +1772,18 @@ def op_foreach_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         return
     var result = List[Owned]()
     for t in self_list:
+        if t.on_mojo() and (
+            t.dtype == DType.uint16
+            or t.dtype == DType.uint32
+            or t.dtype == DType.uint64
+        ):
+            # The per-tensor max of CUDA's slow route has no wide unsigned
+            # kernel either.
+            unsupported(
+                '"max_all_cuda" not implemented for \''
+                + _scalar_type_name(t.dtype)
+                + "'"
+            )
         var one = List[Value](capacity=1)
         one.append(_tensor_value(t))
         var r = call_op("aten::max", "", one^, 1)

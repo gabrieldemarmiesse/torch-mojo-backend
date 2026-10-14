@@ -3267,7 +3267,8 @@ _REDUCE_ORDS = (2, 3, -2, 0, 1, 2.5, -1, float("inf"), float("-inf"), 0.5,
 _REDUCE_INPUTS = [torch.int64, torch.int32, torch.uint8, torch.bool, torch.float16,
                   torch.bfloat16, torch.float32]  # fmt: skip
 _REDUCE_DTYPES = [None, torch.int64, torch.int32, torch.bool, torch.float16,
-                  torch.bfloat16, torch.float32, torch.float64]  # fmt: skip
+                  torch.bfloat16, torch.float32, torch.float64, torch.complex64,
+                  torch.complex128]  # fmt: skip
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
@@ -3396,3 +3397,39 @@ def test_mta_reductions_on_mixed_device_lists(mojo_gpu: str):
     got = torch._foreach_add(lists, [b.to(mojo_gpu), a], alpha=2)
     assert [t.device.type for t in got] == [torch.device(mojo_gpu).type, "cpu"]
     torch.testing.assert_close(got[1], a * 2 + b)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "real"),
+    [(torch.complex64, torch.float32), (torch.complex128, torch.float64),
+     (torch.complex32, torch.float16)],
+    ids=["c64", "c128", "c32"],
+)  # fmt: skip
+def test_mta_powsum_complex_dtype_is_its_real_dtype(
+    mojo_gpu: str, dtype: torch.dtype, real: torch.dtype
+):
+    """Off the fast route (ord 1 / 2 refuse a complex `dtype` for a real
+    list), powsum computes in the complex dtype's real value dtype, as on
+    stock CUDA: `_foreach_powsum([ones(2)], 3, dtype=complex64)` is float32
+    2.0; norm refuses it (linalg.vector_norm's check)."""
+    if real == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    ones = [torch.ones(2, device=mojo_gpu)]
+    for ord_, want in ((3, 2.0), (0, 2.0), (-1, 2.0), (float("inf"), 2.0)):
+        (r,) = torch._foreach_powsum(ones, ord_, dtype=dtype)
+        assert r.dtype == real and r.cpu().item() == want
+    (r,) = torch._foreach_powsum([torch.arange(3, device=mojo_gpu)], 2, dtype=dtype)
+    assert r.dtype == real and r.cpu().item() == 5.0
+    (r,) = torch._foreach_powsum([torch.empty(0, device=mojo_gpu)], 3, dtype=dtype)
+    assert r.dtype == real and r.cpu().item() == 0.0
+    with pytest.raises(RuntimeError, match="dtype should be real for real inputs"):
+        torch._foreach_powsum(ones, 2, dtype=dtype)
+    with pytest.raises(
+        RuntimeError, match="linalg.vector_norm: dtype should be real for real inputs"
+    ):
+        torch._foreach_norm(ones, 3, dtype=dtype)
+
+
+def test_mta_norm_message_prints_integer_orders_exactly(mojo_gpu: str):
+    with pytest.raises(RuntimeError, match="the -9007199254740993 norm"):
+        torch._foreach_norm([torch.empty(0, device=mojo_gpu)], -9007199254740993)
