@@ -1229,8 +1229,9 @@ def _cuda_copy_fast_route(dsts: List[T], srcs: List[T]) -> Bool:
             return False
         if not s.on_mojo() or s.device != first.device or s.dtype != src_dtype:
             return False
-        if not is_dense(d.shape, d.strides, d.rank) or not is_dense(
-            s.shape, s.strides, s.rank
+        # An empty tensor is contiguous, hence non-overlapping and dense.
+        if (d.numel > 0 and not is_dense(d.shape, d.strides, d.rank)) or (
+            s.numel > 0 and not is_dense(s.shape, s.strides, s.rank)
         ):
             return False
         if not d.same_shape(s):

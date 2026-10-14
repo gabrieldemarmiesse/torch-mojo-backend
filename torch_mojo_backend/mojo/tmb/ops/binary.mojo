@@ -71,6 +71,7 @@ from tmb.backend.abi import (
 )
 from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
+from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     decline_float8,
@@ -181,6 +182,14 @@ def _b_promote(a: T, b: T) raises -> Int32:
     """
     if a.stype == b.stype:
         return a.stype
+    if is_float8_stype(a.stype) or is_float8_stype(b.stype):
+        # c10's rules: raises for a float8 meeting another dimensioned
+        # dtype, a 0-dim one of a lower category yields to it.
+        var f8 = result_type(a, b)
+        var other = b.copy() if is_float8_stype(a.stype) else a.copy()
+        if f8 != other.stype and not _b_castable_on(other.stype, other):
+            return Int32(-1)
+        return f8
     if not known_stype(a.stype) or not known_stype(b.stype):
         return Int32(-1)
     var r = result_type(a, b)
@@ -297,6 +306,62 @@ def _b_side_result(t: T, side: Side) raises -> Int32:
             ST_INT64 if s.is_int else default_dtype()
         )
     return combine_categories(dim, combine_categories(zero, wrapped))
+
+
+def _b_sides_result(a: Side, b: Side, c: Side) raises -> Int32:
+    """`torch.result_type` over up to three operand sides (tensor, 0-d CPU
+    tensor or Python Scalar), as TensorIterator's ResultTypeState folds."""
+    var dim = ST_UNDEFINED
+    var zero = ST_UNDEFINED
+    var wrapped = ST_UNDEFINED
+    for k in range(3):
+        var side = a.copy() if k == 0 else (b.copy() if k == 1 else c.copy())
+        if side.is_t:
+            var t = side.t.value().copy()
+            if t.rank == 0:
+                zero = promote_types(zero, t.stype)
+            else:
+                dim = promote_types(dim, t.stype)
+        elif side.zero_st >= 0:
+            zero = promote_types(zero, side.zero_st)
+        else:
+            var s = side.s.value().copy()
+            wrapped = promote_types(
+                wrapped,
+                ST_BOOL if s.is_bool else (
+                    ST_INT64 if s.is_int else default_dtype()
+                ),
+            )
+    return combine_categories(dim, combine_categories(zero, wrapped))
+
+
+def _b_any_float8(a: Side, b: Side, c: Side) -> Bool:
+    return _b_side_float8(a) or _b_side_float8(b) or _b_side_float8(c)
+
+
+def _b_side_float8(side: Side) -> Bool:
+    if side.is_t:
+        return is_float8_stype(side.t.value().stype)
+    return is_float8_stype(side.zero_st)
+
+
+def _b_shape_is(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
+    if t.rank != rank:
+        return False
+    for i in range(MAX_RANK):
+        if t.shape[i] != shape[i]:
+            return False
+    return True
+
+
+def _b_f8_refuse(kernel: StaticString, a: Side, b: Side) raises:
+    """CUDA's `<kernel>` dispatch has no float8 case: refuse when the
+    operands' result type is float8."""
+    if not _b_any_float8(a, b, b):
+        return
+    var common = _b_sides_result(a, b, b)
+    if is_float8_stype(common):
+        decline_float8(max_dtype(common), String(kernel))
 
 
 def _b_side(v: Value) raises -> Side:
@@ -902,6 +967,12 @@ def _b_op_dtype_ok(op: StaticString, st: Int32, is_cmp: Bool) raises:
                 kernel = "max_elementwise_cuda"
             elif op == "MinimumSpec":
                 kernel = "min_elementwise_cuda"
+            elif op == "BitwiseAndSpec":
+                kernel = "bitwise_and_cuda"
+            elif op == "BitwiseOrSpec":
+                kernel = "bitwise_or_cuda"
+            elif op == "BitwiseXorSpec":
+                kernel = "bitwise_xor_cuda"
             unsupported(
                 '"'
                 + kernel
@@ -1400,6 +1471,18 @@ def _b_out_guard3(dest: T, a: Side, b: Side, c: Side) raises:
                     i - (MAX_RANK - rank),
                 )
     if not read_write:
+        # A float8 computation is refused by the kernel dispatch, after
+        # TensorIterator resized `out` (compute_types' checks first).
+        if not _b_any_float8(a, b, c):
+            return
+        var common = _b_sides_result(a, b, c)
+        if (
+            is_float8_stype(common)
+            and _b_can_cast(common, dest.stype)
+            and not _b_shape_is(dest, shape, rank)
+        ):
+            var d = dest.copy()
+            resize_out(d, shape, rank)
         return
     var fits = dest.rank == rank
     for i in range(MAX_RANK):
@@ -1561,6 +1644,7 @@ def _b_sub(
     lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
 ) raises -> Res:
     """The `fast_aten_sub` cascade."""
+    _b_sub_check(lhs, rhs)
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
     if alpha == 1.0:
@@ -1576,6 +1660,58 @@ def _b_sub(
     var res = _b_sub_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
     return res^
+
+
+def _b_is_bool_side(side: Side) -> Bool:
+    if side.is_t:
+        return side.t.value().stype == ST_BOOL
+    if side.zero_st >= 0:
+        return side.zero_st == ST_BOOL
+    return side.s.value().is_bool
+
+
+def _b_sub_check(lhs: Side, rhs: Side) raises:
+    """BinaryOps.cpp's sub_check, before any dtype dispatch."""
+    var a = _b_is_bool_side(lhs)
+    var b = _b_is_bool_side(rhs)
+    if a and b:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if a or b:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+
+
+def _b_pow_float8(lhs: Side, rhs: Side) raises -> Optional[Res]:
+    """pow.Tensor_Scalar of a float8 base (Pow.cpp's pow_out): an exponent
+    of 0 / False fills ones and 1 / True copies, with no kernel; any other
+    reaches pow_cuda, which has no float8 case. None when not float8."""
+    if not lhs.is_t or rhs.is_t:
+        return None
+    var t = lhs.t.value().copy()
+    if not is_float8(t.dtype):
+        return None
+    var s = rhs.s.value().copy()
+    var e = Float64(
+        1.0 if s.is_bool
+        and s.f
+        != 0 else (0.0 if s.is_bool else (Float64(s.i) if s.is_int else s.f))
+    )
+    if e == 0.0:
+        var ones = own(new_like(t))
+        fill_value(ones.t, 1.0)
+        return Res(ones.take(), True)
+    if e == 1.0:
+        var c = own(new_like(t))
+        copy_strided_into(c.t, t)
+        return Res(c.take(), True)
+    decline_float8(t.dtype, "pow_cuda")
+    return None
 
 
 def _b_mul(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
@@ -1946,6 +2082,7 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
         unsupported("div rounding_mode " + name)
     if not lhs.is_t:
         unsupported("div with a scalar numerator")
+    _b_f8_refuse("div_true_cuda", lhs, rhs)
     var a = lhs.t.value().copy()
     var common = _b_true_div_dtype(a, rhs)
     # float64 included: DivSpec dispatches on logic SPEC_BCAST_DTYPES,
@@ -2146,6 +2283,10 @@ def op_pow_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         return
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
+    var f8 = _b_pow_float8(lhs, rhs)
+    if f8:
+        _b_ret(rets, f8.value().copy())
+        return
     var r = _b_try_scalar("PowScalarSpec", lhs, rhs, False, None)
     if r.__bool__():
         _b_ret(rets, r.value().copy())
@@ -2174,6 +2315,10 @@ def op_pow_scalar_out(
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
+    var f8 = _b_pow_float8(lhs, rhs)
+    if f8:
+        _b_store_out(rets, dest, f8.value().copy())
+        return
     var r = _b_try_scalar(
         "PowScalarSpec", lhs, rhs, False, Optional[T](dest.copy())
     )
@@ -2477,8 +2622,8 @@ def _b_clamp_dtype(self_stype: Int32, lo: Value, hi: Value) -> Int32:
     var float_bound = (not v_is_none(lo) and not _b_scalar_is_int(lo)) or (
         not v_is_none(hi) and not _b_scalar_is_int(hi)
     )
-    if _b_is_floating(self_stype):
-        return self_stype
+    if _b_is_floating(self_stype) or is_float8_stype(self_stype):
+        return self_stype  # a wrapped Scalar never promotes a float tensor
     if float_bound:
         return default_dtype()
     if self_stype == ST_BOOL and (_b_int_bound(lo) or _b_int_bound(hi)):
@@ -2519,7 +2664,8 @@ def _b_clamp(
             "torch.clamp: At least one of 'min' or 'max' must not be None"
         )
     var result_stype = _b_clamp_dtype(self.stype, lo, hi)
-    decline_float8(max_dtype(result_stype), "clamp_scalar_cuda")
+    if is_float8_stype(result_stype):
+        return _b_clamp_float8(self, lo, hi, result_stype, single_bound_op)
     if not _b_bcast_dtype(result_stype) or (
         result_stype == ST_FLOAT64 and dev(self.device)[].api == "metal"
     ):
@@ -2565,6 +2711,24 @@ def _b_clamp(
     _b_clamp_launch(out.t, src.t, lo_v, hi_v, has_min, has_max)
     _ = src
     return Res(out.take(), True)
+
+
+def _b_clamp_float8(
+    self: T, lo: Value, hi: Value, result_stype: Int32, single_bound_op: Bool
+) raises -> Res:
+    """A float8 clamp with Scalar bounds: ATen's clamp_out fills a NaN
+    bound's result with NaN without any kernel (float8 too); every other
+    bound reaches clamp_scalar_cuda, which has no float8 case."""
+    var both = not v_is_none(lo) and not v_is_none(hi)
+    var any_nan = _b_is_nan_bound(lo) or _b_is_nan_bound(hi)
+    if any_nan and (both or single_bound_op):
+        var filled = own(
+            new_tensor(self.shape, self.rank, result_stype, self.device)
+        )
+        fill_value(filled.t, nan[DType.float64]())
+        return Res(filled.take(), True)
+    decline_float8(max_dtype(result_stype), "clamp_scalar_cuda")
+    return Res(self.copy(), False)  # unreachable: float8 always declines
 
 
 def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:

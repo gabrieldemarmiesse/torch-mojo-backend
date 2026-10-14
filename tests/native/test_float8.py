@@ -1984,3 +1984,142 @@ def test_where_float8_out_names_torch_dtypes(mojo_device):
     out = torch.empty(2, dtype=torch.float8_e4m3fn, device=dev)
     with pytest.raises(RuntimeError, match="to be Float but got Float8_e4m3fn"):
         torch.where(a > 1, a, a, out=out)
+
+
+# Measured on stock CUDA (torch 2.11 / H100). A Python Scalar never promotes
+# a float8 tensor: a NaN clamp bound fills the float8 result with NaN (no
+# kernel), every other bound reaches clamp_scalar_cuda.
+@pytest.mark.parametrize(
+    "dt,nan_byte", [(torch.float8_e4m3fn, 127), (torch.float8_e8m0fnu, 255)]
+)
+def test_float8_clamp_scalar_bounds(mojo_device, dt, nan_byte):
+    dev = mojo_device
+    x = torch.tensor([1.0, 2.0]).to(dt).to(dev)
+    nan = float("nan")
+    for r in (
+        torch.clamp(x, nan, 1),
+        torch.clamp(x, 0, nan),
+        torch.clamp_min(x, nan),
+        torch.clamp_max(x, nan),
+        torch.clamp(x, nan, 1, out=torch.empty(2, dtype=dt, device=dev)),
+        x.clone().clamp_(nan, 1),
+    ):
+        assert r.dtype == dt
+        assert r.view(torch.uint8).cpu().tolist() == [nan_byte] * 2
+    for s in (float("inf"), -float("inf"), 1, 1.5, True, 0):
+        for fn in (
+            lambda: torch.clamp(x, s, 1),
+            lambda: torch.clamp_min(x, s),
+            lambda: torch.clamp_max(x, s),
+            lambda: x.clone().clamp_(s, 1),
+        ):
+            with pytest.raises(NotImplementedError, match="clamp_scalar_cuda"):
+                fn()
+
+
+def test_float8_scalar_ops_match_cuda(mojo_device):
+    dev = mojo_device
+    x = torch.tensor([1.0, 2.0]).to(torch.float8_e4m3fn).to(dev)
+    for s in (float("nan"), 1.5, 2):
+        with pytest.raises(NotImplementedError, match="div_true_cuda"):
+            x / s
+        with pytest.raises(NotImplementedError, match="bitwise_and_cuda"):
+            x & s
+    with pytest.raises(NotImplementedError, match="nan_to_num_cuda"):
+        torch.nan_to_num(x, 0.0)
+    with pytest.raises(NotImplementedError, match="mul_cuda"):
+        torch.isclose(x, x, rtol=0.0, atol=1.0)
+    assert torch.isclose(x, x, rtol=0.0, atol=0.0).cpu().tolist() == [True, True]
+    with pytest.raises(RuntimeError, match="Subtraction, the `-` operator"):
+        x - True
+    # pow: an exponent of 0 / 1 (or a base of 1) needs no kernel.
+    assert (x**0).view(torch.uint8).cpu().tolist() == [56, 56]
+    assert (x**1).view(torch.uint8).cpu().tolist() == [56, 64]
+    assert (x**True).view(torch.uint8).cpu().tolist() == [56, 64]
+    assert (1**x).view(torch.uint8).cpu().tolist() == [56, 56]
+    with pytest.raises(NotImplementedError, match="pow_cuda"):
+        x**1.5
+    with pytest.raises(NotImplementedError, match="pow_cuda"):
+        2**x
+
+
+def test_float8_promotion_errors_are_cuda_runtime_errors(mojo_device):
+    dev = mojo_device
+    i = torch.ones(2, dtype=torch.int32, device=dev)
+    for f in (torch.ones(2), torch.tensor(1.0)):
+        f8 = f.to(torch.float8_e4m3fn).to(dev)
+        with pytest.raises(RuntimeError, match="promote Int and Float8_e4m3fn"):
+            i + f8
+
+
+@pytest.mark.parametrize(
+    "fn,kernel",
+    [
+        (lambda x, o: torch.add(x, x, out=o), "ufunc_add_CUDA"),
+        (lambda x, o: torch.mul(x, x, out=o), "mul_cuda"),
+        (lambda x, o: torch.div(x, x, out=o), "div_true_cuda"),
+        (lambda x, o: torch.add(x, 1, out=o), "ufunc_add_CUDA"),
+        (lambda x, o: torch.copysign(x, x, out=o), "copysign_cuda"),
+        (lambda x, o: torch.maximum(x, x, out=o), "max_elementwise_cuda"),
+        (lambda x, o: torch.atan2(x, x, out=o), "atan2_cuda"),
+        (lambda x, o: torch.addcmul(x, x, x, out=o), "addcmul_cuda"),
+        (lambda x, o: torch.clamp(x, 0, 1, out=o), "clamp_scalar_cuda"),
+        (lambda x, o: torch.neg(x, out=o), "neg_cuda"),
+        (lambda x, o: torch.exp(x, out=o), "exp_cuda"),
+        (lambda x, o: torch.sqrt(x, out=o), "sqrt_cuda"),
+        (lambda x, o: torch.bitwise_and(x, x, out=o), "bitwise_and_cuda"),
+    ],
+    ids=[
+        "add",
+        "mul",
+        "div",
+        "add_s",
+        "copysign",
+        "maximum",
+        "atan2",
+        "addcmul",
+        "clamp",
+        "neg",
+        "exp",
+        "sqrt",
+        "bitand",
+    ],
+)
+def test_float8_out_resized_before_refusal(mojo_device, fn, kernel):
+    """TensorIterator resizes `out` before the kernel dispatch refuses."""
+    x = torch.ones(2, 3).to(torch.float8_e4m3fn).to(mojo_device)
+    out = torch.empty(0, dtype=x.dtype, device=mojo_device)
+    with pytest.raises(NotImplementedError, match=kernel):
+        fn(x, out)
+    assert out.shape == (2, 3)
+
+
+def test_float8_sum_out_resized_before_refusal(mojo_device):
+    dev = mojo_device
+    out = torch.empty(0, dtype=torch.float8_e4m3fn, device=dev)
+    with pytest.raises(NotImplementedError, match="sum_cuda"):
+        torch.sum(torch.ones(2, 3, device=dev), 0, out=out)
+    assert out.shape == (3,)
+
+
+def test_unary_out_dtype_mismatch_wording(mojo_device):
+    x = torch.ones(2, device=mojo_device)
+    for o, name in ((torch.float8_e4m3fn, "Float8_e4m3fn"), (torch.int32, "Int")):
+        out = torch.empty(2, dtype=o, device=mojo_device)
+        with pytest.raises(
+            RuntimeError, match=f"Found dtype {name} but expected Float"
+        ):
+            torch.neg(x, out=out)
+
+
+@pytest.mark.parametrize("strides", [(99, 3), (1, 0), (5, 7)])
+def test_float8_foreach_copy_empty_any_strides_refused(mojo_device, strides):
+    """An empty tensor is non-overlapping and dense whatever its strides, so
+    CUDA's foreach route (and its dtype refusal) applies."""
+    dev = mojo_device
+    s = torch.empty_strided((0, 3), strides, device=dev)
+    d = torch.empty_strided((0, 3), strides, dtype=torch.float8_e8m0fnu, device=dev)
+    v0 = d._version
+    with pytest.raises(NotImplementedError, match="foreach_tensor_copy"):
+        torch._foreach_copy_([d], [s])
+    assert d._version == v0

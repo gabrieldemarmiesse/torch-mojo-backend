@@ -947,6 +947,16 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
         return b
     if b == ST_UNDEFINED or a == b:
         return a
+    if is_float8_stype(a) or is_float8_stype(b):
+        raise Error(
+            (
+                "Promotion for Float8 Types is not supported, attempted to"
+                " promote "
+            ),
+            scalar_type_name(max_dtype(a)),
+            " and ",
+            scalar_type_name(max_dtype(b)),
+        )
     if not known_stype(a) or not known_stype(b):
         unsupported(
             "type promotion of dtypes " + String(a) + " and " + String(b)
@@ -979,7 +989,7 @@ def combine_categories(higher: Int32, lower: Int32) raises -> Int32:
     floating category there."""
     if is_float_stype(higher) or is_float8_stype(higher):
         return higher
-    if higher == ST_BOOL or is_float_stype(lower):
+    if higher == ST_BOOL or is_float_stype(lower) or is_float8_stype(lower):
         return promote_types(higher, lower)
     if higher != ST_UNDEFINED:
         return higher

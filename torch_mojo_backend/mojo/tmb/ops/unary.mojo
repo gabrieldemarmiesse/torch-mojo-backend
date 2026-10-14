@@ -107,7 +107,31 @@ def _is_bitwise_dtype(dt: DType) -> Bool:
     )
 
 
+def _f8_refuse(op: String, dt: DType) raises:
+    """CUDA's unary kernels dispatch no float8: `"<op>_cuda" not implemented
+    for '<dtype>'`, the op named from its spec (`ExpSpec` -> exp_cuda)."""
+    if is_float8(dt):
+        var name = String(op.removesuffix("Spec")).lower()
+        unsupported(
+            '"'
+            + name
+            + "_cuda\" not implemented for '"
+            + _scalar_type_name(dt)
+            + "'"
+        )
+
+
+def _f8_out_refuse(op: String, t: T, mut dst: T) raises:
+    """A float8 `out=` route: TensorIterator resizes `out` before the kernel
+    dispatch refuses."""
+    if is_float8(t.dtype):
+        if not dst.same_shape(t):
+            resize_out(dst, t.shape, t.rank)
+        _f8_refuse(op, t.dtype)
+
+
 def _require_float(op: String, dt: DType) raises:
+    _f8_refuse(op, dt)
     if not _is_float_dtype(dt):
         unsupported(
             op
@@ -129,6 +153,7 @@ def _require_float_or_f64(op: String, t: T) raises:
 
 
 def _require_direct(op: String, dt: DType) raises:
+    _f8_refuse(op, dt)
     if not _is_spec_unary_dtype(dt):
         unsupported(op + ": dtype " + String(dt) + " is not supported")
 
@@ -217,12 +242,12 @@ def _out_prologue(t_in: T, mut dst: T, result_stype: Int32) raises:
     assert_no_internal_overlap(dst)
     _no_partial_overlap(dst, t_in)
     if dst.stype != result_stype:
+        # TensorIterator's check_dtype wording (stock CUDA, every dtype).
         raise Error(
-            "Expected out tensor to have dtype ",
-            dtype_name(result_stype),
-            ", but got ",
-            dtype_name(dst.stype),
-            " instead",
+            "Found dtype ",
+            _scalar_type_name(dst.dtype),
+            " but expected ",
+            _scalar_type_name(max_dtype(result_stype)),
         )
     if not dst.same_shape(t_in):
         resize_out(dst, t_in.shape, t_in.rank)
@@ -295,6 +320,7 @@ def _float_unary(op: String, t: T) raises -> T:
 
 
 def _float_unary_out(op: String, t: T, mut dst: T) raises:
+    _f8_out_refuse(op, t, dst)
     _require_float(op, t.dtype)
     # silu is a `unary_op` structured kernel (the out dtype is self's); the
     # rest are `unary_float_op`s, which cast.
@@ -307,6 +333,7 @@ def _direct_unary(op: String, t: T) raises -> T:
 
 
 def _direct_unary_out(op: String, t: T, mut dst: T) raises:
+    _f8_out_refuse(op, t, dst)
     _require_direct(op, t.dtype)
     _unary_out("elementwise", op, t, dst, t.dtype)
 
@@ -1336,6 +1363,7 @@ def _promote(t: T) raises -> T:
 
 
 def _promoting_unary(op: String, t: T) raises -> T:
+    _f8_refuse(op, t.dtype)
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":  # the one op of these that takes float64
         return _float_or_f64_unary(op, src.t)
@@ -1344,6 +1372,7 @@ def _promoting_unary(op: String, t: T) raises -> T:
 
 def _promoting_unary_out(op: String, t: T, mut dst: T) raises:
     # Every op here is a `unary_float_op`: its result casts into `out`.
+    _f8_out_refuse(op, t, dst)
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":
         _float_or_f64_unary_out(op, src.t, dst, True)
