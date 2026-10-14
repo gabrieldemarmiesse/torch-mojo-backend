@@ -19,6 +19,7 @@ from tmb.ops.complex import (
     _TO_CX,
     _TO_RE,
     _bshape,
+    _broadcast_into,
     _category,
     _dims_of,
     _first_tensor,
@@ -47,6 +48,7 @@ from tmb.ops.complex import (
     cx_unary_out,
 )
 from tmb.ops.common import (
+    scalar_type_token,
     check_scalar_fits,
     resize_out,
     shape_str,
@@ -191,11 +193,9 @@ def _arith(
         # div_true_kernel_cuda: a CPU-scalar divisor becomes a multiply by
         # its reciprocal, computed once on the host (1 / (0 + 0i) is
         # inf + NaN i, so x / 0j is NaN, as on CUDA)
-        var inv = _host_reciprocal[DType.float32](
-            fb.re, fb.im
-        ) if st == ST_COMPLEX64 else _host_reciprocal[DType.float64](
-            fb.re, fb.im
-        )
+        # (in double, as CUDA's host-side Scalar math is, then narrowed by
+        # the kernel: 1 / 1e-40 is 1e40 -> inf, not inf + NaN i)
+        var inv = _host_reciprocal[DType.float64](fb.re, fb.im)
         fb = _Flat(CX_HOST, 0, inv[0], inv[1])
         launch_kind = "mul"
     if kind == "pow" and fb.mode == CX_HOST:
@@ -776,19 +776,7 @@ def _make(kind: StaticString, re: T, im: T, out_st: Int32) raises -> Owned:
         var t = re.copy() if k == 0 else im.copy()
         if t.on_cpu() and t.rank == 0:
             continue
-        rank = max(rank, t.rank)
-        for i in range(MAX_RANK):
-            if shape[i] == 1:
-                shape[i] = t.shape[i]
-            elif t.shape[i] != 1 and t.shape[i] != shape[i]:
-                raise Error(
-                    "The size of tensor a (",
-                    shape[i],
-                    ") must match the size of tensor b (",
-                    t.shape[i],
-                    ") at non-singleton dimension ",
-                    i - (MAX_RANK - max(re.rank, im.rank)),
-                )
+        _broadcast_into(shape, rank, t)
     var keep = List[Int]()
     var fa = _real_flat(re, shape, rank, keep)
     var fb = _real_flat(im, shape, rank, keep)
@@ -974,9 +962,28 @@ def _reduce(
         var xr = own_if_new(cast_complex(x, want), x)
         var integral = not _is_float(want)
         var r: Owned
-        if want == ST_BOOL and name == "mean":
+        if name == "mean" and _reduced_count(x, dims) == 0:
+            # an empty mean is NaN: True in bool, out of range in an integer
+            if integral and want != ST_BOOL:
+                raise Error(
+                    "value cannot be converted to type ",
+                    scalar_type_token(want),
+                    " without overflow",
+                )
+        elif want == ST_BOOL and name == "mean":
             unsupported("\"mean_cuda\" not implemented for 'Bool'")
-        if want == ST_BOOL:
+        if want == ST_BOOL and name == "mean":
+            # (the empty mean: NaN -> True everywhere)
+            var shp = _Call("aten::any", "dims")
+            shp.t(xr.t)
+            shp.ints(dims)
+            shp.b(keepdim)
+            r = shp.one()
+            var fl = _Call("aten::fill_", "Scalar")
+            fl.t(r.t)
+            fl.s(1.0)
+            _ = fl.run(1)
+        elif want == ST_BOOL:
             # a bool accumulator: x != 0 or'ed (sum's bool addition)
             var ac = _Call("aten::any", "dims")
             ac.t(xr.t)
@@ -1007,7 +1014,7 @@ def _reduce(
                 _ = cp.run(1)
                 r = narrowed^
         _ = xr^
-        if name == "mean" and integral:
+        if name == "mean" and integral and want != ST_BOOL:
             # MeanOps' factor 1/N cast to the integer accumulator: 0 unless
             # one element is reduced
             if _reduced_count(x, dims) != 1:
@@ -1135,9 +1142,44 @@ def cx_mean_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+def _mean_bool_out(
+    mut dest: T, x: T, dim_v: Value, keepdim: Bool, dtype_v: Value
+) raises:
+    """mean into a bool out of a non-empty reduction: the out is resized
+    to the result's shape, then no CUDA kernel takes bool."""
+    if v_dtype_or(dtype_v, dest.stype) != ST_BOOL or not x.is_complex():
+        return
+    var dims = _dims_of(dim_v, x.rank)
+    if _reduced_count(x, dims) == 0:
+        return
+    var shape = IndexList[MAX_RANK](1)
+    var keep = List[Int]()
+    for d in range(x.rank):
+        var reduced = False
+        for e in dims:
+            if e == d:
+                reduced = True
+        if reduced and not keepdim:
+            continue
+        keep.append(1 if reduced else x.dim(d))
+    var rank = len(keep)
+    for i in range(rank):
+        shape[MAX_RANK - rank + i] = keep[i]
+    _same_device(dest, x)
+    resize_out(dest, shape, rank)
+    unsupported("\"mean_cuda\" not implemented for 'Bool'")
+
+
 def cx_mean_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """mean.out(self, dim, keepdim, *, dtype, out)"""
     var dest = v_tensor_c(args[unsafe_offset=4])
+    _mean_bool_out(
+        dest,
+        v_tensor_c(args[unsafe_offset=0]),
+        args[unsafe_offset=1].copy(),
+        v_bool_or(args[unsafe_offset=2], False),
+        args[unsafe_offset=3].copy(),
+    )
     _store_red(
         dest,
         _reduce(
@@ -1166,6 +1208,13 @@ def cx_mean_dtype_out(
             ),
             _st_name(dest.stype),
         )
+    _mean_bool_out(
+        dest,
+        v_tensor_c(args[unsafe_offset=0]),
+        Value(TAG_NONE, 0, 0, 0),
+        False,
+        args[unsafe_offset=1].copy(),
+    )
     _store_red(
         dest,
         _reduce(
@@ -1288,6 +1337,15 @@ def cx_cumsum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """cumsum.out(self, dim, *, dtype, out): resized to self's shape first
     (set_output), then checked and written."""
     var dest = v_tensor_c(args[unsafe_offset=3])
+    var x0 = v_tensor_c(args[unsafe_offset=0])
+    if v_dtype_or(args[unsafe_offset=2], dest.stype) == ST_BOOL:
+        # the structured meta resizes the out; then no kernel takes bool
+        _same_device(dest, x0)
+        resize_out(dest, x0.shape, x0.rank)
+        if x0.numel > 0:  # (an empty scan launches nothing)
+            unsupported("\"cumsum_cuda\" not implemented for 'Bool'")
+        ret_ref(rets, 0, v_tensor_c(args[unsafe_offset=3]))
+        return
     var res = _cumsum(args, dest.stype)
     _same_device(dest, res.t)
     resize_out(dest, res.t.shape, res.t.rank)

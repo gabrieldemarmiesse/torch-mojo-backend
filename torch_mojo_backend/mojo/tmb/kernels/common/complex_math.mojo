@@ -384,7 +384,8 @@ def clog[dt: DType](z: Cx[dt]) -> Cx[dt]:
 # PyTorch's aten/src/ATen/cuda/llvm_complex.cpp (v2.11.0). Part of the LLVM
 # Project, under the Apache License v2.0 with LLVM Exceptions; see
 # THIRD_PARTY_NOTICES.txt. SPDX-License-Identifier: Apache-2.0 WITH
-# LLVM-exception
+# LLVM-exception. PyTorch's modifications: Copyright (c) 2016- Facebook,
+# Inc. and the PyTorch contributors, SPDX-License-Identifier: BSD-3-Clause
 # ---------------------------------------------------------------------------
 
 
@@ -583,6 +584,9 @@ def creciprocal[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """UnaryFractionKernels.cu's reciprocal_wrapper: NaN + NaN i for a NaN
     part or two infinite ones, 0 for one infinite part, else 1 / z (c10's
     division)."""
+    # Modified from reciprocal_wrapper, PyTorch v2.11.0
+    # aten/src/ATen/native/cuda/UnaryFractionKernels.cu (BSD-3-Clause; see
+    # THIRD_PARTY_NOTICES.txt).
     if isnan(z.re) or isnan(z.im) or (isinf(z.re) and isinf(z.im)):
         return Cx[dt](nan[dt](), nan[dt]())
     if isinf(z.re) or isinf(z.im):

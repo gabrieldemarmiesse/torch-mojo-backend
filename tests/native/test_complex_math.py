@@ -868,3 +868,47 @@ def test_third_party_notices_cover_the_ports():
     ).read_text()
     assert "SPDX-License-Identifier: BSD-2-Clause" in src
     assert "SPDX-License-Identifier: Apache-2.0 WITH" in src
+
+
+# --- round-7 review fixes ---------------------------------------------------
+
+
+def test_host_scalar_reciprocal_is_taken_in_double(mojo_gpu: str):
+    got = (torch.tensor([1 + 1j], device=mojo_gpu) / 1e-40).cpu()
+    assert got.real.item() == float("inf") and got.imag.item() == float("inf")
+
+
+def test_empty_mean_into_bool_and_integer_outs(mojo_gpu: str):
+    e = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+    out = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
+    torch.mean(e, 0, out=out)
+    assert out.item() is True  # NaN -> True
+    out3 = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
+    torch.mean(torch.empty(0, 3, dtype=torch.complex64, device=mojo_gpu), 0, out=out3)
+    assert out3.cpu().tolist() == [True] * 3
+    with pytest.raises(RuntimeError, match="value cannot be converted to type int64_t"):
+        torch.mean(e, 0, out=torch.empty(0, dtype=torch.int64, device=mojo_gpu))
+    with pytest.raises(
+        RuntimeError, match="value cannot be converted to type int without"
+    ):
+        torch.mean(e, 0, out=torch.empty(0, dtype=torch.int32, device=mojo_gpu))
+
+
+def test_bool_outs_are_resized_before_the_dtype_is_refused(mojo_gpu: str):
+    x = torch.ones(2, 3, dtype=torch.complex64, device=mojo_gpu)
+    out = torch.empty(7, dtype=torch.bool, device=mojo_gpu)
+    with pytest.raises(NotImplementedError, match="cumsum_cuda"):
+        torch.cumsum(x, 1, out=out)
+    assert out.shape == (2, 3)
+    out = torch.empty(7, dtype=torch.bool, device=mojo_gpu)
+    with pytest.raises(NotImplementedError, match="mean_cuda"):
+        torch.mean(x, 1, out=out)
+    assert out.shape == (2,)
+
+
+def test_notices_ship_with_the_package():
+    root = pathlib.Path(__file__).resolve().parents[2]
+    pyproject = (root / "pyproject.toml").read_text()
+    assert '"THIRD_PARTY_NOTICES.txt"' in pyproject
+    notices = (root / "THIRD_PARTY_NOTICES.txt").read_text()
+    assert "From PyTorch:" in notices and "Neither the names of Facebook" in notices
