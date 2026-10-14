@@ -94,6 +94,22 @@ from tmb.ops.common import (
     scalar_to_int,
 )
 from tmb.ops.core import cast_for_copy
+from tmb.ops.f8_iter import (
+    f8_iter,
+    MODE_CAST,
+    MODE_FN,
+    MODE_INPLACE,
+    MODE_NOCHECK,
+    MODE_OUTDT,
+    MODE_SAME,
+    PRE_BOOL_OUT,
+    PRE_DIV_MODE,
+    PRE_HEAVISIDE,
+    PRE_LDEXP,
+    PRE_NAN_TO_NUM,
+    PRE_NONE,
+    PRE_SUB,
+)
 from tmb.backend.registry import Site, impl
 from tmb.ops.foreach import foreach_addc_inplace, foreach_lerp_inplace
 
@@ -3247,64 +3263,354 @@ def op_lerp_scalar_(
 
 
 def register_binary(site: Site) raises:
-    impl[op_add_tensor, "add.Tensor"](site)
-    impl[op_add_, "add_.Tensor"](site)
-    impl[op_add_out, "add.out"](site)
-    impl[op_addcdiv, "addcdiv"](site)
-    impl[op_addcdiv_, "addcdiv_"](site)
-    impl[op_addcdiv_out, "addcdiv.out"](site)
-    impl[op_addcmul, "addcmul"](site)
-    impl[op_addcmul_, "addcmul_"](site)
-    impl[op_addcmul_out, "addcmul.out"](site)
+    impl[
+        f8_iter[
+            op_add_tensor, "ufunc_add_CUDA", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "add.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_add_, "ufunc_add_CUDA", 2, 0, MODE_INPLACE, False, PRE_NONE],
+        "add_.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_add_out, "ufunc_add_CUDA", 2, 3, MODE_CAST, False, PRE_NONE],
+        "add.out",
+    ](site)
+    impl[
+        f8_iter[op_addcdiv, "addcdiv_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "addcdiv",
+    ](site)
+    impl[
+        f8_iter[
+            op_addcdiv_, "addcdiv_cuda", 3, 0, MODE_INPLACE, False, PRE_NONE
+        ],
+        "addcdiv_",
+    ](site)
+    impl[
+        f8_iter[
+            op_addcdiv_out, "addcdiv_cuda", 3, 4, MODE_CAST, False, PRE_NONE
+        ],
+        "addcdiv.out",
+    ](site)
+    impl[
+        f8_iter[op_addcmul, "addcmul_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "addcmul",
+    ](site)
+    impl[
+        f8_iter[
+            op_addcmul_, "addcmul_cuda", 3, 0, MODE_INPLACE, False, PRE_NONE
+        ],
+        "addcmul_",
+    ](site)
+    impl[
+        f8_iter[
+            op_addcmul_out, "addcmul_cuda", 3, 4, MODE_CAST, False, PRE_NONE
+        ],
+        "addcmul.out",
+    ](site)
     impl[op_bitwise_and, "bitwise_and.Scalar"](site)
-    impl[op_bitwise_and, "bitwise_and.Tensor"](site)
-    impl[op_bitwise_and_out, "bitwise_and.Tensor_out"](site)
+    impl[
+        f8_iter[
+            op_bitwise_and, "bitwise_and_cuda", 2, -1, MODE_FN, True, PRE_NONE
+        ],
+        "bitwise_and.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_bitwise_and_out,
+            "bitwise_and_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            True,
+            PRE_NONE,
+        ],
+        "bitwise_and.Tensor_out",
+    ](site)
     impl[op_bitwise_and_out, "bitwise_and.Scalar_out"](site)
     impl[op_bitwise_or, "bitwise_or.Scalar"](site)
-    impl[op_bitwise_or, "bitwise_or.Tensor"](site)
-    impl[op_bitwise_or_out, "bitwise_or.Tensor_out"](site)
+    impl[
+        f8_iter[
+            op_bitwise_or, "bitwise_or_cuda", 2, -1, MODE_FN, True, PRE_NONE
+        ],
+        "bitwise_or.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_bitwise_or_out,
+            "bitwise_or_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            True,
+            PRE_NONE,
+        ],
+        "bitwise_or.Tensor_out",
+    ](site)
     impl[op_bitwise_or_out, "bitwise_or.Scalar_out"](site)
     impl[op_bitwise_xor, "bitwise_xor.Scalar"](site)
-    impl[op_bitwise_xor, "bitwise_xor.Tensor"](site)
-    impl[op_bitwise_xor_out, "bitwise_xor.Tensor_out"](site)
+    impl[
+        f8_iter[
+            op_bitwise_xor, "bitwise_xor_cuda", 2, -1, MODE_FN, True, PRE_NONE
+        ],
+        "bitwise_xor.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_bitwise_xor_out,
+            "bitwise_xor_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            True,
+            PRE_NONE,
+        ],
+        "bitwise_xor.Tensor_out",
+    ](site)
     impl[op_bitwise_xor_out, "bitwise_xor.Scalar_out"](site)
     impl[op_clamp, "clamp"](site)
     impl[op_clamp_out, "clamp.out"](site)
     impl[op_clamp_max, "clamp_max"](site)
     impl[op_clamp_max_out, "clamp_max.out"](site)
-    impl[op_clamp_max_tensor, "clamp_max.Tensor"](site)
-    impl[op_clamp_max_tensor_out, "clamp_max.Tensor_out"](site)
+    impl[
+        f8_iter[
+            op_clamp_max_tensor,
+            "min_elementwise_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "clamp_max.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_clamp_max_tensor_out,
+            "min_elementwise_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "clamp_max.Tensor_out",
+    ](site)
     impl[op_clamp_min, "clamp_min"](site)
     impl[op_clamp_min_out, "clamp_min.out"](site)
-    impl[op_clamp_min_tensor, "clamp_min.Tensor"](site)
-    impl[op_clamp_min_tensor_out, "clamp_min.Tensor_out"](site)
-    impl[op_div_tensor, "div.Tensor"](site)
-    impl[op_div_mode, "div.Tensor_mode"](site)
-    impl[op_div_out, "div.out"](site)
-    impl[op_div_out_mode, "div.out_mode"](site)
-    impl[op_floor_divide, "floor_divide"](site)
+    impl[
+        f8_iter[
+            op_clamp_min_tensor,
+            "max_elementwise_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "clamp_min.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_clamp_min_tensor_out,
+            "max_elementwise_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "clamp_min.Tensor_out",
+    ](site)
+    impl[
+        f8_iter[
+            op_div_tensor, "div_true_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "div.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_div_mode, "div_true_cuda", 2, -1, MODE_FN, False, PRE_DIV_MODE
+        ],
+        "div.Tensor_mode",
+    ](site)
+    impl[
+        f8_iter[op_div_out, "div_true_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "div.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_div_out_mode,
+            "div_true_cuda",
+            2,
+            3,
+            MODE_CAST,
+            False,
+            PRE_DIV_MODE,
+        ],
+        "div.out_mode",
+    ](site)
+    impl[
+        f8_iter[
+            op_floor_divide, "div_floor_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "floor_divide",
+    ](site)
     impl[op_floor_divide, "floor_divide.Scalar"](site)
-    impl[op_floor_divide_out, "floor_divide.out"](site)
-    impl[op_floor_divide_, "floor_divide_.Tensor"](site)
-    impl[op_logical_and, "logical_and"](site)
-    impl[op_logical_and_out, "logical_and.out"](site)
-    impl[op_logical_or, "logical_or"](site)
-    impl[op_logical_or_out, "logical_or.out"](site)
-    impl[op_logical_xor, "logical_xor"](site)
-    impl[op_logical_xor_out, "logical_xor.out"](site)
-    impl[op_maximum, "maximum"](site)
-    impl[op_maximum_out, "maximum.out"](site)
-    impl[op_minimum, "minimum"](site)
-    impl[op_minimum_out, "minimum.out"](site)
-    impl[op_mul_tensor, "mul.Tensor"](site)
-    impl[op_mul_, "mul_.Tensor"](site)
+    impl[
+        f8_iter[
+            op_floor_divide_out,
+            "div_floor_cuda",
+            2,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "floor_divide.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_floor_divide_,
+            "div_floor_cuda",
+            2,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
+        "floor_divide_.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_logical_and, "logical_and_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logical_and",
+    ](site)
+    impl[
+        f8_iter[
+            op_logical_and_out,
+            "logical_and_cuda",
+            2,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "logical_and.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_logical_or, "logical_or_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logical_or",
+    ](site)
+    impl[
+        f8_iter[
+            op_logical_or_out,
+            "logical_or_cuda",
+            2,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "logical_or.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_logical_xor, "logical_xor_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logical_xor",
+    ](site)
+    impl[
+        f8_iter[
+            op_logical_xor_out,
+            "logical_xor_cuda",
+            2,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "logical_xor.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_maximum, "max_elementwise_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "maximum",
+    ](site)
+    impl[
+        f8_iter[
+            op_maximum_out,
+            "max_elementwise_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "maximum.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_minimum, "min_elementwise_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "minimum",
+    ](site)
+    impl[
+        f8_iter[
+            op_minimum_out,
+            "min_elementwise_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "minimum.out",
+    ](site)
+    impl[
+        f8_iter[op_mul_tensor, "mul_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "mul.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_mul_, "mul_cuda", 2, 0, MODE_INPLACE, False, PRE_NONE],
+        "mul_.Tensor",
+    ](site)
     impl[op_mul_, "mul_.Scalar"](site)
-    impl[op_mul_out, "mul.out"](site)
+    impl[
+        f8_iter[op_mul_out, "mul_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "mul.out",
+    ](site)
     impl[op_remainder, "remainder.Scalar"](site)
     impl[op_remainder, "remainder.Scalar_Tensor"](site)
-    impl[op_remainder, "remainder.Tensor"](site)
+    impl[
+        f8_iter[
+            op_remainder, "remainder_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "remainder.Tensor",
+    ](site)
     impl[op_remainder_out, "remainder.Scalar_out"](site)
-    impl[op_remainder_out, "remainder.Tensor_out"](site)
-    impl[op_sub_tensor, "sub.Tensor"](site)
-    impl[op_sub_, "sub_.Tensor"](site)
-    impl[op_sub_out, "sub.out"](site)
+    impl[
+        f8_iter[
+            op_remainder_out, "remainder_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "remainder.Tensor_out",
+    ](site)
+    impl[
+        f8_iter[
+            op_sub_tensor, "ufunc_add_CUDA", 2, -1, MODE_FN, False, PRE_SUB
+        ],
+        "sub.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_sub_, "ufunc_add_CUDA", 2, 0, MODE_INPLACE, False, PRE_SUB],
+        "sub_.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_sub_out, "ufunc_add_CUDA", 2, 3, MODE_CAST, False, PRE_SUB],
+        "sub.out",
+    ](site)
