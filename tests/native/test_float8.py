@@ -2492,10 +2492,13 @@ _F8_ITER = json.loads(
     (pathlib.Path(__file__).parent / "float8_iter_cuda.json").read_text()
 )
 # Lines where the mojo device differs from stock CUDA for reasons that are
-# not float8's (each reproduces with float32 operands): a CPU 0-d operand of
-# an op whose iterator refuses CPU scalars (logaddexp, nextafter, igamma) is
-# a device mismatch on CUDA; sigmoid/tanh_backward's -0.0 where CUDA has
-# 0.0; the "aten::mul:" prefix of a decomposed backward op's cast error.
+# not float8's (each reproduces with float32 operands): CUDA's per-op
+# dispatcher device check ("got self is on cuda:0, different from other
+# tensors on cpu (when checking argument in method wrapper_CUDA_...)") for a
+# CPU operand or out of an op without CPU scalars (logaddexp, nextafter,
+# igamma, the backward ops, silu / mish / glu out=); sigmoid/tanh_backward's
+# -0.0 where CUDA has 0.0; silu's last float32 bit; relu.out's float32 copy
+# message; the "aten::mul:" prefix of a decomposed backward op's cast error.
 _KNOWN = set(_F8_ITER["known_differences"])
 
 
@@ -2899,3 +2902,161 @@ def test_float8_round11_shapes_match_stock_cuda(mojo_device):
 )
 def test_float8_round11_data_regenerates_on_stock_cuda():
     assert list(_r11_lines("cuda")) == _F8_ITER["round11"]
+
+
+def _act_res(fn, out=None):
+    try:
+        s = "OK " + _mx_enc(fn())
+    except Exception as e:  # noqa: BLE001 -- the outcome itself is compared
+        msg = str(e).split("\n")[0].split(" [aten")[0]
+        s = type(e).__name__ + " " + _dev_free(msg)[:100]
+    if out is not None:
+        s += f" | out={str(out.dtype)[6:]}{tuple(out.shape)}"
+    return s
+
+
+def _dev_free(s):
+    return s.replace("cuda:0", "DEV").replace("mojo:0", "DEV")
+
+
+def _activation_lines(dev):
+    """The forward activations (functional, out= of every dtype, in-place,
+    a CPU out=), and broadcast errors before the dispatch."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+
+    def x32():
+        return torch.tensor([-1.0, 0.0, 1.0, 2.0], device=dev)
+
+    def x8():
+        return torch.tensor([-1.0, 0.0, 1.0, 2.0]).to(f8).to(dev)
+
+    ops = {
+        "threshold": (
+            lambda x: a.threshold(x, 0.5, -2.0),
+            lambda x, o: a.threshold.out(x, 0.5, -2.0, out=o),
+            lambda x: a.threshold_(x, 0.5, -2.0),
+        ),
+        "softshrink": (
+            lambda x: a.softshrink(x, 0.5),
+            lambda x, o: a.softshrink.out(x, 0.5, out=o),
+            None,
+        ),
+        "hardshrink": (
+            lambda x: a.hardshrink(x, 0.5),
+            lambda x, o: a.hardshrink.out(x, 0.5, out=o),
+            None,
+        ),
+        "hardtanh": (a.hardtanh, lambda x, o: a.hardtanh.out(x, out=o), a.hardtanh_),
+        "elu": (a.elu, lambda x, o: a.elu.out(x, out=o), a.elu_),
+        "leaky_relu": (
+            a.leaky_relu,
+            lambda x, o: a.leaky_relu.out(x, out=o),
+            a.leaky_relu_,
+        ),
+        "gelu": (a.gelu, lambda x, o: a.gelu.out(x, out=o), a.gelu_),
+        "silu": (a.silu, lambda x, o: a.silu.out(x, out=o), a.silu_),
+        "mish": (a.mish, lambda x, o: a.mish.out(x, out=o), a.mish_),
+        "hardsigmoid": (
+            a.hardsigmoid,
+            lambda x, o: a.hardsigmoid.out(x, out=o),
+            a.hardsigmoid_,
+        ),
+        "hardswish": (
+            a.hardswish,
+            lambda x, o: a.hardswish.out(x, out=o),
+            a.hardswish_,
+        ),
+        "softplus": (a.softplus, lambda x, o: a.softplus.out(x, out=o), None),
+        "log_sigmoid": (a.log_sigmoid, lambda x, o: a.log_sigmoid.out(x, out=o), None),
+        "relu6": (a.relu6, None, a.relu6_),
+        "celu": (a.celu, None, a.celu_),
+        "selu": (a.selu, None, a.selu_),
+        "relu": (a.relu, lambda x, o: a.relu.out(x, out=o), a.relu_),
+        "glu": (a.glu, lambda x, o: a.glu.out(x, out=o), None),
+    }
+    for name, (f, fo, fi) in ops.items():
+        yield f"{name} fn f8 " + _act_res(lambda: f(x8()))
+        if fi is not None:
+            yield f"{name} inplace f8 " + _act_res(lambda: fi(x8()))
+        if fo is None:
+            continue
+        for src, mk in (("f8", x8), ("f32", x32)):
+            for odt in (f8, torch.float16, torch.float32, torch.int32):
+                o = torch.empty(0, dtype=odt, device=dev)
+                yield f"{name} out {src} {str(odt)[6:]} " + _act_res(
+                    lambda: fo(mk(), o), o
+                )
+        o = torch.empty(0, dtype=f8)
+        yield f"{name} out cpu f8 " + _act_res(lambda: fo(x8(), o), o)
+    for sa, sb in (((2,), (3,)), ((2, 3), (3, 2))):
+        for name in ("add", "mul", "lt", "maximum", "atan2"):
+            f = getattr(torch, name)
+
+            def ta():
+                return torch.ones(sa).to(f8).to(dev)
+
+            def tb():
+                return torch.ones(sb).to(f8).to(dev)
+
+            yield f"{name} bcast {sa} {sb} " + _act_res(lambda: f(ta(), tb()))
+            o = torch.empty(0, dtype=f8, device=dev)
+            yield f"{name} bcast_out {sa} {sb} " + _act_res(
+                lambda: f(ta(), tb(), out=o), o
+            )
+
+
+def _r12_lines(dev):
+    """ldexp's integral-exponent iterator, TensorIterator's device order and
+    its CPU scalars."""
+    f8, e5, a = torch.float8_e4m3fn, torch.float8_e5m2, torch.ops.aten
+
+    def run(name, fn, o=None):
+        r = _act_res(fn)
+        return f"{name} {r} {tuple(o.shape) if o is not None else ''}"
+
+    x8 = torch.ones(2).to(f8).to(dev)
+    for idt in (torch.int32, torch.int64, torch.bool):
+        e = torch.ones(2, dtype=idt, device=dev)
+        yield run(f"ldexp_f8_{idt}", lambda: torch.ldexp(x8, e))
+        for odt in (f8, torch.float32):
+            o = torch.empty(0, dtype=odt, device=dev)
+            yield run(f"ldexp_f8_{idt}_out_{odt}", lambda: torch.ldexp(x8, e, out=o), o)
+    i64 = torch.ones(2, dtype=torch.int64, device=dev)
+    yield run("ldexp_inplace_i64", lambda: x8.clone().ldexp_(i64))
+    e5v = torch.ones(2).to(e5).to(dev)
+    i32 = torch.ones(2, dtype=torch.int32, device=dev)
+    yield run("ldexp_e5_i32", lambda: torch.ldexp(e5v, i32))
+    cpu2 = torch.ones(2).to(f8)
+    for odt in (torch.int64, f8):
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield run(f"add_cpu2_dev_out_{odt}", lambda: torch.add(cpu2, x8, out=o), o)
+    o = torch.empty(0, dtype=f8)
+    yield run("add_dev_dev_out_cpu", lambda: torch.add(x8, x8, out=o), o)
+    c0 = torch.tensor(1.0).to(f8)
+    for name in ("neg", "exp"):
+        o = torch.empty(0, dtype=f8, device=dev)
+        yield run(f"{name}_cpu0d_out_dev", lambda: getattr(torch, name)(c0, out=o), o)
+    yield run("hardtanh_b_cpu0d", lambda: a.hardtanh_backward(c0, x8, -1.0, 1.0))
+    yield run("softshrink_b_cpu0d", lambda: a.softshrink_backward(c0, x8, 0.5))
+    for name in ("eq", "lt"):
+        o = torch.empty(0, dtype=torch.bool, device=dev)
+        yield run(
+            f"{name}_two_cpu0d_out", lambda: getattr(torch, name)(c0, c0, out=o), o
+        )
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield run("add_two_cpu0d_out", lambda: torch.add(c0, c0, out=o), o)
+    yield run("logaddexp_cpu0d", lambda: torch.logaddexp(x8, c0))
+    yield run("add_cpu0d", lambda: torch.add(x8, c0))
+
+
+def test_float8_round12_shapes_match_stock_cuda(mojo_device):
+    _compare(list(_activation_lines(mojo_device)), _F8_ITER["activations"])
+    _compare(list(_r12_lines(mojo_device)), _F8_ITER["round12"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_float8_round12_data_regenerates_on_stock_cuda():
+    assert list(_activation_lines("cuda")) == _F8_ITER["activations"]
+    assert list(_r12_lines("cuda")) == _F8_ITER["round12"]

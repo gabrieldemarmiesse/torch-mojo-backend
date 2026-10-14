@@ -344,6 +344,10 @@ def _operand_as(t: T, other: T, stype: Int32, saturate: Bool) raises -> Owned:
 
 
 def _check_pair_devices(a: T, b: T) raises:
+    if a.on_cpu() and b.on_cpu() and a.rank == 0 and b.rank == 0:
+        # Two CPU scalars reach the mojo kernel only through a device out=
+        # (TensorIterator allows one).
+        raise Error("Trying to pass too many CPU scalars to non-CPU kernel!")
     var a_ok = a.on_mojo() or _cpu_scalar_operand(a, b)
     var b_ok = b.on_mojo() or _cpu_scalar_operand(b, a)
     if (

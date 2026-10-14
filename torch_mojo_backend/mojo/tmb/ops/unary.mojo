@@ -68,6 +68,7 @@ from tmb.ops.common import (
 from tmb.ops.f8_iter import (
     f8_iter,
     MODE_CAST,
+    MODE_COPY_OUT,
     MODE_FN,
     MODE_INPLACE,
     MODE_NOCHECK,
@@ -3114,7 +3115,7 @@ def register_unary(site: Site) raises:
             "clamp_scalar_cuda",
             1,
             1,
-            MODE_NOCHECK,
+            MODE_COPY_OUT,
             False,
             PRE_NONE,
         ],
