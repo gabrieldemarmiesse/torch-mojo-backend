@@ -1235,6 +1235,7 @@ def _copy_e4m3fn_unsaturated(dsts: List[T], srcs: List[T]) raises:
     value becomes NaN, not copy_'s saturated 448 (sm_89+ SATFINITE)."""
     for i in range(len(dsts)):
         if dsts[i].numel == 0:
+            dsts[i].bump_version()  # CUDA's increment_version, empty too
             continue
         if dsts[i].contig:
             cast_into(dsts[i], srcs[i], False)

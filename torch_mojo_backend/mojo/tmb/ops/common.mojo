@@ -531,8 +531,13 @@ def _fill(t: T, s: FillScalar) raises:
         return
     if is_float8(t.dtype):
         # One byte, computed here the way c10 converts (through float32):
-        # a byte memset, or the strided fill of that byte as uint8.
-        var bits = f64_to_fp8_bits(t.dtype, s.f)
+        # a byte memset, or the strided fill of that byte as uint8. An
+        # integer rounds to float32 once, as `static_cast<float>(int64_t)`
+        # does (through Float64 it would round twice).
+        var f = Float64(
+            Scalar[DType.int64](s.i).cast[DType.float32]()
+        ) if s.integral else s.f
+        var bits = f64_to_fp8_bits(t.dtype, f)
         if t.contig:
             var ctx = ctx_for(t.device)
             memset_bytes(ctx, t.ptr, bits, t.numel)

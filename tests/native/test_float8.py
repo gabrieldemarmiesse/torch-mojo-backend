@@ -939,3 +939,53 @@ def test_float8_take_out_checks_before_refusal(mojo_device):
     with pytest.raises(NotImplementedError, match="take_cuda"):
         torch.take(x, torch.tensor([0, 1, 2], device=dev), out=out)
     assert out.shape == (3,)
+
+
+_N_ROUND = 3 * 2**61 - 2**38 - 1  # rounds differently via float64
+
+
+# Measured on stock CUDA (torch 2.11 / H100): an int64 scalar converts to
+# float8 through ONE int64 -> float32 rounding (c10), not through float64.
+@pytest.mark.parametrize(
+    "v,fill_byte,eq",
+    [
+        (_N_ROUND, 189, [True, False, False, False]),
+        (2**63 - 1, 190, [False, True, False, False]),
+        (2**53 + 1, 180, [False, False, False, False]),
+        (1000, 137, [False, False, True, False]),
+    ],
+)
+def test_e8m0_int_scalar_rounds_once(mojo_device, v, fill_byte, eq):
+    dev = mojo_device
+    f8 = torch.float8_e8m0fnu
+    t = torch.zeros(2).to(f8).to(dev)
+    t.fill_(v)
+    assert t.view(torch.uint8).cpu().tolist() == [fill_byte] * 2
+    t.fill_(torch.tensor(v))
+    assert t.view(torch.uint8).cpu().tolist() == [fill_byte] * 2
+    x = torch.tensor([2.0**62, 2.0**63, 1000.0, 7.0]).to(f8).to(dev)
+    assert (x == v).cpu().tolist() == eq
+    assert (x != v).cpu().tolist() == [not e for e in eq]
+
+
+def test_e5m2_compare_huge_int_scalar(mojo_device):
+    x = torch.tensor([2.0**62, 2.0**63, 1000.0, 7.0]).to(torch.float8_e5m2)
+    x = x.to(mojo_device)
+    assert (x == _N_ROUND).cpu().tolist() == [True, True, False, False]
+
+
+def test_float8_foreach_copy_empty_bumps_version(mojo_device):
+    d = torch.empty(0).to(torch.float8_e4m3fn).to(mojo_device)
+    v0 = d._version
+    torch._foreach_copy_([d], [torch.empty(0, device=mojo_device)])
+    assert d._version == v0 + 1
+
+
+def test_float8_clamp_one_tensor_bound_names_cuda_kernel(mojo_device):
+    x = torch.ones(2, 3).to(torch.float8_e4m3fn).to(mojo_device)
+    with pytest.raises(NotImplementedError, match="max_elementwise_cuda"):
+        torch.clamp(x, min=x)
+    with pytest.raises(NotImplementedError, match="min_elementwise_cuda"):
+        torch.clamp(x, max=x)
+    with pytest.raises(NotImplementedError, match="max_elementwise_cuda"):
+        torch.clamp(x, min=x, out=torch.empty_like(x))

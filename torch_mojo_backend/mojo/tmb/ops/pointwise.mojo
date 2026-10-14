@@ -1029,6 +1029,12 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
     # One bound: ATen's maximum_stub / minimum_stub over the promoted pair.
     var bound = _b_side(args[unsafe_offset=1 if has_min else 2])
     var common = _pw_result_type(a, bound, _none_side(), 2)
+    # CUDA's one-bound clamp is maximum / minimum: its float8 refusal names
+    # max_elementwise_cuda / min_elementwise_cuda.
+    if has_min:
+        _pw_no_float8("max_elementwise", common)
+    else:
+        _pw_no_float8("min_elementwise", common)
     var compute = _pw_compute_dtype("clamp", common, P_ALL, True)
     var dest = Optional[T]()
     if out_index >= 0:

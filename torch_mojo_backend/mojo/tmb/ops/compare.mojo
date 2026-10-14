@@ -402,7 +402,14 @@ def _scalar_fill(a: T, v: Value) raises -> Owned:
             raise Error(
                 "Unknown Complex ScalarType for ", _scalar_type_name(a.dtype)
             )
-        fill_value(fill.t, v_f64(v))
+        # An integer rounds to float32 once (c10's int64 -> float ->
+        # float8); through Float64 it would round twice.
+        fill_value(
+            fill.t,
+            Float64(
+                Scalar[DType.int64](v_int(v)).cast[DType.float32]()
+            ) if v_scalar_is_integral(v) else v_f64(v),
+        )
     elif (
         v_scalar_is_integral(v)
         and not a.dtype.is_floating_point()
