@@ -2144,6 +2144,12 @@ def op_fill__tensor(
     # where CUDA copies on the stream), then filled with fill_.Scalar's
     # conversion rules. Reading it first also covers a value aliasing self.
     var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+    if not t.on_mojo():
+        # a host self with a device 0-d value: its item() fills it (fill_'s
+        # own route for a 0-d value on another device)
+        _ = call_op("aten::fill_", "Scalar", [tensor_arg(t), r[0].copy()], 1)
+        ret_ref(rets, 0, t)
+        return
     if value.on_mojo() and value.device == t.device:
         # A same-device value is a `copy_`: it converts without a range
         # check, but keeps copy_'s overlap check on self.
