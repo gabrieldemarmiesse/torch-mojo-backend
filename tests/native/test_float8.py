@@ -1566,17 +1566,26 @@ def _mx_binary(name, dev):
     yield f"{name} out_internal_overlap {_mx_res(lambda: f(a8, a8, out=o), o)}"
 
 
+_F8_ITER = json.loads(
+    (pathlib.Path(__file__).parent / "float8_iter_cuda.json").read_text()
+)
+# Lines where the mojo device differs from stock CUDA for reasons that are
+# not float8's (each reproduces with float32 operands): a CPU 0-d operand of
+# an op whose iterator refuses CPU scalars (logaddexp, nextafter, igamma) is
+# a device mismatch on CUDA; sigmoid/tanh_backward's -0.0 where CUDA has
+# 0.0; the "aten::mul:" prefix of a decomposed backward op's cast error.
+_KNOWN = set(_F8_ITER["known_differences"])
+
+
+def _compare(got, want):
+    pairs = [(g, w) for g, w in zip(got, want, strict=True) if w not in _KNOWN]
+    assert [g for g, _ in pairs] == [w for _, w in pairs]
+
+
 @pytest.mark.parametrize("op", list(_F8_MATRIX))
 def test_float8_elementwise_matches_stock_cuda(mojo_device, op):
     gen = _mx_unary if op in _MATRIX_UNARY else _mx_binary
-    want = [line for line in _F8_MATRIX[op]]
-    # A CPU 0-d operand of an op whose TensorIterator refuses CPU scalars
-    # (logaddexp, nextafter, igamma) is a device mismatch on CUDA for every
-    # dtype -- a separate follow-up, not part of this matrix.
-    got = [
-        line for line in gen(op, mojo_device) if line in want or "f8_cpu0d8" not in line
-    ]
-    assert got == want
+    _compare(list(gen(op, mojo_device)), _F8_MATRIX[op])
 
 
 _R9_CUDA = [
@@ -1660,3 +1669,222 @@ def _r9_lines(dev):
 
 def test_float8_review_items_match_stock_cuda(mojo_device):
     assert list(_r9_lines(mojo_device)) == _R9_CUDA
+
+
+def _r10_res(fn, out=None, watch=()):
+    before = [_r10_enc(w) for w in watch]
+    try:
+        s = "OK " + _r10_enc(fn())
+    except Exception as e:  # noqa: BLE001 -- the outcome itself is compared
+        s = type(e).__name__ + " " + str(e).split("\n")[0].split(" [aten")[0][:100]
+    if out is not None:
+        s += f" | out={str(out.dtype)[6:]}{tuple(out.shape)}"
+    if [_r10_enc(w) for w in watch] != before:
+        s += " | MUTATED " + ",".join(_r10_enc(w) for w in watch)
+    return s
+
+
+def _r10_enc(t):
+    if isinstance(t, tuple):
+        return "(" + ",".join(_r10_enc(x) for x in t) + ")"
+    return _mx_enc(t)
+
+
+def _r10_lines(dev):
+    """Per-op dtype rules beyond TensorIterator's default (lerp,
+    log_sigmoid_backward's buffer, the backward ops, addcmul/addcdiv,
+    where, clamp with tensors) and an out= aliasing an input element."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+
+    def t(vals, dt):
+        return torch.tensor(vals).to(dt).to(dev)
+
+    k = {
+        "f8_0d": lambda: t(0.5, f8),
+        "f8": lambda: t([0.5, 1.0], f8),
+        "f32": lambda: t([1.0, 2.0], torch.float32),
+        "f32_0d": lambda: t(0.5, torch.float32),
+    }
+    mask = torch.tensor([True, False], device=dev)
+    ops3 = {
+        "lerp.Tensor": torch.lerp,
+        "addcmul": torch.addcmul,
+        "addcdiv": torch.addcdiv,
+        "clamp.Tensor": torch.clamp,
+        "where": lambda x, y, z: torch.where(mask, y, z),
+        "log_sigmoid_backward": a.log_sigmoid_backward,
+    }
+    combos3 = [
+        ("f8_0d", "f32", "f32"), ("f32", "f32", "f8_0d"), ("f32", "f8_0d", "f32"),
+        ("f8", "f32", "f32"), ("f32", "f32", "f8"), ("f8", "f8", "f8"),
+        ("f32", "f8", "f8"), ("f8_0d", "f8_0d", "f32_0d"),
+    ]  # fmt: skip
+    for name, f in ops3.items():
+        for c in combos3:
+            yield f"{name} {'/'.join(c)} " + _r10_res(lambda: f(*[k[x]() for x in c]))
+    ops2 = {
+        "lerp.Scalar": lambda x, y: torch.lerp(x, y, 0.5),
+        "sigmoid_backward": a.sigmoid_backward,
+        "tanh_backward": a.tanh_backward,
+        "gelu_backward": a.gelu_backward,
+        "silu_backward": a.silu_backward,
+        "hardsigmoid_backward": a.hardsigmoid_backward,
+        "hardswish_backward": a.hardswish_backward,
+        "mish_backward": a.mish_backward,
+        "logit_backward": a.logit_backward,
+        "threshold_backward": lambda x, y: a.threshold_backward(x, y, 0.5),
+        "hardtanh_backward": lambda x, y: a.hardtanh_backward(x, y, -1.0, 1.0),
+        "leaky_relu_backward": lambda x, y: a.leaky_relu_backward(x, y, 0.01, False),
+        "softplus_backward": lambda x, y: a.softplus_backward(x, y, 1.0, 20.0),
+        "elu_backward": lambda x, y: a.elu_backward(x, 1.0, 1.0, 1.0, False, y),
+        "clamp_min.Tensor": torch.clamp_min,
+    }
+    combos2 = [
+        ("f8_0d", "f32"), ("f32", "f8_0d"), ("f8", "f32"),
+        ("f32", "f8"), ("f8", "f8"), ("f8_0d", "f8_0d"),
+    ]  # fmt: skip
+    for name, f in ops2.items():
+        for c in combos2:
+            yield f"{name} {'/'.join(c)} " + _r10_res(lambda: f(*[k[x]() for x in c]))
+    y, w8 = t([1.0, 2.0], torch.float32), t(0.5, f8)
+    for odt in (torch.float16, torch.float32, f8):
+        o = torch.empty(0, dtype=odt, device=dev)
+        r = _r10_res(lambda: torch.lerp(y, y, w8, out=o), o)
+        yield f"lerp_w8_out {str(odt)[6:]} {r}"
+        o = torch.empty(0, dtype=odt, device=dev)
+        r = _r10_res(lambda: torch.lerp(y, y, 0.5, out=o), o)
+        yield f"lerp_s_out {str(odt)[6:]} {r}"
+        o = torch.empty(0, dtype=odt, device=dev)
+        x8 = t([1.0, 2.0], f8)
+        r = _r10_res(lambda: torch.lerp(x8, x8, 0.5, out=o), o)
+        yield f"lerp_f8f8_out {str(odt)[6:]} {r}"
+        o = torch.empty(0, dtype=odt, device=dev)
+        r = _r10_res(lambda: torch.addcmul(y, y, w8, out=o), o)
+        yield f"addcmul_0d8_out {str(odt)[6:]} {r}"
+        o = torch.empty(0, dtype=odt, device=dev)
+        b8 = t([1.0, 2.0], f8)
+        r = _r10_res(lambda: a.log_sigmoid_backward(y, y, b8, grad_input=o), o)
+        yield f"lsb_out {str(odt)[6:]} {r}"
+        o = torch.empty(0, dtype=odt, device=dev)
+        r = _r10_res(lambda: a.sigmoid_backward(y, w8, grad_input=o), o)
+        yield f"sigb_out {str(odt)[6:]} {r}"
+    for op in ("add", "mul", "maximum", "atan2", "lt", "logical_and", "copysign"):
+        for tag, other in (("alias0d", torch.float32), ("alias0d_f8f8", f8)):
+            b = t([0.5, 7.0], f8)
+            x = b[0]
+            yy = t([1.0, 2.0], other)
+            r = _r10_res(lambda: getattr(torch, op)(x, yy, out=x), x, (b,))
+            yield f"{tag} {op} {r}"
+    b = t([0.5, 7.0], f8)
+    x = b[0]
+    yield "alias0d_neg_view " + _r10_res(lambda: torch.neg(b, out=x), x, (b,))
+    b = t([0.5, 7.0, 1.0, 2.0], f8)
+    x = b[:2]
+    yield "alias_view_resize " + _r10_res(lambda: torch.add(b, b, out=x), x, (b,))
+
+
+def _backward_lines(dev):
+    """Every elementwise backward op: operand dtype pairs and out dtypes."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+    k = {
+        "f8_0d": lambda: torch.tensor(0.5).to(f8).to(dev),
+        "f8": lambda: torch.tensor([0.5, 1.0]).to(f8).to(dev),
+        "f32": lambda: torch.tensor([1.0, 2.0], device=dev),
+        "f32_0d": lambda: torch.tensor(0.5, device=dev),
+    }
+    ops = {
+        "threshold_backward": (
+            lambda x, y: a.threshold_backward(x, y, 0.5),
+            lambda x, y, o: a.threshold_backward.grad_input(x, y, 0.5, grad_input=o),
+        ),
+        "sigmoid_backward": (
+            a.sigmoid_backward,
+            lambda x, y, o: a.sigmoid_backward.grad_input(x, y, grad_input=o),
+        ),
+        "tanh_backward": (
+            a.tanh_backward,
+            lambda x, y, o: a.tanh_backward.grad_input(x, y, grad_input=o),
+        ),
+        "elu_backward": (
+            lambda x, y: a.elu_backward(x, 1.0, 1.0, 1.0, False, y),
+            lambda x, y, o: a.elu_backward.grad_input(
+                x, 1.0, 1.0, 1.0, False, y, grad_input=o
+            ),
+        ),
+        "hardtanh_backward": (
+            lambda x, y: a.hardtanh_backward(x, y, -1.0, 1.0),
+            lambda x, y, o: a.hardtanh_backward.grad_input(
+                x, y, -1.0, 1.0, grad_input=o
+            ),
+        ),
+        "leaky_relu_backward": (
+            lambda x, y: a.leaky_relu_backward(x, y, 0.01, False),
+            lambda x, y, o: a.leaky_relu_backward.grad_input(
+                x, y, 0.01, False, grad_input=o
+            ),
+        ),
+        "softplus_backward": (
+            lambda x, y: a.softplus_backward(x, y, 1.0, 20.0),
+            lambda x, y, o: a.softplus_backward.grad_input(
+                x, y, 1.0, 20.0, grad_input=o
+            ),
+        ),
+        "mish_backward": (a.mish_backward, None),
+        "hardswish_backward": (
+            a.hardswish_backward,
+            lambda x, y, o: a.hardswish_backward.out(x, y, out=o),
+        ),
+        "hardsigmoid_backward": (
+            a.hardsigmoid_backward,
+            lambda x, y, o: a.hardsigmoid_backward.grad_input(x, y, grad_input=o),
+        ),
+        "silu_backward": (
+            a.silu_backward,
+            lambda x, y, o: a.silu_backward.grad_input(x, y, grad_input=o),
+        ),
+        "gelu_backward": (
+            a.gelu_backward,
+            lambda x, y, o: a.gelu_backward.grad_input(x, y, grad_input=o),
+        ),
+        "logit_backward": (
+            a.logit_backward,
+            lambda x, y, o: a.logit_backward.grad_input(x, y, grad_input=o),
+        ),
+        "log_sigmoid_backward": (
+            lambda x, y: a.log_sigmoid_backward(x, y, y),
+            lambda x, y, o: a.log_sigmoid_backward.grad_input(x, y, y, grad_input=o),
+        ),
+    }
+    fn_combos = [
+        ("f8_0d", "f32"), ("f32", "f8_0d"), ("f8", "f32"), ("f32", "f8"),
+        ("f8", "f8"), ("f8_0d", "f8_0d"), ("f8_0d", "f32_0d"),
+    ]  # fmt: skip
+    for name, (f, fo) in ops.items():
+        for c in fn_combos:
+            r = _r10_res(lambda: f(k[c[0]](), k[c[1]]()))
+            yield f"{name} fn {'/'.join(c)} {r}"
+        if fo is None:
+            continue
+        for c in (("f8", "f8"), ("f32", "f8_0d"), ("f32", "f32")):
+            for odt in (f8, torch.float16, torch.float32, torch.int32):
+                o = torch.empty(0, dtype=odt, device=dev)
+                r = _r10_res(lambda: fo(k[c[0]](), k[c[1]](), o), o)
+                yield f"{name} out {'/'.join(c)} {str(odt)[6:]} {r}"
+
+
+def test_float8_iterator_rules_match_stock_cuda(mojo_device):
+    _compare(list(_r10_lines(mojo_device)), _F8_ITER["rules_and_aliasing"])
+    _compare(list(_backward_lines(mojo_device)), _F8_ITER["backward_ops"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_float8_cuda_data_regenerates_on_stock_cuda():
+    """The JSON files are exactly what these generators print on stock CUDA
+    (torch.cuda), so the comparisons above test against the real thing."""
+    for op, want in _F8_MATRIX.items():
+        gen = _mx_unary if op in _MATRIX_UNARY else _mx_binary
+        assert list(gen(op, "cuda")) == want
+    assert list(_r10_lines("cuda")) == _F8_ITER["rules_and_aliasing"]
+    assert list(_backward_lines("cuda")) == _F8_ITER["backward_ops"]
