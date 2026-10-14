@@ -64,6 +64,7 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.matmul import _sm90_cuda
 from tmb.ops.common import (
+    threshold_into_overlapping,
     assert_no_internal_overlap,
     assert_no_overlap,
     assert_no_partial_overlap,
@@ -156,6 +157,10 @@ def op_threshold_backward(
 def op_threshold_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    if threshold_into_overlapping(
+        "aten::threshold_backward", args, 3, args[unsafe_offset=3].copy(), rets
+    ):
+        return
     var grad = v_tensor(args[unsafe_offset=0])
     var out = v_tensor(args[unsafe_offset=3])
     var mask = _threshold_backward_mask(args)
@@ -1584,6 +1589,8 @@ def register_composed(site: Site) raises:
             MODE_FN,
             False,
             PRE_SELF_FIRST,
+            "",
+            False,
         ],
         "threshold_backward",
     ](site)
@@ -1596,6 +1603,8 @@ def register_composed(site: Site) raises:
             MODE_OUTDT,
             False,
             PRE_SELF_FIRST,
+            "",
+            False,
         ],
         "threshold_backward.grad_input",
     ](site)

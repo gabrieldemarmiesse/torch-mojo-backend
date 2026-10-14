@@ -3060,3 +3060,69 @@ def test_float8_round12_shapes_match_stock_cuda(mojo_device):
 def test_float8_round12_data_regenerates_on_stock_cuda():
     assert list(_activation_lines("cuda")) == _F8_ITER["activations"]
     assert list(_r12_lines("cuda")) == _F8_ITER["round12"]
+
+
+def _r13_lines(dev):
+    """Per-op iterator flags and pre-checks (v2.14 source): ldexp's
+    integral-exponent iterator, relu's bool check, threshold without
+    overlap checks (self added twice), softshrink_check's dispatch."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+
+    def run(name, fn, o=None):
+        return f"{name} {_act_res(fn)} | {tuple(o.shape) if o is not None else ''}"
+
+    x8 = torch.ones(2).to(f8).to(dev)
+    x1 = torch.ones(1).to(f8).to(dev)
+    i3 = torch.ones(3, dtype=torch.int32, device=dev)
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield run("ldexp_f8_i32_bcast_out", lambda: torch.ldexp(x8, i3, out=o), o)
+    yield run("ldexp_f8_i32_bcast", lambda: torch.ldexp(x8, i3))
+    yield run(
+        "ldexp_cpu_exp", lambda: torch.ldexp(x8, torch.ones(2, dtype=torch.int32))
+    )
+    yield run(
+        "ldexp_cpu0d_exp", lambda: torch.ldexp(x8, torch.tensor(1, dtype=torch.int32))
+    )
+    yield run("ldexp_inplace_bcast", lambda: x1.clone().ldexp_(i3), x1)
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield run("ldexp_out_bcast_ok", lambda: torch.ldexp(x1, i3, out=o), o)
+    b4 = torch.ones(4, dtype=torch.bool, device=dev)
+    for odt in (f8, torch.float32):
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield run(f"relu_out_bool_{odt}", lambda: a.relu.out(b4, out=o), o)
+    yield run("relu_bool", lambda: a.relu(b4))
+    ones8 = torch.ones(4).to(f8).to(dev)
+    o = torch.empty(1, dtype=torch.float32, device=dev).expand(4)
+    yield run("threshold_out_expanded", lambda: a.threshold.out(ones8, 2, -2, out=o), o)
+    o = torch.empty(1, dtype=f8, device=dev).expand(4)
+    yield run(
+        "threshold_out_expanded_f8", lambda: a.threshold.out(ones8, 2, -2, out=o), o
+    )
+    b = torch.ones(4).to(f8).to(dev)
+    yield run(
+        "threshold_out_partial", lambda: a.threshold.out(b[:2], 2, -2, out=b[1:3]), b
+    )
+    o = torch.empty(1, device=dev).expand(4)
+    yield run(
+        "threshold_b_out_expanded",
+        lambda: a.threshold_backward.grad_input(ones8, ones8, 2, grad_input=o),
+        o,
+    )
+    o = torch.empty(0, dtype=torch.float32, device=dev)
+    c0 = torch.tensor(1.0).to(f8)
+    yield run("threshold_out_cpu0d_self", lambda: a.threshold.out(c0, 2, -2, out=o), o)
+    for idt in (torch.int32, torch.bool, torch.float16):
+        o = torch.empty(0, dtype=f8, device=dev)
+        t = torch.ones(4, dtype=idt, device=dev)
+        yield run(f"softshrink_out_{idt}", lambda: a.softshrink.out(t, 0.5, out=o), o)
+
+
+def test_float8_round13_shapes_match_stock_cuda(mojo_device):
+    _compare(list(_r13_lines(mojo_device)), _F8_ITER["round13"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_float8_round13_data_regenerates_on_stock_cuda():
+    assert list(_r13_lines("cuda")) == _F8_ITER["round13"]

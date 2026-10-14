@@ -88,6 +88,7 @@ from tmb.ops.f8_iter import (
     PRE_SELF_FIRST,
     PRE_SOFTSHRINK,
     PRE_SUB,
+    PRE_THRESHOLD,
 )
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.float8 import is_float8
@@ -120,6 +121,8 @@ from tmb.ops.binary import (
     op_rsub_out,
 )
 from tmb.ops.common import (
+    threshold_into_overlapping,
+    _repeats_elements,
     can_cast,
     decline_float8,
     fill_value,
@@ -2599,6 +2602,10 @@ def op_threshold(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_threshold_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    if threshold_into_overlapping(
+        "aten::threshold", args, 3, args[unsafe_offset=3].copy(), rets
+    ):
+        return
     _pw_act(
         "threshold", args, rets, 0, -1, 3, _threshold_p(args), True, P_NUMERIC
     )
@@ -5111,7 +5118,15 @@ def register_pointwise(site: Site) raises:
     _register_special(site)
     impl[
         f8_iter[
-            op_threshold, "threshold_cuda", 1, -1, MODE_FN, False, PRE_NONE
+            op_threshold,
+            "threshold_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_THRESHOLD,
+            "",
+            False,
         ],
         "threshold",
     ](site)
@@ -5123,13 +5138,23 @@ def register_pointwise(site: Site) raises:
             3,
             MODE_OUTDT,
             False,
-            PRE_NONE,
+            PRE_THRESHOLD,
+            "",
+            False,
         ],
         "threshold.out",
     ](site)
     impl[
         f8_iter[
-            op_threshold_, "threshold_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE
+            op_threshold_,
+            "threshold_cuda",
+            1,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_THRESHOLD,
+            "",
+            False,
         ],
         "threshold_",
     ](site)

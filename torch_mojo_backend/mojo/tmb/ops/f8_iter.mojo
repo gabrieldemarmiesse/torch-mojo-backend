@@ -82,6 +82,8 @@ comptime PRE_ALL_SAME = 8  # grad_output must have self's dtype
 comptime PRE_DISPATCH_SELF = 9  # the kernel dispatches on self's dtype
 comptime PRE_SELF_FIRST = 10  # the iterator adds self (arg 1) before arg 0
 comptime PRE_SOFTSHRINK = 11  # softshrink_check dispatches on self first
+comptime PRE_RELU = 12  # relu's own check: no bool self
+comptime PRE_THRESHOLD = 13  # self is added twice (self and other)
 
 comptime _MAX_ARGS = 16
 
@@ -194,7 +196,22 @@ def _common_device(args: Values, ins: Int, o: T) raises -> String:
     return String("cpu")
 
 
-def _inputs_on_device(args: Values, ins: Int, dev: String) raises:
+def _first_device(args: Values, ins: Int) raises -> String:
+    """The first operand not on the CPU ("" when all are)."""
+    for i in range(_MAX_ARGS):
+        if (ins >> i) & 1 == 0:
+            continue
+        var v = args[unsafe_offset=i].copy()
+        if _rec_tensor(v):
+            var t = T(Int(v.a))
+            if not t.on_cpu():
+                return device_str(t)
+    return String("")
+
+
+def _inputs_on_device(
+    args: Values, ins: Int, dev: String, cpu_scalars: Bool = True
+) raises:
     """Every input on `dev`, except one CPU 0-d scalar of an op with several
     operands (TensorIterator's allow_cpu_scalars); more than one such
     scalar is refused."""
@@ -213,7 +230,7 @@ def _inputs_on_device(args: Values, ins: Int, dev: String) raises:
         var d = device_str(t)
         if d == dev:
             continue
-        if t.on_cpu() and t.rank == 0 and n_ops > 1:
+        if cpu_scalars and t.on_cpu() and t.rank == 0 and n_ops > 1:
             scalars += 1
             continue
         _device_error(dev, d)
@@ -249,6 +266,8 @@ struct _Pre(Movable):
     var ins: Int  # the operand mask after the op's own rules
     var rev: Bool  # promote the operands last to first
     var kernel: String  # "" or the kernel the op dispatches instead
+    var shape_ins: Int  # the iterator's operands: shape, overlap, devices
+    var cpu_scalars: Bool  # the iterator allows one CPU 0-d operand
 
 
 def _pre[
@@ -319,7 +338,10 @@ def _pre[
             # _ldexp_int_exponent: an integral (or bool) exponent of a
             # floating self runs ldexp_cuda's own iterator (out checked and
             # resized first), which has no float8 case.
-            return _Pre(-1, 1, False, "ldexp_cuda")
+            # Its iterator (check_all_same_dtype(false), no CPU scalars)
+            # promotes nothing: self's dtype dispatches, both operands
+            # broadcast and must share a device.
+            return _Pre(-1, 1, False, "ldexp_cuda", ins, False)
         var pdt: Int32
         if not (is_float_stype(a.stype) or is_float8_stype(a.stype)) or (
             a.dtype == DType.float32
@@ -373,8 +395,8 @@ def _pre[
                         " for `weight` but got dtype ",
                         dtype_name(wt.stype),
                     )
-                return _Pre(MODE_SAME, ins, False, "")
-        return _Pre(MODE_CAST, ins, False, "")
+                return _Pre(MODE_SAME, ins, False, "", ins, True)
+        return _Pre(MODE_CAST, ins, False, "", ins, True)
     elif pre == PRE_ALL_SAME:
         # log_sigmoid_backward: grad_output must have self's dtype (the
         # buffer is not an operand on CUDA).
@@ -400,12 +422,26 @@ def _pre[
     elif pre == PRE_SOFTSHRINK:
         # softshrink_check: an AT_DISPATCH over self's dtype, before the
         # iterator (and its out= checks) exists.
+        # AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16).
         var a = T(Int(args[unsafe_offset=0].a))
-        if is_float8_stype(a.stype):
+        if not is_float_stype(a.stype):
             _refuse("softshrink_check", a.stype)
+    elif pre == PRE_THRESHOLD:
+        # threshold's iterator adds self twice (self, other): a CPU 0-d self
+        # is two CPU scalars for a device out.
+        comptime if out_idx >= 0:
+            var a = T(Int(args[unsafe_offset=0].a))
+            var o = T(Int(args[unsafe_offset=out_idx].a))
+            if a.on_cpu() and a.rank == 0 and not o.on_cpu():
+                raise Error(
+                    "Trying to pass too many CPU scalars to non-CPU kernel!"
+                )
+    elif pre == PRE_RELU:
+        if T(Int(args[unsafe_offset=0].a)).dtype == DType.bool:
+            raise Error("Boolean inputs not supported for relu")
     elif pre == PRE_SELF_FIRST:
-        return _Pre(-1, ins, True, "")
-    return _Pre(-1, ins, False, "")
+        return _Pre(-1, ins, True, "", ins, True)
+    return _Pre(-1, ins, False, "", ins, True)
 
 
 def f8_iter[
@@ -417,6 +453,7 @@ def f8_iter[
     int_only: Bool = False,
     pre: Int = PRE_NONE,
     label: StaticString = "",
+    overlap: Bool = True,
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """`ins`: bitmask of the operand args; `out_idx`: the out= (or, inside
     `ins`, the in-place self) arg, -1 for none."""
@@ -432,7 +469,7 @@ def f8_iter[
         return
     var p = _pre[pre, ins, out_idx, label](args)
     var eff_mode = mode if p.mode < 0 else p.mode
-    var it = _shape_of(args, p.ins)
+    var it = _shape_of(args, p.shape_ins)
     var compute: Int32
     comptime if mode == MODE_COPY_OUT:
         # A composite out=: the functional result first (its dispatch
@@ -459,10 +496,11 @@ def f8_iter[
         comptime inplace = (ins >> out_idx) & 1 == 1
         # (b) memory overlap, then the shape of a read-write out: one that
         # is also an operand is never resized.
-        assert_no_internal_overlap(o)
+        comptime if overlap:
+            assert_no_internal_overlap(o)
         var read_write = inplace
         for i in range(_MAX_ARGS):
-            if (p.ins >> i) & 1 == 0:
+            if (p.shape_ins >> i) & 1 == 0:
                 continue
             comptime if inplace:
                 if i == out_idx:
@@ -473,7 +511,8 @@ def f8_iter[
                 if t.impl() == o.impl():
                     read_write = True
                 elif not t.on_cpu():
-                    assert_no_partial_overlap(o, t)
+                    comptime if overlap:
+                        assert_no_partial_overlap(o, t)
         # compute_shape: a broadcast error, then a read-write out's shape.
         if not it.shape_ok:
             raise Error(it.err)
@@ -496,7 +535,7 @@ def f8_iter[
                     " but expected ",
                     _tname(common),
                 )
-        var cdev = _common_device(args, p.ins, o)
+        var cdev = _common_device(args, p.shape_ins, o)
         if device_str(o) != cdev:
             _device_error(cdev, device_str(o))
         if eff_mode != MODE_SAME and eff_mode != MODE_NOCHECK:
@@ -507,7 +546,7 @@ def f8_iter[
                     " can't be cast to the desired output type ",
                     _tname(o.stype),
                 )
-        _inputs_on_device(args, p.ins, cdev)
+        _inputs_on_device(args, p.shape_ins, cdev, p.cpu_scalars)
         # (d)
         if (
             not read_write
@@ -520,6 +559,9 @@ def f8_iter[
         if not it.shape_ok:
             raise Error(it.err)
         compute = _common_of(args, p.ins, p.rev)
+        var fdev = _first_device(args, p.shape_ins)
+        if fdev.byte_length() > 0:
+            _inputs_on_device(args, p.shape_ins, fdev, p.cpu_scalars)
     # (e)
     var k = String(kernel) if p.kernel.byte_length() == 0 else p.kernel
     comptime if pre == PRE_DIV_MODE:
