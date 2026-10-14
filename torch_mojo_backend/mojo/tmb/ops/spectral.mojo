@@ -3,7 +3,7 @@ and _fft_c2r (and their `out=` overloads), which every `torch.fft` function
 (fft, ifft, rfft, irfft, hfft, ihfft, fft2, fftn, rfftn, irfftn, ...)
 lowers to. No cuFFT (AGENTS.md eager rule 1): the transforms are the
 kernels of tmb/kernels/fft (a mixed-radix Stockham FFT, Bluestein's chirp-z
-for lengths with a prime factor above 13, so O(n log n) for every n).
+for lengths with a prime factor above 127, so O(n log n) for every n).
 
 Semantics follow ATen's CPU kernels (aten/src/ATen/native/mkl/
 SpectralOps.cpp), the reference the conformance suite compares against:
@@ -179,10 +179,13 @@ def _upload(values: List[Float64], real_st: Int32, device: Int) raises -> Owned:
         for i in range(n):
             p[unsafe_offset=i] = Float32(values[i])
     var dev_t = own(new_tensor(shape, 1, real_st, device))
-    copy_from_host(
-        device, ctx_for(device), dev_t.t.ptr, host.t.ptr, n * dev_t.t.itemsize
-    )
-    _ = host^  # read by the (blocking) upload above
+    var ctx = ctx_for(device)
+    copy_from_host(device, ctx, dev_t.t.ptr, host.t.ptr, n * dev_t.t.itemsize)
+    # a pageable source is staged and copied in the current stream's order:
+    # finish the copy here, before the table is cached, so a later call on
+    # ANY stream reads a complete table
+    ctx.synchronize()
+    _ = host^
     return dev_t^
 
 
@@ -190,8 +193,8 @@ def _upload(values: List[Float64], real_st: Int32, device: Int) raises -> Owned:
 # (kind, length, dtype, device): they are pure functions of those, and an
 # upload is a blocking host-to-device copy. Bounded, so a sweep over many
 # lengths cannot grow it without limit (past the bound a table is uploaded
-# per call). Only host uploads are cached: they are complete when the call
-# returns, so a later call on any stream may read them. No lock of its own:
+# per call). Only host uploads are cached, each synchronized before it is
+# (`_upload`), so a later call on any stream may read them. No lock of its own:
 # every op body runs under the shim's recursive `tmb_mutex` (the boxed
 # adapter in native/csrc/shim_dispatch.cpp holds it across the Mojo call),
 # so two Python threads' FFTs reach this table one at a time.

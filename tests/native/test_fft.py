@@ -12,6 +12,10 @@ absolute error of eps * max|X|), so the bound is relative to the largest
 output -- what both cuFFT and pocketfft achieve (~2e-7 for float32).
 """
 
+import os
+import subprocess
+import sys
+import textwrap
 import threading
 
 import pytest
@@ -367,19 +371,71 @@ def test_bluestein_keeps_huge_inputs_finite(mojo_gpu: str, n: int):
     )
 
 
-def test_bluestein_tables_do_not_leak(mojo_gpu: str):
-    """A partial cache hit (the chirp cached, the padded chirp not, or the
-    reverse) must not leak the cached reference it re-uploads over."""
-    # (the reviewer's lengths: after 1,049,310 fills most of the table
-    # budget, 1,048,131's chirp still fits but its padded chirp does not)
-    big = torch.ones(1_049_310, dtype=torch.complex64, device=mojo_gpu)
+_LEAK_SCRIPT = textwrap.dedent("""
+    import torch
+    import torch_mojo_backend
+    torch_mojo_backend.register_mojo_devices()
+    dev = torch.accelerator.current_accelerator()
+    # after 1,049,310 fills most of the table budget, 1,048,131's chirp
+    # still fits but its padded chirp does not: a partial hit every call
+    big = torch.ones(1_049_310, dtype=torch.complex64, device=dev)
     torch.fft.fft(big)
     del big
-    x = torch.ones(1_048_131, dtype=torch.complex64, device=mojo_gpu)
+    x = torch.ones(1_048_131, dtype=torch.complex64, device=dev)
     torch.fft.fft(x)
     torch.accelerator.synchronize()
     before = torch.accelerator.memory_allocated()
     for _ in range(5):
         torch.fft.fft(x)
     torch.accelerator.synchronize()
-    assert torch.accelerator.memory_allocated() == before
+    after = torch.accelerator.memory_allocated()
+    assert after == before, (before, after)
+    print("no growth", flush=True)
+""")
+
+
+def test_bluestein_tables_do_not_leak(mojo_gpu: str):
+    """A partial cache hit (the chirp cached, the padded chirp not, or the
+    reverse) must not leak the cached reference it re-uploads over. Run in
+    a fresh process: the table cache is process-wide, and the partial hit
+    needs it empty at the start (any earlier test may have filled it)."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _LEAK_SCRIPT],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "no growth" in proc.stdout
+
+
+def test_cached_tables_are_complete_for_another_stream(mojo_gpu: str):
+    """A table uploaded on one stream is cached; a transform on another
+    stream right after must read it complete (the upload finishes before
+    the table is published). A fresh Bluestein length, so the first call
+    uploads its tables."""
+    n = 1_000_003  # prime: Bluestein (chirp tables) and Stockham twiddles
+    x = torch.randn(n, dtype=torch.complex64)
+    want = torch.fft.fft(x)
+    d = x.to(mojo_gpu)
+    s1 = torch.Stream(device=mojo_gpu)
+    s2 = torch.Stream(device=mojo_gpu)
+    busy = torch.randn(2048, 2048, device=mojo_gpu)
+    torch.accelerator.synchronize()
+    with s1:
+        # work queued ahead on s1, so a copy ordered on s1 lands late
+        for _ in range(20):
+            busy = busy @ busy
+            busy = busy / busy.abs().amax()
+        a = torch.fft.fft(d)
+    with s2:
+        b = torch.fft.fft(d)
+    torch.accelerator.synchronize()
+    _check(a, want)
+    _check(b, want)
