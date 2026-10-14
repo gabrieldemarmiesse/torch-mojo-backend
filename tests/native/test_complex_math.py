@@ -455,7 +455,7 @@ def test_zero_dim_reductions(mojo_gpu: str):
         d.cumsum(1)
 
 
-# --- round-3 review fixes -------------------------------------------------------
+# --- overflow, precision and argument checks ------------------------------
 
 
 def test_pow_of_a_huge_base_stays_finite(mojo_gpu: str):
@@ -589,7 +589,7 @@ def test_arithmetic_argument_checks(mojo_gpu: str):
     _close(torch.pow(True, z.to(mojo_gpu)), torch.pow(True, z))
 
 
-# --- round-4 review fixes -------------------------------------------------------
+# --- fused multiply-adds, rounding and out dtypes ----------------------------
 
 
 def _cuda_cmul64(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -675,7 +675,7 @@ def test_pow_of_one_fills_any_out(mojo_gpu: str):
         torch.pow(2, torch.tensor([1 + 2j], device=mojo_gpu), out=out)
 
 
-# --- round-5 review fixes (and the sweep against stock CUDA) --------------------
+# --- thrust's pow, Scalar conversion, real outs -----------------------------
 
 
 def test_pow_follows_thrust_log_and_exp(mojo_gpu: str):
@@ -765,17 +765,6 @@ def test_outs_of_real_results(mojo_gpu: str):
     # rsub's generated out: exact dtype, no overlap check with the inputs
     with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
         torch.ops.aten.rsub.Tensor_out(d, d, out=c128)
-    # reductions into bool / integer outs, as CUDA computes them
-    bout = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
-    torch.sum(torch.tensor([[1 + 0j], [0j]], device=mojo_gpu), 0, out=bout)
-    assert bout.cpu().tolist() == [True]
-    iout = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        torch.mean(
-            torch.tensor([[1 + 0j], [2 + 0j], [3 + 0j]], device=mojo_gpu), 0, out=iout
-        )
-    assert iout.cpu().tolist() == [0]  # MeanOps' 1/N in an integer: 0
     # a scan's expanded out is refused, a reduction's is written
     with pytest.raises(RuntimeError, match="unsupported operation"):
         torch.cumsum(
@@ -785,7 +774,7 @@ def test_outs_of_real_results(mojo_gpu: str):
         )
 
 
-# --- round-6 review fixes ---------------------------------------------------
+# --- mean dtypes, out casts, broadcast messages, notices ----------------------
 
 
 def test_mean_with_a_non_floating_dtype_raises(mojo_gpu: str):
@@ -795,28 +784,6 @@ def test_mean_with_a_non_floating_dtype_raises(mojo_gpu: str):
             z.mean(dtype=dt)
         with pytest.raises(RuntimeError, match="Optional dtype must be either"):
             z.mean(0, dtype=dt)
-
-
-def test_zero_dim_reduction_into_an_integer_out(mojo_gpu: str):
-    x = torch.tensor(3 + 4j, device=mojo_gpu)
-    for fn in (torch.mean, torch.sum):
-        out = torch.empty((), dtype=torch.int64, device=mojo_gpu)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            fn(x, 0, out=out)
-        assert out.item() == 3
-
-
-def test_narrow_integer_reductions(mojo_gpu: str):
-    z = (_rand(2, 3) * 100).to(mojo_gpu)
-    ref = z.cpu()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        for dt in (torch.int32, torch.int8):
-            assert torch.equal(z.sum(1, dtype=dt).cpu(), ref.sum(1, dtype=dt))
-        out = torch.empty(0, dtype=torch.int32, device=mojo_gpu)
-        torch.sum(z, 0, out=out)
-        assert torch.equal(out.cpu(), ref.real.to(torch.int64).sum(0).to(torch.int32))
 
 
 def test_pow_scalar_base_out_resize_and_bool_base(mojo_gpu: str):
@@ -870,40 +837,12 @@ def test_third_party_notices_cover_the_ports():
     assert "SPDX-License-Identifier: Apache-2.0 WITH" in src
 
 
-# --- round-7 review fixes ---------------------------------------------------
+# --- host-side scalar math, packaging -----------------------------------------
 
 
 def test_host_scalar_reciprocal_is_taken_in_double(mojo_gpu: str):
     got = (torch.tensor([1 + 1j], device=mojo_gpu) / 1e-40).cpu()
     assert got.real.item() == float("inf") and got.imag.item() == float("inf")
-
-
-def test_empty_mean_into_bool_and_integer_outs(mojo_gpu: str):
-    e = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
-    out = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
-    torch.mean(e, 0, out=out)
-    assert out.item() is True  # NaN -> True
-    out3 = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
-    torch.mean(torch.empty(0, 3, dtype=torch.complex64, device=mojo_gpu), 0, out=out3)
-    assert out3.cpu().tolist() == [True] * 3
-    with pytest.raises(RuntimeError, match="value cannot be converted to type int64_t"):
-        torch.mean(e, 0, out=torch.empty(0, dtype=torch.int64, device=mojo_gpu))
-    with pytest.raises(
-        RuntimeError, match="value cannot be converted to type int without"
-    ):
-        torch.mean(e, 0, out=torch.empty(0, dtype=torch.int32, device=mojo_gpu))
-
-
-def test_bool_outs_are_resized_before_the_dtype_is_refused(mojo_gpu: str):
-    x = torch.ones(2, 3, dtype=torch.complex64, device=mojo_gpu)
-    out = torch.empty(7, dtype=torch.bool, device=mojo_gpu)
-    with pytest.raises(NotImplementedError, match="cumsum_cuda"):
-        torch.cumsum(x, 1, out=out)
-    assert out.shape == (2, 3)
-    out = torch.empty(7, dtype=torch.bool, device=mojo_gpu)
-    with pytest.raises(NotImplementedError, match="mean_cuda"):
-        torch.mean(x, 1, out=out)
-    assert out.shape == (2,)
 
 
 def test_notices_ship_with_the_package():
@@ -912,3 +851,52 @@ def test_notices_ship_with_the_package():
     assert '"THIRD_PARTY_NOTICES.txt"' in pyproject
     notices = (root / "THIRD_PARTY_NOTICES.txt").read_text()
     assert "From PyTorch:" in notices and "Neither the names of Facebook" in notices
+
+
+# --- complex reductions and scans into bool / integer dtypes are declined -----
+
+
+@pytest.mark.parametrize(
+    "out_dtype", [torch.bool, torch.int64, torch.int32, torch.int8]
+)
+def test_non_floating_reduction_outs_are_declined_untouched(
+    mojo_gpu: str, out_dtype: torch.dtype
+):
+    x = torch.ones(2, 3, dtype=torch.complex64, device=mojo_gpu)
+    for call in (
+        lambda o: torch.sum(x, 1, out=o),
+        lambda o: torch.mean(x, 1, out=o),
+        lambda o: torch.cumsum(x, 1, out=o),
+        lambda o: torch.mean(
+            torch.empty(3, 0, dtype=torch.complex64, device=mojo_gpu), 0, out=o
+        ),
+        lambda o: torch.cumsum(torch.tensor(1 + 0j, device=mojo_gpu), 0, out=o),
+    ):
+        out = torch.zeros(7, dtype=out_dtype, device=mojo_gpu)
+        with pytest.raises(NotImplementedError):
+            call(out)
+        assert out.shape == (7,)  # declined before the out is touched
+    with pytest.raises(NotImplementedError):
+        x.sum(dtype=out_dtype)
+    with pytest.raises(NotImplementedError):
+        x.cumsum(0, dtype=out_dtype)
+
+
+def test_declines_come_after_cudas_own_checks(mojo_gpu: str):
+    e = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+    bout = torch.zeros(7, dtype=torch.bool, device=mojo_gpu)
+    with pytest.raises(IndexError, match="Dimension out of range"):
+        torch.cumsum(e, 9, out=bout)
+    cout = torch.zeros(5, dtype=torch.complex64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype bool"):
+        torch.cumsum(
+            torch.ones(3, dtype=torch.complex64, device=mojo_gpu),
+            0,
+            dtype=torch.bool,
+            out=cout,
+        )
+    assert cout.shape == (5,)
+    x = torch.ones(2, 3, dtype=torch.complex64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Optional dtype must be either"):
+        torch.mean(x, 1, dtype=torch.bool, out=bout)
+    assert bout.shape == (7,)

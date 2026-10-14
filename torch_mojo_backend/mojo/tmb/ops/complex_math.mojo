@@ -957,70 +957,26 @@ def _reduce(
         return r^
     var overload = String("dim_IntList") if name == "sum" else String("dim")
     if not is_complex_stype(want):
-        # a real accumulation dtype (from dtype= or the out): x's real part
-        # in it, then the real reduction IN it (a bool / int out included)
-        var xr = own_if_new(cast_complex(x, want), x)
-        var integral = not _is_float(want)
-        var r: Owned
-        if name == "mean" and _reduced_count(x, dims) == 0:
-            # an empty mean is NaN: True in bool, out of range in an integer
-            if integral and want != ST_BOOL:
-                raise Error(
-                    "value cannot be converted to type ",
-                    scalar_type_token(want),
-                    " without overflow",
-                )
-        elif want == ST_BOOL and name == "mean":
-            unsupported("\"mean_cuda\" not implemented for 'Bool'")
-        if want == ST_BOOL and name == "mean":
-            # (the empty mean: NaN -> True everywhere)
-            var shp = _Call("aten::any", "dims")
-            shp.t(xr.t)
-            shp.ints(dims)
-            shp.b(keepdim)
-            r = shp.one()
-            var fl = _Call("aten::fill_", "Scalar")
-            fl.t(r.t)
-            fl.s(1.0)
-            _ = fl.run(1)
-        elif want == ST_BOOL:
-            # a bool accumulator: x != 0 or'ed (sum's bool addition)
-            var ac = _Call("aten::any", "dims")
-            ac.t(xr.t)
-            ac.ints(dims)
-            ac.b(keepdim)
-            r = ac.one()
-        else:
-            # integers accumulate in int64 (CUDA's acc type for them), then
-            # narrow: the same bits as an int32 / int8 accumulation
-            var acc = ST_INT64 if integral else want
-            var rc = _Call(
-                String("aten::") + ("sum" if integral else name),
-                "dim_IntList" if integral else overload,
+        if not _is_float(want):
+            # a complex reduction into a bool / integer dtype or out: not
+            # emulated (declined after CUDA's own checks, before the out is
+            # touched)
+            unsupported(
+                String("complex ")
+                + name
+                + " into the non-floating dtype "
+                + dtype_name(want)
             )
-            rc.t(xr.t)
-            rc.ints(dims)
-            rc.b(keepdim)
-            rc.dtype(acc)
-            r = rc.one()
-            if acc != want:
-                var narrowed = own(
-                    new_tensor(r.t.shape, r.t.rank, want, r.t.device)
-                )
-                var cp = _Call("aten::copy_")
-                cp.t(narrowed.t)
-                cp.t(r.t)
-                cp.b(False)
-                _ = cp.run(1)
-                r = narrowed^
+        # a floating accumulation dtype (from dtype= or the out): x's real
+        # part in it, then the real reduction in it
+        var xr = own_if_new(cast_complex(x, want), x)
+        var rc = _Call(String("aten::") + name, overload)
+        rc.t(xr.t)
+        rc.ints(dims)
+        rc.b(keepdim)
+        rc.dtype(want)
+        var r = rc.one()
         _ = xr^
-        if name == "mean" and integral and want != ST_BOOL:
-            # MeanOps' factor 1/N cast to the integer accumulator: 0 unless
-            # one element is reduced
-            if _reduced_count(x, dims) != 1:
-                var z = _Call("aten::zero_")
-                z.t(r.t)
-                _ = z.run(1)
         return r^
     var real_st = real_of(want)
     if x.rank == 0:
@@ -1142,44 +1098,9 @@ def cx_mean_dim(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
-def _mean_bool_out(
-    mut dest: T, x: T, dim_v: Value, keepdim: Bool, dtype_v: Value
-) raises:
-    """mean into a bool out of a non-empty reduction: the out is resized
-    to the result's shape, then no CUDA kernel takes bool."""
-    if v_dtype_or(dtype_v, dest.stype) != ST_BOOL or not x.is_complex():
-        return
-    var dims = _dims_of(dim_v, x.rank)
-    if _reduced_count(x, dims) == 0:
-        return
-    var shape = IndexList[MAX_RANK](1)
-    var keep = List[Int]()
-    for d in range(x.rank):
-        var reduced = False
-        for e in dims:
-            if e == d:
-                reduced = True
-        if reduced and not keepdim:
-            continue
-        keep.append(1 if reduced else x.dim(d))
-    var rank = len(keep)
-    for i in range(rank):
-        shape[MAX_RANK - rank + i] = keep[i]
-    _same_device(dest, x)
-    resize_out(dest, shape, rank)
-    unsupported("\"mean_cuda\" not implemented for 'Bool'")
-
-
 def cx_mean_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """mean.out(self, dim, keepdim, *, dtype, out)"""
     var dest = v_tensor_c(args[unsafe_offset=4])
-    _mean_bool_out(
-        dest,
-        v_tensor_c(args[unsafe_offset=0]),
-        args[unsafe_offset=1].copy(),
-        v_bool_or(args[unsafe_offset=2], False),
-        args[unsafe_offset=3].copy(),
-    )
     _store_red(
         dest,
         _reduce(
@@ -1208,13 +1129,6 @@ def cx_mean_dtype_out(
             ),
             _st_name(dest.stype),
         )
-    _mean_bool_out(
-        dest,
-        v_tensor_c(args[unsafe_offset=0]),
-        Value(TAG_NONE, 0, 0, 0),
-        False,
-        args[unsafe_offset=1].copy(),
-    )
     _store_red(
         dest,
         _reduce(
@@ -1274,6 +1188,8 @@ def _cumsum(args: Values, out_st: Int32 = -1) raises -> Owned:
     warning), then the real scan."""
     var x = v_tensor_c(args[unsafe_offset=0])
     var dtype_v = args[unsafe_offset=2].copy()
+    # CUDA's order: the dim, then the out's dtype against dtype=
+    var dim = _wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
     var want = v_dtype_or(dtype_v, out_st if out_st >= 0 else x.stype)
     if out_st >= 0 and want != out_st:
         raise Error(
@@ -1283,14 +1199,18 @@ def _cumsum(args: Values, out_st: Int32 = -1) raises -> Owned:
             dtype_name(out_st),
             " instead",
         )
+    if not is_complex_stype(want) and not _is_float(want):
+        # a complex scan into a bool / integer dtype or out: not emulated
+        # (declined before the out is touched)
+        unsupported(
+            "complex cumsum into the non-floating dtype " + dtype_name(want)
+        )
     if x.rank == 0:
-        _ = _wrap_dim(Int(args[unsafe_offset=1].a), 0)
         if want != x.stype:
             return own(cast_complex(x, want))
         var copy = own(new_tensor(x.shape, 0, x.stype, x.device))
         copy_strided_into(copy.t, x)
         return copy^
-    var dim = _wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
     var xc = own_if_new(cast_complex(x, want), x)
     if not is_complex_stype(want):
         var rc = _Call("aten::cumsum")
@@ -1337,15 +1257,6 @@ def cx_cumsum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """cumsum.out(self, dim, *, dtype, out): resized to self's shape first
     (set_output), then checked and written."""
     var dest = v_tensor_c(args[unsafe_offset=3])
-    var x0 = v_tensor_c(args[unsafe_offset=0])
-    if v_dtype_or(args[unsafe_offset=2], dest.stype) == ST_BOOL:
-        # the structured meta resizes the out; then no kernel takes bool
-        _same_device(dest, x0)
-        resize_out(dest, x0.shape, x0.rank)
-        if x0.numel > 0:  # (an empty scan launches nothing)
-            unsupported("\"cumsum_cuda\" not implemented for 'Bool'")
-        ret_ref(rets, 0, v_tensor_c(args[unsafe_offset=3]))
-        return
     var res = _cumsum(args, dest.stype)
     _same_device(dest, res.t)
     resize_out(dest, res.t.shape, res.t.rank)
