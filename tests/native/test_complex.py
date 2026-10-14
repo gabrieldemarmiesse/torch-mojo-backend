@@ -1105,14 +1105,20 @@ def test_matching_bits_cancel_and_mixed_bits_decline(mojo_gpu: str):
     assert i.cpu().tolist() == [0]
 
 
-def test_non_blocking_device_to_host_converts_first(mojo_gpu: str):
-    src = torch._neg_view(torch.tensor([-128], dtype=torch.int8, device=mojo_gpu))
+def test_non_blocking_device_to_host_bit_copies(mojo_gpu: str):
+    # with a dtype change stock CUDA drops the bit (int8 [5] negated lands
+    # as [5]): declined here, before anything is written
+    src = torch._neg_view(torch.tensor([5], dtype=torch.int8, device=mojo_gpu))
     h = torch.zeros(1, dtype=torch.int64)
-    h.copy_(src, non_blocking=True)
+    with pytest.raises(NotImplementedError, match="non-blocking"):
+        h.copy_(src, non_blocking=True)
+    assert h.tolist() == [0]
+    h.copy_(src)  # blocking: resolved in the source dtype
+    assert h.tolist() == [-5]
+    same = torch.zeros(1, dtype=torch.int8)
+    same.copy_(src, non_blocking=True)
     torch.accelerator.synchronize()
-    assert h.tolist() == [128]
-    h.copy_(src)
-    assert h.tolist() == [-128]
+    assert same.tolist() == [-5]
 
 
 def test_unsigned_fill_ranges(mojo_gpu: str):
@@ -1139,3 +1145,43 @@ def test_complex_scalar_fill_of_a_real_tensor(mojo_gpu: str):
     ).cpu().tolist() == [True, True]
     with pytest.raises(RuntimeError, match="value cannot be converted to type float"):
         torch.zeros(3, device=mojo_gpu).fill_(1 + 1j)
+
+
+# --- device checks of the multi-tensor complex ops ------------------------------
+
+
+def test_masked_fill_device_checks(mojo_gpu: str):
+    x = torch.tensor([1 + 1j, 2j, 3 + 0j])
+    m = torch.tensor([True, False, True], device=mojo_gpu)
+    for fn in (
+        lambda: x.masked_fill(m, 5j),
+        lambda: x.clone().masked_fill_(m, 5j),
+        lambda: x[:0].masked_fill(m[:0], 5j),
+    ):
+        with pytest.raises(
+            RuntimeError, match="expected self and mask to be on the same device"
+        ):
+            fn()
+    with pytest.raises(RuntimeError, match="Expected inputs to be on same device"):
+        x.masked_fill(m, torch.tensor(5j, device=mojo_gpu))
+
+
+def test_cpu_tensor_with_device_operands(mojo_gpu: str):
+    x = torch.tensor([1 + 1j, 2j, 3 + 0j])
+    with pytest.raises(RuntimeError, match="indices should be either on cpu"):
+        x[torch.tensor([0, 2], device=mojo_gpu)]
+    y = x.clone()
+    y.fill_(torch.tensor(1j, device=mojo_gpu))  # a 0-d device value: its item()
+    assert y.tolist() == [1j, 1j, 1j]
+
+
+def test_fill_from_a_host_tensor_value_is_checked(mojo_gpu: str):
+    # one fill_.Tensor implementation, with fill_.Scalar's checked conversion
+    t = torch.zeros(3, dtype=torch.uint16, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="uint16_t"):
+        t.fill_(torch.tensor(-1.0, dtype=torch.float64))
+    assert t.cpu().tolist() == [0, 0, 0]
+    with pytest.raises(RuntimeError, match="int8_t"):
+        torch.zeros(2, dtype=torch.int8, device=mojo_gpu).fill_(torch.tensor(300))
+    t.fill_(torch.tensor(7.0))
+    assert t.cpu().tolist() == [7, 7, 7]

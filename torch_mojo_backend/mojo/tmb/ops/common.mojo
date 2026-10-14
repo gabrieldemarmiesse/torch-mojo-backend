@@ -10,6 +10,9 @@ from std.utils import IndexList
 from tmb.backend.abi import (
     ST_BFLOAT16,
     TAG_BOOL,
+    TAG_COMPLEX,
+    TAG_DOUBLE,
+    TAG_SCALAR_DOUBLE,
     TAG_INT,
     TAG_SCALAR_BOOL,
     TAG_SCALAR_INT,
@@ -1431,6 +1434,21 @@ def check_real_scalar_fits(st: Int32, v: Value) raises:
             scalar_type_token(st),
             " without overflow",
         )
+
+
+def check_uint64_fill(st: Int32, v: Value, numel: Int) raises:
+    """uint64 past int64's range from a double Scalar: the fill kernels
+    convert through int64, so it is declined rather than written wrong."""
+    if st != ST_UINT64 or numel == 0:
+        return
+    if (
+        v.tag == TAG_SCALAR_DOUBLE
+        or v.tag == TAG_DOUBLE
+        or v.tag == TAG_COMPLEX
+    ):
+        var c = v_complex(v)
+        if c[0] >= 9223372036854775808.0:
+            unsupported("a uint64 fill_ value of 2**63 or more")
 
 
 def check_scalar_fits(st: Int32, re: Float64, im: Float64) raises:

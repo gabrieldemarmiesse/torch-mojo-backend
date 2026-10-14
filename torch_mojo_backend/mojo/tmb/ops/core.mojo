@@ -110,6 +110,7 @@ from tmb.backend.device import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    check_uint64_fill,
     is_float_stype,
     check_real_scalar_fits,
     check_scalar_fits,
@@ -622,10 +623,19 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
             input.on_mojo()
             and dst.on_cpu()
             and (s_conj or s_neg)
-            and not non_blocking
+            and non_blocking
+            and input.stype != dst.stype
         ):
-            # device -> host, blocking (non-blocking converts on the device
-            # first, below): CUDA resolves the bits in the SOURCE dtype
+            # Stock CUDA's non-blocking device -> host copy with a math bit
+            # and a dtype change converts on the GPU and drops the bit
+            # (measured: _neg_view(int8 [5]) into a host int64 gives [5]); a
+            # wrong value is not replicated: declined, before any write.
+            unsupported(
+                "a non-blocking device-to-host copy of a conj / neg view with"
+                " a dtype change (copy blocking, or resolve the view first)"
+            )
+        if input.on_mojo() and dst.on_cpu() and (s_conj or s_neg):
+            # device -> host: CUDA resolves the bits in the SOURCE dtype
             # (uint8 -255 wraps to 1), then converts on the host
             var rawd = own_borrowed(input)
             if s_conj:
@@ -1012,7 +1022,7 @@ def op_fill_scalar_(
     # checked first, as CUDA's fill_ (value.to<scalar_t>()).
     var v = args[unsafe_offset=1].copy()
     check_real_scalar_fits(t.stype, v)
-    _check_uint64_fill(t.stype, v, t.numel)
+    check_uint64_fill(t.stype, v, t.numel)
     if v.tag == TAG_COMPLEX:
         # a complex Scalar that fits: its real part (bool: either part)
         var c = v_complex(v)
@@ -1025,72 +1035,7 @@ def op_fill_scalar_(
     ret_ref(rets, 0, t)
 
 
-def _check_uint64_fill(st: Int32, v: Value, numel: Int) raises:
-    """uint64 past int64's range from a double Scalar: the fill kernels
-    convert through int64, so it is declined rather than written wrong."""
-    if st != ST_UINT64 or numel == 0:
-        return
-    if (
-        v.tag == TAG_SCALAR_DOUBLE
-        or v.tag == TAG_DOUBLE
-        or v.tag == TAG_COMPLEX
-    ):
-        var c = v_complex(v)
-        if c[0] >= 9223372036854775808.0:
-            unsupported("a uint64 fill_ value of 2**63 or more")
-
-
 # aten::fill_.Tensor(Tensor(a!) self, Tensor value) -> Tensor(a!)
-def op_fill_tensor_(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    """`fill_` with a 0-d tensor value: a host value fills as its Scalar
-    (CUDA's `value.item()` route); a device value is broadcast and copied,
-    converting to self's dtype like `copy_`."""
-    var t = v_tensor_c(args[unsafe_offset=0])
-    var value = v_tensor_c(args[unsafe_offset=1])
-    if value.rank != 0:
-        raise Error(
-            "fill_ only supports 0-dimension value tensor but got tensor with ",
-            value.rank,
-            " dimensions.",
-        )
-    if t.numel == 0 and value.on_mojo():
-        ret_ref(rets, 0, t)
-        return
-    if not value.on_mojo():
-        var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
-        # value.item() converted checked, even for an empty self
-        if t.is_complex():
-            var c = v_complex(r[0])
-            check_scalar_fits(t.stype, c[0], c[1])
-        else:
-            check_real_scalar_fits(t.stype, r[0])
-            _check_uint64_fill(t.stype, r[0], t.numel)
-        if t.numel == 0:
-            ret_ref(rets, 0, t)
-            return
-        if t.is_complex():
-            fill_complex(t, r[0])
-        else:
-            fill_value(t, r[0])
-        ret_ref(rets, 0, t)
-        return
-    var expanded = own(
-        view_strided(
-            value, t.shape, IndexList[MAX_RANK](0), t.rank, value.offset
-        )
-    )
-    _ = call_op(
-        "aten::copy_",
-        "",
-        [tensor_arg(t), tensor_arg(expanded.t), bool_arg(False)],
-        1,
-    )
-    _ = expanded^  # alive past the copy
-    ret_ref(rets, 0, t)
-
-
 # aten::zero_(Tensor(a!) self) -> Tensor(a!)
 def op_zero_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor_c(args[unsafe_offset=0])
@@ -1166,6 +1111,5 @@ def register_core(site: Site) raises:
     _aten_view(site, "view_as_complex")
     impl[op_local_scalar_dense, "_local_scalar_dense"](site)
     impl[op_fill_scalar_, "fill_.Scalar"](site)
-    impl[op_fill_tensor_, "fill_.Tensor"](site)
     impl[op_zero_, "zero_"](site)
     impl[op_record_stream, "record_stream"](site)

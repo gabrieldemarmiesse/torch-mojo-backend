@@ -93,6 +93,7 @@ from tmb.backend.abi import (
     view_strided,
     IntList,
 )
+from tmb.backend.device import current_device
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
@@ -700,8 +701,24 @@ def _first_tensor(a: Value, b: Value) raises -> T:
         var t = v_tensor_c(b)
         if t.on_mojo():
             return t^
-    unsupported("a complex op with no mojo tensor operand")
-    return v_tensor_c(a)
+    # no operand on the device (the out is, or the op would not be here):
+    # TensorIterator's device errors
+    var all_scalars = True
+    for k in range(2):
+        var v = a.copy() if k == 0 else b.copy()
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            if v_tensor_c(v).rank != 0:
+                all_scalars = False
+    if all_scalars:
+        raise Error("Trying to pass too many CPU scalars to non-CPU kernel!")
+    raise Error(
+        (
+            "Expected all tensors to be on the same device, but found at least"
+            " two devices, mojo:"
+        ),
+        current_device(),
+        " and cpu!",
+    )
 
 
 def _result_type(a: _Operand, b: _Operand) raises -> Int32:
@@ -1258,6 +1275,15 @@ def _opt_indices_arg(
 def cx_index(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """index.Tensor(self, Tensor?[] indices)"""
     var x = v_tensor_c(args[unsafe_offset=0])
+    if not x.on_mojo():
+        raise Error(
+            (
+                "indices should be either on cpu or on the same device as the"
+                " indexed tensor ("
+            ),
+            device_str(x),
+            ")",
+        )
     _check_index_count(x, args[unsafe_offset=1])
     var keep = List[Owned]()
     var rv = as_real(x)
@@ -1818,6 +1844,18 @@ def cx_fill_tensor_(
     value read once on the host, as the real route does."""
     var t = v_tensor_c(args[unsafe_offset=0])
     var value = v_tensor_c(args[unsafe_offset=1])
+    if not t.on_mojo() and value.on_mojo() and value.rank == 0:
+        # a host self, a device 0-d value: its item() fills it (fill_'s own
+        # route for a 0-d value on another device)
+        var it = _Call("aten::_local_scalar_dense")
+        it.t(value)
+        var rv = it.run(1)
+        var f = _Call("aten::fill_", "Scalar")
+        f.t(t)
+        f.v(rv[0])
+        _ = f.run(1)
+        ret_ref(rets, 0, t)
+        return
     if value.on_mojo():
         assert_no_internal_overlap(t)  # a device value is copy_'d in
     if value.rank != 0:
@@ -2150,9 +2188,25 @@ def _masked_fill_into(target: T, mask: Value, value: Value) raises:
 
 
 def _check_bool_mask(args: Values) raises:
-    """masked_fill's mask check, before anything else (a complex mask would
-    otherwise route this op back to itself)."""
+    """masked_fill's checks, before anything else: a device value only on
+    self's device, the mask on self's device, a bool mask (a complex mask
+    would otherwise route this op back to itself)."""
+    var x = v_tensor_c(args[unsafe_offset=0])
     var mask = v_tensor_c(args[unsafe_offset=1])
+    var val = args[unsafe_offset=2].copy()
+    if val.tag == TAG_TENSOR or val.tag == TAG_TENSOR_REF:
+        var vt = v_tensor_c(val)
+        if not vt.on_cpu() and (
+            not x.on_mojo() or not vt.on_mojo() or vt.device != x.device
+        ):
+            raise Error("masked_fill_: Expected inputs to be on same device")
+    if not x.on_mojo() or not mask.on_mojo() or mask.device != x.device:
+        raise Error(
+            "expected self and mask to be on the same device, but got mask on ",
+            device_str(mask),
+            " and self on ",
+            device_str(x),
+        )
     if mask.stype != ST_BOOL:
         raise Error(
             "masked_fill only supports boolean masks, but got dtype ",
