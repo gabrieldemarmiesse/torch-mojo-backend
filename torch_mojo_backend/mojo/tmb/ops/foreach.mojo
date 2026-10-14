@@ -1527,13 +1527,80 @@ def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
     ret_tensor_list(rets, 0, out)
 
 
+def _digits(var n: Int) -> String:
+    """The decimal digits of n >= 0."""
+    if n == 0:
+        return "0"
+    var out = String()
+    while n > 0:
+        out = String(chr(48 + n % 10)) + out
+        n //= 10
+    return out^
+
+
+def _format_g(x: Float64) -> String:
+    """`std::ostream << double` with the default precision: printf's %g
+    with 6 significant digits, how c10::Scalar prints a double."""
+    if x != x:
+        return "nan"
+    if x == Float64.MAX * 2:
+        return "inf"
+    if x == -Float64.MAX * 2:
+        return "-inf"
+    if x == 0:
+        return "-0" if String(x).startswith("-") else "0"
+    var sign = String("-") if x < 0 else String()
+    var a = abs(x)
+    # The decimal exponent of the value rounded to 6 significant digits.
+    var e = 0
+    var m = a
+    while m >= 10:
+        m /= 10
+        e += 1
+    while m < 1:
+        m *= 10
+        e -= 1
+    var digits = Int(m * 100000 + 0.5)  # 6 significant digits
+    if digits >= 1000000:
+        digits //= 10
+        e += 1
+    var text = _digits(digits)  # d.ddddd without the point
+    if e < -4 or e >= 6:
+        var mant = String(text[byte=0:1])
+        var frac = String(text[byte=1:])
+        while frac.byte_length() > 0 and frac.endswith("0"):
+            var shorter = String(frac[byte = 0 : frac.byte_length() - 1])
+            frac = shorter^
+        if frac.byte_length() > 0:
+            mant += "." + frac
+        var ee = abs(e)
+        var es = _digits(ee)
+        if ee < 10:
+            es = "0" + es
+        return sign + mant + "e" + ("-" if e < 0 else "+") + es
+    var int_part: String
+    var frac_part: String
+    if e >= 0:
+        int_part = String(text[byte = 0 : e + 1])
+        frac_part = String(text[byte = e + 1 :])
+    else:
+        int_part = "0"
+        frac_part = "0" * (-e - 1) + text
+    while frac_part.byte_length() > 0 and frac_part.endswith("0"):
+        var shorter = String(frac_part[byte = 0 : frac_part.byte_length() - 1])
+        frac_part = shorter^
+    if frac_part.byte_length() > 0:
+        return sign + int_part + "." + frac_part
+    return sign + int_part
+
+
 def _ord_text(ord_v: Value, p: Float64) -> String:
-    """The order as c10::Scalar prints it in linalg.vector_norm's messages."""
+    """The order as c10::Scalar prints it in linalg.vector_norm's messages:
+    an integer as itself, a double as %g with 6 digits ("-0.333333",
+    "-1e+100")."""
     if ord_v.tag == TAG_SCALAR_INT or ord_v.tag == TAG_INT:
         return String(Int(p))
-    if p == Float64(Int(p)):
-        return String(Int(p))
-    return String(p)
+    return _format_g(p)
 
 
 def _reduce_input_ok(dt: DType) -> Bool:
@@ -1560,6 +1627,17 @@ def _lp_one(
     CUDA: the elements converted to the result dtype, then accumulated in
     its opmath (float32 for the half types) and rounded once."""
     var inf = Float64.MAX * 2
+    if not t.on_mojo():
+        # A list may mix devices (CUDA's fast route then declines): a
+        # tensor elsewhere is that device's own per-tensor reduction.
+        return _seq_vector_norm(
+            String(
+                "aten::linalg_vector_norm" if root else "aten::linalg__powsum"
+            ),
+            t,
+            ord_v,
+            dtype_v,
+        )
     var out_stype: Int32
     if root:
         if not t.dtype.is_floating_point():
@@ -1652,10 +1730,27 @@ def op_foreach_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         raise Error("Tensor list must have at least one tensor.")
     for t in self_list:
         if t.numel == 0:
+            # Stock CUDA (torch 2.11) takes a list with an empty tensor to
+            # the per-tensor max, which refuses it (the v2.14 source has a
+            # foreach-specific message instead).
             raise Error(
-                "_foreach_max cannot compute the maximum of an empty tensor;"
-                " max over zero elements is undefined."
+                "max(): Expected reduction dim to be specified for"
+                " input.numel() == 0. Specify the reduction dim with the"
+                " 'dim' argument."
             )
+    var lists = List[List[T]]()
+    lists.append(self_list.copy())
+    var dt = self_list[0].dtype
+    if (
+        dt == DType.uint16 or dt == DType.uint32 or dt == DType.uint64
+    ) and _lists_on_route(lists):
+        # On CUDA's fast route the kernel's dispatch has no wide unsigned
+        # type.
+        unsupported(
+            '"foreach_tensor_max_cuda_scalar_type" not implemented for \''
+            + _scalar_type_name(dt)
+            + "'"
+        )
     if _reduce_on_route(self_list, False):
         ret_tensor_list(
             rets,

@@ -256,6 +256,11 @@ def _reduce_finalize_kernel[
             total = _pow(total, Scalar[acc](1) / p)
         var result = total.cast[out_dtype]()
         comptime if norm != FR_MAX:
+            # An empty reduction runs no kernel on CUDA: TensorIterator
+            # fills the result with the identity, 0, with no root applied
+            # (so ord nan or 1e100 give 0, not pow(0, 1/p)).
+            if desc.numel == 0:
+                result = 0
             if one_element_abs_arg != 0 and desc.numel == 1:
                 var x = _make_ptr[dtype](desc.a)[unsafe_offset=0].cast[
                     out_dtype

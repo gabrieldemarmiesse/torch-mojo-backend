@@ -27,6 +27,7 @@ this file.
 
 import contextlib
 import math
+import re
 from collections.abc import Sequence
 
 import pytest
@@ -3231,7 +3232,7 @@ def test_mta_max_matches_cpu(mojo_gpu: str, dtype: torch.dtype):
     with _one_launch("_foreach_max"):
         actual = torch._foreach_max(dev)
     _assert_lists(actual, [t.max() for t in cpu])
-    with pytest.raises(RuntimeError, match="maximum of an empty tensor"):
+    with pytest.raises(RuntimeError, match="Expected reduction dim to be specified"):
         torch._foreach_max([*dev, torch.empty(0, dtype=dtype, device=mojo_gpu)])
 
 
@@ -3261,6 +3262,8 @@ def _reduce_outcome(fn, tensors: list[torch.Tensor], ord_: float, dtype) -> str:
     return f"{r.cpu().item()!r} {r.dtype}"
 
 
+_REDUCE_ORDS = (2, 3, -2, 0, 1, 2.5, -1, float("inf"), float("-inf"), 0.5,
+                float("nan"), 1e100, -1e100, 1e-100, -1 / 3)  # fmt: skip
 _REDUCE_INPUTS = [torch.int64, torch.int32, torch.uint8, torch.bool, torch.float16,
                   torch.bfloat16, torch.float32]  # fmt: skip
 _REDUCE_DTYPES = [None, torch.int64, torch.int32, torch.bool, torch.float16,
@@ -3282,7 +3285,7 @@ def test_mta_norm_and_powsum_match_stock_cuda(
     fn = getattr(torch, f"_foreach_{fn_name}")
     for n in (5, 0, 1):
         base = torch.arange(1, n + 1) if n != 1 else torch.tensor([-3])
-        for ord_ in (2, 3, -2, 0, 1, 2.5, -1, float("inf"), float("-inf"), 0.5):
+        for ord_ in _REDUCE_ORDS:
             if dtype == torch.float64 and is_metal(mojo_gpu):
                 continue
             outcomes = [
@@ -3305,3 +3308,91 @@ def test_mta_powsum_rounds_once(mojo_gpu: str):
         NotImplementedError, match="\"powsum_cuda\" not implemented for 'Long'"
     ):
         torch._foreach_powsum(x, 2, dtype=torch.int64)
+
+
+# CUDA-free pins of the stock-CUDA behaviours above (torch 2.11, H100),
+# so a machine without stock CUDA still checks them.
+
+
+@pytest.mark.parametrize("ord_", [float("nan"), 1e100, 3.0, 0.5, 1e-100])
+@pytest.mark.parametrize("fn_name", ["norm", "powsum"])
+def test_mta_empty_reductions_are_zero(mojo_gpu: str, fn_name: str, ord_: float):
+    """No kernel runs on an empty tensor: the result is the identity, 0,
+    with no root -- for ord nan and 1e100 too (not nan, not 1)."""
+    fn = getattr(torch, f"_foreach_{fn_name}")
+    (r,) = fn([torch.empty(0, device=mojo_gpu)], ord_)
+    assert r.dtype == torch.float32 and r.cpu().item() == 0.0
+
+
+def test_mta_reductions_on_integer_lists_without_cuda(mojo_gpu: str):
+    """Ord 3 is off the fast route, whose own dtype check (ord 2) refuses an
+    integer `dtype` with a different message."""
+    x = [torch.arange(5, device=mojo_gpu)]
+    with pytest.raises(
+        RuntimeError,
+        match="Expected a floating point or complex tensor as input. Got Long",
+    ):
+        torch._foreach_norm(x, 2, dtype=torch.float32)
+    (zero,) = torch._foreach_powsum(
+        [torch.empty(0, dtype=torch.int32, device=mojo_gpu)], 2
+    )
+    assert zero.dtype == torch.int64 and zero.cpu().item() == 0
+    (zero,) = torch._foreach_powsum(
+        [torch.empty(0, device=mojo_gpu)], 3, dtype=torch.int32
+    )
+    assert zero.dtype == torch.int32 and zero.cpu().item() == 0
+    with pytest.raises(
+        NotImplementedError, match="\"powsum_cuda\" not implemented for 'Int'"
+    ):
+        torch._foreach_powsum([torch.ones(3, device=mojo_gpu)], 3, dtype=torch.int32)
+    (r,) = torch._foreach_powsum(x, 2, dtype=torch.float32)
+    assert r.cpu().item() == 30.0
+    for ord_, text in ((-1 / 3, "-0.333333"), (-1e100, "-1e+100"), (-2.5, "-2.5"),
+                       (-123456789.0, "-1.23457e+08"), (-0.0001234567, "-0.000123457"),
+                       (-2, "-2")):  # fmt: skip
+        with pytest.raises(
+            RuntimeError, match=f"cannot compute the {re.escape(text)} norm"
+        ):
+            torch._foreach_norm([torch.empty(0, device=mojo_gpu)], ord_)
+
+
+def test_mta_max_refusals(mojo_gpu: str):
+    for dtype, name in ((torch.uint16, "UInt16"), (torch.uint32, "UInt32")):
+        x = torch.ones(3, dtype=dtype, device=mojo_gpu)
+        with pytest.raises(
+            NotImplementedError,
+            match=f"\"foreach_tensor_max_cuda_scalar_type\" not implemented for '{name}'",
+        ):
+            torch._foreach_max([x])
+    with pytest.raises(RuntimeError, match="Expected reduction dim to be specified"):
+        torch._foreach_max(
+            [torch.ones(2, device=mojo_gpu), torch.empty(0, device=mojo_gpu)]
+        )
+
+
+def test_mta_reductions_on_mixed_device_lists(mojo_gpu: str):
+    """A list mixing the mojo device and the CPU takes the per-tensor route:
+    each result on its input's device, as on stock CUDA."""
+    a = torch.tensor([3.0, -4.0])
+    b = torch.tensor([1.5, 2.0])
+    lists = [a.to(mojo_gpu), b]
+    for fn, args, want in (
+        (torch._foreach_norm, (2,), [5.0, 2.5]),
+        (
+            torch._foreach_norm,
+            (3,),
+            [
+                torch.linalg.vector_norm(a, 3).item(),
+                torch.linalg.vector_norm(b, 3).item(),
+            ],
+        ),
+        (torch._foreach_norm, (float("inf"),), [4.0, 2.0]),
+        (torch._foreach_powsum, (2,), [25.0, 6.25]),
+        (lambda ts, *_: torch._foreach_max(ts), (), [3.0, 2.0]),
+    ):
+        got = fn(lists, *args)
+        assert [t.device.type for t in got] == [torch.device(mojo_gpu).type, "cpu"]
+        assert [t.cpu().item() for t in got] == pytest.approx(want, rel=1e-6)
+    got = torch._foreach_add(lists, [b.to(mojo_gpu), a], alpha=2)
+    assert [t.device.type for t in got] == [torch.device(mojo_gpu).type, "cpu"]
+    torch.testing.assert_close(got[1], a * 2 + b)
