@@ -42,6 +42,7 @@ from tmb.backend.abi import (
     ST_INT64,
     ST_INT8,
     ST_UINT8,
+    ST_UINT64,
     TAG_BOOL,
     TAG_COMPLEX,
     TAG_DOUBLE,
@@ -97,6 +98,7 @@ from tmb.backend.device import current_device
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    uint64_cross_item,
     shares_storage,
     check_real_scalar_fits,
     scalar_type_token,
@@ -1847,12 +1849,17 @@ def cx_fill_tensor_(
     if not t.on_mojo() and value.on_mojo() and value.rank == 0:
         # a host self, a device 0-d value: its item() fills it (fill_'s own
         # route for a 0-d value on another device)
-        var it = _Call("aten::_local_scalar_dense")
-        it.t(value)
-        var rv = it.run(1)
+        var hv: Value
+        if value.stype == ST_UINT64:
+            hv = uint64_cross_item(value)
+        else:
+            var it = _Call("aten::_local_scalar_dense")
+            it.t(value)
+            var rv = it.run(1)
+            hv = rv[0].copy()
         var f = _Call("aten::fill_", "Scalar")
         f.t(t)
-        f.v(rv[0])
+        f.v(hv)
         _ = f.run(1)
         ret_ref(rets, 0, t)
         return
@@ -1887,9 +1894,16 @@ def cx_fill_tensor_(
         _ = vexp^
         ret_ref(rets, 0, t)
         return
-    var c = _Call("aten::_local_scalar_dense")
-    c.t(value)
-    var r = c.run(1)
+    var item: Value
+    if value.stype == ST_UINT64:
+        item = uint64_cross_item(value)
+    else:
+        var c = _Call("aten::_local_scalar_dense")
+        c.t(value)
+        var rr = c.run(1)
+        item = rr[0].copy()
+    var r = List[Value]()
+    r.append(item^)
     var v = v_complex(r[0])
     # value.item(), converted checked to self's dtype -- before anything is
     # written, and for an empty self too
@@ -2245,6 +2259,22 @@ def cx_masked_fill(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _ret(rets, _masked_fill(args))
 
 
+def resize_any(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
+    """`resize_output` on an out of any device (a host out is resized by
+    torch's own resize_)."""
+    if t.on_mojo():
+        resize_out(t, shape, rank)
+        return
+    var sizes = List[Int]()
+    for i in range(rank):
+        sizes.append(shape[MAX_RANK - rank + i])
+    var c = _Call("aten::resize_")
+    c.t(t)
+    c.ints(sizes)
+    c.none()
+    _ = c.run(1)
+
+
 def cx_masked_fill_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
@@ -2254,10 +2284,10 @@ def cx_masked_fill_out(
     # the generated out= wrapper: the functional result, the out resized to
     # it, then its dtype checked (CUDA resizes before raising), then the copy
     # (no overlap check against the inputs)
-    _same_device(dest, res.t)
-    resize_out(dest, res.t.shape, res.t.rank)
+    resize_any(dest, res.t.shape, res.t.rank)
     var resized = v_tensor_c(args[unsafe_offset=3])
-    _exact_dtype(resized, res.t.stype)
+    _exact_dtype(resized, res.t.stype)  # (before the device check, as CUDA)
+    _same_device(resized, res.t)
     _store(resized, res^, rets)
 
 
