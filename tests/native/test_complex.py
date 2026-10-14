@@ -1185,3 +1185,43 @@ def test_fill_from_a_host_tensor_value_is_checked(mojo_gpu: str):
         torch.zeros(2, dtype=torch.int8, device=mojo_gpu).fill_(torch.tensor(300))
     t.fill_(torch.tensor(7.0))
     assert t.cpu().tolist() == [7, 7, 7]
+
+
+# --- masked_fill outs and the rounding of fill values ---------------------------
+
+
+def test_masked_fill_outs_take_a_complex_value_on_a_real_tensor(mojo_gpu: str):
+    m = torch.ones(2, dtype=torch.bool, device=mojo_gpu)
+    for v in (torch.tensor(5 + 0j), 5 + 0j):
+        fn = (
+            torch.ops.aten.masked_fill.Tensor_out
+            if isinstance(v, torch.Tensor)
+            else torch.ops.aten.masked_fill.Scalar_out
+        )
+        out = torch.empty(2, device=mojo_gpu)
+        fn(torch.zeros(2, device=mojo_gpu), m, v, out=out)
+        assert out.cpu().tolist() == [5.0, 5.0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_half_fills_round_through_float(mojo_gpu: str, dtype: torch.dtype):
+    # c10's Half / BFloat16 from double go through float: two roundings
+    m = torch.ones(1, dtype=torch.bool, device=mojo_gpu)
+    for v in (1 + 2**-11 + 2**-30, 1 + 2**-8 + 2**-30, -(1 + 2**-11 + 2**-30)):
+        want = torch.tensor(v, dtype=torch.float64).to(dtype)  # CPU torch: same chain
+        for got in (
+            torch.zeros(1, dtype=dtype, device=mojo_gpu).fill_(v),
+            torch.zeros(1, dtype=dtype, device=mojo_gpu).fill_(complex(v, 0)),
+            torch.zeros(1, dtype=dtype, device=mojo_gpu).fill_(
+                torch.tensor(complex(v, 0), dtype=torch.complex128)
+            ),
+            torch.zeros(1, dtype=dtype, device=mojo_gpu).masked_fill_(m, complex(v, 0)),
+            torch.full((1,), complex(v, 0), dtype=dtype, device=mojo_gpu),
+        ):
+            assert torch.equal(got.cpu(), want.reshape(1))
+
+
+def test_fill_a_host_tensor_with_a_device_value(mojo_gpu: str):
+    t = torch.zeros(3)
+    t.fill_(torch.tensor(2.0, device=mojo_gpu))
+    assert t.tolist() == [2.0, 2.0, 2.0]

@@ -2298,6 +2298,9 @@ def _masked_fill_real_(self: T, args: Values) raises:
     if self.stype == ST_BOOL:  # a complex value is true if either part is
         var truth = Int64(1) if c[0] != 0.0 or c[1] != 0.0 else Int64(0)
         m.v(Value(TAG_SCALAR_BOOL, 0, truth, 0))
+    elif self.stype == ST_FLOAT16 or self.stype == ST_BFLOAT16:
+        # through float, as c10's Half / BFloat16 conversions from double
+        m.s(Float64(Float32(c[0])))
     else:
         m.s(c[0])
     _ = m.run(1)

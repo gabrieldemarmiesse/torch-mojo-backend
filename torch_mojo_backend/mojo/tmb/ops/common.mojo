@@ -511,10 +511,16 @@ def fill_value(t: T, value: Value) raises:
     _fill(t, FillScalar(value))
 
 
-def _fill(t: T, s: FillScalar) raises:
-    """A memset when contiguous, else the strided fill kernel."""
+def _fill(t: T, s_in: FillScalar) raises:
+    """A memset when contiguous, else the strided fill kernel. A half /
+    bfloat16 destination takes the value through float first, as c10's
+    Half / BFloat16 conversions from double do (1 + 2**-11 + 2**-30 fills
+    a half with 1.0, not 1.0009765625)."""
     if t.numel == 0:
         return
+    var s = s_in.copy()
+    if t.dtype == DType.float16 or t.dtype == DType.bfloat16:
+        s.f = Float64(Float32(s.f))
     if t.contig:
         _fill_contiguous(t, s)
         return
