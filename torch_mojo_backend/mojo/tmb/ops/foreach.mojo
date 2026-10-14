@@ -1,22 +1,23 @@
 """ATen ops: foreach group (see agents_docs/native_backend.md).
 
-Every `_foreach_*_` op below tries ONE batched kernel
-launch (the `optimizer` family, ported host-side from
-`eager_kernels/aten_fast.py`) when its homogeneous-dtype / contiguous /
-no-aliasing preconditions hold, and otherwise falls back to ATen's own
-sequential semantics: call the per-tensor op once per list element through
-`tmb_call_op`, exactly what ATen's CompositeExplicitAutograd "slow" kernels
-do (`aten/src/ATen/native/ForeachOpsKernels.cpp`). That fallback is what
-makes "declining" safe here, unlike the general porting rule of raising
-`unsupported(...)` on every old `NOT_HANDLED`: the old Python eager path had
-no dispatcher to fall through to, but this native op runs as a real
-PrivateUse1 kernel, so calling the *same* op name from inside itself would
-re-enter our own registration (infinite recursion) -- calling the
-*per-tensor* op name instead (`add_.Scalar`, `addcmul_`, ...) does not, and
-matches the exact semantics ATen's own slow kernels implement.
+Every elementwise `aten::_foreach_*` overload is a row of FOREACH_OVERLOADS
+(below) and runs through one op body, `op_foreach`: the row says which
+arguments the schema has, which element math the generic multi-tensor apply
+(tmb/kernels/foreach) runs, and which per-tensor op ATen's own slow kernel
+calls. When CUDA's fast-route conditions hold the whole list is one batched
+launch; otherwise the op falls back to ATen's sequential semantics: the
+per-tensor op once per list element through `tmb_call_op`, exactly what
+ATen's CompositeExplicitAutograd "slow" kernels do
+(`aten/src/ATen/native/ForeachOpsKernels.cpp`). That fallback is what makes
+declining safe here, unlike the general porting rule of raising
+`unsupported(...)`: this native op runs as a real PrivateUse1 kernel, so
+calling the *same* op name from inside itself would re-enter our own
+registration (infinite recursion) -- calling the *per-tensor* op name
+instead (`add_.Scalar`, `addcmul_`, ...) does not, and matches the exact
+semantics ATen's own slow kernels implement.
 
-GradScaler's two ops, `_amp_foreach_non_finite_check_and_unscale_` (a member
-of the same batched family) and `_amp_update_scale_` (one thread), have no
+GradScaler's two ops, `_amp_foreach_non_finite_check_and_unscale_` (a kind of
+the same multi-tensor apply) and `_amp_update_scale_` (one thread), have no
 CompositeExplicitAutograd registration either, so they take no sequential
 fallback: what the batched kernel cannot take goes through a contiguous
 temporary, and what no kernel supports is declined.
@@ -25,15 +26,6 @@ The fused optimizers (`_fused_{adam,adamw,sgd,adagrad}_`, what
 torch.optim runs with `fused=True`) are the same: no CompositeExplicitAutograd
 registration, so no sequential fallback. They validate like stock CUDA and
 raise its errors; see their section below.
-
-`_foreach_div_.ScalarList` and `_foreach_addcdiv_.ScalarList` are NOT
-registered here: there is no batched kernel for them, and with no
-PrivateUse1 override ATen's own CompositeExplicitAutograd decomposition
-(`foreach_tensor_div_scalarlist_kernel_slow_` /
-`..._addcdiv_scalarlist_kernel_slow_`) already does exactly what the
-sequential fallbacks below do -- one `div_.Scalar` / `addcdiv_` per tensor.
-(Their `Scalar[]` argument does marshal: `to_record`'s `ListType` branch in
-`native/csrc/shim_dispatch.cpp` has a `NumberType` arm.)
 """
 from std.builtin.sort import sort
 from std.math import ceildiv
@@ -41,6 +33,15 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     ST_FLOAT32,
+    ST_FLOAT64,
+    TAG_BOOL_LIST,
+    TAG_COMPLEX,
+    TAG_DOUBLE_LIST,
+    TAG_INT_LIST,
+    TAG_SCALAR_BOOL,
+    TAG_SCALAR_DOUBLE,
+    new_strided,
+    v_scalar_is_integral,
     T,
     is_dense,
     Value,
@@ -72,7 +73,20 @@ from tmb.kernels.optimizer.foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
-from tmb.ops.common import copy_strided_into
+from tmb.kernels.foreach.contract import (
+    FE_ROLE_ALPHA,
+    FE_ROLE_B,
+    FE_ROLE_C,
+    FE_ROLE_NONE,
+    fe_variant,
+    foreach_apple_supported,
+)
+from tmb.ops.common import (
+    copy_strided_into,
+    device_str,
+    scalar_to_float,
+    scalar_to_int,
+)
 from tmb.ops.data_movement import _scalar_type_name
 
 
@@ -92,52 +106,6 @@ def _tensor_value(t: T) -> Value:
 
 def _none_value() -> Value:
     return Value(TAG_NONE, 0, 0, 0)
-
-
-def _seq_add_scalar_(t: T, scalar_v: Value) raises:
-    var args = List[Value](capacity=3)
-    args.append(_tensor_value(t))
-    args.append(scalar_v.copy())
-    args.append(Value(TAG_SCALAR_INT, 0, 1, 0))  # alpha=1
-    _ = call_op("aten::add_", "Scalar", args^, 1)
-
-
-def _seq_mul_scalar_(t: T, scalar_v: Value) raises:
-    var args = List[Value](capacity=2)
-    args.append(_tensor_value(t))
-    args.append(scalar_v.copy())
-    _ = call_op("aten::mul_", "Scalar", args^, 1)
-
-
-def _seq_mul_tensor_(t: T, other: T) raises:
-    var args = List[Value](capacity=2)
-    args.append(_tensor_value(t))
-    args.append(_tensor_value(other))
-    _ = call_op("aten::mul_", "Tensor", args^, 1)
-
-
-def _seq_addcmul_(t: T, t1: T, t2: T, value_v: Value) raises:
-    var args = List[Value](capacity=4)
-    args.append(_tensor_value(t))
-    args.append(_tensor_value(t1))
-    args.append(_tensor_value(t2))
-    args.append(value_v.copy())
-    _ = call_op("aten::addcmul_", "", args^, 1)
-
-
-def _seq_lerp_scalar_(t: T, end: T, weight_v: Value) raises:
-    var args = List[Value](capacity=3)
-    args.append(_tensor_value(t))
-    args.append(_tensor_value(end))
-    args.append(weight_v.copy())
-    _ = call_op("aten::lerp_", "Scalar", args^, 1)
-
-
-def _seq_sqrt(t: T) raises -> T:
-    var args = List[Value](capacity=1)
-    args.append(_tensor_value(t))
-    var rets = call_op("aten::sqrt", "", args^, 1)
-    return rets.take_tensor(0)
 
 
 def _seq_vector_norm(t: T, ord_v: Value, dtype_v: Value) raises -> T:
@@ -175,26 +143,6 @@ def _self_overlaps(ts: List[T]) -> Bool:
     return False
 
 
-def _overlaps_any(ts: List[T], other: List[T]) -> Bool:
-    for a in ts:
-        for b in other:
-            if _overlaps(a, b):
-                return True
-    return False
-
-
-def _scalar_overlaps_any(ts: List[T], scalar: T) -> Bool:
-    """Whether the 0-d `scalar`'s bytes intersect ANY list tensor's bytes. If
-    so, take the sequential fallback: its per-tensor `mul_.Tensor(a!)` call
-    both tolerates true self-aliasing (`t.mul_(t)`) and raises ATen's own
-    "Please clone()" error for a genuine partial overlap -- the batched
-    kernel, with no ordering between its parallel slots, could do neither."""
-    for t in ts:
-        if _overlaps(t, scalar):
-            return True
-    return False
-
-
 # --- fast-path qualification (aten_fast._foreach_lists): every tensor across
 # every list mojo-resident, contiguous, on one shared device, one shared
 # dtype, with index-aligned tensors sharing a shape ------------
@@ -229,196 +177,7 @@ def _qualifies1(a: List[T], allow_half: Bool) raises -> Bool:
     return True
 
 
-def _qualifies2(a: List[T], b: List[T], allow_half: Bool) raises -> Bool:
-    if not _qualifies1(a, allow_half):
-        return False
-    if len(b) != len(a):
-        return False
-    for i in range(len(a)):
-        if not _tensor_qualifies(b[i], a[0].device, a[0].dtype):
-            return False
-        if not b[i].same_shape(a[i]):
-            return False
-    return True
-
-
-def _qualifies3(
-    a: List[T], b: List[T], c: List[T], allow_half: Bool
-) raises -> Bool:
-    if not _qualifies2(a, b, allow_half):
-        return False
-    if len(c) != len(a):
-        return False
-    for i in range(len(a)):
-        if not _tensor_qualifies(c[i], a[0].device, a[0].dtype):
-            return False
-        if not c[i].same_shape(a[i]):
-            return False
-    return True
-
-
-# --- batched launches (optimizer family: ForeachMul/Add/MulTensor/Lerp/
-# Addcmul/Sqrt/L2Norm, FusedAdamW -- see tmb/kernels/optimizer/entry.mojo's `tmb_call`
-# ladder for the exact slot list each one expects) ------------------------
-
-
-def _foreach_ew_scalar_launch(
-    op_name: StaticString, tensors: List[T], value: Float64
-) raises:
-    """ForeachMul / ForeachAdd: one repeated per-tensor FP32 scalar (`.Scalar`
-    and `.ScalarList` share this kernel code; every tensor here gets the same
-    value since only the `.Scalar` overloads reach this launcher)."""
-    var metadata = List[Int]()
-    for t in tensors:
-        metadata.append(t.ptr)
-        metadata.append(t.numel)
-    var scalars = List[Int]()
-    for _ in range(len(tensors)):
-        scalars.append(Int(f64_bits(value)))
-    var dtype = tensors[0].dtype
-    var device = tensors[0].device
-    var ctx = ctx_for(device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall("optimizer", String(op_name))
-    call.arg_dtype(0, dtype)
-    call.out_dtype(dtype)
-    call.tuple(metadata)
-    call.tuple(scalars)
-    call.tuple(List[Int]())
-    call.int(dtype_code(dtype))
-    call.int(cp)
-    call.run()
-    for t in tensors:
-        t.bump_version()
-    _ = ctx
-
-
-def _foreach_mul_tensor_launch(tensors: List[T], scalar: T) raises:
-    var metadata = List[Int]()
-    for t in tensors:
-        metadata.append(t.ptr)
-        metadata.append(t.numel)
-    var dtype = tensors[0].dtype
-    var ctx = ctx_for(tensors[0].device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall("optimizer", "ForeachMulTensor")
-    call.arg_dtype(0, dtype)
-    call.out_dtype(dtype)
-    call.tuple(metadata)
-    call.tuple(List[Int]())
-    var aux = List[Int]()
-    aux.append(scalar.ptr)
-    call.tuple(aux)
-    call.int(dtype_code(dtype))
-    call.int(cp)
-    call.run()
-    for t in tensors:
-        t.bump_version()
-    _ = ctx
-
-
-def _foreach_lerp_launch(
-    self_list: List[T],
-    end_list: List[T],
-    weight: Float64,
-    bump_versions: Bool = True,
-) raises:
-    var metadata = List[Int]()
-    for i in range(len(self_list)):
-        metadata.append(self_list[i].ptr)
-        metadata.append(end_list[i].ptr)
-        metadata.append(self_list[i].numel)
-    var narrowed_weight = Float32(weight)
-    var one_minus_weight = Float32(1.0) - narrowed_weight
-    var low_branch = 1 if abs(narrowed_weight) < Float32(0.5) else 0
-    var scalars = List[Int]()
-    scalars.append(Int(f64_bits(Float64(narrowed_weight))))
-    scalars.append(Int(f64_bits(Float64(one_minus_weight))))
-    var aux = List[Int]()
-    aux.append(low_branch)
-    var dtype = self_list[0].dtype
-    var ctx = ctx_for(self_list[0].device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall("optimizer", "ForeachLerp")
-    call.arg_dtype(0, dtype)
-    call.arg_dtype(1, dtype)
-    call.out_dtype(dtype)
-    call.tuple(metadata)
-    call.tuple(scalars)
-    call.tuple(aux)
-    call.int(dtype_code(dtype))
-    call.int(cp)
-    call.run()
-    if bump_versions:
-        for t in self_list:
-            t.bump_version()
-    _ = ctx
-
-
-def _foreach_addc_launch(
-    self_list: List[T],
-    t1_list: List[T],
-    t2_list: List[T],
-    value: Float64,
-    op: String = "ForeachAddcmul",
-    bump_versions: Bool = True,
-) raises:
-    var metadata = List[Int]()
-    for i in range(len(self_list)):
-        metadata.append(self_list[i].ptr)
-        metadata.append(t1_list[i].ptr)
-        metadata.append(t2_list[i].ptr)
-        metadata.append(self_list[i].numel)
-    var scalars = List[Int]()
-    for _ in range(len(self_list)):
-        scalars.append(Int(f64_bits(value)))
-    var dtype = self_list[0].dtype
-    var ctx = ctx_for(self_list[0].device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall("optimizer", op)
-    call.arg_dtype(0, dtype)
-    call.arg_dtype(1, dtype)
-    call.arg_dtype(2, dtype)
-    call.out_dtype(dtype)
-    call.tuple(metadata)
-    call.tuple(scalars)
-    call.tuple(List[Int]())
-    call.int(dtype_code(dtype))
-    call.int(cp)
-    call.run()
-    if bump_versions:
-        for t in self_list:
-            t.bump_version()
-    _ = ctx
-
-
-def _foreach_sqrt_launch(tensors: List[T]) raises -> List[T]:
-    var outs = List[Owned]()
-    for t in tensors:
-        outs.append(own(new_tensor(t.shape, t.rank, t.stype, t.device)))
-    var metadata = List[Int]()
-    for i in range(len(tensors)):
-        metadata.append(tensors[i].ptr)
-        metadata.append(outs[i].t.ptr)
-        metadata.append(tensors[i].numel)
-    var dtype = tensors[0].dtype
-    var ctx = ctx_for(tensors[0].device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall("optimizer", "ForeachSqrt")
-    call.arg_dtype(0, dtype)
-    call.arg_dtype(1, dtype)
-    call.out_dtype(dtype)
-    call.tuple(metadata)
-    call.tuple(List[Int]())
-    call.tuple(List[Int]())
-    call.int(dtype_code(dtype))
-    call.int(cp)
-    call.run()
-    _ = ctx
-    var result = List[T]()
-    for i in range(len(outs)):
-        result.append(outs[i].take())
-    return result^
+# --- _foreach_norm: the optimizer family's ForeachL2Norm ---------------------
 
 
 def _foreach_norm_launch(tensors: List[T]) raises -> List[T]:
@@ -457,102 +216,790 @@ def _foreach_norm_launch(tensors: List[T]) raises -> List[T]:
     return result^
 
 
-# --- ops -------------------------------------------------------------------
+# --- the foreach overload table ----------------------------------------------
+#
+# Every elementwise `aten::_foreach_*` overload is one row below and nothing
+# else: `op_foreach[row, inplace]` is the only op body, registered for each
+# row's functional and in-place schema by `register_foreach`. A row names
+#
+#   * the schemas (functional, in-place; "" when the overload has none);
+#   * `kind`, the element math of the generic multi-tensor apply
+#     (tmb/kernels/foreach, `functors.foreach_math`);
+#   * `shape`, which arguments the schema has (S_*), hence the kernel's
+#     operand variant (`_variant`);
+#   * the per-tensor op ATen's own CompositeExplicitAutograd slow kernel
+#     calls for each element (ForeachOpsKernels.cpp), which is what runs when
+#     the fast route does not apply;
+#   * the dtypes CUDA's fast route takes (its AT_DISPATCH set and its
+#     `does_op_promote_integer_inputs_to_float` flag, D_*), and whether this
+#     kind's float64 math lowers on the GPU (`f64`).
+#
+# The fast route is CUDA's `can_use_fast_route` (ForeachUtils.h): every
+# tensor of every list on one mojo device, non-overlapping and dense, of one
+# dtype, index-aligned tensors sharing sizes and strides, and no Scalar that
+# would promote the result dtype -- plus the one rule CUDA leaves to chance:
+# an in-place list that overlaps itself or another operand (other than the
+# same tensor at the same index) runs sequentially. Anything else falls back
+# to the per-tensor op through the dispatcher, exactly what ATen's slow
+# kernel does: calling the per-tensor op name (`add_.Scalar`, `addcmul_`, ...)
+# never re-enters this registration, so declining is always safe.
+
+# Argument shapes of the foreach schemas.
+comptime S_UNARY = 0  # (Tensor[] self)
+comptime S_SCALAR = 1  # (Tensor[] self, Scalar scalar)
+comptime S_SCALARLIST = 2  # (Tensor[] self, Scalar[] scalars)
+comptime S_LIST = 3  # (Tensor[] self, Tensor[] other[, *, Scalar alpha])
+comptime S_TENSOR = 4  # (Tensor[] self, Tensor other[, *, Scalar alpha])
+comptime S_PW_SCALAR = 5  # (self, Tensor[] tensor1, Tensor[] tensor2, Scalar)
+comptime S_PW_SCALARLIST = 6  # (self, tensor1, tensor2, Scalar[] scalars)
+comptime S_PW_TENSOR = 7  # (self, tensor1, tensor2, Tensor scalars) (CPU, 1-D)
+comptime S_LERP_LIST = 8  # (self, Tensor[] tensors1, Tensor[] weights)
+comptime S_LERP_SCALAR = 9  # (self, Tensor[] tensors1, Scalar weight)
+comptime S_LERP_SCALARLIST = 10  # (self, Tensor[] tensors1, Scalar[] weight)
+comptime S_RPOW = 11  # (Scalar self, Tensor[] exponent)
+
+# Fast-route dtypes (CUDA's dispatch set for the overload).
+comptime D_FLOAT = 0  # float32 / float16 / bfloat16 (+ float64 if `f64`)
+comptime D_INT = 1  # and the integer dtypes
+comptime D_ALL = 2  # and bool
 
 
-# aten::_foreach_add_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
-def op_foreach_add_scalar_(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var self_list = v_tensor_list(args[unsafe_offset=0])
-    if len(self_list) == 0:
-        raise Error("Tensor list must have at least one tensor.")
-    var scalar_v = args[unsafe_offset=1].copy()
-    if (
-        not v_scalar_is_bool(scalar_v)
-        and _qualifies1(self_list, True)
-        and not _self_overlaps(self_list)
-    ):
-        _foreach_ew_scalar_launch("ForeachAdd", self_list, v_f64(scalar_v))
-        return
-    for t in self_list:
-        _seq_add_scalar_(t, scalar_v)
+@fieldwise_init
+struct ForeachOverload(ImplicitlyCopyable, Movable):
+    var name: StaticString  # the functional schema, "" if none
+    var name_: StaticString  # the in-place schema, "" if none
+    var kind: StaticString
+    var shape: Int
+    var op: StaticString  # per-tensor op of the functional slow path
+    var overload: StaticString
+    var op_: StaticString  # per-tensor op of the in-place slow path
+    var overload_: StaticString
+    var dtypes: Int
+    var f64: Bool
+    var alpha: Bool  # the per-tensor op takes an alpha (add, sub)
+    var reciprocal: Bool  # div.Scalar: multiply by 1 / scalar, as CUDA does
+    var apple: Bool  # the in-place / sqrt route Apple's fixed-arity kernels take
 
 
-# aten::_foreach_mul_.Scalar(Tensor(a!)[] self, Scalar scalar) -> ()
-def op_foreach_mul_scalar_(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var self_list = v_tensor_list(args[unsafe_offset=0])
-    if len(self_list) == 0:
-        raise Error("Tensor list must have at least one tensor.")
-    var scalar_v = args[unsafe_offset=1].copy()
-    if (
-        not v_scalar_is_bool(scalar_v)
-        and _qualifies1(self_list, True)
-        and not _self_overlaps(self_list)
-    ):
-        _foreach_ew_scalar_launch("ForeachMul", self_list, v_f64(scalar_v))
-        return
-    for t in self_list:
-        _seq_mul_scalar_(t, scalar_v)
+def _unary(
+    name: StaticString,
+    name_: StaticString,
+    kind: StaticString,
+    op: StaticString,
+    op_: StaticString,
+    dtypes: Int,
+    f64: Bool,
+    apple: Bool = False,
+) -> ForeachOverload:
+    return ForeachOverload(
+        name,
+        name_,
+        kind,
+        S_UNARY,
+        op,
+        "",
+        op_,
+        "",
+        dtypes,
+        f64,
+        False,
+        False,
+        apple,
+    )
 
 
-# aten::_foreach_mul_.Tensor(Tensor(a!)[] self, Tensor other) -> ()
-def op_foreach_mul_tensor_(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var self_list = v_tensor_list(args[unsafe_offset=0])
-    var other = v_tensor(args[unsafe_offset=1])
-    if other.rank != 0:
-        raise Error(
-            "scalar tensor expected to be 0 dim but it has ",
-            other.rank,
-            " dimensions and ",
-            other.numel,
-            " elements.",
+def _binary(
+    name: StaticString,
+    name_: StaticString,
+    kind: StaticString,
+    shape: Int,
+    op: StaticString,
+    overload: StaticString,
+    op_: StaticString,
+    overload_: StaticString,
+    dtypes: Int,
+    alpha: Bool = False,
+    reciprocal: Bool = False,
+    apple: Bool = False,
+) -> ForeachOverload:
+    return ForeachOverload(
+        name,
+        name_,
+        kind,
+        shape,
+        op,
+        overload,
+        op_,
+        overload_,
+        dtypes,
+        True,
+        alpha,
+        reciprocal,
+        apple,
+    )
+
+
+# One row per overload pair, one line per row: a table read across.
+# fmt: off
+comptime FOREACH_OVERLOADS: List[ForeachOverload] = [
+    # The overloads the multi-tensor apply started with; the other
+    # families join in the commits that follow.
+    _unary("_foreach_sqrt", "", "sqrt", "aten::sqrt", "aten::sqrt_", D_FLOAT, True, apple=True),
+    _binary("", "_foreach_add_.Scalar", "add", S_SCALAR, "aten::add", "Scalar", "aten::add_", "Scalar", D_ALL, alpha=True, apple=True),
+    _binary("", "_foreach_mul_.Scalar", "mul", S_SCALAR, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL, apple=True),
+    _binary("", "_foreach_mul_.Tensor", "mul", S_TENSOR, "aten::mul", "Tensor", "aten::mul_", "Tensor", D_ALL, apple=True),
+    _binary("", "_foreach_addcmul_.Scalar", "addcmul", S_PW_SCALAR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT, apple=True),
+    _binary("", "_foreach_lerp_.Scalar", "lerp", S_LERP_SCALAR, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT, apple=True),
+]
+# fmt: on
+
+
+def _variant(e: ForeachOverload, inplace: Bool) -> Int:
+    """The kernel's operand variant (tmb/kernels/foreach/contract.mojo) of a
+    row: where each operand of `foreach_math` comes from."""
+    var s = e.shape
+    var out = not inplace
+    if s == S_SCALAR or s == S_SCALARLIST or s == S_RPOW:
+        return fe_variant(1, out, FE_ROLE_B, False)
+    if s == S_LIST:
+        return fe_variant(
+            2, out, FE_ROLE_ALPHA if e.alpha else FE_ROLE_NONE, False
         )
-    if len(self_list) == 0:
-        raise Error("Tensor list must have at least one tensor.")
+    if s == S_TENSOR:
+        return fe_variant(
+            1, out, FE_ROLE_ALPHA if e.alpha else FE_ROLE_NONE, True
+        )
+    if s == S_PW_SCALAR or s == S_PW_SCALARLIST or s == S_PW_TENSOR:
+        return fe_variant(3, out, FE_ROLE_ALPHA, False)
+    if s == S_LERP_LIST:
+        return fe_variant(3, out, FE_ROLE_NONE, False)
+    if s == S_LERP_SCALAR or s == S_LERP_SCALARLIST:
+        return fe_variant(2, out, FE_ROLE_C, False)
+    return fe_variant(1, out, FE_ROLE_NONE, False)
+
+
+# --- arguments ------------------------------------------------------------------
+
+
+def _int_scalar(x: Int) -> Value:
+    return Value(TAG_SCALAR_INT, 0, Int64(x), 0)
+
+
+def _scalar_list(v: Value) raises -> List[Value]:
+    """A `Scalar[]` argument, element by element (see `to_record` in
+    native/csrc/shim_dispatch.cpp: the list is tagged by the type every
+    element agrees on, so a mixed int/float list arrives as doubles)."""
+    var out = List[Value](capacity=Int(v.len))
+    if v.tag == TAG_INT_LIST:
+        var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
+        for i in range(Int(v.len)):
+            out.append(Value(TAG_SCALAR_INT, 0, p[unsafe_offset=i], 0))
+    elif v.tag == TAG_DOUBLE_LIST:
+        var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
+        for i in range(Int(v.len)):
+            out.append(Value(TAG_SCALAR_DOUBLE, 0, p[unsafe_offset=i], 0))
+    elif v.tag == TAG_BOOL_LIST:
+        var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
+        for i in range(Int(v.len)):
+            out.append(
+                Value(TAG_SCALAR_BOOL, 0, Int64(p[unsafe_offset=i] != 0), 0)
+            )
+    else:
+        raise Error("expected a Scalar[] argument, got record tag ", v.tag)
+    return out^
+
+
+def _cpu_element(t: T, i: Int) raises -> Value:
+    """Element `i` of a contiguous CPU tensor as the Scalar
+    `Tensor::item()` / `scalar_t` makes of it."""
+    if t.dtype == DType.float32:
+        var p = Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+        return Value(
+            TAG_SCALAR_DOUBLE, 0, f64_bits(Float64(p[unsafe_offset=i])), 0
+        )
+    if t.dtype == DType.float64:
+        var p = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+        return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(p[unsafe_offset=i]), 0)
+    if t.dtype == DType.float16:
+        var p = Pointer[Float16, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+        return Value(
+            TAG_SCALAR_DOUBLE,
+            0,
+            f64_bits(p[unsafe_offset=i].cast[DType.float64]()),
+            0,
+        )
+    if t.dtype == DType.bfloat16:
+        var p = Pointer[BFloat16, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+        return Value(
+            TAG_SCALAR_DOUBLE,
+            0,
+            f64_bits(p[unsafe_offset=i].cast[DType.float64]()),
+            0,
+        )
+    if t.dtype == DType.bool or t.dtype == DType.uint8:
+        var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+        var x = Int64(p[unsafe_offset=i])
+        if t.dtype == DType.bool:
+            return Value(TAG_SCALAR_BOOL, 0, Int64(x != 0), 0)
+        return _int_scalar(Int(x))
+    if t.dtype == DType.int8:
+        var p = Pointer[Int8, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+        return _int_scalar(Int(p[unsafe_offset=i]))
+    if t.dtype == DType.int16:
+        var p = Pointer[Int16, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+        return _int_scalar(Int(p[unsafe_offset=i]))
+    if t.dtype == DType.int32:
+        var p = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+        return _int_scalar(Int(p[unsafe_offset=i]))
+    if t.dtype == DType.int64:
+        var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+        return _int_scalar(Int(p[unsafe_offset=i]))
+    unsupported("a CPU scalar of dtype " + String(t.dtype))
+    return _int_scalar(0)
+
+
+def _packed_scalars(v: Value, expect: Int) raises -> List[Value]:
+    """ForeachUtils.h's `convert_tensor_to_scalar_list`: the pointwise
+    `.Tensor` overloads' scalars, a 1-D CPU tensor."""
+    var t = v_tensor(v)
+    if not t.on_cpu():
+        raise Error(
+            "Expected scalars to be on CPU, got ", device_str(t), " instead."
+        )
+    if not t.contig:
+        raise Error("Expected scalars to be contiguous.")
+    if t.rank != 1:
+        raise Error(
+            "Expected packed scalar Tensor to be of dimension 1. Got ",
+            t.rank,
+            " instead.",
+        )
+    if t.dim(0) != expect:
+        raise Error(
+            "Expected length of scalars to match input of length ",
+            expect,
+            " but got ",
+            t.dim(0),
+            " instead.",
+        )
+    var out = List[Value](capacity=expect)
+    for i in range(expect):
+        out.append(_cpu_element(t, i))
+    return out^
+
+
+def _reciprocal(v: Value) raises -> Value:
+    """ForeachBinaryOpScalar.cu's `scalar_reciprocal`: 1 / x in double."""
+    if v.tag == TAG_COMPLEX:
+        unsupported("a complex Scalar for _foreach_div")
+    return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(1.0 / v_f64(v)), 0)
+
+
+struct _ForeachArgs(Movable):
+    """One call's operands, read by the row's shape: the tensor lists (self
+    or the exponents first), the Scalar or the per-tensor Scalars, the 0-d
+    `other` tensor, alpha."""
+
+    var lists: List[List[T]]
+    var scalar: Value
+    var scalars: List[Value]
+    var other: List[T]  # the `.Tensor` overloads' operand, else empty
+    var alpha: Value
+
+    def __init__(out self, e: ForeachOverload, args: Values) raises:
+        self.lists = List[List[T]]()
+        self.scalar = _int_scalar(1)
+        self.scalars = List[Value]()
+        self.other = List[T]()
+        self.alpha = _int_scalar(1)
+        var s = e.shape
+        if s == S_RPOW:
+            self.scalar = args[unsafe_offset=0].copy()
+            self.lists.append(v_tensor_list(args[unsafe_offset=1]))
+            return
+        self.lists.append(v_tensor_list(args[unsafe_offset=0]))
+        if s == S_SCALAR:
+            self.scalar = args[unsafe_offset=1].copy()
+        elif s == S_SCALARLIST:
+            self.scalars = _scalar_list(args[unsafe_offset=1])
+        elif s == S_LIST:
+            self.lists.append(v_tensor_list(args[unsafe_offset=1]))
+            if e.alpha:
+                self.alpha = args[unsafe_offset=2].copy()
+        elif s == S_TENSOR:
+            self.other.append(v_tensor(args[unsafe_offset=1]))
+            if e.alpha:
+                self.alpha = args[unsafe_offset=2].copy()
+        elif s == S_LERP_LIST:
+            self.lists.append(v_tensor_list(args[unsafe_offset=1]))
+            self.lists.append(v_tensor_list(args[unsafe_offset=2]))
+        elif s == S_LERP_SCALAR:
+            self.lists.append(v_tensor_list(args[unsafe_offset=1]))
+            self.scalar = args[unsafe_offset=2].copy()
+        elif s == S_LERP_SCALARLIST:
+            self.lists.append(v_tensor_list(args[unsafe_offset=1]))
+            self.scalars = _scalar_list(args[unsafe_offset=2])
+        elif s != S_UNARY:  # the pointwise shapes
+            self.lists.append(v_tensor_list(args[unsafe_offset=1]))
+            self.lists.append(v_tensor_list(args[unsafe_offset=2]))
+            if s == S_PW_SCALAR:
+                self.scalar = args[unsafe_offset=3].copy()
+            elif s == S_PW_SCALARLIST:
+                self.scalars = _scalar_list(args[unsafe_offset=3])
+            else:
+                self.scalars = _packed_scalars(
+                    args[unsafe_offset=3], len(self.lists[0])
+                )
+
+    def check(self, e: ForeachOverload) raises:
+        """ForeachUtils.h's `check_foreach_api_restrictions`."""
+        for k in range(len(self.lists)):
+            if len(self.lists[k]) == 0:
+                raise Error("Tensor list must have at least one tensor.")
+        for k in range(1, len(self.lists)):
+            if len(self.lists[k]) != len(self.lists[0]):
+                raise Error(
+                    "Tensor lists must have the same number of tensors, got ",
+                    len(self.lists[0]),
+                    " and ",
+                    len(self.lists[k]),
+                )
+        var s = e.shape
+        if (
+            s == S_SCALARLIST
+            or s == S_PW_SCALARLIST
+            or s == S_PW_TENSOR
+            or s == S_LERP_SCALARLIST
+        ) and len(self.scalars) != len(self.lists[0]):
+            raise Error(
+                "Tensor list must have same number of elements as scalar list."
+            )
+
+    def scalar_at(self, e: ForeachOverload, i: Int) -> Value:
+        """The Scalar tensor `i` is combined with (the reciprocal already
+        taken for div)."""
+        if len(self.scalars) != 0:
+            return self.scalars[i].copy()
+        return self.scalar.copy()
+
+
+# --- the fast route ---------------------------------------------------------------
+
+
+def _scalar_keeps_dtype(v: Value, dt: DType) -> Bool:
+    """`result_type(scalar, tensor) == tensor.scalar_type()`: a Scalar of a
+    lower category than the list's dtype does not promote it."""
+    if v.tag == TAG_COMPLEX:
+        return False
+    if dt.is_floating_point():
+        return True
+    if dt == DType.bool:
+        return v_scalar_is_bool(v)
+    return v_scalar_is_integral(v)
+
+
+def _dtype_on_route(e: ForeachOverload, dt: DType) -> Bool:
+    if dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16:
+        return True
+    if dt == DType.float64:
+        return e.f64
     if (
-        _qualifies1(self_list, False)
-        and other.on_mojo()
-        and other.device == self_list[0].device
-        and other.dtype == self_list[0].dtype
-        and other.contig
-        and not _self_overlaps(self_list)
-        and not _scalar_overlaps_any(self_list, other)
+        dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
+        or dt == DType.uint8
     ):
-        _foreach_mul_tensor_launch(self_list, other)
-        return
-    for t in self_list:
-        _seq_mul_tensor_(t, other)
+        return e.dtypes != D_FLOAT
+    if dt == DType.bool:
+        return e.dtypes == D_ALL
+    return False
 
 
-# aten::_foreach_addcmul_.Scalar(Tensor(a!)[] self, Tensor[] tensor1,
-#   Tensor[] tensor2, Scalar value=1) -> ()
-def op_foreach_addcmul_scalar_(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
+def _same_layout(a: T, b: T) -> Bool:
+    """Equal sizes, and equal strides on every dim of size > 1
+    (`_check_tensors_share_sizes_and_strides`)."""
+    if not a.same_shape(b):
+        return False
+    for i in range(a.rank):
+        if a.dim(i) != 1 and a.stride(i) != b.stride(i):
+            return False
+    return True
+
+
+def _lists_on_route(lists: List[List[T]]) raises -> Bool:
+    """`_check_tensors_share_device_and_dtype` and
+    `_check_tensors_share_sizes_and_strides`, over every list."""
+    var first = lists[0][0].copy()
+    if not first.on_mojo():
+        return False
+    for k in range(len(lists)):
+        for i in range(len(lists[k])):
+            ref t = lists[k][i]
+            if (
+                not t.on_mojo()
+                or t.device != first.device
+                or t.dtype != first.dtype
+                or not (t.contig or is_dense(t.shape, t.strides, t.rank))
+            ):
+                return False
+            if k > 0 and not _same_layout(lists[0][i], t):
+                return False
+    return True
+
+
+def _same_span(a: T, b: T) -> Bool:
+    return a.ptr == b.ptr and _same_layout(a, b)
+
+
+def _inplace_hazard(p: _ForeachArgs) -> Bool:
+    """An in-place launch has no order between its blocks, so a written
+    tensor may share bytes with nothing but itself at its own index."""
+    ref written = p.lists[0]
+    var read = List[T]()
+    for k in range(1, len(p.lists)):
+        for i in range(len(p.lists[k])):
+            if not _same_span(written[i], p.lists[k][i]):
+                read.append(p.lists[k][i].copy())
+    for t in p.other:
+        read.append(t.copy())
+    return _writes_overlap(written, read)
+
+
+def _opmath_stype(dt: DType) -> Int32:
+    return ST_FLOAT64 if dt == DType.float64 else ST_FLOAT32
+
+
+def _scalar_slot(v: Value, t: T) raises -> Int:
+    """A Scalar as the kernel's per-tensor slot (`Scalar.to<opmath_t>()`,
+    with c10's overflow check): float64 bits for a floating list, the value
+    for an integer or bool one."""
+    if t.dtype.is_floating_point():
+        return Int(f64_bits(scalar_to_float(v, _opmath_stype(t.dtype))))
+    if t.dtype == DType.bool:
+        return 1 if v_bool(v) else 0
+    return scalar_to_int(v, t.stype)
+
+
+def _fast_route(
+    e: ForeachOverload, inplace: Bool, p: _ForeachArgs
+) raises -> Bool:
+    if not _lists_on_route(p.lists):
+        return False
+    ref first = p.lists[0][0]
+    var dt = first.dtype
+    if not _dtype_on_route(e, dt):
+        return False
+    if dev(first.device)[].api == "metal":
+        if (
+            dt != DType.float32
+            or not e.apple
+            or not foreach_apple_supported(e.kind, _variant(e, inplace))
+        ):
+            return False
+    var s = e.shape
+    # The Scalars that must not promote: the overload's scalar(s), and add /
+    # sub's alpha where the schema has one.
+    if s == S_SCALAR or s == S_PW_SCALAR or s == S_LERP_SCALAR:
+        if not _scalar_keeps_dtype(p.scalar, dt):
+            return False
+    elif s == S_RPOW:
+        if p.scalar.tag == TAG_COMPLEX:
+            return False
+    for v in p.scalars:
+        if not _scalar_keeps_dtype(v, dt):
+            return False
+    if (s == S_LIST or s == S_TENSOR) and e.alpha:
+        if not _scalar_keeps_dtype(p.alpha, dt):
+            return False
+    if e.kind == "sub":
+        # sub_check: a bool operand raises, which the per-tensor sub does.
+        if v_scalar_is_bool(p.scalar) or v_scalar_is_bool(p.alpha):
+            return False
+        for v in p.scalars:
+            if v_scalar_is_bool(v):
+                return False
+    if s == S_TENSOR:
+        ref other = p.other[0]
+        if other.dtype != dt:
+            return False
+        if not other.on_mojo() or other.device != first.device:
+            # CUDA's fast route does not look at the scalar's device; its
+            # kernel then refuses it.
+            raise Error(
+                "scalar tensor is expected to be on " if inplace else (
+                    "scalar tensor expected to be on "
+                ),
+                device_str(first),
+                " but is on ",
+                device_str(other),
+            )
+    if inplace and _inplace_hazard(p):
+        return False
+    return True
+
+
+def _mta_launch(
+    kind: StringSlice,
+    variant: Int,
+    lists: List[List[T]],
+    outs: List[T],
+    scalars: List[Int],
+    device_addr: Int,
+    aux_addr: Int,
 ) raises:
-    var self_list = v_tensor_list(args[unsafe_offset=0])
-    var t1_list = v_tensor_list(args[unsafe_offset=1])
-    var t2_list = v_tensor_list(args[unsafe_offset=2])
-    if len(self_list) == 0:
-        raise Error("Tensor list must have at least one tensor.")
-    if len(t1_list) != len(self_list) or len(t2_list) != len(self_list):
-        raise Error("Tensor lists must have the same number of tensors.")
-    var value_v = args[unsafe_offset=3].copy()
-    if (
-        not v_scalar_is_bool(value_v)
-        and _qualifies3(self_list, t1_list, t2_list, False)
-        and not _self_overlaps(self_list)
-        and not _overlaps_any(self_list, t1_list)
-        and not _overlaps_any(self_list, t2_list)
-    ):
-        _foreach_addc_launch(self_list, t1_list, t2_list, v_f64(value_v))
+    """One multi-tensor apply over index-aligned lists (tmb/kernels/foreach):
+    five ints per tensor, the operand addresses then the numel."""
+    ref a = lists[0]
+    var metadata = List[Int](capacity=5 * len(a))
+    for i in range(len(a)):
+        metadata.append(a[i].ptr)
+        metadata.append(lists[1][i].ptr if len(lists) > 1 else 0)
+        metadata.append(lists[2][i].ptr if len(lists) > 2 else 0)
+        metadata.append(outs[i].ptr if len(outs) > 0 else 0)
+        metadata.append(a[i].numel)
+    var ctx = ctx_for(a[0].device)
+    var call = KernelCall("foreach", kind)
+    call.flag("FE_VARIANT", variant)
+    call.arg_dtype(0, a[0].dtype)
+    call.tuple(metadata)
+    call.tuple(scalars)
+    call.int(device_addr)
+    call.int(aux_addr)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+
+
+def _launch(
+    e: ForeachOverload, inplace: Bool, p: _ForeachArgs, rets: Values
+) raises:
+    ref selves = p.lists[0]
+    var n = len(selves)
+    var role_scalars = List[Int]()
+    var s = e.shape
+    if (s == S_LIST or s == S_TENSOR) and e.alpha:
+        var slot = _scalar_slot(p.alpha, selves[0])
+        for _ in range(n):
+            role_scalars.append(slot)
+    elif s != S_UNARY and s != S_LIST and s != S_TENSOR and s != S_LERP_LIST:
+        for i in range(n):
+            role_scalars.append(_scalar_slot(p.scalar_at(e, i), selves[i]))
+    var device_addr = p.other[0].ptr if len(p.other) > 0 else 0
+    var outs = List[Owned]()
+    var out_ts = List[T]()
+    if not inplace:
+        for t in selves:
+            outs.append(
+                own(new_strided(t.shape, t.strides, t.rank, t.stype, t.device))
+            )
+            out_ts.append(outs[len(outs) - 1].t.copy())
+    _mta_launch(
+        e.kind,
+        _variant(e, inplace),
+        p.lists,
+        out_ts,
+        role_scalars,
+        device_addr,
+        0,
+    )
+    if inplace:
+        # A `Tensor(a!)[]` gets no ADInplaceOrView bump: one per entry here.
+        for t in selves:
+            t.bump_version()
         return
-    for i in range(len(self_list)):
-        _seq_addcmul_(self_list[i], t1_list[i], t2_list[i], value_v)
+    var result = List[T]()
+    for i in range(len(outs)):
+        result.append(outs[i].take())
+    ret_tensor_list(rets, 0, result)
+
+
+# --- the slow route: ATen's own per-tensor composition ------------------------
+
+
+def _per_tensor_args(
+    e: ForeachOverload, p: _ForeachArgs, i: Int
+) -> List[Value]:
+    var s = e.shape
+    var out = List[Value](capacity=4)
+    if s == S_RPOW:
+        out.append(p.scalar.copy())
+        out.append(_tensor_value(p.lists[0][i]))
+        return out^
+    out.append(_tensor_value(p.lists[0][i]))
+    if s == S_SCALAR or s == S_SCALARLIST:
+        out.append(p.scalar_at(e, i))
+        if e.alpha:
+            out.append(_int_scalar(1))
+    elif s == S_LIST:
+        out.append(_tensor_value(p.lists[1][i]))
+        if e.alpha:
+            out.append(p.alpha.copy())
+    elif s == S_TENSOR:
+        out.append(_tensor_value(p.other[0]))
+        if e.alpha:
+            out.append(p.alpha.copy())
+    elif s == S_LERP_LIST:
+        out.append(_tensor_value(p.lists[1][i]))
+        out.append(_tensor_value(p.lists[2][i]))
+    elif s == S_LERP_SCALAR or s == S_LERP_SCALARLIST:
+        out.append(_tensor_value(p.lists[1][i]))
+        out.append(p.scalar_at(e, i))
+    elif s != S_UNARY:  # pointwise
+        out.append(_tensor_value(p.lists[1][i]))
+        out.append(_tensor_value(p.lists[2][i]))
+        out.append(p.scalar_at(e, i))
+    return out^
+
+
+def _per_tensor(
+    e: ForeachOverload, inplace: Bool, p: _ForeachArgs, rets: Values
+) raises:
+    var op = String(e.op_ if inplace else e.op)
+    var overload = String(e.overload_ if inplace else e.overload)
+    var results = List[Owned]()
+    for i in range(len(p.lists[0])):
+        var r = call_op(op, overload, _per_tensor_args(e, p, i), 1)
+        if not inplace:
+            results.append(own(r.take_tensor(0)))
+    if inplace:
+        return
+    var result = List[T]()
+    for i in range(len(results)):
+        result.append(results[i].take())
+    ret_tensor_list(rets, 0, result)
+
+
+def _scalar_twin(e: ForeachOverload) -> ForeachOverload:
+    """The `.Scalar` overload a `.Tensor` row (mul, div) runs when its
+    operand is a CPU tensor: ForeachBinaryOpScalarTensor.cu calls
+    `foreach_tensor_<op>_scalar_kernel_cuda(tensors, scalar.item())`, and
+    div's Scalar overload is the multiply by the reciprocal. Built from the
+    row itself, so a functional and an in-place row both map to their own
+    form."""
+    var div = e.kind == "div"
+    return ForeachOverload(
+        e.name,
+        e.name_,
+        "mul" if div else e.kind,
+        S_SCALAR,
+        "aten::mul" if div else e.op,
+        "Scalar",
+        "aten::mul_" if div else e.op_,
+        "Scalar",
+        e.dtypes,
+        e.f64,
+        e.alpha,
+        div,
+        e.apple,
+    )
+
+
+def _foreach(
+    e: ForeachOverload, inplace: Bool, args: Values, rets: Values
+) raises:
+    var p = _ForeachArgs(e, args)
+    if e.shape == S_TENSOR and p.other[0].on_cpu() and not e.alpha:
+        # mul / div by a CPU tensor: CUDA takes its `item()` and runs the
+        # Scalar overload (div's being the reciprocal multiply).
+        ref other = p.other[0]
+        if other.numel != 1:
+            raise Error(
+                "a Tensor with ",
+                other.numel,
+                " elements cannot be converted to Scalar",
+            )
+        var scalar_row = _scalar_twin(e)
+        p.scalar = _cpu_element(other, 0)
+        p.other = List[T]()
+        if scalar_row.reciprocal:
+            p.scalar = _reciprocal(p.scalar)
+        p.check(scalar_row)
+        if _fast_route(scalar_row, inplace, p):
+            _launch(scalar_row, inplace, p, rets)
+        else:
+            _per_tensor(scalar_row, inplace, p, rets)
+        return
+    p.check(e)
+    if e.shape == S_TENSOR:
+        ref other = p.other[0]
+        if other.rank != 0 or other.numel != 1:
+            # The in-place fast kernel words it without "it"
+            # (ForeachBinaryOpScalarTensor.cu's foreach_binary_op_).
+            var fast_inplace = (
+                inplace
+                and other.dtype == p.lists[0][0].dtype
+                and _lists_on_route(p.lists)
+            )
+            raise Error(
+                "scalar tensor expected to be 0 dim but has " if fast_inplace else (
+                    "scalar tensor expected to be 0 dim but it has "
+                ),
+                other.rank,
+                " dimensions and ",
+                other.numel,
+                " elements.",
+            )
+    if e.reciprocal:
+        p.scalar = _reciprocal(p.scalar)
+    if _fast_route(e, inplace, p):
+        _launch(e, inplace, p, rets)
+    else:
+        _per_tensor(e, inplace, p, rets)
+
+
+def op_foreach[
+    row: Int, inplace: Bool
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """Every row of FOREACH_OVERLOADS, functional and in place."""
+    comptime e = FOREACH_OVERLOADS[row]
+    _foreach(e, inplace, args, rets)
+
+
+def foreach_addc_inplace(
+    dest: T, t1: T, t2: T, value: Float64, multiplies: Bool
+) raises:
+    """`dest += value * (t1 * t2)` (or `/`) as a one-tensor multi-tensor
+    apply: the per-tensor addcmul_ / addcdiv_ route for same-dtype dense
+    operands of one layout (tmb/ops/binary.mojo). Its version bump is the
+    caller's dispatcher's."""
+    var lists = List[List[T]]()
+    lists.append([dest.copy()])
+    lists.append([t1.copy()])
+    lists.append([t2.copy()])
+    var scalars = List[Int]()
+    scalars.append(Int(f64_bits(value)))
+    _mta_launch(
+        "addcmul" if multiplies else "addcdiv",
+        fe_variant(3, False, FE_ROLE_ALPHA, False),
+        lists,
+        List[T](),
+        scalars,
+        0,
+        0,
+    )
+
+
+def foreach_lerp_inplace(dest: T, end: T, weight: Float64) raises:
+    """`dest = lerp(dest, end, weight)` as a one-tensor multi-tensor apply
+    (the per-tensor lerp_.Scalar route of tmb/ops/binary.mojo)."""
+    var lists = List[List[T]]()
+    lists.append([dest.copy()])
+    lists.append([end.copy()])
+    var scalars = List[Int]()
+    scalars.append(Int(f64_bits(weight)))
+    _mta_launch(
+        "lerp",
+        fe_variant(2, False, FE_ROLE_C, False),
+        lists,
+        List[T](),
+        scalars,
+        0,
+        0,
+    )
+
+
+# --- ops -------------------------------------------------------------------
 
 
 def _batch_copy_dtype(dt: DType) -> Bool:
@@ -768,45 +1215,6 @@ def op_foreach_copy_(
         _ = call_op("aten::copy_", "", copy_args^, 1)
 
 
-# aten::_foreach_lerp_.Scalar(Tensor(a!)[] self, Tensor[] tensors1, Scalar weight) -> ()
-def op_foreach_lerp_scalar_(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var self_list = v_tensor_list(args[unsafe_offset=0])
-    var end_list = v_tensor_list(args[unsafe_offset=1])
-    if len(self_list) == 0:
-        raise Error("Tensor list must have at least one tensor.")
-    if len(end_list) != len(self_list):
-        raise Error("Tensor lists must have the same number of tensors.")
-    var weight_v = args[unsafe_offset=2].copy()
-    if (
-        not v_scalar_is_bool(weight_v)
-        and _qualifies2(self_list, end_list, False)
-        and not _self_overlaps(self_list)
-        and not _overlaps_any(self_list, end_list)
-    ):
-        _foreach_lerp_launch(self_list, end_list, v_f64(weight_v))
-        return
-    for i in range(len(self_list)):
-        _seq_lerp_scalar_(self_list[i], end_list[i], weight_v)
-
-
-# aten::_foreach_sqrt(Tensor[] self) -> Tensor[]
-def op_foreach_sqrt(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var self_list = v_tensor_list(args[unsafe_offset=0])
-    if len(self_list) == 0:
-        raise Error("Tensor list must have at least one tensor.")
-    if _qualifies1(self_list, False):
-        ret_tensor_list(rets, 0, _foreach_sqrt_launch(self_list))
-        return
-    var result = List[T]()
-    for t in self_list:
-        result.append(_seq_sqrt(t))
-    ret_tensor_list(rets, 0, result)
-
-
 # aten::_foreach_norm.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]
 def op_foreach_norm_scalar(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -868,31 +1276,22 @@ def _unscale_dtype_ok(t: T) raises -> Bool:
 
 
 def _unscale_launch(tensors: List[T], inv_scale: T, found_inf: T) raises:
-    """One batched launch over same-dtype tensors whose elements are dense:
-    the math is elementwise, so any stride permutation of a dense tensor is
-    the same `numel` elements from its data pointer."""
-    var metadata = List[Int]()
-    for t in tensors:
-        metadata.append(t.ptr)
-        metadata.append(t.numel)
-    var aux = List[Int]()
-    aux.append(inv_scale.ptr)
-    aux.append(found_inf.ptr)
-    var dtype = tensors[0].dtype
-    var ctx = ctx_for(tensors[0].device)
-    var cp = ctx_ptr(ctx)
-    var call = KernelCall("optimizer", "ForeachNonFiniteUnscale")
-    call.arg_dtype(0, dtype)
-    call.out_dtype(dtype)
-    call.tuple(metadata)
-    call.tuple(List[Int]())
-    call.tuple(aux)
-    call.int(dtype_code(dtype))
-    call.int(cp)
-    call.run()
+    """One multi-tensor apply over same-dtype tensors whose elements are
+    dense: the math is elementwise, so any stride permutation of a dense
+    tensor is the same `numel` elements from its data pointer."""
+    var lists = List[List[T]]()
+    lists.append(tensors.copy())
+    _mta_launch(
+        "nonfinite_unscale",
+        fe_variant(1, False, FE_ROLE_NONE, False),
+        lists,
+        List[T](),
+        List[Int](),
+        inv_scale.ptr,
+        found_inf.ptr,
+    )
     for t in tensors:
         t.bump_version()
-    _ = ctx
 
 
 # aten::_amp_foreach_non_finite_check_and_unscale_(Tensor(a!)[] self,
@@ -1451,13 +1850,13 @@ def register_foreach(site: Site) raises:
     ](site)
     impl[op_amp_update_scale_, "_amp_update_scale_"](site)
     impl[op_foreach_copy_, "_foreach_copy_"](site)
-    impl[op_foreach_add_scalar_, "_foreach_add_.Scalar"](site)
-    impl[op_foreach_addcmul_scalar_, "_foreach_addcmul_.Scalar"](site)
-    impl[op_foreach_lerp_scalar_, "_foreach_lerp_.Scalar"](site)
-    impl[op_foreach_mul_scalar_, "_foreach_mul_.Scalar"](site)
-    impl[op_foreach_mul_tensor_, "_foreach_mul_.Tensor"](site)
     impl[op_foreach_norm_scalar, "_foreach_norm.Scalar"](site)
-    impl[op_foreach_sqrt, "_foreach_sqrt"](site)
+    comptime for row in range(len(FOREACH_OVERLOADS)):
+        comptime e = FOREACH_OVERLOADS[row]
+        comptime if e.name != "":
+            impl[op_foreach[row, False], e.name](site)
+        comptime if e.name_ != "":
+            impl[op_foreach[row, True], e.name_](site)
     impl[op_fused_adam_, "_fused_adam_"](site)
     impl[op_fused_adam_, "_fused_adam_.tensor_lr"](site)
     impl[op_fused_adamw_, "_fused_adamw_"](site)
@@ -1466,6 +1865,3 @@ def register_foreach(site: Site) raises:
     impl[op_fused_sgd_, "_fused_sgd_.tensor_lr"](site)
     impl[op_fused_adagrad_, "_fused_adagrad_"](site)
     impl[op_fused_adagrad_, "_fused_adagrad_.tensor_lr"](site)
-    # _foreach_div_.ScalarList / _foreach_addcdiv_.ScalarList: intentionally
-    # unregistered -- see the module docstring (Scalar[] cannot be marshalled
-    # by the current C++ shim).

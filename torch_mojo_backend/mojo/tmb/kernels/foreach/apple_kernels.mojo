@@ -1,25 +1,25 @@
-"""Fixed-arity batched FP32 foreach elementwise kernels: the APPLE half.
+"""Fixed-arity batched FP32 foreach kernels: the APPLE half of the family.
 
-Every op here is also served by the single descriptor-batched body in
-`foreach_batched_kernels`, which is the route on CUDA and ROCm and the one to
-change when the element math changes. These exist because Metal cannot take
-that route: Metal only translates pointer-typed kernel *arguments* into valid
-GPU addresses, and a raw address smuggled as data (a descriptor struct or an
-Int) reads back zeros — while per-tensor launches are dispatch bound for
-optimizer-sized tensor lists.
+Everywhere else the generic multi-tensor apply in `apply.mojo` runs every
+foreach overload. Metal cannot take that route: it only translates
+pointer-typed kernel *arguments* into valid GPU addresses, and a raw address
+smuggled as data (a descriptor struct or an Int) reads back zeros -- while
+per-tensor launches are dispatch bound for optimizer-sized tensor lists.
 
 So each kernel here takes a fixed arity of FOREACH_EW_SLOTS real pointer
 arguments per tensor list plus per-slot chunk offsets/lengths as plain data
-(non-pointer data passes fine, in fixed-width form — see `_SlotInts`), and one
+(non-pointer data passes fine, in fixed-width form -- see `_SlotInts`), and one
 launch covers up to FOREACH_EW_SLOTS tensors, grid-strided over the
 concatenation of their fixed-size chunks.
 Unused slots repeat a valid pointer with length zero and are never
-dereferenced. `foreach_ew_enqueue` does the regrouping from the shared
-descriptors.
+dereferenced. `apply.foreach_apply_apple` does the regrouping from the shared
+descriptors, for the overloads the host routes here (`ops/foreach.mojo`'s
+`metal` column): the in-place Scalar add/mul/div, the 0-d tensor mul, the
+Scalar addcmul/addcdiv and lerp, sqrt, and GradScaler's unscale.
 
 Element math deliberately mirrors the scalar eager kernels these ops fall
 back to (`elementwise`/`logic`), keeping the batched path
-bit-compatible with the sequential per-tensor decomposition.
+bit-compatible with the sequential per-tensor decomposition on Apple.
 """
 
 from std.collections import Array
@@ -480,62 +480,6 @@ def _foreach_sqrt_kernel(
             in_values[unsafe_offset=index]
         )
         index += FOREACH_EW_THREADS
-
-
-def _gather_scalars_kernel(
-    out_ptr: _MutPtr,
-    s0: _ImmutPtr,
-    s1: _ImmutPtr,
-    s2: _ImmutPtr,
-    s3: _ImmutPtr,
-    s4: _ImmutPtr,
-    s5: _ImmutPtr,
-    s6: _ImmutPtr,
-    s7: _ImmutPtr,
-    base_arg: Int64,
-    count_arg: Int64,
-):
-    """out[base + i] = s_i[0]: one batched launch replaces per-scalar copies
-    (the `stack` of foreach-norm outputs in gradient clipping)."""
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var base = Int(base_arg)
-    var count = Int(count_arg)
-    var i = Int(thread_idx.x)
-    if i < count:
-        out_ptr[unsafe_offset=base + i] = _pick_immut(
-            i, s0, s1, s2, s3, s4, s5, s6, s7
-        )[unsafe_offset=0]
-
-
-def enqueue_foreach_gather_scalars_f32(
-    out_addr: Int,
-    in_addrs: Array[Int, FOREACH_EW_SLOTS],
-    base: Int,
-    count: Int,
-    ctx: DeviceContext,
-) raises:
-    comptime if has_accelerator():
-        _enqueue_cached[_gather_scalars_kernel](
-            ctx,
-            1,
-            1,
-            1,
-            FOREACH_EW_SLOTS,
-            _addr_ptr(out_addr),
-            _addr_ptr(in_addrs[0]).as_imm(),
-            _addr_ptr(in_addrs[1]).as_imm(),
-            _addr_ptr(in_addrs[2]).as_imm(),
-            _addr_ptr(in_addrs[3]).as_imm(),
-            _addr_ptr(in_addrs[4]).as_imm(),
-            _addr_ptr(in_addrs[5]).as_imm(),
-            _addr_ptr(in_addrs[6]).as_imm(),
-            _addr_ptr(in_addrs[7]).as_imm(),
-            Int64(base),
-            Int64(count),
-        )
-    else:
-        raise Error("no GPU accelerator available at compile time")
 
 
 def enqueue_foreach_scalar_f32[
