@@ -121,10 +121,26 @@ def _f8_refuse(op: String, dt: DType) raises:
         )
 
 
-def _f8_out_refuse(op: String, t: T, mut dst: T) raises:
-    """A float8 `out=` route: TensorIterator resizes `out` before the kernel
-    dispatch refuses."""
+def _f8_out_refuse(op: String, t: T, mut dst: T, same_dtype: Bool) raises:
+    """A float8 `out=` route in TensorIterator's order: the out dtype check
+    (a `unary_op` wants the input's own dtype, a `unary_float_op` one the
+    result can cast to) leaves `out` untouched; then `out` is resized; then
+    the kernel dispatch refuses."""
     if is_float8(t.dtype):
+        if same_dtype and dst.stype != t.stype:
+            raise Error(
+                "Found dtype ",
+                _scalar_type_name(dst.dtype),
+                " but expected ",
+                _scalar_type_name(t.dtype),
+            )
+        if not same_dtype and not can_cast(t.stype, dst.stype):
+            raise Error(
+                "result type ",
+                _scalar_type_name(t.dtype),
+                " can't be cast to the desired output type ",
+                _scalar_type_name(dst.dtype),
+            )
         if not dst.same_shape(t):
             resize_out(dst, t.shape, t.rank)
         _f8_refuse(op, t.dtype)
@@ -320,7 +336,7 @@ def _float_unary(op: String, t: T) raises -> T:
 
 
 def _float_unary_out(op: String, t: T, mut dst: T) raises:
-    _f8_out_refuse(op, t, dst)
+    _f8_out_refuse(op, t, dst, op == "SiluSpec")
     _require_float(op, t.dtype)
     # silu is a `unary_op` structured kernel (the out dtype is self's); the
     # rest are `unary_float_op`s, which cast.
@@ -333,7 +349,7 @@ def _direct_unary(op: String, t: T) raises -> T:
 
 
 def _direct_unary_out(op: String, t: T, mut dst: T) raises:
-    _f8_out_refuse(op, t, dst)
+    _f8_out_refuse(op, t, dst, True)
     _require_direct(op, t.dtype)
     _unary_out("elementwise", op, t, dst, t.dtype)
 
@@ -1372,7 +1388,7 @@ def _promoting_unary(op: String, t: T) raises -> T:
 
 def _promoting_unary_out(op: String, t: T, mut dst: T) raises:
     # Every op here is a `unary_float_op`: its result casts into `out`.
-    _f8_out_refuse(op, t, dst)
+    _f8_out_refuse(op, t, dst, False)
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":
         _float_or_f64_unary_out(op, src.t, dst, True)
@@ -1882,6 +1898,17 @@ def op_nan_to_num_out(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=4])
+    if is_float8(t.dtype):
+        # nan_to_num_out's own dtype check, then the resize, then
+        # nan_to_num_cuda's dispatch (no float8 case).
+        if dst.stype != t.stype:
+            raise Error(
+                "nan_to_num: dtype of out: ",
+                _scalar_type_name(dst.dtype),
+                " should be same as input: ",
+                _scalar_type_name(t.dtype),
+            )
+        _f8_out_refuse("nan_to_num", t, dst, True)
     if _is_bitwise_dtype(t.dtype):
         _identity_into(t, dst)
         ret_ref(rets, 0, dst)

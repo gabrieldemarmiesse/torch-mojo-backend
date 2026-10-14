@@ -104,6 +104,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.ops.common import (
+    promote_types,
     _repeats_elements,
     decline_float8,
     scalar_type_name,
@@ -901,6 +902,11 @@ def _cat_impl(ins: List[T], dim: Int) raises -> Owned:
         raise Error("cat: dim out of range")
     for i in range(1, n):
         var b = ins[i].copy()
+        if b.dtype != first.dtype and (
+            is_float8(b.dtype) or is_float8(first.dtype)
+        ):
+            # cat's result_type: c10's float8 promotion error (RuntimeError).
+            _ = promote_types(first.stype, b.stype)
         if b.dtype != first.dtype or b.device != first.device or b.rank != rank:
             unsupported("aten::cat/stack with mismatched dtype/device/rank")
         for d in range(rank):
