@@ -1225,3 +1225,75 @@ def test_fill_a_host_tensor_with_a_device_value(mojo_gpu: str):
     t = torch.zeros(3)
     t.fill_(torch.tensor(2.0, device=mojo_gpu))
     assert t.tolist() == [2.0, 2.0, 2.0]
+
+
+# --- uint64 fill values, masked_fill out dtypes, half masked_fill rounding ------
+
+
+@pytest.mark.parametrize("host_self", [True, False])
+def test_uint64_fill_values_are_read_unsigned(mojo_gpu: str, host_self: bool):
+    big = torch.tensor(2**63, dtype=torch.uint64)
+    value = big.to(mojo_gpu) if host_self else big
+
+    def target(dt: torch.dtype) -> torch.Tensor:
+        return (
+            torch.zeros(1, dtype=dt)
+            if host_self
+            else torch.zeros(1, dtype=dt, device=mojo_gpu)
+        )
+
+    assert target(torch.float64).fill_(value).cpu().item() == 2.0**63
+    assert target(torch.uint64).fill_(value).cpu().item() == 2**63
+    assert target(torch.bool).fill_(value).cpu().item() is True
+    for dt in (torch.int64, torch.int32):
+        t = target(dt)
+        with pytest.raises(RuntimeError, match="without overflow"):
+            t.fill_(value)
+        assert t.cpu().item() == 0
+
+
+@pytest.mark.parametrize(
+    "out_dtype", [torch.int32, torch.float64, torch.complex64, torch.bool]
+)
+def test_masked_fill_out_resizes_before_its_dtype_check(
+    mojo_gpu: str, out_dtype: torch.dtype
+):
+    m = torch.ones(2, dtype=torch.bool, device=mojo_gpu)
+    for call in (
+        lambda o: torch.ops.aten.masked_fill.Scalar_out(
+            torch.zeros(2, device=mojo_gpu), m, 5 + 0j, out=o
+        ),
+        lambda o: torch.ops.aten.masked_fill.Tensor_out(
+            torch.zeros(2, device=mojo_gpu), m, torch.tensor(5 + 0j), out=o
+        ),
+        lambda o: torch.ops.aten.masked_fill.Scalar_out(
+            torch.zeros(2, device=mojo_gpu), m, 5.0, out=o
+        ),
+        lambda o: torch.ops.aten.masked_fill.Tensor_out(
+            torch.zeros(2, device=mojo_gpu), m, torch.tensor(5.0), out=o
+        ),
+    ):
+        out = torch.empty(0, dtype=out_dtype, device=mojo_gpu)
+        with pytest.raises(
+            RuntimeError, match="Expected out tensor to have dtype float"
+        ):
+            call(out)
+        assert out.shape == (2,)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "value"),
+    [(torch.float16, 1 + 2**-11 + 2**-30), (torch.bfloat16, 1 + 2**-8 + 2**-30)],
+)
+def test_real_masked_fill_rounds_half_through_float(
+    mojo_gpu: str, dtype: torch.dtype, value: float
+):
+    want = torch.tensor(value, dtype=torch.float64).to(dtype).item()
+    m = torch.ones(3, dtype=torch.bool, device=mojo_gpu)
+    got = torch.zeros(3, dtype=dtype, device=mojo_gpu).masked_fill_(m, value)
+    assert got.cpu().tolist() == [want] * 3
+    out = torch.empty(3, dtype=dtype, device=mojo_gpu)
+    torch.ops.aten.masked_fill.Scalar_out(
+        torch.zeros(3, dtype=dtype, device=mojo_gpu), m, value, out=out
+    )
+    assert out.cpu().tolist() == [want] * 3

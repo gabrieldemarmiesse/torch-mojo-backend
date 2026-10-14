@@ -39,6 +39,10 @@ from tmb.backend.abi import (
     IntList,
     Owned,
     ST_BOOL,
+    ST_UINT64,
+    is_complex_stype,
+    TAG_SCALAR_DOUBLE,
+    f64_bits,
     ST_INT64,
     T,
     TAG_MEMORY_FORMAT,
@@ -88,6 +92,8 @@ from tmb.ops.complex import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    is_float_stype,
+    scalar_type_token,
     check_real_scalar_fits,
     check_uint64_fill,
     assert_no_internal_overlap,
@@ -2143,11 +2149,21 @@ def op_fill__tensor(
     # The value is read once, on the host (a device value costs one sync,
     # where CUDA copies on the stream), then filled with fill_.Scalar's
     # conversion rules. Reading it first also covers a value aliasing self.
-    var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+    var item: Value
+    if value.on_cpu() and value.stype == ST_UINT64:
+        # (a host uint64 item() is a UInt Scalar the call boundary does not
+        # carry: read the 64 bits directly)
+        var bits = Pointer[Int64, MutUntrackedOrigin](
+            unsafe_from_address=value.ptr
+        )[]
+        item = _unsigned_item(value, Value(TAG_SCALAR_INT, 0, bits, 0), t.stype)
+    else:
+        var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+        item = _unsigned_item(value, r[0], t.stype)
     if not t.on_mojo():
         # a host self with a device 0-d value: its item() fills it (fill_'s
         # own route for a 0-d value on another device)
-        _ = call_op("aten::fill_", "Scalar", [tensor_arg(t), r[0].copy()], 1)
+        _ = call_op("aten::fill_", "Scalar", [tensor_arg(t), item.copy()], 1)
         ret_ref(rets, 0, t)
         return
     if value.on_mojo() and value.device == t.device:
@@ -2158,10 +2174,33 @@ def op_fill__tensor(
         # A value on another device (the CPU or another GPU) goes through
         # `fill_(Scalar)`, whose `Scalar::to<scalar_t>()` raises on overflow.
         # (one checked conversion for fill_: the Scalar route's)
-        check_real_scalar_fits(t.stype, r[0])
-        check_uint64_fill(t.stype, r[0], t.numel)
-    fill_value(t, r[0])
+        check_real_scalar_fits(t.stype, item)
+        check_uint64_fill(t.stype, item, t.numel)
+    fill_value(t, item)
     ret_ref(rets, 0, t)
+
+
+def _unsigned_item(value: T, item: Value, dst: Int32) raises -> Value:
+    """A uint64 value's item() arrives as int64 bits: read it unsigned. Past
+    int64's range it fits no signed or narrower integer dtype (CUDA's
+    checked conversion raises) and becomes a double for a float one."""
+    if value.stype != ST_UINT64 or item.a >= 0:
+        return item.copy()
+    var u = UInt64(item.a)
+    if (
+        dst != ST_UINT64
+        and dst != ST_BOOL
+        and not is_float_stype(dst)
+        and not is_complex_stype(dst)
+    ):
+        raise Error(
+            "value cannot be converted to type ",
+            scalar_type_token(dst),
+            " without overflow",
+        )
+    if dst == ST_UINT64:
+        return item.copy()  # the same 64 bits
+    return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(Float64(u)), 0)
 
 
 def register_indexing(site: Site) raises:
