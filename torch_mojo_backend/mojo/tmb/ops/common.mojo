@@ -50,6 +50,9 @@ from tmb.backend.abi import (
     v_scalar_is_integral,
     v_tensor,
     ret_ref,
+    tensor_arg,
+    TAG_TENSOR,
+    TAG_TENSOR_REF,
     v_int,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
@@ -91,6 +94,9 @@ def copy_strided_into(dst: T, src: T) raises:
     """
     if src.stype != dst.stype:
         raise Error("copy_strided_into: dtype mismatch")
+    if not dst.on_mojo() or not src.on_mojo() or dst.device != src.device:
+        # Never hand a host buffer (or another device's) to the kernel.
+        raise Error("copy_strided_into: tensors on different devices")
     if not dst.same_shape(src):
         raise Error(
             "copy_strided_into: shape mismatch, destination ",
@@ -1267,18 +1273,90 @@ def threshold_into_overlapping(
     overlapping out= (an expanded one) takes the functional result, copied
     in. False when out is an ordinary tensor."""
     var dst = v_tensor(out_v)
-    if dst.numel == 0 or not _repeats_elements(dst):
+    if not dst.on_mojo():
         return False
+    var self0 = v_tensor(args[unsafe_offset=0])
+    if op == "aten::threshold" and self0.on_cpu() and self0.rank == 0:
+        # threshold's iterator adds self twice (self, other).
+        raise Error("Trying to pass too many CPU scalars to non-CPU kernel!")
+    # Taken when out differs from the plain case: aliasing itself or an
+    # input (no overlap check here), or of another dtype than an input
+    # (the kernel dispatches on out's dtype).
+    var special = dst.numel > 0 and _repeats_elements(dst)
+    for i in range(n_in):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            var t = v_tensor(v)
+            if t.stype != dst.stype or (
+                t.on_mojo() and overlap_status(dst, t) != OVERLAP_NO
+            ):
+                special = True
+    if not special:
+        return False
+    # TensorIterator's sequence for this out= (threshold's config: inputs
+    # promoted to their common dtype, the kernel dispatched on the out
+    # dtype, safe casting enforced): every operand on out's device, the
+    # common dtype castable to out's, the broadcast shape out's own.
+    var common = ST_UNDEFINED
+    var n_t = 0
+    var first = v_tensor(args[unsafe_offset=0])
+    for i in range(n_in):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
+            continue
+        var t = v_tensor(v)
+        if not t.on_mojo() or t.device != dst.device:
+            raise Error(
+                "Expected all tensors to be on the same device, but found at",
+                " least two devices, ",
+                device_str(dst),
+                " and ",
+                device_str(t),
+                "!",
+            )
+        if not t.same_shape(first):
+            return False
+        common = t.stype if n_t == 0 else result_type(first, t)
+        if n_t == 0:
+            first = t.copy()
+        n_t += 1
+    if n_t == 0:
+        return False
+    if not can_cast(common, dst.stype):
+        raise Error(
+            "result type ",
+            scalar_type_name(max_dtype(common)),
+            " can't be cast to the desired output type ",
+            scalar_type_name(dst.dtype),
+        )
+    var aliased = False
+    for i in range(n_in):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            if v_tensor(v).impl() == dst.impl():
+                aliased = True
+    if not dst.same_shape(first):
+        if aliased:
+            return False  # the read-write shape error of the plain path
+        resize_out(dst, first.shape, first.rank)
+    # Computed in out's dtype: every operand converted to it first.
+    var held = List[Owned]()
     var call_args = List[Value]()
     for i in range(n_in):
-        call_args.append(args[unsafe_offset=i].copy())
+        var v = args[unsafe_offset=i].copy()
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            var t = v_tensor(v)
+            if t.stype != dst.stype:
+                held.append(own(cast_to(t, dst.stype, False)))
+                call_args.append(tensor_arg(held[len(held) - 1].t))
+                continue
+        call_args.append(v^)
     var r = call_op(String(op), "", call_args^, 1)
     var res = own(r.take_tensor(0))
-    if not res.t.same_shape(dst):
-        return False
-    var c = own_if_new(cast_to(res.t, dst.stype, False), res.t)
-    copy_strided_into(dst, c.t)
-    _ = c^
+    _ = held^
+    if res.t.stype != dst.stype or not res.t.same_shape(dst):
+        raise Error("internal: threshold result does not match out")
+    copy_strided_into(dst, res.t)
     _ = res^
     ret_ref(rets, 0, dst)
     return True

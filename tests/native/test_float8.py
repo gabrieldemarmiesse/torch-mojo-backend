@@ -12,6 +12,7 @@ stock-CUDA saturation rule applied where it differs (`_stock_cast`).
 import itertools
 import json
 import pathlib
+import re
 
 import pytest
 import torch
@@ -1580,8 +1581,31 @@ _F8_ITER = json.loads(
 _KNOWN = set(_F8_ITER["known_differences"])
 
 
+# The JSON holds what the installed stock CUDA torch (2.11) prints; where
+# torch 2.14's source changes the outcome, the mojo device follows 2.14 and
+# this maps the measured line to the 2.14 one (ldexp's _ldexp_int_exponent
+# fast path also wants out.dtype == self.dtype since 2.14; otherwise the
+# fallback's _pow2 meets the float8 promotion error, out untouched).
+_V214 = _F8_ITER["torch_2_14_overrides"]
+
+
+_FLOAT_LIT = re.compile(r"-?\d+\.\d+(?:e[+-]?\d+)?|-?\d+e[+-]?\d+")
+
+
+def _hw_free(line):
+    """A line with its non-float8 float values rounded to 5 significant
+    digits and signed zeros folded: transcendental results (and the sign of
+    a zero computed as a difference) may differ in the last ulp between GPU
+    generations (H100 vs L4). float8 values compare exactly as bytes."""
+    return _FLOAT_LIT.sub(lambda m: format(float(m.group()) + 0.0, ".5g"), line)
+
+
 def _compare(got, want):
-    pairs = [(g, w) for g, w in zip(got, want, strict=True) if w not in _KNOWN]
+    pairs = [
+        (_hw_free(g), _hw_free(_V214.get(w, w)))
+        for g, w in zip(got, want, strict=True)
+        if w not in _KNOWN
+    ]
     assert [g for g, _ in pairs] == [w for _, w in pairs]
 
 
@@ -2204,3 +2228,95 @@ def test_float8_round13_shapes_match_stock_cuda(mojo_device):
 )
 def test_float8_round13_data_regenerates_on_stock_cuda():
     assert list(_r13_lines("cuda")) == _F8_ITER["round13"]
+
+
+def _r14_lines(dev):
+    """threshold's iterator config (inputs promoted, kernel dispatched on the
+    out dtype, no overlap check, safe casting) for every out= shape;
+    softshrink_check's lambda range; ldexp's 2.14 fast-path condition."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+
+    def run(name, fn, o=None):
+        return f"{name} {_act_res(fn)} | {tuple(o.shape) if o is not None else ''}"
+
+    x = torch.full((4,), 1.0001, device=dev)
+    ones = torch.ones(4, device=dev)
+    for odt in (torch.float16, torch.bool, torch.float32, f8, torch.int32):
+        o = torch.empty(1, dtype=odt, device=dev).expand(4)
+        yield run(f"thr_exp_{odt}", lambda: a.threshold.out(x, 1.00005, 0.5, out=o), o)
+        o = torch.empty(4, dtype=odt, device=dev)
+        yield run(
+            f"thr_plain_{odt}", lambda: a.threshold.out(x, 1.00005, 0.5, out=o), o
+        )
+        o = torch.empty(1, dtype=odt, device=dev).expand(4)
+        yield run(
+            f"thrb_exp_{odt}",
+            lambda: a.threshold_backward.grad_input(ones, x, 1.00005, grad_input=o),
+            o,
+        )
+        o = torch.empty(1, dtype=odt, device=dev).expand(4)
+        yield run(f"thr_ones_exp_{odt}", lambda: a.threshold.out(ones, 2, -2, out=o), o)
+    for lam in (-1.0, float("nan"), 1e39, 0.5):
+        for odt in (f8, torch.float32):
+            o = torch.empty(0, dtype=odt, device=dev)
+            yield run(
+                f"softshrink_f32_lam{lam}_{odt}",
+                lambda: a.softshrink.out(ones, lam, out=o),
+                o,
+            )
+        o = torch.empty(0, dtype=f8, device=dev)
+        h = torch.ones(4, device=dev, dtype=torch.float16)
+        yield run(
+            f"softshrink_f16_lam{lam}", lambda: a.softshrink.out(h, lam, out=o), o
+        )
+        yield run(f"softshrink_fn_f32_lam{lam}", lambda: a.softshrink(ones, lam))
+    x8 = torch.ones(2).to(f8).to(dev)
+    i32 = torch.ones(2, dtype=torch.int32, device=dev)
+    for odt in (torch.float32, f8, torch.float16):
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield run(f"ldexp_f8_i32_out_{odt}", lambda: torch.ldexp(x8, i32, out=o), o)
+    e5 = torch.ones(2).to(torch.float8_e5m2).to(dev)
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield run("ldexp_e5_i32_out_e4", lambda: torch.ldexp(e5, i32, out=o), o)
+    ar = torch.arange(4.0, device=dev)
+    o = torch.empty(1, device=dev).expand(4)
+    yield run(
+        "thr_cpu_self_exp_out",
+        lambda: a.threshold.out(torch.arange(4.0), 1.5, -1, out=o),
+        o,
+    )
+    o = torch.empty(1, device=dev).expand(4)
+    yield run(
+        "thrb_cpu_grad_exp_out",
+        lambda: a.threshold_backward.grad_input(
+            torch.arange(4.0), ar, 1.5, grad_input=o
+        ),
+        o,
+    )
+    b = torch.arange(4.0, device=dev)
+    yield run("thr_partial", lambda: a.threshold.out(b[:3], 1.5, -1, out=b[1:]), b)
+    e = torch.zeros(1, device=dev).expand(4)
+    yield run("thr_inplace_expanded", lambda: a.threshold_(e, 1.5, -1), e)
+    o = torch.empty(1, device=dev).expand(3)
+    yield run("thr_exp_wrong_shape", lambda: a.threshold.out(ar, 1.5, -1, out=o), o)
+    o = torch.empty(0, device=dev)
+    yield run(
+        "thr_cpu0d_f32_self",
+        lambda: a.threshold.out(torch.tensor(1.0), 1.5, -1, out=o),
+        o,
+    )
+    o = torch.empty(0, device=dev)
+    i4 = torch.ones(4, dtype=torch.int32, device=dev)
+    yield run("softshrink_i32_f32out", lambda: a.softshrink.out(i4, 0.5, out=o), o)
+    yield run("softshrink_i32_fn", lambda: a.softshrink(i4, 0.5))
+
+
+def test_float8_round14_shapes_match_stock_cuda(mojo_device):
+    _compare(list(_r14_lines(mojo_device)), _F8_ITER["round14"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_float8_round14_data_regenerates_on_stock_cuda():
+    assert list(_r14_lines("cuda")) == _F8_ITER["round14"]
