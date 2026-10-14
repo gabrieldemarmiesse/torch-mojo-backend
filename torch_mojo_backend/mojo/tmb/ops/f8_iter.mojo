@@ -67,6 +67,7 @@ comptime MODE_SAME = 2  # out must hold the common dtype ("Found dtype")
 comptime MODE_NOCHECK = 3  # any out (a bool result casts anywhere)
 comptime MODE_OUTDT = 4  # canCast; the kernel dispatches on out's dtype
 comptime MODE_INPLACE = 5  # self is out: canCast(common, self)
+comptime MODE_COPY_OUT = 6  # functional result, then resize_out + exact dtype
 
 # Checks an op makes before its TensorIterator.
 comptime PRE_NONE = 0
@@ -80,6 +81,7 @@ comptime PRE_LERP = 7  # end / weight dtypes, the weight's rank picks the mode
 comptime PRE_ALL_SAME = 8  # grad_output must have self's dtype
 comptime PRE_DISPATCH_SELF = 9  # the kernel dispatches on self's dtype
 comptime PRE_SELF_FIRST = 10  # the iterator adds self (arg 1) before arg 0
+comptime PRE_SOFTSHRINK = 11  # softshrink_check dispatches on self first
 
 comptime _MAX_ARGS = 16
 
@@ -109,6 +111,7 @@ struct _Iter(Movable):
     var shape: IndexList[MAX_RANK]
     var rank: Int
     var shape_ok: Bool
+    var err: String  # the broadcast error, when not shape_ok
 
 
 def _shape_of(args: Values, ins: Int) raises -> _Iter:
@@ -116,6 +119,7 @@ def _shape_of(args: Values, ins: Int) raises -> _Iter:
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     var ok = True
+    var err = String("")
     for i in range(_MAX_ARGS):
         if (ins >> i) & 1 == 0:
             continue
@@ -124,12 +128,23 @@ def _shape_of(args: Values, ins: Int) raises -> _Iter:
             continue
         var t = T(Int(v.a))
         rank = max(rank, t.rank)
-        for k in range(MAX_RANK):
+        # infer_size: the trailing dims first, as c10 reports them.
+        for j in range(MAX_RANK):
+            var k = MAX_RANK - 1 - j
             if shape[k] == 1:
                 shape[k] = t.shape[k]
             elif t.shape[k] != 1 and t.shape[k] != shape[k]:
+                if ok:
+                    err = (
+                        "The size of tensor a ("
+                        + String(shape[k])
+                        + ") must match the size of tensor b ("
+                        + String(t.shape[k])
+                        + ") at non-singleton dimension "
+                        + String(k - (MAX_RANK - rank))
+                    )
                 ok = False
-    return _Iter(shape, rank, ok)
+    return _Iter(shape, rank, ok, err)
 
 
 def _common_of(args: Values, ins: Int, rev: Bool = False) raises -> Int32:
@@ -163,10 +178,31 @@ def _shape_is(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
     return True
 
 
-def _same_device(args: Values, ins: Int, o: T) raises:
-    """TensorIterator's common device: every operand but a CPU 0-d one, and
-    the out, on one device."""
-    var first = String("")
+def _common_device(args: Values, ins: Int, o: T) raises -> String:
+    """TensorIterator's common device: the first operand, out first, that
+    is not on the CPU."""
+    if not o.on_cpu():
+        return device_str(o)
+    for i in range(_MAX_ARGS):
+        if (ins >> i) & 1 == 0:
+            continue
+        var v = args[unsafe_offset=i].copy()
+        if _rec_tensor(v):
+            var t = T(Int(v.a))
+            if not t.on_cpu():
+                return device_str(t)
+    return String("cpu")
+
+
+def _inputs_on_device(args: Values, ins: Int, dev: String) raises:
+    """Every input on `dev`, except one CPU 0-d scalar of an op with several
+    operands (TensorIterator's allow_cpu_scalars); more than one such
+    scalar is refused."""
+    var n_ops = 0
+    for i in range(_MAX_ARGS):
+        if (ins >> i) & 1 == 1:
+            n_ops += 1
+    var scalars = 0
     for i in range(_MAX_ARGS):
         if (ins >> i) & 1 == 0:
             continue
@@ -174,16 +210,15 @@ def _same_device(args: Values, ins: Int, o: T) raises:
         if not _rec_tensor(v):
             continue
         var t = T(Int(v.a))
-        if t.on_cpu() and t.rank == 0:
-            continue
         var d = device_str(t)
-        if first.byte_length() == 0:
-            first = d
-        elif d != first:
-            _device_error(first, d)
-    var od = device_str(o)
-    if first.byte_length() > 0 and od != first:
-        _device_error(first, od)
+        if d == dev:
+            continue
+        if t.on_cpu() and t.rank == 0 and n_ops > 1:
+            scalars += 1
+            continue
+        _device_error(dev, d)
+    if scalars > 1:
+        raise Error("Trying to pass too many CPU scalars to non-CPU kernel!")
 
 
 def _device_error(a: String, b: String) raises:
@@ -213,6 +248,7 @@ struct _Pre(Movable):
     var mode: Int  # -1: the op's own
     var ins: Int  # the operand mask after the op's own rules
     var rev: Bool  # promote the operands last to first
+    var kernel: String  # "" or the kernel the op dispatches instead
 
 
 def _pre[
@@ -279,6 +315,11 @@ def _pre[
                     _tname(o.stype),
                 )
         var b_float = is_float_stype(b.stype) or is_float8_stype(b.stype)
+        if not b_float and is_float8_stype(a.stype):
+            # _ldexp_int_exponent: an integral (or bool) exponent of a
+            # floating self runs ldexp_cuda's own iterator (out checked and
+            # resized first), which has no float8 case.
+            return _Pre(-1, 1, False, "ldexp_cuda")
         var pdt: Int32
         if not (is_float_stype(a.stype) or is_float8_stype(a.stype)) or (
             a.dtype == DType.float32
@@ -332,8 +373,8 @@ def _pre[
                         " for `weight` but got dtype ",
                         dtype_name(wt.stype),
                     )
-                return _Pre(MODE_SAME, ins, False)
-        return _Pre(MODE_CAST, ins, False)
+                return _Pre(MODE_SAME, ins, False, "")
+        return _Pre(MODE_CAST, ins, False, "")
     elif pre == PRE_ALL_SAME:
         # log_sigmoid_backward: grad_output must have self's dtype (the
         # buffer is not an operand on CUDA).
@@ -356,9 +397,15 @@ def _pre[
                 " but expected ",
                 _tname(a.stype),
             )
+    elif pre == PRE_SOFTSHRINK:
+        # softshrink_check: an AT_DISPATCH over self's dtype, before the
+        # iterator (and its out= checks) exists.
+        var a = T(Int(args[unsafe_offset=0].a))
+        if is_float8_stype(a.stype):
+            _refuse("softshrink_check", a.stype)
     elif pre == PRE_SELF_FIRST:
-        return _Pre(-1, ins, True)
-    return _Pre(-1, ins, False)
+        return _Pre(-1, ins, True, "")
+    return _Pre(-1, ins, False, "")
 
 
 def f8_iter[
@@ -387,7 +434,27 @@ def f8_iter[
     var eff_mode = mode if p.mode < 0 else p.mode
     var it = _shape_of(args, p.ins)
     var compute: Int32
-    comptime if out_idx >= 0:
+    comptime if mode == MODE_COPY_OUT:
+        # A composite out=: the functional result first (its dispatch
+        # refuses with out untouched), then resize_output, then the exact
+        # dtype check of the copy.
+        if not it.shape_ok:
+            raise Error(it.err)
+        compute = _common_of(args, p.ins, p.rev)
+        if is_float8_stype(compute):
+            _refuse(String(kernel), compute)
+        var o = T(Int(args[unsafe_offset=out_idx].a))
+        if not _shape_is(o, it.shape, it.rank):
+            resize_out(o, it.shape, it.rank)
+        if o.stype != compute:
+            raise Error(
+                "Expected out tensor to have dtype ",
+                dtype_name(compute),
+                ", but got ",
+                dtype_name(o.stype),
+                " instead",
+            )
+    elif out_idx >= 0:
         var o = T(Int(args[unsafe_offset=out_idx].a))
         comptime inplace = (ins >> out_idx) & 1 == 1
         # (b) memory overlap, then the shape of a read-write out: one that
@@ -407,7 +474,10 @@ def f8_iter[
                     read_write = True
                 elif not t.on_cpu():
                     assert_no_partial_overlap(o, t)
-        if read_write and it.shape_ok and not _shape_is(o, it.shape, it.rank):
+        # compute_shape: a broadcast error, then a read-write out's shape.
+        if not it.shape_ok:
+            raise Error(it.err)
+        if read_write and not _shape_is(o, it.shape, it.rank):
             raise Error(
                 "output with shape ",
                 _shape_str(o.shape, o.rank),
@@ -426,10 +496,10 @@ def f8_iter[
                     " but expected ",
                     _tname(common),
                 )
-        _same_device(args, p.ins, o)
-        if eff_mode == MODE_SAME or eff_mode == MODE_NOCHECK:
-            pass
-        else:
+        var cdev = _common_device(args, p.ins, o)
+        if device_str(o) != cdev:
+            _device_error(cdev, device_str(o))
+        if eff_mode != MODE_SAME and eff_mode != MODE_NOCHECK:
             if not can_cast(common, o.stype):
                 raise Error(
                     "result type ",
@@ -437,6 +507,7 @@ def f8_iter[
                     " can't be cast to the desired output type ",
                     _tname(o.stype),
                 )
+        _inputs_on_device(args, p.ins, cdev)
         # (d)
         if (
             not read_write
@@ -446,9 +517,11 @@ def f8_iter[
             resize_out(o, it.shape, it.rank)
         compute = o.stype if eff_mode == MODE_OUTDT else common
     else:
+        if not it.shape_ok:
+            raise Error(it.err)
         compute = _common_of(args, p.ins, p.rev)
     # (e)
-    var k = String(kernel)
+    var k = String(kernel) if p.kernel.byte_length() == 0 else p.kernel
     comptime if pre == PRE_DIV_MODE:
         var m = args[unsafe_offset=2].copy()
         if not v_is_none(m):

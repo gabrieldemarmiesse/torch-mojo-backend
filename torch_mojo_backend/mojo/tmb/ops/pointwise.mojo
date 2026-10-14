@@ -86,6 +86,7 @@ from tmb.ops.f8_iter import (
     PRE_NAN_TO_NUM,
     PRE_NONE,
     PRE_SELF_FIRST,
+    PRE_SOFTSHRINK,
     PRE_SUB,
 )
 from tmb.backend.registry import Site, impl
@@ -2133,10 +2134,21 @@ def _glu(args: Values, rets: Values, out_index: Int) raises:
     var b = own(_glu_half(self, d, True))
     var sa = _b_tside(a.t)
     var sb = _b_tside(b.t)
-    var compute = _pw_compute_dtype("glu", self.stype, P_FLOAT_ONLY, True)
     var dest = Optional[T]()
+    var common = self.stype
     if out_index >= 0:
+        # The out= checks and resize precede the kernel dispatch.
         dest = _pw_out_of(args[unsafe_offset=out_index], sa, sb, _none_side())
+        var o = dest.value().stype
+        if _pw_is_f8(common) or _pw_is_f8(o):
+            # glu_cuda dispatches on the OUTPUT dtype: a float8 input into a
+            # wider out computes there, a float8 out refuses as itself (out
+            # resized first).
+            common = o
+            var d = dest.value().copy()
+            if not d.same_shape(a.t):
+                resize_out(d, a.t.shape, a.t.rank)
+    var compute = _pw_compute_dtype("glu", common, P_FLOAT_ONLY, True)
     _pw_finish(
         rets,
         dest,
@@ -4837,8 +4849,30 @@ def register_pointwise(site: Site) raises:
         ],
         "log_sigmoid_backward.grad_input",
     ](site)
-    impl[op_log_sigmoid_forward, "log_sigmoid_forward"](site)
-    impl[op_log_sigmoid_forward_output, "log_sigmoid_forward.output"](site)
+    impl[
+        f8_iter[
+            op_log_sigmoid_forward,
+            "log_sigmoid_forward_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "log_sigmoid_forward",
+    ](site)
+    impl[
+        f8_iter[
+            op_log_sigmoid_forward_output,
+            "log_sigmoid_forward_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "log_sigmoid_forward.output",
+    ](site)
     impl[
         f8_iter[
             op_logaddexp, "logaddexp_cuda", 3, -1, MODE_FN, False, PRE_NONE
@@ -5028,7 +5062,13 @@ def register_pointwise(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_softshrink, "softshrink_check", 1, -1, MODE_FN, False, PRE_NONE
+            op_softshrink,
+            "softshrink_check",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_SOFTSHRINK,
         ],
         "softshrink",
     ](site)
@@ -5038,9 +5078,9 @@ def register_pointwise(site: Site) raises:
             "softshrink_check",
             1,
             2,
-            MODE_NOCHECK,
+            MODE_SAME,
             False,
-            PRE_NONE,
+            PRE_SOFTSHRINK,
         ],
         "softshrink.out",
     ](site)
@@ -5069,9 +5109,30 @@ def register_pointwise(site: Site) raises:
         "softshrink_backward.grad_input",
     ](site)
     _register_special(site)
-    impl[op_threshold, "threshold"](site)
-    impl[op_threshold_out, "threshold.out"](site)
-    impl[op_threshold_, "threshold_"](site)
+    impl[
+        f8_iter[
+            op_threshold, "threshold_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "threshold",
+    ](site)
+    impl[
+        f8_iter[
+            op_threshold_out,
+            "threshold_cuda",
+            1,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "threshold.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_threshold_, "threshold_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE
+        ],
+        "threshold_",
+    ](site)
     impl[
         f8_iter[op_xlogy, "xlogy_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "xlogy.Tensor",
