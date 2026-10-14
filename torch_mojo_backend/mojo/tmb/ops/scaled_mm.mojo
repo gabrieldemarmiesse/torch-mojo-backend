@@ -1303,6 +1303,16 @@ def _scaled_mm_v2(args: Values, mut dest: T) raises:
     # take float8_e4m3fn operands only.
     var kind_a = recipe_a[0]
     var kind_b = recipe_b[0]
+    if len(scale_a) != 1 or len(scale_b) != 1:
+        # Reached by the DeepSeek recipes, which the meta does not validate:
+        # find_scaled_gemm_impl matches no implementation (torch 2.14's
+        # message then reads scale_a[0] of an empty list).
+        raise Error(
+            "Invalid scaling configuration. Expected one scale per side, got ",
+            len(scale_a),
+            " and ",
+            len(scale_b),
+        )
     var sa = scale_a[0].copy()
     var sb = scale_b[0].copy()
     var e4m3_both = (

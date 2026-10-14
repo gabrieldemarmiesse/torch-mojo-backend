@@ -1842,3 +1842,22 @@ def test_scaled_mm_v2_scale_list_lengths(mojo_device):
         v2([ra, ra], [rw], [rb], [rw])
     with pytest.raises(RuntimeError, match="unsupported recipe"):
         v2([one, one], [tw, tw], [one], [tw])
+
+
+def test_scaled_mm_v2_deepseek_empty_scale_list(mojo_device):
+    """The DeepSeek recipes skip the meta's list checks: an empty scale list
+    still raises instead of indexing past the end."""
+    dev = mojo_device
+    a = torch.randn(128, 128).to(torch.float8_e4m3fn).to(dev)
+    b = torch.randn(128, 128).to(torch.float8_e4m3fn).to(dev).t()
+    r = ScalingType.BlockWise1x128.value
+    ns = SwizzleType.NO_SWIZZLE.value
+    sb = torch.ones(1, 128, device=dev)
+    with pytest.raises(RuntimeError, match="Invalid scaling configuration"):
+        torch.ops.aten._scaled_mm_v2(
+            a, b, [], [r], [ns], [sb], [r], [ns], None, torch.bfloat16, [], False
+        )
+    with pytest.raises(RuntimeError, match="Invalid scaling configuration"):
+        torch.ops.aten._scaled_mm_v2(
+            a, b, [sb], [r], [ns], [], [r], [ns], None, torch.bfloat16, [], False
+        )
