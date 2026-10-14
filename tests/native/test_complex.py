@@ -1534,6 +1534,147 @@ def test_scalar_tensor_defaults_to_the_float_dtype(mojo_gpu: str):
     )
 
 
+_REAL_DTYPES = [
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+    torch.int8,
+    torch.uint8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.uint16,
+    torch.uint32,
+    torch.uint64,
+    torch.bool,
+]
+
+
+def _outcome(fn):
+    try:
+        return ("ok", fn().cpu())
+    except Exception as e:  # noqa: BLE001 -- the exception type is the result
+        return ("raised", type(e))
+
+
+@pytest.mark.parametrize("v", [1e19 + 0j, 2**63 + 0j, -1 + 0j, 300 + 0j, 2.5 + 0j])
+@pytest.mark.parametrize("dtype", _REAL_DTYPES)
+def test_complex_scalar_converts_as_its_real_part(mojo_gpu: str, v, dtype):
+    """A complex Scalar with no imaginary part meets a real destination as
+    its real part would (CUDA's c10 conversion), at every Scalar entry."""
+    msk = torch.tensor([True, False], device=mojo_gpu)
+
+    def setitem(val, key):
+        x = torch.zeros(2, dtype=dtype, device=mojo_gpu)
+        x[msk if key == "mask" else key] = val
+        return x
+
+    def entries(val):
+        return {
+            "scalar_tensor": lambda: torch.scalar_tensor(
+                val, dtype=dtype, device=mojo_gpu
+            ),
+            "full": lambda: torch.full((2,), val, dtype=dtype, device=mojo_gpu),
+            "fill_": lambda: torch.zeros(2, dtype=dtype, device=mojo_gpu).fill_(val),
+            "masked_fill": lambda: torch.zeros(
+                2, dtype=dtype, device=mojo_gpu
+            ).masked_fill(msk, val),
+            "x[0]": lambda: setitem(val, 0),
+            "x[:]": lambda: setitem(val, slice(None)),
+            "x[mask]": lambda: setitem(val, "mask"),
+        }
+
+    for name, fn in entries(v).items():
+        if name == "scalar_tensor" and dtype in (torch.float16, torch.bfloat16):
+            continue  # an explicit out-of-range half raises on CUDA, inf here
+        got = _outcome(fn)
+        want = _outcome(entries(v.real)[name])
+        assert got[0] == want[0], (name, got, want)
+        if got[0] == "ok":
+            assert torch.equal(got[1], want[1]), (name, got, want)
+        else:
+            assert got[1] is want[1], (name, got, want)
+
+
+def test_complex_scalar_into_uint64_is_exact(mojo_gpu: str):
+    got = torch.scalar_tensor(1e19 + 0j, dtype=torch.uint64, device=mojo_gpu)
+    assert got.cpu().tolist() == 10**19
+    x = torch.zeros(2, dtype=torch.uint64, device=mojo_gpu)
+    x[0] = 1e19 + 0j  # ty: ignore[invalid-assignment]
+    assert x.cpu().tolist() == [10**19, 0]
+
+
+def test_uint64_fill_of_two_to_the_64(mojo_gpu: str):
+    """2.0**64 passes c10's check (it compares with double(UINT64_MAX)); the
+    host static_cast then gives 0, as on CUDA."""
+    for v in (2.0**64, 2.0**64 + 0j):
+        assert torch.scalar_tensor(
+            v, dtype=torch.uint64, device=mojo_gpu
+        ).cpu().tolist() == 0
+        assert torch.zeros(2, dtype=torch.uint64, device=mojo_gpu).fill_(
+            v
+        ).cpu().tolist() == [0, 0]
+    with pytest.raises(RuntimeError, match="uint64_t"):
+        torch.zeros(1, dtype=torch.uint64, device=mojo_gpu).fill_(1.9e19)
+
+
+def test_uint64_fill_from_a_same_device_float(mojo_gpu: str):
+    """A same-device value is a copy_ (exact past 2**63)."""
+    for vdt, want in ((torch.float64, 10**19), (torch.float32, 9999999980506447872)):
+        val = torch.tensor(1e19, dtype=vdt, device=mojo_gpu)
+        got = torch.zeros(2, dtype=torch.uint64, device=mojo_gpu).fill_(val)
+        assert got.cpu().tolist() == [want] * 2
+
+
+def test_int64_masked_and_index_fill_past_int64(mojo_gpu: str):
+    msk = torch.tensor([True, False], device=mojo_gpu)
+    for v in (2.0**63, 2**63 + 0j):
+        x = torch.zeros(2, dtype=torch.int64, device=mojo_gpu)
+        assert x.masked_fill(msk, v).cpu().tolist() == [-(2**63), 0]
+    x = torch.zeros(2, dtype=torch.int64, device=mojo_gpu)
+    x.index_fill_(0, torch.tensor([0], device=mojo_gpu), 2.0**63)
+    assert x.cpu().tolist() == [-(2**63), 0]
+    x = torch.zeros(2, dtype=torch.int64, device=mojo_gpu)
+    assert x.masked_fill(msk, 2**62 + 1).cpu().tolist() == [2**62 + 1, 0]
+
+
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
+def test_wide_unsigned_masked_and_index_fill_decline(mojo_gpu: str, dtype):
+    """CUDA's masked_fill / index_fill / index_put kernels are not built for
+    uint16/32/64: the dtype dispatch refuses before the value converts."""
+    name = {torch.uint16: "UInt16", torch.uint32: "UInt32"}.get(dtype, "UInt64")
+    msk = torch.tensor([True, False], device=mojo_gpu)
+    idx = torch.tensor([0], device=mojo_gpu)
+    for v in (3, 1e19, -1 + 0j, 1 + 2j):
+        x = torch.zeros(2, dtype=dtype, device=mojo_gpu)
+        with pytest.raises(NotImplementedError, match=f"masked_fill_.*{name}"):
+            x.masked_fill(msk, v)
+        with pytest.raises(NotImplementedError, match=f"masked_fill_.*{name}"):
+            x.masked_fill_(msk, v)
+        assert x.cpu().tolist() == [0, 0]
+    x = torch.zeros(2, dtype=dtype, device=mojo_gpu)
+    # (item assignment builds its value first: one that does not fit raises
+    # the conversion error there, as on CUDA)
+    with pytest.raises(NotImplementedError, match=f"masked_fill_.*{name}"):
+        x[msk] = 3
+    with pytest.raises(NotImplementedError, match=f"index_fill_.*{name}"):
+        x.index_fill_(0, idx, 1e19)
+    with pytest.raises(NotImplementedError, match=f"index_put.*{name}"):
+        x[torch.tensor([True, False])] = 3  # a CPU mask: index_put's kernel
+    with pytest.raises(NotImplementedError, match=f"index_put.*{name}"):
+        x[idx] = 3
+    assert x.cpu().tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64, torch.uint64])
+def test_index_fill_refuses_a_complex_scalar(mojo_gpu: str, dtype):
+    x = torch.zeros(2, dtype=dtype, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Converting complex Scalar"):
+        x.index_fill_(0, torch.tensor([0], device=mojo_gpu), 1 + 0j)
+    assert x.cpu().tolist() == [0, 0]
+
+
 def test_index_add_integer_alpha_rounds_once(mojo_gpu: str):
     got = torch.zeros(1, dtype=torch.complex64, device=mojo_gpu).index_add(
         0,

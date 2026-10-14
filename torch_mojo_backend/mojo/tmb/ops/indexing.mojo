@@ -36,6 +36,7 @@ handed to kernels, never to the dispatcher.
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    TAG_COMPLEX,
     IntList,
     Owned,
     ST_BOOL,
@@ -91,7 +92,9 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     uint64_cross_item,
     check_real_scalar_fits,
-    uint64_fill_value,
+    real_fill_value,
+    is_wide_unsigned,
+    scalar_type_name,
     assert_no_internal_overlap,
     assert_no_overlap,
     call_op,
@@ -775,6 +778,12 @@ def _index_fill(a: T, dim_in: Int, index: T, value_v: Value) raises:
     if index.dtype != DType.int64:
         raise Error("index_fill_(): Expected dtype int64 for index.")
     assert_no_overlap(a, index)
+    if not a.is_complex() and value_v.tag == TAG_COMPLEX:
+        # ATen's own check, before the dtype dispatch: even 1+0j is refused
+        raise Error(
+            "index_fill_(): Converting complex Scalar to non-complex type is"
+            " not supported"
+        )
     var dim = _norm_dim(dim_in, a.rank, "index_fill_")
     if index.rank > 1:
         raise Error("Index has to be a vector/scalar")
@@ -782,6 +791,14 @@ def _index_fill(a: T, dim_in: Int, index: T, value_v: Value) raises:
         unsupported("index_fill_ with the index on a different device")
     # The value converts (and is range-checked) before any early return, as
     # ATen's `source.to<scalar_t>()` does even for an empty fill.
+    if is_wide_unsigned(a.stype):
+        # CUDA's kernel is not instantiated for them: declined before the
+        # value converts, as its dtype dispatch does
+        unsupported(
+            "\"index_fill_\" not implemented for '"
+            + scalar_type_name(a.stype)
+            + "'"
+        )
     var value = scalar_as_fill(value_v, a.dtype)
     if index.numel == 0:
         return
@@ -2146,9 +2163,11 @@ def op_fill__tensor(
     # where CUDA copies on the stream), then filled with fill_.Scalar's
     # conversion rules. Reading it first also covers a value aliasing self.
     var same = t.on_mojo() and value.on_mojo() and value.device == t.device
-    if same and value.stype == ST_UINT64:
-        # a same-device value is a copy_: the uint64 converts as copy_ does
-        # (unsigned into a float, wrapping into a signed integer)
+    if same and (value.stype == ST_UINT64 or t.stype == ST_UINT64):
+        # A same-device value is a copy_ (CUDA's fill_ copies on the
+        # stream): a uint64 converts as copy_ does (unsigned into a float,
+        # wrapping into a signed integer), and so does a value into uint64
+        # (a double of 2**63 or more exactly, which no Scalar record holds).
         assert_no_internal_overlap(t)
         var expanded = own(
             view_strided(
@@ -2185,7 +2204,7 @@ def op_fill__tensor(
         # `fill_(Scalar)`, whose `Scalar::to<scalar_t>()` raises on overflow.
         # (one checked conversion for fill_: the Scalar route's)
         check_real_scalar_fits(t.stype, item)
-        item = uint64_fill_value(t.stype, item)
+        item = real_fill_value(t.stype, item)
     fill_value(t, item)
     ret_ref(rets, 0, t)
 

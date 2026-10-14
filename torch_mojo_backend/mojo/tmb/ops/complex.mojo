@@ -99,6 +99,8 @@ from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     int_to_component,
+    is_wide_unsigned,
+    scalar_type_name,
     scalar_parts,
     uint_to_component,
     fill_item,
@@ -2382,7 +2384,15 @@ def cx_masked_fill_(
 
 def _masked_fill_real_(self: T, args: Values) raises:
     """masked_fill_ of a REAL self with a complex value: value.item()
-    converted checked (a zero imaginary part fits), then the real op."""
+    converted checked (a zero imaginary part fits), then the real op. A
+    uint16 / uint32 / uint64 self is declined first, as CUDA's dtype
+    dispatch is (its kernel is not instantiated for them)."""
+    if is_wide_unsigned(self.stype):
+        unsupported(
+            "\"masked_fill_\" not implemented for '"
+            + scalar_type_name(self.stype)
+            + "'"
+        )
     var val = args[unsafe_offset=2].copy()
     if val.tag == TAG_TENSOR or val.tag == TAG_TENSOR_REF:
         var vt = v_tensor_c(val)
