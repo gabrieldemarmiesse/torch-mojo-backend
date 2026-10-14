@@ -166,84 +166,197 @@ def cdiv[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
     return Cx[dt](a.fma(rat, b) * scl, b.fma(rat, -a) * scl)
 
 
+# thrust's exp / log of complex (CCCL 3.0, as stock torch 2.11+cu130 runs
+# them in pow: thrust/detail/complex/cexp(f).h, clog(f).h -- FreeBSD msun),
+# ported literally, bit tricks included.
+
+
 @always_inline
-def _overflow_threshold[dt: DType]() -> Scalar[dt]:
-    """Where exp(x) overflows (msun's cexp_ovfl)."""
+def _hi_word[dt: DType](x: Scalar[dt]) -> UInt32:
+    """get_float_word (float) / get_high_word (double)."""
     comptime if dt == DType.float64:
-        return Scalar[dt](709.782712893383973096)
+        return UInt32(bitcast[DType.uint64](x.cast[DType.float64]()) >> 32)
     else:
-        return Scalar[dt](88.7228391116729996)
+        return bitcast[DType.uint32](x.cast[DType.float32]())
+
+
+@always_inline
+def _lo_word[dt: DType](x: Scalar[dt]) -> UInt32:
+    comptime if dt == DType.float64:
+        return UInt32(
+            bitcast[DType.uint64](x.cast[DType.float64]()) & 0xFFFFFFFF
+        )
+    else:
+        return 0
+
+
+@always_inline
+def _from_words[dt: DType](hi: UInt32, lo: UInt32) -> Scalar[dt]:
+    """set_float_word (float) / insert_words (double)."""
+    comptime if dt == DType.float64:
+        return bitcast[DType.float64]((UInt64(hi) << 32) | UInt64(lo)).cast[
+            dt
+        ]()
+    else:
+        return bitcast[DType.float32](hi).cast[dt]()
+
+
+@always_inline
+def _frexp_exp[dt: DType](x: Scalar[dt], mut expt: Int) -> Scalar[dt]:
+    """frexp_exp(f): exp(x - k ln2) with its exponent field reset."""
+    comptime if dt == DType.float64:
+        var exp_x = _rexp(x - Scalar[dt](1246.97177782734161156))
+        var hx = _hi_word(exp_x)
+        expt = Int(hx >> 20) - (0x3FF + 1023) + 1799
+        return _from_words[dt](
+            (hx & 0xFFFFF) | UInt32((0x3FF + 1023) << 20), _lo_word(exp_x)
+        )
+    else:
+        var exp_x = _rexp(x - Scalar[dt](162.88958740))
+        var hx = _hi_word(exp_x)
+        expt = Int(hx >> 23) - (0x7F + 127) + 235
+        return _from_words[dt]((hx & 0x7FFFFF) | UInt32((0x7F + 127) << 23), 0)
+
+
+@always_inline
+def _ldexp_cexp[dt: DType](z: Cx[dt], expt_in: Int) -> Cx[dt]:
+    var ex_expt = 0
+    var exp_x = _frexp_exp(z.re, ex_expt)
+    var expt = expt_in + ex_expt
+    var half = expt // 2 if expt >= 0 else -((-expt) // 2)  # C's / truncates
+    var scale1: Scalar[dt]
+    var scale2: Scalar[dt]
+    comptime if dt == DType.float64:
+        scale1 = _from_words[dt](UInt32((0x3FF + half) << 20), 0)
+        scale2 = _from_words[dt](UInt32((0x3FF + (expt - half)) << 20), 0)
+    else:
+        scale1 = _from_words[dt](UInt32((0x7F + half) << 23), 0)
+        scale2 = _from_words[dt](UInt32((0x7F + (expt - half)) << 23), 0)
+    var y = z.im
+    return Cx[dt](
+        _rcos(y) * exp_x * scale1 * scale2, _rsin(y) * exp_x * scale1 * scale2
+    )
 
 
 @always_inline
 def cexp[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    """msun's cexp / cexpf (thrust's complex exp), Annex G special values."""
+    """thrust's cexp / cexpf."""
     var x = z.re
     var y = z.im
-    if _is_zero(y):
-        # exp(x + 0i) = exp(x) + 0i, the zero's sign kept
+    var hy = _hi_word(y) & 0x7FFFFFFF
+    var ly = _lo_word(y)
+    if (hy | ly) == 0:
         return Cx[dt](_rexp(x), y)
-    if _is_zero(x):
+    var hx = _hi_word(x)
+    var lx = _lo_word(x)
+    if ((hx & 0x7FFFFFFF) | lx) == 0:
         return Cx[dt](_rcos(y), _rsin(y))
-    if isinf(y) or isnan(y):
-        # y is not finite
-        if isinf(x) and not _signbit(x):
-            # cexp(+inf + i y) = +inf + NaN i  (y +-inf or NaN)
-            return Cx[dt](x, y - y)
-        if isinf(x):
-            # cexp(-inf + i y) = +-0 +- 0i
+    comptime INF_HI = UInt32(0x7FF00000) if dt == DType.float64 else UInt32(
+        0x7F800000
+    )
+    if hy >= INF_HI:
+        # (double: thrust tests lx here, not ly -- kept)
+        if lx != 0 or (hx & 0x7FFFFFFF) != INF_HI:
+            return Cx[dt](y - y, y - y)
+        elif (hx & 0x80000000) != 0:
             return Cx[dt](Scalar[dt](0), Scalar[dt](0))
-        # cexp(finite|NaN +- i inf|NaN) = NaN + NaN i
-        return Cx[dt](nan[dt](), nan[dt]())
-    var c = _rcos(y)
-    var s = _rsin(y)
-    if not isnan(x) and not isinf(x) and x > _overflow_threshold[dt]():
-        # exp(x) alone overflows while exp(x) * cos(y) may not: halve it.
-        var h = _rexp(x * Scalar[dt](0.5))
-        return Cx[dt]((h * c) * h, (h * s) * h)
-    var e = _rexp(x)
-    if isinf(e):
-        # x = +inf (y finite, nonzero): inf * cos(y) / inf * sin(y)
-        return Cx[dt](e * c, e * s)
-    return Cx[dt](e * c, e * s)
+        else:
+            return Cx[dt](x, y - y)
+    comptime EXP_OVFL = UInt32(0x40862E42) if dt == DType.float64 else UInt32(
+        0x42B17218
+    )
+    comptime CEXP_OVFL = UInt32(0x4096B8E4) if dt == DType.float64 else UInt32(
+        0x43400074
+    )
+    if hx >= EXP_OVFL and hx <= CEXP_OVFL:
+        return _ldexp_cexp(z, 0)
+    var exp_x = _rexp(x)
+    return Cx[dt](exp_x * _rcos(y), exp_x * _rsin(y))
+
+
+@always_inline
+def _trim[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """Round down to a third of the mantissa bits."""
+    comptime if dt == DType.float64:
+        return _from_words[dt](_hi_word(x) & 0xFFFFFFF8, 0)
+    else:
+        return _from_words[dt](_hi_word(x) & 0xFFFF0000, 0)
 
 
 @always_inline
 def clog[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    """log|z| + i arg(z). Near |z| = 1, where log|z| is small and the plain
-    log(hypot) loses its relative precision, log|z| comes from log1p of
-    |z|^2 - 1 computed as (x - 1)(x + 1) + y^2 about the larger component."""
+    """thrust's clog / clogf. Every a*b + c*d is the fused multiply-add nvcc
+    forms for it: fma(a, b, c*d)."""
     var x = z.re
     var y = z.im
-    var ang = catan2(y, x)
-    if isnan(x) or isnan(y):
-        if isinf(x) or isinf(y):
-            return Cx[dt](inf[dt](), ang)
-        return Cx[dt](nan[dt](), nan[dt]())
-    var h = chypot(x, y)
+    if x != x or y != y:
+        return Cx[dt](_rlog(x.fma(x, y * y)), catan2(y, x))
     var ax = abs(x)
     var ay = abs(y)
-    var big = max(ax, ay)
-    var small = min(ax, ay)
-    if (
-        big > Scalar[dt](0.5)
-        and big < Scalar[dt](1.5)
-        and h > Scalar[dt](0.70710678)
-        and h < Scalar[dt](1.25)
-    ):
-        var t = (big - 1) * (big + 1) + small * small
-        return Cx[dt](_rlog1p(t) * Scalar[dt](0.5), ang)
-    if isinf(h) and not isinf(x) and not isinf(y):
-        # |z| overflows the component type though z is finite (thrust's
-        # clog scales): log|z| = log|z / 2| + log 2, so [3e38+3e38j] ** 0.1
-        # stays finite as on CUDA
-        var half = Scalar[dt](0.5)
+    if ax < ay:
+        var t = ax
+        ax = ay
+        ay = t
+    comptime BIG = Scalar[dt](5e307) if dt == DType.float64 else Scalar[dt](
+        1e34
+    )
+    comptime TINY1 = Scalar[dt](1e-150) if dt == DType.float64 else Scalar[dt](
+        1e-19
+    )
+    comptime LO = Scalar[dt](1e-50) if dt == DType.float64 else Scalar[dt](1e-6)
+    comptime HI = Scalar[dt](1e50) if dt == DType.float64 else Scalar[dt](1e6)
+    var one = Scalar[dt](1)
+    var half = Scalar[dt](0.5)
+    if ay > BIG:
+        var e = Scalar[dt](2.7182818284590452354)
+        return Cx[dt](_rlog(chypot(x / e, y / e)) + one, catan2(y, x))
+    if ax == one:
+        if ay < TINY1:
+            return Cx[dt]((ay * half) * ay, catan2(y, x))
+        return Cx[dt](_rlog1p(ay * ay) * half, catan2(y, x))
+    if ax < LO or ay < LO or ax > HI or ay > HI:
+        return Cx[dt](_rlog(chypot(x, y)), catan2(y, x))
+    if ax >= one:
         return Cx[dt](
-            _rlog(chypot(x * half, y * half))
-            + Scalar[dt](0.69314718055994530942),
-            ang,
+            _rlog1p(ay.fma(ay, (ax - one) * (ax + one))) * half, catan2(y, x)
         )
-    return Cx[dt](_rlog(h), ang)
+    if ax.fma(ax, ay * ay) <= Scalar[dt](0.7):
+        return Cx[dt](_rlog(ax.fma(ax, ay * ay)) * half, catan2(y, x))
+    var x0 = _trim(ax)
+    ax = ax - x0
+    var x1 = _trim(ax)
+    var x2 = ax - x1
+    var y0 = _trim(ay)
+    ay = ay - y0
+    var y1 = _trim(ay)
+    var y2 = ay - y1
+    var two = Scalar[dt](2)
+    var val = SIMD[dt, 16](0)
+    val[0] = x0 * x0
+    val[1] = y0 * y0
+    val[2] = two * x0 * x1
+    val[3] = two * y0 * y1
+    val[4] = x1 * x1
+    val[5] = y1 * y1
+    val[6] = two * x0 * x2
+    val[7] = two * y0 * y2
+    val[8] = two * x1 * x2
+    val[9] = two * y1 * y2
+    val[10] = x2 * x2
+    val[11] = y2 * y2
+    var sorted = False
+    while not sorted:
+        sorted = True
+        for i in range(11):
+            if val[i] < val[i + 1]:
+                sorted = False
+                var t = val[i]
+                val[i] = val[i + 1]
+                val[i + 1] = t
+    var hm1 = -one
+    for i in range(12):
+        hm1 += val[i]
+    return Cx[dt](half * _rlog1p(hm1), catan2(y, x))
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +549,13 @@ def csqrt_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
 
 @always_inline
 def creciprocal[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    """UnaryOpsKernel.cu's complex reciprocal: `scalar_t(1) / a`."""
+    """UnaryFractionKernels.cu's reciprocal_wrapper: NaN + NaN i for a NaN
+    part or two infinite ones, 0 for one infinite part, else 1 / z (c10's
+    division)."""
+    if isnan(z.re) or isnan(z.im) or (isinf(z.re) and isinf(z.im)):
+        return Cx[dt](nan[dt](), nan[dt]())
+    if isinf(z.re) or isinf(z.im):
+        return Cx[dt](Scalar[dt](0), Scalar[dt](0))
     return cdiv(Cx[dt](Scalar[dt](1), Scalar[dt](0)), z)
 
 

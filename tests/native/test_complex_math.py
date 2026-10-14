@@ -672,3 +672,113 @@ def test_pow_of_one_fills_any_out(mojo_gpu: str):
     assert out.cpu().tolist() == [1.0, 1.0]
     with pytest.raises(RuntimeError, match="can't be cast"):
         torch.pow(2, torch.tensor([1 + 2j], device=mojo_gpu), out=out)
+
+
+# --- round-5 review fixes (and the sweep against stock CUDA) --------------------
+
+
+def test_pow_follows_thrust_log_and_exp(mojo_gpu: str):
+    # recorded on stock CUDA (torch 2.11+cu130): thrust's clogf takes
+    # log1p(1)/2 for |re| == 1, so the phase of y * log(x) matches
+    x = torch.tensor([1 + 1j, 2.5 + 0.9999j, 1 + 0.5j])
+    y = torch.tensor([-1e20j, -1j, 1 + 0j])
+    got = (x.to(mojo_gpu) ** y.to(mojo_gpu)).cpu()
+    assert got[0].real.item() == float("-inf") and got[0].imag.item() == float("-inf")
+    assert got[1].item() == complex(0.8021237254142761, -1.223475694656372)
+    assert got[2].item() == complex(1.0, 0.5000000596046448)
+
+
+def test_scalar_conversion_overflow(mojo_gpu: str):
+    z = _rand(3).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.add(z, z, alpha=1e100)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.sub(z, z, alpha=1e100)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        z**1e100
+    # complex128 holds any double; a wrapped operand is not checked
+    w = z.to(torch.complex128)
+    assert torch.add(w, w, alpha=1e100).cpu().real.abs().max() > 1e99
+    got = (torch.tensor([1 + 1j], device=mojo_gpu) + 1e100).cpu()
+    assert got.real.item() == float("inf") and got.imag.isnan()
+
+
+def test_pow_scalar_base_resizes_its_out_first(mojo_gpu: str):
+    x = _rand(2)
+    out = torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(3)
+    torch.pow(2, x.to(mojo_gpu), out=out)
+    assert out.shape == (2,)
+    _close(out, torch.pow(2, x))
+
+
+@pytest.mark.parametrize("dtype", CDTYPES)
+def test_signed_zeros_and_reciprocal_specials(mojo_gpu: str, dtype: torch.dtype):
+    _skip_c128(mojo_gpu, dtype)
+    z = torch.tensor([complex(1.0, -0.0), complex(0.0, -0.0)], dtype=dtype)
+    got = torch.sqrt(z.to(mojo_gpu)).cpu()
+    assert torch.equal(
+        torch.view_as_real(got).signbit(), torch.view_as_real(torch.sqrt(z)).signbit()
+    )
+    inf = float("inf")
+    r = torch.tensor(
+        [
+            complex(inf, 1),
+            complex(1, -inf),
+            complex(inf, inf),
+            complex(float("nan"), 0),
+            2j,
+        ],
+        dtype=dtype,
+    )
+    got = torch.reciprocal(r.to(mojo_gpu)).cpu()
+    assert got[:2].tolist() == [0j, 0j]
+    assert got[2:4].real.isnan().all() and got[2:4].imag.isnan().all()
+    assert got[4].item() == -0.5j
+
+
+def test_alpha_and_in_place_dtype_errors(mojo_gpu: str):
+    r = torch.ones(2, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="argument alpha must not be a complex"):
+        torch.add(r, r, alpha=1j)
+    with pytest.raises(RuntimeError, match="Bad in-place call"):
+        _rand(3).to(mojo_gpu).cumsum_(0, dtype=torch.complex128)
+
+
+def test_outs_of_real_results(mojo_gpu: str):
+    z = _rand(2, 3)
+    d = z.to(mojo_gpu)
+    # abs / angle of a complex self: resize then copy_ (any device)
+    cpu_out = torch.empty(0)
+    torch.abs(d, out=cpu_out)
+    _close(cpu_out, torch.abs(z))
+    ex = torch.empty(1, device=mojo_gpu).expand(7)
+    torch.angle(d, out=ex)
+    _close(ex, torch.angle(z))
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.abs(d, out=torch.empty(0, dtype=torch.int64, device=mojo_gpu))
+    c128 = torch.empty(0, dtype=torch.complex128, device=mojo_gpu)
+    torch.angle(d, out=c128)
+    _close(c128, torch.angle(z).to(torch.complex128))
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype bool"):
+        torch.ops.aten.isnan.out(d, out=torch.empty(0, device=mojo_gpu))
+    # rsub's generated out: exact dtype, no overlap check with the inputs
+    with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+        torch.ops.aten.rsub.Tensor_out(d, d, out=c128)
+    # reductions into bool / integer outs, as CUDA computes them
+    bout = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
+    torch.sum(torch.tensor([[1 + 0j], [0j]], device=mojo_gpu), 0, out=bout)
+    assert bout.cpu().tolist() == [True]
+    iout = torch.empty(0, dtype=torch.int64, device=mojo_gpu)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torch.mean(
+            torch.tensor([[1 + 0j], [2 + 0j], [3 + 0j]], device=mojo_gpu), 0, out=iout
+        )
+    assert iout.cpu().tolist() == [0]  # MeanOps' 1/N in an integer: 0
+    # a scan's expanded out is refused, a reduction's is written
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.cumsum(
+            d,
+            1,
+            out=torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(2, 3),
+        )

@@ -2993,8 +2993,8 @@ def op_lerp_scalar_(
 
 
 def register_binary(site: Site) raises:
-    impl[routed[op_add_tensor, cx_add, 2], "add.Tensor"](site)
-    impl[routed[op_add_, cx_add_, 2], "add_.Tensor"](site)
+    impl[routed[op_add_tensor, cx_add, 3], "add.Tensor"](site)
+    impl[routed[op_add_, cx_add_, 3], "add_.Tensor"](site)
     impl[routed[op_add_out, cx_add_out, 4], "add.out"](site)
     impl[op_addcdiv, "addcdiv"](site)
     impl[op_addcdiv_, "addcdiv_"](site)
@@ -3068,6 +3068,6 @@ def register_binary(site: Site) raises:
     impl[op_remainder, "remainder.Tensor"](site)
     impl[op_remainder_out, "remainder.Scalar_out"](site)
     impl[op_remainder_out, "remainder.Tensor_out"](site)
-    impl[routed[op_sub_tensor, cx_sub, 2], "sub.Tensor"](site)
-    impl[routed[op_sub_, cx_sub_, 2], "sub_.Tensor"](site)
+    impl[routed[op_sub_tensor, cx_sub, 3], "sub.Tensor"](site)
+    impl[routed[op_sub_, cx_sub_, 3], "sub_.Tensor"](site)
     impl[routed[op_sub_out, cx_sub_out, 4], "sub.out"](site)

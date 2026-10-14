@@ -491,6 +491,8 @@ def _sincos_f64(a: Float64) -> Tuple[Float64, Float64]:
     (within an ulp)."""
     if isnan(a) or isinf(a):
         return (nan[DType.float64](), nan[DType.float64]())
+    if a == 0.0:
+        return (a, 1.0)  # sin(-0) is -0
     var qf = llvm_intrinsic["llvm.roundeven", Float64, has_side_effect=False](
         a * Float64(from_bits=UInt64(0x3FE45F306DC9C883))
     )

@@ -37,6 +37,8 @@ from tmb.ops.complex import (
     _store,
     _store_ew,
     _store_ew_n,
+    _exact_dtype,
+    _check_cast,
     _tensor_or_scalar,
     _unary,
     _wrap_dim,
@@ -45,6 +47,7 @@ from tmb.ops.complex import (
     cx_unary_out,
 )
 from tmb.ops.common import (
+    check_scalar_fits,
     resize_out,
     shape_str,
     CX_DEVICE,
@@ -157,8 +160,17 @@ def _arith(
     var a = _operand(av, like)
     var b = _operand(bv, like)
     var st = _result_type(a, b)
+    if alpha.tag == TAG_COMPLEX and not is_complex_stype(st):
+        raise Error(
+            "For non-complex input tensors, argument alpha must not be a"
+            " complex number."
+        )
     if not is_complex_stype(st):
         unsupported("a complex op whose result type is not complex")
+    if alpha.tag != TAG_NONE:
+        # alpha.to<scalar_t>(), checked
+        var al0 = v_complex(alpha)
+        check_scalar_fits(st, al0[0], al0[1])
     var device = _one_device(a, b)
     var geo = _bshape(a, b)
     var fa = _flatten(a, st, geo[0], geo[1])
@@ -240,7 +252,7 @@ def _store_red(mut dest: T, var res: Owned, rets: Values) raises:
     not refused -- then the copy."""
     _same_device(dest, res.t)
     resize_out(dest, res.t.shape, res.t.rank)
-    _store(dest, res^, rets)
+    _store(dest, res^, rets, False)  # reductions check no overlap
 
 
 def cx_unary[
@@ -525,6 +537,8 @@ def _pow_tensor_scalar(x: T, ev: Value) raises -> Owned:
         kind = "reciprocal"
     elif e[0] == 2.0 and e[1] == 0.0:
         kind = "square"
+    if kind == "pow":
+        check_scalar_fits(st, e[0], e[1])  # exp_scalar.to<scalar_t>()
     cx_launch(
         kind,
         out.t.ptr,
@@ -604,13 +618,15 @@ def cx_pow_tensor_out(
     var dest = v_tensor_c(args[unsafe_offset=2])
     var av = args[unsafe_offset=0].copy()
     if av.tag != TAG_TENSOR and av.tag != TAG_TENSOR_REF:
+        # pow.Scalar is structured: its meta resizes the out to the
+        # exponent's shape before anything checks it
+        var ex = v_tensor_c(args[unsafe_offset=1])
+        _same_device(dest, ex)
+        resize_out(dest, ex.shape, ex.rank)
         var base = v_complex(av)
         if base[0] == 1.0 and base[1] == 0.0:
             # pow_Scalar_out: `out.fill_(1)` in the out's own dtype, no
             # result-type cast check
-            var e = v_tensor_c(args[unsafe_offset=1])
-            _same_device(dest, e)
-            resize_out(dest, e.shape, e.rank)
             var f = _Call("aten::fill_", "Scalar")
             f.t(dest)
             f.s(1.0)
@@ -628,24 +644,73 @@ def cx_pow_tensor_out(
 comptime cx_abs = cx_unary["abs", _TO_RE]
 
 
-def cx_abs_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    """abs.out(self, *, out) with a complex self or out
-    (unary_op_impl_with_complex_to_float_out): a complex out must hold
-    self's own dtype; a real self never writes a complex out."""
+def cx_to_real_out[
+    kind: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """abs.out / angle.out with a complex self or out
+    (unary_op_impl_with_complex_to_float_out). A real out of a complex self:
+    the result computed, the out resized (resize_output) and copy_'d into
+    -- any device, no overlap check before the resize. A complex out: a
+    TensorIterator unary op, so self's own dtype. A real self (a complex
+    out): abs refuses; angle casts the real op's result."""
     var x = v_tensor_c(args[unsafe_offset=0])
     var dest = v_tensor_c(args[unsafe_offset=1])
-    if is_complex_stype(dest.stype) and dest.stype != x.stype:
+    if not x.is_complex():
+        comptime if kind == "angle":
+            if _real_out(String("aten::") + kind, "", args, 1, 1, rets):
+                return
         raise Error(
             "Found dtype ",
             _st_name(dest.stype),
             " but expected ",
             _st_name(x.stype),
         )
-    _store_ew[1](args, dest, _unary("abs", _TO_RE, x), rets)
+    if is_complex_stype(dest.stype):
+        if kind == "abs" and dest.stype != x.stype:
+            raise Error(
+                "Found dtype ",
+                _st_name(dest.stype),
+                " but expected ",
+                _st_name(x.stype),
+            )
+        _store_ew[1](args, dest, _unary(kind, _TO_RE, x), rets)
+        return
+    var res = _unary(kind, _TO_RE, x)
+    _check_cast(res.t.stype, dest.stype)
+    var sizes = List[Int]()
+    for d in range(res.t.rank):
+        sizes.append(res.t.dim(d))
+    var rz = _Call("aten::resize_")
+    rz.t(dest)
+    rz.ints(sizes)
+    rz.none()
+    _ = rz.run(1)
+    var dest2 = v_tensor_c(args[unsafe_offset=1])
+    var cp = _Call("aten::copy_")
+    cp.t(dest2)
+    cp.t(res.t)
+    cp.b(False)
+    _ = cp.run(1)
+    _ = res^
+    ret_ref(rets, 0, dest2)
 
 
+comptime cx_abs_out = cx_to_real_out["abs"]
 comptime cx_angle = cx_unary["angle", _TO_RE]
-comptime cx_angle_out = cx_unary_out["angle", _TO_RE]
+comptime cx_angle_out = cx_to_real_out["angle"]
+
+
+def cx_bool_out[
+    kind: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """isnan.out / isinf.out (generated out= wrappers): a bool out only,
+    then resize and copy."""
+    var x = v_tensor_c(args[unsafe_offset=0])
+    var dest = v_tensor_c(args[unsafe_offset=1])
+    _exact_dtype(dest, ST_BOOL)
+    _store(dest, _unary(kind, _TO_BOOL, x), rets)
+
+
 comptime cx_exp = cx_unary["exp", _TO_CX]
 comptime cx_exp_out = cx_unary_out["exp", _TO_CX]
 comptime cx_log = cx_unary["log", _TO_CX]
@@ -661,9 +726,9 @@ comptime cx_sgn_out = cx_unary_same_out["sgn"]
 comptime cx_sqrt = cx_unary["sqrt", _TO_CX]
 comptime cx_sqrt_out = cx_unary_out["sqrt", _TO_CX]
 comptime cx_isnan = cx_unary["isnan", _TO_BOOL]
-comptime cx_isnan_out = cx_unary_out["isnan", _TO_BOOL]
+comptime cx_isnan_out = cx_bool_out["isnan"]
 comptime cx_isinf = cx_unary["isinf", _TO_BOOL]
-comptime cx_isinf_out = cx_unary_out["isinf", _TO_BOOL]
+comptime cx_isinf_out = cx_bool_out["isinf"]
 comptime cx_isfinite = cx_unary["isfinite", _TO_BOOL]
 
 # ---------------------------------------------------------------------------
@@ -869,14 +934,41 @@ def _reduce(
         return r^
     var overload = String("dim_IntList") if name == "sum" else String("dim")
     if not is_complex_stype(want):
+        # a real accumulation dtype (from dtype= or the out): x's real part
+        # in it, then the real reduction IN it (a bool / int out included)
         var xr = own_if_new(cast_complex(x, want), x)
-        var rc = _Call(String("aten::") + name, overload)
-        rc.t(xr.t)
-        rc.ints(dims)
-        rc.b(keepdim)
-        rc.none()
-        var r = rc.one()
+        var integral = not _is_float(want)
+        var r: Owned
+        if want == ST_BOOL and name == "mean":
+            unsupported("\"mean_cuda\" not implemented for 'Bool'")
+        if want == ST_BOOL:
+            # a bool accumulator: x != 0 or'ed (sum's bool addition)
+            var ac = _Call("aten::any", "dims")
+            ac.t(xr.t)
+            ac.ints(dims)
+            ac.b(keepdim)
+            r = ac.one()
+        else:
+            var rc = _Call(
+                String("aten::") + ("sum" if integral else name),
+                "dim_IntList" if integral else overload,
+            )
+            rc.t(xr.t)
+            rc.ints(dims)
+            rc.b(keepdim)
+            rc.dtype(want)
+            r = rc.one()
         _ = xr^
+        if name == "mean" and integral:
+            # MeanOps' factor 1/N cast to the integer accumulator: 0 unless
+            # one element is reduced
+            var count = 1
+            for d in dims:
+                count *= x.shape[MAX_RANK - x.rank + d]
+            if count != 1:
+                var z = _Call("aten::zero_")
+                z.t(r.t)
+                _ = z.run(1)
         return r^
     var real_st = real_of(want)
     if x.rank == 0:
@@ -1071,18 +1163,17 @@ def cx_rsub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         rets,
     ):
         return
+    # rsub.*_out is a generated wrapper: the functional result, the out's
+    # exact dtype, then resize and copy (no overlap check with the inputs)
     var dest = v_tensor_c(args[unsafe_offset=3])
-    _store_ew[2](
-        args,
-        dest,
-        _arith(
-            "sub",
-            args[unsafe_offset=1],
-            args[unsafe_offset=0],
-            args[unsafe_offset=2].copy(),
-        ),
-        rets,
+    var res = _arith(
+        "sub",
+        args[unsafe_offset=1],
+        args[unsafe_offset=0],
+        args[unsafe_offset=2].copy(),
     )
+    _exact_dtype(dest, res.t.stype)
+    _store(dest, res^, rets)
 
 
 def _cumsum(args: Values, out_st: Int32 = -1) raises -> Owned:
@@ -1139,6 +1230,15 @@ def cx_cumsum(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def cx_cumsum_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """cumsum_(self, int dim, *, ScalarType? dtype)"""
     var self = v_tensor_c(args[unsafe_offset=0])
+    var want = v_dtype_or(args[unsafe_offset=2], self.stype)
+    if want != self.stype:
+        raise Error(
+            "Bad in-place call: input tensor dtype ",
+            dtype_name(self.stype),
+            " and output tensor dtype ",
+            dtype_name(want),
+            " should match",
+        )
     _store(self, _cumsum(args, self.stype), rets)
 
 
@@ -1146,7 +1246,10 @@ def cx_cumsum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """cumsum.out(self, dim, *, dtype, out): resized to self's shape first
     (set_output), then checked and written."""
     var dest = v_tensor_c(args[unsafe_offset=3])
-    _store_red(dest, _cumsum(args, dest.stype), rets)
+    var res = _cumsum(args, dest.stype)
+    _same_device(dest, res.t)
+    resize_out(dest, res.t.shape, res.t.rank)
+    _store(dest, res^, rets)  # a scan's out: internal overlap checked
 
 
 def register_complex_math(site: Site) raises:
