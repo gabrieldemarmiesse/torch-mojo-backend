@@ -96,6 +96,7 @@ from tmb.backend.abi import (
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    check_scalar_fits,
     CX_DEVICE,
     CX_FULL,
     CX_HOST,
@@ -111,7 +112,6 @@ from tmb.ops.common import (
     resize_out,
     resized_geometry,
     assert_no_overlap,
-    shape_str,
     assert_no_internal_overlap,
     assert_no_partial_overlap,
     store_out,
@@ -294,7 +294,9 @@ def _check_cast(result: Int32, dest: Int32) raises:
         )
 
 
-def _store(mut dest: T, var res: Owned, rets: Values) raises:
+def _store(
+    mut dest: T, var res: Owned, rets: Values, internal: Bool = True
+) raises:
     """A fresh result into a caller's `out=` (or an in-place `self`):
     `resize_output` first, then the internal-overlap check on the resized
     out (an expanded out of the wrong shape is resized, not refused), then
@@ -302,7 +304,8 @@ def _store(mut dest: T, var res: Owned, rets: Values) raises:
     cast check)."""
     _same_device(dest, res.t)
     resize_out(dest, res.t.shape, res.t.rank)
-    assert_no_internal_overlap(dest)
+    if internal:
+        assert_no_internal_overlap(dest)
     if dest.stype == res.t.stype:
         copy_strided_into(dest, res.t)
         _ = res^
@@ -315,6 +318,16 @@ def _store(mut dest: T, var res: Owned, rets: Values) raises:
         _ = c.run(1)
         _ = res^
     ret_ref(rets, 0, dest)
+
+
+def _sizes(t: T) -> String:
+    """`t.sizes()` as torch prints it in an error: [2, 3]."""
+    var s = String("[")
+    for i in range(t.rank):
+        if i:
+            s += ", "
+        s += String(t.dim(i))
+    return s + "]"
 
 
 def _exact_dtype(dest: T, st: Int32) raises:
@@ -407,16 +420,8 @@ def _ew_overlaps(args: Values, n_in: Int, dest: T) raises:
 
 
 def _is_same(a: T, b: T) -> Bool:
-    """Whether two records are the same tensor (TensorBase::is_same: one
-    storage element for element, same geometry and dtype)."""
-    if a.h == b.h:
-        return True
-    if a.ptr != b.ptr or a.stype != b.stype or not a.same_shape(b):
-        return False
-    for d in range(a.rank):
-        if a.stride(d) != b.stride(d):
-            return False
-    return True
+    """TensorBase::is_same: the same TensorImpl."""
+    return a.impl() == b.impl()
 
 
 def _store_ew_n(
@@ -437,9 +442,9 @@ def _store_ew_n(
                 if _is_same(dest, v_tensor_c(v)):
                     raise Error(
                         "output with shape ",
-                        shape_str(dest),
+                        _sizes(dest),
                         " doesn't match the broadcast shape ",
-                        shape_str(res.t),
+                        _sizes(res.t),
                     )
     _store(dest, res^, rets)
 
@@ -945,7 +950,21 @@ def cx_unary_out[
     )
 
 
-comptime cx_conj_physical_out = cx_unary_out["conj", _TO_CX]
+def cx_conj_physical_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """conj_physical.out(self, *, out): a borrowing unary op, so the out
+    must already hold self's dtype (checked before anything is resized)."""
+    var x = v_tensor_c(args[unsafe_offset=0])
+    var dest = v_tensor_c(args[unsafe_offset=1])
+    if dest.stype != x.stype:
+        raise Error(
+            "Found dtype ",
+            _st_name(dest.stype),
+            " but expected ",
+            _st_name(x.stype),
+        )
+    _store_ew[1](args, dest, _unary("conj", _TO_CX, x), rets)
 
 
 # ---------------------------------------------------------------------------
@@ -1043,6 +1062,15 @@ def _cat(args: Values, stack: Bool, out_st: Int32 = -1) raises -> Owned:
                 ") cannot be concatenated",
             )
     var st = _common_complex(all_ts)
+    if out_st >= 0 and _category(st) > _category(out_st):
+        # (a TypeError on CUDA; this device raises RuntimeError)
+        raise Error(
+            (
+                "torch.cat(): input types can't be cast to the desired output"
+                " type "
+            ),
+            _st_name(out_st),
+        )
     if out_st >= 0 and is_complex_stype(out_st):
         _check_cast(st, out_st)
         st = out_st
@@ -1178,10 +1206,54 @@ def _check_index_count(x: T, indices: Value) raises:
         )
 
 
+def _opt_indices_arg(
+    mut c: _Call, v: Value, device: Int, mut keep: List[Owned]
+) raises:
+    """A `Tensor?[]` of indices for a call on `device`: a CPU index is
+    copied there (indexing takes CPU indices, as on CUDA); None stays."""
+    var present = v_opt_tensor_list_present(v)
+    var given = v_tensor_list_c(v)
+    var l = List[Int64](capacity=max(len(present), 1))
+    var gi = 0
+    for i in range(len(present)):
+        if not present[i]:
+            l.append(0)
+            continue
+        var t = given[gi].copy()
+        gi += 1
+        if t.on_cpu():
+            var d = own(new_tensor(t.shape, t.rank, t.stype, device))
+            var cp = _Call("aten::copy_")
+            cp.t(d.t)
+            cp.t(t)
+            cp.b(False)
+            _ = cp.run(1)
+            t = d.t.copy()
+            keep.append(d^)
+        var h = retain(t)
+        c.held.append(h)
+        l.append(Int64(h))
+    var addr = Int(l.unsafe_ptr())
+    c.lists.append(l^)
+    c.vals.append(
+        Value(TAG_OPT_TENSOR_LIST, Int32(len(present)), Int64(addr), 0)
+    )
+
+
 def cx_index(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """index.Tensor(self, Tensor?[] indices)"""
-    _check_index_count(v_tensor_c(args[unsafe_offset=0]), args[unsafe_offset=1])
-    _ret(rets, _on_real_view("aten::index", "Tensor", args, n_args))
+    var x = v_tensor_c(args[unsafe_offset=0])
+    _check_index_count(x, args[unsafe_offset=1])
+    var keep = List[Owned]()
+    var rv = as_real(x)
+    var c = _Call("aten::index", "Tensor")
+    c.t(rv.t)
+    _opt_indices_arg(c, args[unsafe_offset=1], x.device, keep)
+    var r = c.one()
+    _ = rv^
+    _ = keep^
+    _ret(rets, as_complex(r.t))
+    _ = r^
 
 
 def _dim_args(
@@ -1370,6 +1442,69 @@ def cx_repeat(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _ = r^
 
 
+def _index_put_as_masked_fill(self: T, args: Values, values: T) raises -> Bool:
+    """canDispatchToMaskedFill: one bool / byte mask on self's device (Nones
+    around it), a one-element CPU value -> self.masked_fill_(mask,
+    value.item()), whatever the value's dtype. False when it does not
+    apply."""
+    if values.numel != 1 or not values.on_cpu():
+        return False
+    var present = v_opt_tensor_list_present(args[unsafe_offset=1])
+    var given = v_tensor_list_c(args[unsafe_offset=1])
+    var num_ind = 0
+    var gi = 0
+    var found = False
+    var mask = self.copy()
+    for i in range(len(present)):
+        if not present[i]:
+            num_ind += 1
+            continue
+        var idx = given[gi].copy()
+        gi += 1
+        var is_mask = idx.stype == ST_BOOL or idx.stype == ST_UINT8
+        if (
+            not is_mask
+            or not idx.on_mojo()
+            or idx.device != self.device
+            or found
+        ):
+            return False
+        found = True
+        mask = idx.copy()
+        for j in range(idx.rank):
+            if num_ind + j >= self.rank or idx.dim(j) != self.dim(num_ind + j):
+                index_error(
+                    "The shape of the mask "
+                    + _sizes(idx)
+                    + " at index "
+                    + String(j)
+                    + " does not match the shape of the indexed tensor "
+                    + _sizes(self)
+                    + " at index "
+                    + String(num_ind + j)
+                )
+        num_ind += idx.rank
+    if not found:
+        return False
+    var m = own(mask.copy())
+    m.live = False
+    for _ in range(num_ind, self.rank):
+        var u = _Call("aten::unsqueeze")
+        u.t(m.t)
+        u.i(-1)
+        m = u.one()
+    var item = _Call("aten::_local_scalar_dense")
+    item.t(values)
+    var r = item.run(1)
+    var f = _Call("aten::masked_fill_", "Scalar")
+    f.t(self)
+    f.t(m.t)
+    f.v(r[0])
+    _ = f.run(1)
+    _ = m^
+    return True
+
+
 def cx_index_put_impl_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
@@ -1384,6 +1519,10 @@ def cx_index_put_impl_(
     var self = v_tensor_c(args[unsafe_offset=0])
     var values = v_tensor_c(args[unsafe_offset=2])
     _check_index_count(self, args[unsafe_offset=1])
+    var accumulate = v_bool_or(args[unsafe_offset=3], False)
+    if not accumulate and _index_put_as_masked_fill(self, args, values):
+        ret_ref(rets, 0, self)
+        return
     if self.stype != values.stype:
         # CUDA's index_put_ converts nothing (Indexing.cu's index_put_with_sort
         # and TensorAdvancedIndexing's index_put_ both check the dtypes)
@@ -1396,6 +1535,15 @@ def cx_index_put_impl_(
         )
     if self.rank == 0:
         index_error("too many indices for tensor of dimension 0")
+    # index_put_'s overlap checks, on the operands as given
+    if accumulate:
+        assert_no_internal_overlap(self)
+    if values.on_mojo() and values.device == self.device:
+        assert_no_overlap(self, values)
+    var given0 = v_tensor_list_c(args[unsafe_offset=1])
+    for i in range(len(given0)):
+        if given0[i].on_mojo() and given0[i].device == self.device:
+            assert_no_overlap(self, given0[i])
     # a 0-d CPU value is a scalar (copied over); any other must be here
     var vals: Owned
     if values.on_cpu() and values.rank == 0:
@@ -1434,11 +1582,11 @@ def cx_index_put_impl_(
             if index.dim(d) != self.dim(p + d):
                 index_error(
                     "The shape of the mask "
-                    + shape_str(index)
+                    + _sizes(index)
                     + " at index "
                     + String(d)
                     + " does not match the shape of the indexed tensor "
-                    + shape_str(self)
+                    + _sizes(self)
                     + " at index "
                     + String(p + d)
                 )
@@ -1567,7 +1715,7 @@ def cx_index_put_impl_(
             rs += String(rshape[i]) + (", " if i + 1 < rr else "")
         raise Error(
             "shape mismatch: value tensor of shape ",
-            shape_str(vals.t),
+            _sizes(vals.t),
             " cannot be broadcast to indexing result of shape ",
             rs + "]",
         )
@@ -1639,6 +1787,8 @@ def cx_fill_tensor_(
     value read once on the host, as the real route does."""
     var t = v_tensor_c(args[unsafe_offset=0])
     var value = v_tensor_c(args[unsafe_offset=1])
+    if value.on_mojo():
+        assert_no_internal_overlap(t)  # a device value is copy_'d in
     if value.rank != 0:
         raise Error(
             "fill_ only supports 0-dimension value tensor but got tensor with ",
@@ -1673,10 +1823,36 @@ def cx_via_bool[
     var cx_out = False
     var out_idx = n_args - 1
     comptime is_out = overload.endswith("out")
+    comptime logical = op.startswith("logical_")
+    comptime if logical:
+        # TensorIterator's device check: no CPU operand, not even a 0-d one
+        var dev = -1
+        for i in range(k):
+            var v = args[unsafe_offset=i].copy()
+            if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+                var t = v_tensor_c(v)
+                if t.on_mojo() and dev < 0:
+                    dev = t.device
+        for i in range(k):
+            var v = args[unsafe_offset=i].copy()
+            if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+                var t = v_tensor_c(v)
+                if not t.on_mojo() or t.device != dev:
+                    raise Error(
+                        (
+                            "Expected all tensors to be on the same device, but"
+                            " found at least two devices, mojo:"
+                        ),
+                        dev,
+                        " and ",
+                        device_str(t),
+                        "!",
+                    )
     comptime if is_out:
-        # the overlap checks see the original operands, not the bool
-        # stand-ins the real op gets
-        _ew_overlaps(args, k, v_tensor_c(args[unsafe_offset=out_idx]))
+        comptime if logical:
+            # the overlap checks see the original operands, not the bool
+            # stand-ins the real op gets (reductions check none)
+            _ew_overlaps(args, k, v_tensor_c(args[unsafe_offset=out_idx]))
         cx_out = v_is_complex(args[unsafe_offset=out_idx])
         if cx_out and (op == "any" or op == "all"):
             raise Error(
@@ -1755,6 +1931,27 @@ def _device_complex(v: Value, st: Int32, like: T) raises -> Owned:
     return one^
 
 
+def _to_device_0d(t: T, device: Int, what: StaticString) raises -> Owned:
+    """`t` itself when on mojo `device`; a CPU 0-d tensor copied there;
+    anything else is TensorIterator's device error."""
+    if t.on_mojo() and t.device == device:
+        var same = own(t.copy())
+        same.live = False
+        return same^
+    if t.on_cpu() and t.rank == 0:
+        var d = own(new_tensor(t.shape, 0, t.stype, device))
+        var c = _Call("aten::copy_")
+        c.t(d.t)
+        c.t(t)
+        c.b(False)
+        _ = c.run(1)
+        return d^
+    _require_same_device(t, device, what)
+    var same = own(t.copy())
+    same.live = False
+    return same^
+
+
 def _where(args: Values) raises -> Owned:
     """where.self(condition, self, other) with a complex self or other: both
     sides in the common complex dtype, then `where` on each part (real /
@@ -1770,14 +1967,22 @@ def _where(args: Values) raises -> Owned:
     var a = _operand(args[unsafe_offset=1], like)
     var b = _operand(args[unsafe_offset=2], like)
     var st = _result_type(a, b)
+    # a Python scalar converts to the result type checked (CUDA's
+    # wrapped-scalar route)
+    if not a.is_t and a.rank_kind == _RANK_WRAPPED:
+        check_scalar_fits(st, a.re, a.im)
+    if not b.is_t and b.rank_kind == _RANK_WRAPPED:
+        check_scalar_fits(st, b.re, b.im)
     var ta = _device_complex(args[unsafe_offset=1], st, like)
     var tb = _device_complex(args[unsafe_offset=2], st, like)
+    # a CPU 0-d condition is a scalar (TensorIterator moves it)
+    var dcond = _to_device_0d(cond, ta.t.device, "condition")
     var parts = List[Owned]()
     for which in range(2):
         var pa = _part(ta.t, which)
         var pb = _part(tb.t, which)
         var w = _Call("aten::where", "self")
-        w.t(cond)
+        w.t(dcond.t)
         w.t(pa.t)
         w.t(pb.t)
         parts.append(w.one())
@@ -1785,6 +1990,7 @@ def _where(args: Values) raises -> Owned:
         _ = pb^
     _ = ta^
     _ = tb^
+    _ = dcond^
     return _from_parts(parts[0].t, parts[1].t, st)
 
 
@@ -1878,8 +2084,10 @@ def cx_masked_fill_out(
     """masked_fill.Scalar_out / .Tensor_out(self, mask, value, *, out)"""
     var dest = v_tensor_c(args[unsafe_offset=3])
     var res = _masked_fill(args)
-    _exact_dtype(dest, res.t.stype)  # the generated out= wrapper's check
-    _store_ew[2](args, dest, res^, rets)
+    # the generated out= wrapper: the functional result, its dtype, then
+    # resize and copy (no overlap check against the inputs)
+    _exact_dtype(dest, res.t.stype)
+    _store(dest, res^, rets)
 
 
 def cx_masked_fill_(
@@ -1902,6 +2110,8 @@ def cx_fill(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var x = v_tensor_c(args[unsafe_offset=0])
     if not x.is_complex():
         unsupported("fill of a real tensor with a complex value")
+    var c = v_complex(args[unsafe_offset=1])
+    check_scalar_fits(x.stype, c[0], c[1])
     var out = own(new_tensor(x.shape, x.rank, x.stype, x.device))
     fill_complex(out.t, args[unsafe_offset=1].copy())
     _ret(rets, out^)
@@ -1979,6 +2189,17 @@ def cx_gather_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def _masked_select(args: Values) raises -> Owned:
     var x = v_tensor_c(args[unsafe_offset=0])
     var mask = v_tensor_c(args[unsafe_offset=1])
+    if not x.on_mojo():
+        raise Error(
+            (
+                "Expected all tensors to be on the same device, but got mask is"
+                " on "
+            ),
+            device_str(mask),
+            ", different from other tensors on ",
+            device_str(x),
+        )
+    _require_same_device(mask, x.device, "mask")
     var rv = as_real(x)
     var u = _Call("aten::unsqueeze")
     u.t(mask)
@@ -2087,7 +2308,24 @@ def _index_into(op: StaticString, target: T, args: Values, n_args: Int) raises:
     _ = src^
 
 
+def _self_on_device(args: Values) raises:
+    """index_add / index_copy with a CPU self and a device index: the
+    device check names the index, as CUDA's."""
+    var x = v_tensor_c(args[unsafe_offset=0])
+    if not x.on_mojo():
+        raise Error(
+            (
+                "Expected all tensors to be on the same device, but got index"
+                " is on "
+            ),
+            device_str(v_tensor_c(args[unsafe_offset=2])),
+            ", different from other tensors on ",
+            device_str(x),
+        )
+
+
 def _index_func(op: StaticString, args: Values, n_args: Int) raises -> Owned:
+    _self_on_device(args)
     var x = v_tensor_c(args[unsafe_offset=0])
     var source_st = v_tensor_c(args[unsafe_offset=3]).stype
     if x.stype != source_st:
@@ -2126,6 +2364,7 @@ def _index_func_store(
     exact dtype; resize, then no internal overlap and no overlap with the
     index or the source (index_func_meta_impl), and a partial overlap with
     self only when the out is not self."""
+    _self_on_device(args)
     var dest = v_tensor_c(args[unsafe_offset=dest_idx])
     var x = v_tensor_c(args[unsafe_offset=0])
     _exact_dtype(dest, x.stype)
@@ -2214,24 +2453,26 @@ def cx_triu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def cx_tril_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = v_tensor_c(args[unsafe_offset=0])
-    _store(self, _tri("aten::tril", args), rets)
+    # (no memory-overlap check: tril_ / triu_ write an expanded self)
+    _store(self, _tri("aten::tril", args), rets, False)
 
 
 def cx_triu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = v_tensor_c(args[unsafe_offset=0])
-    _store(self, _tri("aten::triu", args), rets)
+    # (no memory-overlap check: tril_ / triu_ write an expanded self)
+    _store(self, _tri("aten::triu", args), rets, False)
 
 
 def cx_tril_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor_c(args[unsafe_offset=2])
     _exact_dtype(dest, v_tensor_c(args[unsafe_offset=0]).stype)
-    _store(dest, _tri("aten::tril", args), rets)
+    _store(dest, _tri("aten::tril", args), rets, False)
 
 
 def cx_triu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor_c(args[unsafe_offset=2])
     _exact_dtype(dest, v_tensor_c(args[unsafe_offset=0]).stype)
-    _store(dest, _tri("aten::triu", args), rets)
+    _store(dest, _tri("aten::triu", args), rets, False)
 
 
 # ---------------------------------------------------------------------------
@@ -2281,6 +2522,8 @@ def op_conj_physical_(
     kernel: conjugate the stored values in place (a real tensor is left
     as is)."""
     var self = v_tensor_c(args[unsafe_offset=0])
+    if self.is_complex():
+        assert_no_internal_overlap(self)  # its TensorIterator's check
     if self.is_complex() and self.numel > 0:
         var conj = own(conj_copy(self))
         copy_strided_into(self, conj.t)

@@ -10,6 +10,10 @@ from std.ffi import external_call
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    ST_BOOL,
+    ST_FLOAT16,
+    ST_FLOAT32,
+    ST_FLOAT64,
     Values,
     Value,
     T,
@@ -94,6 +98,7 @@ from tmb.backend.device import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    check_scalar_fits,
     assert_no_internal_overlap,
     assert_no_partial_overlap,
     cx_unary_into,
@@ -434,6 +439,20 @@ def _resolved_source(input: T) raises -> Owned:
     return fresh^
 
 
+def _same_strides(a: T, b: T) -> Bool:
+    for d in range(a.rank):
+        if a.stride(d) != b.stride(d):
+            return False
+    return True
+
+
+def own_borrowed(t: T) -> Owned:
+    """An `Owned` over a borrowed tensor: never released by it."""
+    var o = own(t.copy())
+    o.live = False
+    return o^
+
+
 def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
     """`dst.copy_(input)` when either carries a lazy math bit (conj on a
     complex tensor, neg on any): the stored values end up the logical ones,
@@ -450,14 +469,56 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
     )
     if not bits:
         return False
-    if dst.on_mojo() and input.on_mojo() and dst.device == input.device:
-        # copy_'s TensorIterator checks, on the operands as given (before a
-        # bit is resolved into a fresh tensor that overlaps nothing)
-        if dst.h == input.h:
-            pass
-        else:
-            assert_no_internal_overlap(dst)
-            assert_no_partial_overlap(dst, input)
+    if input.on_mojo() and dst.on_mojo():
+        # copy_device_to_device's kernels: neg into bool, and neg + conj
+        # from a real source, have no CUDA instantiation (stock CUDA raises
+        # these; matched so code behaves the same on both)
+        var neg_differs = input.is_neg() != dst.is_neg()
+        var conj_differs = (input.is_complex() and input.is_conj()) != (
+            dst.is_complex() and dst.is_conj()
+        )
+        if neg_differs and dst.stype == ST_BOOL:
+            unsupported("\"neg_cuda\" not implemented for 'Bool'")
+        if neg_differs and conj_differs and not input.is_complex():
+            unsupported(
+                '"neg_conj_cuda" not implemented for \''
+                + (
+                    "Float" if input.stype
+                    == ST_FLOAT32 else "Double" if input.stype
+                    == ST_FLOAT64 else "Half" if input.stype
+                    == ST_FLOAT16 else "BFloat16"
+                )
+                + "'"
+            )
+    if input.stype != dst.stype or not (
+        input.on_mojo() and dst.on_mojo() and input.device == dst.device
+    ):
+        # convert first, then apply the math bits (copy_'s semantics: the
+        # destination's logical values are the converted source's), so a
+        # negation never happens in the narrower or unsigned dtype
+        var src = _resolved_source(input) if (
+            (input.is_complex() and input.is_conj()) or input.is_neg()
+        ) else own_borrowed(input)
+        var conv = own(
+            new_tensor(src.t.shape, src.t.rank, dst.stype, dst.device)
+        ) if dst.on_mojo() else own(
+            cpu_empty(src.t.shape, src.t.rank, dst.stype)
+        )
+        _ = call_op(
+            "aten::copy_",
+            "",
+            [tensor_arg(conv.t), tensor_arg(src.t), bool_arg(non_blocking)],
+            1,
+        )
+        _ = call_op(
+            "aten::copy_",
+            "",
+            [tensor_arg(dst), tensor_arg(conv.t), bool_arg(non_blocking)],
+            1,
+        )
+        _ = conv^
+        _ = src^
+        return True
     if dst.is_complex() and dst.is_conj():
         _copy_through_toggled("aten::_conj", input, dst, non_blocking)
         return True
@@ -482,6 +543,29 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var input = v_tensor_c(args[unsafe_offset=0])
     var dst = v_tensor_c(args[unsafe_offset=1])
     var non_blocking = v_bool_or(args[unsafe_offset=2], False)
+    # copy_impl: nothing to do for the same tensor, or for a view of the
+    # very same data (dtype and math bits included)
+    if dst.impl() == input.impl():
+        ret_ref(rets, 0, dst)
+        return
+    if (
+        dst.on_mojo()
+        and input.on_mojo()
+        and dst.device == input.device
+        and dst.ptr == input.ptr
+        and dst.stype == input.stype
+        and dst.same_shape(input)
+        and _same_strides(dst, input)
+        and dst.is_neg() == input.is_neg()
+        and (not dst.is_complex() or dst.is_conj() == input.is_conj())
+    ):
+        ret_ref(rets, 0, dst)
+        return
+    # its TensorIterator's memory-overlap checks, on the operands as given
+    if dst.on_mojo():
+        assert_no_internal_overlap(dst)
+        if input.on_mojo() and input.device == dst.device:
+            assert_no_partial_overlap(dst, input)
     if _copy_bits(input, dst, non_blocking):
         ret_ref(rets, 0, dst)
         return
@@ -750,6 +834,8 @@ def op_fill_scalar_(
 ) raises:
     var t = v_tensor_c(args[unsafe_offset=0])
     if t.is_complex():
+        var c = v_complex(args[unsafe_offset=1])
+        check_scalar_fits(t.stype, c[0], c[1])
         fill_complex(t, args[unsafe_offset=1].copy())
         ret_ref(rets, 0, t)
         return
@@ -780,6 +866,8 @@ def op_fill_tensor_(
     if not value.on_mojo():
         var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
         if t.is_complex():
+            var c = v_complex(r[0])
+            check_scalar_fits(t.stype, c[0], c[1])
             fill_complex(t, r[0])
         else:
             fill_value(t, r[0])

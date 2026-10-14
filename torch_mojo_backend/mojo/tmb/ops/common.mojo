@@ -1295,6 +1295,23 @@ def conj_copy(t: T) raises -> T:
     return out.take()
 
 
+def check_scalar_fits(st: Int32, re: Float64, im: Float64) raises:
+    """c10::checked_convert of a Scalar to complex64: a finite part out of
+    float's range raises, as CUDA's Scalar conversions do (complex128 holds
+    any double)."""
+    if st != ST_COMPLEX64:
+        return
+    comptime FMAX = 3.4028234663852886e38
+    # (x - x == 0: finite; an inf or NaN converts as is)
+    var bad_re = re - re == 0.0 and abs(re) > FMAX
+    var bad_im = im - im == 0.0 and abs(im) > FMAX
+    if bad_re or bad_im:
+        raise Error(
+            "value cannot be converted to type c10::complex<float> without"
+            " overflow"
+        )
+
+
 def fill_complex(t: T, v: Value) raises:
     """fill_ of a complex tensor: the two parts of the Scalar (a real one has
     a zero imaginary part) into the two strided component views; one memset

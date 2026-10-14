@@ -758,3 +758,118 @@ def test_index_put_on_an_expanded_self(mojo_gpu: str):
         (torch.tensor([1], device=mojo_gpu),), torch.tensor(7j, device=mojo_gpu)
     )
     assert torch.equal(x.cpu(), torch.full((3, 4), 7j))
+
+
+# --- round-5 review fixes (and the sweep against stock CUDA) --------------------
+
+
+def test_copy_converts_before_applying_math_bits(mojo_gpu: str):
+    z = torch.zeros(1, dtype=torch.complex64, device=mojo_gpu)
+    z.conj().imag.copy_(torch.tensor([255], dtype=torch.uint8, device=mojo_gpu))
+    assert z.cpu().tolist() == [-255j]
+    n = torch.zeros(3, dtype=torch.complex64, device=mojo_gpu)
+    torch._neg_view(n).copy_(
+        torch.tensor([255, 1, 0], dtype=torch.uint8, device=mojo_gpu)
+    )
+    assert n.cpu().real.tolist() == [-255.0, -1.0, 0.0]
+    f = torch.zeros(2, dtype=torch.complex128, device=mojo_gpu)
+    f.conj().copy_(torch._neg_view(torch.tensor([1 + 2j, 3j], device=mojo_gpu)))
+    assert f.cpu().tolist() == [-1 + 2j, 3j]
+    # (stock CUDA has no kernel for these two; matched)
+    with pytest.raises(NotImplementedError, match="neg_cuda"):
+        torch.zeros(2, dtype=torch.bool, device=mojo_gpu).copy_(
+            torch._neg_view(torch.ones(2, device=mojo_gpu))
+        )
+    with pytest.raises(NotImplementedError, match="neg_conj_cuda"):
+        torch.zeros(2, dtype=torch.complex64, device=mojo_gpu).conj().copy_(
+            torch._neg_view(torch.ones(2, device=mojo_gpu))
+        )
+
+
+def test_copy_overlap_checks(mojo_gpu: str):
+    x = _rand(3, 3).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        x.copy_(x.t())
+    e = torch.zeros(1, dtype=torch.complex64, device=mojo_gpu).expand(3)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        e.copy_(_rand(3).to(mojo_gpu))
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        e.fill_(torch.tensor(1j, device=mojo_gpu))
+    x.copy_(x)  # the same tensor: nothing to do
+
+
+def test_out_identity_is_the_tensor_not_its_data(mojo_gpu: str):
+    a = torch.zeros(0, 1, dtype=torch.complex64, device=mojo_gpu)
+    b = torch.zeros(0, 2, dtype=torch.complex64, device=mojo_gpu)
+    out = torch.zeros(0, 1, dtype=torch.bool, device=mojo_gpu)
+    torch.logical_and(a, b, out=out)
+    assert out.shape == (0, 2)
+    v = torch.tensor([1j, 0j, 1 + 0j], device=mojo_gpu)
+    w = _rand(2, 3).to(mojo_gpu)
+    o = v.view(3)
+    torch.logical_and(v, w, out=o)
+    assert o.shape == (2, 3)
+
+
+def test_index_put_value_overlap_and_masked_fill_dispatch(mojo_gpu: str):
+    x = _rand(3, 3).to(mojo_gpu)
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        x.index_put_((torch.tensor([0, 1], device=mojo_gpu),), x.t())
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.zeros(1, 3, dtype=torch.complex64, device=mojo_gpu).expand(
+            3, 3
+        ).index_put_(
+            (torch.tensor([0], device=mojo_gpu),),
+            _rand(3).to(mojo_gpu),
+            accumulate=True,
+        )
+    # one mask + a one-element CPU value of another dtype: masked_fill_
+    a = _rand(2, 3)
+    m = torch.rand(2, 3) > 0.5
+    d = a.to(mojo_gpu)
+    d.index_put_((m.to(mojo_gpu),), torch.tensor(2.5))
+    a.index_put_((m,), torch.tensor(2.5))
+    assert torch.equal(d.cpu(), a)
+    rows = torch.tensor([True, False])
+    d.index_put_((rows.to(mojo_gpu),), torch.tensor(-1.0))
+    a.index_put_((rows,), torch.tensor(-1.0))
+    assert torch.equal(d.cpu(), a)
+    with pytest.raises(RuntimeError, match="Index put requires"):
+        d.index_put_((torch.tensor([0], device=mojo_gpu),), torch.tensor(2.5))
+    with pytest.raises(RuntimeError, match="Index put requires"):
+        d.index_put_((m.to(mojo_gpu),), torch.tensor(2.5), accumulate=True)
+
+
+def test_conj_physical_out_and_in_place(mojo_gpu: str):
+    z = _rand(3).to(mojo_gpu)
+    with pytest.raises(
+        RuntimeError, match="Found dtype ComplexDouble but expected ComplexFloat"
+    ):
+        torch.conj_physical(
+            z, out=torch.empty(3, dtype=torch.complex128, device=mojo_gpu)
+        )
+    bad = torch.empty(5, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="Found dtype Float"):
+        torch.conj_physical(z, out=bad)
+    assert bad.shape == (5,)  # refused before any resize
+    with pytest.raises(RuntimeError, match="unsupported operation"):
+        torch.tensor([1j], device=mojo_gpu).expand(3).conj_physical_()
+
+
+def test_scalar_overflow_and_cpu_operands(mojo_gpu: str):
+    a = _rand(2, 3).to(mojo_gpu)
+    m = torch.tensor([[True, False, True], [False, True, False]], device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        a.clone().fill_(1e100)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.where(m, a, 1e100)
+    # a CPU 0-d condition, CPU indices, device errors with CUDA's type
+    got = torch.where(torch.tensor(True), a, torch.zeros_like(a))
+    assert torch.equal(got.cpu(), a.cpu())
+    assert torch.equal(a[torch.tensor([1, 0])].cpu(), a.cpu()[torch.tensor([1, 0])])
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.masked_select(a, m.cpu())
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.logical_or(torch.tensor(1.0), a)
+    with pytest.raises(RuntimeError, match="input types can't be cast"):
+        torch.cat([a, a], out=torch.empty(0, device=mojo_gpu))
