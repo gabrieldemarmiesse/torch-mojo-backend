@@ -3001,19 +3001,51 @@ def register_unary(site: Site) raises:
         "special_ndtri.out",
     ](site)
     impl[
-        op_special_scaled_modified_bessel_k0,
+        f8_iter[
+            op_special_scaled_modified_bessel_k0,
+            "scaled_modified_bessel_k0_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_scaled_modified_bessel_k0",
     ](site)
     impl[
-        op_special_scaled_modified_bessel_k0_out,
+        f8_iter[
+            op_special_scaled_modified_bessel_k0_out,
+            "scaled_modified_bessel_k0_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_scaled_modified_bessel_k0.out",
     ](site)
     impl[
-        op_special_scaled_modified_bessel_k1,
+        f8_iter[
+            op_special_scaled_modified_bessel_k1,
+            "scaled_modified_bessel_k1_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_scaled_modified_bessel_k1",
     ](site)
     impl[
-        op_special_scaled_modified_bessel_k1_out,
+        f8_iter[
+            op_special_scaled_modified_bessel_k1_out,
+            "scaled_modified_bessel_k1_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_scaled_modified_bessel_k1.out",
     ](site)
     impl[
