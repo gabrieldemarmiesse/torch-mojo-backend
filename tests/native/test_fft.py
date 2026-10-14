@@ -415,27 +415,56 @@ def test_bluestein_tables_do_not_leak(mojo_gpu: str):
     assert "no growth" in proc.stdout
 
 
-def test_cached_tables_are_complete_for_another_stream(mojo_gpu: str):
-    """A table uploaded on one stream is cached; a transform on another
-    stream right after must read it complete (the upload finishes before
-    the table is published). A fresh Bluestein length, so the first call
-    uploads its tables."""
+_STREAM_SCRIPT = textwrap.dedent("""
+    import torch
+    import torch_mojo_backend
+    torch_mojo_backend.register_mojo_devices()
+    dev = torch.accelerator.current_accelerator()
     n = 1_000_003  # prime: Bluestein (chirp tables) and Stockham twiddles
     x = torch.randn(n, dtype=torch.complex64)
     want = torch.fft.fft(x)
-    d = x.to(mojo_gpu)
-    s1 = torch.Stream(device=mojo_gpu)
-    s2 = torch.Stream(device=mojo_gpu)
-    busy = torch.randn(2048, 2048, device=mojo_gpu)
+    d = x.to(dev)
+    s1 = torch.Stream(device=dev)
+    s2 = torch.Stream(device=dev)
+    busy = torch.randn(2048, 2048, device=dev)
     torch.accelerator.synchronize()
     with s1:
-        # work queued ahead on s1, so a copy ordered on s1 lands late
+        # work queued ahead on s1, so a copy ordered on s1 lands late; this
+        # is the process's first transform, so it uploads every table
         for _ in range(20):
             busy = busy @ busy
             busy = busy / busy.abs().amax()
         a = torch.fft.fft(d)
     with s2:
+        # the tables just cached, read from another stream
         b = torch.fft.fft(d)
     torch.accelerator.synchronize()
-    _check(a, want)
-    _check(b, want)
+    scale = max(want.abs().max().item(), 1.0)
+    for got in (a, b):
+        torch.testing.assert_close(
+            got.cpu(), want, rtol=2e-5, atol=2e-6 * scale
+        )
+    print("both complete", flush=True)
+""")
+
+
+def test_cached_tables_are_complete_for_another_stream(mojo_gpu: str):
+    """A table uploaded on one stream is cached; a transform on another
+    stream right after must read it complete (the upload finishes before
+    the table is published). Run in a fresh process: the table cache is
+    process-wide, and the first transform must be the one that uploads
+    (an earlier test, e.g. the byte-bound one, may already have filled it)."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
+    }
+    proc = subprocess.run(
+        [sys.executable, "-c", _STREAM_SCRIPT],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "both complete" in proc.stdout
