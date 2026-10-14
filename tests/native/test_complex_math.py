@@ -7,6 +7,7 @@ stock CUDA torch where CPU and CUDA differ). complex128 needs float64, which
 Apple GPUs do not have.
 """
 
+import pathlib
 import warnings
 
 import pytest
@@ -782,3 +783,88 @@ def test_outs_of_real_results(mojo_gpu: str):
             1,
             out=torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(2, 3),
         )
+
+
+# --- round-6 review fixes ---------------------------------------------------
+
+
+def test_mean_with_a_non_floating_dtype_raises(mojo_gpu: str):
+    z = _rand(2, 3).to(mojo_gpu)
+    for dt in (torch.int64, torch.bool, torch.int8, torch.int32):
+        with pytest.raises(RuntimeError, match="Optional dtype must be either"):
+            z.mean(dtype=dt)
+        with pytest.raises(RuntimeError, match="Optional dtype must be either"):
+            z.mean(0, dtype=dt)
+
+
+def test_zero_dim_reduction_into_an_integer_out(mojo_gpu: str):
+    x = torch.tensor(3 + 4j, device=mojo_gpu)
+    for fn in (torch.mean, torch.sum):
+        out = torch.empty((), dtype=torch.int64, device=mojo_gpu)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fn(x, 0, out=out)
+        assert out.item() == 3
+
+
+def test_narrow_integer_reductions(mojo_gpu: str):
+    z = (_rand(2, 3) * 100).to(mojo_gpu)
+    ref = z.cpu()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for dt in (torch.int32, torch.int8):
+            assert torch.equal(z.sum(1, dtype=dt).cpu(), ref.sum(1, dtype=dt))
+        out = torch.empty(0, dtype=torch.int32, device=mojo_gpu)
+        torch.sum(z, 0, out=out)
+        assert torch.equal(out.cpu(), ref.real.to(torch.int64).sum(0).to(torch.int32))
+
+
+def test_pow_scalar_base_out_resize_and_bool_base(mojo_gpu: str):
+    out = torch.empty(1, dtype=torch.complex64, device=mojo_gpu).expand(3)
+    torch.pow(2, torch.tensor([1.0, 2.0], device=mojo_gpu), out=out)
+    assert out.cpu().tolist() == [2 + 0j, 4 + 0j]
+    # True is not Scalar::equal(1.0): the power is computed
+    got = torch.pow(True, torch.tensor([float("inf") + 0j], device=mojo_gpu)).cpu()
+    assert got[0].real.isnan() and got[0].imag.isnan()
+
+
+def test_out_cast_is_checked_before_the_resize(mojo_gpu: str):
+    z = _rand(2).to(mojo_gpu)
+    for op in (torch.add, torch.mul, torch.pow):
+        out = torch.zeros(5, device=mojo_gpu)
+        with pytest.raises(RuntimeError, match="can't be cast"):
+            op(z, z, out=out)
+        assert out.shape == (5,)
+
+
+def test_broadcast_error_names_the_sizes(mojo_gpu: str):
+    with pytest.raises(
+        RuntimeError,
+        match=r"tensor a \(3\) must match the size of tensor b \(2\) at non-singleton dimension 2",
+    ):
+        torch.ones(2, 3, device=mojo_gpu) * torch.ones(
+            4, 1, 2, dtype=torch.complex64, device=mojo_gpu
+        )
+    with pytest.raises(
+        RuntimeError,
+        match=r"tensor a \(2\) must match the size of tensor b \(3\) at non-singleton dimension 0",
+    ):
+        torch.complex(torch.ones(2, device=mojo_gpu), torch.ones(3, device=mojo_gpu))
+
+
+def test_third_party_notices_cover_the_ports():
+    root = pathlib.Path(__file__).resolve().parents[2]
+    notices = (root / "THIRD_PARTY_NOTICES.txt").read_text()
+    for needle in (
+        "David Schultz",
+        "Stephen Montgomery-Smith",
+        "NVIDIA Corporation",
+        "LLVM Exceptions",
+        "Apache License",
+    ):
+        assert needle in notices
+    src = (
+        root / "torch_mojo_backend/mojo/tmb/kernels/common/complex_math.mojo"
+    ).read_text()
+    assert "SPDX-License-Identifier: BSD-2-Clause" in src
+    assert "SPDX-License-Identifier: Apache-2.0 WITH" in src

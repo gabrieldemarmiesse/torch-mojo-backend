@@ -169,6 +169,14 @@ def cdiv[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
 # thrust's exp / log of complex (CCCL 3.0, as stock torch 2.11+cu130 runs
 # them in pow: thrust/detail/complex/cexp(f).h, clog(f).h -- FreeBSD msun),
 # ported literally, bit tricks included.
+#
+# Third-party code (full notices and licence texts: THIRD_PARTY_NOTICES.txt
+# at the repository root):
+#   Copyright (c) 2011 David Schultz <das@FreeBSD.ORG> (cexp)
+#   Copyright (c) 2012 Stephen Montgomery-Smith <stephen@FreeBSD.ORG> (clog)
+#   SPDX-License-Identifier: BSD-2-Clause
+#   Copyright 2008-2021 NVIDIA Corporation; Copyright 2013 Filipe RNC Maia
+#   SPDX-License-Identifier: Apache-2.0
 
 
 @always_inline
@@ -204,6 +212,8 @@ def _from_words[dt: DType](hi: UInt32, lo: UInt32) -> Scalar[dt]:
 @always_inline
 def _frexp_exp[dt: DType](x: Scalar[dt], mut expt: Int) -> Scalar[dt]:
     """frexp_exp(f): exp(x - k ln2) with its exponent field reset."""
+    # Modified from frexp_exp / frexp_expf, thrust/detail/complex/cexp.h,
+    # cexpf.h (nvidia-cuda-cccl 13.0.85; FreeBSD lib/msun/src/k_exp.c).
     comptime if dt == DType.float64:
         var exp_x = _rexp(x - Scalar[dt](1246.97177782734161156))
         var hx = _hi_word(exp_x)
@@ -220,6 +230,8 @@ def _frexp_exp[dt: DType](x: Scalar[dt], mut expt: Int) -> Scalar[dt]:
 
 @always_inline
 def _ldexp_cexp[dt: DType](z: Cx[dt], expt_in: Int) -> Cx[dt]:
+    # Modified from ldexp_cexp / ldexp_cexpf, thrust/detail/complex/cexp.h,
+    # cexpf.h (nvidia-cuda-cccl 13.0.85; FreeBSD lib/msun/src/k_exp.c).
     var ex_expt = 0
     var exp_x = _frexp_exp(z.re, ex_expt)
     var expt = expt_in + ex_expt
@@ -241,6 +253,8 @@ def _ldexp_cexp[dt: DType](z: Cx[dt], expt_in: Int) -> Cx[dt]:
 @always_inline
 def cexp[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """thrust's cexp / cexpf."""
+    # Modified from cexp / cexpf, thrust/detail/complex/cexp.h, cexpf.h
+    # (nvidia-cuda-cccl 13.0.85; FreeBSD lib/msun/src/s_cexp.c, s_cexpf.c).
     var x = z.re
     var y = z.im
     var hy = _hi_word(y) & 0x7FFFFFFF
@@ -277,6 +291,8 @@ def cexp[dt: DType](z: Cx[dt]) -> Cx[dt]:
 @always_inline
 def _trim[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """Round down to a third of the mantissa bits."""
+    # Modified from trim, thrust/detail/complex/clog.h, clogf.h
+    # (nvidia-cuda-cccl 13.0.85; FreeBSD lib/msun/src/s_clog.c).
     comptime if dt == DType.float64:
         return _from_words[dt](_hi_word(x) & 0xFFFFFFF8, 0)
     else:
@@ -287,9 +303,11 @@ def _trim[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 def clog[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """thrust's clog / clogf. Every a*b + c*d is the fused multiply-add nvcc
     forms for it: fma(a, b, c*d)."""
+    # Modified from clog / clogf, thrust/detail/complex/clog.h, clogf.h
+    # (nvidia-cuda-cccl 13.0.85; FreeBSD lib/msun/src/s_clog.c, s_clogf.c).
     var x = z.re
     var y = z.im
-    if x != x or y != y:
+    if isnan(x) or isnan(y):
         return Cx[dt](_rlog(x.fma(x, y * y)), catan2(y, x))
     var ax = abs(x)
     var ay = abs(y)
@@ -361,6 +379,12 @@ def clog[dt: DType](z: Cx[dt]) -> Cx[dt]:
 
 # ---------------------------------------------------------------------------
 # libc++ <complex> (the jiterator's), ported literally
+#
+# Third-party code: LLVM libc++ <complex>, as copied with modifications into
+# PyTorch's aten/src/ATen/cuda/llvm_complex.cpp (v2.11.0). Part of the LLVM
+# Project, under the Apache License v2.0 with LLVM Exceptions; see
+# THIRD_PARTY_NOTICES.txt. SPDX-License-Identifier: Apache-2.0 WITH
+# LLVM-exception
 # ---------------------------------------------------------------------------
 
 
@@ -379,6 +403,7 @@ def _unit_sign[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 def _logb[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """C's logb for x >= 0: the unbiased exponent (subnormals included),
     -inf at 0, inf at inf, NaN at NaN."""
+    # Modified from libc++ logb (libc++ <complex> helper, llvm_complex.cpp) (PyTorch v2.11.0; LLVM licence).
     if isnan(x):
         return x
     if isinf(x):
@@ -413,6 +438,7 @@ def _logb[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def _scalbn[dt: DType](x: Scalar[dt], n: Int) -> Scalar[dt]:
     """x * 2^n, exact (in up to three in-range power-of-two steps)."""
+    # Modified from libc++ scalbn (libc++ <complex> helper, llvm_complex.cpp) (PyTorch v2.11.0; LLVM licence).
     var r = x
     var k = n
     comptime lim = 1000 if dt == DType.float64 else 120
@@ -438,6 +464,7 @@ def _pow2[dt: DType](k: Int) -> Scalar[dt]:
 def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
     """libc++'s operator/(complex, complex): scaled by the larger exponent
     of the divisor (logb / scalbn), Annex G recovery."""
+    # Modified from libc++ operator/(const complex&, const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
     var ilogbw = 0
     var a = z.re
     var b = z.im
@@ -486,6 +513,7 @@ def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
 @always_inline
 def cexp_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """libc++'s exp(complex)."""
+    # Modified from libc++ exp(const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
     var i = z.im
     if _is_zero(i):
         return Cx[dt](_rexp(z.re), _copysign(Scalar[dt](0), i))
@@ -504,12 +532,14 @@ def cexp_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
 @always_inline
 def clog_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """libc++'s log(complex): log(abs(z)) + i arg(z)."""
+    # Modified from libc++ log(const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
     return Cx[dt](_rlog(chypot(z.re, z.im)), catan2(z.im, z.re))
 
 
 @always_inline
 def _polar[dt: DType](rho: Scalar[dt], theta: Scalar[dt]) -> Cx[dt]:
     """libc++'s polar(rho, theta)."""
+    # Modified from libc++ polar(const _Tp&, const _Tp&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
     if isnan(rho) or _signbit(rho):
         return Cx[dt](nan[dt](), nan[dt]())
     if isnan(theta):
@@ -532,6 +562,7 @@ def _polar[dt: DType](rho: Scalar[dt], theta: Scalar[dt]) -> Cx[dt]:
 @always_inline
 def csqrt_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """libc++'s sqrt(complex): the polar form, Annex G's infinities."""
+    # Modified from libc++ sqrt(const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
     if isinf(z.im):
         return Cx[dt](_inf[dt](), z.im)
     if isinf(z.re):

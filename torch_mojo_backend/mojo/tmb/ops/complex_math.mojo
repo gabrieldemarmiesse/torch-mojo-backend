@@ -66,6 +66,7 @@ from tmb.backend.abi import (
     v_is_complex,
     Owned,
     ST_BOOL,
+    ST_INT64,
     ST_FLOAT16,
     ST_FLOAT32,
     ST_FLOAT64,
@@ -586,15 +587,24 @@ def cx_pow_tensor_scalar_out(
     )
 
 
+def _base_is_one(av: Value) raises -> Bool:
+    """pow_Scalar_out's `base.equal(1.0)`: a Scalar base equal to 1 (a bool
+    True is not: Scalar::equal compares a bool to a bool only)."""
+    if av.tag == TAG_TENSOR or av.tag == TAG_TENSOR_REF:
+        return False
+    if av.tag == TAG_SCALAR_BOOL or av.tag == TAG_BOOL:
+        return False
+    var base = v_complex(av)
+    return base[0] == 1.0 and base[1] == 0.0
+
+
 def _pow(av: Value, bv: Value) raises -> Owned:
     """pow.Tensor_Tensor / pow.Scalar. Pow.cpp's pow_Scalar_out: a base
     EQUAL to 1 fills ones (of the result dtype)."""
-    if av.tag != TAG_TENSOR and av.tag != TAG_TENSOR_REF:
-        var base = v_complex(av)
-        if base[0] == 1.0 and base[1] == 0.0:
-            var e = v_tensor_c(bv)
-            var st = _result_type(_operand(av, e), _Operand(e))
-            return _ones(e.shape, e.rank, st, e.device)
+    if _base_is_one(av):
+        var e = v_tensor_c(bv)
+        var st = _result_type(_operand(av, e), _Operand(e))
+        return _ones(e.shape, e.rank, st, e.device)
     return _arith("pow", av, bv, _no_alpha())
 
 
@@ -606,6 +616,15 @@ def cx_pow_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def cx_pow_tensor_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    var dest = v_tensor_c(args[unsafe_offset=2])
+    var av = args[unsafe_offset=0].copy()
+    if av.tag != TAG_TENSOR and av.tag != TAG_TENSOR_REF:
+        # pow.Scalar is structured: its meta resizes the out to the
+        # exponent's shape before anything checks it (a real exponent too)
+        var ex = v_tensor_c(args[unsafe_offset=1])
+        _same_device(dest, ex)
+        resize_out(dest, ex.shape, ex.rank)
+        dest = v_tensor_c(args[unsafe_offset=2])
     if _real_out(
         "aten::pow",
         _tensor_or_scalar(args[unsafe_offset=0], "Tensor_Tensor", "Scalar"),
@@ -615,24 +634,15 @@ def cx_pow_tensor_out(
         rets,
     ):
         return
-    var dest = v_tensor_c(args[unsafe_offset=2])
-    var av = args[unsafe_offset=0].copy()
-    if av.tag != TAG_TENSOR and av.tag != TAG_TENSOR_REF:
-        # pow.Scalar is structured: its meta resizes the out to the
-        # exponent's shape before anything checks it
-        var ex = v_tensor_c(args[unsafe_offset=1])
-        _same_device(dest, ex)
-        resize_out(dest, ex.shape, ex.rank)
-        var base = v_complex(av)
-        if base[0] == 1.0 and base[1] == 0.0:
-            # pow_Scalar_out: `out.fill_(1)` in the out's own dtype, no
-            # result-type cast check
-            var f = _Call("aten::fill_", "Scalar")
-            f.t(dest)
-            f.s(1.0)
-            _ = f.run(1)
-            ret_ref(rets, 0, dest)
-            return
+    if _base_is_one(av):
+        # pow_Scalar_out: `out.fill_(1)` in the out's own dtype, no
+        # result-type cast check
+        var f = _Call("aten::fill_", "Scalar")
+        f.t(dest)
+        f.s(1.0)
+        _ = f.run(1)
+        ret_ref(rets, 0, dest)
+        return
     _store_ew[2](
         args,
         dest,
@@ -772,8 +782,12 @@ def _make(kind: StaticString, re: T, im: T, out_st: Int32) raises -> Owned:
                 shape[i] = t.shape[i]
             elif t.shape[i] != 1 and t.shape[i] != shape[i]:
                 raise Error(
-                    "The size of tensor a must match the size of tensor b at"
-                    " non-singleton dimension"
+                    "The size of tensor a (",
+                    shape[i],
+                    ") must match the size of tensor b (",
+                    t.shape[i],
+                    ") at non-singleton dimension ",
+                    i - (MAX_RANK - max(re.rank, im.rank)),
                 )
     var keep = List[Int]()
     var fa = _real_flat(re, shape, rank, keep)
@@ -879,6 +893,17 @@ def op_polar_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _make_op("polar", args, rets, 2)
 
 
+def _reduced_count(x: T, dims: List[Int]) -> Int:
+    """How many elements each output of a reduction over `dims` takes (1
+    for a 0-d x, whose dims are none)."""
+    if x.rank == 0:
+        return 1
+    var count = 1
+    for d in dims:
+        count *= x.dim(d)
+    return count
+
+
 def _reduce(
     name: StaticString,
     x: T,
@@ -908,6 +933,16 @@ def _reduce(
             ),
             _st_name(x.stype),
         )
+    if name == "mean" and dtype_v.tag != TAG_NONE:
+        var asked = v_dtype_or(dtype_v, x.stype)
+        if not _is_float(asked) and not is_complex_stype(asked):
+            raise Error(
+                (
+                    "mean(): could not infer output dtype. Optional dtype must"
+                    " be either a floating point or complex dtype. Got: "
+                ),
+                _st_name(asked),
+            )
     var want = v_dtype_or(dtype_v, out_st if out_st >= 0 else x.stype)
     if out_st >= 0 and dtype_v.tag != TAG_NONE and want != out_st:
         raise Error(
@@ -949,6 +984,9 @@ def _reduce(
             ac.b(keepdim)
             r = ac.one()
         else:
+            # integers accumulate in int64 (CUDA's acc type for them), then
+            # narrow: the same bits as an int32 / int8 accumulation
+            var acc = ST_INT64 if integral else want
             var rc = _Call(
                 String("aten::") + ("sum" if integral else name),
                 "dim_IntList" if integral else overload,
@@ -956,16 +994,23 @@ def _reduce(
             rc.t(xr.t)
             rc.ints(dims)
             rc.b(keepdim)
-            rc.dtype(want)
+            rc.dtype(acc)
             r = rc.one()
+            if acc != want:
+                var narrowed = own(
+                    new_tensor(r.t.shape, r.t.rank, want, r.t.device)
+                )
+                var cp = _Call("aten::copy_")
+                cp.t(narrowed.t)
+                cp.t(r.t)
+                cp.b(False)
+                _ = cp.run(1)
+                r = narrowed^
         _ = xr^
         if name == "mean" and integral:
             # MeanOps' factor 1/N cast to the integer accumulator: 0 unless
             # one element is reduced
-            var count = 1
-            for d in dims:
-                count *= x.shape[MAX_RANK - x.rank + d]
-            if count != 1:
+            if _reduced_count(x, dims) != 1:
                 var z = _Call("aten::zero_")
                 z.t(r.t)
                 _ = z.run(1)
@@ -1006,10 +1051,7 @@ def _reduce(
     _ = dense^
     _ = back^
     if name == "mean" and cv.t.numel > 0:
-        var count = 1
-        for d in dims:
-            count *= x.shape[MAX_RANK - x.rank + d]
-        if count == 0:
+        if _reduced_count(x, dims) == 0:
             # CUDA's mean of nothing is NaN + 0i (each part's mean, ours,
             # would make the imaginary part NaN too)
             var im = _part(cv.t, 1)
