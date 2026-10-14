@@ -237,7 +237,7 @@ def _cast_into_out(
         raise Error("expected the out= tensor on the operands' mojo device")
     if not _shape_eq(out_arg, shape, rank):
         resize_out(out_arg, shape, rank)
-    var casted = own(cast_for_copy(res, out_arg.stype))
+    var casted = own(cast_for_copy(res, out_arg.stype, False))
     copy_strided_into(out_arg, casted.t)
     _ = casted^  # alive past the launch
 

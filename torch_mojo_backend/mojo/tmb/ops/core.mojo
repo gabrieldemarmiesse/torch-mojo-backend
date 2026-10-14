@@ -342,9 +342,12 @@ def _copy_broadcast_source(src: T, dst: T) raises -> T:
     return view_strided(src, dst.shape, strides, dst.rank, src.offset)
 
 
-def cast_for_copy(src: T, stype: Int32) raises -> T:
+def cast_for_copy(src: T, stype: Int32, saturate: Bool = True) raises -> T:
+    """`src` converted to `stype`. `saturate` is copy_'s float -> e4m3fn
+    rule; an out= / in-place store of a TensorIterator op converts in its
+    kernel (c10's static_cast) and passes False."""
     if is_cast_pair_on(src.dtype, max_dtype(stype), src):
-        return cast_to(src, stype)
+        return cast_to(src, stype, saturate)
     # CPU torch preserves integer precision for pairs outside CastSpec.
     var host_src = own(cpu_empty(src.shape, src.rank, src.stype))
     copy_to_host(

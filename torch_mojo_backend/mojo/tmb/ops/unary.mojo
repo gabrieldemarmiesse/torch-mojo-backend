@@ -262,7 +262,7 @@ def _unary_out(
         if not dst.same_shape(t_in):
             resize_out(dst, t_in.shape, t_in.rank)
         var result = own(_unary(family, op, t_in, out_dtype))
-        var casted = own(cast_for_copy(result.t, dst.stype))
+        var casted = own(cast_for_copy(result.t, dst.stype, False))
         copy_strided_into(dst, casted.t)
         _ = casted^  # alive past the launch
         _ = result^
@@ -1528,7 +1528,7 @@ def _param_unary_out(
         if not dst.same_shape(t_in):
             resize_out(dst, t_in.shape, t_in.rank)
         var result = own(_param_unary(op, t_in, p0, p1, p2))
-        var casted = own(cast_for_copy(result.t, dst.stype))
+        var casted = own(cast_for_copy(result.t, dst.stype, False))
         copy_strided_into(dst, casted.t)
         _ = casted^  # alive past the launch
         _ = result^
@@ -1805,7 +1805,7 @@ def op_mvlgamma_out(
     if not dst.same_shape(result.t):
         resize_out(dst, result.t.shape, result.t.rank)
     assert_no_internal_overlap(dst)
-    var casted = own_if_new(cast_for_copy(result.t, dst.stype), result.t)
+    var casted = own_if_new(cast_for_copy(result.t, dst.stype, False), result.t)
     copy_strided_into(dst, casted.t)
     _ = casted^  # alive past the launch
     _ = result^

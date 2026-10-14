@@ -509,9 +509,9 @@ def op_where_self_out(
     if r.t.stype != out.stype:
         raise Error(
             "Expected out type to be ",
-            String(r.t.dtype),
+            _scalar_type_name(r.t.dtype),
             " but got ",
-            String(out.dtype),
+            _scalar_type_name(out.dtype),
         )
     if not out.same_shape(r.t):
         resize_out(out, r.t.shape, r.t.rank)
