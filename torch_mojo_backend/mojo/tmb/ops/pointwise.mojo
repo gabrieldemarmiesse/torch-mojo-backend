@@ -99,6 +99,8 @@ from tmb.ops.binary import (
     op_rsub_out,
 )
 from tmb.ops.common import (
+    decline_float8,
+    fill_value,
     scalar_type_name,
     ST_UNDEFINED,
     assert_no_internal_overlap,
@@ -525,7 +527,12 @@ def _pw_no_float8(kind: StaticString, compute: Int32) raises:
     if _pw_is_f8(compute):
         unsupported(
             '"'
-            + ("lerp" if kind == "lerp_scalar" else String(kind))
+            + (
+                "lerp" if kind
+                == "lerp_scalar" else (
+                    "pow" if kind == "pow_scalar_base" else String(kind)
+                )
+            )
             + "_cuda\" not implemented for '"
             + scalar_type_name(max_dtype(compute))
             + "'"
@@ -550,10 +557,12 @@ def _pw_math(
     var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
     var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
     var common = _pw_result_type(a, b, c, arity)
-    var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     var dest = Optional[T]()
     if out_index >= 0:
+        # TensorIterator's out= checks and resize precede the kernel
+        # dispatch (a float8 computation is refused after the resize).
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
+    var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     _pw_finish(
         rets,
         dest,
@@ -1100,14 +1109,23 @@ def _pw_pow_scalar_base(args: Values, rets: Values, out_index: Int) raises:
         _pw_ipow(args, rets, out_index, False)
         return
     var common = _pw_result_type(base, expo, _none_side(), 2)
-    var compute = _pw_compute_dtype(
-        "pow_scalar_base", common, P_FLOAT_ONLY, True
-    )
     var dest = Optional[T]()
     if out_index >= 0:
         dest = _pw_out_of(
             args[unsafe_offset=out_index], expo, _none_side(), _none_side()
         )
+    if _pw_is_f8(common) and expo.is_t:
+        var b = base.s.value().copy()
+        if not b.is_bool and (Float64(b.i) if b.is_int else b.f) == 1.0:
+            # Pow.cpp: a base of 1 fills ones, no kernel (float8 too).
+            var e = expo.t.value().copy()
+            var ones = own(new_tensor(e.shape, e.rank, common, e.device))
+            fill_value(ones.t, 1.0)
+            _pw_finish(rets, dest, Res(ones.take(), True))
+            return
+    var compute = _pw_compute_dtype(
+        "pow_scalar_base", common, P_FLOAT_ONLY, True
+    )
     _pw_finish(
         rets,
         dest,
@@ -3958,6 +3976,36 @@ def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         raise Error(
             "atol must be greater than or equal to zero, but got ", atol
         )
+    if _pw_is_f8(st) and a.is_t and b.is_t:
+        # isclose.cpp: `close = self == other` (eq has a float8 kernel), the
+        # equal_nan term, then -- unless both tolerances are zero --
+        # `rtol * other`, whose mul_cuda has no float8 case.
+        if rtol != 0 or atol != 0:
+            decline_float8(max_dtype(st), "mul_cuda")
+        var ta = a.t.value().copy()
+        var tb = b.t.value().copy()
+        var close = call_op(
+            "aten::eq", "Tensor", [tensor_arg(ta), tensor_arg(tb)], 1
+        )
+        if not equal_nan:
+            var only = own(close.take_tensor(0))
+            ret_owned(rets, 0, only)
+            return
+        var na = call_op("aten::isnan", "", [tensor_arg(ta)], 1)
+        var nb = call_op("aten::isnan", "", [tensor_arg(tb)], 1)
+        var both = call_op(
+            "aten::logical_and", "", [na[0].copy(), nb[0].copy()], 1
+        )
+        var r = call_op(
+            "aten::logical_or", "", [close[0].copy(), both[0].copy()], 1
+        )
+        var res = own(r.take_tensor(0))
+        ret_owned(rets, 0, res)
+        _ = na^
+        _ = nb^
+        _ = both^
+        _ = close^
+        return
     if not (_pw_is_float(st) or _pw_is_int(st) or st == ST_BOOL):
         unsupported("isclose on dtype " + dtype_name(st))
     var tol_on = 0.0 if (rtol == 0 and atol == 0) else 1.0
