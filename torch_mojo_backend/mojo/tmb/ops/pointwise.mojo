@@ -102,7 +102,7 @@ from tmb.ops.common import (
     scalar_type_name,
     ST_UNDEFINED,
     assert_no_internal_overlap,
-    combine_categories as _pw_combine,
+    combine_categories as _pw_combine_known,
     contiguous,
     copy_strided_into,
     is_float_stype as _pw_is_float,
@@ -133,6 +133,39 @@ struct _TypeState(Copyable, Movable):
     var wrapped: Int32
 
 
+def _pw_is_f8(st: Int32) raises -> Bool:
+    return st != ST_UNDEFINED and is_float8(max_dtype(st))
+
+
+def _pw_promote(a: Int32, b: Int32) raises -> Int32:
+    """c10::promoteTypes with its float8 rule: a float8 dtype promotes with
+    no other dtype."""
+    if a != ST_UNDEFINED and b != ST_UNDEFINED and a != b:
+        if _pw_is_f8(a) or _pw_is_f8(b):
+            raise Error(
+                (
+                    "Promotion for Float8 Types is not supported, attempted to"
+                    " promote "
+                ),
+                scalar_type_name(max_dtype(a)),
+                " and ",
+                scalar_type_name(max_dtype(b)),
+            )
+    return promote_types(a, b)
+
+
+def _pw_combine(higher: Int32, lower: Int32) raises -> Int32:
+    """c10's combine_categories, float8 counting as floating."""
+    if _pw_is_f8(higher):
+        return higher
+    if _pw_is_f8(lower) and (higher == ST_BOOL or higher == ST_UNDEFINED):
+        return _pw_promote(higher, lower)
+    if _pw_is_f8(lower) and not _pw_is_float(higher):
+        # An integral dimensioned result meets a float8 0-d / wrapped one.
+        return _pw_promote(higher, lower)
+    return _pw_combine_known(higher, lower)
+
+
 def _pw_update(mut state: _TypeState, side: Side) raises:
     """at::native::update_result_type_state for one operand. A Scalar (or
     torch's 0-d CPU wrapped number) is a wrapped number: bool, int64, or the
@@ -140,19 +173,19 @@ def _pw_update(mut state: _TypeState, side: Side) raises:
     if side.is_t:
         var t = side.t.value().copy()
         if t.rank == 0:
-            state.zero = promote_types(state.zero, t.stype)
+            state.zero = _pw_promote(state.zero, t.stype)
         else:
-            state.dim = promote_types(state.dim, t.stype)
+            state.dim = _pw_promote(state.dim, t.stype)
         return
     if side.zero_st >= 0:
         # An explicit 0-d CPU tensor (not a wrapped Python number).
-        state.zero = promote_types(state.zero, side.zero_st)
+        state.zero = _pw_promote(state.zero, side.zero_st)
         return
     var s = side.s.value().copy()
     var st = ST_BOOL if s.is_bool else (
         ST_INT64 if s.is_int else default_dtype()
     )
-    state.wrapped = promote_types(state.wrapped, st)
+    state.wrapped = _pw_promote(state.wrapped, st)
 
 
 def _pw_result_type(a: Side, b: Side, c: Side, arity: Int) raises -> Int32:
@@ -176,6 +209,7 @@ comptime P_NUMERIC = 4  # every dtype but bool
 def _pw_compute_dtype(
     kind: StaticString, common: Int32, policy: Int, f64_ok: Bool
 ) raises -> Int32:
+    _pw_no_float8(kind, common)
     var st = common
     if policy == P_FLOAT and not _pw_is_float(st):
         st = default_dtype()
@@ -366,7 +400,7 @@ def _pw_run(
     """One launch of `kind` over (a, b, c) computed in `compute`, stored as
     `out_stype`: into `dst` when it already has the result's dtype, shape
     and a dense layout, else into a fresh tensor."""
-    _pw_no_float8(kind, a, b, c)
+    _pw_no_float8(kind, compute)
     var device = _pw_device(a, b, c)
     var bs = _pw_broadcast(a, b, c, arity)
     var shape = bs[0]
@@ -484,20 +518,18 @@ def _pw_inplace_self(
     return self^
 
 
-def _pw_no_float8(kind: StaticString, a: Side, b: Side, c: Side) raises:
-    """CUDA's pointwise math kernels dispatch no float8 operand (empty ones
-    included): refuse with the `<op>_cuda` name its error uses."""
-    for side in [a.copy(), b.copy(), c.copy()]:
-        if side.is_t:
-            var dt = side.t.value().dtype
-            if is_float8(dt):
-                unsupported(
-                    '"'
-                    + String(kind)
-                    + "_cuda\" not implemented for '"
-                    + scalar_type_name(dt)
-                    + "'"
-                )
+def _pw_no_float8(kind: StaticString, compute: Int32) raises:
+    """CUDA's pointwise math kernels dispatch no float8 computation (empty
+    operands included): refuse with the `<op>_cuda` name its error uses. A
+    float8 0-d operand of a wider computation converts like any other."""
+    if _pw_is_f8(compute):
+        unsupported(
+            '"'
+            + ("lerp" if kind == "lerp_scalar" else String(kind))
+            + "_cuda\" not implemented for '"
+            + scalar_type_name(max_dtype(compute))
+            + "'"
+        )
 
 
 def _pw_math(

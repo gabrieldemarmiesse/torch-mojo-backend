@@ -602,14 +602,15 @@ def _take_checks(a: T, index: T, dest: T) raises:
         )
     if a.numel == 0 and index.numel != 0:
         raise Error("take(): tried to take from an empty tensor")
-    if index.numel > 0:  # after CUDA's checks; an empty take never dispatches
-        decline_float8(a.dtype, "take_cuda")
 
 
 def _take_into(dst: T, a: T, index: T) raises:
     """dst (contiguous, index's shape) = a.flatten()[index]."""
     if index.numel == 0:
         return
+    # CUDA's take_cuda dispatch runs past the checks, the overlap checks and
+    # out's resize; an empty take never dispatches.
+    decline_float8(a.dtype, "take_cuda")
     var idx = _wrapped_index(index, a.numel)
     var src = own_if_new(contiguous(a), a)
     _gather_dim_launch(

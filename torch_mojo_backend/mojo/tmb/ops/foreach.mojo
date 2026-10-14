@@ -42,6 +42,7 @@ from std.utils import IndexList
 from tmb.backend.abi import (
     ST_FLOAT32,
     T,
+    bool_arg,
     is_dense,
     Value,
     Values,
@@ -72,7 +73,7 @@ from tmb.kernels.optimizer.foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
-from tmb.ops.common import copy_strided_into, decline_float8, fill_value
+from tmb.ops.common import cast_into, cast_to, copy_strided_into
 from tmb.ops.data_movement import _scalar_type_name
 
 
@@ -746,19 +747,6 @@ def _copy_adjacent_views(dsts: List[T], srcs: List[T]) raises -> Bool:
 
 
 # aten::_foreach_copy_(Tensor(a!)[] self, Tensor[] src, bool non_blocking=False) -> ()
-# aten::_foreach_zero_(Tensor(a!)[] self) -> ()
-def op_foreach_zero_(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    """ATen's composite would zero a float8 tensor; CUDA's kernel has no
-    float8 case (empty tensors included), so refuse those first."""
-    var ts = v_tensor_list(args[unsafe_offset=0])
-    for i in range(len(ts)):
-        decline_float8(ts[i].dtype, "foreach_zero_cuda_")
-    for i in range(len(ts)):
-        fill_value(ts[i], 0.0)
-
-
 def op_foreach_copy_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
@@ -768,14 +756,17 @@ def op_foreach_copy_(
         raise Error("Tensor list must have at least one tensor.")
     if len(srcs) != len(dsts):
         raise Error("Tensor lists must have the same number of tensors.")
-    for i in range(len(dsts)):
-        # CUDA's foreach copy dispatches float8 except e8m0, empty included.
-        if dsts[i].dtype == DType.float8_e8m0fnu:
-            decline_float8(dsts[i].dtype, "foreach_tensor_copy")
     if _copy_adjacent_views(dsts, srcs):
         return
     if _copy_batch_qualifies(dsts, srcs):
         _copy_batch_launch(dsts, srcs)
+        return
+    if (
+        dsts[0].dtype == DType.float8_e4m3fn
+        and srcs[0].dtype != DType.float8_e4m3fn
+        and _cuda_copy_fast_route(dsts, srcs)
+    ):
+        _copy_e4m3fn_unsaturated(dsts, srcs)
         return
     for i in range(len(dsts)):
         var copy_args = List[Value]()
@@ -783,6 +774,60 @@ def op_foreach_copy_(
         copy_args.append(_tensor_value(srcs[i]))
         copy_args.append(args[unsafe_offset=2].copy())
         _ = call_op("aten::copy_", "", copy_args^, 1)
+
+
+def _cuda_copy_fast_route(dsts: List[T], srcs: List[T]) -> Bool:
+    """The condition of CUDA's `_foreach_copy_` multi_tensor_apply route
+    (ForeachBinaryOpList.cu): one device, dense strided tensors, one dtype
+    per list, index-aligned sizes and strides."""
+    var first = dsts[0].copy()
+    if not first.on_mojo():
+        return False
+    var src_dtype = srcs[0].dtype
+    for i in range(len(dsts)):
+        ref d = dsts[i]
+        ref s = srcs[i]
+        if (
+            not d.on_mojo()
+            or d.device != first.device
+            or d.dtype != first.dtype
+        ):
+            return False
+        if not s.on_mojo() or s.device != first.device or s.dtype != src_dtype:
+            return False
+        if not is_dense(d.shape, d.strides, d.rank) or not is_dense(
+            s.shape, s.strides, s.rank
+        ):
+            return False
+        if not d.same_shape(s):
+            return False
+        var pad = MAX_RANK - d.rank
+        for k in range(d.rank):
+            if (
+                d.shape[pad + k] != 1
+                and d.strides[pad + k] != s.strides[pad + k]
+            ):
+                return False
+    return True
+
+
+def _copy_e4m3fn_unsaturated(dsts: List[T], srcs: List[T]) raises:
+    """CUDA's fast route converts with c10's static_cast: an out-of-range
+    value becomes NaN, not copy_'s saturated 448 (sm_89+ SATFINITE)."""
+    for i in range(len(dsts)):
+        if dsts[i].numel == 0:
+            continue
+        if dsts[i].contig:
+            cast_into(dsts[i], srcs[i], False)
+            dsts[i].bump_version()
+            continue
+        var tmp = own(cast_to(srcs[i], dsts[i].stype, False))
+        var copy_args = List[Value]()
+        copy_args.append(_tensor_value(dsts[i]))
+        copy_args.append(_tensor_value(tmp.t))
+        copy_args.append(bool_arg(False))
+        _ = call_op("aten::copy_", "", copy_args^, 1)
+        _ = tmp^
 
 
 # aten::_foreach_lerp_.Scalar(Tensor(a!)[] self, Tensor[] tensors1, Scalar weight) -> ()
@@ -1468,7 +1513,6 @@ def register_foreach(site: Site) raises:
     ](site)
     impl[op_amp_update_scale_, "_amp_update_scale_"](site)
     impl[op_foreach_copy_, "_foreach_copy_"](site)
-    impl[op_foreach_zero_, "_foreach_zero_"](site)
     impl[op_foreach_add_scalar_, "_foreach_add_.Scalar"](site)
     impl[op_foreach_addcmul_scalar_, "_foreach_addcmul_.Scalar"](site)
     impl[op_foreach_lerp_scalar_, "_foreach_lerp_.Scalar"](site)

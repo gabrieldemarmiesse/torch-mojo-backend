@@ -72,6 +72,7 @@ from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    decline_float8,
     ST_UNDEFINED,
     scalar_type_name,
     assert_no_internal_overlap,
@@ -894,6 +895,12 @@ def _b_op_dtype_ok(op: StaticString, st: Int32, is_cmp: Bool) raises:
                 kernel = "div_true_cuda"
             elif op == "PowSpec":
                 kernel = "pow_cuda"
+            elif op == "RemainderSpec":
+                kernel = "remainder_cuda"
+            elif op == "MaximumSpec":
+                kernel = "max_elementwise_cuda"
+            elif op == "MinimumSpec":
+                kernel = "min_elementwise_cuda"
             unsupported(
                 '"'
                 + kernel
@@ -2511,6 +2518,7 @@ def _b_clamp(
             "torch.clamp: At least one of 'min' or 'max' must not be None"
         )
     var result_stype = _b_clamp_dtype(self.stype, lo, hi)
+    decline_float8(max_dtype(result_stype), "clamp_scalar_cuda")
     if not _b_bcast_dtype(result_stype) or (
         result_stype == ST_FLOAT64 and dev(self.device)[].api == "metal"
     ):
@@ -2733,6 +2741,10 @@ def _b_addc(
         raise Error("expected every operand on the same mojo device")
     if a.stype != b.stype or a.stype != c.stype:
         unsupported("addc* operands of different dtypes")
+    # CUDA's addcmul_cuda / addcdiv_cuda dispatch no float8.
+    decline_float8(
+        a.dtype, "addcmul_cuda" if op == "AddcmulBcast" else "addcdiv_cuda"
+    )
     if not _b_float3(a.stype) and not (allow_int and _b_int_dtype(a.stype)):
         unsupported("addc* of dtype " + String(a.stype))
     if a.rank > 4 or b.rank > 4 or c.rank > 4:

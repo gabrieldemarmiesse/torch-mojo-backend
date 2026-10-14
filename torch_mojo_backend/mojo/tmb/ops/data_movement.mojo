@@ -104,6 +104,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.ops.common import (
+    _repeats_elements,
     decline_float8,
     scalar_type_name,
     assert_no_internal_overlap,
@@ -3085,6 +3086,39 @@ def _index_put_mask_fill(
                 values.offset,
             )
         )
+        # CUDA's index_put kernel writes only the selected positions, so on
+        # an expanded self every alias of a selected element sees the value.
+        # masked_fill writes every position (the unselected ones with what
+        # they read): collapse each expanded dim instead, the mask reduced
+        # with `any` over it, so each storage element is written once.
+        var dst = target.copy()
+        var fill_mask = mask_view.t.copy()
+        var held = List[Owned]()
+        if _repeats_elements(target):
+            var cshape = target.shape
+            var cmask = mask_view.t.copy()
+            var pad = MAX_RANK - target.rank
+            for d in range(target.rank):
+                if target.stride(d) == 0 and target.dim(d) > 1:
+                    cshape[pad + d] = 1
+                    var r = call_op(
+                        "aten::any",
+                        "dim",
+                        [tensor_arg(cmask), int_arg(d), bool_arg(True)],
+                        1,
+                    )
+                    held.append(own(r.take_tensor(0)))
+                    cmask = held[len(held) - 1].t.copy()
+            var cview = own(
+                view_strided(
+                    target, cshape, target.strides, target.rank, target.offset
+                )
+            )
+            if _repeats_elements(cview.t):
+                unsupported("index_put_ into an internally overlapping self")
+            dst = cview.t.copy()
+            held.append(cview^)
+            fill_mask = cmask.copy()
         if is_float8(target.dtype):
             # A device value never takes ATen's masked_fill route
             # (canDispatchToMaskedFill wants a CPU value) and CUDA's
@@ -3095,7 +3129,7 @@ def _index_put_mask_fill(
             var t8 = call_op(
                 "aten::view",
                 "dtype",
-                [tensor_arg(target), int_arg(Int(ST_UINT8))],
+                [tensor_arg(dst), int_arg(Int(ST_UINT8))],
                 1,
             )
             var v8 = call_op(
@@ -3107,7 +3141,7 @@ def _index_put_mask_fill(
             _ = call_op(
                 "aten::masked_fill_",
                 "Tensor",
-                [t8[0].copy(), tensor_arg(mask_view.t), v8[0].copy()],
+                [t8[0].copy(), tensor_arg(fill_mask), v8[0].copy()],
                 1,
             )
             _ = t8^
@@ -3117,13 +3151,15 @@ def _index_put_mask_fill(
                 "aten::masked_fill_",
                 "Tensor",
                 [
-                    tensor_arg(target),
-                    tensor_arg(mask_view.t),
+                    tensor_arg(dst),
+                    tensor_arg(fill_mask),
                     tensor_arg(value0.t),
                 ],
                 1,
             )
         _ = value0^
+        _ = held^
+        _ = dst^
     _ = mask_view^
 
 

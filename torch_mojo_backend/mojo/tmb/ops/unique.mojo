@@ -262,7 +262,9 @@ def run_bounds(sorted: T) raises -> RunBounds:
 def _check_dtype(t: T, what: String) raises:
     var dt = t.dtype
     # CUDA's unique kernels dispatch no float8, empty input included.
-    decline_float8(dt, "unique")
+    decline_float8(
+        dt, "unique_dim" if what.startswith("unique_dim") else "unique"
+    )
     if not (
         dt.is_floating_point()
         or dt == DType.int64
@@ -521,7 +523,13 @@ def op_unique_consecutive(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    _check_dtype(t, "unique_consecutive")
+    # With a dim, CUDA runs unique_dim_consecutive_cuda.
+    _check_dtype(
+        t,
+        "unique_dim_consecutive" if not v_is_none(
+            args[unsafe_offset=3]
+        ) else "unique_consecutive",
+    )
     var inverse = v_bool(args[unsafe_offset=1])
     var counts = v_bool(args[unsafe_offset=2])
     if v_is_none(args[unsafe_offset=3]):

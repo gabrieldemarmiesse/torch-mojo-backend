@@ -9,6 +9,8 @@ CUDA has no float8 kernel for is declined. References are CPU torch, with the
 stock-CUDA saturation rule applied where it differs (`_stock_cast`).
 """
 
+import itertools
+
 import pytest
 import torch
 
@@ -810,21 +812,52 @@ def test_float8_mask_assign_overlapping_mask_raises(mojo_device):
         (lambda x: torch.copysign(x, x), "copysign_cuda"),
         (lambda x: torch.unique(x), "unique"),
         (lambda x: torch.unique(x[:0]), "unique"),
-        (lambda x: torch._foreach_zero_([x]), "foreach_zero_cuda_"),
+        (lambda x: torch.unique(x, dim=0), "unique_dim"),
+        (lambda x: torch.unique_consecutive(x, dim=0), "unique_dim"),
+        (lambda x: torch.lerp(x, x, 0.5), "lerp_cuda"),
+        (lambda x: torch.lerp(x, x, x), "lerp_cuda"),
+        (lambda x: torch.addcmul(x, x, x), "addcmul_cuda"),
+        (lambda x: torch.addcdiv(x, x, x), "addcdiv_cuda"),
+        (lambda x: torch.clamp(x, 0, 1), "clamp_scalar_cuda"),
+        (lambda x: torch.clamp_min(x, 0), "clamp_scalar_cuda"),
+        (lambda x: torch.clamp(x, x, x), "clamp_cuda"),
+        (lambda x: torch.hypot(x, x), "hypot_cuda"),
+        (lambda x: torch.fmod(x, x), "fmod_cuda"),
+        (lambda x: torch.remainder(x, x), "remainder_cuda"),
+        (lambda x: torch.maximum(x, x), "max_elementwise_cuda"),
+        (lambda x: torch.minimum(x, x), "min_elementwise_cuda"),
+        (
+            lambda x: torch.copysign(x, torch.tensor(-1.0, device=x.device)),
+            "copysign_cuda",
+        ),
     ],
-    ids=["reflect", "replicate", "copysign", "unique", "unique_empty", "foreach_zero"],
+    ids=[
+        "reflect",
+        "replicate",
+        "copysign",
+        "unique",
+        "unique_empty",
+        "unique_dim",
+        "unique_consecutive_dim",
+        "lerp_scalar",
+        "lerp_tensor",
+        "addcmul",
+        "addcdiv",
+        "clamp",
+        "clamp_min",
+        "clamp_tensor",
+        "hypot",
+        "fmod",
+        "remainder",
+        "maximum",
+        "minimum",
+        "copysign_0d",
+    ],
 )
 def test_float8_more_refusals_name_cuda_kernels(mojo_device, op, kernel):
     x = _x(torch.float8_e4m3fn).to(mojo_device)
     with pytest.raises(NotImplementedError, match=kernel):
         op(x)
-
-
-def test_float8_e8m0_foreach_copy_refused(mojo_device):
-    dst = torch.ones(3).to(torch.float8_e8m0fnu).to(mojo_device)
-    src = torch.ones(3, device=mojo_device)
-    with pytest.raises(NotImplementedError, match="foreach_tensor_copy"):
-        torch._foreach_copy_([dst], [src])
 
 
 def test_float8_tril_out_resized_before_refusal(mojo_device):
@@ -855,12 +888,54 @@ def test_index_put_check_order(mojo_device):
         t[bad_mask] = t[0]
 
 
-@pytest.mark.parametrize("hit", [True, False])
-def test_float8_mask_assign_into_expanded_self(mojo_device, hit):
-    """CUDA's index_put kernel writes the selected elements, so every alias
-    of an expanded self sees the value (or none does)."""
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float32])
+@pytest.mark.parametrize("mask", list(itertools.product([False, True], repeat=3)))
+def test_mask_assign_into_expanded_self(mojo_device, dtype, mask):
+    """CUDA's index_put kernel writes only the selected positions, so every
+    alias of an expanded self sees the value as soon as one is selected."""
     dev = mojo_device
-    t = torch.ones(1).to(torch.float8_e4m3fn).to(dev).expand(3)
-    mask = torch.tensor([hit, False, False], device=dev)
+    t = torch.ones(1).to(dtype).to(dev).expand(3)
+    t[torch.tensor(mask, device=dev)] = torch.tensor(3.0).to(dtype).to(dev)
+    assert t.float().cpu().tolist() == [3.0 if any(mask) else 1.0] * 3
+
+
+def test_mask_assign_into_expanded_self_2d(mojo_device):
+    dev = mojo_device
+    t = torch.ones(2, 1).to(torch.float8_e4m3fn).to(dev).expand(2, 3)
+    mask = torch.tensor([[False, True, False], [False, False, False]], device=dev)
     t[mask] = torch.tensor(3.0).to(torch.float8_e4m3fn).to(dev)
-    assert t.view(torch.uint8).cpu().tolist() == [68 if hit else 56] * 3
+    assert t.float().cpu().tolist() == [[3.0] * 3, [1.0] * 3]
+
+
+@pytest.mark.parametrize("src", [torch.float32, torch.float16, torch.bfloat16])
+def test_float8_foreach_copy_does_not_saturate(mojo_device, src):
+    """CUDA's _foreach_copy_ fast route converts with c10's static_cast (an
+    out-of-range value is NaN), unlike copy_'s sm_89+ saturation."""
+    dev = mojo_device
+    dst = [torch.zeros(3).to(torch.float8_e4m3fn).to(dev)]
+    torch._foreach_copy_(dst, [torch.tensor([500.0, 1.0, -1e6]).to(src).to(dev)])
+    assert dst[0].view(torch.uint8).cpu().tolist() == [127, 56, 255]
+
+
+def test_copysign_float8_promotion(mojo_device):
+    """A float8 0-d operand of a float32 copysign converts; a dimensioned one
+    does not promote (c10::promoteTypes)."""
+    dev = mojo_device
+    a = torch.tensor([1.0, 2.0], device=dev)
+    got = torch.copysign(a, torch.tensor(-1.0).to(torch.float8_e4m3fn).to(dev))
+    assert got.dtype == torch.float32 and got.cpu().tolist() == [-1.0, -2.0]
+    with pytest.raises(RuntimeError, match="Promotion for Float8 Types"):
+        torch.copysign(a, torch.tensor([-1.0, 1.0]).to(torch.float8_e4m3fn).to(dev))
+
+
+def test_float8_take_out_checks_before_refusal(mojo_device):
+    """take(out=): overlap checks and out's resize come before take_cuda's
+    float8 refusal."""
+    dev = mojo_device
+    x = torch.ones(2, 3).to(torch.float8_e4m3fn).to(dev)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        torch.take(x, torch.tensor([0, 1], device=dev), out=x.view(-1)[:2])
+    out = torch.empty(0, dtype=x.dtype, device=dev)
+    with pytest.raises(NotImplementedError, match="take_cuda"):
+        torch.take(x, torch.tensor([0, 1, 2], device=dev), out=out)
+    assert out.shape == (3,)

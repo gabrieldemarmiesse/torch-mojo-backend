@@ -55,12 +55,7 @@ COVERS: dict[str, str] = {
     ),
 }
 
-SKIPPED: dict[str, str] = {
-    "aten::_foreach_zero_": (
-        "registered only to refuse float8 as CUDA does; otherwise one memset "
-        "per tensor, the same work as zero_"
-    )
-}
+SKIPPED: dict[str, str] = {}
 
 
 COPY_LISTS = {
