@@ -303,6 +303,8 @@ def _store(
     the copy, converting when the dtypes differ (after TensorIterator's
     cast check)."""
     _same_device(dest, res.t)
+    if dest.stype != res.t.stype:
+        _check_cast(res.t.stype, dest.stype)  # before the out is touched
     resize_out(dest, res.t.shape, res.t.rank)
     if internal:
         assert_no_internal_overlap(dest)
@@ -719,12 +721,15 @@ def _bshape(a: _Operand, b: _Operand) raises -> Tuple[IndexList[MAX_RANK], Int]:
     """Broadcast shape and rank of the tensor operands."""
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
+    if a.is_t:
+        rank = max(rank, a.t.rank)
+    if b.is_t:
+        rank = max(rank, b.t.rank)
     for k in range(2):
         var is_t = a.is_t if k == 0 else b.is_t
         if not is_t:
             continue
         var t = a.t.copy() if k == 0 else b.t.copy()
-        rank = max(rank, t.rank)
         for i in range(MAX_RANK):
             var x = shape[i]
             var y = t.shape[i]
@@ -734,8 +739,12 @@ def _bshape(a: _Operand, b: _Operand) raises -> Tuple[IndexList[MAX_RANK], Int]:
                 shape[i] = y
             else:
                 raise Error(
-                    "The size of tensor a must match the size of tensor b at"
-                    " non-singleton dimension"
+                    "The size of tensor a (",
+                    x,
+                    ") must match the size of tensor b (",
+                    y,
+                    ") at non-singleton dimension ",
+                    i - (MAX_RANK - rank),
                 )
     return (shape, rank)
 
@@ -1457,7 +1466,8 @@ def _index_put_as_masked_fill(self: T, args: Values, values: T) raises -> Bool:
     var mask = self.copy()
     for i in range(len(present)):
         if not present[i]:
-            num_ind += 1
+            if not found:  # only the Nones before the mask shift it
+                num_ind += 1
             continue
         var idx = given[gi].copy()
         gi += 1
@@ -1496,6 +1506,8 @@ def _index_put_as_masked_fill(self: T, args: Values, values: T) raises -> Bool:
     var item = _Call("aten::_local_scalar_dense")
     item.t(values)
     var r = item.run(1)
+    var iv = v_complex(r[0])
+    check_scalar_fits(self.stype, iv[0], iv[1])
     var f = _Call("aten::masked_fill_", "Scalar")
     f.t(self)
     f.t(m.t)
@@ -1780,6 +1792,30 @@ def cx_index_put_impl_(
     ret_ref(rets, 0, self)
 
 
+def _scalar_type_token(st: Int32) -> String:
+    """The C++ type token AT_FORALL_SCALAR_TYPES names a dtype by (what
+    checked_convert's overflow error prints)."""
+    if st == ST_FLOAT32:
+        return "float"
+    if st == ST_FLOAT64:
+        return "double"
+    if st == ST_FLOAT16:
+        return "at::Half"
+    if st == ST_BFLOAT16:
+        return "at::BFloat16"
+    if st == ST_INT64:
+        return "int64_t"
+    if st == ST_INT32:
+        return "int"
+    if st == ST_INT16:
+        return "int16_t"
+    if st == ST_INT8:
+        return "int8_t"
+    if st == ST_UINT8:
+        return "uint8_t"
+    return dtype_name(st)
+
+
 def cx_fill_tensor_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
@@ -1795,12 +1831,54 @@ def cx_fill_tensor_(
             value.rank,
             " dimensions.",
         )
-    if not t.is_complex():
-        unsupported("fill_ of a real tensor with a complex value")
+    if t.numel == 0:
+        ret_ref(rets, 0, t)
+        return
+    if value.on_mojo():
+        # a device value is broadcast and copy_'d in (a complex value into a
+        # real self keeps the real part, as copy_ does)
+        _require_same_device(value, t.device, "value")
+        var sizes = List[Int]()
+        for d in range(t.rank):
+            sizes.append(t.dim(d))
+        var ex = _Call("aten::expand")
+        ex.t(value)
+        ex.ints(sizes)
+        ex.b(False)
+        var vexp = ex.one()
+        var cp = _Call("aten::copy_")
+        cp.t(t)
+        cp.t(vexp.t)
+        cp.b(False)
+        _ = cp.run(1)
+        _ = vexp^
+        ret_ref(rets, 0, t)
+        return
     var c = _Call("aten::_local_scalar_dense")
     c.t(value)
     var r = c.run(1)
-    fill_complex(t, r[0])
+    var v = v_complex(r[0])
+    if t.is_complex():
+        check_scalar_fits(t.stype, v[0], v[1])  # before anything is written
+        fill_complex(t, r[0])
+    else:
+        # value.item() is a complex Scalar, converted checked: a nonzero
+        # imaginary part does not fit a real dtype (bool: either part
+        # nonzero)
+        if t.stype != ST_BOOL and v[1] != 0.0:
+            raise Error(
+                "value cannot be converted to type ",
+                _scalar_type_token(t.stype),
+                " without overflow",
+            )
+        var f = _Call("aten::fill_", "Scalar")
+        f.t(t)
+        if t.stype == ST_BOOL:
+            var truth = Int64(1) if v[0] != 0.0 or v[1] != 0.0 else Int64(0)
+            f.v(Value(TAG_SCALAR_BOOL, 0, truth, 0))
+        else:
+            f.s(v[0])
+        _ = f.run(1)
     ret_ref(rets, 0, t)
 
 
@@ -2033,6 +2111,8 @@ def _masked_fill_into(target: T, mask: Value, value: Value) raises:
         var r = s.run(1)
         val = r[0].copy()
     var parts = v_complex(val)
+    # the Scalar's checked conversion, before anything is written
+    check_scalar_fits(target.stype, parts[0], parts[1])
     var rv = as_real(target)
     for j in range(2):
         var sel = _Call("aten::select", "int")
@@ -2291,6 +2371,7 @@ def _index_into(op: StaticString, target: T, args: Values, n_args: Int) raises:
     src.live = False
     if n_args > 4:
         var al = v_complex(args[unsafe_offset=4])
+        check_scalar_fits(target.stype, al[0], al[1])  # alpha.to<scalar_t>
         src = _scaled(source, al[0], al[1])
     for which in range(2):
         var tp = _part(target, which)

@@ -453,6 +453,13 @@ def own_borrowed(t: T) -> Owned:
     return o^
 
 
+def _toggled_view(op: StaticString, t: T) raises -> Owned:
+    """`aten::_conj` / `aten::_neg_view` of t: the same data, that bit
+    toggled."""
+    var r = call_op(String(op), "", [tensor_arg(t)], 1)
+    return own(r.take_tensor(0))
+
+
 def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
     """`dst.copy_(input)` when either carries a lazy math bit (conj on a
     complex tensor, neg on any): the stored values end up the logical ones,
@@ -469,6 +476,8 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
     )
     if not bits:
         return False
+    if dst.numel == 0:
+        return True  # copy_impl returns before choosing a kernel
     if input.on_mojo() and dst.on_mojo():
         # copy_device_to_device's kernels: neg into bool, and neg + conj
         # from a real source, have no CUDA instantiation (stock CUDA raises
@@ -495,21 +504,38 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
     ):
         # convert first, then apply the math bits (copy_'s semantics: the
         # destination's logical values are the converted source's), so a
-        # negation never happens in the narrower or unsigned dtype
-        var src = _resolved_source(input) if (
-            (input.is_complex() and input.is_conj()) or input.is_neg()
-        ) else own_borrowed(input)
+        # negation never happens in the narrower or unsigned source dtype:
+        # the source's raw values (its bits toggled off, views) converted
+        # into a fresh tensor of dst's dtype, which then takes the bits
+        var s_conj = input.is_complex() and input.is_conj()
+        var s_neg = input.is_neg()
+        var raw = own_borrowed(input)
+        if s_conj:
+            raw = _toggled_view("aten::_conj", raw.t)
+        if s_neg:
+            raw = _toggled_view("aten::_neg_view", raw.t)
         var conv = own(
-            new_tensor(src.t.shape, src.t.rank, dst.stype, dst.device)
+            new_tensor(raw.t.shape, raw.t.rank, dst.stype, dst.device)
         ) if dst.on_mojo() else own(
-            cpu_empty(src.t.shape, src.t.rank, dst.stype)
+            cpu_empty(raw.t.shape, raw.t.rank, dst.stype)
         )
         _ = call_op(
             "aten::copy_",
             "",
-            [tensor_arg(conv.t), tensor_arg(src.t), bool_arg(non_blocking)],
+            [tensor_arg(conv.t), tensor_arg(raw.t), bool_arg(non_blocking)],
             1,
         )
+        _ = raw^
+        if s_conj and conv.t.is_complex():
+            if conv.t.on_mojo():
+                cx_unary_into("conj", conv.t, conv.t)
+            else:
+                _ = call_op("aten::conj_physical_", "", [tensor_arg(conv.t)], 1)
+        if s_neg:
+            if conv.t.on_mojo() and conv.t.is_complex():
+                cx_unary_into("neg", conv.t, conv.t)
+            elif conv.t.stype != ST_BOOL:  # -x is as true as x
+                _ = call_op("aten::neg_", "", [tensor_arg(conv.t)], 1)
         _ = call_op(
             "aten::copy_",
             "",
@@ -517,7 +543,6 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
             1,
         )
         _ = conv^
-        _ = src^
         return True
     if dst.is_complex() and dst.is_conj():
         _copy_through_toggled("aten::_conj", input, dst, non_blocking)

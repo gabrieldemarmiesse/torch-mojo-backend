@@ -2318,7 +2318,7 @@ def register_unary(site: Site) raises:
     impl[op_neg, "neg"](site)
     impl[op_neg_out, "neg.out"](site)
     impl[
-        routed[op_conj_physical_out, cx_conj_physical_out, 1],
+        routed[op_conj_physical_out, cx_conj_physical_out, 2],
         "conj_physical.out",
     ](site)
     impl[op_polygamma, "polygamma"](site)

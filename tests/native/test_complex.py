@@ -873,3 +873,63 @@ def test_scalar_overflow_and_cpu_operands(mojo_gpu: str):
         torch.logical_or(torch.tensor(1.0), a)
     with pytest.raises(RuntimeError, match="input types can't be cast"):
         torch.cat([a, a], out=torch.empty(0, device=mojo_gpu))
+
+
+# --- round-6 review fixes ---------------------------------------------------
+
+
+def test_math_bit_source_converts_before_its_bit(mojo_gpu: str):
+    out = torch.zeros(1, dtype=torch.complex64, device=mojo_gpu)
+    out.copy_(torch._neg_view(torch.tensor([255], dtype=torch.uint8, device=mojo_gpu)))
+    assert out.cpu().tolist() == [-255 + 0j]
+    i8 = torch.zeros(1, dtype=torch.int64, device=mojo_gpu)
+    i8.copy_(torch._neg_view(torch.tensor([-128], dtype=torch.int8, device=mojo_gpu)))
+    assert i8.cpu().tolist() == [128]
+    # an empty copy chooses no kernel: nothing to refuse
+    torch.zeros(0, dtype=torch.bool, device=mojo_gpu).copy_(
+        torch._neg_view(torch.zeros(0, device=mojo_gpu))
+    )
+
+
+def test_scalars_are_checked_before_anything_is_written(mojo_gpu: str):
+    x = _rand(2, 3).to(mojo_gpu)
+    before = x.cpu()
+    m = torch.ones(2, 3, dtype=torch.bool, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        x.masked_fill_(m, 7 + 1e100j)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        x.fill_(torch.tensor(1e100, dtype=torch.float64))
+    with pytest.raises(RuntimeError, match="without overflow"):
+        x.fill_(torch.tensor(1e39j, dtype=torch.complex128))
+    with pytest.raises(RuntimeError, match="without overflow"):
+        x.index_add_(0, torch.tensor([0, 1], device=mojo_gpu), x.clone(), alpha=1e100)
+    assert torch.equal(x.cpu(), before)
+
+
+def test_fill_a_real_tensor_with_a_complex_value(mojo_gpu: str):
+    t = torch.zeros(3, device=mojo_gpu)
+    t.fill_(torch.tensor(2 + 3j, device=mojo_gpu))  # copy_: the real part
+    assert t.cpu().tolist() == [2.0, 2.0, 2.0]
+    with pytest.raises(RuntimeError, match="value cannot be converted to type float"):
+        t.fill_(torch.tensor(2 + 3j))  # .item(): a checked conversion
+    t.fill_(torch.tensor(5 + 0j))
+    assert t.cpu().tolist() == [5.0, 5.0, 5.0]
+
+
+def test_index_put_mask_with_a_trailing_none(mojo_gpu: str):
+    x = _rand(2, 2, 4)
+    d = x.to(mojo_gpu)
+    m = torch.tensor([True, False])
+    torch.ops.aten.index_put_(d, [m.to(mojo_gpu), None], torch.tensor(5 + 1j))
+    torch.ops.aten.index_put_(x, [m, None], torch.tensor(5 + 1j))
+    assert torch.equal(d.cpu(), x)
+
+
+def test_conj_physical_of_a_real_tensor_into_a_complex_out(mojo_gpu: str):
+    with pytest.raises(
+        RuntimeError, match="Found dtype ComplexFloat but expected Float"
+    ):
+        torch.conj_physical(
+            torch.ones(2, device=mojo_gpu),
+            out=torch.empty(2, dtype=torch.complex64, device=mojo_gpu),
+        )
