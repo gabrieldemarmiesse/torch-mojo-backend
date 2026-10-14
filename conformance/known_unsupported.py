@@ -356,7 +356,6 @@ _ERRORS_MATCH: dict[str, tuple[str, ...]] = {
     "complex": ("float32",),
     "dstack": ("float32",),
     "hstack": ("float32",),
-    "masked_fill": ("float32",),
     "masked_select": ("float32",),
     "mean": ("float32",),
     "median": ("float32",),

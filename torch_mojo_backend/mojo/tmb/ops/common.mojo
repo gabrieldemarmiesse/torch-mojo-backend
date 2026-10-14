@@ -9,6 +9,10 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     ST_BFLOAT16,
+    TAG_BOOL,
+    TAG_INT,
+    TAG_SCALAR_BOOL,
+    TAG_SCALAR_INT,
     ST_BOOL,
     ST_FLOAT16,
     ST_FLOAT32,
@@ -1293,6 +1297,95 @@ def conj_copy(t: T) raises -> T:
     cx_unary_into("conj", out.t, dense.t)
     _ = dense^
     return out.take()
+
+
+def scalar_type_token(st: Int32) -> String:
+    """The C++ type a checked_convert overflow error names (c10's
+    AT_FORALL_SCALAR_TYPES spelling)."""
+    if st == ST_FLOAT32:
+        return "float"
+    if st == ST_FLOAT64:
+        return "double"
+    if st == ST_FLOAT16:
+        return "c10::Half"
+    if st == ST_BFLOAT16:
+        return "c10::BFloat16"
+    if st == ST_INT64:
+        return "int64_t"
+    if st == ST_INT32:
+        return "int"
+    if st == ST_INT16:
+        return "int16_t"
+    if st == ST_INT8:
+        return "int8_t"
+    if st == ST_UINT8:
+        return "uint8_t"
+    if st == ST_COMPLEX64:
+        return "c10::complex<float>"
+    return "c10::complex<double>"
+
+
+def check_real_scalar_fits(st: Int32, v: Value) raises:
+    """c10::checked_convert of a Scalar record (`v`) to the REAL dtype `st`
+    (c10::overflows): bool takes anything; a complex value with a nonzero
+    imaginary part fits no other real dtype; a float dtype refuses a finite
+    value past its range (inf / NaN pass); an integer dtype refuses NaN /
+    inf and a double past its range, and an integer past it (an unsigned
+    dtype also takes -x for x within it, as C++'s wrap)."""
+    if st == ST_BOOL or is_complex_stype(st):
+        return
+    var bad = False
+    var is_int_value = v.tag == TAG_SCALAR_INT or v.tag == TAG_INT
+    if v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL:
+        return
+    var re: Float64
+    if is_int_value:
+        re = Float64(v.a)
+    else:
+        var c = v_complex(v)
+        re = c[0]
+        if c[1] != 0.0:
+            bad = True
+    var finite = re - re == 0.0
+    if st == ST_FLOAT16 or st == ST_BFLOAT16 or st == ST_FLOAT32:
+        var fmax = 65504.0 if st == ST_FLOAT16 else (
+            3.3895313892515355e38 if st
+            == ST_BFLOAT16 else 3.4028234663852886e38
+        )
+        if finite and abs(re) > fmax:
+            bad = True
+    elif st != ST_FLOAT64:
+        var lo: Float64
+        var hi: Float64
+        if st == ST_UINT8:
+            lo = 0.0
+            hi = 255.0
+        elif st == ST_INT8:
+            lo = -128.0
+            hi = 127.0
+        elif st == ST_INT16:
+            lo = -32768.0
+            hi = 32767.0
+        elif st == ST_INT32:
+            lo = -2147483648.0
+            hi = 2147483647.0
+        else:
+            lo = -9223372036854775808.0
+            hi = 9223372036854775807.0
+        if is_int_value:
+            var iv = v.a
+            if st == ST_UINT8:
+                bad = bad or iv > 255 or (iv < 0 and -iv > 255)
+            elif st != ST_INT64:
+                bad = bad or re < lo or re > hi
+        else:
+            bad = bad or not finite or re < lo or re > hi
+    if bad:
+        raise Error(
+            "value cannot be converted to type ",
+            scalar_type_token(st),
+            " without overflow",
+        )
 
 
 def check_scalar_fits(st: Int32, re: Float64, im: Float64) raises:

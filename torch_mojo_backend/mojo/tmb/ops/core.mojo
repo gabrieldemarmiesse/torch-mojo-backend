@@ -11,6 +11,13 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     ST_BOOL,
+    ST_BFLOAT16,
+    ST_INT16,
+    ST_INT32,
+    ST_INT64,
+    ST_INT8,
+    ST_UINT8,
+    dtype_name,
     ST_FLOAT16,
     ST_FLOAT32,
     ST_FLOAT64,
@@ -98,6 +105,7 @@ from tmb.backend.device import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    check_real_scalar_fits,
     check_scalar_fits,
     assert_no_internal_overlap,
     assert_no_partial_overlap,
@@ -453,6 +461,65 @@ def own_borrowed(t: T) -> Owned:
     return o^
 
 
+def _check_copy_broadcast(src: T, dst: T) raises:
+    """copy_'s TensorIterator shape check (infer_size, scanning from the
+    last dim): src must broadcast to dst."""
+    if src.numel == dst.numel and src.same_shape(dst):
+        return
+    var n = max(src.rank, dst.rank)
+    for k in range(n):
+        var i = n - 1 - k
+        var ia = i - (n - dst.rank)
+        var ib = i - (n - src.rank)
+        var a = dst.dim(ia) if ia >= 0 else 1
+        var b = src.dim(ib) if ib >= 0 else 1
+        if a != b and a != 1 and b != 1:
+            raise Error(
+                "The size of tensor a (",
+                a,
+                ") must match the size of tensor b (",
+                b,
+                ") at non-singleton dimension ",
+                i,
+            )
+    if src.rank > dst.rank or not _broadcasts_to(src, dst):
+        raise Error("_copy_from: source shape cannot broadcast to destination")
+
+
+def _broadcasts_to(src: T, dst: T) -> Bool:
+    for i in range(src.rank):
+        var j = i + (dst.rank - src.rank)
+        if src.dim(i) != 1 and src.dim(i) != dst.dim(j):
+            return False
+    return True
+
+
+def _st_token(st: Int32) -> String:
+    """c10::toString(ScalarType): what AT_DISPATCH's not-implemented
+    message names."""
+    if st == ST_FLOAT32:
+        return "Float"
+    if st == ST_FLOAT64:
+        return "Double"
+    if st == ST_FLOAT16:
+        return "Half"
+    if st == ST_BFLOAT16:
+        return "BFloat16"
+    if st == ST_INT64:
+        return "Long"
+    if st == ST_INT32:
+        return "Int"
+    if st == ST_INT16:
+        return "Short"
+    if st == ST_INT8:
+        return "Char"
+    if st == ST_UINT8:
+        return "Byte"
+    if st == ST_BOOL:
+        return "Bool"
+    return dtype_name(st)
+
+
 def _toggled_view(op: StaticString, t: T) raises -> Owned:
     """`aten::_conj` / `aten::_neg_view` of t: the same data, that bit
     toggled."""
@@ -476,6 +543,7 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
     )
     if not bits:
         return False
+    _check_copy_broadcast(input, dst)
     if dst.numel == 0:
         return True  # copy_impl returns before choosing a kernel
     if input.on_mojo() and dst.on_mojo():
@@ -486,17 +554,14 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
         var conj_differs = (input.is_complex() and input.is_conj()) != (
             dst.is_complex() and dst.is_conj()
         )
-        if neg_differs and dst.stype == ST_BOOL:
+        # (neg alone: a neg kernel on dst's dtype; neg and conj: the fused
+        # neg_conj kernel on the source's)
+        if neg_differs and not conj_differs and dst.stype == ST_BOOL:
             unsupported("\"neg_cuda\" not implemented for 'Bool'")
         if neg_differs and conj_differs and not input.is_complex():
             unsupported(
                 '"neg_conj_cuda" not implemented for \''
-                + (
-                    "Float" if input.stype
-                    == ST_FLOAT32 else "Double" if input.stype
-                    == ST_FLOAT64 else "Half" if input.stype
-                    == ST_FLOAT16 else "BFloat16"
-                )
+                + _st_token(input.stype)
                 + "'"
             )
     if input.stype != dst.stype or not (
@@ -509,6 +574,34 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
         # into a fresh tensor of dst's dtype, which then takes the bits
         var s_conj = input.is_complex() and input.is_conj()
         var s_neg = input.is_neg()
+        if input.on_mojo() and dst.on_cpu() and (s_conj or s_neg):
+            # device -> host: CUDA resolves the bits in the SOURCE dtype
+            # (uint8 -255 wraps to 1), then converts on the host
+            var rawd = own_borrowed(input)
+            if s_conj:
+                rawd = _toggled_view("aten::_conj", rawd.t)
+            if s_neg:
+                rawd = _toggled_view("aten::_neg_view", rawd.t)
+            var host = own(cpu_empty(rawd.t.shape, rawd.t.rank, input.stype))
+            _ = call_op(
+                "aten::copy_",
+                "",
+                [tensor_arg(host.t), tensor_arg(rawd.t), bool_arg(False)],
+                1,
+            )
+            _ = rawd^
+            if s_conj:
+                _ = call_op("aten::conj_physical_", "", [tensor_arg(host.t)], 1)
+            if s_neg:
+                _ = call_op("aten::neg_", "", [tensor_arg(host.t)], 1)
+            _ = call_op(
+                "aten::copy_",
+                "",
+                [tensor_arg(dst), tensor_arg(host.t), bool_arg(False)],
+                1,
+            )
+            _ = host^
+            return True
         var raw = own_borrowed(input)
         if s_conj:
             raw = _toggled_view("aten::_conj", raw.t)
@@ -865,7 +958,9 @@ def op_fill_scalar_(
         ret_ref(rets, 0, t)
         return
     # The Scalar record, not a Float64: a bool tensor fills on nonzero truth
-    # and an int64 one keeps every bit (ops_common.FillScalar).
+    # and an int64 one keeps every bit (ops_common.FillScalar). Converted
+    # checked first, as CUDA's fill_ (value.to<scalar_t>()).
+    check_real_scalar_fits(t.stype, args[unsafe_offset=1].copy())
     fill_value(t, args[unsafe_offset=1].copy())
     ret_ref(rets, 0, t)
 
@@ -885,14 +980,21 @@ def op_fill_tensor_(
             value.rank,
             " dimensions.",
         )
-    if t.numel == 0:
+    if t.numel == 0 and value.on_mojo():
         ret_ref(rets, 0, t)
         return
     if not value.on_mojo():
         var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+        # value.item() converted checked, even for an empty self
         if t.is_complex():
             var c = v_complex(r[0])
             check_scalar_fits(t.stype, c[0], c[1])
+        else:
+            check_real_scalar_fits(t.stype, r[0])
+        if t.numel == 0:
+            ret_ref(rets, 0, t)
+            return
+        if t.is_complex():
             fill_complex(t, r[0])
         else:
             fill_value(t, r[0])

@@ -836,7 +836,9 @@ def test_index_put_value_overlap_and_masked_fill_dispatch(mojo_gpu: str):
     assert torch.equal(d.cpu(), a)
     with pytest.raises(RuntimeError, match="Index put requires"):
         d.index_put_((torch.tensor([0], device=mojo_gpu),), torch.tensor(2.5))
-    with pytest.raises(RuntimeError, match="Index put requires"):
+    with pytest.raises(
+        RuntimeError, match="expected scalar type Float but found ComplexFloat"
+    ):
         d.index_put_((m.to(mojo_gpu),), torch.tensor(2.5), accumulate=True)
 
 
@@ -932,4 +934,127 @@ def test_conj_physical_of_a_real_tensor_into_a_complex_out(mojo_gpu: str):
         torch.conj_physical(
             torch.ones(2, device=mojo_gpu),
             out=torch.empty(2, dtype=torch.complex64, device=mojo_gpu),
+        )
+
+
+# --- round-7 review fixes ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("dtype", "value"),
+    [
+        (torch.float32, 1e100 + 0j),
+        (torch.uint8, -1 + 0j),
+        (torch.int32, 1e100 + 0j),
+        (torch.float16, 70000 + 0j),
+        (torch.float32, 5 + 1j),
+    ],
+)
+def test_real_fill_from_a_complex_value_is_checked(
+    mojo_gpu: str, dtype: torch.dtype, value: complex
+):
+    t = torch.zeros(3, dtype=dtype, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        t.fill_(torch.tensor(value, dtype=torch.complex128))
+    assert t.cpu().tolist() == [0, 0, 0]
+    with pytest.raises(RuntimeError, match="without overflow"):
+        t.masked_fill_(
+            torch.ones(3, dtype=torch.bool, device=mojo_gpu),
+            torch.tensor(value, dtype=torch.complex128),
+        )
+    assert t.cpu().tolist() == [0, 0, 0]
+
+
+def test_real_fill_scalar_is_checked(mojo_gpu: str):
+    with pytest.raises(RuntimeError, match="value cannot be converted to type uint8_t"):
+        torch.zeros(3, dtype=torch.uint8, device=mojo_gpu).fill_(-1.0)
+    with pytest.raises(
+        RuntimeError, match="value cannot be converted to type int without"
+    ):
+        torch.zeros(3, dtype=torch.int32, device=mojo_gpu).fill_(1e100)
+    # C++'s unsigned wrap of an in-range negative integer is accepted
+    assert torch.zeros(1, dtype=torch.uint8, device=mojo_gpu).fill_(-1).item() == 255
+    assert torch.zeros(1, dtype=torch.bool, device=mojo_gpu).fill_(1e100).item() is True
+
+
+def test_masked_fill_of_a_real_tensor_with_a_complex_value(mojo_gpu: str):
+    m = torch.ones(3, dtype=torch.bool, device=mojo_gpu)
+    for v in (torch.tensor(5 + 0j), torch.tensor(5 + 0j, device=mojo_gpu), 5 + 0j):
+        assert (
+            torch.zeros(3, device=mojo_gpu).masked_fill_(m, v).cpu().tolist()
+            == [5.0] * 3
+        )
+        assert (
+            torch.zeros(3, device=mojo_gpu).masked_fill(m, v).cpu().tolist()
+            == [5.0] * 3
+        )
+
+
+def test_device_source_bits_follow_cuda(mojo_gpu: str):
+    # device -> host: the bit resolves in the SOURCE dtype (uint8 wraps)
+    host = torch.zeros(1, dtype=torch.int64)
+    host.copy_(torch._neg_view(torch.tensor([255], dtype=torch.uint8, device=mojo_gpu)))
+    assert host.tolist() == [1]
+    host.copy_(torch._neg_view(torch.tensor([-128], dtype=torch.int8, device=mojo_gpu)))
+    assert host.tolist() == [-128]
+    # device -> device: converted first, then the bit
+    dev = torch.zeros(1, dtype=torch.int64, device=mojo_gpu)
+    dev.copy_(torch._neg_view(torch.tensor([255], dtype=torch.uint8, device=mojo_gpu)))
+    assert dev.cpu().tolist() == [-255]
+    # neg + conj into bool runs the fused kernel on the complex source
+    b = torch.zeros(1, dtype=torch.bool, device=mojo_gpu)
+    b.copy_(torch._neg_view(torch.tensor([1 + 2j], device=mojo_gpu).conj()))
+    assert b.cpu().tolist() == [True]
+    with pytest.raises(
+        NotImplementedError, match="neg_conj_cuda\" not implemented for 'Long'"
+    ):
+        torch.zeros(1, dtype=torch.complex64, device=mojo_gpu).conj().copy_(
+            torch._neg_view(torch.tensor([1], device=mojo_gpu))
+        )
+
+
+def test_empty_tensors_still_validate(mojo_gpu: str):
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.zeros(0, dtype=torch.complex64, device=mojo_gpu).fill_(
+            torch.tensor(1e100, dtype=torch.float64)
+        )
+    with pytest.raises(
+        RuntimeError, match=r"tensor a \(0\) must match the size of tensor b \(3\)"
+    ):
+        torch.zeros(0, device=mojo_gpu).copy_(
+            torch._neg_view(torch.randn(3, device=mojo_gpu))
+        )
+    with pytest.raises(
+        RuntimeError, match=r"tensor a \(0\) must match the size of tensor b \(3\)"
+    ):
+        torch.zeros(0, dtype=torch.complex64, device=mojo_gpu).copy_(
+            _rand(3).to(mojo_gpu).conj()
+        )
+    torch.zeros(0, device=mojo_gpu).copy_(
+        torch._neg_view(torch.randn(1, device=mojo_gpu))
+    )
+
+
+def test_equal_of_the_same_elements_with_nan(mojo_gpu: str):
+    x = torch.tensor([float("nan") + 0j], device=mojo_gpu)
+    assert torch.equal(x, x)
+    assert torch.equal(x, x.view(1))
+    assert not torch.equal(x, x.clone())
+
+
+def test_where_and_index_put_messages(mojo_gpu: str):
+    with pytest.raises(
+        RuntimeError,
+        match=r"tensor a \(2\) must match the size of tensor b \(3\) at non-singleton dimension 0",
+    ):
+        torch.where(
+            torch.ones(2, dtype=torch.bool, device=mojo_gpu), _rand(3).to(mojo_gpu), 0j
+        )
+    with pytest.raises(
+        RuntimeError, match="expected scalar type ComplexDouble but found ComplexFloat"
+    ):
+        torch.zeros(3, dtype=torch.complex64, device=mojo_gpu).index_put_(
+            (torch.tensor([0], device=mojo_gpu),),
+            torch.ones(1, dtype=torch.complex128, device=mojo_gpu),
+            accumulate=True,
         )

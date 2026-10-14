@@ -96,6 +96,9 @@ from tmb.backend.abi import (
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    shares_storage,
+    check_real_scalar_fits,
+    scalar_type_token,
     check_scalar_fits,
     CX_DEVICE,
     CX_FULL,
@@ -717,35 +720,38 @@ def _result_type(a: _Operand, b: _Operand) raises -> Int32:
     return cx_combine(dim, cx_combine(zero, wrapped))
 
 
+def _broadcast_into(mut shape: IndexList[MAX_RANK], mut rank: Int, t: T) raises:
+    """infer_size(shape, t.shape) in place: scanned from the last dim, the
+    first mismatch named as CUDA names it (a: the shape so far, b: t)."""
+    var n = max(rank, t.rank)
+    for k in range(n):
+        var i = MAX_RANK - 1 - k
+        var x = shape[i]
+        var y = t.shape[i]
+        if x == y or y == 1:
+            continue
+        if x == 1:
+            shape[i] = y
+        else:
+            raise Error(
+                "The size of tensor a (",
+                x,
+                ") must match the size of tensor b (",
+                y,
+                ") at non-singleton dimension ",
+                n - 1 - k,
+            )
+    rank = n
+
+
 def _bshape(a: _Operand, b: _Operand) raises -> Tuple[IndexList[MAX_RANK], Int]:
     """Broadcast shape and rank of the tensor operands."""
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     if a.is_t:
-        rank = max(rank, a.t.rank)
+        _broadcast_into(shape, rank, a.t)
     if b.is_t:
-        rank = max(rank, b.t.rank)
-    for k in range(2):
-        var is_t = a.is_t if k == 0 else b.is_t
-        if not is_t:
-            continue
-        var t = a.t.copy() if k == 0 else b.t.copy()
-        for i in range(MAX_RANK):
-            var x = shape[i]
-            var y = t.shape[i]
-            if x == y or y == 1:
-                continue
-            if x == 1:
-                shape[i] = y
-            else:
-                raise Error(
-                    "The size of tensor a (",
-                    x,
-                    ") must match the size of tensor b (",
-                    y,
-                    ") at non-singleton dimension ",
-                    i - (MAX_RANK - rank),
-                )
+        _broadcast_into(shape, rank, b.t)
     return (shape, rank)
 
 
@@ -1535,6 +1541,19 @@ def cx_index_put_impl_(
     if not accumulate and _index_put_as_masked_fill(self, args, values):
         ret_ref(rets, 0, self)
         return
+    if accumulate and values.numel == 0 and self.rank > 0:
+        # nothing to add (CUDA's accumulate path returns before any check)
+        ret_ref(rets, 0, self)
+        return
+    if accumulate and self.stype != values.stype:
+        # index_put_with_sort's accumulate path checks it in index_put_'s
+        # own terms
+        raise Error(
+            "expected scalar type ",
+            _st_name(values.stype),
+            " but found ",
+            _st_name(self.stype),
+        )
     if self.stype != values.stype:
         # CUDA's index_put_ converts nothing (Indexing.cu's index_put_with_sort
         # and TensorAdvancedIndexing's index_put_ both check the dtypes)
@@ -1792,30 +1811,6 @@ def cx_index_put_impl_(
     ret_ref(rets, 0, self)
 
 
-def _scalar_type_token(st: Int32) -> String:
-    """The C++ type token AT_FORALL_SCALAR_TYPES names a dtype by (what
-    checked_convert's overflow error prints)."""
-    if st == ST_FLOAT32:
-        return "float"
-    if st == ST_FLOAT64:
-        return "double"
-    if st == ST_FLOAT16:
-        return "at::Half"
-    if st == ST_BFLOAT16:
-        return "at::BFloat16"
-    if st == ST_INT64:
-        return "int64_t"
-    if st == ST_INT32:
-        return "int"
-    if st == ST_INT16:
-        return "int16_t"
-    if st == ST_INT8:
-        return "int8_t"
-    if st == ST_UINT8:
-        return "uint8_t"
-    return dtype_name(st)
-
-
 def cx_fill_tensor_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
@@ -1831,7 +1826,7 @@ def cx_fill_tensor_(
             value.rank,
             " dimensions.",
         )
-    if t.numel == 0:
+    if t.numel == 0 and value.on_mojo():
         ret_ref(rets, 0, t)
         return
     if value.on_mojo():
@@ -1858,19 +1853,19 @@ def cx_fill_tensor_(
     c.t(value)
     var r = c.run(1)
     var v = v_complex(r[0])
+    # value.item(), converted checked to self's dtype -- before anything is
+    # written, and for an empty self too
     if t.is_complex():
-        check_scalar_fits(t.stype, v[0], v[1])  # before anything is written
+        check_scalar_fits(t.stype, v[0], v[1])
+    else:
+        check_real_scalar_fits(t.stype, r[0])
+    if t.numel == 0:
+        ret_ref(rets, 0, t)
+        return
+    if t.is_complex():
         fill_complex(t, r[0])
     else:
-        # value.item() is a complex Scalar, converted checked: a nonzero
-        # imaginary part does not fit a real dtype (bool: either part
-        # nonzero)
-        if t.stype != ST_BOOL and v[1] != 0.0:
-            raise Error(
-                "value cannot be converted to type ",
-                _scalar_type_token(t.stype),
-                " without overflow",
-            )
+        # (bool: either part nonzero)
         var f = _Call("aten::fill_", "Scalar")
         f.t(t)
         if t.stype == ST_BOOL:
@@ -1980,6 +1975,24 @@ def cx_equal(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not a.same_shape(b):
         rets[unsafe_offset=0] = Value(TAG_BOOL, 0, 0, 0)
         return
+    var alias = (
+        a.on_mojo()
+        and b.on_mojo()
+        and a.device == b.device
+        and shares_storage(a, b)
+        and a.offset == b.offset
+        and a.stype == b.stype
+        and a.is_neg() == b.is_neg()
+        and a.is_conj() == b.is_conj()
+    )
+    for d in range(a.rank):
+        if a.stride(d) != b.stride(d):
+            alias = False
+    if a.numel == 0 or alias:
+        # cuda_equal: an empty tensor, or the very same elements (NaN
+        # included), is equal without a comparison
+        rets[unsafe_offset=0] = Value(TAG_BOOL, 0, 1, 0)
+        return
     var eq = _binary("eq", args[unsafe_offset=0], args[unsafe_offset=1])
     var c = _Call("aten::all")
     c.t(eq.t)
@@ -2051,6 +2064,13 @@ def _where(args: Values) raises -> Owned:
         check_scalar_fits(st, a.re, a.im)
     if not b.is_t and b.rank_kind == _RANK_WRAPPED:
         check_scalar_fits(st, b.re, b.im)
+    var wshape = IndexList[MAX_RANK](1)
+    var wrank = 0
+    _broadcast_into(wshape, wrank, cond)
+    for k in range(1, 3):
+        var v = args[unsafe_offset=k].copy()
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            _broadcast_into(wshape, wrank, v_tensor_c(v))
     var ta = _device_complex(args[unsafe_offset=1], st, like)
     var tb = _device_complex(args[unsafe_offset=2], st, like)
     # a CPU 0-d condition is a scalar (TensorIterator moves it)
@@ -2132,7 +2152,13 @@ def _masked_fill_into(target: T, mask: Value, value: Value) raises:
 def _masked_fill(args: Values) raises -> Owned:
     var x = v_tensor_c(args[unsafe_offset=0])
     if not x.is_complex():
-        unsupported("masked_fill of a real tensor with a complex value")
+        # clone, then masked_fill_ (its value checked first)
+        var c = _Call("aten::clone")
+        c.t(x)
+        c.none()
+        var y = c.one()
+        _masked_fill_real_(y.t, args)
+        return y^
     # the result has the broadcast shape of self and mask
     var mask = v_tensor_c(args[unsafe_offset=1])
     var shape = IndexList[MAX_RANK](1)
@@ -2176,13 +2202,43 @@ def cx_masked_fill_(
     """masked_fill_.Scalar / .Tensor(self, mask, value)"""
     var self = v_tensor_c(args[unsafe_offset=0])
     if not self.is_complex():
-        raise Error(
-            "value cannot be converted to type ",
-            _st_name(self.stype),
-            " without overflow",
-        )
+        _masked_fill_real_(self, args)
+        ret_ref(rets, 0, self)
+        return
     _masked_fill_into(self, args[unsafe_offset=1], args[unsafe_offset=2])
     ret_ref(rets, 0, self)
+
+
+def _masked_fill_real_(self: T, args: Values) raises:
+    """masked_fill_ of a REAL self with a complex value: value.item()
+    converted checked (a zero imaginary part fits), then the real op."""
+    var val = args[unsafe_offset=2].copy()
+    if val.tag == TAG_TENSOR or val.tag == TAG_TENSOR_REF:
+        var vt = v_tensor_c(val)
+        if vt.rank != 0:
+            raise Error(
+                (
+                    "masked_fill_ only supports a 0-dimensional value"
+                    " tensor, but got tensor with "
+                ),
+                vt.rank,
+                " dimension(s).",
+            )
+        var it = _Call("aten::_local_scalar_dense")
+        it.t(vt)
+        var r = it.run(1)
+        val = r[0].copy()
+    check_real_scalar_fits(self.stype, val)
+    var c = v_complex(val)
+    var m = _Call("aten::masked_fill_", "Scalar")
+    m.t(self)
+    m.v(args[unsafe_offset=1])
+    if self.stype == ST_BOOL:  # a complex value is true if either part is
+        var truth = Int64(1) if c[0] != 0.0 or c[1] != 0.0 else Int64(0)
+        m.v(Value(TAG_SCALAR_BOOL, 0, truth, 0))
+    else:
+        m.s(c[0])
+    _ = m.run(1)
 
 
 def cx_fill(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
