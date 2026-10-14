@@ -1398,3 +1398,62 @@ def test_masked_fill_tensor_out_value_first_and_host_out_device(mojo_gpu: str):
             torch.zeros(2, device=mojo_gpu), m, 5.0, out=host
         )
     assert host.shape == (2,)
+
+
+# --- integers meet floating components in one rounding; item assignment ---------
+
+
+@pytest.mark.parametrize(
+    "v", [2**53 + 1, 2**62 + 2**38 + 1, 2**63 - 1, -(2**62 + 2**38 + 1)]
+)
+def test_integers_round_once_into_complex64(mojo_gpu: str, v: int):
+    want = torch.tensor(v).to(torch.complex64)  # int64 -> float, one rounding
+    m = torch.ones(2, dtype=torch.bool, device=mojo_gpu)
+    for src in (v, torch.tensor(v), torch.tensor(v, device=mojo_gpu)):
+        got = torch.zeros(2, dtype=torch.complex64, device=mojo_gpu).masked_fill_(
+            m, src
+        )
+        assert torch.equal(got.cpu(), want.expand(2))
+        x = torch.full(
+            (2,), complex(want.item()), dtype=torch.complex64, device=mojo_gpu
+        )
+        assert torch.eq(x, src).cpu().all()
+        w = torch.where(m, src, torch.zeros(2, dtype=torch.complex64, device=mojo_gpu))
+        assert torch.equal(w.cpu(), want.expand(2))
+    y = torch.zeros(2, dtype=torch.complex64, device=mojo_gpu)
+    y[m] = torch.tensor(v)
+    assert torch.equal(y.cpu(), want.expand(2))
+
+
+@pytest.mark.parametrize(
+    ("dtype", "value", "assigns"),
+    [
+        (torch.float16, 70000.0, True),
+        (torch.bfloat16, 1e39, True),
+        (torch.int8, 1000, False),
+        (torch.float32, 1e39, False),
+    ],
+)
+def test_item_assignment_converts_like_cuda(
+    mojo_gpu: str, dtype: torch.dtype, value: float, assigns: bool
+):
+    # Python item assignment builds its value with scalar_tensor, which
+    # (like CUDA's host-side scalar_tensor_static) lets a half / bfloat16
+    # overflow to inf; an explicit fill_ stays checked
+    m = torch.ones(2, dtype=torch.bool, device=mojo_gpu)
+    for key in (0, m, slice(None)):
+        x = torch.zeros(2, dtype=dtype, device=mojo_gpu)
+        if assigns:
+            x[key] = value
+            assert x.cpu().float()[0].item() == float("inf")
+        else:
+            with pytest.raises(RuntimeError, match="without overflow"):
+                x[key] = value
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.zeros(2, dtype=dtype, device=mojo_gpu).fill_(value)
+
+
+def test_index_put_on_uint64_is_cudas_not_implemented(mojo_gpu: str):
+    x = torch.zeros(2, dtype=torch.uint64, device=mojo_gpu)
+    with pytest.raises(NotImplementedError, match="index_put"):
+        x[torch.tensor([0], device=mojo_gpu)] = -1

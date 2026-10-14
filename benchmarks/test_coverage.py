@@ -147,6 +147,7 @@ SKIPPED_OPS: dict[str, str] = {
         "strided copy) or, for a host value, fill_.Scalar's fill kernel"
     ),
     "aten::fill.Scalar": _FILL,
+    "aten::scalar_tensor": _FILL + " (a 0-d tensor: Python item assignment's value)",
     # -- transfers / sync -------------------------------------------------
     "aten::_local_scalar_dense": (
         "scalar extraction / sync primitive: the cost is the sync, not a kernel"
