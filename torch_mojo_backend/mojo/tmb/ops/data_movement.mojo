@@ -115,6 +115,8 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     fill_item,
+    is_wide_unsigned,
+    scalar_type_name,
     cast_complex,
     cx_unary_into,
     assert_no_internal_overlap,
@@ -3127,35 +3129,32 @@ def _overlaps_contiguous_target(target: T, source: T) -> Bool:
     )
 
 
-def _ip_st_name(st: Int32) -> String:
-    """c10::toString(ScalarType) for index_put_'s dtype error."""
-    if st == ST_FLOAT32:
-        return "Float"
-    if st == ST_FLOAT64:
-        return "Double"
-    if st == ST_FLOAT16:
-        return "Half"
-    if st == ST_BFLOAT16:
-        return "BFloat16"
-    if st == ST_INT64:
-        return "Long"
-    if st == ST_INT32:
-        return "Int"
-    if st == ST_INT16:
-        return "Short"
-    if st == ST_INT8:
-        return "Char"
-    if st == ST_UINT8:
-        return "Byte"
-    if st == ST_BOOL:
-        return "Bool"
-    if st == ST_UINT64:
-        return "UInt64"
-    if st == ST_COMPLEX64:
-        return "ComplexFloat"
-    if st == ST_COMPLEX128:
-        return "ComplexDouble"
-    return String(st)
+def _dispatches_to_masked_fill(
+    target: T, present: List[Bool], indices: List[T], values: T
+) -> Bool:
+    """ATen's `canDispatchToMaskedFill`: a one-element value and exactly one
+    index, a bool or uint8 mask on self's device (None slots around it
+    allowed). ATen also wants the value on the CPU, which `x[mask] = v`
+    gives it on CUDA; Python builds that value on the device for a
+    PrivateUse1 self, so here the value's device is not looked at (an
+    explicit `index_put_` with a device value names masked_fill_ where
+    CUDA names index_put)."""
+    if values.numel != 1:
+        return False
+    var masks = 0
+    var k = 0
+    for i in range(len(present)):
+        if not present[i]:
+            continue
+        var dt = indices[k].dtype
+        var on_self = (
+            indices[k].on_mojo() and indices[k].device == target.device
+        )
+        k += 1
+        if (dt != DType.bool and dt != DType.uint8) or not on_self:
+            return False
+        masks += 1
+    return masks == 1
 
 
 def _index_put_mask_fill(target: T, mask: T, values: T) raises:
@@ -3204,9 +3203,9 @@ def _index_put_mask_fill(target: T, mask: T, values: T) raises:
                     "Index put requires the source and destination dtypes"
                     " match, got "
                 ),
-                _ip_st_name(target.stype),
+                scalar_type_name(target.stype),
                 " for the destination and ",
-                _ip_st_name(values.stype),
+                scalar_type_name(values.stype),
                 " for the source.",
             )
         var value0 = own(
@@ -3243,16 +3242,17 @@ def op_index_put_impl_(
     # per-slice-width rounding of `scatter_add_sorted`); matching it would
     # put a sort on this hot path, so it is left as a known difference.
     var accumulate = v_bool(args[unsafe_offset=3])
-    if target.stype == ST_UINT64:
-        # CUDA's own: a single bool mask takes masked_fill_'s route there
-        if (
-            len(indices) == 1
-            and len(present) >= 1
-            and present[0]
-            and indices[0].dtype == DType.bool
+    if is_wide_unsigned(target.stype):
+        # CUDA's kernels are not instantiated for them. Its index_put_ takes
+        # masked_fill_'s route (canDispatchToMaskedFill) for a one-element
+        # value and a single bool / uint8 mask on self's device; any other
+        # call (a CPU mask, an integer index) reaches index_put's kernel.
+        var name = scalar_type_name(target.stype)
+        if not accumulate and _dispatches_to_masked_fill(
+            target, present, indices, values
         ):
-            unsupported("\"masked_fill_\" not implemented for 'UInt64'")
-        unsupported("\"index_put\" not implemented for 'UInt64'")
+            unsupported("\"masked_fill_\" not implemented for '" + name + "'")
+        unsupported("\"index_put\" not implemented for '" + name + "'")
     if (
         len(indices) == 1
         and len(present) >= 1
