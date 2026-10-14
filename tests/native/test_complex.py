@@ -424,7 +424,7 @@ def test_core_ops_run_natively(mojo_gpu: str):
     assert native.op_count("aten::cat") == 2
 
 
-# --- round-3 review fixes -------------------------------------------------------
+# --- cat, flip, logical ops, where, outs and index_put --------------------------
 
 
 def test_cat_converts_each_input_to_the_out_dtype(mojo_gpu: str):
@@ -619,7 +619,7 @@ def test_boolean_mask_assignment(mojo_gpu: str):
     assert torch.equal(d.cpu(), x)
 
 
-# --- round-4 review fixes -------------------------------------------------------
+# --- overlap, unsigned scalars, index_add and general index_put ---------------
 
 
 def test_in_place_logical_ops_never_resize_self(mojo_gpu: str):
@@ -760,7 +760,7 @@ def test_index_put_on_an_expanded_self(mojo_gpu: str):
     assert torch.equal(x.cpu(), torch.full((3, 4), 7j))
 
 
-# --- round-5 review fixes (and the sweep against stock CUDA) --------------------
+# --- copies with math bits, identity, overflow and CPU operands ---------------
 
 
 def test_copy_converts_before_applying_math_bits(mojo_gpu: str):
@@ -772,9 +772,11 @@ def test_copy_converts_before_applying_math_bits(mojo_gpu: str):
         torch.tensor([255, 1, 0], dtype=torch.uint8, device=mojo_gpu)
     )
     assert n.cpu().real.tolist() == [-255.0, -1.0, 0.0]
+    # a different bit on each side is declined, not emulated
     f = torch.zeros(2, dtype=torch.complex128, device=mojo_gpu)
-    f.conj().copy_(torch._neg_view(torch.tensor([1 + 2j, 3j], device=mojo_gpu)))
-    assert f.cpu().tolist() == [-1 + 2j, 3j]
+    with pytest.raises(NotImplementedError, match="different math bits"):
+        f.conj().copy_(torch._neg_view(torch.tensor([1 + 2j, 3j], device=mojo_gpu)))
+    assert f.cpu().tolist() == [0j, 0j]
     # (stock CUDA has no kernel for these two; matched)
     with pytest.raises(NotImplementedError, match="neg_cuda"):
         torch.zeros(2, dtype=torch.bool, device=mojo_gpu).copy_(
@@ -877,7 +879,7 @@ def test_scalar_overflow_and_cpu_operands(mojo_gpu: str):
         torch.cat([a, a], out=torch.empty(0, device=mojo_gpu))
 
 
-# --- round-6 review fixes ---------------------------------------------------
+# --- Scalar checks before writes, fill_ of real tensors, mask Nones ------------
 
 
 def test_math_bit_source_converts_before_its_bit(mojo_gpu: str):
@@ -937,7 +939,7 @@ def test_conj_physical_of_a_real_tensor_into_a_complex_out(mojo_gpu: str):
         )
 
 
-# --- round-7 review fixes ---------------------------------------------------
+# --- checked conversions, device-source bits, empty tensors, equal -----------
 
 
 @pytest.mark.parametrize(
@@ -1058,3 +1060,82 @@ def test_where_and_index_put_messages(mojo_gpu: str):
             torch.ones(1, dtype=torch.complex128, device=mojo_gpu),
             accumulate=True,
         )
+
+
+# --- masks, broadcasting, bit cancellation and declined copies ----------------
+
+
+def test_masked_fill_mask_must_be_bool(mojo_gpu: str):
+    # (a complex mask once routed a real self back to itself, forever)
+    cases = [
+        (torch.float32, torch.complex64),
+        (torch.complex64, torch.complex64),
+        (torch.complex64, torch.uint8),
+    ]
+    for self_dt, mask_dt in cases:
+        x = torch.zeros(3, dtype=self_dt, device=mojo_gpu)
+        with pytest.raises(RuntimeError, match="only supports boolean masks"):
+            x.masked_fill_(torch.ones(3, dtype=mask_dt, device=mojo_gpu), 1.0)
+
+
+def test_real_masked_fill_with_a_complex_value_broadcasts(mojo_gpu: str):
+    m = torch.tensor([[True], [False]], device=mojo_gpu)
+    got = torch.ones(1, 3, device=mojo_gpu).masked_fill(m, 5 + 0j)
+    assert got.cpu().tolist() == [[5.0] * 3, [1.0] * 3]
+    m2 = torch.ones(2, 3, dtype=torch.bool, device=mojo_gpu)
+    for v in (1 + 0j, torch.tensor(1 + 0j)):
+        got = torch.zeros(3, device=mojo_gpu).masked_fill(m2, v)
+        assert got.shape == (2, 3) and got.cpu().eq(1).all()
+
+
+def test_matching_bits_cancel_and_mixed_bits_decline(mojo_gpu: str):
+    b = torch.zeros(3, dtype=torch.bool, device=mojo_gpu)
+    torch._neg_view(b).copy_(
+        torch._neg_view(torch.tensor([1.0, 0.0, -2.0], device=mojo_gpu))
+    )
+    assert b.cpu().tolist() == [True, False, True]
+    o = torch.zeros(2, dtype=torch.complex64, device=mojo_gpu)
+    with pytest.raises(NotImplementedError):
+        torch._neg_view(o).copy_(torch.tensor([1j, 2], device=mojo_gpu).conj())
+    i = torch.zeros(1, dtype=torch.int32, device=mojo_gpu)
+    with pytest.raises(NotImplementedError, match="neg \\+ conj"):
+        i.copy_(
+            torch._neg_view(torch.tensor([-2147483648 + 1j], device=mojo_gpu).conj())
+        )
+    assert i.cpu().tolist() == [0]
+
+
+def test_non_blocking_device_to_host_converts_first(mojo_gpu: str):
+    src = torch._neg_view(torch.tensor([-128], dtype=torch.int8, device=mojo_gpu))
+    h = torch.zeros(1, dtype=torch.int64)
+    h.copy_(src, non_blocking=True)
+    torch.accelerator.synchronize()
+    assert h.tolist() == [128]
+    h.copy_(src)
+    assert h.tolist() == [-128]
+
+
+def test_unsigned_fill_ranges(mojo_gpu: str):
+    torch.empty(0, dtype=torch.uint64, device=mojo_gpu).fill_(1e19)
+    with pytest.raises(NotImplementedError):  # past int64: declined, not wrong
+        torch.zeros(2, dtype=torch.uint64, device=mojo_gpu).fill_(1e19)
+    assert (
+        torch.zeros(1, dtype=torch.uint64, device=mojo_gpu).fill_(-1).cpu().item()
+        == 2**64 - 1
+    )
+    with pytest.raises(RuntimeError, match="uint32_t"):
+        torch.zeros(1, dtype=torch.uint32, device=mojo_gpu).fill_(5e9)
+    with pytest.raises(RuntimeError, match="uint8_t"):
+        torch.zeros(1, dtype=torch.uint8, device=mojo_gpu).fill_(-(2**63))
+
+
+def test_complex_scalar_fill_of_a_real_tensor(mojo_gpu: str):
+    assert torch.zeros(3, device=mojo_gpu).fill_(1 + 0j).cpu().tolist() == [1.0] * 3
+    assert torch.full(
+        (2,), 1 + 0j, dtype=torch.float32, device=mojo_gpu
+    ).cpu().tolist() == [1.0, 1.0]
+    assert torch.zeros(2, dtype=torch.bool, device=mojo_gpu).fill_(
+        1j
+    ).cpu().tolist() == [True, True]
+    with pytest.raises(RuntimeError, match="value cannot be converted to type float"):
+        torch.zeros(3, device=mojo_gpu).fill_(1 + 1j)

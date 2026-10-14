@@ -17,6 +17,11 @@ from tmb.backend.abi import (
     ST_INT64,
     ST_INT8,
     ST_UINT8,
+    ST_UINT64,
+    TAG_COMPLEX,
+    TAG_DOUBLE,
+    TAG_SCALAR_BOOL,
+    TAG_SCALAR_DOUBLE,
     dtype_name,
     ST_FLOAT16,
     ST_FLOAT32,
@@ -105,6 +110,7 @@ from tmb.backend.device import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    is_float_stype,
     check_real_scalar_fits,
     check_scalar_fits,
     assert_no_internal_overlap,
@@ -546,6 +552,29 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
     _check_copy_broadcast(input, dst)
     if dst.numel == 0:
         return True  # copy_impl returns before choosing a kernel
+    var s_conj = input.is_complex() and input.is_conj()
+    var s_neg = input.is_neg()
+    var d_conj = dst.is_complex() and dst.is_conj()
+    var d_neg = dst.is_neg()
+    if (s_neg and d_neg) or (s_conj and d_conj):
+        # a bit on both sides cancels: copy between the views without it
+        var src_v = own_borrowed(input)
+        var dst_v = own_borrowed(dst)
+        if s_neg and d_neg:
+            src_v = _toggled_view("aten::_neg_view", src_v.t)
+            dst_v = _toggled_view("aten::_neg_view", dst_v.t)
+        if s_conj and d_conj:
+            src_v = _toggled_view("aten::_conj", src_v.t)
+            dst_v = _toggled_view("aten::_conj", dst_v.t)
+        _ = call_op(
+            "aten::copy_",
+            "",
+            [tensor_arg(dst_v.t), tensor_arg(src_v.t), bool_arg(non_blocking)],
+            1,
+        )
+        _ = src_v^
+        _ = dst_v^
+        return True
     if input.on_mojo() and dst.on_mojo():
         # copy_device_to_device's kernels: neg into bool, and neg + conj
         # from a real source, have no CUDA instantiation (stock CUDA raises
@@ -564,6 +593,23 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
                 + _st_token(input.stype)
                 + "'"
             )
+    if (s_conj or s_neg) and (d_conj or d_neg):
+        # a different bit on each side: not emulated (declined cleanly)
+        unsupported(
+            "a copy whose source and destination carry different math bits"
+        )
+    if (
+        s_conj
+        and s_neg
+        and not dst.is_complex()
+        and not is_float_stype(dst.stype)
+        and dst.stype != ST_BOOL
+    ):
+        # CUDA runs the fused neg+conj in the source dtype, then converts
+        # out-of-range values the device's way: not emulated
+        unsupported(
+            "a neg + conj view copied into an integer tensor (resolve it first)"
+        )
     if input.stype != dst.stype or not (
         input.on_mojo() and dst.on_mojo() and input.device == dst.device
     ):
@@ -572,10 +618,14 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
         # negation never happens in the narrower or unsigned source dtype:
         # the source's raw values (its bits toggled off, views) converted
         # into a fresh tensor of dst's dtype, which then takes the bits
-        var s_conj = input.is_complex() and input.is_conj()
-        var s_neg = input.is_neg()
-        if input.on_mojo() and dst.on_cpu() and (s_conj or s_neg):
-            # device -> host: CUDA resolves the bits in the SOURCE dtype
+        if (
+            input.on_mojo()
+            and dst.on_cpu()
+            and (s_conj or s_neg)
+            and not non_blocking
+        ):
+            # device -> host, blocking (non-blocking converts on the device
+            # first, below): CUDA resolves the bits in the SOURCE dtype
             # (uint8 -255 wraps to 1), then converts on the host
             var rawd = own_borrowed(input)
             if s_conj:
@@ -960,9 +1010,34 @@ def op_fill_scalar_(
     # The Scalar record, not a Float64: a bool tensor fills on nonzero truth
     # and an int64 one keeps every bit (ops_common.FillScalar). Converted
     # checked first, as CUDA's fill_ (value.to<scalar_t>()).
-    check_real_scalar_fits(t.stype, args[unsafe_offset=1].copy())
-    fill_value(t, args[unsafe_offset=1].copy())
+    var v = args[unsafe_offset=1].copy()
+    check_real_scalar_fits(t.stype, v)
+    _check_uint64_fill(t.stype, v, t.numel)
+    if v.tag == TAG_COMPLEX:
+        # a complex Scalar that fits: its real part (bool: either part)
+        var c = v_complex(v)
+        if t.stype == ST_BOOL:
+            var truth = Int64(1) if c[0] != 0.0 or c[1] != 0.0 else Int64(0)
+            v = Value(TAG_SCALAR_BOOL, 0, truth, 0)
+        else:
+            v = Value(TAG_SCALAR_DOUBLE, 0, f64_bits(c[0]), 0)
+    fill_value(t, v)
     ret_ref(rets, 0, t)
+
+
+def _check_uint64_fill(st: Int32, v: Value, numel: Int) raises:
+    """uint64 past int64's range from a double Scalar: the fill kernels
+    convert through int64, so it is declined rather than written wrong."""
+    if st != ST_UINT64 or numel == 0:
+        return
+    if (
+        v.tag == TAG_SCALAR_DOUBLE
+        or v.tag == TAG_DOUBLE
+        or v.tag == TAG_COMPLEX
+    ):
+        var c = v_complex(v)
+        if c[0] >= 9223372036854775808.0:
+            unsupported("a uint64 fill_ value of 2**63 or more")
 
 
 # aten::fill_.Tensor(Tensor(a!) self, Tensor value) -> Tensor(a!)
@@ -991,6 +1066,7 @@ def op_fill_tensor_(
             check_scalar_fits(t.stype, c[0], c[1])
         else:
             check_real_scalar_fits(t.stype, r[0])
+            _check_uint64_fill(t.stype, r[0], t.numel)
         if t.numel == 0:
             ret_ref(rets, 0, t)
             return

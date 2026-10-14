@@ -2152,16 +2152,20 @@ def _masked_fill_into(target: T, mask: Value, value: Value) raises:
     _ = rv^
 
 
+def _check_bool_mask(args: Values) raises:
+    """masked_fill's mask check, before anything else (a complex mask would
+    otherwise route this op back to itself)."""
+    var mask = v_tensor_c(args[unsafe_offset=1])
+    if mask.stype != ST_BOOL:
+        raise Error(
+            "masked_fill only supports boolean masks, but got dtype ",
+            _st_name(mask.stype),
+        )
+
+
 def _masked_fill(args: Values) raises -> Owned:
+    _check_bool_mask(args)
     var x = v_tensor_c(args[unsafe_offset=0])
-    if not x.is_complex():
-        # clone, then masked_fill_ (its value checked first)
-        var c = _Call("aten::clone")
-        c.t(x)
-        c.none()
-        var y = c.one()
-        _masked_fill_real_(y.t, args)
-        return y^
     # the result has the broadcast shape of self and mask
     var mask = v_tensor_c(args[unsafe_offset=1])
     var shape = IndexList[MAX_RANK](1)
@@ -2178,6 +2182,9 @@ def _masked_fill(args: Values) raises -> Owned:
     var out = own(new_tensor(shape, rank, x.stype, x.device))
     copy_strided_into(out.t, expanded.t)
     _ = expanded^
+    if not x.is_complex():
+        _masked_fill_real_(out.t, args)  # (its value checked first)
+        return out^
     _masked_fill_into(out.t, args[unsafe_offset=1], args[unsafe_offset=2])
     return out^
 
@@ -2203,6 +2210,7 @@ def cx_masked_fill_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     """masked_fill_.Scalar / .Tensor(self, mask, value)"""
+    _check_bool_mask(args)
     var self = v_tensor_c(args[unsafe_offset=0])
     if not self.is_complex():
         _masked_fill_real_(self, args)
