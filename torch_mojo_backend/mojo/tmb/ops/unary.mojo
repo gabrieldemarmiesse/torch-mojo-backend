@@ -65,6 +65,22 @@ from tmb.ops.common import (
     same_view,
     shares_storage,
 )
+from tmb.ops.f8_iter import (
+    f8_iter,
+    MODE_CAST,
+    MODE_FN,
+    MODE_INPLACE,
+    MODE_NOCHECK,
+    MODE_OUTDT,
+    MODE_SAME,
+    PRE_BOOL_OUT,
+    PRE_DIV_MODE,
+    PRE_HEAVISIDE,
+    PRE_LDEXP,
+    PRE_NAN_TO_NUM,
+    PRE_NONE,
+    PRE_SUB,
+)
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import cast_for_copy
 from tmb.ops.data_movement import _scalar_type_name
@@ -2318,135 +2334,672 @@ def op_fill_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def register_unary(site: Site) raises:
-    impl[op_abs, "abs"](site)
-    impl[op_abs_out, "abs.out"](site)
-    impl[op_acos, "acos"](site)
-    impl[op_acos_out, "acos.out"](site)
-    impl[op_acosh, "acosh"](site)
-    impl[op_acosh_out, "acosh.out"](site)
-    impl[op_angle, "angle"](site)
-    impl[op_angle_out, "angle.out"](site)
-    impl[op_asin, "asin"](site)
-    impl[op_asin_out, "asin.out"](site)
-    impl[op_asinh, "asinh"](site)
-    impl[op_asinh_out, "asinh.out"](site)
-    impl[op_atan, "atan"](site)
-    impl[op_atan_out, "atan.out"](site)
-    impl[op_atanh, "atanh"](site)
-    impl[op_atanh_out, "atanh.out"](site)
-    impl[op_ceil, "ceil"](site)
-    impl[op_ceil_out, "ceil.out"](site)
-    impl[op_cos, "cos"](site)
-    impl[op_cos_out, "cos.out"](site)
-    impl[op_cosh, "cosh"](site)
-    impl[op_cosh_out, "cosh.out"](site)
-    impl[op_digamma, "digamma"](site)
-    impl[op_digamma_out, "digamma.out"](site)
-    impl[op_erf, "erf"](site)
-    impl[op_erf_out, "erf.out"](site)
-    impl[op_erfc, "erfc"](site)
-    impl[op_erfc_out, "erfc.out"](site)
-    impl[op_erfinv, "erfinv"](site)
-    impl[op_erfinv_out, "erfinv.out"](site)
-    impl[op_exp, "exp"](site)
-    impl[op_exp_out, "exp.out"](site)
-    impl[op_exp2, "exp2"](site)
-    impl[op_exp2_out, "exp2.out"](site)
-    impl[op_expm1, "expm1"](site)
-    impl[op_expm1_out, "expm1.out"](site)
-    impl[op_floor, "floor"](site)
-    impl[op_floor_out, "floor.out"](site)
-    impl[op_frac, "frac"](site)
-    impl[op_frac_out, "frac.out"](site)
-    impl[op_i0, "i0"](site)
-    impl[op_i0_out, "i0.out"](site)
-    impl[op_lgamma, "lgamma"](site)
-    impl[op_lgamma_out, "lgamma.out"](site)
-    impl[op_log, "log"](site)
-    impl[op_log_out, "log.out"](site)
-    impl[op_log10, "log10"](site)
-    impl[op_log10_out, "log10.out"](site)
-    impl[op_log1p, "log1p"](site)
-    impl[op_log1p_out, "log1p.out"](site)
-    impl[op_log2, "log2"](site)
-    impl[op_log2_out, "log2.out"](site)
-    impl[op_logit, "logit"](site)
-    impl[op_logit_out, "logit.out"](site)
-    impl[op_logit_, "logit_"](site)
+    impl[
+        f8_iter[op_abs, "abs_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "abs",
+    ](site)
+    impl[
+        f8_iter[op_abs_out, "abs_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "abs.out",
+    ](site)
+    impl[
+        f8_iter[op_acos, "acos_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "acos",
+    ](site)
+    impl[
+        f8_iter[op_acos_out, "acos_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "acos.out",
+    ](site)
+    impl[
+        f8_iter[op_acosh, "acosh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "acosh",
+    ](site)
+    impl[
+        f8_iter[op_acosh_out, "acosh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "acosh.out",
+    ](site)
+    impl[
+        f8_iter[op_angle, "angle_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "angle",
+    ](site)
+    impl[
+        f8_iter[op_angle_out, "angle_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "angle.out",
+    ](site)
+    impl[
+        f8_iter[op_asin, "asin_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "asin",
+    ](site)
+    impl[
+        f8_iter[op_asin_out, "asin_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "asin.out",
+    ](site)
+    impl[
+        f8_iter[op_asinh, "asinh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "asinh",
+    ](site)
+    impl[
+        f8_iter[op_asinh_out, "asinh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "asinh.out",
+    ](site)
+    impl[
+        f8_iter[op_atan, "atan_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "atan",
+    ](site)
+    impl[
+        f8_iter[op_atan_out, "atan_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "atan.out",
+    ](site)
+    impl[
+        f8_iter[op_atanh, "atanh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "atanh",
+    ](site)
+    impl[
+        f8_iter[op_atanh_out, "atanh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "atanh.out",
+    ](site)
+    impl[
+        f8_iter[op_ceil, "ceil_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "ceil",
+    ](site)
+    impl[
+        f8_iter[op_ceil_out, "ceil_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "ceil.out",
+    ](site)
+    impl[
+        f8_iter[op_cos, "cos_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "cos",
+    ](site)
+    impl[
+        f8_iter[op_cos_out, "cos_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "cos.out",
+    ](site)
+    impl[
+        f8_iter[op_cosh, "cosh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "cosh",
+    ](site)
+    impl[
+        f8_iter[op_cosh_out, "cosh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "cosh.out",
+    ](site)
+    impl[
+        f8_iter[op_digamma, "digamma_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "digamma",
+    ](site)
+    impl[
+        f8_iter[
+            op_digamma_out, "digamma_cuda", 1, 1, MODE_CAST, False, PRE_NONE
+        ],
+        "digamma.out",
+    ](site)
+    impl[
+        f8_iter[op_erf, "erf_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "erf",
+    ](site)
+    impl[
+        f8_iter[op_erf_out, "erf_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "erf.out",
+    ](site)
+    impl[
+        f8_iter[op_erfc, "erfc_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "erfc",
+    ](site)
+    impl[
+        f8_iter[op_erfc_out, "erfc_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "erfc.out",
+    ](site)
+    impl[
+        f8_iter[op_erfinv, "erfinv_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "erfinv",
+    ](site)
+    impl[
+        f8_iter[op_erfinv_out, "erfinv_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "erfinv.out",
+    ](site)
+    impl[
+        f8_iter[op_exp, "exp_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "exp",
+    ](site)
+    impl[
+        f8_iter[op_exp_out, "exp_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "exp.out",
+    ](site)
+    impl[
+        f8_iter[op_exp2, "exp2_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "exp2",
+    ](site)
+    impl[
+        f8_iter[op_exp2_out, "exp2_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "exp2.out",
+    ](site)
+    impl[
+        f8_iter[op_expm1, "expm1_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "expm1",
+    ](site)
+    impl[
+        f8_iter[op_expm1_out, "expm1_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "expm1.out",
+    ](site)
+    impl[
+        f8_iter[op_floor, "floor_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "floor",
+    ](site)
+    impl[
+        f8_iter[op_floor_out, "floor_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "floor.out",
+    ](site)
+    impl[
+        f8_iter[op_frac, "frac_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "frac",
+    ](site)
+    impl[
+        f8_iter[op_frac_out, "frac_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "frac.out",
+    ](site)
+    impl[
+        f8_iter[op_i0, "i0_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "i0",
+    ](site)
+    impl[
+        f8_iter[op_i0_out, "i0_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "i0.out",
+    ](site)
+    impl[
+        f8_iter[op_lgamma, "lgamma_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "lgamma",
+    ](site)
+    impl[
+        f8_iter[op_lgamma_out, "lgamma_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "lgamma.out",
+    ](site)
+    impl[
+        f8_iter[op_log, "log_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "log",
+    ](site)
+    impl[
+        f8_iter[op_log_out, "log_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "log.out",
+    ](site)
+    impl[
+        f8_iter[op_log10, "log10_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "log10",
+    ](site)
+    impl[
+        f8_iter[op_log10_out, "log10_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "log10.out",
+    ](site)
+    impl[
+        f8_iter[op_log1p, "log1p_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "log1p",
+    ](site)
+    impl[
+        f8_iter[op_log1p_out, "log1p_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "log1p.out",
+    ](site)
+    impl[
+        f8_iter[op_log2, "log2_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "log2",
+    ](site)
+    impl[
+        f8_iter[op_log2_out, "log2_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "log2.out",
+    ](site)
+    impl[
+        f8_iter[op_logit, "logit_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "logit",
+    ](site)
+    impl[
+        f8_iter[op_logit_out, "logit_cuda", 1, 2, MODE_CAST, False, PRE_NONE],
+        "logit.out",
+    ](site)
+    impl[
+        f8_iter[op_logit_, "logit_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE],
+        "logit_",
+    ](site)
     impl[op_mvlgamma, "mvlgamma"](site)
     impl[op_mvlgamma_out, "mvlgamma.out"](site)
-    impl[op_nan_to_num, "nan_to_num"](site)
-    impl[op_nan_to_num_out, "nan_to_num.out"](site)
-    impl[op_neg, "neg"](site)
-    impl[op_neg_out, "neg.out"](site)
-    impl[op_conj_physical_out, "conj_physical.out"](site)
+    impl[
+        f8_iter[
+            op_nan_to_num, "nan_to_num_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "nan_to_num",
+    ](site)
+    impl[
+        f8_iter[
+            op_nan_to_num_out,
+            "nan_to_num_cuda",
+            1,
+            4,
+            MODE_SAME,
+            False,
+            PRE_NAN_TO_NUM,
+        ],
+        "nan_to_num.out",
+    ](site)
+    impl[
+        f8_iter[op_neg, "neg_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "neg",
+    ](site)
+    impl[
+        f8_iter[op_neg_out, "neg_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "neg.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_conj_physical_out, "conj_cuda", 1, 1, MODE_SAME, False, PRE_NONE
+        ],
+        "conj_physical.out",
+    ](site)
     impl[op_polygamma, "polygamma"](site)
     impl[op_polygamma_out, "polygamma.out"](site)
-    impl[op_reciprocal, "reciprocal"](site)
-    impl[op_reciprocal_out, "reciprocal.out"](site)
-    impl[op_round, "round"](site)
+    impl[
+        f8_iter[
+            op_reciprocal, "reciprocal_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "reciprocal",
+    ](site)
+    impl[
+        f8_iter[
+            op_reciprocal_out,
+            "reciprocal_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "reciprocal.out",
+    ](site)
+    impl[
+        f8_iter[op_round, "round_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "round",
+    ](site)
     impl[op_round_decimals, "round.decimals"](site)
     impl[op_round_decimals_out, "round.decimals_out"](site)
-    impl[op_round_out, "round.out"](site)
+    impl[
+        f8_iter[op_round_out, "round_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "round.out",
+    ](site)
     impl[op_round__decimals, "round_.decimals"](site)
-    impl[op_rsqrt, "rsqrt"](site)
-    impl[op_rsqrt_out, "rsqrt.out"](site)
-    impl[op_sgn, "sgn"](site)
-    impl[op_sgn_out, "sgn.out"](site)
-    impl[op_sigmoid, "sigmoid"](site)
-    impl[op_sigmoid_out, "sigmoid.out"](site)
-    impl[op_sign, "sign"](site)
-    impl[op_sign_out, "sign.out"](site)
-    impl[op_signbit, "signbit"](site)
-    impl[op_signbit_out, "signbit.out"](site)
-    impl[op_silu, "silu"](site)
-    impl[op_silu_out, "silu.out"](site)
-    impl[op_sin, "sin"](site)
-    impl[op_sin_out, "sin.out"](site)
-    impl[op_sinc, "sinc"](site)
-    impl[op_sinc_out, "sinc.out"](site)
-    impl[op_sinh, "sinh"](site)
-    impl[op_sinh_out, "sinh.out"](site)
-    impl[op_special_airy_ai, "special_airy_ai"](site)
-    impl[op_special_airy_ai_out, "special_airy_ai.out"](site)
-    impl[op_special_bessel_j0, "special_bessel_j0"](site)
-    impl[op_special_bessel_j0_out, "special_bessel_j0.out"](site)
-    impl[op_special_bessel_j1, "special_bessel_j1"](site)
-    impl[op_special_bessel_j1_out, "special_bessel_j1.out"](site)
-    impl[op_special_bessel_y0, "special_bessel_y0"](site)
-    impl[op_special_bessel_y0_out, "special_bessel_y0.out"](site)
-    impl[op_special_bessel_y1, "special_bessel_y1"](site)
-    impl[op_special_bessel_y1_out, "special_bessel_y1.out"](site)
-    impl[op_special_entr, "special_entr"](site)
-    impl[op_special_entr_out, "special_entr.out"](site)
-    impl[op_special_erfcx, "special_erfcx"](site)
-    impl[op_special_erfcx_out, "special_erfcx.out"](site)
-    impl[op_special_i0e, "special_i0e"](site)
-    impl[op_special_i0e_out, "special_i0e.out"](site)
-    impl[op_special_i1, "special_i1"](site)
-    impl[op_special_i1_out, "special_i1.out"](site)
-    impl[op_special_i1e, "special_i1e"](site)
-    impl[op_special_i1e_out, "special_i1e.out"](site)
-    impl[op_special_log_ndtr, "special_log_ndtr"](site)
-    impl[op_special_log_ndtr_out, "special_log_ndtr.out"](site)
-    impl[op_special_modified_bessel_i0, "special_modified_bessel_i0"](site)
-    impl[op_special_modified_bessel_i0_out, "special_modified_bessel_i0.out"](
-        site
-    )
-    impl[op_special_modified_bessel_i1, "special_modified_bessel_i1"](site)
-    impl[op_special_modified_bessel_i1_out, "special_modified_bessel_i1.out"](
-        site
-    )
-    impl[op_special_modified_bessel_k0, "special_modified_bessel_k0"](site)
-    impl[op_special_modified_bessel_k0_out, "special_modified_bessel_k0.out"](
-        site
-    )
-    impl[op_special_modified_bessel_k1, "special_modified_bessel_k1"](site)
-    impl[op_special_modified_bessel_k1_out, "special_modified_bessel_k1.out"](
-        site
-    )
-    impl[op_special_ndtri, "special_ndtri"](site)
-    impl[op_special_ndtri_out, "special_ndtri.out"](site)
+    impl[
+        f8_iter[op_rsqrt, "rsqrt_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "rsqrt",
+    ](site)
+    impl[
+        f8_iter[op_rsqrt_out, "rsqrt_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "rsqrt.out",
+    ](site)
+    impl[
+        f8_iter[op_sgn, "sign_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "sgn",
+    ](site)
+    impl[
+        f8_iter[op_sgn_out, "sign_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "sgn.out",
+    ](site)
+    impl[
+        f8_iter[op_sigmoid, "sigmoid_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "sigmoid",
+    ](site)
+    impl[
+        f8_iter[
+            op_sigmoid_out, "sigmoid_cuda", 1, 1, MODE_CAST, False, PRE_NONE
+        ],
+        "sigmoid.out",
+    ](site)
+    impl[
+        f8_iter[op_sign, "sign_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "sign",
+    ](site)
+    impl[
+        f8_iter[op_sign_out, "sign_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "sign.out",
+    ](site)
+    impl[
+        f8_iter[op_signbit, "signbit_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "signbit",
+    ](site)
+    impl[
+        f8_iter[
+            op_signbit_out,
+            "signbit_cuda",
+            1,
+            1,
+            MODE_NOCHECK,
+            False,
+            PRE_BOOL_OUT,
+            "signbit",
+        ],
+        "signbit.out",
+    ](site)
+    impl[
+        f8_iter[op_silu, "silu_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "silu",
+    ](site)
+    impl[
+        f8_iter[op_silu_out, "silu_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "silu.out",
+    ](site)
+    impl[
+        f8_iter[op_sin, "sin_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "sin",
+    ](site)
+    impl[
+        f8_iter[op_sin_out, "sin_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "sin.out",
+    ](site)
+    impl[
+        f8_iter[op_sinc, "sinc_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "sinc",
+    ](site)
+    impl[
+        f8_iter[op_sinc_out, "sinc_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "sinc.out",
+    ](site)
+    impl[
+        f8_iter[op_sinh, "sinh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "sinh",
+    ](site)
+    impl[
+        f8_iter[op_sinh_out, "sinh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "sinh.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_airy_ai, "airy_ai_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "special_airy_ai",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_airy_ai_out,
+            "airy_ai_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_airy_ai.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_bessel_j0,
+            "bessel_j0_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_bessel_j0",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_bessel_j0_out,
+            "bessel_j0_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_bessel_j0.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_bessel_j1,
+            "bessel_j1_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_bessel_j1",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_bessel_j1_out,
+            "bessel_j1_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_bessel_j1.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_bessel_y0,
+            "bessel_y0_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_bessel_y0",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_bessel_y0_out,
+            "bessel_y0_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_bessel_y0.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_bessel_y1,
+            "bessel_y1_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_bessel_y1",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_bessel_y1_out,
+            "bessel_y1_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_bessel_y1.out",
+    ](site)
+    impl[
+        f8_iter[op_special_entr, "entr_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "special_entr",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_entr_out, "entr_cuda", 1, 1, MODE_CAST, False, PRE_NONE
+        ],
+        "special_entr.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_erfcx, "erfcx_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "special_erfcx",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_erfcx_out, "erfcx_cuda", 1, 1, MODE_CAST, False, PRE_NONE
+        ],
+        "special_erfcx.out",
+    ](site)
+    impl[
+        f8_iter[op_special_i0e, "i0e_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "special_i0e",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_i0e_out, "i0e_cuda", 1, 1, MODE_CAST, False, PRE_NONE
+        ],
+        "special_i0e.out",
+    ](site)
+    impl[
+        f8_iter[op_special_i1, "i1_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "special_i1",
+    ](site)
+    impl[
+        f8_iter[op_special_i1_out, "i1_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "special_i1.out",
+    ](site)
+    impl[
+        f8_iter[op_special_i1e, "i1e_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "special_i1e",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_i1e_out, "i1e_cuda", 1, 1, MODE_CAST, False, PRE_NONE
+        ],
+        "special_i1e.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_log_ndtr,
+            "log_ndtr_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_log_ndtr",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_log_ndtr_out,
+            "log_ndtr_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_log_ndtr.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_modified_bessel_i0,
+            "modified_bessel_i0_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_modified_bessel_i0",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_modified_bessel_i0_out,
+            "modified_bessel_i0_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_modified_bessel_i0.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_modified_bessel_i1,
+            "modified_bessel_i1_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_modified_bessel_i1",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_modified_bessel_i1_out,
+            "modified_bessel_i1_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_modified_bessel_i1.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_modified_bessel_k0,
+            "modified_bessel_k0_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_modified_bessel_k0",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_modified_bessel_k0_out,
+            "modified_bessel_k0_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_modified_bessel_k0.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_modified_bessel_k1,
+            "modified_bessel_k1_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_modified_bessel_k1",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_modified_bessel_k1_out,
+            "modified_bessel_k1_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_modified_bessel_k1.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_ndtri, "ndtri_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "special_ndtri",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_ndtri_out, "ndtri_cuda", 1, 1, MODE_CAST, False, PRE_NONE
+        ],
+        "special_ndtri.out",
+    ](site)
     impl[
         op_special_scaled_modified_bessel_k0,
         "special_scaled_modified_bessel_k0",
@@ -2463,34 +3016,176 @@ def register_unary(site: Site) raises:
         op_special_scaled_modified_bessel_k1_out,
         "special_scaled_modified_bessel_k1.out",
     ](site)
-    impl[op_special_spherical_bessel_j0, "special_spherical_bessel_j0"](site)
-    impl[op_special_spherical_bessel_j0_out, "special_spherical_bessel_j0.out"](
-        site
-    )
-    impl[op_sqrt, "sqrt"](site)
-    impl[op_sqrt_out, "sqrt.out"](site)
-    impl[op_tan, "tan"](site)
-    impl[op_tan_out, "tan.out"](site)
-    impl[op_tanh, "tanh"](site)
-    impl[op_tanh_out, "tanh.out"](site)
-    impl[op_trunc_out, "trunc.out"](site)
-    impl[op_trunc, "trunc"](site)
-    impl[op_relu, "relu"](site)
-    impl[op_relu_out, "relu.out"](site)
-    impl[op_relu_, "relu_"](site)
-    impl[op_gelu, "gelu"](site)
-    impl[op_gelu_out, "gelu.out"](site)
+    impl[
+        f8_iter[
+            op_special_spherical_bessel_j0,
+            "spherical_bessel_j0_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_spherical_bessel_j0",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_spherical_bessel_j0_out,
+            "spherical_bessel_j0_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_spherical_bessel_j0.out",
+    ](site)
+    impl[
+        f8_iter[op_sqrt, "sqrt_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "sqrt",
+    ](site)
+    impl[
+        f8_iter[op_sqrt_out, "sqrt_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "sqrt.out",
+    ](site)
+    impl[
+        f8_iter[op_tan, "tan_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "tan",
+    ](site)
+    impl[
+        f8_iter[op_tan_out, "tan_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "tan.out",
+    ](site)
+    impl[
+        f8_iter[op_tanh, "tanh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "tanh",
+    ](site)
+    impl[
+        f8_iter[op_tanh_out, "tanh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "tanh.out",
+    ](site)
+    impl[
+        f8_iter[op_trunc_out, "trunc_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "trunc.out",
+    ](site)
+    impl[
+        f8_iter[op_trunc, "trunc_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "trunc",
+    ](site)
+    impl[
+        f8_iter[op_relu, "clamp_scalar_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "relu",
+    ](site)
+    impl[
+        f8_iter[
+            op_relu_out,
+            "clamp_scalar_cuda",
+            1,
+            1,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "relu.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_relu_, "clamp_scalar_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE
+        ],
+        "relu_",
+    ](site)
+    impl[
+        f8_iter[op_gelu, "GeluCUDAKernelImpl", 1, -1, MODE_FN, False, PRE_NONE],
+        "gelu",
+    ](site)
+    impl[
+        f8_iter[
+            op_gelu_out, "GeluCUDAKernelImpl", 1, 2, MODE_SAME, False, PRE_NONE
+        ],
+        "gelu.out",
+    ](site)
     impl[op_isnan, "isnan"](site)
     impl[op_isnan_out, "isnan.out"](site)
-    impl[op_isinf, "isinf"](site)
-    impl[op_isinf_out, "isinf.out"](site)
-    impl[op_isfinite, "isfinite"](site)
-    impl[op_isposinf, "isposinf"](site)
-    impl[op_isposinf_out, "isposinf.out"](site)
-    impl[op_isneginf, "isneginf"](site)
-    impl[op_isneginf_out, "isneginf.out"](site)
-    impl[op_logical_not, "logical_not"](site)
-    impl[op_logical_not_out, "logical_not.out"](site)
-    impl[op_bitwise_not, "bitwise_not"](site)
-    impl[op_bitwise_not_out, "bitwise_not.out"](site)
+    impl[
+        f8_iter[op_isinf, "isinf", 1, -1, MODE_FN, False, PRE_NONE],
+        "isinf",
+    ](site)
+    impl[
+        f8_iter[op_isinf_out, "isinf", 1, 1, MODE_NOCHECK, False, PRE_NONE],
+        "isinf.out",
+    ](site)
+    impl[
+        f8_iter[op_isfinite, "isfinite", 1, -1, MODE_FN, False, PRE_NONE],
+        "isfinite",
+    ](site)
+    impl[
+        f8_iter[op_isposinf, "isposinf_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "isposinf",
+    ](site)
+    impl[
+        f8_iter[
+            op_isposinf_out,
+            "isposinf_cuda",
+            1,
+            1,
+            MODE_NOCHECK,
+            False,
+            PRE_BOOL_OUT,
+            "isposinf",
+        ],
+        "isposinf.out",
+    ](site)
+    impl[
+        f8_iter[op_isneginf, "isneginf_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "isneginf",
+    ](site)
+    impl[
+        f8_iter[
+            op_isneginf_out,
+            "isneginf_cuda",
+            1,
+            1,
+            MODE_NOCHECK,
+            False,
+            PRE_BOOL_OUT,
+            "isneginf",
+        ],
+        "isneginf.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_logical_not, "logical_not_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logical_not",
+    ](site)
+    impl[
+        f8_iter[
+            op_logical_not_out,
+            "logical_not_cuda",
+            1,
+            1,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "logical_not.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_bitwise_not, "bitwise_not_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "bitwise_not",
+    ](site)
+    impl[
+        f8_iter[
+            op_bitwise_not_out,
+            "bitwise_not_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "bitwise_not.out",
+    ](site)
     impl[op_fill_scalar, "fill.Scalar"](site)

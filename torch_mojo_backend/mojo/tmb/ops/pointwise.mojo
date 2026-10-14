@@ -68,6 +68,22 @@ from tmb.backend.abi import (
 )
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
+from tmb.ops.f8_iter import (
+    f8_iter,
+    MODE_CAST,
+    MODE_FN,
+    MODE_INPLACE,
+    MODE_NOCHECK,
+    MODE_OUTDT,
+    MODE_SAME,
+    PRE_BOOL_OUT,
+    PRE_DIV_MODE,
+    PRE_HEAVISIDE,
+    PRE_LDEXP,
+    PRE_NAN_TO_NUM,
+    PRE_NONE,
+    PRE_SUB,
+)
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
@@ -1057,9 +1073,10 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
     if out_index >= 0:
         # The out= checks and resize come before the kernel dispatch.
         dest = _pw_out_of(args[unsafe_offset=out_index], a, bound, _none_side())
-    if _pw_is_f8(common) and dest and not _pw_is_f8(dest.value().stype):
+    if dest and (_pw_is_f8(common) or _pw_is_f8(dest.value().stype)):
         # max/min_elementwise dispatch on the OUTPUT dtype: a float8 pair
-        # computes in a wider out's dtype.
+        # computes in a wider out's dtype, and a float8 out refuses as
+        # itself.
         common = dest.value().stype
     # CUDA's one-bound clamp is maximum / minimum: its float8 refusal names
     # max_elementwise_cuda / min_elementwise_cuda.
@@ -2850,9 +2867,10 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     if out_index >= 0:
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
         var d = dest.value().copy()
-        if not _pw_is_float(d.stype):
+        if not (_pw_is_float(d.stype) or _pw_is_f8(d.stype)):
             raise Error(
-                "ldexp can't be cast to the desired output type ", d.stype
+                "ldexp can't be cast to the desired output type ",
+                scalar_type_name(d.dtype),
             )
     var e_integral = _pw_is_int(e_st) or e_st == ST_BOOL
     if (
@@ -4027,7 +4045,11 @@ def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # operand joins as a device 0-d tensor (its value is a float8 one,
         # exact in the float64 it was read as).
         if rtol != 0 or atol != 0:
-            decline_float8(max_dtype(st), "mul_cuda")
+            # `rtol * other` runs where other lives: a CPU 0-d other meets
+            # the CPU kernel's name.
+            decline_float8(
+                max_dtype(st), "mul_cuda" if b.is_t else "mul_cpu_reduced_float"
+            )
         var device = _pw_device(a, b, _none_side())
         var ha = _pw_f8_side_tensor(a, st, device)
         var hb = _pw_f8_side_tensor(b, st, device)
@@ -4207,8 +4229,22 @@ def op_sample_dirichlet(
 
 def register_pointwise(site: Site) raises:
     impl[op_sample_dirichlet, "_sample_dirichlet"](site)
-    impl[op_prelu_kernel, "_prelu_kernel"](site)
-    impl[op_prelu_kernel_backward, "_prelu_kernel_backward"](site)
+    impl[
+        f8_iter[op_prelu_kernel, "prelu_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "_prelu_kernel",
+    ](site)
+    impl[
+        f8_iter[
+            op_prelu_kernel_backward,
+            "prelu_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "_prelu_kernel_backward",
+    ](site)
     impl[op_add_relu, "_add_relu.Tensor"](site)
     impl[op_add_relu, "_add_relu.Scalar"](site)
     impl[op_add_relu_out, "_add_relu.out"](site)
@@ -4216,44 +4252,123 @@ def register_pointwise(site: Site) raises:
     impl[op_add_relu_, "_add_relu_.Scalar"](site)
     impl[op_isclose, "isclose"](site)
     impl[op_masked_scale, "_masked_scale"](site)
-    impl[op_standard_gamma_grad, "_standard_gamma_grad"](site)
+    impl[
+        f8_iter[
+            op_standard_gamma_grad,
+            "_standard_gamma_grad_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "_standard_gamma_grad",
+    ](site)
     impl[op_dirichlet_grad, "_dirichlet_grad"](site)
     impl[op_ilshift, "__ilshift__.Scalar"](site)
-    impl[op_ilshift, "__ilshift__.Tensor"](site)
+    impl[
+        f8_iter[op_ilshift, "lshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        "__ilshift__.Tensor",
+    ](site)
     impl[op_irshift, "__irshift__.Scalar"](site)
-    impl[op_irshift, "__irshift__.Tensor"](site)
+    impl[
+        f8_iter[op_irshift, "rshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        "__irshift__.Tensor",
+    ](site)
     impl[op_lshift, "__lshift__.Scalar"](site)
-    impl[op_lshift, "__lshift__.Tensor"](site)
+    impl[
+        f8_iter[op_lshift, "lshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        "__lshift__.Tensor",
+    ](site)
     impl[op_rshift, "__rshift__.Scalar"](site)
-    impl[op_rshift, "__rshift__.Tensor"](site)
-    impl[op_atan2, "atan2"](site)
-    impl[op_atan2_out, "atan2.out"](site)
-    impl[op_lshift, "bitwise_left_shift.Tensor"](site)
-    impl[op_lshift_out, "bitwise_left_shift.Tensor_out"](site)
-    impl[op_rshift, "bitwise_right_shift.Tensor"](site)
-    impl[op_rshift_out, "bitwise_right_shift.Tensor_out"](site)
+    impl[
+        f8_iter[op_rshift, "rshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        "__rshift__.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_atan2, "atan2_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "atan2",
+    ](site)
+    impl[
+        f8_iter[op_atan2_out, "atan2_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "atan2.out",
+    ](site)
+    impl[
+        f8_iter[op_lshift, "lshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        "bitwise_left_shift.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_lshift_out, "lshift_cuda", 2, 2, MODE_OUTDT, True, PRE_NONE],
+        "bitwise_left_shift.Tensor_out",
+    ](site)
+    impl[
+        f8_iter[op_rshift, "rshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        "bitwise_right_shift.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_rshift_out, "rshift_cuda", 2, 2, MODE_OUTDT, True, PRE_NONE],
+        "bitwise_right_shift.Tensor_out",
+    ](site)
     impl[op_clamp_tensor, "clamp.Tensor"](site)
     impl[op_clamp_tensor_out, "clamp.Tensor_out"](site)
     impl[op_copysign, "copysign.Scalar"](site)
-    impl[op_copysign, "copysign.Tensor"](site)
+    impl[
+        f8_iter[op_copysign, "copysign_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "copysign.Tensor",
+    ](site)
     impl[op_copysign_out, "copysign.Scalar_out"](site)
-    impl[op_copysign_out, "copysign.out"](site)
-    impl[op_elu, "elu"](site)
-    impl[op_elu_out, "elu.out"](site)
+    impl[
+        f8_iter[
+            op_copysign_out, "copysign_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "copysign.out",
+    ](site)
+    impl[
+        f8_iter[op_elu, "elu_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "elu",
+    ](site)
+    impl[
+        f8_iter[op_elu_out, "elu_cuda", 1, 4, MODE_SAME, False, PRE_NONE],
+        "elu.out",
+    ](site)
     impl[op_elu_backward, "elu_backward"](site)
     impl[op_elu_backward_grad_input, "elu_backward.grad_input"](site)
-    impl[op_fmax, "fmax"](site)
-    impl[op_fmax_out, "fmax.out"](site)
-    impl[op_fmin, "fmin"](site)
-    impl[op_fmin_out, "fmin.out"](site)
+    impl[
+        f8_iter[op_fmax, "fmax_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "fmax",
+    ](site)
+    impl[
+        f8_iter[op_fmax_out, "fmax_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "fmax.out",
+    ](site)
+    impl[
+        f8_iter[op_fmin, "fmin_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "fmin",
+    ](site)
+    impl[
+        f8_iter[op_fmin_out, "fmin_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "fmin.out",
+    ](site)
     impl[op_fmod, "fmod.Scalar"](site)
-    impl[op_fmod, "fmod.Tensor"](site)
+    impl[
+        f8_iter[op_fmod, "fmod_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "fmod.Tensor",
+    ](site)
     impl[op_fmod_out, "fmod.Scalar_out"](site)
-    impl[op_fmod_out, "fmod.Tensor_out"](site)
+    impl[
+        f8_iter[op_fmod_out, "fmod_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "fmod.Tensor_out",
+    ](site)
     impl[op_frexp, "frexp.Tensor"](site)
     impl[op_frexp_out, "frexp.Tensor_out"](site)
-    impl[op_gcd, "gcd"](site)
-    impl[op_gcd_out, "gcd.out"](site)
+    impl[
+        f8_iter[op_gcd, "gcd_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "gcd",
+    ](site)
+    impl[
+        f8_iter[op_gcd_out, "gcd_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "gcd.out",
+    ](site)
     impl[op_binary_cross_entropy, "binary_cross_entropy"](site)
     impl[op_binary_cross_entropy_out, "binary_cross_entropy.out"](site)
     impl[op_binary_cross_entropy_backward, "binary_cross_entropy_backward"](
@@ -4271,24 +4386,62 @@ def register_pointwise(site: Site) raises:
         op_binary_cross_entropy_with_logits_out,
         "binary_cross_entropy_with_logits.out",
     ](site)
-    impl[op_deg2rad, "deg2rad"](site)
-    impl[op_deg2rad_out, "deg2rad.out"](site)
-    impl[op_deg2rad_, "deg2rad_"](site)
-    impl[op_gelu_backward_any, "gelu_backward"](site)
+    impl[
+        f8_iter[op_deg2rad, "mul_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "deg2rad",
+    ](site)
+    impl[
+        f8_iter[op_deg2rad_out, "mul_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "deg2rad.out",
+    ](site)
+    impl[
+        f8_iter[op_deg2rad_, "mul_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE],
+        "deg2rad_",
+    ](site)
+    impl[
+        f8_iter[
+            op_gelu_backward_any,
+            "GeluBackwardCUDAKernelImpl",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "gelu_backward",
+    ](site)
     impl[op_huber_loss, "huber_loss"](site)
     impl[op_huber_loss_out, "huber_loss.out"](site)
     impl[op_huber_loss_backward, "huber_loss_backward"](site)
     impl[op_huber_loss_backward_out, "huber_loss_backward.out"](site)
-    impl[op_ldexp, "ldexp.Tensor"](site)
-    impl[op_ldexp_out, "ldexp.out"](site)
-    impl[op_ldexp_, "ldexp_"](site)
+    impl[
+        f8_iter[op_ldexp, "pow_cuda", 2, -1, MODE_FN, False, PRE_LDEXP],
+        "ldexp.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_ldexp_out, "pow_cuda", 2, 2, MODE_CAST, False, PRE_LDEXP],
+        "ldexp.out",
+    ](site)
+    impl[
+        f8_iter[op_ldexp_, "pow_cuda", 2, 0, MODE_INPLACE, False, PRE_LDEXP],
+        "ldexp_",
+    ](site)
     impl[op_mse_loss, "mse_loss"](site)
     impl[op_mse_loss_out, "mse_loss.out"](site)
     impl[op_mse_loss_backward, "mse_loss_backward"](site)
     impl[op_mse_loss_backward_grad_input, "mse_loss_backward.grad_input"](site)
-    impl[op_rad2deg, "rad2deg"](site)
-    impl[op_rad2deg_out, "rad2deg.out"](site)
-    impl[op_rad2deg_, "rad2deg_"](site)
+    impl[
+        f8_iter[op_rad2deg, "mul_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "rad2deg",
+    ](site)
+    impl[
+        f8_iter[op_rad2deg_out, "mul_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "rad2deg.out",
+    ](site)
+    impl[
+        f8_iter[op_rad2deg_, "mul_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE],
+        "rad2deg_",
+    ](site)
     impl[op_smooth_l1_loss, "smooth_l1_loss"](site)
     impl[op_smooth_l1_loss_out, "smooth_l1_loss.out"](site)
     impl[op_smooth_l1_loss_backward, "smooth_l1_loss_backward"](site)
@@ -4296,40 +4449,236 @@ def register_pointwise(site: Site) raises:
         op_smooth_l1_loss_backward_grad_input,
         "smooth_l1_loss_backward.grad_input",
     ](site)
-    impl[op_gelu_backward_grad_input, "gelu_backward.grad_input"](site)
-    impl[op_hardshrink, "hardshrink"](site)
-    impl[op_hardshrink_out, "hardshrink.out"](site)
+    impl[
+        f8_iter[
+            op_gelu_backward_grad_input,
+            "GeluBackwardCUDAKernelImpl",
+            2,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "gelu_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardshrink, "hardshrink_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "hardshrink",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardshrink_out,
+            "hardshrink_cuda",
+            1,
+            2,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "hardshrink.out",
+    ](site)
     impl[op_shrink_backward, "hardshrink_backward"](site)
     impl[op_shrink_backward_grad_input, "hardshrink_backward.grad_input"](site)
-    impl[op_hardsigmoid, "hardsigmoid"](site)
-    impl[op_hardsigmoid_out, "hardsigmoid.out"](site)
-    impl[op_hardsigmoid_, "hardsigmoid_"](site)
-    impl[op_hardsigmoid_backward, "hardsigmoid_backward"](site)
-    impl[op_hardsigmoid_backward_grad_input, "hardsigmoid_backward.grad_input"](
-        site
-    )
-    impl[op_hardswish, "hardswish"](site)
-    impl[op_hardswish_out, "hardswish.out"](site)
-    impl[op_hardswish_, "hardswish_"](site)
-    impl[op_hardswish_backward, "hardswish_backward"](site)
-    impl[op_hardtanh, "hardtanh"](site)
-    impl[op_hardtanh_out, "hardtanh.out"](site)
-    impl[op_hardtanh_, "hardtanh_"](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid, "hardsigmoid_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "hardsigmoid",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid_out,
+            "hardsigmoid_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "hardsigmoid.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid_,
+            "hardsigmoid_cuda",
+            1,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
+        "hardsigmoid_",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid_backward,
+            "hardsigmoid_backward_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "hardsigmoid_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid_backward_grad_input,
+            "hardsigmoid_backward_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "hardsigmoid_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardswish, "hardswish_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "hardswish",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardswish_out, "hardswish_cuda", 1, 1, MODE_SAME, False, PRE_NONE
+        ],
+        "hardswish.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardswish_, "hardswish_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE
+        ],
+        "hardswish_",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardswish_backward,
+            "hardswish_backward_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "hardswish_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardtanh, "clamp_scalar_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "hardtanh",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardtanh_out,
+            "clamp_scalar_cuda",
+            1,
+            3,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "hardtanh.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardtanh_,
+            "clamp_scalar_cuda",
+            1,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
+        "hardtanh_",
+    ](site)
     impl[op_hardtanh_backward, "hardtanh_backward"](site)
     impl[op_hardtanh_backward_grad_input, "hardtanh_backward.grad_input"](site)
-    impl[op_heaviside, "heaviside"](site)
-    impl[op_heaviside_out, "heaviside.out"](site)
-    impl[op_hypot, "hypot"](site)
-    impl[op_hypot_out, "hypot.out"](site)
-    impl[op_igamma, "igamma"](site)
-    impl[op_igamma_out, "igamma.out"](site)
-    impl[op_igammac, "igammac"](site)
-    impl[op_igammac_out, "igammac.out"](site)
-    impl[op_lcm, "lcm"](site)
-    impl[op_lcm_out, "lcm.out"](site)
-    impl[op_leaky_relu, "leaky_relu"](site)
-    impl[op_leaky_relu_out, "leaky_relu.out"](site)
-    impl[op_leaky_relu_, "leaky_relu_"](site)
+    impl[
+        f8_iter[
+            op_heaviside, "heaviside_cuda", 2, -1, MODE_FN, False, PRE_HEAVISIDE
+        ],
+        "heaviside",
+    ](site)
+    impl[
+        f8_iter[
+            op_heaviside_out,
+            "heaviside_cuda",
+            2,
+            2,
+            MODE_CAST,
+            False,
+            PRE_HEAVISIDE,
+        ],
+        "heaviside.out",
+    ](site)
+    impl[
+        f8_iter[op_hypot, "hypot_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "hypot",
+    ](site)
+    impl[
+        f8_iter[op_hypot_out, "hypot_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "hypot.out",
+    ](site)
+    impl[
+        f8_iter[op_igamma, "igamma_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "igamma",
+    ](site)
+    impl[
+        f8_iter[op_igamma_out, "igamma_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "igamma.out",
+    ](site)
+    impl[
+        f8_iter[op_igammac, "igammac_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "igammac",
+    ](site)
+    impl[
+        f8_iter[
+            op_igammac_out, "igammac_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "igammac.out",
+    ](site)
+    impl[
+        f8_iter[op_lcm, "lcm_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "lcm",
+    ](site)
+    impl[
+        f8_iter[op_lcm_out, "lcm_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "lcm.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_leaky_relu, "leaky_relu_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "leaky_relu",
+    ](site)
+    impl[
+        f8_iter[
+            op_leaky_relu_out,
+            "leaky_relu_cuda",
+            1,
+            2,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "leaky_relu.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_leaky_relu_,
+            "leaky_relu_cuda",
+            1,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
+        "leaky_relu_",
+    ](site)
     impl[op_leaky_relu_backward, "leaky_relu_backward"](site)
     impl[op_leaky_relu_backward_grad_input, "leaky_relu_backward.grad_input"](
         site
@@ -4337,35 +4686,160 @@ def register_pointwise(site: Site) raises:
     impl[op_lerp_scalar_any, "lerp.Scalar"](site)
     impl[op_lerp_scalar_out_any, "lerp.Scalar_out"](site)
     impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
-    impl[op_lerp_tensor, "lerp.Tensor"](site)
-    impl[op_lerp_tensor_out, "lerp.Tensor_out"](site)
-    impl[op_log_sigmoid_backward, "log_sigmoid_backward"](site)
-    impl[op_log_sigmoid_backward_grad_input, "log_sigmoid_backward.grad_input"](
-        site
-    )
+    impl[
+        f8_iter[op_lerp_tensor, "lerp_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "lerp.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_lerp_tensor_out, "lerp_cuda", 3, 3, MODE_SAME, False, PRE_NONE
+        ],
+        "lerp.Tensor_out",
+    ](site)
+    impl[
+        f8_iter[
+            op_log_sigmoid_backward,
+            "log_sigmoid_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "log_sigmoid_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_log_sigmoid_backward_grad_input,
+            "log_sigmoid_backward_cuda",
+            3,
+            3,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "log_sigmoid_backward.grad_input",
+    ](site)
     impl[op_log_sigmoid_forward, "log_sigmoid_forward"](site)
     impl[op_log_sigmoid_forward_output, "log_sigmoid_forward.output"](site)
-    impl[op_logaddexp, "logaddexp"](site)
-    impl[op_logaddexp_out, "logaddexp.out"](site)
-    impl[op_logaddexp2, "logaddexp2"](site)
-    impl[op_logaddexp2_out, "logaddexp2.out"](site)
-    impl[op_logit_backward, "logit_backward"](site)
-    impl[op_logit_backward_grad_input, "logit_backward.grad_input"](site)
-    impl[op_mish, "mish"](site)
-    impl[op_mish_out, "mish.out"](site)
-    impl[op_mish_backward, "mish_backward"](site)
-    impl[op_nextafter, "nextafter"](site)
-    impl[op_nextafter_out, "nextafter.out"](site)
-    impl[op_rsub_any, "rsub.Tensor"](site)
+    impl[
+        f8_iter[
+            op_logaddexp, "logaddexp_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logaddexp",
+    ](site)
+    impl[
+        f8_iter[
+            op_logaddexp_out,
+            "logaddexp_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "logaddexp.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_logaddexp2, "logaddexp2_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logaddexp2",
+    ](site)
+    impl[
+        f8_iter[
+            op_logaddexp2_out,
+            "logaddexp2_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "logaddexp2.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_logit_backward, "logit_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logit_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_logit_backward_grad_input,
+            "logit_cuda",
+            2,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "logit_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[op_mish, "mish_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "mish",
+    ](site)
+    impl[
+        f8_iter[op_mish_out, "mish_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "mish.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_mish_backward,
+            "mish_backward_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "mish_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_nextafter, "nextafter_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "nextafter",
+    ](site)
+    impl[
+        f8_iter[
+            op_nextafter_out, "nextafter_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "nextafter.out",
+    ](site)
+    impl[
+        f8_iter[op_rsub_any, "ufunc_add_CUDA", 2, -1, MODE_FN, False, PRE_SUB],
+        "rsub.Tensor",
+    ](site)
     impl[op_rsub_any, "rsub.Scalar"](site)
-    impl[op_rsub_out_any, "rsub.Tensor_out"](site)
+    impl[
+        f8_iter[
+            op_rsub_out_any,
+            "ufunc_add_CUDA",
+            2,
+            3,
+            MODE_NOCHECK,
+            False,
+            PRE_SUB,
+        ],
+        "rsub.Tensor_out",
+    ](site)
     impl[op_rsub_out_any, "rsub.Scalar_out"](site)
     impl[op_pow_scalar_base, "pow.Scalar"](site)
     impl[op_pow_scalar_base_out, "pow.Scalar_out"](site)
     impl[op_pow_scalar_any, "pow.Tensor_Scalar"](site)
     impl[op_pow_scalar_out_any, "pow.Tensor_Scalar_out"](site)
-    impl[op_pow_tensor_any, "pow.Tensor_Tensor"](site)
-    impl[op_pow_tensor_out_any, "pow.Tensor_Tensor_out"](site)
+    impl[
+        f8_iter[op_pow_tensor_any, "pow_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "pow.Tensor_Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_pow_tensor_out_any, "pow_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "pow.Tensor_Tensor_out",
+    ](site)
     impl[op_rrelu_with_noise, "rrelu_with_noise"](site)
     impl[op_rrelu_with_noise_out, "rrelu_with_noise.out"](site)
     impl[op_rrelu_with_noise_, "rrelu_with_noise_"](site)
@@ -4377,22 +4851,74 @@ def register_pointwise(site: Site) raises:
     impl[op_glu_jvp_out, "glu_jvp.out"](site)
     impl[op_glu_backward_jvp, "glu_backward_jvp"](site)
     impl[op_glu_backward_jvp_out, "glu_backward_jvp.out"](site)
-    impl[op_silu_backward, "silu_backward"](site)
-    impl[op_silu_backward_grad_input, "silu_backward.grad_input"](site)
-    impl[op_softplus, "softplus"](site)
-    impl[op_softplus_out, "softplus.out"](site)
+    impl[
+        f8_iter[
+            op_silu_backward,
+            "silu_backward_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "silu_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_silu_backward_grad_input,
+            "silu_backward_cuda",
+            2,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "silu_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[op_softplus, "softplus_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "softplus",
+    ](site)
+    impl[
+        f8_iter[
+            op_softplus_out, "softplus_cuda", 1, 3, MODE_SAME, False, PRE_NONE
+        ],
+        "softplus.out",
+    ](site)
     impl[op_softplus_backward, "softplus_backward"](site)
     impl[op_softplus_backward_grad_input, "softplus_backward.grad_input"](site)
-    impl[op_softshrink, "softshrink"](site)
-    impl[op_softshrink_out, "softshrink.out"](site)
+    impl[
+        f8_iter[
+            op_softshrink, "softshrink_check", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "softshrink",
+    ](site)
+    impl[
+        f8_iter[
+            op_softshrink_out,
+            "softshrink_check",
+            1,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "softshrink.out",
+    ](site)
     impl[op_shrink_backward, "softshrink_backward"](site)
     impl[op_shrink_backward_grad_input, "softshrink_backward.grad_input"](site)
     _register_special(site)
     impl[op_threshold, "threshold"](site)
     impl[op_threshold_out, "threshold.out"](site)
     impl[op_threshold_, "threshold_"](site)
-    impl[op_xlogy, "xlogy.Tensor"](site)
-    impl[op_xlogy_out, "xlogy.OutTensor"](site)
+    impl[
+        f8_iter[op_xlogy, "xlogy_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "xlogy.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_xlogy_out, "xlogy_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        "xlogy.OutTensor",
+    ](site)
 
 
 comptime op_special_chebyshev_polynomial_t = op_poly[
@@ -4462,55 +4988,129 @@ comptime op_special_shifted_chebyshev_polynomial_w_out = op_poly[
 
 
 def _register_special(site: Site) raises:
-    impl[op_special_chebyshev_polynomial_t, "special_chebyshev_polynomial_t"](
-        site
-    )
+    impl[
+        f8_iter[
+            op_special_chebyshev_polynomial_t,
+            "chebyshev_polynomial_t_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_chebyshev_polynomial_t",
+    ](site)
     impl[
         op_special_chebyshev_polynomial_t_out,
         "special_chebyshev_polynomial_t.out",
     ](site)
-    impl[op_special_chebyshev_polynomial_u, "special_chebyshev_polynomial_u"](
-        site
-    )
+    impl[
+        f8_iter[
+            op_special_chebyshev_polynomial_u,
+            "chebyshev_polynomial_u_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_chebyshev_polynomial_u",
+    ](site)
     impl[
         op_special_chebyshev_polynomial_u_out,
         "special_chebyshev_polynomial_u.out",
     ](site)
-    impl[op_special_chebyshev_polynomial_v, "special_chebyshev_polynomial_v"](
-        site
-    )
+    impl[
+        f8_iter[
+            op_special_chebyshev_polynomial_v,
+            "chebyshev_polynomial_v_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_chebyshev_polynomial_v",
+    ](site)
     impl[
         op_special_chebyshev_polynomial_v_out,
         "special_chebyshev_polynomial_v.out",
     ](site)
-    impl[op_special_chebyshev_polynomial_w, "special_chebyshev_polynomial_w"](
-        site
-    )
+    impl[
+        f8_iter[
+            op_special_chebyshev_polynomial_w,
+            "chebyshev_polynomial_w_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_chebyshev_polynomial_w",
+    ](site)
     impl[
         op_special_chebyshev_polynomial_w_out,
         "special_chebyshev_polynomial_w.out",
     ](site)
-    impl[op_special_hermite_polynomial_h, "special_hermite_polynomial_h"](site)
+    impl[
+        f8_iter[
+            op_special_hermite_polynomial_h,
+            "hermite_polynomial_h_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_hermite_polynomial_h",
+    ](site)
     impl[
         op_special_hermite_polynomial_h_out, "special_hermite_polynomial_h.out"
     ](site)
-    impl[op_special_hermite_polynomial_he, "special_hermite_polynomial_he"](
-        site
-    )
+    impl[
+        f8_iter[
+            op_special_hermite_polynomial_he,
+            "hermite_polynomial_he_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_hermite_polynomial_he",
+    ](site)
     impl[
         op_special_hermite_polynomial_he_out,
         "special_hermite_polynomial_he.out",
     ](site)
-    impl[op_special_laguerre_polynomial_l, "special_laguerre_polynomial_l"](
-        site
-    )
+    impl[
+        f8_iter[
+            op_special_laguerre_polynomial_l,
+            "laguerre_polynomial_l_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_laguerre_polynomial_l",
+    ](site)
     impl[
         op_special_laguerre_polynomial_l_out,
         "special_laguerre_polynomial_l.out",
     ](site)
-    impl[op_special_legendre_polynomial_p, "special_legendre_polynomial_p"](
-        site
-    )
+    impl[
+        f8_iter[
+            op_special_legendre_polynomial_p,
+            "legendre_polynomial_p_cuda",
+            2,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_legendre_polynomial_p",
+    ](site)
     impl[
         op_special_legendre_polynomial_p_out,
         "special_legendre_polynomial_p.out",
@@ -4547,7 +5147,31 @@ def _register_special(site: Site) raises:
         op_special_shifted_chebyshev_polynomial_w_out,
         "special_shifted_chebyshev_polynomial_w.out",
     ](site)
-    impl[op_special_xlog1py, "special_xlog1py"](site)
-    impl[op_special_xlog1py_out, "special_xlog1py.out"](site)
-    impl[op_special_zeta, "special_zeta"](site)
-    impl[op_special_zeta_out, "special_zeta.out"](site)
+    impl[
+        f8_iter[
+            op_special_xlog1py, "xlog1py_cuda", 2, -1, MODE_FN, False, PRE_NONE
+        ],
+        "special_xlog1py",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_xlog1py_out,
+            "xlog1py_cuda",
+            2,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_xlog1py.out",
+    ](site)
+    impl[
+        f8_iter[op_special_zeta, "zeta_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "special_zeta",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_zeta_out, "zeta_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "special_zeta.out",
+    ](site)

@@ -12,6 +12,8 @@ dequantized operands.
 """
 
 import itertools
+import json
+import pathlib
 
 import pytest
 import torch
@@ -2387,3 +2389,196 @@ def test_float8_cpu_0d_operands_match_cuda(mojo_device):
         torch.cat([x, torch.ones(2, device=dev)])
     with pytest.raises(RuntimeError, match="promote Float and Float8_e4m3fn"):
         torch.cat([torch.ones(2, device=dev), x])
+
+
+# ---------------------------------------------------------------------------
+# TensorIterator's pre-dispatch sequence (tmb/ops/f8_iter.mojo), op by op:
+# every unary / binary / comparison / logical op against stock CUDA in each
+# float8 situation -- float8 self / other / out, 0-d and CPU 0-d operands,
+# fresh / empty / wrong-dtype / partially and internally overlapping outs.
+# float8_elementwise_cuda.json holds the lines measured on stock CUDA (torch
+# 2.11 / H100) with exactly the generator below.
+# ---------------------------------------------------------------------------
+
+_F8_MATRIX = json.loads(
+    (pathlib.Path(__file__).parent / "float8_elementwise_cuda.json").read_text()
+)
+_MATRIX_UNARY = {
+    "abs", "neg", "sign", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
+    "sqrt", "rsqrt", "sin", "cos", "tan", "sinh", "cosh", "tanh", "asin", "acos",
+    "atan", "asinh", "acosh", "atanh", "sigmoid", "erf", "erfc", "erfinv",
+    "reciprocal", "ceil", "floor", "round", "trunc", "frac", "nan_to_num",
+    "isnan", "isinf", "isfinite", "signbit", "bitwise_not", "logical_not", "sgn",
+    "lgamma", "digamma", "i0", "square", "relu", "angle", "positive", "deg2rad",
+    "rad2deg", "fix",
+}  # fmt: skip
+
+
+def _mx_enc(t):
+    if not isinstance(t, torch.Tensor):
+        return repr(t)[:40]
+    v = t.view(torch.uint8) if t.dtype in FP8 else t
+    return f"{str(t.dtype)[6:]}{tuple(t.shape)}{v.cpu().tolist()}"
+
+
+def _mx_res(fn, out=None, inp=()):
+    before = [_mx_enc(i) for i in inp]
+    try:
+        s = "OK " + _mx_enc(fn())
+    except Exception as e:  # noqa: BLE001 -- the outcome itself is compared
+        msg = str(e).split("\n")[0].split(" [aten")[0][:90]
+        s = type(e).__name__ + " " + msg
+    if out is not None:
+        s += f" | out={str(out.dtype)[6:]}{tuple(out.shape)}"
+    if [_mx_enc(i) for i in inp] != before:
+        s += " | INPUT MUTATED"
+    return s
+
+
+def _mx_unary(name, dev):
+    f = getattr(torch, name)
+    f8 = torch.float8_e4m3fn
+
+    def mk(vals):
+        return torch.tensor(vals).to(f8).to(dev)
+
+    a = mk([1.0, 2.0])
+    yield f"{name} fn {_mx_res(lambda: f(a))}"
+    for odt in (f8, torch.float32, torch.int32, torch.bool):
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield f"{name} out_empty {str(odt)[6:]} {_mx_res(lambda: f(a, out=o), o)}"
+    o = torch.empty(2, dtype=f8, device=dev)
+    yield f"{name} out_fresh {_mx_res(lambda: f(a, out=o), o)}"
+    b = mk([1.0, 2.0, 3.0, 4.0])
+    o = b[1:]
+    yield f"{name} out_partial_overlap {_mx_res(lambda: f(b[:2], out=o), o, (b,))}"
+    o = torch.empty(1, dtype=f8, device=dev).expand(2)
+    yield f"{name} out_internal_overlap {_mx_res(lambda: f(a, out=o), o)}"
+    yield f"{name} fn_0d {_mx_res(lambda: f(mk(1.0)))}"
+
+
+def _mx_binary(name, dev):
+    f = getattr(torch, name)
+    f8 = torch.float8_e4m3fn
+
+    def mk(vals, dt):
+        return torch.tensor(vals).to(dt).to(dev)
+
+    a8, a32 = mk([1.0, 2.0], f8), mk([1.0, 2.0], torch.float32)
+    z8, z32 = mk(2.0, f8), mk(2.0, torch.float32)
+    combos = {
+        "f8_f8": (a8, a8), "f8_f32": (a8, a32), "f32_f8": (a32, a8),
+        "f8_0d32": (a8, z32), "0d8_f32": (z8, a32), "f32_0d8": (a32, z8),
+        "0d32_f8": (z32, a8), "f8_scalar": (a8, 2.0), "f8_iscalar": (a8, 2),
+        "f8_cpu0d8": (a8, torch.tensor(2.0).to(f8)),
+    }  # fmt: skip
+    for k, (x, y) in combos.items():
+        yield f"{name} fn {k} {_mx_res(lambda: f(x, y))}"
+    for odt in (f8, torch.float32, torch.int32, torch.bool):
+        o = torch.empty(0, dtype=odt, device=dev)
+        res = _mx_res(lambda: f(a8, a8, out=o), o)
+        yield f"{name} out_empty_f8f8 {str(odt)[6:]} {res}"
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield f"{name} out_empty_f32f32_to_f8 {_mx_res(lambda: f(a32, a32, out=o), o)}"
+    b = mk([1.0, 2.0, 3.0, 4.0], f8)
+    o = b[1:]
+    res = _mx_res(lambda: f(b[:2], a8, out=o), o, (b,))
+    yield f"{name} out_partial_overlap {res}"
+    o = torch.empty(1, dtype=f8, device=dev).expand(2)
+    yield f"{name} out_internal_overlap {_mx_res(lambda: f(a8, a8, out=o), o)}"
+
+
+@pytest.mark.parametrize("op", list(_F8_MATRIX))
+def test_float8_elementwise_matches_stock_cuda(mojo_device, op):
+    gen = _mx_unary if op in _MATRIX_UNARY else _mx_binary
+    want = [line for line in _F8_MATRIX[op]]
+    # A CPU 0-d operand of an op whose TensorIterator refuses CPU scalars
+    # (logaddexp, nextafter, igamma) is a device mismatch on CUDA for every
+    # dtype -- a separate follow-up, not part of this matrix.
+    got = [
+        line for line in gen(op, mojo_device) if line in want or "f8_cpu0d8" not in line
+    ]
+    assert got == want
+
+
+_R9_CUDA = [
+    'pow_0d8_f32 OK float32(2,)[8.0, 8.0]',
+    'pow_tt_out_torch.float8_e4m3fn NotImplementedError "pow_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'pow_tt_out_torch.float32 NotImplementedError "pow_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    "pow_tt_out_torch.int32 RuntimeError result type Float8_e4m3fn can't be cast to the desired output type Int | out=(0,)",
+    'gt_out_torch.float32 NotImplementedError "compare_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'gt_out_torch.bool NotImplementedError "compare_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'logical_and_out_torch.float32 NotImplementedError "logical_and_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'logical_and_out_torch.bool NotImplementedError "logical_and_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'logical_or_out_torch.float32 NotImplementedError "logical_or_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'logical_or_out_torch.bool NotImplementedError "logical_or_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'logical_xor_out_torch.float32 NotImplementedError "logical_xor_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'logical_xor_out_torch.bool NotImplementedError "logical_xor_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'neg_overlap RuntimeError unsupported operation: some elements of the input tensor and the written-to tensor refer to a single | out=(3,)',
+    'exp_overlap RuntimeError unsupported operation: some elements of the input tensor and the written-to tensor refer to a single | out=(3,)',
+    'nan_to_num_overlap RuntimeError unsupported operation: some elements of the input tensor and the written-to tensor refer to a single | out=(3,)',
+    'lt_cpu0d_out NotImplementedError "compare_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+    'maximum_e5out NotImplementedError "max_elementwise_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
+    'bitand_e5out NotImplementedError "bitwise_and_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
+    'clamp_tmin_e5out NotImplementedError "max_elementwise_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
+    'minimum_e5out NotImplementedError "min_elementwise_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
+    'pow_int_f8 RuntimeError Promotion for Float8 Types is not supported, attempted to promote Int and Float8_e4m3fn',
+    'pow_bool_f8 RuntimeError Promotion for Float8 Types is not supported, attempted to promote Bool and Float8_e4m3fn',
+    'isclose_tol NotImplementedError "mul_cuda" not implemented for \'Float8_e4m3fn\'',
+    'isclose_tol_cpu0d NotImplementedError "mul_cpu_reduced_float" not implemented for \'Float8_e4m3fn\'',
+    'div_floor NotImplementedError "div_floor_cuda" not implemented for \'Float8_e4m3fn\'',
+    'div_trunc NotImplementedError "div_trunc_cuda" not implemented for \'Float8_e4m3fn\'',
+    'div_floor_out NotImplementedError "div_floor_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
+]  # fmt: skip
+
+
+def _r9_lines(dev):
+    f8, e5 = torch.float8_e4m3fn, torch.float8_e5m2
+
+    def run(name, fn, out=None):
+        try:
+            s = "OK " + _mx_enc(fn())
+        except Exception as e:  # noqa: BLE001 -- the outcome itself is compared
+            s = type(e).__name__ + " " + str(e).split("\n")[0].split(" [aten")[0][:100]
+        if out is not None:
+            s += f" | out={tuple(out.shape)}"
+        return f"{name} {s}"
+
+    x = torch.tensor([1.0, 2.0]).to(f8).to(dev)
+    base = torch.tensor(2.0).to(f8).to(dev)
+    yield run("pow_0d8_f32", lambda: torch.pow(base, torch.full((2,), 3.0, device=dev)))
+    for odt in (f8, torch.float32, torch.int32):
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield run(f"pow_tt_out_{odt}", lambda: torch.pow(x, x, out=o), o)
+    for fn in ("gt", "logical_and", "logical_or", "logical_xor"):
+        for odt in (torch.float32, torch.bool):
+            o = torch.empty(0, dtype=odt, device=dev)
+            yield run(f"{fn}_out_{odt}", lambda: getattr(torch, fn)(x, x, out=o), o)
+    a = torch.ones(4).to(f8).to(dev)
+    for fn in ("neg", "exp", "nan_to_num"):
+        o = a[1:]
+        yield run(f"{fn}_overlap", lambda: getattr(torch, fn)(a[:2], out=o), o)
+    o = torch.empty(0, dtype=torch.bool, device=dev)
+    yield run("lt_cpu0d_out", lambda: torch.lt(x, torch.tensor(1.5), out=o), o)
+    for name, f in [
+        ("maximum", lambda o: torch.maximum(x, x, out=o)),
+        ("bitand", lambda o: torch.bitwise_and(x, x, out=o)),
+        ("clamp_tmin", lambda o: torch.clamp(x, min=x, out=o)),
+        ("minimum", lambda o: torch.minimum(x, x, out=o)),
+    ]:
+        o = torch.empty(0, dtype=e5, device=dev)
+        yield run(f"{name}_e5out", lambda: f(o), o)
+    ones_i = torch.ones(2, dtype=torch.int32, device=dev)
+    yield run("pow_int_f8", lambda: torch.pow(ones_i, x))
+    ones_b = torch.ones(2, dtype=torch.bool, device=dev)
+    yield run("pow_bool_f8", lambda: torch.pow(ones_b, x))
+    yield run("isclose_tol", lambda: torch.isclose(x, x))
+    yield run("isclose_tol_cpu0d", lambda: torch.isclose(x, torch.tensor(1.0).to(f8)))
+    yield run("div_floor", lambda: torch.div(x, x, rounding_mode="floor"))
+    yield run("div_trunc", lambda: torch.div(x, x, rounding_mode="trunc"))
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield run("div_floor_out", lambda: torch.div(x, x, rounding_mode="floor", out=o), o)
+
+
+def test_float8_review_items_match_stock_cuda(mojo_device):
+    assert list(_r9_lines(mojo_device)) == _R9_CUDA

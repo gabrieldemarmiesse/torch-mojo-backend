@@ -78,6 +78,22 @@ from tmb.ops.common import (
     scalar_to_float,
     scalar_to_int,
 )
+from tmb.ops.f8_iter import (
+    f8_iter,
+    MODE_CAST,
+    MODE_FN,
+    MODE_INPLACE,
+    MODE_NOCHECK,
+    MODE_OUTDT,
+    MODE_SAME,
+    PRE_BOOL_OUT,
+    PRE_DIV_MODE,
+    PRE_HEAVISIDE,
+    PRE_LDEXP,
+    PRE_NAN_TO_NUM,
+    PRE_NONE,
+    PRE_SUB,
+)
 from tmb.backend.registry import Site, impl
 from tmb.ops.core import _host_copy, cast_for_copy
 from tmb.ops.binary import _b_out_guard, _b_tside
@@ -1948,20 +1964,76 @@ def register_compare(site: Site) raises:
     impl[op_ne_tensor_out, "ne.Tensor_out"](site)
     impl[op_ne_scalar, "ne.Scalar"](site)
     impl[op_ne_scalar_out, "ne.Scalar_out"](site)
-    impl[op_lt_tensor, "lt.Tensor"](site)
-    impl[op_lt_tensor_out, "lt.Tensor_out"](site)
+    impl[
+        f8_iter[op_lt_tensor, "compare_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "lt.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_lt_tensor_out,
+            "compare_cuda",
+            2,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "lt.Tensor_out",
+    ](site)
     impl[op_lt_scalar, "lt.Scalar"](site)
     impl[op_lt_scalar_out, "lt.Scalar_out"](site)
-    impl[op_le_tensor, "le.Tensor"](site)
-    impl[op_le_tensor_out, "le.Tensor_out"](site)
+    impl[
+        f8_iter[op_le_tensor, "compare_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "le.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_le_tensor_out,
+            "compare_cuda",
+            2,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "le.Tensor_out",
+    ](site)
     impl[op_le_scalar, "le.Scalar"](site)
     impl[op_le_scalar_out, "le.Scalar_out"](site)
-    impl[op_gt_tensor, "gt.Tensor"](site)
-    impl[op_gt_tensor_out, "gt.Tensor_out"](site)
+    impl[
+        f8_iter[op_gt_tensor, "compare_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "gt.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_gt_tensor_out,
+            "compare_cuda",
+            2,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "gt.Tensor_out",
+    ](site)
     impl[op_gt_scalar, "gt.Scalar"](site)
     impl[op_gt_scalar_out, "gt.Scalar_out"](site)
-    impl[op_ge_tensor, "ge.Tensor"](site)
-    impl[op_ge_tensor_out, "ge.Tensor_out"](site)
+    impl[
+        f8_iter[op_ge_tensor, "compare_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        "ge.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_ge_tensor_out,
+            "compare_cuda",
+            2,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "ge.Tensor_out",
+    ](site)
     impl[op_ge_scalar, "ge.Scalar"](site)
     impl[op_ge_scalar_out, "ge.Scalar_out"](site)
     impl[op_isin_scalar_tensor, "isin.Scalar_Tensor"](site)
