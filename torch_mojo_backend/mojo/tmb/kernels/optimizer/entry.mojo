@@ -8,22 +8,17 @@ no allocation, host read, synchronization, or vendor-library call.
 
 from std.collections import Array
 from std.math import ceildiv
-from std.os import abort
 from max.gpu.host import DeviceContext
 
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
-    FLOAT_DTYPES,
     _raw_ctx,
-    _raw_dtype_int,
     _raw_int,
     _raw_tuple_f64,
     _raw_tuple_int,
     _raw_tuple_len,
-    _spec_dispatcher3,
     _spec_dispatcher4,
-    _spec_dispatcher5,
     _spec_dispatcher6,
     _spec_dispatcher7,
 )
@@ -50,35 +45,12 @@ from tmb.kernels.optimizer.foreach_clip_contract import (
 from tmb.kernels.optimizer.foreach_clip_kernels import (
     enqueue_foreach_l2_norm_f32,
 )
-from tmb.kernels.optimizer.foreach_batched_kernels import (
-    FEW_ADD,
-    FEW_ADDCDIV,
-    FEW_ADDCMUL,
-    FEW_DESC_CAP,
-    FEW_DIV,
-    FEW_LERP,
-    FEW_MUL,
-    FEW_MUL_TENSOR,
-    FEW_NONFINITE_UNSCALE,
-    FEW_SQRT,
-    ForeachEwDesc,
-    _few_fields,
-    _few_has_scalar,
-    _few_label,
-    empty_foreach_ew_desc,
-    foreach_ew_chunk_elements,
-    foreach_ew_enqueue,
-)
-from tmb.kernels.optimizer.foreach_elementwise_kernels import (
-    FOREACH_EW_SLOTS,
-    enqueue_foreach_gather_scalars_f32,
-)
+from tmb.kernels.foreach.apply import foreach_chunk_elements
 
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
     NO_OP_COMPILED,
     _dtype_arg_on,
-    _dtype_supported,
     _op_on,
     _tmb_entry_error,
 )
@@ -202,7 +174,7 @@ def _fused_opt_go[
         total_elements += _raw_tuple_int(
             metadata_obj, record * _FUSED_OPT_RECORD_FIELDS + 6
         )
-    var chunk_elements = foreach_ew_chunk_elements(total_elements, ctx)
+    var chunk_elements = foreach_chunk_elements(total_elements, ctx)
 
     comptime for pdt in _FUSED_OPT_PARAM_DTYPES:
         comptime if _dtype_arg_on[0, pdt]():
@@ -305,194 +277,6 @@ def _foreach_l2_norm_go(
         partial_offset += total_chunks
 
 
-def _foreach_ew_validate(
-    metadata_obj: Arg, record_fields: Int, op_name: StaticString
-) raises -> Int:
-    """Shared record-count/pointer validation for the batched foreach ops.
-
-    Every record's trailing field is the numel; all leading fields are
-    device pointers that must be nonzero when the numel is positive.
-    """
-    var value_count = _raw_tuple_len(metadata_obj)
-    if value_count == 0:
-        raise Error(op_name, " requires a nonempty TensorList")
-    if value_count % record_fields != 0:
-        raise Error("invalid ", op_name, " metadata field count")
-    var record_count = value_count // record_fields
-    for record in range(record_count):
-        var base = record * record_fields
-        var numel = _raw_tuple_int(metadata_obj, base + record_fields - 1)
-        if numel < 0:
-            raise Error(op_name, " tensor numel must be nonnegative")
-        if numel > 0:
-            for field in range(record_fields - 1):
-                if _raw_tuple_int(metadata_obj, base + field) == 0:
-                    raise Error(op_name, " nonempty pointer must be nonzero")
-    return record_count
-
-
-def _foreach_ew_go[
-    op: Int
-](
-    metadata_obj: Arg,
-    scalars_obj: Arg,
-    aux_obj: Arg,
-    dtype_obj: Arg,
-    device_context_ptr: Arg,
-) raises:
-    """One bridge for the whole `aten::_foreach_*` elementwise family.
-
-    The Python boundary has already validated ATen's mutable-TensorList
-    contract and flattened the list into `metadata_obj`: `_few_fields[op]()`
-    ints per tensor, the operand addresses then the numel. What else an op
-    needs travels in the two small tuples, and which of them it reads is a
-    compile-time fact:
-
-    * `scalars_obj` -- one FP32 scalar per tensor for mul/add/div/addc
-      (`.Scalar` fills the same tuple with one repeated value that
-      `.ScalarList` fills per tensor), or the two lerp weights.
-    * `aux_obj` -- ints: the lerp branch selector, the address of the 0-d
-      device scalar `_foreach_mul_.Tensor` multiplies by, or GradScaler's
-      (inv_scale, found_inf) device scalar addresses.
-
-    Descriptors are packed `FEW_DESC_CAP` at a time; a longer list becomes
-    several launches of the same compiled kernel. Nothing is allocated, read
-    back, or synchronized here.
-    """
-    comptime fields = _few_fields[op]()
-    comptime label = _few_label[op]()
-    var record_count = _foreach_ew_validate(metadata_obj, fields, label)
-
-    var dtype = _raw_dtype_int(dtype_obj)
-    if not _dtype_supported[List[DType](FLOAT_DTYPES)](dtype):
-        raise Error("mojo foreach ", label, ": unsupported dtype ", dtype)
-
-    var weight = Float32(0.0)
-    var one_minus_weight = Float32(0.0)
-    comptime if _few_has_scalar[op]():
-        if _raw_tuple_len(scalars_obj) != record_count:
-            raise Error("mojo foreach ", label, " needs one scalar per tensor")
-    comptime if op == FEW_LERP:
-        if _raw_tuple_len(scalars_obj) != 2:
-            raise Error("mojo foreach lerp needs both narrowed weights")
-        weight = Float32(_raw_tuple_f64(scalars_obj, 0))
-        one_minus_weight = Float32(_raw_tuple_f64(scalars_obj, 1))
-
-    var low_branch = 0
-    var scalar_addr = 0
-    comptime if op == FEW_LERP:
-        if _raw_tuple_len(aux_obj) != 1:
-            raise Error("mojo foreach lerp needs its branch selector")
-        low_branch = _raw_tuple_int(aux_obj, 0)
-    comptime if op == FEW_MUL_TENSOR:
-        if _raw_tuple_len(aux_obj) != 1:
-            raise Error("mojo foreach multiply needs its scalar address")
-        scalar_addr = _raw_tuple_int(aux_obj, 0)
-        if scalar_addr == 0:
-            raise Error("mojo foreach multiply scalar pointer must be nonzero")
-    var flag_addr = 0
-    comptime if op == FEW_NONFINITE_UNSCALE:
-        if _raw_tuple_len(aux_obj) != 2:
-            raise Error("mojo foreach unscale needs inv_scale and found_inf")
-        scalar_addr = _raw_tuple_int(aux_obj, 0)
-        flag_addr = _raw_tuple_int(aux_obj, 1)
-        if scalar_addr == 0 or flag_addr == 0:
-            raise Error("mojo foreach unscale scalar pointers must be nonzero")
-
-    var ctx = _raw_ctx(device_context_ptr)
-
-    # The chunk size is what fills the device, so it is derived from the whole
-    # list's element count once, before any descriptor batch is packed.
-    var total_elements = 0
-    for record in range(record_count):
-        total_elements += _raw_tuple_int(
-            metadata_obj, record * fields + fields - 1
-        )
-    var chunk_elements = foreach_ew_chunk_elements(total_elements, ctx)
-
-    var record = 0
-    while record < record_count:
-        var descs = Array[ForeachEwDesc, FEW_DESC_CAP](
-            fill=empty_foreach_ew_desc()
-        )
-        var scalars = Array[Float32, FEW_DESC_CAP](fill=0.0)
-        var desc_count = 0
-        var total_chunks = 0
-        while record < record_count and desc_count < FEW_DESC_CAP:
-            var base = record * fields
-            var numel = _raw_tuple_int(metadata_obj, base + fields - 1)
-            if numel > 0:
-                total_chunks += ceildiv(numel, chunk_elements)
-            var addr1 = 0
-            var addr2 = 0
-            comptime if fields >= 3:
-                addr1 = _raw_tuple_int(metadata_obj, base + 1)
-            comptime if fields >= 4:
-                addr2 = _raw_tuple_int(metadata_obj, base + 2)
-            descs[desc_count] = ForeachEwDesc(
-                _raw_tuple_int(metadata_obj, base),
-                addr1,
-                addr2,
-                numel,
-                total_chunks,
-            )
-            comptime if _few_has_scalar[op]():
-                scalars[desc_count] = Float32(
-                    _raw_tuple_f64(scalars_obj, record)
-                )
-            record += 1
-            desc_count += 1
-
-        comptime for dt in FLOAT_DTYPES:
-            comptime if _dtype_arg_on[0, dt]():
-                if dtype == dt:
-                    foreach_ew_enqueue[dt, op](
-                        descs,
-                        scalars,
-                        desc_count,
-                        total_chunks,
-                        chunk_elements,
-                        scalar_addr,
-                        weight,
-                        one_minus_weight,
-                        low_branch,
-                        flag_addr,
-                        ctx,
-                    )
-
-
-def _foreach_gather_scalars_go(
-    metadata_obj: Arg,
-    out_ptr_obj: Arg,
-    device_context_ptr: Arg,
-) raises:
-    var record_count = _raw_tuple_len(metadata_obj)
-    if record_count == 0:
-        raise Error("foreach gather requires a nonempty TensorList")
-    var out_addr = _raw_int(out_ptr_obj)
-    if out_addr == 0:
-        raise Error("foreach gather output pointer must be nonzero")
-    for record in range(record_count):
-        if _raw_tuple_int(metadata_obj, record) == 0:
-            raise Error("foreach gather input pointers must be nonzero")
-    var ctx = _raw_ctx(device_context_ptr)
-
-    var record = 0
-    while record < record_count:
-        var in_addrs = Array[Int, FOREACH_EW_SLOTS](fill=0)
-        var base = record
-        var slot = 0
-        while record < record_count and slot < FOREACH_EW_SLOTS:
-            in_addrs[slot] = _raw_tuple_int(metadata_obj, record)
-            record += 1
-            slot += 1
-        var count = slot
-        while slot < FOREACH_EW_SLOTS:
-            in_addrs[slot] = in_addrs[0]
-            slot += 1
-        enqueue_foreach_gather_scalars_f32(out_addr, in_addrs, base, count, ctx)
-
-
 def _amp_update_scale_go(
     scale_ptr_obj: Arg,
     growth_tracker_ptr_obj: Arg,
@@ -512,12 +296,6 @@ def _amp_update_scale_go(
         _raw_int(growth_interval_obj),
         _raw_ctx(device_context_ptr),
     )
-
-
-comptime _FOREACH_EW_DOC = (
-    "(metadata, scalars, aux, dtype, context_ptr); one batched in-place"
-    " launch for one member of the foreach elementwise family"
-)
 
 
 @export
@@ -547,52 +325,8 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["ForeachL2Norm"]():
             _spec_dispatcher4[_foreach_l2_norm_go, "ForeachL2Norm"](argv, argc)
             return 0
-        comptime if _op_on["ForeachGatherScalars"]():
-            _spec_dispatcher3[
-                _foreach_gather_scalars_go, "ForeachGatherScalars"
-            ](argv, argc)
-            return 0
-        comptime if _op_on["ForeachMul"]():
-            _spec_dispatcher5[_foreach_ew_go[FEW_MUL], "ForeachMul"](argv, argc)
-            return 0
-        comptime if _op_on["ForeachAdd"]():
-            _spec_dispatcher5[_foreach_ew_go[FEW_ADD], "ForeachAdd"](argv, argc)
-            return 0
-        comptime if _op_on["ForeachDiv"]():
-            _spec_dispatcher5[_foreach_ew_go[FEW_DIV], "ForeachDiv"](argv, argc)
-            return 0
-        comptime if _op_on["ForeachMulTensor"]():
-            _spec_dispatcher5[
-                _foreach_ew_go[FEW_MUL_TENSOR], "ForeachMulTensor"
-            ](argv, argc)
-            return 0
-        comptime if _op_on["ForeachLerp"]():
-            _spec_dispatcher5[_foreach_ew_go[FEW_LERP], "ForeachLerp"](
-                argv, argc
-            )
-            return 0
-        comptime if _op_on["ForeachAddcmul"]():
-            _spec_dispatcher5[_foreach_ew_go[FEW_ADDCMUL], "ForeachAddcmul"](
-                argv, argc
-            )
-            return 0
-        comptime if _op_on["ForeachAddcdiv"]():
-            _spec_dispatcher5[_foreach_ew_go[FEW_ADDCDIV], "ForeachAddcdiv"](
-                argv, argc
-            )
-            return 0
-        comptime if _op_on["ForeachNonFiniteUnscale"]():
-            _spec_dispatcher5[
-                _foreach_ew_go[FEW_NONFINITE_UNSCALE], "ForeachNonFiniteUnscale"
-            ](argv, argc)
-            return 0
         comptime if _op_on["AmpUpdateScale"]():
             _spec_dispatcher6[_amp_update_scale_go, "AmpUpdateScale"](
-                argv, argc
-            )
-            return 0
-        comptime if _op_on["ForeachSqrt"]():
-            _spec_dispatcher5[_foreach_ew_go[FEW_SQRT], "ForeachSqrt"](
                 argv, argc
             )
             return 0

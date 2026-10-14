@@ -23,7 +23,7 @@ corrections) run in float32 there.
 
 Two launch shapes share that body. Everywhere but Apple a descriptor batch is
 passed by value and each block owns one chunk of the concatenated list (the
-chunk size filling the device, `foreach_ew_chunk_elements`), mapped back to
+chunk size filling the device, `foreach.apply.foreach_chunk_elements`), mapped back to
 its tensor through the descriptors' `chunk_end` prefix sums. Metal only
 translates pointer-typed kernel *arguments* into GPU addresses, so on Apple
 each tensor is one launch with real pointer arguments. Tensor sizes and
