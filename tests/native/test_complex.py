@@ -1230,26 +1230,42 @@ def test_fill_a_host_tensor_with_a_device_value(mojo_gpu: str):
 # --- uint64 fill values, masked_fill out dtypes, half masked_fill rounding ------
 
 
-@pytest.mark.parametrize("host_self", [True, False])
-def test_uint64_fill_values_are_read_unsigned(mojo_gpu: str, host_self: bool):
+def test_uint64_fill_values(mojo_gpu: str):
     big = torch.tensor(2**63, dtype=torch.uint64)
-    value = big.to(mojo_gpu) if host_self else big
-
-    def target(dt: torch.dtype) -> torch.Tensor:
-        return (
-            torch.zeros(1, dtype=dt)
-            if host_self
-            else torch.zeros(1, dtype=dt, device=mojo_gpu)
-        )
-
-    assert target(torch.float64).fill_(value).cpu().item() == 2.0**63
-    assert target(torch.uint64).fill_(value).cpu().item() == 2**63
-    assert target(torch.bool).fill_(value).cpu().item() is True
-    for dt in (torch.int64, torch.int32):
-        t = target(dt)
-        with pytest.raises(RuntimeError, match="without overflow"):
-            t.fill_(value)
-        assert t.cpu().item() == 0
+    dev = big.to(mojo_gpu)
+    # the same device: a copy_ (unsigned into a float, wrapping into an int),
+    # empty destinations included
+    assert (
+        torch.zeros(1, dtype=torch.float64, device=mojo_gpu).fill_(dev).cpu().item()
+        == 2.0**63
+    )
+    assert torch.zeros(1, dtype=torch.int64, device=mojo_gpu).fill_(
+        dev
+    ).cpu().item() == -(2**63)
+    assert (
+        torch.zeros(1, dtype=torch.int32, device=mojo_gpu).fill_(dev).cpu().item() == 0
+    )
+    torch.zeros(0, dtype=torch.int64, device=mojo_gpu).fill_(dev)
+    # another device, a uint64 destination: the same 64 bits (strided too)
+    u = torch.zeros(4, dtype=torch.uint64, device=mojo_gpu)
+    u[::2].fill_(big)
+    assert u.cpu().tolist() == [2**63, 0, 2**63, 0]
+    # another device, any other destination: declined before writing
+    for host_self in (True, False):
+        for dt in (torch.float64, torch.int64, torch.complex64, torch.bool):
+            t = (
+                torch.zeros(1, dtype=dt)
+                if host_self
+                else torch.zeros(1, dtype=dt, device=mojo_gpu)
+            )
+            with pytest.raises(NotImplementedError, match="2\\*\\*63"):
+                t.fill_(dev if host_self else big)
+            assert t.cpu().item() == 0
+    # below 2**63: exact, one rounding into float
+    small = torch.tensor(2**62 + 2**39 + 1, dtype=torch.uint64)
+    want = torch.zeros(1).fill_(small).item()
+    assert torch.zeros(1, device=mojo_gpu).fill_(small).cpu().item() == want
+    assert torch.zeros(1).fill_(small.to(mojo_gpu)).item() == want
 
 
 @pytest.mark.parametrize(
@@ -1297,3 +1313,29 @@ def test_real_masked_fill_rounds_half_through_float(
         torch.zeros(3, dtype=dtype, device=mojo_gpu), m, value, out=out
     )
     assert out.cpu().tolist() == [want] * 3
+
+
+def test_masked_fill_out_checks_the_value_first_and_resizes_host_outs(mojo_gpu: str):
+    m = torch.ones(2, dtype=torch.bool, device=mojo_gpu)
+    out = torch.empty(0, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="int8_t without overflow"):
+        torch.ops.aten.masked_fill.Scalar_out(
+            torch.zeros(2, dtype=torch.int8, device=mojo_gpu), m, 1000, out=out
+        )
+    assert out.shape == (0,)
+    out64 = torch.empty(0, dtype=torch.float64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="float without overflow"):
+        torch.ops.aten.masked_fill.Scalar_out(
+            torch.zeros(2, device=mojo_gpu), m, 1e100, out=out64
+        )
+    assert out64.shape == (0,)
+    for self_dt, out_dt in (
+        (torch.float32, torch.int32),
+        (torch.complex64, torch.float32),
+    ):
+        host = torch.empty(0, dtype=out_dt)
+        with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
+            torch.ops.aten.masked_fill.Scalar_out(
+                torch.zeros(2, dtype=self_dt, device=mojo_gpu), m, 5.0, out=host
+            )
+        assert host.shape == (2,)

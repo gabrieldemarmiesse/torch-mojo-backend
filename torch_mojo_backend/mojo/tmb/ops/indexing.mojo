@@ -40,9 +40,6 @@ from tmb.backend.abi import (
     Owned,
     ST_BOOL,
     ST_UINT64,
-    is_complex_stype,
-    TAG_SCALAR_DOUBLE,
-    f64_bits,
     ST_INT64,
     T,
     TAG_MEMORY_FORMAT,
@@ -92,8 +89,7 @@ from tmb.ops.complex import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
-    is_float_stype,
-    scalar_type_token,
+    uint64_cross_item,
     check_real_scalar_fits,
     check_uint64_fill,
     assert_no_internal_overlap,
@@ -2149,24 +2145,38 @@ def op_fill__tensor(
     # The value is read once, on the host (a device value costs one sync,
     # where CUDA copies on the stream), then filled with fill_.Scalar's
     # conversion rules. Reading it first also covers a value aliasing self.
+    var same = t.on_mojo() and value.on_mojo() and value.device == t.device
+    if same and value.stype == ST_UINT64:
+        # a same-device value is a copy_: the uint64 converts as copy_ does
+        # (unsigned into a float, wrapping into a signed integer)
+        assert_no_internal_overlap(t)
+        var expanded = own(
+            view_strided(
+                value, t.shape, IndexList[MAX_RANK](0), t.rank, value.offset
+            )
+        )
+        _ = call_op(
+            "aten::copy_",
+            "",
+            [tensor_arg(t), tensor_arg(expanded.t), bool_arg(False)],
+            1,
+        )
+        _ = expanded^
+        ret_ref(rets, 0, t)
+        return
     var item: Value
-    if value.on_cpu() and value.stype == ST_UINT64:
-        # (a host uint64 item() is a UInt Scalar the call boundary does not
-        # carry: read the 64 bits directly)
-        var bits = Pointer[Int64, MutUntrackedOrigin](
-            unsafe_from_address=value.ptr
-        )[]
-        item = _unsigned_item(value, Value(TAG_SCALAR_INT, 0, bits, 0), t.stype)
+    if value.stype == ST_UINT64 and not same:
+        item = uint64_cross_item(value, t.stype)
     else:
         var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
-        item = _unsigned_item(value, r[0], t.stype)
+        item = r[0].copy()
     if not t.on_mojo():
         # a host self with a device 0-d value: its item() fills it (fill_'s
         # own route for a 0-d value on another device)
         _ = call_op("aten::fill_", "Scalar", [tensor_arg(t), item.copy()], 1)
         ret_ref(rets, 0, t)
         return
-    if value.on_mojo() and value.device == t.device:
+    if same:
         # A same-device value is a `copy_`: it converts without a range
         # check, but keeps copy_'s overlap check on self.
         assert_no_internal_overlap(t)
@@ -2178,29 +2188,6 @@ def op_fill__tensor(
         check_uint64_fill(t.stype, item, t.numel)
     fill_value(t, item)
     ret_ref(rets, 0, t)
-
-
-def _unsigned_item(value: T, item: Value, dst: Int32) raises -> Value:
-    """A uint64 value's item() arrives as int64 bits: read it unsigned. Past
-    int64's range it fits no signed or narrower integer dtype (CUDA's
-    checked conversion raises) and becomes a double for a float one."""
-    if value.stype != ST_UINT64 or item.a >= 0:
-        return item.copy()
-    var u = UInt64(item.a)
-    if (
-        dst != ST_UINT64
-        and dst != ST_BOOL
-        and not is_float_stype(dst)
-        and not is_complex_stype(dst)
-    ):
-        raise Error(
-            "value cannot be converted to type ",
-            scalar_type_token(dst),
-            " without overflow",
-        )
-    if dst == ST_UINT64:
-        return item.copy()  # the same 64 bits
-    return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(Float64(u)), 0)
 
 
 def register_indexing(site: Site) raises:

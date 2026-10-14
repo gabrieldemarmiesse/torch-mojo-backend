@@ -519,7 +519,15 @@ def _fill(t: T, s_in: FillScalar) raises:
     if t.numel == 0:
         return
     var s = s_in.copy()
-    if t.dtype == DType.float16 or t.dtype == DType.bfloat16:
+    if s.integral and (
+        t.dtype == DType.float32
+        or t.dtype == DType.float16
+        or t.dtype == DType.bfloat16
+    ):
+        # an integer converts to float in one rounding (int64 -> float), not
+        # through a double
+        s.f = Float64(Int64(s.i).cast[DType.float32]())
+    elif t.dtype == DType.float16 or t.dtype == DType.bfloat16:
         s.f = Float64(Float32(s.f))
     if t.contig:
         _fill_contiguous(t, s)
@@ -528,7 +536,8 @@ def _fill(t: T, s_in: FillScalar) raises:
         # The StridedFill kernel narrows a Float64 into the destination
         # dtype, which cannot carry a 64-bit integer past 2**53. Fill a dense
         # buffer exactly (memset) and lay that out instead.
-        if abs(s.i) > _MAX_EXACT_INT:
+        # (not abs(): it overflows for INT64_MIN, a uint64 2**63's bits)
+        if s.i > _MAX_EXACT_INT or s.i < -_MAX_EXACT_INT:
             var dense = own(new_like(t))
             _fill_contiguous(dense.t, s)
             copy_strided_into(t, dense.t)
@@ -1440,6 +1449,26 @@ def check_real_scalar_fits(st: Int32, v: Value) raises:
             scalar_type_token(st),
             " without overflow",
         )
+
+
+def uint64_cross_item(value: T, dst: Int32 = -1) raises -> Value:
+    """A uint64 0-d fill value read on the host for a fill on ANOTHER
+    device (fill_'s Scalar route): below 2**63 an int Scalar; from 2**63 on,
+    declined -- the call boundary carries no unsigned Scalar, and an int64
+    one would be a different number (a same-device value is a copy_ and
+    never comes here)."""
+    var bits: Int64
+    if value.on_cpu():
+        bits = Pointer[Int64, MutUntrackedOrigin](
+            unsafe_from_address=value.ptr
+        )[]
+    else:
+        var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+        bits = r[0].a
+    if bits < 0 and dst != ST_UINT64:
+        # (a uint64 destination takes the same 64 bits: exact)
+        unsupported("a uint64 fill_ value of 2**63 or more from another device")
+    return Value(TAG_SCALAR_INT, 0, bits, 0)
 
 
 def check_uint64_fill(st: Int32, v: Value, numel: Int) raises:
