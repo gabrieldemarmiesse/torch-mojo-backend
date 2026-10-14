@@ -915,6 +915,11 @@ def test_abs_angle_of_a_host_tensor_into_a_device_out(mojo_gpu: str):
             assert out.device.type == "mojo" and torch.equal(out.cpu(), ref)
         with pytest.raises(RuntimeError, match="same device"):
             fn(x, out=torch.empty(0, dtype=torch.complex64, device=mojo_gpu))
+    # abs: the out's dtype is checked before the devices
+    with pytest.raises(
+        RuntimeError, match="Found dtype ComplexDouble but expected ComplexFloat"
+    ):
+        torch.abs(x, out=torch.empty(0, dtype=torch.complex128, device=mojo_gpu))
 
 
 def test_binary_outs_with_only_host_operands(mojo_gpu: str):

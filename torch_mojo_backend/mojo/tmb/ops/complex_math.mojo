@@ -677,6 +677,14 @@ def cx_to_real_out[
             _st_name(x.stype),
         )
     if is_complex_stype(dest.stype):
+        # (the dtype check first, then the device check, as CUDA orders them)
+        if kind == "abs" and dest.stype != x.stype:
+            raise Error(
+                "Found dtype ",
+                _st_name(dest.stype),
+                " but expected ",
+                _st_name(x.stype),
+            )
         if not x.on_mojo():
             raise Error(
                 (
@@ -685,13 +693,6 @@ def cx_to_real_out[
                 ),
                 device_str(dest),
                 " and cpu!",
-            )
-        if kind == "abs" and dest.stype != x.stype:
-            raise Error(
-                "Found dtype ",
-                _st_name(dest.stype),
-                " but expected ",
-                _st_name(x.stype),
             )
         _store_ew[1](args, dest, _unary(kind, _TO_RE, x), rets)
         return
