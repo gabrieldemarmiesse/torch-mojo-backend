@@ -77,11 +77,15 @@ from tmb.ops.f8_iter import (
     MODE_OUTDT,
     MODE_SAME,
     PRE_BOOL_OUT,
+    PRE_ALL_SAME,
+    PRE_DISPATCH_SELF,
     PRE_DIV_MODE,
+    PRE_LERP,
     PRE_HEAVISIDE,
     PRE_LDEXP,
     PRE_NAN_TO_NUM,
     PRE_NONE,
+    PRE_SELF_FIRST,
     PRE_SUB,
 )
 from tmb.backend.registry import Site, impl
@@ -4230,14 +4234,14 @@ def op_sample_dirichlet(
 def register_pointwise(site: Site) raises:
     impl[op_sample_dirichlet, "_sample_dirichlet"](site)
     impl[
-        f8_iter[op_prelu_kernel, "prelu_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_prelu_kernel, "prelu_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "_prelu_kernel",
     ](site)
     impl[
         f8_iter[
             op_prelu_kernel_backward,
             "prelu_backward_cuda",
-            3,
+            7,
             -1,
             MODE_FN,
             False,
@@ -4256,7 +4260,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_standard_gamma_grad,
             "_standard_gamma_grad_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -4267,59 +4271,59 @@ def register_pointwise(site: Site) raises:
     impl[op_dirichlet_grad, "_dirichlet_grad"](site)
     impl[op_ilshift, "__ilshift__.Scalar"](site)
     impl[
-        f8_iter[op_ilshift, "lshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        f8_iter[op_ilshift, "lshift_cuda", 3, 0, MODE_INPLACE, True, PRE_NONE],
         "__ilshift__.Tensor",
     ](site)
     impl[op_irshift, "__irshift__.Scalar"](site)
     impl[
-        f8_iter[op_irshift, "rshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        f8_iter[op_irshift, "rshift_cuda", 3, 0, MODE_INPLACE, True, PRE_NONE],
         "__irshift__.Tensor",
     ](site)
     impl[op_lshift, "__lshift__.Scalar"](site)
     impl[
-        f8_iter[op_lshift, "lshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        f8_iter[op_lshift, "lshift_cuda", 3, -1, MODE_FN, True, PRE_NONE],
         "__lshift__.Tensor",
     ](site)
     impl[op_rshift, "__rshift__.Scalar"](site)
     impl[
-        f8_iter[op_rshift, "rshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        f8_iter[op_rshift, "rshift_cuda", 3, -1, MODE_FN, True, PRE_NONE],
         "__rshift__.Tensor",
     ](site)
     impl[
-        f8_iter[op_atan2, "atan2_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_atan2, "atan2_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "atan2",
     ](site)
     impl[
-        f8_iter[op_atan2_out, "atan2_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_atan2_out, "atan2_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "atan2.out",
     ](site)
     impl[
-        f8_iter[op_lshift, "lshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        f8_iter[op_lshift, "lshift_cuda", 3, -1, MODE_FN, True, PRE_NONE],
         "bitwise_left_shift.Tensor",
     ](site)
     impl[
-        f8_iter[op_lshift_out, "lshift_cuda", 2, 2, MODE_OUTDT, True, PRE_NONE],
+        f8_iter[op_lshift_out, "lshift_cuda", 3, 2, MODE_OUTDT, True, PRE_NONE],
         "bitwise_left_shift.Tensor_out",
     ](site)
     impl[
-        f8_iter[op_rshift, "rshift_cuda", 2, -1, MODE_FN, True, PRE_NONE],
+        f8_iter[op_rshift, "rshift_cuda", 3, -1, MODE_FN, True, PRE_NONE],
         "bitwise_right_shift.Tensor",
     ](site)
     impl[
-        f8_iter[op_rshift_out, "rshift_cuda", 2, 2, MODE_OUTDT, True, PRE_NONE],
+        f8_iter[op_rshift_out, "rshift_cuda", 3, 2, MODE_OUTDT, True, PRE_NONE],
         "bitwise_right_shift.Tensor_out",
     ](site)
     impl[op_clamp_tensor, "clamp.Tensor"](site)
     impl[op_clamp_tensor_out, "clamp.Tensor_out"](site)
     impl[op_copysign, "copysign.Scalar"](site)
     impl[
-        f8_iter[op_copysign, "copysign_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_copysign, "copysign_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "copysign.Tensor",
     ](site)
     impl[op_copysign_out, "copysign.Scalar_out"](site)
     impl[
         f8_iter[
-            op_copysign_out, "copysign_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+            op_copysign_out, "copysign_cuda", 3, 2, MODE_CAST, False, PRE_NONE
         ],
         "copysign.out",
     ](site)
@@ -4331,42 +4335,64 @@ def register_pointwise(site: Site) raises:
         f8_iter[op_elu_out, "elu_cuda", 1, 4, MODE_SAME, False, PRE_NONE],
         "elu.out",
     ](site)
-    impl[op_elu_backward, "elu_backward"](site)
-    impl[op_elu_backward_grad_input, "elu_backward.grad_input"](site)
     impl[
-        f8_iter[op_fmax, "fmax_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_elu_backward,
+            "elu_backward_cuda",
+            33,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "elu_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_elu_backward_grad_input,
+            "elu_backward_cuda",
+            33,
+            6,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "elu_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[op_fmax, "fmax_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "fmax",
     ](site)
     impl[
-        f8_iter[op_fmax_out, "fmax_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_fmax_out, "fmax_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "fmax.out",
     ](site)
     impl[
-        f8_iter[op_fmin, "fmin_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_fmin, "fmin_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "fmin",
     ](site)
     impl[
-        f8_iter[op_fmin_out, "fmin_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_fmin_out, "fmin_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "fmin.out",
     ](site)
     impl[op_fmod, "fmod.Scalar"](site)
     impl[
-        f8_iter[op_fmod, "fmod_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_fmod, "fmod_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "fmod.Tensor",
     ](site)
     impl[op_fmod_out, "fmod.Scalar_out"](site)
     impl[
-        f8_iter[op_fmod_out, "fmod_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_fmod_out, "fmod_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "fmod.Tensor_out",
     ](site)
     impl[op_frexp, "frexp.Tensor"](site)
     impl[op_frexp_out, "frexp.Tensor_out"](site)
     impl[
-        f8_iter[op_gcd, "gcd_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_gcd, "gcd_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "gcd",
     ](site)
     impl[
-        f8_iter[op_gcd_out, "gcd_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_gcd_out, "gcd_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "gcd.out",
     ](site)
     impl[op_binary_cross_entropy, "binary_cross_entropy"](site)
@@ -4402,7 +4428,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_gelu_backward_any,
             "GeluBackwardCUDAKernelImpl",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -4415,15 +4441,15 @@ def register_pointwise(site: Site) raises:
     impl[op_huber_loss_backward, "huber_loss_backward"](site)
     impl[op_huber_loss_backward_out, "huber_loss_backward.out"](site)
     impl[
-        f8_iter[op_ldexp, "pow_cuda", 2, -1, MODE_FN, False, PRE_LDEXP],
+        f8_iter[op_ldexp, "pow_cuda", 3, -1, MODE_FN, False, PRE_LDEXP],
         "ldexp.Tensor",
     ](site)
     impl[
-        f8_iter[op_ldexp_out, "pow_cuda", 2, 2, MODE_CAST, False, PRE_LDEXP],
+        f8_iter[op_ldexp_out, "pow_cuda", 3, 2, MODE_CAST, False, PRE_LDEXP],
         "ldexp.out",
     ](site)
     impl[
-        f8_iter[op_ldexp_, "pow_cuda", 2, 0, MODE_INPLACE, False, PRE_LDEXP],
+        f8_iter[op_ldexp_, "pow_cuda", 3, 0, MODE_INPLACE, False, PRE_LDEXP],
         "ldexp_",
     ](site)
     impl[op_mse_loss, "mse_loss"](site)
@@ -4453,7 +4479,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_gelu_backward_grad_input,
             "GeluBackwardCUDAKernelImpl",
-            2,
+            3,
             3,
             MODE_OUTDT,
             False,
@@ -4515,7 +4541,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_hardsigmoid_backward,
             "hardsigmoid_backward_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -4527,7 +4553,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_hardsigmoid_backward_grad_input,
             "hardsigmoid_backward_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             False,
@@ -4557,7 +4583,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_hardswish_backward,
             "hardswish_backward_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -4595,11 +4621,33 @@ def register_pointwise(site: Site) raises:
         ],
         "hardtanh_",
     ](site)
-    impl[op_hardtanh_backward, "hardtanh_backward"](site)
-    impl[op_hardtanh_backward_grad_input, "hardtanh_backward.grad_input"](site)
     impl[
         f8_iter[
-            op_heaviside, "heaviside_cuda", 2, -1, MODE_FN, False, PRE_HEAVISIDE
+            op_hardtanh_backward,
+            "hardtanh_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "hardtanh_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardtanh_backward_grad_input,
+            "hardtanh_backward_cuda",
+            3,
+            4,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "hardtanh_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_heaviside, "heaviside_cuda", 3, -1, MODE_FN, False, PRE_HEAVISIDE
         ],
         "heaviside",
     ](site)
@@ -4607,7 +4655,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_heaviside_out,
             "heaviside_cuda",
-            2,
+            3,
             2,
             MODE_CAST,
             False,
@@ -4616,37 +4664,37 @@ def register_pointwise(site: Site) raises:
         "heaviside.out",
     ](site)
     impl[
-        f8_iter[op_hypot, "hypot_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_hypot, "hypot_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "hypot",
     ](site)
     impl[
-        f8_iter[op_hypot_out, "hypot_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_hypot_out, "hypot_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "hypot.out",
     ](site)
     impl[
-        f8_iter[op_igamma, "igamma_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_igamma, "igamma_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "igamma",
     ](site)
     impl[
-        f8_iter[op_igamma_out, "igamma_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_igamma_out, "igamma_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "igamma.out",
     ](site)
     impl[
-        f8_iter[op_igammac, "igammac_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_igammac, "igammac_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "igammac",
     ](site)
     impl[
         f8_iter[
-            op_igammac_out, "igammac_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+            op_igammac_out, "igammac_cuda", 3, 2, MODE_CAST, False, PRE_NONE
         ],
         "igammac.out",
     ](site)
     impl[
-        f8_iter[op_lcm, "lcm_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_lcm, "lcm_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "lcm",
     ](site)
     impl[
-        f8_iter[op_lcm_out, "lcm_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_lcm_out, "lcm_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "lcm.out",
     ](site)
     impl[
@@ -4679,20 +4727,67 @@ def register_pointwise(site: Site) raises:
         ],
         "leaky_relu_",
     ](site)
-    impl[op_leaky_relu_backward, "leaky_relu_backward"](site)
-    impl[op_leaky_relu_backward_grad_input, "leaky_relu_backward.grad_input"](
-        site
-    )
-    impl[op_lerp_scalar_any, "lerp.Scalar"](site)
-    impl[op_lerp_scalar_out_any, "lerp.Scalar_out"](site)
-    impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
     impl[
-        f8_iter[op_lerp_tensor, "lerp_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_leaky_relu_backward,
+            "leaky_relu_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_SELF_FIRST,
+        ],
+        "leaky_relu_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_leaky_relu_backward_grad_input,
+            "leaky_relu_backward_cuda",
+            3,
+            4,
+            MODE_OUTDT,
+            False,
+            PRE_SELF_FIRST,
+        ],
+        "leaky_relu_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_lerp_scalar_any, "lerp_cuda", 3, -1, MODE_FN, False, PRE_LERP
+        ],
+        "lerp.Scalar",
+    ](site)
+    impl[
+        f8_iter[
+            op_lerp_scalar_out_any,
+            "lerp_cuda",
+            3,
+            3,
+            MODE_CAST,
+            False,
+            PRE_LERP,
+        ],
+        "lerp.Scalar_out",
+    ](site)
+    impl[
+        f8_iter[
+            op_lerp_scalar__any,
+            "lerp_cuda",
+            3,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_LERP,
+        ],
+        "lerp_.Scalar",
+    ](site)
+    impl[
+        f8_iter[op_lerp_tensor, "lerp_cuda", 7, -1, MODE_FN, False, PRE_LERP],
         "lerp.Tensor",
     ](site)
     impl[
         f8_iter[
-            op_lerp_tensor_out, "lerp_cuda", 3, 3, MODE_SAME, False, PRE_NONE
+            op_lerp_tensor_out, "lerp_cuda", 7, 3, MODE_SAME, False, PRE_LERP
         ],
         "lerp.Tensor_out",
     ](site)
@@ -4704,7 +4799,7 @@ def register_pointwise(site: Site) raises:
             -1,
             MODE_FN,
             False,
-            PRE_NONE,
+            PRE_ALL_SAME,
         ],
         "log_sigmoid_backward",
     ](site)
@@ -4716,7 +4811,7 @@ def register_pointwise(site: Site) raises:
             3,
             MODE_SAME,
             False,
-            PRE_NONE,
+            PRE_ALL_SAME,
         ],
         "log_sigmoid_backward.grad_input",
     ](site)
@@ -4724,7 +4819,7 @@ def register_pointwise(site: Site) raises:
     impl[op_log_sigmoid_forward_output, "log_sigmoid_forward.output"](site)
     impl[
         f8_iter[
-            op_logaddexp, "logaddexp_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_logaddexp, "logaddexp_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "logaddexp",
     ](site)
@@ -4732,7 +4827,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_logaddexp_out,
             "logaddexp_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             False,
@@ -4742,7 +4837,7 @@ def register_pointwise(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_logaddexp2, "logaddexp2_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_logaddexp2, "logaddexp2_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "logaddexp2",
     ](site)
@@ -4750,7 +4845,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_logaddexp2_out,
             "logaddexp2_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             False,
@@ -4760,7 +4855,7 @@ def register_pointwise(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_logit_backward, "logit_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_logit_backward, "logit_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "logit_backward",
     ](site)
@@ -4768,7 +4863,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_logit_backward_grad_input,
             "logit_cuda",
-            2,
+            3,
             3,
             MODE_OUTDT,
             False,
@@ -4788,28 +4883,28 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_mish_backward,
             "mish_backward_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
-            PRE_NONE,
+            PRE_DISPATCH_SELF,
         ],
         "mish_backward",
     ](site)
     impl[
         f8_iter[
-            op_nextafter, "nextafter_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_nextafter, "nextafter_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "nextafter",
     ](site)
     impl[
         f8_iter[
-            op_nextafter_out, "nextafter_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+            op_nextafter_out, "nextafter_cuda", 3, 2, MODE_CAST, False, PRE_NONE
         ],
         "nextafter.out",
     ](site)
     impl[
-        f8_iter[op_rsub_any, "ufunc_add_CUDA", 2, -1, MODE_FN, False, PRE_SUB],
+        f8_iter[op_rsub_any, "ufunc_add_CUDA", 3, -1, MODE_FN, False, PRE_SUB],
         "rsub.Tensor",
     ](site)
     impl[op_rsub_any, "rsub.Scalar"](site)
@@ -4817,7 +4912,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_rsub_out_any,
             "ufunc_add_CUDA",
-            2,
+            3,
             3,
             MODE_NOCHECK,
             False,
@@ -4831,12 +4926,12 @@ def register_pointwise(site: Site) raises:
     impl[op_pow_scalar_any, "pow.Tensor_Scalar"](site)
     impl[op_pow_scalar_out_any, "pow.Tensor_Scalar_out"](site)
     impl[
-        f8_iter[op_pow_tensor_any, "pow_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_pow_tensor_any, "pow_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "pow.Tensor_Tensor",
     ](site)
     impl[
         f8_iter[
-            op_pow_tensor_out_any, "pow_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+            op_pow_tensor_out_any, "pow_cuda", 3, 2, MODE_CAST, False, PRE_NONE
         ],
         "pow.Tensor_Tensor_out",
     ](site)
@@ -4855,7 +4950,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_silu_backward,
             "silu_backward_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -4867,7 +4962,7 @@ def register_pointwise(site: Site) raises:
         f8_iter[
             op_silu_backward_grad_input,
             "silu_backward_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             False,
@@ -4885,8 +4980,30 @@ def register_pointwise(site: Site) raises:
         ],
         "softplus.out",
     ](site)
-    impl[op_softplus_backward, "softplus_backward"](site)
-    impl[op_softplus_backward_grad_input, "softplus_backward.grad_input"](site)
+    impl[
+        f8_iter[
+            op_softplus_backward,
+            "softplus_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "softplus_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_softplus_backward_grad_input,
+            "softplus_backward_cuda",
+            3,
+            4,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "softplus_backward.grad_input",
+    ](site)
     impl[
         f8_iter[
             op_softshrink, "softshrink_check", 1, -1, MODE_FN, False, PRE_NONE
@@ -4912,11 +5029,11 @@ def register_pointwise(site: Site) raises:
     impl[op_threshold_out, "threshold.out"](site)
     impl[op_threshold_, "threshold_"](site)
     impl[
-        f8_iter[op_xlogy, "xlogy_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_xlogy, "xlogy_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "xlogy.Tensor",
     ](site)
     impl[
-        f8_iter[op_xlogy_out, "xlogy_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_xlogy_out, "xlogy_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "xlogy.OutTensor",
     ](site)
 
@@ -4992,7 +5109,7 @@ def _register_special(site: Site) raises:
         f8_iter[
             op_special_chebyshev_polynomial_t,
             "chebyshev_polynomial_t_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -5008,7 +5125,7 @@ def _register_special(site: Site) raises:
         f8_iter[
             op_special_chebyshev_polynomial_u,
             "chebyshev_polynomial_u_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -5024,7 +5141,7 @@ def _register_special(site: Site) raises:
         f8_iter[
             op_special_chebyshev_polynomial_v,
             "chebyshev_polynomial_v_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -5040,7 +5157,7 @@ def _register_special(site: Site) raises:
         f8_iter[
             op_special_chebyshev_polynomial_w,
             "chebyshev_polynomial_w_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -5056,7 +5173,7 @@ def _register_special(site: Site) raises:
         f8_iter[
             op_special_hermite_polynomial_h,
             "hermite_polynomial_h_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -5071,7 +5188,7 @@ def _register_special(site: Site) raises:
         f8_iter[
             op_special_hermite_polynomial_he,
             "hermite_polynomial_he_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -5087,7 +5204,7 @@ def _register_special(site: Site) raises:
         f8_iter[
             op_special_laguerre_polynomial_l,
             "laguerre_polynomial_l_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -5103,7 +5220,7 @@ def _register_special(site: Site) raises:
         f8_iter[
             op_special_legendre_polynomial_p,
             "legendre_polynomial_p_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -5149,7 +5266,7 @@ def _register_special(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_special_xlog1py, "xlog1py_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_special_xlog1py, "xlog1py_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "special_xlog1py",
     ](site)
@@ -5157,7 +5274,7 @@ def _register_special(site: Site) raises:
         f8_iter[
             op_special_xlog1py_out,
             "xlog1py_cuda",
-            2,
+            3,
             2,
             MODE_CAST,
             False,
@@ -5166,12 +5283,12 @@ def _register_special(site: Site) raises:
         "special_xlog1py.out",
     ](site)
     impl[
-        f8_iter[op_special_zeta, "zeta_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_special_zeta, "zeta_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "special_zeta",
     ](site)
     impl[
         f8_iter[
-            op_special_zeta_out, "zeta_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+            op_special_zeta_out, "zeta_cuda", 3, 2, MODE_CAST, False, PRE_NONE
         ],
         "special_zeta.out",
     ](site)

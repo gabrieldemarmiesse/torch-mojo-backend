@@ -3265,54 +3265,54 @@ def op_lerp_scalar_(
 def register_binary(site: Site) raises:
     impl[
         f8_iter[
-            op_add_tensor, "ufunc_add_CUDA", 2, -1, MODE_FN, False, PRE_NONE
+            op_add_tensor, "ufunc_add_CUDA", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "add.Tensor",
     ](site)
     impl[
-        f8_iter[op_add_, "ufunc_add_CUDA", 2, 0, MODE_INPLACE, False, PRE_NONE],
+        f8_iter[op_add_, "ufunc_add_CUDA", 3, 0, MODE_INPLACE, False, PRE_NONE],
         "add_.Tensor",
     ](site)
     impl[
-        f8_iter[op_add_out, "ufunc_add_CUDA", 2, 3, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_add_out, "ufunc_add_CUDA", 3, 3, MODE_CAST, False, PRE_NONE],
         "add.out",
     ](site)
     impl[
-        f8_iter[op_addcdiv, "addcdiv_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_addcdiv, "addcdiv_cuda", 7, -1, MODE_FN, False, PRE_NONE],
         "addcdiv",
     ](site)
     impl[
         f8_iter[
-            op_addcdiv_, "addcdiv_cuda", 3, 0, MODE_INPLACE, False, PRE_NONE
+            op_addcdiv_, "addcdiv_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
         ],
         "addcdiv_",
     ](site)
     impl[
         f8_iter[
-            op_addcdiv_out, "addcdiv_cuda", 3, 4, MODE_CAST, False, PRE_NONE
+            op_addcdiv_out, "addcdiv_cuda", 7, 4, MODE_CAST, False, PRE_NONE
         ],
         "addcdiv.out",
     ](site)
     impl[
-        f8_iter[op_addcmul, "addcmul_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_addcmul, "addcmul_cuda", 7, -1, MODE_FN, False, PRE_NONE],
         "addcmul",
     ](site)
     impl[
         f8_iter[
-            op_addcmul_, "addcmul_cuda", 3, 0, MODE_INPLACE, False, PRE_NONE
+            op_addcmul_, "addcmul_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
         ],
         "addcmul_",
     ](site)
     impl[
         f8_iter[
-            op_addcmul_out, "addcmul_cuda", 3, 4, MODE_CAST, False, PRE_NONE
+            op_addcmul_out, "addcmul_cuda", 7, 4, MODE_CAST, False, PRE_NONE
         ],
         "addcmul.out",
     ](site)
     impl[op_bitwise_and, "bitwise_and.Scalar"](site)
     impl[
         f8_iter[
-            op_bitwise_and, "bitwise_and_cuda", 2, -1, MODE_FN, True, PRE_NONE
+            op_bitwise_and, "bitwise_and_cuda", 3, -1, MODE_FN, True, PRE_NONE
         ],
         "bitwise_and.Tensor",
     ](site)
@@ -3320,7 +3320,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_bitwise_and_out,
             "bitwise_and_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             True,
@@ -3332,7 +3332,7 @@ def register_binary(site: Site) raises:
     impl[op_bitwise_or, "bitwise_or.Scalar"](site)
     impl[
         f8_iter[
-            op_bitwise_or, "bitwise_or_cuda", 2, -1, MODE_FN, True, PRE_NONE
+            op_bitwise_or, "bitwise_or_cuda", 3, -1, MODE_FN, True, PRE_NONE
         ],
         "bitwise_or.Tensor",
     ](site)
@@ -3340,7 +3340,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_bitwise_or_out,
             "bitwise_or_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             True,
@@ -3352,7 +3352,7 @@ def register_binary(site: Site) raises:
     impl[op_bitwise_xor, "bitwise_xor.Scalar"](site)
     impl[
         f8_iter[
-            op_bitwise_xor, "bitwise_xor_cuda", 2, -1, MODE_FN, True, PRE_NONE
+            op_bitwise_xor, "bitwise_xor_cuda", 3, -1, MODE_FN, True, PRE_NONE
         ],
         "bitwise_xor.Tensor",
     ](site)
@@ -3360,7 +3360,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_bitwise_xor_out,
             "bitwise_xor_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             True,
@@ -3377,7 +3377,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_clamp_max_tensor,
             "min_elementwise_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -3389,7 +3389,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_clamp_max_tensor_out,
             "min_elementwise_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             False,
@@ -3403,7 +3403,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_clamp_min_tensor,
             "max_elementwise_cuda",
-            2,
+            3,
             -1,
             MODE_FN,
             False,
@@ -3415,7 +3415,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_clamp_min_tensor_out,
             "max_elementwise_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             False,
@@ -3425,25 +3425,25 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_div_tensor, "div_true_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_div_tensor, "div_true_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "div.Tensor",
     ](site)
     impl[
         f8_iter[
-            op_div_mode, "div_true_cuda", 2, -1, MODE_FN, False, PRE_DIV_MODE
+            op_div_mode, "div_true_cuda", 3, -1, MODE_FN, False, PRE_DIV_MODE
         ],
         "div.Tensor_mode",
     ](site)
     impl[
-        f8_iter[op_div_out, "div_true_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_div_out, "div_true_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "div.out",
     ](site)
     impl[
         f8_iter[
             op_div_out_mode,
             "div_true_cuda",
-            2,
+            3,
             3,
             MODE_CAST,
             False,
@@ -3453,7 +3453,7 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_floor_divide, "div_floor_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_floor_divide, "div_floor_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "floor_divide",
     ](site)
@@ -3462,7 +3462,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_floor_divide_out,
             "div_floor_cuda",
-            2,
+            3,
             2,
             MODE_CAST,
             False,
@@ -3474,7 +3474,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_floor_divide_,
             "div_floor_cuda",
-            2,
+            3,
             0,
             MODE_INPLACE,
             False,
@@ -3484,7 +3484,7 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_logical_and, "logical_and_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_logical_and, "logical_and_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "logical_and",
     ](site)
@@ -3492,7 +3492,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_logical_and_out,
             "logical_and_cuda",
-            2,
+            3,
             2,
             MODE_NOCHECK,
             False,
@@ -3502,7 +3502,7 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_logical_or, "logical_or_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_logical_or, "logical_or_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "logical_or",
     ](site)
@@ -3510,7 +3510,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_logical_or_out,
             "logical_or_cuda",
-            2,
+            3,
             2,
             MODE_NOCHECK,
             False,
@@ -3520,7 +3520,7 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_logical_xor, "logical_xor_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_logical_xor, "logical_xor_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "logical_xor",
     ](site)
@@ -3528,7 +3528,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_logical_xor_out,
             "logical_xor_cuda",
-            2,
+            3,
             2,
             MODE_NOCHECK,
             False,
@@ -3538,7 +3538,7 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_maximum, "max_elementwise_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_maximum, "max_elementwise_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "maximum",
     ](site)
@@ -3546,7 +3546,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_maximum_out,
             "max_elementwise_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             False,
@@ -3556,7 +3556,7 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_minimum, "min_elementwise_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_minimum, "min_elementwise_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "minimum",
     ](site)
@@ -3564,7 +3564,7 @@ def register_binary(site: Site) raises:
         f8_iter[
             op_minimum_out,
             "min_elementwise_cuda",
-            2,
+            3,
             2,
             MODE_OUTDT,
             False,
@@ -3573,44 +3573,44 @@ def register_binary(site: Site) raises:
         "minimum.out",
     ](site)
     impl[
-        f8_iter[op_mul_tensor, "mul_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_mul_tensor, "mul_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "mul.Tensor",
     ](site)
     impl[
-        f8_iter[op_mul_, "mul_cuda", 2, 0, MODE_INPLACE, False, PRE_NONE],
+        f8_iter[op_mul_, "mul_cuda", 3, 0, MODE_INPLACE, False, PRE_NONE],
         "mul_.Tensor",
     ](site)
     impl[op_mul_, "mul_.Scalar"](site)
     impl[
-        f8_iter[op_mul_out, "mul_cuda", 2, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[op_mul_out, "mul_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "mul.out",
     ](site)
     impl[op_remainder, "remainder.Scalar"](site)
     impl[op_remainder, "remainder.Scalar_Tensor"](site)
     impl[
         f8_iter[
-            op_remainder, "remainder_cuda", 2, -1, MODE_FN, False, PRE_NONE
+            op_remainder, "remainder_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "remainder.Tensor",
     ](site)
     impl[op_remainder_out, "remainder.Scalar_out"](site)
     impl[
         f8_iter[
-            op_remainder_out, "remainder_cuda", 2, 2, MODE_CAST, False, PRE_NONE
+            op_remainder_out, "remainder_cuda", 3, 2, MODE_CAST, False, PRE_NONE
         ],
         "remainder.Tensor_out",
     ](site)
     impl[
         f8_iter[
-            op_sub_tensor, "ufunc_add_CUDA", 2, -1, MODE_FN, False, PRE_SUB
+            op_sub_tensor, "ufunc_add_CUDA", 3, -1, MODE_FN, False, PRE_SUB
         ],
         "sub.Tensor",
     ](site)
     impl[
-        f8_iter[op_sub_, "ufunc_add_CUDA", 2, 0, MODE_INPLACE, False, PRE_SUB],
+        f8_iter[op_sub_, "ufunc_add_CUDA", 3, 0, MODE_INPLACE, False, PRE_SUB],
         "sub_.Tensor",
     ](site)
     impl[
-        f8_iter[op_sub_out, "ufunc_add_CUDA", 2, 3, MODE_CAST, False, PRE_SUB],
+        f8_iter[op_sub_out, "ufunc_add_CUDA", 3, 3, MODE_CAST, False, PRE_SUB],
         "sub.out",
     ](site)

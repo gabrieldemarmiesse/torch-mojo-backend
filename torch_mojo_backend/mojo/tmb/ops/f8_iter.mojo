@@ -34,6 +34,7 @@ from tmb.backend.abi import (
     TAG_TENSOR_REF,
     Value,
     Values,
+    dtype_name,
     is_float8_stype,
     max_dtype,
     own,
@@ -73,6 +74,12 @@ comptime PRE_BOOL_OUT = 3  # signbit / isposinf / isneginf: bool out only
 comptime PRE_NAN_TO_NUM = 4  # out dtype == input dtype
 comptime PRE_LDEXP = 5  # ldexp = self * pow(2, other), composite
 comptime PRE_DIV_MODE = 6  # div's rounding_mode picks the kernel
+comptime PRE_LERP = 7  # end / weight dtypes, the weight's rank picks the mode
+comptime PRE_ALL_SAME = 8  # grad_output must have self's dtype
+comptime PRE_DISPATCH_SELF = 9  # the kernel dispatches on self's dtype
+comptime PRE_SELF_FIRST = 10  # the iterator adds self (arg 1) before arg 0
+
+comptime _MAX_ARGS = 16
 
 
 def _rec_tensor(v: Value) -> Bool:
@@ -97,22 +104,42 @@ def _refuse(kernel: String, st: Int32) raises:
 
 @fieldwise_init
 struct _Iter(Movable):
-    var common: Int32
     var shape: IndexList[MAX_RANK]
     var rank: Int
     var shape_ok: Bool
 
 
-def _iter_of(args: Values, n_in: Int) raises -> _Iter:
-    """(a): the common dtype of the tensor operands and their broadcast
-    shape. A wrapped Python number cannot change a float8 result, so only
-    tensors take part."""
-    var dim = ST_UNDEFINED
-    var zero = ST_UNDEFINED
+def _shape_of(args: Values, ins: Int) raises -> _Iter:
+    """The operands' broadcast shape (`ins`: bitmask of operand args)."""
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     var ok = True
-    for i in range(n_in):
+    for i in range(_MAX_ARGS):
+        if (ins >> i) & 1 == 0:
+            continue
+        var v = args[unsafe_offset=i].copy()
+        if not _rec_tensor(v):
+            continue
+        var t = T(Int(v.a))
+        rank = max(rank, t.rank)
+        for k in range(MAX_RANK):
+            if shape[k] == 1:
+                shape[k] = t.shape[k]
+            elif t.shape[k] != 1 and t.shape[k] != shape[k]:
+                ok = False
+    return _Iter(shape, rank, ok)
+
+
+def _common_of(args: Values, ins: Int, rev: Bool = False) raises -> Int32:
+    """(a): c10's ResultTypeState over the tensor operands. A wrapped Python
+    number cannot change a float8 result, so only tensors take part. Raises
+    c10's float8 promotion error."""
+    var dim = ST_UNDEFINED
+    var zero = ST_UNDEFINED
+    for j in range(_MAX_ARGS):
+        var i = _MAX_ARGS - 1 - j if rev else j
+        if (ins >> i) & 1 == 0:
+            continue
         var v = args[unsafe_offset=i].copy()
         if not _rec_tensor(v):
             continue
@@ -122,13 +149,7 @@ def _iter_of(args: Values, n_in: Int) raises -> _Iter:
                 zero = promote_types(zero, t.stype)
         else:
             dim = promote_types(dim, t.stype)
-        rank = max(rank, t.rank)
-        for k in range(MAX_RANK):
-            if shape[k] == 1:
-                shape[k] = t.shape[k]
-            elif t.shape[k] != 1 and t.shape[k] != shape[k]:
-                ok = False
-    return _Iter(combine_categories(dim, zero), shape, rank, ok)
+    return combine_categories(dim, zero)
 
 
 def _shape_is(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
@@ -140,10 +161,27 @@ def _shape_is(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
     return True
 
 
+def _shape_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
+    var s = String("[")
+    for i in range(rank):
+        if i > 0:
+            s += ", "
+        s += String(shape[MAX_RANK - rank + i])
+    return s + "]"
+
+
+@fieldwise_init
+struct _Pre(Movable):
+    var mode: Int  # -1: the op's own
+    var ins: Int  # the operand mask after the op's own rules
+    var rev: Bool  # promote the operands last to first
+
+
 def _pre[
-    pre: Int, n_in: Int, out_idx: Int, label: StaticString
-](args: Values) raises:
-    """The checks an op makes before building its iterator."""
+    pre: Int, ins: Int, out_idx: Int, label: StaticString
+](args: Values) raises -> _Pre:
+    """The checks an op makes before building its iterator, on the
+    operands' ORIGINAL dtypes."""
     comptime if pre == PRE_SUB:
         for i in range(2):
             var v = args[unsafe_offset=i].copy()
@@ -196,8 +234,8 @@ def _pre[
         var b = T(Int(args[unsafe_offset=1].a))
         comptime if out_idx >= 0:
             var o = T(Int(args[unsafe_offset=out_idx].a))
-            var it = _iter_of(args, 2)
-            if not can_cast(it.common, o.stype):
+            var common = _common_of(args, 3)
+            if not can_cast(common, o.stype):
                 raise Error(
                     "ldexp can't be cast to the desired output type ",
                     _tname(o.stype),
@@ -206,21 +244,74 @@ def _pre[
             _refuse("pow_cuda", b.stype)
         if is_float8_stype(a.stype) and a.rank > 0 and b.stype != a.stype:
             _ = promote_types(a.stype, b.stype)
+    elif pre == PRE_LERP:
+        # lerp's meta: `end` (and a dimensioned `weight`) must have self's
+        # dtype; such a weight joins the all-same-dtype iterator (out must
+        # match), a 0-d one promotes like any operand (out casts).
+        var a = T(Int(args[unsafe_offset=0].a))
+        var b = T(Int(args[unsafe_offset=1].a))
+        if b.stype != a.stype:
+            raise Error(
+                "expected dtype ",
+                dtype_name(a.stype),
+                " for `end` but got dtype ",
+                dtype_name(b.stype),
+            )
+        var w = args[unsafe_offset=2].copy()
+        if _rec_tensor(w):
+            var wt = T(Int(w.a))
+            if wt.rank > 0:
+                if wt.stype != a.stype:
+                    raise Error(
+                        "expected dtype ",
+                        dtype_name(a.stype),
+                        " for `weight` but got dtype ",
+                        dtype_name(wt.stype),
+                    )
+                return _Pre(MODE_SAME, ins, False)
+        return _Pre(MODE_CAST, ins, False)
+    elif pre == PRE_ALL_SAME:
+        # log_sigmoid_backward: grad_output must have self's dtype (the
+        # buffer is not an operand on CUDA).
+        var g = T(Int(args[unsafe_offset=0].a))
+        var a = T(Int(args[unsafe_offset=1].a))
+        comptime if out_idx >= 0:
+            # The iterator's operands: out, self, grad_output.
+            var o = T(Int(args[unsafe_offset=out_idx].a))
+            if o.stype != a.stype:
+                raise Error(
+                    "Found dtype ",
+                    _tname(o.stype),
+                    " but expected ",
+                    _tname(a.stype),
+                )
+        if g.stype != a.stype:
+            raise Error(
+                "Found dtype ",
+                _tname(g.stype),
+                " but expected ",
+                _tname(a.stype),
+            )
+    elif pre == PRE_SELF_FIRST:
+        return _Pre(-1, ins, True)
+    return _Pre(-1, ins, False)
 
 
 def f8_iter[
     op: OpFn,
     kernel: StaticString,
-    n_in: Int,
+    ins: Int,
     out_idx: Int,
     mode: Int,
     int_only: Bool = False,
     pre: Int = PRE_NONE,
     label: StaticString = "",
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`ins`: bitmask of the operand args; `out_idx`: the out= (or, inside
+    `ins`, the in-place self) arg, -1 for none."""
     var touched = False
-    for i in range(n_in):
-        if _f8_rec(args[unsafe_offset=i]):
+    for i in range(_MAX_ARGS):
+        if (ins >> i) & 1 == 1 and _f8_rec(args[unsafe_offset=i]):
             touched = True
     comptime if out_idx >= 0:
         if _f8_rec(args[unsafe_offset=out_idx]):
@@ -228,46 +319,65 @@ def f8_iter[
     if not touched:
         op(args, n_args, rets, n_rets)
         return
-    _pre[pre, n_in, out_idx, label](args)
-    var it = _iter_of(args, n_in)  # (a), raises c10's promotion error
-    var compute = it.common
+    var p = _pre[pre, ins, out_idx, label](args)
+    var eff_mode = mode if p.mode < 0 else p.mode
+    var it = _shape_of(args, p.ins)
+    var compute: Int32
     comptime if out_idx >= 0:
         var o = T(Int(args[unsafe_offset=out_idx].a))
-        comptime inplace = out_idx < n_in
-        # (b)
+        comptime inplace = (ins >> out_idx) & 1 == 1
+        # (b) memory overlap, then the shape of a read-write out: one that
+        # is also an operand is never resized.
         assert_no_internal_overlap(o)
-        for i in range(n_in):
+        var read_write = inplace
+        for i in range(_MAX_ARGS):
+            if (p.ins >> i) & 1 == 0:
+                continue
             comptime if inplace:
                 if i == out_idx:
                     continue
             var v = args[unsafe_offset=i].copy()
             if _rec_tensor(v):
                 var t = T(Int(v.a))
-                if not t.on_cpu():
+                if t.impl() == o.impl():
+                    read_write = True
+                elif not t.on_cpu():
                     assert_no_partial_overlap(o, t)
-        # (c)
-        comptime if mode == MODE_SAME:
-            if o.stype != it.common:
+        if read_write and it.shape_ok and not _shape_is(o, it.shape, it.rank):
+            raise Error(
+                "output with shape ",
+                _shape_str(o.shape, o.rank),
+                " doesn't match the broadcast shape ",
+                _shape_str(it.shape, it.rank),
+            )
+        # (a) + (c)
+        var common = _common_of(args, p.ins, p.rev)
+        if eff_mode == MODE_SAME:
+            if o.stype != common:
                 raise Error(
                     "Found dtype ",
                     _tname(o.stype),
                     " but expected ",
-                    _tname(it.common),
+                    _tname(common),
                 )
-        elif mode != MODE_NOCHECK:
-            if not can_cast(it.common, o.stype):
+        elif eff_mode != MODE_NOCHECK:
+            if not can_cast(common, o.stype):
                 raise Error(
                     "result type ",
-                    _tname(it.common),
+                    _tname(common),
                     " can't be cast to the desired output type ",
                     _tname(o.stype),
                 )
         # (d)
-        comptime if not inplace:
-            if it.shape_ok and not _shape_is(o, it.shape, it.rank):
-                resize_out(o, it.shape, it.rank)
-        comptime if mode == MODE_OUTDT:
-            compute = o.stype
+        if (
+            not read_write
+            and it.shape_ok
+            and not _shape_is(o, it.shape, it.rank)
+        ):
+            resize_out(o, it.shape, it.rank)
+        compute = o.stype if eff_mode == MODE_OUTDT else common
+    else:
+        compute = _common_of(args, p.ins, p.rev)
     # (e)
     var k = String(kernel)
     comptime if pre == PRE_DIV_MODE:
@@ -278,6 +388,11 @@ def f8_iter[
                 k = "div_floor_cuda"
             elif name == "trunc":
                 k = "div_trunc_cuda"
+    comptime if pre == PRE_DISPATCH_SELF:
+        # The kernel dispatches on self's dtype (arg 1), not the common one.
+        var a = T(Int(args[unsafe_offset=1].a))
+        if is_float8_stype(a.stype):
+            _refuse(k, a.stype)
     if is_float8_stype(compute):
         _refuse(k, compute)
     comptime if int_only:
@@ -288,13 +403,9 @@ def f8_iter[
     var held = List[Owned]()
     for i in range(n_args):
         var v = args[unsafe_offset=i].copy()
-        if i < n_in and _rec_tensor(v):
+        if i < _MAX_ARGS and (p.ins >> i) & 1 == 1 and _rec_tensor(v):
             var t = T(Int(v.a))
-            var swap: Bool
-            comptime if out_idx >= 0 and out_idx < n_in:
-                swap = i != out_idx
-            else:
-                swap = True
+            var swap = i != out_idx
             if swap and is_float8_stype(t.stype) and not t.on_cpu():
                 held.append(own(cast_to(t, compute, False)))
                 recs.append(tensor_arg(held[len(held) - 1].t))

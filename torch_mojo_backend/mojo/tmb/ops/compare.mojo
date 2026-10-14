@@ -1965,14 +1965,14 @@ def register_compare(site: Site) raises:
     impl[op_ne_scalar, "ne.Scalar"](site)
     impl[op_ne_scalar_out, "ne.Scalar_out"](site)
     impl[
-        f8_iter[op_lt_tensor, "compare_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_lt_tensor, "compare_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "lt.Tensor",
     ](site)
     impl[
         f8_iter[
             op_lt_tensor_out,
             "compare_cuda",
-            2,
+            3,
             2,
             MODE_NOCHECK,
             False,
@@ -1983,14 +1983,14 @@ def register_compare(site: Site) raises:
     impl[op_lt_scalar, "lt.Scalar"](site)
     impl[op_lt_scalar_out, "lt.Scalar_out"](site)
     impl[
-        f8_iter[op_le_tensor, "compare_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_le_tensor, "compare_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "le.Tensor",
     ](site)
     impl[
         f8_iter[
             op_le_tensor_out,
             "compare_cuda",
-            2,
+            3,
             2,
             MODE_NOCHECK,
             False,
@@ -2001,14 +2001,14 @@ def register_compare(site: Site) raises:
     impl[op_le_scalar, "le.Scalar"](site)
     impl[op_le_scalar_out, "le.Scalar_out"](site)
     impl[
-        f8_iter[op_gt_tensor, "compare_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_gt_tensor, "compare_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "gt.Tensor",
     ](site)
     impl[
         f8_iter[
             op_gt_tensor_out,
             "compare_cuda",
-            2,
+            3,
             2,
             MODE_NOCHECK,
             False,
@@ -2019,14 +2019,14 @@ def register_compare(site: Site) raises:
     impl[op_gt_scalar, "gt.Scalar"](site)
     impl[op_gt_scalar_out, "gt.Scalar_out"](site)
     impl[
-        f8_iter[op_ge_tensor, "compare_cuda", 2, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_ge_tensor, "compare_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "ge.Tensor",
     ](site)
     impl[
         f8_iter[
             op_ge_tensor_out,
             "compare_cuda",
-            2,
+            3,
             2,
             MODE_NOCHECK,
             False,

@@ -79,6 +79,13 @@ from tmb.ops.common import (
     same_view,
 )
 from tmb.ops.data_movement import _scalar_type_name
+from tmb.ops.f8_iter import (
+    f8_iter,
+    MODE_FN,
+    MODE_OUTDT,
+    PRE_NONE,
+    PRE_SELF_FIRST,
+)
 from tmb.backend.registry import Site, impl
 
 
@@ -1568,14 +1575,78 @@ def op_test_functorch_fallback_out(
 
 
 def register_composed(site: Site) raises:
-    impl[op_threshold_backward, "threshold_backward"](site)
-    impl[op_threshold_backward_grad_input, "threshold_backward.grad_input"](
-        site
-    )
-    impl[op_sigmoid_backward, "sigmoid_backward"](site)
-    impl[op_sigmoid_backward_grad_input, "sigmoid_backward.grad_input"](site)
-    impl[op_tanh_backward, "tanh_backward"](site)
-    impl[op_tanh_backward_grad_input, "tanh_backward.grad_input"](site)
+    impl[
+        f8_iter[
+            op_threshold_backward,
+            "threshold_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_SELF_FIRST,
+        ],
+        "threshold_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_threshold_backward_grad_input,
+            "threshold_cuda",
+            3,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_SELF_FIRST,
+        ],
+        "threshold_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_sigmoid_backward,
+            "sigmoid_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "sigmoid_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_sigmoid_backward_grad_input,
+            "sigmoid_backward_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "sigmoid_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_tanh_backward,
+            "tanh_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "tanh_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_tanh_backward_grad_input,
+            "tanh_backward_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "tanh_backward.grad_input",
+    ](site)
     impl[op_where_self_out, "where.self_out"](site)
     impl[op_native_batch_norm_backward, "native_batch_norm_backward"](site)
     impl[op_native_group_norm_backward, "native_group_norm_backward"](site)
