@@ -71,9 +71,10 @@ from tmb.backend.abi import (
 )
 from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
-from tmb.kernels.common.float8 import is_float8
+from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    is_cast_pair_on,
     decline_float8,
     ST_UNDEFINED,
     scalar_type_name,
@@ -240,6 +241,12 @@ def _b_host_scalar(t: T) raises -> Scal:
     if t.dtype == DType.float16:
         var vh = Float64(p.unsafe_bitcast[Float16]()[])
         return Scal(vh, Int(vh), False, False)
+    if is_float8(t.dtype):
+        # A CPU 0-d float8 (a promotion operand): its exact value.
+        var v8 = fp8_bits_to_f64(t.dtype, p[])
+        return Scal(
+            v8, Int(v8) if v8 == v8 and abs(v8) < 1e18 else 0, False, False
+        )
     var k: Int = 0
     if t.dtype == DType.int64:
         k = Int(p.unsafe_bitcast[Int64]()[])
@@ -454,7 +461,9 @@ def _b_hold(t: T) -> Held:
 def _b_cast(t: T, st: Int32) raises -> Held:
     if t.stype == st:
         return Held(t.copy(), False)
-    if not (_b_castable_on(t.stype, t) and _b_castable_on(st, t)):
+    if not (
+        _b_castable_on(t.stype, t) and _b_castable_on(st, t)
+    ) and not is_cast_pair_on(t.dtype, max_dtype(st), t):
         unsupported(
             "a cast from dtype "
             + String(t.stype)
@@ -462,7 +471,8 @@ def _b_cast(t: T, st: Int32) raises -> Held:
             + String(st)
             + " on the mojo device"
         )
-    return Held(cast_to(t, st), True)
+    # A promotion, not a copy_: no e4m3fn saturation.
+    return Held(cast_to(t, st, False), True)
 
 
 def _b_ready(t: T, st: Int32, need_contig: Bool) raises -> Held:
@@ -935,6 +945,32 @@ struct Res(Copyable, Movable):
     var owned: Bool
 
 
+def _b_cuda_kernel(op: StaticString) -> String:
+    """The CUDA kernel name a float8 refusal of `op` quotes."""
+    var kernel = String(op)
+    if op == "AddSpec" or op == "SubSpec":
+        kernel = "ufunc_add_CUDA"
+    elif op == "MulSpec":
+        kernel = "mul_cuda"
+    elif op == "DivSpec":
+        kernel = "div_true_cuda"
+    elif op == "PowSpec":
+        kernel = "pow_cuda"
+    elif op == "RemainderSpec":
+        kernel = "remainder_cuda"
+    elif op == "MaximumSpec":
+        kernel = "max_elementwise_cuda"
+    elif op == "MinimumSpec":
+        kernel = "min_elementwise_cuda"
+    elif op == "BitwiseAndSpec":
+        kernel = "bitwise_and_cuda"
+    elif op == "BitwiseOrSpec":
+        kernel = "bitwise_or_cuda"
+    elif op == "BitwiseXorSpec":
+        kernel = "bitwise_xor_cuda"
+    return kernel
+
+
 def _b_op_dtype_ok(op: StaticString, st: Int32, is_cmp: Bool) raises:
     """The dtype checks `_binary_spec_into_go` makes, made here instead so a
     declined pair never triggers a kernel build."""
@@ -952,27 +988,7 @@ def _b_op_dtype_ok(op: StaticString, st: Int32, is_cmp: Bool) raises:
         if st == 23 or st == 24 or st == 25 or st == 26 or st == 44:
             # (torch's five float8 ScalarTypes)
             # CUDA's own refusal for the common float8 arithmetic.
-            var kernel = String(op)
-            if op == "AddSpec" or op == "SubSpec":
-                kernel = "ufunc_add_CUDA"
-            elif op == "MulSpec":
-                kernel = "mul_cuda"
-            elif op == "DivSpec":
-                kernel = "div_true_cuda"
-            elif op == "PowSpec":
-                kernel = "pow_cuda"
-            elif op == "RemainderSpec":
-                kernel = "remainder_cuda"
-            elif op == "MaximumSpec":
-                kernel = "max_elementwise_cuda"
-            elif op == "MinimumSpec":
-                kernel = "min_elementwise_cuda"
-            elif op == "BitwiseAndSpec":
-                kernel = "bitwise_and_cuda"
-            elif op == "BitwiseOrSpec":
-                kernel = "bitwise_or_cuda"
-            elif op == "BitwiseXorSpec":
-                kernel = "bitwise_xor_cuda"
+            var kernel = _b_cuda_kernel(op)
             unsupported(
                 '"'
                 + kernel
@@ -1271,19 +1287,13 @@ def _b_store_out(
         return
     var held = own(res.t.copy())
     if exact_dtype and held.t.stype != dest.stype:
-        raise Error(
-            "Expected out tensor to have dtype ",
-            dtype_name(held.t.stype),
-            ", but got ",
-            dtype_name(dest.stype),
-            " instead",
-        )
+        _b_found_dtype_error(dest.stype, held.t.stype)
     if not _b_can_cast(held.t.stype, dest.stype):
         raise Error(
             "result type ",
-            dtype_name(held.t.stype),
+            _b_tname(held.t.stype),
             " can't be cast to the desired output type ",
-            dtype_name(dest.stype),
+            _b_tname(dest.stype),
         )
     var dst = dest.copy()
     if not dst.same_shape(held.t):
@@ -1325,12 +1335,7 @@ def _b_store_inplace(rets: Values, self: T, var res: Res) raises:
         # the cast is category-safe: float16.add_(float32) is float16,
         # int64.add_(float32) raises.
         if not _b_can_cast(held.t.stype, self.stype):
-            raise Error(
-                "result type ",
-                dtype_name(held.t.stype),
-                " can't be cast to the desired output type ",
-                dtype_name(self.stype),
-            )
+            _b_cast_error(held.t.stype, self.stype)
         var casted = own(cast_for_copy(held.t, self.stype, False))
         _b_copy_into(self, casted.t)
         _ = casted^  # alive past the launch
@@ -1429,12 +1434,36 @@ def _b_shape_list(shape: IndexList[MAX_RANK], rank: Int) -> String:
     return s + "]"
 
 
-def _b_out_guard(dest: T, a: Side, b: Side) raises:
+def _b_tname(st: Int32) raises -> String:
+    return scalar_type_name(max_dtype(st))
+
+
+def _b_cast_error(result: Int32, out_st: Int32) raises:
+    """TensorIterator's compute_types check (stock CUDA wording)."""
+    raise Error(
+        "result type ",
+        _b_tname(result),
+        " can't be cast to the desired output type ",
+        _b_tname(out_st),
+    )
+
+
+def _b_found_dtype_error(out_st: Int32, expected: Int32) raises:
+    """TensorIterator's check_dtype for an out= that must hold the result's
+    own dtype (stock CUDA wording)."""
+    raise Error(
+        "Found dtype ", _b_tname(out_st), " but expected ", _b_tname(expected)
+    )
+
+
+def _b_out_guard(dest: T, a: Side, b: Side, common_out: Bool = True) raises:
     """`_b_out_guard3` of a binary op."""
-    _b_out_guard3(dest, a, b, b)
+    _b_out_guard3(dest, a, b, b, common_out)
 
 
-def _b_out_guard3(dest: T, a: Side, b: Side, c: Side) raises:
+def _b_out_guard3(
+    dest: T, a: Side, b: Side, c: Side, common_out: Bool = True
+) raises:
     """TensorIterator's `out=` meta against the inputs, before anything is
     written or resized:
 
@@ -1473,14 +1502,17 @@ def _b_out_guard3(dest: T, a: Side, b: Side, c: Side) raises:
     if not read_write:
         # A float8 computation is refused by the kernel dispatch, after
         # TensorIterator resized `out` (compute_types' checks first).
-        if not _b_any_float8(a, b, c):
+        # `common_out`: the output holds the common dtype (not a
+        # comparison's / logical op's bool), so compute_types' canCast
+        # check applies -- before any resize.
+        if not common_out or not _b_any_float8(a, b, c):
             return
         var common = _b_sides_result(a, b, c)
-        if (
-            is_float8_stype(common)
-            and _b_can_cast(common, dest.stype)
-            and not _b_shape_is(dest, shape, rank)
-        ):
+        if not is_float8_stype(common):
+            return
+        if not _b_can_cast(common, dest.stype):
+            _b_cast_error(common, dest.stype)
+        if not _b_shape_is(dest, shape, rank):
             var d = dest.copy()
             resize_out(d, shape, rank)
         return
@@ -2266,13 +2298,31 @@ def _b_simple_out(
         args[unsafe_offset=out_index], _b_device_of(lhs, rhs)
     )
     _b_out_guard(dest, lhs, rhs)
+    if (
+        op == "BitwiseAndSpec"
+        or op == "BitwiseOrSpec"
+        or op == "BitwiseXorSpec"
+    ):
+        var w = _b_f8_into_out(lhs, rhs, Optional[T](dest.copy()))
+        if w:
+            # Dispatched on the out dtype, which is floating here.
+            unsupported(
+                '"'
+                + _b_cuda_kernel(op)
+                + "\" not implemented for '"
+                + _b_tname(w.value())
+                + "'"
+            )
     _b_store_out(
         rets, dest, _b_binary(op, lhs, rhs, Int32(-1), Optional[T](dest.copy()))
     )
 
 
-def _b_pow_float_base(lhs: Side) raises:
+def _b_pow_float_base(lhs: Side, rhs: Side) raises:
     # The kernel raises on integers, which would leave the output unwritten.
+    if lhs.is_t and is_float8(lhs.t.value().dtype):
+        _ = _b_sides_result(lhs, rhs, rhs)  # c10's float8 promotion error
+        decline_float8(lhs.t.value().dtype, "pow_cuda")
     if not lhs.is_t or not _b_is_floating(lhs.t.value().stype):
         unsupported("pow.Tensor_Tensor on a tensor that is not float")
 
@@ -2334,7 +2384,9 @@ def op_pow_scalar_out(
 
 # aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
 def op_pow_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_pow_float_base(_b_side(args[unsafe_offset=0]))
+    _b_pow_float_base(
+        _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+    )
     _b_simple("PowSpec", args, rets)
 
 
@@ -2342,7 +2394,9 @@ def op_pow_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_pow_tensor_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _b_pow_float_base(_b_side(args[unsafe_offset=0]))
+    _b_pow_float_base(
+        _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+    )
     _b_simple_out("PowSpec", args, rets, 2)
 
 
@@ -2362,7 +2416,46 @@ def _b_maxmin_res(
         and rhs.t.value().stype == ST_BOOL
     ):
         return _b_binary(bool_op, lhs, rhs, ST_BOOL, dst)
+    var f8 = _b_f8_into_out(lhs, rhs, dst)
+    if f8:
+        # max/min_elementwise dispatch on the OUTPUT dtype: a float8 pair
+        # computes in a wider out's dtype (TensorIterator casts the inputs).
+        var w = f8.value()
+        var a = _b_cast_side(lhs, w)
+        var b = _b_cast_side(rhs, w)
+        var r = _b_binary(op, a.side.copy(), b.side.copy(), Int32(-1), dst)
+        _ = a^
+        _ = b^
+        return r^
     return _b_binary(op, lhs, rhs, Int32(-1), dst)
+
+
+def _b_f8_into_out(
+    lhs: Side, rhs: Side, dst: Optional[T]
+) raises -> Optional[Int32]:
+    """The out dtype, when a float8 computation writes a non-float8 out=
+    (ops whose kernel dispatches on the output dtype compute in it)."""
+    if not dst or not _b_any_float8(lhs, rhs, rhs):
+        return None
+    var common = _b_sides_result(lhs, rhs, rhs)
+    var d = dst.value().stype
+    if is_float8_stype(common) and not is_float8_stype(d):
+        return d
+    return None
+
+
+@fieldwise_init
+struct _CastSide(Movable):
+    var side: Side
+    var held: Optional[Held]
+
+
+def _b_cast_side(side: Side, st: Int32) raises -> _CastSide:
+    if not side.is_t or side.t.value().stype == st:
+        return _CastSide(side.copy(), None)
+    var h = _b_cast(side.t.value(), st)
+    var s2 = _b_tside(h.t)
+    return _CastSide(s2^, h^)
 
 
 def _b_maxmin(
@@ -2566,7 +2659,7 @@ def _b_logical_out(op: StaticString, args: Values, rets: Values) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
-    _b_out_guard(dest, lhs, rhs)
+    _b_out_guard(dest, lhs, rhs, False)
     _b_store_out(
         rets, dest, _b_logical_res(op, lhs, rhs, Optional[T](dest.copy()))
     )
@@ -2777,6 +2870,11 @@ def _b_clamp_out(
 ) raises:
     var self = _b_self(args[unsafe_offset=0], "clamp")
     var dest = _b_out_tensor(args[unsafe_offset=out_index], self.device)
+    var result_stype = _b_clamp_dtype(self.stype, lo, hi)
+    if is_float8_stype(result_stype) and dest.stype != result_stype:
+        # A unary iterator: out must hold the result dtype, checked before
+        # out is touched.
+        _b_found_dtype_error(dest.stype, result_stype)
     _b_out_guard(dest, _b_tside(self), _b_tside(self))
     # TORCH_META_FUNC(clamp) and clamp_min / clamp_max build a unary
     # iterator: the out dtype is the result's own.

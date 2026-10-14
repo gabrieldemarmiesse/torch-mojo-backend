@@ -217,7 +217,7 @@ def _compare_out_guard(out_arg: T, a: T, b: T) raises:
     if not out_arg.on_mojo():
         raise Error("expected the out= tensor on the operands' mojo device")
     assert_no_internal_overlap(out_arg)
-    _b_out_guard(out_arg, _b_tside(a), _b_tside(b))
+    _b_out_guard(out_arg, _b_tside(a), _b_tside(b), False)
 
 
 def _cast_into_out(

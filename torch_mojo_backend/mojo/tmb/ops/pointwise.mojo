@@ -99,6 +99,7 @@ from tmb.ops.binary import (
     op_rsub_out,
 )
 from tmb.ops.common import (
+    can_cast,
     decline_float8,
     fill_value,
     scalar_type_name,
@@ -488,7 +489,21 @@ def _pw_finish(
         _b_ret(rets, res^)
 
 
-def _pw_out_of(v: Value, a: Side, b: Side, c: Side) raises -> T:
+def _pw_f8_side_tensor(side: Side, st: Int32, device: Int) raises -> Owned:
+    """A float8 operand as a device tensor: the tensor itself (not owned),
+    or a CPU 0-d one rebuilt on `device`."""
+    if side.is_t:
+        var o = own(side.t.value().copy())
+        _ = o.take()  # borrowed: never released here
+        return o^
+    var t = own(new_tensor(IndexList[MAX_RANK](1), 0, st, device))
+    fill_value(t.t, side.s.value().f)
+    return t^
+
+
+def _pw_out_of(
+    v: Value, a: Side, b: Side, c: Side, common_out: Bool = True
+) raises -> T:
     """The caller's `out=`, checked like TensorIterator's meta: no internal
     overlap, no partial overlap with an input, and never resized when it is
     one of the inputs (see `_b_out_guard`)."""
@@ -500,7 +515,7 @@ def _pw_out_of(v: Value, a: Side, b: Side, c: Side) raises -> T:
         if side.is_t and side.t.value().device != dest.device:
             raise Error("expected `out` and the inputs on the same mojo device")
     assert_no_internal_overlap(dest)
-    _b_out_guard3(dest, a, b, c)
+    _b_out_guard3(dest, a, b, c, common_out)
     return dest^
 
 
@@ -1038,6 +1053,14 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
     # One bound: ATen's maximum_stub / minimum_stub over the promoted pair.
     var bound = _b_side(args[unsafe_offset=1 if has_min else 2])
     var common = _pw_result_type(a, bound, _none_side(), 2)
+    var dest = Optional[T]()
+    if out_index >= 0:
+        # The out= checks and resize come before the kernel dispatch.
+        dest = _pw_out_of(args[unsafe_offset=out_index], a, bound, _none_side())
+    if _pw_is_f8(common) and dest and not _pw_is_f8(dest.value().stype):
+        # max/min_elementwise dispatch on the OUTPUT dtype: a float8 pair
+        # computes in a wider out's dtype.
+        common = dest.value().stype
     # CUDA's one-bound clamp is maximum / minimum: its float8 refusal names
     # max_elementwise_cuda / min_elementwise_cuda.
     if has_min:
@@ -1045,9 +1068,6 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
     else:
         _pw_no_float8("min_elementwise", common)
     var compute = _pw_compute_dtype("clamp", common, P_ALL, True)
-    var dest = Optional[T]()
-    if out_index >= 0:
-        dest = _pw_out_of(args[unsafe_offset=out_index], a, bound, _none_side())
     if has_min:
         _pw_finish(
             rets,
@@ -1109,20 +1129,44 @@ def _pw_pow_scalar_base(args: Values, rets: Values, out_index: Int) raises:
         _pw_ipow(args, rets, out_index, False)
         return
     var common = _pw_result_type(base, expo, _none_side(), 2)
+    if _pw_is_f8(common) and expo.is_t:
+        # Pow.cpp's pow(Scalar, Tensor).out: out is resized first; a base of
+        # 1 fills it with ones whatever its dtype (no cast check, no
+        # kernel); any other base meets the out cast check, then pow_cuda.
+        var e = expo.t.value().copy()
+        var b = base.s.value().copy()
+        var one = not b.is_bool and (Float64(b.i) if b.is_int else b.f) == 1.0
+        if out_index >= 0:
+            var d = _pw_out_of(
+                args[unsafe_offset=out_index],
+                expo,
+                _none_side(),
+                _none_side(),
+                False,
+            )
+            if not d.same_shape(e):
+                resize_out(d, e.shape, e.rank)
+            if one:
+                fill_value(d, 1.0)
+                ret_ref(rets, 0, d)
+                return
+            if not can_cast(common, d.stype):
+                raise Error(
+                    "result type ",
+                    scalar_type_name(max_dtype(common)),
+                    " can't be cast to the desired output type ",
+                    scalar_type_name(d.dtype),
+                )
+        elif one:
+            var ones = own(new_tensor(e.shape, e.rank, common, e.device))
+            fill_value(ones.t, 1.0)
+            ret_owned(rets, 0, ones)
+            return
     var dest = Optional[T]()
     if out_index >= 0:
         dest = _pw_out_of(
             args[unsafe_offset=out_index], expo, _none_side(), _none_side()
         )
-    if _pw_is_f8(common) and expo.is_t:
-        var b = base.s.value().copy()
-        if not b.is_bool and (Float64(b.i) if b.is_int else b.f) == 1.0:
-            # Pow.cpp: a base of 1 fills ones, no kernel (float8 too).
-            var e = expo.t.value().copy()
-            var ones = own(new_tensor(e.shape, e.rank, common, e.device))
-            fill_value(ones.t, 1.0)
-            _pw_finish(rets, dest, Res(ones.take(), True))
-            return
     var compute = _pw_compute_dtype(
         "pow_scalar_base", common, P_FLOAT_ONLY, True
     )
@@ -3976,20 +4020,27 @@ def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         raise Error(
             "atol must be greater than or equal to zero, but got ", atol
         )
-    if _pw_is_f8(st) and a.is_t and b.is_t:
+    if _pw_is_f8(st) and (a.is_t or b.is_t):
         # isclose.cpp: `close = self == other` (eq has a float8 kernel), the
         # equal_nan term, then -- unless both tolerances are zero --
-        # `rtol * other`, whose mul_cuda has no float8 case.
+        # `rtol * other`, whose mul_cuda has no float8 case. A CPU 0-d
+        # operand joins as a device 0-d tensor (its value is a float8 one,
+        # exact in the float64 it was read as).
         if rtol != 0 or atol != 0:
             decline_float8(max_dtype(st), "mul_cuda")
-        var ta = a.t.value().copy()
-        var tb = b.t.value().copy()
+        var device = _pw_device(a, b, _none_side())
+        var ha = _pw_f8_side_tensor(a, st, device)
+        var hb = _pw_f8_side_tensor(b, st, device)
+        var ta = ha.t.copy()
+        var tb = hb.t.copy()
         var close = call_op(
             "aten::eq", "Tensor", [tensor_arg(ta), tensor_arg(tb)], 1
         )
         if not equal_nan:
             var only = own(close.take_tensor(0))
             ret_owned(rets, 0, only)
+            _ = ha^
+            _ = hb^
             return
         var na = call_op("aten::isnan", "", [tensor_arg(ta)], 1)
         var nb = call_op("aten::isnan", "", [tensor_arg(tb)], 1)
@@ -4001,6 +4052,8 @@ def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         )
         var res = own(r.take_tensor(0))
         ret_owned(rets, 0, res)
+        _ = ha^
+        _ = hb^
         _ = na^
         _ = nb^
         _ = both^

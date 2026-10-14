@@ -2123,3 +2123,267 @@ def test_float8_foreach_copy_empty_any_strides_refused(mojo_device, strides):
     with pytest.raises(NotImplementedError, match="foreach_tensor_copy"):
         torch._foreach_copy_([d], [s])
     assert d._version == v0
+
+
+# Measured on stock CUDA (torch 2.11 / H100): TensorIterator's order for an
+# out= of a float8 computation -- (1) the out dtype check raises
+# RuntimeError with out untouched, (2) out is resized, (3) the kernel
+# dispatch raises NotImplementedError. (op, out dtype, outcome, message or
+# values, out's shape afterwards.)
+_OUT_ORDER_CUDA = [
+    ('neg', 'float8_e4m3fn', 'NotImplementedError', '"neg_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('neg', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
+    ('neg', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
+    ('neg', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
+    ('neg', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
+    ('abs', 'float8_e4m3fn', 'NotImplementedError', '"abs_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('abs', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
+    ('abs', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
+    ('abs', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
+    ('abs', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
+    ('exp', 'float8_e4m3fn', 'NotImplementedError', '"exp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('exp', 'float32', 'NotImplementedError', '"exp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('exp', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('exp', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('exp', 'float16', 'NotImplementedError', '"exp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sqrt', 'float8_e4m3fn', 'NotImplementedError', '"sqrt_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sqrt', 'float32', 'NotImplementedError', '"sqrt_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sqrt', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('sqrt', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('sqrt', 'float16', 'NotImplementedError', '"sqrt_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sigmoid', 'float8_e4m3fn', 'NotImplementedError', '"sigmoid_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sigmoid', 'float32', 'NotImplementedError', '"sigmoid_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sigmoid', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('sigmoid', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('sigmoid', 'float16', 'NotImplementedError', '"sigmoid_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sign', 'float8_e4m3fn', 'NotImplementedError', '"sign_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sign', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
+    ('sign', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
+    ('sign', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
+    ('sign', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
+    ('add', 'float8_e4m3fn', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('add', 'float32', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('add', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('add', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('add', 'float16', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('add_s', 'float8_e4m3fn', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('add_s', 'float32', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('add_s', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('add_s', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('add_s', 'float16', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('mul', 'float8_e4m3fn', 'NotImplementedError', '"mul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('mul', 'float32', 'NotImplementedError', '"mul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('mul', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('mul', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('mul', 'float16', 'NotImplementedError', '"mul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('div', 'float8_e4m3fn', 'NotImplementedError', '"div_true_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('div', 'float32', 'NotImplementedError', '"div_true_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('div', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('div', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('div', 'float16', 'NotImplementedError', '"div_true_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sub', 'float8_e4m3fn', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sub', 'float32', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sub', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('sub', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('sub', 'float16', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('maximum', 'float8_e4m3fn', 'NotImplementedError', '"max_elementwise_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('maximum', 'float32', 'ok', [1.0, 1.0], (2,)),
+    ('maximum', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('maximum', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('maximum', 'float16', 'ok', [1.0, 1.0], (2,)),
+    ('bitand', 'float8_e4m3fn', 'NotImplementedError', '"bitwise_and_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('bitand', 'float32', 'NotImplementedError', '"bitwise_and_cuda" not implemented for \'Float\'', (2,)),
+    ('bitand', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('bitand', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('bitand', 'float16', 'NotImplementedError', '"bitwise_and_cuda" not implemented for \'Half\'', (2,)),
+    ('copysign', 'float8_e4m3fn', 'NotImplementedError', '"copysign_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('copysign', 'float32', 'NotImplementedError', '"copysign_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('copysign', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('copysign', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('copysign', 'float16', 'NotImplementedError', '"copysign_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('atan2', 'float8_e4m3fn', 'NotImplementedError', '"atan2_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('atan2', 'float32', 'NotImplementedError', '"atan2_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('atan2', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('atan2', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('atan2', 'float16', 'NotImplementedError', '"atan2_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('fmod', 'float8_e4m3fn', 'NotImplementedError', '"fmod_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('fmod', 'float32', 'NotImplementedError', '"fmod_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('fmod', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('fmod', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('fmod', 'float16', 'NotImplementedError', '"fmod_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('addcmul', 'float8_e4m3fn', 'NotImplementedError', '"addcmul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('addcmul', 'float32', 'NotImplementedError', '"addcmul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('addcmul', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('addcmul', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('addcmul', 'float16', 'NotImplementedError', '"addcmul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('lerp', 'float8_e4m3fn', 'NotImplementedError', '"lerp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('lerp', 'float32', 'NotImplementedError', '"lerp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('lerp', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('lerp', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('lerp', 'float16', 'NotImplementedError', '"lerp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('clamp_s', 'float8_e4m3fn', 'NotImplementedError', '"clamp_scalar_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('clamp_s', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
+    ('clamp_s', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
+    ('clamp_s', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
+    ('clamp_s', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
+    ('clamp_nan', 'float8_e4m3fn', 'ok', [127, 127], (2,)),
+    ('clamp_nan', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
+    ('clamp_nan', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
+    ('clamp_nan', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
+    ('clamp_nan', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
+    ('clamp_min_nan', 'float8_e4m3fn', 'ok', [127, 127], (2,)),
+    ('clamp_min_nan', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
+    ('clamp_min_nan', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
+    ('clamp_min_nan', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
+    ('clamp_min_nan', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
+    ('clamp_t', 'float8_e4m3fn', 'NotImplementedError', '"clamp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('clamp_t', 'float32', 'NotImplementedError', '"clamp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('clamp_t', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('clamp_t', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('clamp_t', 'float16', 'NotImplementedError', '"clamp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('clamp_tmin', 'float8_e4m3fn', 'NotImplementedError', '"max_elementwise_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('clamp_tmin', 'float32', 'ok', [1.0, 1.0], (2,)),
+    ('clamp_tmin', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('clamp_tmin', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('clamp_tmin', 'float16', 'ok', [1.0, 1.0], (2,)),
+    ('clamp_tmax', 'float8_e4m3fn', 'NotImplementedError', '"min_elementwise_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('clamp_tmax', 'float32', 'ok', [1.0, 1.0], (2,)),
+    ('clamp_tmax', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('clamp_tmax', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('clamp_tmax', 'float16', 'ok', [1.0, 1.0], (2,)),
+    ('pow0', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
+    ('pow0', 'float32', 'ok', [1.0, 1.0], (2,)),
+    ('pow0', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('pow0', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('pow0', 'float16', 'ok', [1.0, 1.0], (2,)),
+    ('pow1', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
+    ('pow1', 'float32', 'ok', [1.0, 1.0], (2,)),
+    ('pow1', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('pow1', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('pow1', 'float16', 'ok', [1.0, 1.0], (2,)),
+    ('pow2', 'float8_e4m3fn', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('pow2', 'float32', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('pow2', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
+    ('pow2', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
+    ('pow2', 'float16', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('rpow1', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
+    ('rpow1', 'float32', 'ok', [1.0, 1.0], (2,)),
+    ('rpow1', 'int32', 'ok', [1, 1], (2,)),
+    ('rpow1', 'bool', 'ok', [True, True], (2,)),
+    ('rpow1', 'float16', 'ok', [1.0, 1.0], (2,)),
+    ('rpow2', 'float8_e4m3fn', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('rpow2', 'float32', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('rpow2', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (2,)),
+    ('rpow2', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (2,)),
+    ('rpow2', 'float16', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('sum', 'float8_e4m3fn', 'NotImplementedError', '"sum_cuda" not implemented for \'Float8_e4m3fn\'', ()),
+    ('sum', 'float32', 'ok', 2.0, ()),
+    ('sum', 'float16', 'ok', 2.0, ()),
+    ('eq', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
+    ('eq', 'float32', 'ok', [1.0, 1.0], (2,)),
+    ('eq', 'int32', 'ok', [1, 1], (2,)),
+    ('eq', 'bool', 'ok', [True, True], (2,)),
+    ('eq', 'float16', 'ok', [1.0, 1.0], (2,)),
+    ('ne_s', 'float8_e4m3fn', 'ok', [0, 0], (2,)),
+    ('ne_s', 'float32', 'ok', [0.0, 0.0], (2,)),
+    ('ne_s', 'int32', 'ok', [0, 0], (2,)),
+    ('ne_s', 'bool', 'ok', [False, False], (2,)),
+    ('ne_s', 'float16', 'ok', [0.0, 0.0], (2,)),
+    ('nan_to_num', 'float8_e4m3fn', 'NotImplementedError', '"nan_to_num_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
+    ('nan_to_num', 'float32', 'RuntimeError', 'nan_to_num: dtype of out: Float should be same as input: Float8_e4m3fn', (0,)),
+    ('nan_to_num', 'int32', 'RuntimeError', 'nan_to_num: dtype of out: Int should be same as input: Float8_e4m3fn', (0,)),
+    ('nan_to_num', 'bool', 'RuntimeError', 'nan_to_num: dtype of out: Bool should be same as input: Float8_e4m3fn', (0,)),
+    ('nan_to_num', 'float16', 'RuntimeError', 'nan_to_num: dtype of out: Half should be same as input: Float8_e4m3fn', (0,)),
+    ('where', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
+    ('where', 'float32', 'RuntimeError', 'Expected out type to be Float8_e4m3fn but got Float', (0,)),
+    ('where', 'int32', 'RuntimeError', 'Expected out type to be Float8_e4m3fn but got Int', (0,)),
+    ('where', 'bool', 'RuntimeError', 'Expected out type to be Float8_e4m3fn but got Bool', (0,)),
+    ('where', 'float16', 'RuntimeError', 'Expected out type to be Float8_e4m3fn but got Half', (0,)),
+]  # fmt: skip
+
+
+def _out_order_ops(dev):
+    x = torch.ones(2).to(torch.float8_e4m3fn).to(dev)
+    nan = float("nan")
+    t = torch.ones(2, dtype=torch.bool, device=dev)
+    return {
+        "neg": lambda o: torch.neg(x, out=o),
+        "abs": lambda o: torch.abs(x, out=o),
+        "exp": lambda o: torch.exp(x, out=o),
+        "sqrt": lambda o: torch.sqrt(x, out=o),
+        "sigmoid": lambda o: torch.sigmoid(x, out=o),
+        "sign": lambda o: torch.sign(x, out=o),
+        "add": lambda o: torch.add(x, x, out=o),
+        "add_s": lambda o: torch.add(x, 1, out=o),
+        "mul": lambda o: torch.mul(x, x, out=o),
+        "div": lambda o: torch.div(x, x, out=o),
+        "sub": lambda o: torch.sub(x, x, out=o),
+        "maximum": lambda o: torch.maximum(x, x, out=o),
+        "bitand": lambda o: torch.bitwise_and(x, x, out=o),
+        "copysign": lambda o: torch.copysign(x, x, out=o),
+        "atan2": lambda o: torch.atan2(x, x, out=o),
+        "fmod": lambda o: torch.fmod(x, x, out=o),
+        "addcmul": lambda o: torch.addcmul(x, x, x, out=o),
+        "lerp": lambda o: torch.lerp(x, x, 0.5, out=o),
+        "clamp_s": lambda o: torch.clamp(x, 0, 1, out=o),
+        "clamp_nan": lambda o: torch.clamp(x, nan, 1, out=o),
+        "clamp_min_nan": lambda o: torch.clamp_min(x, nan, out=o),
+        "clamp_t": lambda o: torch.clamp(x, x, x, out=o),
+        "clamp_tmin": lambda o: torch.clamp(x, min=x, out=o),
+        "clamp_tmax": lambda o: torch.clamp(x, max=x, out=o),
+        "pow0": lambda o: torch.pow(x, 0, out=o),
+        "pow1": lambda o: torch.pow(x, 1, out=o),
+        "pow2": lambda o: torch.pow(x, 2, out=o),
+        "rpow1": lambda o: torch.pow(1, x, out=o),
+        "rpow2": lambda o: torch.pow(2, x, out=o),
+        "sum": lambda o: torch.sum(x, 0, out=o),
+        "eq": lambda o: torch.eq(x, x, out=o),
+        "ne_s": lambda o: torch.ne(x, 1.0, out=o),
+        "nan_to_num": lambda o: torch.nan_to_num(x, out=o),
+        "where": lambda o: torch.where(t, x, x, out=o),
+    }
+
+
+@pytest.mark.parametrize("case", _OUT_ORDER_CUDA, ids=lambda c: f"{c[0]}-{c[1]}")
+def test_float8_out_order_matches_cuda(mojo_device, case):
+    op, odt, outcome, want, shape = case
+    out = torch.empty(0, dtype=getattr(torch, odt), device=mojo_device)
+    fn = _out_order_ops(mojo_device)[op]
+    if outcome == "ok":
+        fn(out)
+        got = out.view(torch.uint8) if out.dtype in FP8 else out
+        assert got.cpu().tolist() == want
+    else:
+        exc = NotImplementedError if outcome == "NotImplementedError" else RuntimeError
+        with pytest.raises(exc) as info:
+            fn(out)
+        assert type(info.value) is exc
+        assert str(info.value).startswith(want)
+    assert tuple(out.shape) == shape
+
+
+def test_float8_cpu_0d_operands_match_cuda(mojo_device):
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    x = torch.tensor([1.0, 2.0]).to(f8).to(dev)
+    assert torch.isclose(
+        x, torch.tensor(1.0).to(f8), rtol=0, atol=0
+    ).cpu().tolist() == [True, False]
+    nan8 = torch.tensor(float("nan")).to(f8)
+    assert torch.isclose(x, nan8, rtol=0, atol=0, equal_nan=True).cpu().tolist() == [
+        False,
+        False,
+    ]
+    one = torch.tensor(1.0).to(f8).to(dev)
+    r = torch.ones(2, device=dev) + one
+    assert r.dtype == torch.float32 and r.cpu().tolist() == [2.0, 2.0]
+    r = torch.ones(2, dtype=torch.float16, device=dev) + one
+    assert r.dtype == torch.float16 and r.cpu().tolist() == [2.0, 2.0]
+    with pytest.raises(NotImplementedError, match="pow_cuda"):
+        torch.pow(x, torch.tensor(1.0))
+    with pytest.raises(RuntimeError, match="promote Float8_e4m3fn and Float"):
+        torch.pow(x, torch.ones(2, device=dev))
+    with pytest.raises(RuntimeError, match="promote Float8_e4m3fn and Float"):
+        torch.cat([x, torch.ones(2, device=dev)])
+    with pytest.raises(RuntimeError, match="promote Float and Float8_e4m3fn"):
+        torch.cat([torch.ones(2, device=dev), x])
