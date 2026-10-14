@@ -947,3 +947,22 @@ def test_reduction_dim_is_checked_before_the_out_dtype(mojo_gpu: str):
             fn(x, 9, dtype=torch.float32, out=out)
     with pytest.raises(RuntimeError, match="Optional dtype must be either"):
         torch.mean(x, 9, dtype=torch.bool)
+
+
+# --- integer scalars meet complex arithmetic in one rounding --------------------
+
+
+@pytest.mark.parametrize(
+    "v", [2**53 + 1, 2**62 + 2**38 + 1, 2**63 - 1, -(2**62 + 2**38 + 1)]
+)
+@pytest.mark.parametrize("dtype", CDTYPES)
+def test_integer_scalars_round_once(mojo_gpu: str, v: int, dtype: torch.dtype):
+    _skip_c128(mojo_gpu, dtype)
+    one = torch.ones(2, dtype=dtype)
+    d = one.to(mojo_gpu)
+    for op in (torch.add, torch.sub, torch.mul):
+        want = op(one.cuda() if torch.cuda.is_available() else one, v).cpu()
+        assert torch.equal(op(d, v).cpu(), want)
+        assert torch.equal(op(d, torch.tensor(v)).cpu(), want)
+    want = torch.add(one, one, alpha=v)
+    assert torch.equal(torch.add(d, d, alpha=v).cpu(), want)

@@ -48,6 +48,7 @@ from tmb.ops.complex import (
     cx_unary_out,
 )
 from tmb.ops.common import (
+    scalar_parts,
     scalar_type_token,
     device_str,
     check_scalar_fits,
@@ -186,7 +187,7 @@ def _arith(
     var p_re = 1.0
     var p_im = 0.0
     if alpha.tag != TAG_NONE:
-        var al = v_complex(alpha)
+        var al = scalar_parts(alpha, st)  # an integer: one rounding
         p_re = al[0]
         p_im = al[1]
     var launch_kind = kind
@@ -522,6 +523,7 @@ def _pow_tensor_scalar(x: T, ev: Value) raises -> Owned:
         unsupported("pow of a complex tensor with a non-complex result")
     if e[0] == 0.0 and e[1] == 0.0:
         return _ones(x.shape, x.rank, st, x.device)
+    var ek = scalar_parts(ev, st)  # the exponent in st's parts, one rounding
     var dense = own_if_new(cast_complex(x, st), x)
     var out = own(new_tensor(x.shape, x.rank, st, x.device))
     if e[0] == 1.0 and e[1] == 0.0:
@@ -550,8 +552,8 @@ def _pow_tensor_scalar(x: T, ev: Value) raises -> Owned:
         CX_HOST,
         0.0,
         0.0,
-        e[0],
-        e[1],
+        ek[0],
+        ek[1],
         x.numel,
         dense.t.dtype,
         x.device,
