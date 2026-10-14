@@ -79,3 +79,5 @@ comptime FR_L1 = 1
 comptime FR_L2 = 2
 comptime FR_LINF = 3
 comptime FR_MAX = 4
+comptime FR_LNEGINF = 5  # the -inf norm: min of |x|
+comptime FR_LP = 6  # any other order p: sum(|x|^p) (and its 1/p root)

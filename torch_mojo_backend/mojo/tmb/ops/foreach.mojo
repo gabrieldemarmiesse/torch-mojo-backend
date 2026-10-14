@@ -89,6 +89,8 @@ from tmb.kernels.foreach.contract import (
     FR_L1,
     FR_L2,
     FR_LINF,
+    FR_LNEGINF,
+    FR_LP,
     FR_MAX,
     FE_ROLE_ALPHA,
     FE_ROLE_B,
@@ -102,6 +104,7 @@ from tmb.ops.common import (
     fill_value,
     device_str,
     is_float_stype,
+    known_stype,
     promote_types,
     scalar_to_float,
     scalar_to_int,
@@ -1343,7 +1346,12 @@ def op_foreach_copy_(
 
 
 def _reduce_launch(
-    tensors: List[T], norm: Int, root: Bool, out_stype: Int32
+    tensors: List[T],
+    norm: Int,
+    root: Bool,
+    out_stype: Int32,
+    p: Float64 = 0.0,
+    one_element_abs: Bool = False,
 ) raises -> List[T]:
     var outs = List[Owned]()
     var total_chunks = 0
@@ -1370,6 +1378,8 @@ def _reduce_launch(
     call.out_dtype(max_dtype(out_stype))
     call.tuple(metadata)
     call.int(partials.t.ptr)
+    call.f64(p)
+    call.int(1 if one_element_abs else 0)
     call.int(ctx_ptr(ctx))
     call.run()
     _ = partials  # alive past the launch (its last use above is the pointer read)
@@ -1478,10 +1488,11 @@ def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
                     " empty tensor because the operation does not have an"
                     " identity"
                 )
+    # Stock CUDA (torch 2.11) takes ord 0 off its fast route: the slow
+    # route's linalg_vector_norm runs it (measured: its dtype errors are
+    # linalg.vector_norm's).
     var norm = -1
-    if p == 0 and root:
-        norm = FR_L0
-    elif p == 1:
+    if p == 1:
         norm = FR_L1
     elif p == 2:
         norm = FR_L2
@@ -1507,38 +1518,117 @@ def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
         # Apple: the float32 L2 norm's fixed-arity kernels.
         ret_tensor_list(rets, 0, _foreach_norm_launch(self_list))
         return
-    var op = String(
-        "aten::linalg_vector_norm" if root else "aten::linalg__powsum"
-    )
     var result = List[Owned]()
     for t in self_list:
-        if not t.dtype.is_floating_point():
-            # The per-tensor reductions CUDA's slow route runs, on integer
-            # and bool tensors (measured on stock CUDA): linalg.vector_norm
-            # refuses them whatever `dtype`; linalg__powsum without a
-            # `dtype` sums in int64, whose powsum kernel does not exist
-            # (NotImplementedError) unless the tensor is empty, where the
-            # sum is an int64 0. With a `dtype` it computes in that dtype.
-            if root:
-                raise Error(
-                    (
-                        "linalg.vector_norm: Expected a floating point or"
-                        " complex tensor as input. Got "
-                    ),
-                    _scalar_type_name(t.dtype),
-                )
-            if dtype_v.tag == TAG_NONE:
-                if t.numel > 0:
-                    unsupported("\"powsum_cuda\" not implemented for 'Long'")
-                var zero = own(new_scalar(ST_INT64, t.device))
-                fill_value(zero.t, 0.0)
-                result.append(zero^)
-                continue
-        result.append(own(_seq_vector_norm(op, t, ord_v, dtype_v)))
+        result.append(own(_lp_one(t, root, ord_v, p, dtype_v)))
     var out = List[T]()
     for i in range(len(result)):
         out.append(result[i].take())
     ret_tensor_list(rets, 0, out)
+
+
+def _ord_text(ord_v: Value, p: Float64) -> String:
+    """The order as c10::Scalar prints it in linalg.vector_norm's messages."""
+    if ord_v.tag == TAG_SCALAR_INT or ord_v.tag == TAG_INT:
+        return String(Int(p))
+    if p == Float64(Int(p)):
+        return String(Int(p))
+    return String(p)
+
+
+def _reduce_input_ok(dt: DType) -> Bool:
+    """The input dtypes the norm reduction builds (bool as uint8)."""
+    return (
+        dt.is_floating_point()
+        and dt != DType.float8_e4m3fn
+        and dt != DType.float8_e5m2
+        or dt == DType.bool
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
+        or dt == DType.uint8
+    )
+
+
+def _lp_one(
+    t: T, root: Bool, ord_v: Value, p: Float64, dtype_v: Value
+) raises -> T:
+    """One tensor of CUDA's slow route: `linalg_vector_norm` (root) or
+    `linalg__powsum` of the whole tensor, with their checks and their
+    arithmetic (LinearAlgebra.cpp, ReduceNormKernel.cu), measured on stock
+    CUDA: the elements converted to the result dtype, then accumulated in
+    its opmath (float32 for the half types) and rounded once."""
+    var inf = Float64.MAX * 2
+    var out_stype: Int32
+    if root:
+        if not t.dtype.is_floating_point():
+            raise Error(
+                (
+                    "linalg.vector_norm: Expected a floating point or"
+                    " complex tensor as input. Got "
+                ),
+                _scalar_type_name(t.dtype),
+            )
+        if t.numel == 0 and (p < 0 or p == inf):
+            raise Error(
+                "linalg.vector_norm cannot compute the ",
+                _ord_text(ord_v, p),
+                (
+                    " norm on an empty tensor because the operation does not"
+                    " have an identity"
+                ),
+            )
+        _check_norm_dtype(dtype_v, t.stype, "linalg.vector_norm")
+        out_stype = v_dtype_or(dtype_v, t.stype)
+    else:
+        # get_dtype_from_self(promote_integers=True): `dtype`, else int64
+        # for an integer or bool tensor. Only a floating computation dtype
+        # has a powsum kernel: an empty tensor is a 0 of the computation
+        # dtype (no kernel runs), any other raises.
+        out_stype = v_dtype_or(
+            dtype_v, t.stype if t.dtype.is_floating_point() else ST_INT64
+        )
+        if not is_float_stype(out_stype):
+            if t.numel == 0 and known_stype(out_stype):
+                var zero = new_scalar(out_stype, t.device)
+                fill_value(zero, 0.0)
+                return zero^
+            unsupported(
+                '"powsum_cuda" not implemented for \''
+                + _scalar_type_name(max_dtype(out_stype))
+                + "'"
+            )
+    if dev(t.device)[].api == "metal" or not _reduce_input_ok(t.dtype):
+        var op = String(
+            "aten::linalg_vector_norm" if root else "aten::linalg__powsum"
+        )
+        return _seq_vector_norm(op, t, ord_v, dtype_v)
+    # ReduceNormKernel.cu: the norm specializes 0, 1, 2, inf and -inf, the
+    # powsum only 2 (its order 1 is NormOps' pow(|x|, 1), which CUDA's
+    # double pow does not keep exact: pow(3., 1.) = 2.9999999999999996).
+    var norm = FR_LP
+    if root and p == 0:
+        norm = FR_L0
+    elif root and p == 1:
+        norm = FR_L1
+    elif p == 2:
+        norm = FR_L2
+    elif root and p == inf:
+        norm = FR_LINF
+    elif root and p == -inf:
+        norm = FR_LNEGINF
+    var one = List[T]()
+    var dense = t.contig or is_dense(t.shape, t.strides, t.rank)
+    var tmp = own(new_like(t) if not dense else new_scalar(t.stype, t.device))
+    if dense:
+        one.append(t.copy())
+    else:
+        copy_strided_into(tmp.t, t)
+        one.append(tmp.t.copy())
+    var r = _reduce_launch(one, norm, root, out_stype, p, one_element_abs=root)
+    _ = tmp
+    return r[0].copy()
 
 
 # aten::_foreach_norm.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]
