@@ -3246,3 +3246,45 @@ def test_mta_max_of_negative_infinities_is_negative_infinity(mojo_gpu: str):
         (actual,) = torch._foreach_max([x.to(mojo_gpu)])
         assert actual.cpu().item() == float("-inf")
         assert torch._foreach_max([x])[0].item() == float("-inf")
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.int64, torch.int32, torch.int8, torch.uint8, torch.bool], ids=str
+)
+def test_mta_norm_and_powsum_on_integer_lists(mojo_gpu: str, dtype: torch.dtype):
+    """What stock CUDA (torch 2.11, H100) does with integer lists: they take
+    the per-tensor slow route. powsum with a `dtype` computes in it; without
+    one a non-empty tensor raises and an empty one is an int64 0; norm
+    refuses them whatever the `dtype`."""
+    names = {
+        torch.int64: "Long",
+        torch.int32: "Int",
+        torch.int8: "Char",
+        torch.uint8: "Byte",
+        torch.bool: "Bool",
+    }
+    cpu = [torch.arange(5).to(dtype), torch.ones(3, dtype=dtype)]
+    dev = [t.to(mojo_gpu) for t in cpu]
+    outs = [torch.float32] if is_metal(mojo_gpu) else [torch.float32, torch.float64]
+    for ord_ in (1, 2, 3):
+        for out in outs:
+            got = torch._foreach_powsum(dev, ord_, dtype=out)
+            want = [t.to(out).abs().pow(ord_).sum() for t in cpu]
+            _assert_lists(got, want, rtol=1e-6, atol=1e-6)
+    with pytest.raises(
+        NotImplementedError, match="\"powsum_cuda\" not implemented for 'Long'"
+    ):
+        torch._foreach_powsum(dev, 2)
+    empty = [torch.empty(0, dtype=dtype, device=mojo_gpu)]
+    (zero,) = torch._foreach_powsum(empty, 2)
+    assert zero.dtype == torch.int64 and zero.cpu().item() == 0
+    (zero,) = torch._foreach_powsum(empty, 2, dtype=torch.float32)
+    assert zero.dtype == torch.float32 and zero.cpu().item() == 0
+    message = (
+        f"Expected a floating point or complex tensor as input. Got {names[dtype]}"
+    )
+    for kwargs in ({}, {"dtype": torch.float32}):
+        with pytest.raises(RuntimeError, match=message):
+            torch._foreach_norm(dev, 2, **kwargs)
+        with pytest.raises(RuntimeError, match=message):
+            torch._foreach_norm(empty, 2, **kwargs)

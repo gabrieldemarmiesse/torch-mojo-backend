@@ -32,6 +32,7 @@ from std.math import ceildiv
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    ST_INT64,
     ST_COMPLEX32,
     ST_COMPLEX64,
     ST_COMPLEX128,
@@ -98,6 +99,7 @@ from tmb.kernels.foreach.contract import (
 )
 from tmb.ops.common import (
     copy_strided_into,
+    fill_value,
     device_str,
     is_float_stype,
     promote_types,
@@ -1467,16 +1469,6 @@ def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
     )
     if len(self_list) == 0:
         raise Error("Tensor list must have at least one tensor.")
-    if not root:
-        # The per-tensor linalg__powsum CUDA's slow route runs dispatches on
-        # floating types only (AT_DISPATCH in its powsum kernel).
-        for t in self_list:
-            if not t.dtype.is_floating_point():
-                unsupported(
-                    '"powsum_cuda" not implemented for \''
-                    + _scalar_type_name(t.dtype)
-                    + "'"
-                )
     var inf = Float64.MAX * 2
     if root and p == inf:
         for t in self_list:
@@ -1520,6 +1512,28 @@ def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
     )
     var result = List[Owned]()
     for t in self_list:
+        if not t.dtype.is_floating_point():
+            # The per-tensor reductions CUDA's slow route runs, on integer
+            # and bool tensors (measured on stock CUDA): linalg.vector_norm
+            # refuses them whatever `dtype`; linalg__powsum without a
+            # `dtype` sums in int64, whose powsum kernel does not exist
+            # (NotImplementedError) unless the tensor is empty, where the
+            # sum is an int64 0. With a `dtype` it computes in that dtype.
+            if root:
+                raise Error(
+                    (
+                        "linalg.vector_norm: Expected a floating point or"
+                        " complex tensor as input. Got "
+                    ),
+                    _scalar_type_name(t.dtype),
+                )
+            if dtype_v.tag == TAG_NONE:
+                if t.numel > 0:
+                    unsupported("\"powsum_cuda\" not implemented for 'Long'")
+                var zero = own(new_scalar(ST_INT64, t.device))
+                fill_value(zero.t, 0.0)
+                result.append(zero^)
+                continue
         result.append(own(_seq_vector_norm(op, t, ord_v, dtype_v)))
     var out = List[T]()
     for i in range(len(result)):
