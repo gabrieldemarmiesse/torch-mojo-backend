@@ -852,6 +852,10 @@ def scalar_to_float(v: Value, st: Int32) raises -> Float64:
     `c10::overflows` does, while inf and NaN pass. The result is the float64
     the caller narrows into `st` (a float64 target never overflows)."""
     var f = v_f64(v)
+    if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
+        # an integer: one rounding into the target (int64 -> float for the
+        # single-precision ones), not through a double
+        f = int_to_component(v.a, st)
     if st != ST_FLOAT16 and st != ST_BFLOAT16 and st != ST_FLOAT32:
         return f
     var top = 3.4028234663852886e38  # float32
@@ -1536,18 +1540,49 @@ def check_scalar_fits(st: Int32, re: Float64, im: Float64) raises:
         )
 
 
+def int_to_component(i: Int64, st: Int32) -> Float64:
+    """An integer as dtype `st`'s real component in ONE rounding: int64 ->
+    float for complex64 / float32 / half / bfloat16 (the latter two round
+    on from that float, as c10 does), int64 -> double otherwise (never a
+    double first for a float32 target)."""
+    if (
+        st == ST_COMPLEX64
+        or st == ST_FLOAT32
+        or st == ST_FLOAT16
+        or st == ST_BFLOAT16
+    ):
+        return Float64(Scalar[DType.int64](i).cast[DType.float32]())
+    return Float64(i)
+
+
+def uint_to_component(u: UInt64, st: Int32) -> Float64:
+    """`int_to_component` of an unsigned 64-bit integer."""
+    if (
+        st == ST_COMPLEX64
+        or st == ST_FLOAT32
+        or st == ST_FLOAT16
+        or st == ST_BFLOAT16
+    ):
+        return Float64(Scalar[DType.uint64](u).cast[DType.float32]())
+    return Float64(u)
+
+
+def scalar_parts(v: Value, st: Int32) raises -> Tuple[Float64, Float64]:
+    """A Scalar record's (re, im) as dtype `st` will hold them: an integer
+    rounded once into the component type (`int_to_component`), any other
+    record as `v_complex` reads it."""
+    if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
+        return (int_to_component(v.a, st), 0.0)
+    return v_complex(v)
+
+
 def fill_complex(t: T, v: Value) raises:
     """fill_ of a complex tensor: the two parts of the Scalar (a real one has
     a zero imaginary part) into the two strided component views; one memset
     for an all-zero value."""
-    var c = v_complex(v)
+    var c = scalar_parts(v, t.stype)  # an integer: one rounding
     var re = c[0]
     var im = c[1]
-    if (
-        v.tag == TAG_SCALAR_INT or v.tag == TAG_INT
-    ) and t.stype == ST_COMPLEX64:
-        # an integer converts to float in one rounding (int64 -> float)
-        re = Float64(Int64(v.a).cast[DType.float32]())
     if t.is_conj():
         im = -im
     if t.numel == 0:

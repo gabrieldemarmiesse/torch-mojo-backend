@@ -21,6 +21,10 @@ from tmb.backend.abi import (
     TAG_COMPLEX,
     TAG_DOUBLE,
     TAG_SCALAR_BOOL,
+    TAG_SCALAR_INT,
+    TAG_INT,
+    TAG_BOOL,
+    complex_of,
     TAG_SCALAR_DOUBLE,
     dtype_name,
     ST_FLOAT16,
@@ -151,6 +155,40 @@ def _shape_of(sizes: IntList) raises -> IndexList[MAX_RANK]:
             raise Error("negative dimension ", sizes[i])
         shape[pad + i] = sizes[i]
     return shape
+
+
+# aten::scalar_tensor(Scalar s, *, ScalarType? dtype, Layout? layout,
+#   Device? device, bool? pin_memory) -> Tensor
+def op_scalar_tensor(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """A 0-d tensor holding `s`, as at::detail::scalar_tensor_static makes
+    it (what Python item assignment builds the value with: `x[i] = v`): a
+    half / bfloat16 destination takes the double unchecked (overflowing to
+    inf, like the torch.tensor constructor); any other dtype converts
+    checked, as fill_ does."""
+    var v = args[unsafe_offset=0].copy()
+    var dflt = default_dtype()
+    if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
+        dflt = ST_INT64
+    elif v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL:
+        dflt = ST_BOOL
+    elif v.tag == TAG_COMPLEX:
+        dflt = complex_of(default_dtype())
+    var stype = v_dtype_or(args[unsafe_offset=1], dflt)
+    var device = _target_device(args[unsafe_offset=3])
+    var out = own(new_tensor(IndexList[MAX_RANK](1), 0, stype, device))
+    if is_complex_stype(stype):
+        var c = v_complex(v)
+        check_scalar_fits(stype, c[0], c[1])
+        fill_complex(out.t, v)
+    elif stype == ST_FLOAT16 or stype == ST_BFLOAT16:
+        # scalar_tensor_static's relaxed cast: value.to<double>(), no check
+        fill_value(out.t, v_complex(v)[0])
+    else:
+        check_real_scalar_fits(stype, v)
+        fill_value(out.t, v)
+    ret_tensor(rets, 0, out.take())
 
 
 # aten::empty.memory_format(SymInt[] size, *, ScalarType? dtype, Layout? layout,
@@ -1112,4 +1150,5 @@ def register_core(site: Site) raises:
     impl[op_local_scalar_dense, "_local_scalar_dense"](site)
     impl[op_fill_scalar_, "fill_.Scalar"](site)
     impl[op_zero_, "zero_"](site)
+    impl[op_scalar_tensor, "scalar_tensor"](site)
     impl[op_record_stream, "record_stream"](site)
