@@ -2604,6 +2604,35 @@ def _blas_epilogue[
 
 
 @always_inline
+def pointwise_op_impl[
+    multiplies: Bool, w: DType, n: Int
+](
+    input: SIMD[w, n],
+    tensor1: SIMD[w, n],
+    tensor2: SIMD[w, n],
+    alpha: Scalar[w],
+) -> SIMD[w, n]:
+    """`input + alpha * op(tensor1, tensor2)` in opmath `w`, op the product
+    (addcmul) or the quotient (addcdiv): DeviceAddCmulCdiv.cuh, which CUDA's
+    per-tensor (PointwiseOpsKernel.cu) and foreach kernels share. alpha == 1
+    skips the scale; a floating product is one explicit fma."""
+    var q: SIMD[w, n]
+    comptime if multiplies:
+        q = tensor1 * tensor2
+    else:
+        q = tensor1 / tensor2
+    if alpha == 1:
+        comptime if multiplies and w.is_floating_point():
+            return tensor1.fma(tensor2, input)
+        else:
+            return input + q
+    comptime if w.is_floating_point():
+        return SIMD[w, n](alpha).fma(q, input)
+    else:
+        return input + alpha * q
+
+
+@always_inline
 def pointwise[
     kind: StaticString, dtype: DType, out_dtype: DType, n: Int
 ](

@@ -48,13 +48,24 @@ _IMPL_RE = re.compile(
 )
 
 
+# The foreach group registers its elementwise overloads from one table
+# (`FOREACH_OVERLOADS` in tmb/ops/foreach.mojo, a comptime loop of impl[...]):
+# every schema name in a row of that table is a registration.
+_FOREACH_TABLE_RE = re.compile(
+    r"comptime FOREACH_OVERLOADS: List\[ForeachOverload\] = \[(.*?)\n\]", re.S
+)
+_FOREACH_NAME_RE = re.compile(r'"(_foreach_[A-Za-z0-9_]+(?:\.[A-Za-z]+)?)"')
+
+
 def registered_ops() -> set[str]:
     names: set[str] = set()
     for path in sorted(OPS_DIR.glob("*.mojo")):
+        text = path.read_text()
         names |= {
-            name if "::" in name else f"aten::{name}"
-            for name in _IMPL_RE.findall(path.read_text())
+            name if "::" in name else f"aten::{name}" for name in _IMPL_RE.findall(text)
         }
+        for table in _FOREACH_TABLE_RE.findall(text):
+            names |= {f"aten::{name}" for name in _FOREACH_NAME_RE.findall(table)}
     if not names:
         raise AssertionError(f"no aten op registrations found under {OPS_DIR}")
     return names
