@@ -101,6 +101,9 @@ from tmb.backend.device import current_device
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    int_to_component,
+    scalar_parts,
+    uint_to_component,
     fill_item,
     shares_storage,
     check_real_scalar_fits,
@@ -532,6 +535,8 @@ struct _Operand(Movable):
     var im: Float64
     var stype: Int32  # the dtype it promotes as
     var rank_kind: Int
+    var ikind: Int  # 1: re is the integer `ibits`, 2: the unsigned one
+    var ibits: Int64
 
     def __init__(out self, t: T) raises:
         self.is_t = True
@@ -542,6 +547,8 @@ struct _Operand(Movable):
         self.im = 0.0
         self.stype = t.stype
         self.rank_kind = _RANK_DIM if t.rank > 0 else _RANK_ZERO
+        self.ikind = 0
+        self.ibits = 0
 
     def __init__(
         out self,
@@ -559,6 +566,17 @@ struct _Operand(Movable):
         self.im = im
         self.stype = stype
         self.rank_kind = rank_kind
+        self.ikind = 0
+        self.ibits = 0
+
+    def parts(self, st: Int32) -> Tuple[Float64, Float64]:
+        """(re, im) as complex dtype `st` holds them: an integer value
+        rounded once into the component type."""
+        if self.ikind == 1:
+            return (int_to_component(self.ibits, st), self.im)
+        if self.ikind == 2:
+            return (uint_to_component(UInt64(self.ibits), st), self.im)
+        return (self.re, self.im)
 
 
 def _host_value(t: T) raises -> Tuple[Float64, Float64]:
@@ -650,6 +668,52 @@ def _host_value(t: T) raises -> Tuple[Float64, Float64]:
     return (Float64(b), 0.0)
 
 
+def _host_int_kind(t: T) -> Int:
+    """1 for a signed (or narrow unsigned) integer host tensor, 2 for a
+    uint64 one, 0 otherwise: their value is kept exact."""
+    if t.stype == ST_UINT64:
+        return 2
+    var dt = t.dtype
+    if (
+        dt == DType.int64
+        or dt == DType.int32
+        or dt == DType.int16
+        or dt == DType.int8
+        or dt == DType.uint8
+        or dt == DType.uint16
+        or dt == DType.uint32
+    ):
+        return 1
+    return 0
+
+
+def _host_int_bits(t: T) -> Int64:
+    """The one element of an integer host tensor, exactly."""
+    var p = t.ptr
+    var dt = t.dtype
+    if dt == DType.int64 or dt == DType.uint64:
+        return Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=p)[]
+    if dt == DType.int32:
+        return Int64(
+            Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=p)[]
+        )
+    if dt == DType.uint32:
+        return Int64(
+            Pointer[UInt32, MutUntrackedOrigin](unsafe_from_address=p)[]
+        )
+    if dt == DType.int16:
+        return Int64(
+            Pointer[Int16, MutUntrackedOrigin](unsafe_from_address=p)[]
+        )
+    if dt == DType.uint16:
+        return Int64(
+            Pointer[UInt16, MutUntrackedOrigin](unsafe_from_address=p)[]
+        )
+    if dt == DType.int8:
+        return Int64(Pointer[Int8, MutUntrackedOrigin](unsafe_from_address=p)[])
+    return Int64(Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=p)[])
+
+
 def _operand(v: Value, like: T) raises -> _Operand:
     """Read one operand record (`like` is any mojo tensor of the call, a
     placeholder for the host kinds)."""
@@ -659,14 +723,20 @@ def _operand(v: Value, like: T) raises -> _Operand:
             return _Operand(t)
         if t.on_cpu() and t.rank == 0:
             var hv = _host_value(t)
+            var st = t.stype
+            var rk = _RANK_ZERO
             if t.is_wrapped_number():
-                var st = t.stype
+                rk = _RANK_WRAPPED
                 if is_complex_stype(st):
                     st = _default_complex()
                 elif _is_float(st):
                     st = default_dtype()
-                return _Operand(like, hv[0], hv[1], st, _RANK_WRAPPED)
-            return _Operand(like, hv[0], hv[1], t.stype, _RANK_ZERO)
+            var o = _Operand(like, hv[0], hv[1], st, rk)
+            var kind = _host_int_kind(t)
+            if kind != 0:
+                o.ikind = kind
+                o.ibits = _host_int_bits(t)
+            return o^
         raise Error(
             (
                 "Expected all tensors to be on the same device, but found at"
@@ -690,7 +760,10 @@ def _operand(v: Value, like: T) raises -> _Operand:
             like, 1.0 if v.a != 0 else 0.0, 0.0, ST_BOOL, _RANK_WRAPPED
         )
     if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
-        return _Operand(like, Float64(v.a), 0.0, ST_INT64, _RANK_WRAPPED)
+        var o = _Operand(like, Float64(v.a), 0.0, ST_INT64, _RANK_WRAPPED)
+        o.ikind = 1
+        o.ibits = v.a
+        return o^
     if v.tag == TAG_SCALAR_DOUBLE or v.tag == TAG_DOUBLE:
         return _Operand(like, v_f64(v), 0.0, default_dtype(), _RANK_WRAPPED)
     raise Error("unexpected operand record tag ", v.tag)
@@ -794,7 +867,8 @@ def _flatten(
     """The operand as the complex family takes it: cast to `st`, then a dense
     buffer of `shape`, one device element (a 0-d tensor) or a host value."""
     if not x.is_t:
-        return _Flat(CX_HOST, 0, x.re, x.im)
+        var pr = x.parts(st)  # an integer: one rounding into st's parts
+        return _Flat(CX_HOST, 0, pr[0], pr[1])
     var cast = own_if_new(cast_complex(x.t, st), x.t)
     if cast.t.rank == 0:
         var flat = _Flat(CX_DEVICE, cast.t.ptr, 0.0, 0.0)
@@ -2072,7 +2146,8 @@ def _device_complex(v: Value, st: Int32, like: T) raises -> Owned:
             return own_if_new(cast_complex(t, st), t)
     var op = _operand(v, like)
     var one = own(new_tensor(IndexList[MAX_RANK](1), 0, st, like.device))
-    fill_complex(one.t, Value(TAG_COMPLEX, 0, f64_bits(op.re), f64_bits(op.im)))
+    var pr = op.parts(st)
+    fill_complex(one.t, Value(TAG_COMPLEX, 0, f64_bits(pr[0]), f64_bits(pr[1])))
     return one^
 
 
@@ -2185,7 +2260,7 @@ def _masked_fill_into(target: T, mask: Value, value: Value) raises:
             target.stype,
             vt.on_mojo() and target.on_mojo() and vt.device == target.device,
         )
-    var parts = v_complex(val)
+    var parts = scalar_parts(val, target.stype)  # an integer: one rounding
     # the Scalar's checked conversion, before anything is written
     check_scalar_fits(target.stype, parts[0], parts[1])
     var rv = as_real(target)
@@ -2329,7 +2404,7 @@ def _masked_fill_real_(self: T, args: Values) raises:
             vt.on_mojo() and self.on_mojo() and vt.device == self.device,
         )
     check_real_scalar_fits(self.stype, val)
-    var c = v_complex(val)
+    var c = scalar_parts(val, self.stype)  # an integer: one rounding
     var m = _Call("aten::masked_fill_", "Scalar")
     m.t(self)
     m.v(args[unsafe_offset=1])

@@ -3243,6 +3243,8 @@ def op_index_put_impl_(
     # per-slice-width rounding of `scatter_add_sorted`); matching it would
     # put a sort on this hot path, so it is left as a known difference.
     var accumulate = v_bool(args[unsafe_offset=3])
+    if target.stype == ST_UINT64:
+        unsupported("\"index_put\" not implemented for 'UInt64'")  # (CUDA's)
     if (
         len(indices) == 1
         and len(present) >= 1
