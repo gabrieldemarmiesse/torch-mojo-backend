@@ -114,7 +114,7 @@ from tmb.backend.device import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
-    uint64_fill_value,
+    real_fill_value,
     is_float_stype,
     check_real_scalar_fits,
     check_scalar_fits,
@@ -172,7 +172,8 @@ def op_scalar_tensor(
     - complex: the checked complex conversion;
     - bool: the value's truth;
     - every other dtype: value.to<scalar_t>(), checked (a complex with no
-      imaginary part converts; uint64 takes doubles up to 2**64 exactly).
+      imaginary part converts as its real part does; uint64 takes doubles
+      up to 2**64 as the host static_cast does -- `real_fill_value`).
     An explicit torch.scalar_tensor(70000., dtype=half) is checked on CUDA
     (a device fill_) but inf here: both entry points reach this one op."""
     var v = args[unsafe_offset=0].copy()
@@ -197,10 +198,8 @@ def op_scalar_tensor(
             v.tag == TAG_SCALAR_INT or v.tag == TAG_INT
         ) else c[0]
         fill_value(out.t, dbl)
-    elif v.tag == TAG_COMPLEX:
-        fill_value(out.t, Value(TAG_SCALAR_DOUBLE, 0, f64_bits(c[0]), 0))
     else:
-        fill_value(out.t, uint64_fill_value(stype, v))
+        fill_value(out.t, real_fill_value(stype, v))
     ret_tensor(rets, 0, out.take())
 
 
@@ -1073,15 +1072,12 @@ def op_fill_scalar_(
     # checked first, as CUDA's fill_ (value.to<scalar_t>()).
     var v = args[unsafe_offset=1].copy()
     check_real_scalar_fits(t.stype, v)
-    v = uint64_fill_value(t.stype, v)
+    v = real_fill_value(t.stype, v)
     if v.tag == TAG_COMPLEX:
-        # a complex Scalar that fits: its real part (bool: either part)
+        # a complex Scalar into bool: its truth reads either part
         var c = v_complex(v)
-        if t.stype == ST_BOOL:
-            var truth = Int64(1) if c[0] != 0.0 or c[1] != 0.0 else Int64(0)
-            v = Value(TAG_SCALAR_BOOL, 0, truth, 0)
-        else:
-            v = Value(TAG_SCALAR_DOUBLE, 0, f64_bits(c[0]), 0)
+        var truth = Int64(1) if c[0] != 0.0 or c[1] != 0.0 else Int64(0)
+        v = Value(TAG_SCALAR_BOOL, 0, truth, 0)
     fill_value(t, v)
     ret_ref(rets, 0, t)
 

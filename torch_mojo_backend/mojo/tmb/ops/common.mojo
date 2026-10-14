@@ -837,7 +837,11 @@ def scalar_to_int(v: Value, st: Int32) raises -> Int:
     var lo_f = 0.0 if st == ST_UINT8 else Float64(lo)
     var ok = f >= lo_f and f <= Float64(hi)
     if st == ST_INT64:
-        ok = f >= -9223372036854775808.0 and f < 9223372036854775808.0
+        # c10::overflows compares with double(INT64_MAX), which is 2**63:
+        # 2**63 itself passes, and the host static_cast gives INT64_MIN
+        ok = f >= -9223372036854775808.0 and f <= 9223372036854775808.0
+        if ok and f == 9223372036854775808.0:
+            return Int.MIN
     if not ok:
         raise Error(
             "value cannot be converted to type ", name, " without overflow"
@@ -1508,28 +1512,76 @@ def fill_item(value: T, dst: Int32, same_device: Bool) raises -> Value:
     )
 
 
-def uint64_fill_value(st: Int32, v: Value) raises -> Value:
-    """A floating Scalar of 2**63 or more for a uint64 destination as its
-    exact (truncated) 64 bits in an int record -- the fill kernels go
-    through int64, and an int record carries the bits whole. Anything else
-    is returned unchanged."""
-    if st != ST_UINT64:
+def real_fill_value(st: Int32, v: Value) raises -> Value:
+    """The Scalar record `v`, already range-checked for the real dtype `st`
+    (`check_real_scalar_fits`), as the record the fill kernels take: the one
+    conversion every Scalar entry point into a real tensor shares (fill_,
+    scalar_tensor, full, masked_fill, item assignment).
+    - A complex Scalar (its imaginary part is zero, or the check raised)
+      becomes its real part as a double, then converts as that double does.
+      A bool destination keeps the record: its truth reads either part.
+    - Into uint64, a double of 2**63 or more becomes an int record holding
+      the 64 bits of C++'s host `static_cast<uint64_t>` (the fill kernels go
+      through int64): exact below 2**64, and 0 for 2**64 itself, which
+      c10::overflows lets through (it compares with double(UINT64_MAX)).
+    Anything else is returned unchanged."""
+    if st == ST_BOOL or is_complex_stype(st):
         return v.copy()
-    if (
-        v.tag == TAG_SCALAR_DOUBLE
-        or v.tag == TAG_DOUBLE
-        or v.tag == TAG_COMPLEX
-    ):
-        var c = v_complex(v)
-        if c[0] >= 9223372036854775808.0:
-            var u = UInt64(c[0])
-            return Value(
-                TAG_SCALAR_INT,
-                0,
-                Int64(Scalar[DType.uint64](u).cast[DType.int64]()),
-                0,
-            )
-    return v.copy()
+    var r = v.copy()
+    if r.tag == TAG_COMPLEX:
+        r = Value(TAG_SCALAR_DOUBLE, 0, f64_bits(v_complex(v)[0]), 0)
+    if st == ST_UINT64 and (r.tag == TAG_SCALAR_DOUBLE or r.tag == TAG_DOUBLE):
+        var d = v_complex(r)[0]
+        if d >= 9223372036854775808.0:
+            var bits = Int64(0)
+            if d < 18446744073709551616.0:
+                bits = Int64(
+                    Scalar[DType.uint64](UInt64(d)).cast[DType.int64]()
+                )
+            return Value(TAG_SCALAR_INT, 0, bits, 0)
+    return r^
+
+
+def scalar_type_name(st: Int32) -> String:
+    """c10::toString(ScalarType): the name ATen's dispatch errors print
+    (`"index_put" not implemented for 'UInt64'`)."""
+    if st == ST_FLOAT32:
+        return "Float"
+    if st == ST_FLOAT64:
+        return "Double"
+    if st == ST_FLOAT16:
+        return "Half"
+    if st == ST_BFLOAT16:
+        return "BFloat16"
+    if st == ST_INT64:
+        return "Long"
+    if st == ST_INT32:
+        return "Int"
+    if st == ST_INT16:
+        return "Short"
+    if st == ST_INT8:
+        return "Char"
+    if st == ST_UINT8:
+        return "Byte"
+    if st == ST_BOOL:
+        return "Bool"
+    if st == ST_UINT16:
+        return "UInt16"
+    if st == ST_UINT32:
+        return "UInt32"
+    if st == ST_UINT64:
+        return "UInt64"
+    if st == ST_COMPLEX64:
+        return "ComplexFloat"
+    if st == ST_COMPLEX128:
+        return "ComplexDouble"
+    return String(st)
+
+
+def is_wide_unsigned(st: Int32) -> Bool:
+    """uint16 / uint32 / uint64: the dtypes CUDA's masked_fill, index_fill
+    and index_put kernels are not instantiated for."""
+    return st == ST_UINT16 or st == ST_UINT32 or st == ST_UINT64
 
 
 def check_scalar_fits(st: Int32, re: Float64, im: Float64) raises:
