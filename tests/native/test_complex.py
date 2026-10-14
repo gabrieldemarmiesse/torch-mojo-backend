@@ -1123,8 +1123,11 @@ def test_non_blocking_device_to_host_bit_copies(mojo_gpu: str):
 
 def test_unsigned_fill_ranges(mojo_gpu: str):
     torch.empty(0, dtype=torch.uint64, device=mojo_gpu).fill_(1e19)
-    with pytest.raises(NotImplementedError):  # past int64: declined, not wrong
-        torch.zeros(2, dtype=torch.uint64, device=mojo_gpu).fill_(1e19)
+    # past int64: the exact 64 bits (as CUDA)
+    assert (
+        torch.zeros(2, dtype=torch.uint64, device=mojo_gpu).fill_(1e19).cpu().tolist()
+        == [10**19] * 2
+    )
     assert (
         torch.zeros(1, dtype=torch.uint64, device=mojo_gpu).fill_(-1).cpu().item()
         == 2**64 - 1
@@ -1457,3 +1460,85 @@ def test_index_put_on_uint64_is_cudas_not_implemented(mojo_gpu: str):
     x = torch.zeros(2, dtype=torch.uint64, device=mojo_gpu)
     with pytest.raises(NotImplementedError, match="index_put"):
         x[torch.tensor([0], device=mojo_gpu)] = -1
+
+
+# --- scalar_tensor and Python item assignment, as CUDA builds them --------------
+
+
+_ITEM_VALUES = [
+    True,
+    3,
+    -1,
+    2.5,
+    1e100,
+    1 + 2j,
+    1 + 0j,
+    1j,
+    2**63 - 1,
+    1e19,
+    70000.0,
+    -(2**63),
+]
+_ITEM_DTYPES = [
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+    torch.float64,
+    torch.int8,
+    torch.uint8,
+    torch.int32,
+    torch.int64,
+    torch.uint64,
+    torch.bool,
+    torch.complex64,
+    torch.complex128,
+]
+
+
+@pytest.mark.parametrize("dtype", _ITEM_DTYPES, ids=str)
+def test_item_assignment_matches_the_host_conversion(mojo_gpu: str, dtype: torch.dtype):
+    # CPU torch's item assignment uses the same scalar_tensor_static
+    # conversion CUDA's does (on the host), so it is the oracle here
+    if dtype in (torch.float64, torch.complex128):
+        _skip_c128(mojo_gpu, torch.complex128)
+    m = torch.tensor([True, False])
+    for v in _ITEM_VALUES:
+        for key in (0, m, slice(None)):
+            ref = torch.zeros(2, dtype=dtype)
+            errs = []
+            try:
+                ref[key] = v  # ty: ignore[invalid-assignment]
+            except RuntimeError as e:  # NotImplementedError included
+                errs.append(type(e))
+            x = torch.zeros(2, dtype=dtype, device=mojo_gpu)
+            dkey = key.to(mojo_gpu) if isinstance(key, torch.Tensor) else key
+            if errs:
+                with pytest.raises(errs[0]):
+                    x[dkey] = v  # ty: ignore[invalid-assignment]
+                assert torch.equal(x.cpu(), torch.zeros(2, dtype=dtype))
+            else:
+                x[dkey] = v  # ty: ignore[invalid-assignment]
+                assert torch.equal(x.cpu(), ref), (v, key)
+
+
+def test_scalar_tensor_defaults_to_the_float_dtype(mojo_gpu: str):
+    assert torch.scalar_tensor(3, device=mojo_gpu).dtype == torch.get_default_dtype()
+    assert torch.scalar_tensor(True, device=mojo_gpu).dtype == torch.get_default_dtype()
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.scalar_tensor(1 + 2j, device=mojo_gpu)
+    got = torch.scalar_tensor(1e19, dtype=torch.uint64, device=mojo_gpu)
+    assert got.cpu().item() == 10**19
+    assert (
+        torch.zeros(2, dtype=torch.uint64, device=mojo_gpu).fill_(1e19).cpu().tolist()
+        == [10**19] * 2
+    )
+
+
+def test_index_add_integer_alpha_rounds_once(mojo_gpu: str):
+    got = torch.zeros(1, dtype=torch.complex64, device=mojo_gpu).index_add(
+        0,
+        torch.tensor([0], device=mojo_gpu),
+        torch.ones(1, dtype=torch.complex64, device=mojo_gpu),
+        alpha=2**62 + 2**38 + 1,
+    )
+    assert got.cpu()[0].real.item() == 2**62 + 2**39

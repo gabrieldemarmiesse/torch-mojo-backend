@@ -114,7 +114,7 @@ from tmb.backend.device import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
-    check_uint64_fill,
+    uint64_fill_value,
     is_float_stype,
     check_real_scalar_fits,
     check_scalar_fits,
@@ -162,32 +162,45 @@ def _shape_of(sizes: IntList) raises -> IndexList[MAX_RANK]:
 def op_scalar_tensor(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    """A 0-d tensor holding `s`, as at::detail::scalar_tensor_static makes
-    it (what Python item assignment builds the value with: `x[i] = v`): a
-    half / bfloat16 destination takes the double unchecked (overflowing to
-    inf, like the torch.tensor constructor); any other dtype converts
-    checked, as fill_ does."""
+    """A 0-d tensor holding `s`. Its dtype defaults to the default float
+    dtype whatever the Scalar's kind (CUDA's scalar_tensor). The value
+    converts as at::detail::scalar_tensor_static does -- what Python item
+    assignment (`x[i] = v`, `x[mask] = v`, `x[:] = v`) builds its value
+    with on the host for CUDA, and through this op on this device:
+    - half / bfloat16: value.to<double>() (a complex with an imaginary part
+      raises), then an unchecked narrowing (overflow is inf);
+    - complex: the checked complex conversion;
+    - bool: the value's truth;
+    - every other dtype: value.to<scalar_t>(), checked (a complex with no
+      imaginary part converts; uint64 takes doubles up to 2**64 exactly).
+    An explicit torch.scalar_tensor(70000., dtype=half) is checked on CUDA
+    (a device fill_) but inf here: both entry points reach this one op."""
     var v = args[unsafe_offset=0].copy()
-    var dflt = default_dtype()
-    if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
-        dflt = ST_INT64
-    elif v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL:
-        dflt = ST_BOOL
-    elif v.tag == TAG_COMPLEX:
-        dflt = complex_of(default_dtype())
-    var stype = v_dtype_or(args[unsafe_offset=1], dflt)
+    var stype = v_dtype_or(args[unsafe_offset=1], default_dtype())
     var device = _target_device(args[unsafe_offset=3])
+    var c = v_complex(v)
+    if is_complex_stype(stype):
+        check_scalar_fits(stype, c[0], c[1])
+    elif stype == ST_FLOAT16 or stype == ST_BFLOAT16:
+        check_real_scalar_fits(ST_FLOAT64, v)  # value.to<double>()
+    elif stype != ST_BOOL:
+        check_real_scalar_fits(stype, v)
     var out = own(new_tensor(IndexList[MAX_RANK](1), 0, stype, device))
     if is_complex_stype(stype):
-        var c = v_complex(v)
-        check_scalar_fits(stype, c[0], c[1])
         fill_complex(out.t, v)
+    elif stype == ST_BOOL:
+        var truth = Int64(1) if c[0] != 0.0 or c[1] != 0.0 else Int64(0)
+        fill_value(out.t, Value(TAG_SCALAR_BOOL, 0, truth, 0))
     elif stype == ST_FLOAT16 or stype == ST_BFLOAT16:
-        # scalar_tensor_static's relaxed cast: value.to<double>(), no check
-        fill_value(out.t, v_complex(v)[0])
+        # the double, narrowed unchecked (through float, as c10 does)
+        var dbl = Float64(v.a) if (
+            v.tag == TAG_SCALAR_INT or v.tag == TAG_INT
+        ) else c[0]
+        fill_value(out.t, dbl)
+    elif v.tag == TAG_COMPLEX:
+        fill_value(out.t, Value(TAG_SCALAR_DOUBLE, 0, f64_bits(c[0]), 0))
     else:
-        check_real_scalar_fits(stype, v)
-        fill_value(out.t, v)
+        fill_value(out.t, uint64_fill_value(stype, v))
     ret_tensor(rets, 0, out.take())
 
 
@@ -1060,7 +1073,7 @@ def op_fill_scalar_(
     # checked first, as CUDA's fill_ (value.to<scalar_t>()).
     var v = args[unsafe_offset=1].copy()
     check_real_scalar_fits(t.stype, v)
-    check_uint64_fill(t.stype, v, t.numel)
+    v = uint64_fill_value(t.stype, v)
     if v.tag == TAG_COMPLEX:
         # a complex Scalar that fits: its real part (bool: either part)
         var c = v_complex(v)
