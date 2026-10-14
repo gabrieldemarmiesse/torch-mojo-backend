@@ -586,3 +586,89 @@ def test_arithmetic_argument_checks(mojo_gpu: str):
         torch.add(d, d, alpha=True)
     z = _rand(4)
     _close(torch.pow(True, z.to(mojo_gpu)), torch.pow(True, z))
+
+
+# --- round-4 review fixes -------------------------------------------------------
+
+
+def _cuda_cmul64(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """complex64 a * b as stock CUDA computes it (nvcc's contraction of
+    c10's operator*, measured bit-exact on 200k pairs): re = fma(a, c,
+    -(b d)), im = fma(a, d, b c), each fma in float64 then rounded."""
+    ar, ai = a.real.double(), a.imag.double()
+    br, bi = b.real.double(), b.imag.double()
+    bd = (ai * bi).float().double()
+    bc = (ai * br).float().double()
+    re = (ar * br - bd).float()
+    im = (ar * bi + bc).float()
+    return torch.complex(re, im)
+
+
+def test_mul_overflow_matches_cuda(mojo_gpu: str):
+    # recorded on stock CUDA (torch 2.11, H100)
+    a = torch.tensor([1e30 + 1e30j, 1e20 + 1e20j])
+    b = torch.tensor([1e30 - 1e30j, 1e20 - 1e20j])
+    got = (a.to(mojo_gpu) * b.to(mojo_gpu)).cpu()
+    assert got.tolist() == [complex(float("inf"), float("inf"))] * 2
+    vals = [1e20, -1e20, 1e30, -1e30, 3e38, -3e38, 2.5, -7e-3]
+    zs = torch.tensor([complex(x, y) for x in vals for y in vals])
+    x = zs.repeat_interleave(len(zs))
+    y = zs.repeat(len(zs))
+    got = torch.view_as_real((x.to(mojo_gpu) * y.to(mojo_gpu)).cpu())
+    want = torch.view_as_real(_cuda_cmul64(x, y))
+    # which parts overflow, and to which sign, is the contraction's doing;
+    # the finite parts agree up to the model's double rounding
+    assert torch.equal(got.isinf(), want.isinf())
+    assert torch.equal(got[got.isinf()], want[want.isinf()])
+    fin = got.isfinite()
+    torch.testing.assert_close(got[fin], want[fin], rtol=1e-6, atol=0)
+
+
+def test_pow_cpu_exponent_is_rounded_first(mojo_gpu: str):
+    z = torch.tensor([1e20j], device=mojo_gpu)
+    got = (z ** torch.tensor(2.00000001, dtype=torch.float64)).cpu()
+    assert got.real.item() == float("-inf") and got.imag.item() == 0.0
+
+
+def test_div_rounding_mode_into_a_complex_out(mojo_gpu: str):
+    out = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+    torch.div(
+        torch.tensor([-3.0, 3.0], device=mojo_gpu), 2, rounding_mode="floor", out=out
+    )
+    assert out.cpu().tolist() == [-2 + 0j, 1 + 0j]
+
+
+def test_mean_out_dtype_checks(mojo_gpu: str):
+    cout = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+    with pytest.raises(RuntimeError, match="could not infer output dtype"):
+        torch.mean(torch.tensor([1, 2, 3], device=mojo_gpu), 0, out=cout)
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.ops.aten.mean.dtype_out(
+            torch.tensor([1 + 2j], device=mojo_gpu), out=torch.empty(0, device=mojo_gpu)
+        )
+
+
+def test_abs_out_dtypes(mojo_gpu: str):
+    z = torch.tensor([3 + 4j], device=mojo_gpu)
+    with pytest.raises(
+        RuntimeError, match="Found dtype ComplexDouble but expected ComplexFloat"
+    ):
+        torch.abs(z, out=torch.empty(0, dtype=torch.complex128, device=mojo_gpu))
+    with pytest.raises(
+        RuntimeError, match="Found dtype ComplexFloat but expected Float"
+    ):
+        torch.abs(
+            torch.tensor([-1.0], device=mojo_gpu),
+            out=torch.empty(0, dtype=torch.complex64, device=mojo_gpu),
+        )
+    out = torch.empty(0, dtype=torch.complex64, device=mojo_gpu)
+    torch.abs(z, out=out)
+    assert out.cpu().tolist() == [5 + 0j]
+
+
+def test_pow_of_one_fills_any_out(mojo_gpu: str):
+    out = torch.empty(0, device=mojo_gpu)
+    torch.pow(1, torch.tensor([1 + 2j, 3j], device=mojo_gpu), out=out)
+    assert out.cpu().tolist() == [1.0, 1.0]
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch.pow(2, torch.tensor([1 + 2j], device=mojo_gpu), out=out)

@@ -2282,7 +2282,7 @@ def op_fill_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def register_unary(site: Site) raises:
     impl[routed[op_abs, cx_abs, 1], "abs"](site)
-    impl[routed[op_abs_out, cx_abs_out, 1], "abs.out"](site)
+    impl[routed[op_abs_out, cx_abs_out, 2], "abs.out"](site)
     impl[op_acos, "acos"](site)
     impl[op_acos_out, "acos.out"](site)
     impl[op_acosh, "acosh"](site)

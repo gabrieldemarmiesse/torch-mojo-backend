@@ -19,6 +19,7 @@ from tmb.ops.complex import (
     _TO_CX,
     _TO_RE,
     _bshape,
+    _category,
     _dims_of,
     _first_tensor,
     _flatten,
@@ -93,6 +94,7 @@ from tmb.backend.abi import (
     v_dtype_or,
     v_tensor_c,
     view_strided,
+    ret_ref,
 )
 
 
@@ -183,6 +185,12 @@ def _arith(
         )
         fb = _Flat(CX_HOST, 0, inv[0], inv[1])
         launch_kind = "mul"
+    if kind == "pow" and fb.mode == CX_HOST:
+        # the CPU-scalar exponent becomes a scalar_t first
+        # (iter.scalar_value<scalar_t>), so it is compared once rounded
+        if st == ST_COMPLEX64:
+            fb.re = Float64(Float32(fb.re))
+            fb.im = Float64(Float32(fb.im))
     if kind == "pow" and fb.mode == CX_HOST and fb.re == 2.0 and fb.im == 0.0:
         # pow_tensor_tensor_kernel: a CPU-scalar exponent goes through
         # pow_tensor_scalar_kernel as a complex Scalar, whose only shortcut
@@ -459,9 +467,10 @@ def cx_div_out_mode(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     """div.out_mode(self, other, *, rounding_mode, out)"""
-    _no_rounding(args[unsafe_offset=2].copy())
+    # real inputs into a complex out: the real op (which rounds), cast
     if _real_out("aten::div", "Tensor_mode", args, 3, 3, rets):
         return
+    _no_rounding(args[unsafe_offset=2].copy())
     var dest = v_tensor_c(args[unsafe_offset=3])
     _store_ew[2](
         args,
@@ -593,6 +602,21 @@ def cx_pow_tensor_out(
     ):
         return
     var dest = v_tensor_c(args[unsafe_offset=2])
+    var av = args[unsafe_offset=0].copy()
+    if av.tag != TAG_TENSOR and av.tag != TAG_TENSOR_REF:
+        var base = v_complex(av)
+        if base[0] == 1.0 and base[1] == 0.0:
+            # pow_Scalar_out: `out.fill_(1)` in the out's own dtype, no
+            # result-type cast check
+            var e = v_tensor_c(args[unsafe_offset=1])
+            _same_device(dest, e)
+            resize_out(dest, e.shape, e.rank)
+            var f = _Call("aten::fill_", "Scalar")
+            f.t(dest)
+            f.s(1.0)
+            _ = f.run(1)
+            ret_ref(rets, 0, dest)
+            return
     _store_ew[2](
         args,
         dest,
@@ -602,7 +626,24 @@ def cx_pow_tensor_out(
 
 
 comptime cx_abs = cx_unary["abs", _TO_RE]
-comptime cx_abs_out = cx_unary_out["abs", _TO_RE]
+
+
+def cx_abs_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """abs.out(self, *, out) with a complex self or out
+    (unary_op_impl_with_complex_to_float_out): a complex out must hold
+    self's own dtype; a real self never writes a complex out."""
+    var x = v_tensor_c(args[unsafe_offset=0])
+    var dest = v_tensor_c(args[unsafe_offset=1])
+    if is_complex_stype(dest.stype) and dest.stype != x.stype:
+        raise Error(
+            "Found dtype ",
+            _st_name(dest.stype),
+            " but expected ",
+            _st_name(x.stype),
+        )
+    _store_ew[1](args, dest, _unary("abs", _TO_RE, x), rets)
+
+
 comptime cx_angle = cx_unary["angle", _TO_RE]
 comptime cx_angle_out = cx_unary_out["angle", _TO_RE]
 comptime cx_exp = cx_unary["exp", _TO_CX]
@@ -788,6 +829,20 @@ def _reduce(
     column reduction rounded 7x worse on a 1M-element sum), viewed back as
     complex. A real one: x converted to it first (keeping the real part,
     with torch's warning), then the real reduction."""
+    if (
+        name == "mean"
+        and dtype_v.tag == TAG_NONE
+        and not _is_float(x.stype)
+        and not x.is_complex()
+    ):
+        # mean_dtype_out / meta: no dtype= to compute an integer mean in
+        raise Error(
+            (
+                "mean(): could not infer output dtype. Input dtype must be"
+                " either a floating point or complex dtype. Got: "
+            ),
+            _st_name(x.stype),
+        )
     var want = v_dtype_or(dtype_v, out_st if out_st >= 0 else x.stype)
     if out_st >= 0 and dtype_v.tag != TAG_NONE and want != out_st:
         raise Error(
@@ -968,6 +1023,15 @@ def cx_mean_dtype_out(
 ) raises:
     """mean.dtype_out(self, *, dtype, out)"""
     var dest = v_tensor_c(args[unsafe_offset=2])
+    var x = v_tensor_c(args[unsafe_offset=0])
+    if _category(x.stype) > _category(dest.stype):
+        raise Error(
+            (
+                "mean.dtype_out(): input types can't be cast to the desired"
+                " output type "
+            ),
+            _st_name(dest.stype),
+        )
     _store_red(
         dest,
         _reduce(

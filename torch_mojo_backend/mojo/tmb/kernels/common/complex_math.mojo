@@ -130,8 +130,12 @@ def catan2[dt: DType](y: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def cmul[dt: DType](a: Cx[dt], b: Cx[dt]) -> Cx[dt]:
-    """c10::complex operator*: (ac - bd) + (ad + bc)i."""
-    return Cx[dt](a.re * b.re - a.im * b.im, a.re * b.im + a.im * b.re)
+    """c10::complex operator*: (ac - bd) + (ad + bc)i, with the fused
+    multiply-adds nvcc forms for it (measured bit-exact against stock CUDA
+    on 200k complex64 / 5k complex128 pairs): re = fma(a, c, -(b d)),
+    im = fma(a, d, b c). Spelled out so no contraction choice of this
+    compiler can differ -- it decides overflow signs (inf - inf)."""
+    return Cx[dt](a.re.fma(b.re, -(a.im * b.im)), a.re.fma(b.im, a.im * b.re))
 
 
 @always_inline
@@ -154,11 +158,12 @@ def cdiv[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
             # divide by zeros should yield a complex inf or nan
             return Cx[dt](a / abs_c, b / abs_d)
         var rat = d / c
-        var scl = Scalar[dt](1) / (c + d * rat)
-        return Cx[dt]((a + b * rat) * scl, (b - a * rat) * scl)
+        # each multiply-add one fma, as nvcc contracts c10's expressions
+        var scl = Scalar[dt](1) / d.fma(rat, c)
+        return Cx[dt](b.fma(rat, a) * scl, (-a).fma(rat, b) * scl)
     var rat = c / d
-    var scl = Scalar[dt](1) / (d + c * rat)
-    return Cx[dt]((a * rat + b) * scl, (b * rat - a) * scl)
+    var scl = Scalar[dt](1) / c.fma(rat, d)
+    return Cx[dt](a.fma(rat, b) * scl, b.fma(rat, -a) * scl)
 
 
 @always_inline
