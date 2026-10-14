@@ -704,5 +704,24 @@
   "add_two_cpu0d_out RuntimeError Trying to pass too many CPU scalars to non-CPU kernel! (0,)",
   "logaddexp_cpu0d RuntimeError Expected all tensors to be on the same device, but got other is on cpu, different from other tensors ",
   "add_cpu0d NotImplementedError \"ufunc_add_CUDA\" not implemented for 'Float8_e4m3fn' "
+ ],
+ "round13": [
+  "ldexp_f8_i32_bcast_out RuntimeError The size of tensor a (2) must match the size of tensor b (3) at non-singleton dimension 0 | (0,)",
+  "ldexp_f8_i32_bcast RuntimeError The size of tensor a (2) must match the size of tensor b (3) at non-singleton dimension 0 | ",
+  "ldexp_cpu_exp RuntimeError Expected all tensors to be on the same device, but found at least two devices, DEV and cpu! | ",
+  "ldexp_cpu0d_exp RuntimeError Expected all tensors to be on the same device, but found at least two devices, DEV and cpu! | ",
+  "ldexp_inplace_bcast RuntimeError output with shape [1] doesn't match the broadcast shape [3] | (1,)",
+  "ldexp_out_bcast_ok NotImplementedError \"ldexp_cuda\" not implemented for 'Float8_e4m3fn' | (3,)",
+  "relu_out_bool_torch.float8_e4m3fn RuntimeError Boolean inputs not supported for relu | (0,)",
+  "relu_out_bool_torch.float32 RuntimeError Boolean inputs not supported for relu | (0,)",
+  "relu_bool RuntimeError Boolean inputs not supported for relu | ",
+  "threshold_out_expanded OK float32(4,)[-2.0, -2.0, -2.0, -2.0] | (4,)",
+  "threshold_out_expanded_f8 NotImplementedError \"threshold_cuda\" not implemented for 'Float8_e4m3fn' | (4,)",
+  "threshold_out_partial NotImplementedError \"threshold_cuda\" not implemented for 'Float8_e4m3fn' | (4,)",
+  "threshold_b_out_expanded OK float32(4,)[0.0, 0.0, 0.0, 0.0] | (4,)",
+  "threshold_out_cpu0d_self RuntimeError Trying to pass too many CPU scalars to non-CPU kernel! | (0,)",
+  "softshrink_out_torch.int32 NotImplementedError \"softshrink_check\" not implemented for 'Int' | (0,)",
+  "softshrink_out_torch.bool NotImplementedError \"softshrink_check\" not implemented for 'Bool' | (0,)",
+  "softshrink_out_torch.float16 RuntimeError Found dtype Float8_e4m3fn but expected Half | (0,)"
  ]
 }

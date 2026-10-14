@@ -48,6 +48,8 @@ from tmb.backend.abi import (
     unsupported,
     v_f64,
     v_scalar_is_integral,
+    v_tensor,
+    ret_ref,
     v_int,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
@@ -1255,3 +1257,28 @@ def like_layout(var r: Owned, like: T, any_dense: Bool = False) raises -> Owned:
     copy_strided_into(out.t, r.t)
     _ = r^
     return out^
+
+
+def threshold_into_overlapping(
+    op: StaticString, args: Values, n_in: Int, out_v: Value, rets: Values
+) raises -> Bool:
+    """threshold / threshold_backward build their iterator without the
+    memory-overlap check (threshold is idempotent): an internally
+    overlapping out= (an expanded one) takes the functional result, copied
+    in. False when out is an ordinary tensor."""
+    var dst = v_tensor(out_v)
+    if dst.numel == 0 or not _repeats_elements(dst):
+        return False
+    var call_args = List[Value]()
+    for i in range(n_in):
+        call_args.append(args[unsafe_offset=i].copy())
+    var r = call_op(String(op), "", call_args^, 1)
+    var res = own(r.take_tensor(0))
+    if not res.t.same_shape(dst):
+        return False
+    var c = own_if_new(cast_to(res.t, dst.stype, False), res.t)
+    copy_strided_into(dst, c.t)
+    _ = c^
+    _ = res^
+    ret_ref(rets, 0, dst)
+    return True

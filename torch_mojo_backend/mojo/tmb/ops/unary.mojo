@@ -80,6 +80,7 @@ from tmb.ops.f8_iter import (
     PRE_LDEXP,
     PRE_NAN_TO_NUM,
     PRE_NONE,
+    PRE_RELU,
     PRE_SUB,
 )
 from tmb.backend.registry import Site, impl
@@ -471,8 +472,14 @@ def op_sign_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 # aten::relu(Tensor self) -> Tensor
+def _relu_check(t: T) raises:
+    if t.dtype == DType.bool:
+        raise Error("Boolean inputs not supported for relu")
+
+
 def op_relu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
+    _relu_check(t)
     var out = own(_direct_unary("ReluSpec", t))
     ret_owned(rets, 0, out)
 
@@ -480,6 +487,7 @@ def op_relu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::relu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
 def op_relu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
+    _relu_check(t)
     var dst = v_tensor(args[unsafe_offset=1])
     _direct_unary_out("ReluSpec", t, dst)
     ret_ref(rets, 0, dst)
@@ -488,6 +496,7 @@ def op_relu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::relu_(Tensor(a!) self) -> Tensor(a!)
 def op_relu_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
+    _relu_check(t)
     # `_unary_out` with dst == t_in: computes straight into self when self is
     # already contiguous, else materializes and copies back into self's
     # (possibly strided) storage — same as the old `fast_aten_relu` +
@@ -3106,7 +3115,7 @@ def register_unary(site: Site) raises:
         "trunc",
     ](site)
     impl[
-        f8_iter[op_relu, "clamp_scalar_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[op_relu, "clamp_scalar_cuda", 1, -1, MODE_FN, False, PRE_RELU],
         "relu",
     ](site)
     impl[
@@ -3117,13 +3126,13 @@ def register_unary(site: Site) raises:
             1,
             MODE_COPY_OUT,
             False,
-            PRE_NONE,
+            PRE_RELU,
         ],
         "relu.out",
     ](site)
     impl[
         f8_iter[
-            op_relu_, "clamp_scalar_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE
+            op_relu_, "clamp_scalar_cuda", 1, 0, MODE_INPLACE, False, PRE_RELU
         ],
         "relu_",
     ](site)
