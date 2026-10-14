@@ -1159,13 +1159,20 @@ def test_transfer_lazy_negative_and_to_identity(mojo_device: str, non_blocking: 
     torch.testing.assert_close(downloaded, expected)
 
 
+@pytest.mark.parametrize("non_blocking", [False, True])
 @pytest.mark.parametrize("dtype", [torch.complex64, torch.complex128])
-def test_transfer_unsupported_complex_is_explicit(mojo_device: str, dtype: torch.dtype):
-    """Complex host pinning is supported; device transfer has a clear dtype boundary."""
+def test_transfer_complex_conj_view(
+    mojo_device: str, dtype: torch.dtype, non_blocking: bool
+):
+    """A pinned complex host tensor's conj view transfers with its values
+    resolved; the host tensor is left as it was."""
+    if dtype == torch.complex128 and is_metal(mojo_device):
+        pytest.skip("complex128 needs float64, which Apple GPUs lack")
     host = torch.tensor([1 + 2j, -3 - 4j], dtype=dtype).pin_memory()
     expected = host.clone()
-    with pytest.raises(NotImplementedError, match="dtype|ScalarType"):
-        host.conj().to(mojo_device, non_blocking=True)
+    got = host.conj().to(mojo_device, non_blocking=non_blocking)
+    device_module.synchronize(mojo_device)
+    torch.testing.assert_close(got.cpu(), host.conj().resolve_conj())
     torch.testing.assert_close(host, expected)
 
 

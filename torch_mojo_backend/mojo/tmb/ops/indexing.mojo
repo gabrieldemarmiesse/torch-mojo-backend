@@ -88,6 +88,8 @@ from tmb.ops.complex import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    check_real_scalar_fits,
+    check_uint64_fill,
     assert_no_internal_overlap,
     assert_no_overlap,
     call_op,
@@ -101,8 +103,6 @@ from tmb.ops.common import (
     is_int_stype,
     resize_out,
     same_view,
-    scalar_to_float,
-    scalar_to_int,
     shape_str,
 )
 from tmb.ops.compare import _where_select, scalar_as_fill
@@ -2151,10 +2151,9 @@ def op_fill__tensor(
     else:
         # A value on another device (the CPU or another GPU) goes through
         # `fill_(Scalar)`, whose `Scalar::to<scalar_t>()` raises on overflow.
-        if is_int_stype(t.stype):
-            _ = scalar_to_int(r[0], t.stype)
-        elif t.dtype.is_floating_point():
-            _ = scalar_to_float(r[0], t.stype)
+        # (one checked conversion for fill_: the Scalar route's)
+        check_real_scalar_fits(t.stype, r[0])
+        check_uint64_fill(t.stype, r[0], t.numel)
     fill_value(t, r[0])
     ret_ref(rets, 0, t)
 
