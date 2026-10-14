@@ -3244,7 +3244,15 @@ def op_index_put_impl_(
     # put a sort on this hot path, so it is left as a known difference.
     var accumulate = v_bool(args[unsafe_offset=3])
     if target.stype == ST_UINT64:
-        unsupported("\"index_put\" not implemented for 'UInt64'")  # (CUDA's)
+        # CUDA's own: a single bool mask takes masked_fill_'s route there
+        if (
+            len(indices) == 1
+            and len(present) >= 1
+            and present[0]
+            and indices[0].dtype == DType.bool
+        ):
+            unsupported("\"masked_fill_\" not implemented for 'UInt64'")
+        unsupported("\"index_put\" not implemented for 'UInt64'")
     if (
         len(indices) == 1
         and len(present) >= 1

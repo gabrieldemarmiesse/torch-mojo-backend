@@ -1508,11 +1508,13 @@ def fill_item(value: T, dst: Int32, same_device: Bool) raises -> Value:
     )
 
 
-def check_uint64_fill(st: Int32, v: Value, numel: Int) raises:
-    """uint64 past int64's range from a double Scalar: the fill kernels
-    convert through int64, so it is declined rather than written wrong."""
-    if st != ST_UINT64 or numel == 0:
-        return
+def uint64_fill_value(st: Int32, v: Value) raises -> Value:
+    """A floating Scalar of 2**63 or more for a uint64 destination as its
+    exact (truncated) 64 bits in an int record -- the fill kernels go
+    through int64, and an int record carries the bits whole. Anything else
+    is returned unchanged."""
+    if st != ST_UINT64:
+        return v.copy()
     if (
         v.tag == TAG_SCALAR_DOUBLE
         or v.tag == TAG_DOUBLE
@@ -1520,7 +1522,14 @@ def check_uint64_fill(st: Int32, v: Value, numel: Int) raises:
     ):
         var c = v_complex(v)
         if c[0] >= 9223372036854775808.0:
-            unsupported("a uint64 fill_ value of 2**63 or more")
+            var u = UInt64(c[0])
+            return Value(
+                TAG_SCALAR_INT,
+                0,
+                Int64(Scalar[DType.uint64](u).cast[DType.int64]()),
+                0,
+            )
+    return v.copy()
 
 
 def check_scalar_fits(st: Int32, re: Float64, im: Float64) raises:
