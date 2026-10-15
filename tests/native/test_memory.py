@@ -1437,6 +1437,11 @@ def _current_rss() -> int:
     raise AssertionError("/proc/self/status did not report VmRSS")
 
 
+# Samples of the staging test that a loaded host can spoil, retried this many
+# times before the test fails.
+_STAGING_ATTEMPTS = 4
+
+
 def _check_empty_cache_staging(device: str, api_name: str):
     """Worker shared with mutation probes; see the test for oracle limits."""
     register_mojo_devices()
@@ -1452,17 +1457,25 @@ def _check_empty_cache_staging(device: str, api_name: str):
         uploaded.copy_(source, non_blocking=True)
     stream.synchronize()
     torch.testing.assert_close(uploaded.cpu(), expected)
-    device_module.synchronize(device)
-    stream.synchronize()
-    baseline = _current_rss()
     current = device_module.memory_allocated(device)
-    with stream:
-        uploaded.copy_(source, non_blocking=True)
-    # A device synchronize also drains staging, masking a no-op empty_cache.
-    # Stream synchronization only completes the transfer and its callback.
-    stream.synchronize()
-    completed = _current_rss()
-    assert completed >= baseline + size * 3 // 4, "staging was not resident"
+    # Under host load an upload's fresh staging can occasionally fail to show
+    # in VmRSS (seen at the same rate on main): measure again after a drain
+    # rather than read one sample as a missing buffer.
+    for _ in range(_STAGING_ATTEMPTS):
+        device_module.synchronize(device)
+        stream.synchronize()
+        baseline = _current_rss()
+        with stream:
+            uploaded.copy_(source, non_blocking=True)
+        # A device synchronize also drains staging, masking a no-op
+        # empty_cache. Stream synchronization only completes the transfer and
+        # its callback.
+        stream.synchronize()
+        completed = _current_rss()
+        if completed >= baseline + size * 3 // 4:
+            break
+    else:
+        raise AssertionError("staging was not resident")
     api.empty_cache()
     # MAX queues the physical free on the owning stream even with caching off.
     # Finish that free without calling a second staging-drain entry point.
@@ -1488,20 +1501,34 @@ def _check_empty_cache_staging(device: str, api_name: str):
     # Four samples per leg, in ABBA order, so a clock/temperature ramp does
     # not favor one leg. Medians tolerate a scheduling outlier. Time only the
     # call after enqueueing identical work, not Python enqueue overhead.
+    queued = 64
     for wait in (True, False, False, True) * 2:
-        source.fill_(37)
-        device_module.synchronize(device)
-        stream.synchronize()
-        baseline = _current_rss()
-        with stream:
-            for _ in range(64):
-                torch.mm(a, b, out=out)
-            uploaded.copy_(source, non_blocking=True)
-        # The pageable source is no longer the transfer's source of truth.
-        source.fill_(99)
-        staged = _current_rss()
-        assert staged >= baseline + size * 3 // 4, "staging was not resident"
-        assert not stream.query(), "queued work finished before the timing sample"
+        # The sample needs the stream still busy: a host descheduled under
+        # load (the staging memcpy and the source refill are host work) can
+        # outlast the queued GEMMs, so queue twice as many and sample again
+        # rather than time an idle stream. A missed staging sample is
+        # measured again too (see the first upload above).
+        for _ in range(_STAGING_ATTEMPTS):
+            source.fill_(37)
+            device_module.synchronize(device)
+            stream.synchronize()
+            baseline = _current_rss()
+            with stream:
+                for _ in range(queued):
+                    torch.mm(a, b, out=out)
+                uploaded.copy_(source, non_blocking=True)
+            # The pageable source is no longer the transfer's source of truth.
+            source.fill_(99)
+            staged = _current_rss()
+            busy = not stream.query()
+            if busy and staged >= baseline + size * 3 // 4:
+                break
+            if not busy:
+                queued *= 2
+            stream.synchronize()
+        else:
+            assert busy, "queued work finished before the timing sample"
+            raise AssertionError("staging was not resident")
         started = time.perf_counter()
         if wait:
             stream.synchronize()
