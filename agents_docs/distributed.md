@@ -325,6 +325,56 @@ communicators and does the actual library calls.
   propagating (`_loud`): an exception escaping into the autograd engine on
   this backend can otherwise kill the process with no Python traceback.
 
+## Collectives in compiled graphs
+
+`torch.compile(backend=mojo_backend)` on the mojo device lowers the
+`_c10d_functional` ops dynamo traces (functional collectives, the
+`dist.all_reduce`-style calls it rewrites into them, DTensor
+redistributions) into the MAX graph itself
+(`torch_compile_backend/collectives.py`). No graph break, no Python at run
+time.
+
+- **Two custom ops per collective** (`tmb/graph/collectives.mojo`).
+  `c10d_start` enqueues the collective; `c10d_wait`, emitted at the FX
+  `wait_tensor`, makes the graph stream wait for it. Both are
+  `inplace_custom` ops on one `buffer_create`d output buffer, so the device
+  chain keeps every start and wait in program order (each rank issues the
+  same sequence), and the `buffer_load` after the wait aliases the buffer —
+  measured: no copy, as long as nothing mutates the buffer after the load.
+  Pure compute between the two floats freely, which is the overlap. A
+  collective nothing waits for is waited for at the graph output.
+- **The comm stream is the eager one.** `tmb_pg_graph_start` (`pg.mojo`)
+  records an event on the graph's stream, makes the communicator's comm
+  stream wait on it, issues the library call there and records a
+  completion event, keyed by the output pointer; `tmb_pg_graph_wait` makes
+  the graph stream wait on that event. Eager and compiled collectives of a
+  rank therefore share one stream per communicator in host program order.
+  MAX calls custom ops from one worker thread, but strictly inside
+  `model.execute()` (measured), so the host order is the program order.
+- **The wait op takes the collective's input too**, so MAX keeps it alive
+  until the graph stream has waited for the comm stream; otherwise a
+  temporary consumed only by the collective is released at the start and
+  reused while the comm stream still reads it (the cross-stream free hazard
+  of the eager path, fenced there with `record_stream`).
+- **The ops reach the process group through a host graph input**, one int64
+  `[pg, device, graph_start, graph_wait, tmb_get_error]` per group
+  (`GroupHandles`), fed at every `execute` like the RNG seed. These are
+  addresses in the backend library, which the MAX-compiled package cannot
+  link against (it has its own globals); passing them as constants would
+  make every process compile a different graph.
+- MAX gives each `execute()` its own stream (handles differ per call), which
+  is why the ops take the stream from their `ctx` rather than once.
+- Only the mojo process group is lowered; `all_to_all_single` raises at
+  compile time (MojoCCL has no all-to-all). The communicator of the graph's
+  device is created at compile time, which is collective: every rank
+  compiles the same graph at the same point of the program.
+- DTensor tensor parallelism on this device needed one more fix, eager mode
+  included: the mojo device's native `aten::linear` makes autograd emit
+  `aten::linear_backward`, which DTensor cannot shard
+  (`monkeypatching.let_dtensor_differentiate_a_native_linear`).
+- `tests/compile_c10d_worker.py` compares every pattern with eager mode on
+  two ranks, both libraries (`test_two_rank_compiled_collectives`).
+
 ## Cluster notes (SLURM, IB — NVIDIA)
 
 - ptxas needs no configuration: the package sets

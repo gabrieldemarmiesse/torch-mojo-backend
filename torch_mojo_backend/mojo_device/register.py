@@ -11,6 +11,7 @@ from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
 from torch_mojo_backend.monkeypatching import (
     fix_batch_isend_irecv_for_python_process_groups,
     fix_privateuse1_dlpack_device_type,
+    let_dtensor_differentiate_a_native_linear,
     print_apple_gpu_tensors_from_the_host,
     stage_mojo_checkpoint_tensors,
 )
@@ -53,6 +54,7 @@ def register_mojo_devices():
         # each of these is idempotent, so a retry may run them again
         fix_privateuse1_dlpack_device_type()
         fix_batch_isend_irecv_for_python_process_groups()
+        let_dtensor_differentiate_a_native_linear()
         print_apple_gpu_tensors_from_the_host()
         native.register()
         install_triton_hook()

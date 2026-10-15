@@ -33,6 +33,12 @@ from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
 from torch_mojo_backend.mojo_device import dlpack as mojo_dlpack
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.torch_compile_backend import debug
+from torch_mojo_backend.torch_compile_backend.collectives import (
+    COLLECTIVE_OPS,
+    CollectiveLoweringError,
+    GraphCollectives,
+    wait,
+)
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,
     get_error_message,
@@ -202,6 +208,9 @@ class _GraphFactory:
         # Whether the graph takes one trailing uint64 seed input (a random op
         # of GRAPH_SEEDED_OPS is in it; set by create_graph).
         self.takes_seed = False
+        # The graph's collectives, whose process-group handles are host
+        # inputs after the seed (set by create_graph).
+        self.collectives: GraphCollectives | None = None
 
     def initialize_graph(self):
         if self.graph is not None:
@@ -209,16 +218,26 @@ class _GraphFactory:
 
         if self.takes_seed:
             self.graph_inputs.append(max_ops.random.SeedType(DeviceRef.CPU()))
+        n_handles = 0
+        if self.collectives is not None:
+            handle_types = self.collectives.input_types()
+            n_handles = len(handle_types)
+            self.graph_inputs.extend(handle_types)
         self.graph = Graph(
             "torch_mojo_backend",
             input_types=self.graph_inputs,
             kernel_library=global_max_objects().kernel_library,
         ).__enter__()
         self._graph_open = True
+        if self.collectives is not None:
+            values = [v.tensor for v in self.graph.inputs]
+            split = len(values) - n_handles
+            self.collectives.bind(values[:split], values[split:])
         if self.takes_seed:
             # A constant seed would make every execution draw the same
             # numbers; the caller feeds a fresh one per call (graph_seed()).
-            max_ops.random.set_seed(self.graph.inputs[-1].tensor)
+            seed_index = len(self.graph.inputs) - n_handles - 1
+            max_ops.random.set_seed(self.graph.inputs[seed_index].tensor)
         # Let's fill the tensor book
         for tensor_name, idx in self.names_to_input_idx.items():
             self.tensor_book[tensor_name] = self.graph.inputs[idx]
@@ -302,6 +321,17 @@ class _GraphFactory:
             self.tensor_book[node.name] = func_to_execute(*all_bases, *input_tensors)
             return
         key = node.target
+        if key in COLLECTIVE_OPS:
+            assert self.collectives is not None
+            try:
+                self.tensor_book[node.name] = self.collectives.lower(node, func_args)
+            except Exception as e:
+                raise MojoCompilerError(
+                    get_error_message(node, node_idx, func_args, func_kwargs)
+                    + f"Lowering the collective failed: {e}\n"
+                    f"{traceback.format_exc()}"
+                ) from e
+            return
 
         # TODO: refactor this
         if (
@@ -393,7 +423,8 @@ class _GraphFactory:
         output_args = node.args[0]
         assert isinstance(output_args, list | tuple)
         for x in output_args:
-            converted = self.tensor_book.convert_to_max(x)
+            # A collective nothing waited for still completes inside the graph.
+            converted = wait(self.tensor_book.convert_to_max(x))
             if converted is None:
                 output_blueprint.append((OutputBlueprintKind.NONE, None))
             elif isinstance(converted, max.graph.Dim):
@@ -422,6 +453,10 @@ class _GraphFactory:
             node.op == "call_function" and node.target in GRAPH_SEEDED_OPS
             for node in graph.nodes
         )
+        try:
+            self.collectives = GraphCollectives.scan(graph)
+        except CollectiveLoweringError as e:
+            raise MojoCompilerError(str(e)) from e
         try:
             for node_idx, node in enumerate(graph.nodes):
                 if node.op == "placeholder":
@@ -561,6 +596,9 @@ class BaseMaxCompiler:
         factory = _GraphFactory()
         graph, self.output_blueprint = factory.create_graph(gm.graph)
         self.takes_seed = factory.takes_seed
+        self.collective_inputs = (
+            factory.collectives.runtime_inputs() if factory.collectives else []
+        )
         if verbose_enabled():
             print(graph)
         if profiling_enabled():
@@ -601,6 +639,7 @@ class BaseMaxCompiler:
         ]
         if self.takes_seed:
             input_tensors.append(graph_seed())
+        input_tensors.extend(self.collective_inputs)
         outputs = self.model.execute(*input_tensors)
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
