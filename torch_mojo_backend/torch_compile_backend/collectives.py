@@ -34,12 +34,12 @@ from max.graph import (
     ops,
 )
 
+from torch_mojo_backend import native
 from torch_mojo_backend.distributed.process_group import (
     MojoProcessGroup,
     _nccl_dtype,
     _nccl_red_op,
 )
-from torch_mojo_backend import native
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.types import MaxTensor
 

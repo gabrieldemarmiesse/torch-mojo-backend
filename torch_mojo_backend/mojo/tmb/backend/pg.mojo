@@ -166,12 +166,9 @@ struct PG(Movable):
     def graph_release(mut self, device: Int, ev: Int):
         """Back to the pool. A wait enqueued on the event already captured
         its last record, so the event may be recorded again right away."""
-        if device not in self.graph_events:
-            self.graph_events[device] = List[Int]()
-        try:
-            self.graph_events[device].append(ev)
-        except:
-            pass
+        var pool = self.graph_events.pop(device, List[Int]())
+        pool.append(ev)
+        self.graph_events[device] = pool^
 
     def sync_in(self, c: Comm) raises:
         """The comm stream waits for everything the caller's current stream has
