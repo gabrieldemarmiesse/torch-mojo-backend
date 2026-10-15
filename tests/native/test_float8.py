@@ -3353,6 +3353,73 @@ def _threshold_scalar_lines(dev):
     yield _act_res(lambda: a.threshold_(x.half(), 0.5, 1e6))
     e5 = torch.ones(4).to(torch.float8_e5m2).to(dev)
     yield _act_res(lambda: a.threshold.out(e5, 0.5, 1e6, out=out0()))
+    # Every Scalar kind (int, float, bool) against every dispatched dtype.
+    e5b = torch.tensor([0.0, 1.0]).to(torch.float8_e5m2).to(dev)
+    yield _act_res(lambda: a.threshold.out(e5b, 0, 100000, out=out0()))
+    dts = [torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64]
+    dts += [h, torch.bfloat16, torch.float32, torch.float64]
+    vals = [100000, -1, -300, 300, -128, 128, 2**40, 2**63 - 1, True, False] + [
+        1e6,
+        1e40,
+        -1.0,
+        2.5,
+        255.0,
+        256.0,
+        float("inf"),
+        float("nan"),
+    ]
+    for dt in dts:
+        for v in vals:
+            xd = torch.ones(2, dtype=dt, device=dev)
+            yield _act_res(lambda xd=xd, v=v: a.threshold(xd, 0, v))
+            yield _act_res(lambda xd=xd, v=v: a.threshold(xd, v, 0))
+    # The overflow raises in the kernel, after the iterator resized out.
+    for v in (1e6, 100000):
+        o = out0()
+        yield _act_res(lambda o=o, v=v: a.threshold.out(x.half(), 0, v, out=o), o)
+        o = out0()
+        yield _act_res(lambda o=o, v=v: a.threshold.out(x, 0, v, out=o), o)
+    y = x.half()
+    yield _act_res(lambda: a.threshold_(y, 0, 100000), y)
+    # threshold_backward converts its threshold the same way.
+    for v in (1e6, 100000, True, float("inf")):
+        yield _act_res(lambda v=v: a.threshold_backward(x.half(), x.half(), v))
+        o = out0()
+        yield _act_res(
+            lambda o=o, v=v: a.threshold_backward.grad_input(x, x, v, grad_input=o), o
+        )
+    i8 = torch.ones(2, dtype=torch.int8, device=dev)
+    yield _act_res(lambda: a.threshold_backward(i8, i8, 300))
+    # The dispatcher wrapper's device check (a CPU grad_input, a CPU 0-d
+    # operand), then the kernel's refusal of bool.
+    d = x[:2]
+    c = torch.ones(2)
+    c0 = torch.tensor(1.0)
+    yield _act_res(lambda: a.threshold_backward.grad_input(d, d, 0, grad_input=c))
+    yield _act_res(
+        lambda: a.threshold_backward.grad_input(c, d, 0, grad_input=d.clone())
+    )
+    yield _act_res(
+        lambda: a.threshold_backward.grad_input(d, c, 0, grad_input=d.clone())
+    )
+    yield _act_res(lambda: a.threshold_backward(c0, d, 0))
+    yield _act_res(lambda: a.threshold_backward(d, c0, 0))
+    bl = torch.ones(2, dtype=torch.bool, device=dev)
+    yield _act_res(lambda: a.threshold_backward(bl, bl, 0))
+    yield _act_res(lambda: a.threshold_backward(d, bl, 0))
+    yield _act_res(
+        lambda: a.threshold_backward.grad_input(bl, bl, 0, grad_input=bl.clone())
+    )
+    yield _act_res(lambda: a.threshold.out(bl, 0, 0, out=bl.clone()))
+    # The broadcast error comes first, in the iterator's (self, grad) order.
+    for gs, ss in (((2,), (3,)), ((3,), (2,)), ((2, 3), (4, 1))):
+        o = torch.empty(0, device=dev)
+        yield _act_res(
+            lambda o=o, gs=gs, ss=ss: a.threshold_backward.grad_input(
+                torch.ones(gs, device=dev), torch.ones(ss, device=dev), 0, grad_input=o
+            ),
+            o,
+        )
 
 
 def test_threshold_scalar_overflow_matches_stock_cuda(mojo_device):

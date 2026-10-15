@@ -124,6 +124,7 @@ from tmb.ops.binary import (
 from tmb.ops.common import (
     threshold_into_overlapping,
     threshold_scalar_check,
+    threshold_scalar_overflows,
     _repeats_elements,
     can_cast,
     decline_float8,
@@ -2586,7 +2587,10 @@ def _threshold_p(args: Values) raises -> SIMD[DType.float64, 4]:
 
 # aten::threshold(Tensor self, Scalar threshold, Scalar value) -> Tensor
 def op_threshold(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    threshold_scalar_check(args, 1, 2, v_tensor(args[unsafe_offset=0]).stype)
+    var st = v_tensor(args[unsafe_offset=0]).stype
+    if st == ST_BOOL:
+        unsupported("\"threshold_cuda\" not implemented for 'Bool'")
+    threshold_scalar_check(args, 1, 2, st)
     _pw_act(
         "threshold", args, rets, 0, -1, -1, _threshold_p(args), True, P_NUMERIC
     )
@@ -2596,11 +2600,20 @@ def op_threshold(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_threshold_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    # An overflowing Scalar (or bool, no kernel) raises in the kernel,
+    # after the iterator's checks and resize: the helper runs that sequence.
+    var out = v_tensor(args[unsafe_offset=3])
     if threshold_into_overlapping(
-        "aten::threshold", args, 3, args[unsafe_offset=3].copy(), rets
+        "aten::threshold",
+        args,
+        3,
+        args[unsafe_offset=3].copy(),
+        rets,
+        out.stype == ST_BOOL
+        or threshold_scalar_overflows(args, 1, 2, out.stype),
     ):
         return
-    threshold_scalar_check(args, 1, 2, v_tensor(args[unsafe_offset=3]).stype)
+    threshold_scalar_check(args, 1, 2, out.stype)
     _pw_act(
         "threshold", args, rets, 0, -1, 3, _threshold_p(args), True, P_NUMERIC
     )
@@ -2608,11 +2621,20 @@ def op_threshold_out(
 
 # aten::threshold_(Tensor(a!) self, Scalar threshold, Scalar value) -> Tensor(a!)
 def op_threshold_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    # An overflowing Scalar (or bool, no kernel) raises in the kernel,
+    # after the iterator's checks and resize: the helper runs that sequence.
+    var out = v_tensor(args[unsafe_offset=0])
     if threshold_into_overlapping(
-        "aten::threshold", args, 3, args[unsafe_offset=0].copy(), rets
+        "aten::threshold",
+        args,
+        3,
+        args[unsafe_offset=0].copy(),
+        rets,
+        out.stype == ST_BOOL
+        or threshold_scalar_overflows(args, 1, 2, out.stype),
     ):
         return
-    threshold_scalar_check(args, 1, 2, v_tensor(args[unsafe_offset=0]).stype)
+    threshold_scalar_check(args, 1, 2, out.stype)
     _pw_act_inplace("threshold", args, rets, _threshold_p(args), P_NUMERIC)
 
 
