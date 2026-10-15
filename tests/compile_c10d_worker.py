@@ -396,13 +396,20 @@ def run_desync_compiled():
     dev = torch.accelerator.current_accelerator()
     assert dev is not None
 
-    @torch.compile(backend=mojo_backend, fullgraph=True)
-    def reduce(x: torch.Tensor) -> torch.Tensor:
-        return funcol.all_reduce(x, "sum", group) + 1
+    def compiled(pg: dist.ProcessGroup) -> Callable[[torch.Tensor], torch.Tensor]:
+        @torch.compile(backend=mojo_backend, fullgraph=True)
+        def reduce(x: torch.Tensor) -> torch.Tensor:
+            return funcol.all_reduce(x, "sum", pg) + 1
+
+        return reduce
 
     x = torch.ones(1024, device=dev)
+    # The same graph on the default group (300 s timeout) first: a cold
+    # compile on one rank must not count against the 10 s group's timeout.
+    compiled(_world())(x).cpu()
+    reduce = compiled(group)
     dist.barrier()
-    reduce(x).cpu()  # #1, on every rank (compiles the graph)
+    reduce(x).cpu()  # #1 on the timed group, on every rank (cache warm)
     dist.barrier()
     print(f"[rank {rank}] compiled all_reduce #1 done", flush=True)
     if rank == 0:
