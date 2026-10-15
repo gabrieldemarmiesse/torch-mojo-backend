@@ -795,7 +795,7 @@ def _index_fill(a: T, dim_in: Int, index: T, value_v: Value) raises:
         # CUDA's kernel is not instantiated for them: declined before the
         # value converts, as its dtype dispatch does (in its words)
         unsupported(
-            "\"index_fill_cuda\" not implemented for '"
+            '"index_fill_cuda" not implemented for \''
             + scalar_type_name(a.stype)
             + "'"
         )

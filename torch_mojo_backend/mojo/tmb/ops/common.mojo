@@ -178,8 +178,10 @@ def check_expands_to(t: T, target: T) raises:
             _sizes_str(target),
             "): the number of sizes provided (",
             target.rank,
-            ") must be greater or equal to the number of dimensions in the"
-            " tensor (",
+            (
+                ") must be greater or equal to the number of dimensions in the"
+                " tensor ("
+            ),
             t.rank,
             ")",
         )

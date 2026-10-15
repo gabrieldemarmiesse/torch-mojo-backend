@@ -1612,9 +1612,10 @@ def test_uint64_fill_of_two_to_the_64(mojo_gpu: str):
     """2.0**64 passes c10's check (it compares with double(UINT64_MAX)); the
     host static_cast then gives 0, as on CUDA."""
     for v in (2.0**64, 2.0**64 + 0j):
-        assert torch.scalar_tensor(
-            v, dtype=torch.uint64, device=mojo_gpu
-        ).cpu().tolist() == 0
+        assert (
+            torch.scalar_tensor(v, dtype=torch.uint64, device=mojo_gpu).cpu().tolist()
+            == 0
+        )
         assert torch.zeros(2, dtype=torch.uint64, device=mojo_gpu).fill_(
             v
         ).cpu().tolist() == [0, 0]
