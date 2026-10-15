@@ -89,6 +89,7 @@ FAMILY_MODULES = (
     "test_torchvision_ops",
     "test_data_movement",
     "test_linalg",
+    "test_fft",
 )
 
 _VIEW = "pure view/metadata op: zero-copy metadata math, no kernel launched"
