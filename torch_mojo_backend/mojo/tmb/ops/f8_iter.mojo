@@ -72,6 +72,7 @@ from tmb.ops.common import (
     combine_categories,
     device_str,
     is_float_stype,
+    is_wide_unsigned,
     promote_types,
     resize_out,
     scalar_type_name,
@@ -793,6 +794,10 @@ def f8_iter[
             # alpha_check(dtype(), alpha): the iterator's dtype() is its
             # output's -- the out (or in-place self), resized by now
             _alpha_check(o.stype, args[unsafe_offset=alpha_idx].copy())
+            # the add kernel's dtype dispatch (no uint16 / 32 / 64 case)
+            # refuses before it converts alpha
+            if is_wide_unsigned(common):
+                _refuse(String(kernel), common)
             alpha_dt = common
         compute = o.stype if eff_mode == MODE_OUTDT else common
     else:
