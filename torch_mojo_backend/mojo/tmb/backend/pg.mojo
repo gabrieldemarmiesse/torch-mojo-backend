@@ -604,8 +604,12 @@ def tmb_pg_graph_start(
             _need_vendor()
             var graph_raw = raw_stream_of(be()[].vendor.value(), stream)
             var ready = pg[].graph_event(c.device)
-            be()[].vendor.value().event_record(ready, graph_raw)
-            be()[].vendor.value().stream_wait_event(c.raw, ready)
+            try:
+                be()[].vendor.value().event_record(ready, graph_raw)
+                be()[].vendor.value().stream_wait_event(c.raw, ready)
+            except e:
+                pg[].graph_release(c.device, ready)
+                raise e^
             pg[].graph_release(c.device, ready)
             var rc: Int32
             var what: StaticString
@@ -633,7 +637,11 @@ def tmb_pg_graph_start(
                 raise Error("unknown graph collective kind ", kind)
             pg[].check(rc, what)
             var done = pg[].graph_event(c.device)
-            be()[].vendor.value().event_record(done, c.raw)
+            try:
+                be()[].vendor.value().event_record(done, c.raw)
+            except e:
+                pg[].graph_release(c.device, done)
+                raise e^
             pg[].graph_pending[recv] = done
             return 0
         except e:

@@ -85,6 +85,7 @@ def _compare(
 def run_functional(failures: list[str]):
     rank, world = dist.get_rank(), dist.get_world_size()
     group = _world()
+    second_group = dist.new_group(list(range(world)))
     dev = torch.accelerator.current_accelerator()
     assert dev is not None
     g = torch.Generator().manual_seed(1234 + rank)
@@ -140,6 +141,26 @@ def run_functional(failures: list[str]):
         rb = funcol.all_reduce(b * 2, "sum", group)
         return [ra, rb]
 
+    def coalesced_gather_scatter(
+        a: torch.Tensor, b: torch.Tensor
+    ) -> list[torch.Tensor]:
+        ga, gb = funcol.all_gather_into_tensor_coalesced([a, b], group)
+        sa, sb = funcol.reduce_scatter_tensor_coalesced(
+            [ga * 2, gb], "sum", [0, 0], group
+        )
+        return [ga, gb, sa, sb]
+
+    def bool_any(x: torch.Tensor) -> torch.Tensor:
+        # bool SUM reduces as uint8 MAX (a logical or)
+        return funcol.all_reduce(x > 0, "sum", group)
+
+    def two_groups(x: torch.Tensor) -> torch.Tensor:
+        a = funcol.all_reduce(x, "sum", group)
+        return funcol.all_reduce(a * 2, "avg", second_group)
+
+    def empty(x: torch.Tensor) -> torch.Tensor:
+        return funcol.all_reduce(x, "sum", group) + 1
+
     def unused_result(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         # dead-code elimination drops rb's wait, never the collective
         ra, rb = funcol.all_reduce_coalesced([a, b * 2], "sum", group)
@@ -177,6 +198,17 @@ def run_functional(failures: list[str]):
     _compare(failures, "coalesced", coalesced, rand(10), rand(3, 3))
     _compare(failures, "chain", chain, rand(world * 8, 16))
     _compare(failures, "mixed_dtypes", mixed_dtypes, rand(1000), rand(77, 3))
+    _compare(
+        failures,
+        "coalesced_gather_scatter",
+        coalesced_gather_scatter,
+        rand(world * 5, 3),
+        rand(world * 7),
+    )
+    if not _MOJO_CCL:  # mojoccl reduces SUM and AVG of numeric types only
+        _compare(failures, "bool_any", bool_any, rand(64), exact=True)
+    _compare(failures, "two_groups", two_groups, rand(100))
+    _compare(failures, "empty", empty, rand(0, 4))
     _compare(failures, "unused_result", unused_result, rand(4096), rand(4096))
     _compare(
         failures, "same_shape_in_flight", same_shape_in_flight, rand(4096), rand(4096)
@@ -194,8 +226,7 @@ def run_interleaved(failures: list[str]):
 
     # The size changes every call, so dynamo recompiles with a symbolic one:
     # the all-gather's output is then `s0 * world`, and the reduce-scatter
-    # of `z` (`s1` rows) gives `s1 // world`, a shape MAX cannot load as a
-    # buffer (collectives.py's copying variant).
+    # of `z` (`s1` rows) gives `s1 // world`.
     @torch.compile(backend=mojo_backend, fullgraph=True)
     def step(
         x: torch.Tensor, z: torch.Tensor

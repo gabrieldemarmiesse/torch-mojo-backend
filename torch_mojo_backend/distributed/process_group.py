@@ -100,6 +100,10 @@ def _nccl_red_op(
     )
 
 
+# The collective entry points `_loud` wrapped, for `_never_traced`.
+_LOUD: set[Callable[..., object]] = set()
+
+
 def _loud(method: Callable[..., object]) -> Callable[..., object]:
     """torch swallows exceptions raised inside a Python ProcessGroup method
     called from the autograd thread; print the traceback before re-raising.
@@ -120,7 +124,7 @@ def _loud(method: Callable[..., object]) -> Callable[..., object]:
             self._abort_coalescing()
             raise
 
-    wrapper._loud = True  # ty: ignore[unresolved-attribute]
+    _LOUD.add(wrapper)
     return wrapper
 
 
@@ -146,9 +150,7 @@ def _never_traced(cls: _C) -> _C:
     recursive, and each wrapper costs ~0.4 us on the eager path."""
     for name, attr in list(vars(cls).items()):
         if inspect.isfunction(attr) and (
-            not name.startswith("_")
-            or getattr(attr, "_loud", False)
-            or name in _C10D_HOOKS
+            not name.startswith("_") or attr in _LOUD or name in _C10D_HOOKS
         ):
             setattr(cls, name, torch.compiler.disable(attr))
     return cls

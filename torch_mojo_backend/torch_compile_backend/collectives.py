@@ -200,8 +200,13 @@ class GraphCollectives:
     def handles_value(self, node: torch.fx.Node) -> TensorValue:
         return self._values[_group_name(node)]
 
-    def start(self, node: torch.fx.Node, args: list[object]) -> object:
+    def start(
+        self, node: torch.fx.Node, args: list[object]
+    ) -> _Pending | list[_Pending]:
         return _START_OPS[node.target](self, node, *args)
+
+    def started(self, pending: _Pending):
+        self._started.append(pending)
 
     def synchronize(self):
         """Host-wait for every collective the graph's process groups issued:
@@ -239,7 +244,7 @@ def _start(
         parameters={"kind": kind, "nccl_dtype": _nccl_dtype(dtype), "arg": arg},
     )
     pending = _Pending(started.tensor, x, handles, token)
-    collectives._started.append(pending)
+    collectives.started(pending)
     return pending
 
 
@@ -400,7 +405,7 @@ def _coalesced(one: Callable[..., _Pending]) -> Callable[..., list[_Pending]]:
     return lower
 
 
-_START_OPS: dict[object, Callable[..., object]] = {
+_START_OPS: dict[object, Callable[..., _Pending | list[_Pending]]] = {
     _functional.all_reduce.default: _single(_all_reduce),
     _functional.all_reduce_coalesced.default: _coalesced(_all_reduce),
     _functional.all_gather_into_tensor.default: _single(_all_gather),

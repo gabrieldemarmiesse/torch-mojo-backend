@@ -87,6 +87,10 @@ def _start[
     handles: InputTensor[dtype=DType.int64, rank=1, ...],
     ctx: DeviceContext,
 ) raises:
+    # Nothing to transfer: no call, so no completion event keyed by an
+    # address MAX may hand to another empty output.
+    if count == 0:
+        return
     _check(
         _fn[StartFn](_handle(handles, _START))(
             _handle(handles, _PG),
@@ -106,9 +110,12 @@ def _start[
 
 def _wait(
     output: Int,
+    count: Int,
     handles: InputTensor[dtype=DType.int64, rank=1, ...],
     ctx: DeviceContext,
 ) raises:
+    if count == 0:  # `_start` issued nothing
+        return
     _check(
         _fn[WaitFn](_handle(handles, _WAIT))(
             _handle(handles, _PG),
@@ -171,7 +178,7 @@ struct C10dWait:
         ctx: DeviceContext,
     ) raises:
         comptime if target == "gpu":
-            _wait(Int(started.unsafe_ptr()), handles, ctx)
+            _wait(Int(started.unsafe_ptr()), started.size(), handles, ctx)
             var n = output.size()
             if n > 0:
                 ctx.enqueue_copy(

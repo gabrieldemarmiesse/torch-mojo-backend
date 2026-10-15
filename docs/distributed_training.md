@@ -318,7 +318,8 @@ model = torch.compile(model, backend=mojo_backend)
 Each collective runs on the same stream as the eager collectives of that
 process group, and the computation between the start of a collective and
 the first use of its result overlaps with it. Both collective libraries
-work, with the reductions of the table above.
+work, with the reductions of the table above. Compiled collectives were
+tested on NVIDIA GPUs only; on AMD they're untested.
 
 - `all_to_all_single` raises an error when the graph is compiled.
 - FSDP2 with its default settings runs its collectives in eager mode,
