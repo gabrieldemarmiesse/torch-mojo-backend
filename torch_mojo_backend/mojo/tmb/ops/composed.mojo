@@ -71,6 +71,7 @@ from tmb.ops.common import (
     call_op,
     check_out,
     cast_to,
+    result_type,
     contiguous,
     copy_strided_into,
     device_str,
@@ -128,50 +129,58 @@ def _one_minus(x: T) raises -> T:
 
 
 # aten::threshold_backward(Tensor grad_output, Tensor self, Scalar threshold) -> Tensor
-def _threshold_backward_mask(args: Values) raises -> T:
-    return _dispatch(
-        "aten::gt",
-        "Scalar",
-        [
-            _tensor_value(v_tensor(args[unsafe_offset=1])),
-            args[unsafe_offset=2].copy(),
-        ],
-    )
-
-
 def op_threshold_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    """`self <= threshold ? 0 : grad` (Activation.cpp: threshold's kernel
+    with value 0 and other = grad), a SELECTION in the promoted dtype of
+    (self, grad): an inf / nan grad where self is at or below the
+    threshold is 0, not a product's nan."""
     var grad = v_tensor(args[unsafe_offset=0])
-    var mask = _threshold_backward_mask(args)
-    var g = own(
+    var self = v_tensor(args[unsafe_offset=1])
+    var common = result_type(self, grad)
+    var g = own_if_new(cast_to(grad, common, False), grad)
+    var s = own_if_new(cast_to(self, common, False), self)
+    var cond = own(
         _dispatch(
-            "aten::mul", "Tensor", [_tensor_value(grad), _tensor_value(mask)]
+            "aten::le",
+            "Scalar",
+            [_tensor_value(s.t), args[unsafe_offset=2].copy()],
         )
     )
-    release(mask.h)
-    ret_owned(rets, 0, g)
+    var r = own(
+        _dispatch(
+            "aten::where",
+            "ScalarSelf",
+            [
+                _tensor_value(cond.t),
+                Value(TAG_SCALAR_INT, 0, 0, 0),
+                _tensor_value(g.t),
+            ],
+        )
+    )
+    _ = cond^
+    _ = g^
+    _ = s^
+    ret_owned(rets, 0, r)
 
 
 # aten::threshold_backward.grad_input(Tensor grad_output, Tensor self, Scalar threshold, *, Tensor(a!) grad_input)
 def op_threshold_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    # Always the iterator sequence of threshold's config (out dtype
+    # dispatch, safe casting, no overlap check), then the selection.
     if threshold_into_overlapping(
-        "aten::threshold_backward", args, 3, args[unsafe_offset=3].copy(), rets
+        "aten::threshold_backward",
+        args,
+        3,
+        args[unsafe_offset=3].copy(),
+        rets,
+        True,
     ):
         return
-    var grad = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=3])
-    var mask = _threshold_backward_mask(args)
-    _dispatch_into(
-        "aten::mul",
-        "out",
-        [_tensor_value(grad), _tensor_value(mask), _tensor_value(out)],
-        out,
-    )
-    release(mask.h)
-    ret_ref(rets, 0, out)
+    unsupported("threshold_backward.grad_input with an out off the mojo device")
 
 
 # aten::sigmoid_backward(Tensor grad_output, Tensor output) -> Tensor: grad * out * (1 - out)

@@ -53,6 +53,7 @@ from tmb.backend.abi import (
     tensor_arg,
     TAG_TENSOR,
     TAG_TENSOR_REF,
+    TAG_SCALAR_DOUBLE,
     v_int,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
@@ -70,6 +71,15 @@ def _padded(shape: IndexList[MAX_RANK]) -> List[Int]:
     for i in range(MAX_RANK):
         out.append(shape[i])
     return out^
+
+
+def _shape_list_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
+    var s = String("[")
+    for i in range(rank):
+        if i > 0:
+            s += ", "
+        s += String(shape[MAX_RANK - rank + i])
+    return s + "]"
 
 
 def shape_str(t: T) raises -> String:
@@ -1265,8 +1275,41 @@ def like_layout(var r: Owned, like: T, any_dense: Bool = False) raises -> Owned:
     return out^
 
 
+def threshold_scalar_check(
+    args: Values, first: Int, last: Int, st: Int32
+) raises:
+    """`Scalar::to<scalar_t>()` of threshold's Scalar args in the kernel's
+    dtype: a finite value past the dtype's range overflows (c10::overflows;
+    an infinity converts)."""
+    var top: Float64
+    if st == ST_FLOAT16:
+        top = 65504.0
+    elif st == ST_BFLOAT16:
+        top = 3.3895313892515355e38
+    elif st == ST_FLOAT32:
+        top = 3.4028234663852886e38
+    else:
+        return
+    for i in range(first, last + 1):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag != TAG_SCALAR_DOUBLE:
+            continue
+        var f = v_f64(v)
+        if f == f and abs(f) <= 1.7976931348623157e308 and abs(f) > top:
+            raise Error(
+                "value cannot be converted to type ",
+                dtype_name(st),
+                " without overflow",
+            )
+
+
 def threshold_into_overlapping(
-    op: StaticString, args: Values, n_in: Int, out_v: Value, rets: Values
+    op: StaticString,
+    args: Values,
+    n_in: Int,
+    out_v: Value,
+    rets: Values,
+    force: Bool = False,
 ) raises -> Bool:
     """threshold / threshold_backward build their iterator without the
     memory-overlap check (threshold is idempotent): an internally
@@ -1282,11 +1325,14 @@ def threshold_into_overlapping(
     # Taken when out differs from the plain case: aliasing itself or an
     # input (no overlap check here), or of another dtype than an input
     # (the kernel dispatches on out's dtype).
-    var special = dst.numel > 0 and _repeats_elements(dst)
+    var special = force or (dst.numel > 0 and _repeats_elements(dst))
     for i in range(n_in):
         var v = args[unsafe_offset=i].copy()
         if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
             var t = v_tensor(v)
+            # The same tensor (an in-place self) is the plain path's case.
+            if t.impl() == dst.impl():
+                continue
             if t.stype != dst.stype or (
                 t.on_mojo() and overlap_status(dst, t) != OVERLAP_NO
             ):
@@ -1299,6 +1345,8 @@ def threshold_into_overlapping(
     # common dtype castable to out's, the broadcast shape out's own.
     var common = ST_UNDEFINED
     var n_t = 0
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
     var first = v_tensor(args[unsafe_offset=0])
     for i in range(n_in):
         var v = args[unsafe_offset=i].copy()
@@ -1314,8 +1362,14 @@ def threshold_into_overlapping(
                 device_str(t),
                 "!",
             )
-        if not t.same_shape(first):
-            return False
+        # The operands broadcast (an incompatible pair is the plain path's
+        # error).
+        rank = max(rank, t.rank)
+        for k in range(MAX_RANK):
+            if shape[k] == 1:
+                shape[k] = t.shape[k]
+            elif t.shape[k] != 1 and t.shape[k] != shape[k]:
+                return False
         common = t.stype if n_t == 0 else result_type(first, t)
         if n_t == 0:
             first = t.copy()
@@ -1335,10 +1389,23 @@ def threshold_into_overlapping(
         if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
             if v_tensor(v).impl() == dst.impl():
                 aliased = True
-    if not dst.same_shape(first):
+    var fits = dst.rank == rank
+    for k in range(MAX_RANK):
+        if dst.shape[k] != shape[k]:
+            fits = False
+    if not fits:
         if aliased:
-            return False  # the read-write shape error of the plain path
-        resize_out(dst, first.shape, first.rank)
+            raise Error(
+                "output with shape ",
+                _shape_list_str(dst.shape, dst.rank),
+                " doesn't match the broadcast shape ",
+                _shape_list_str(shape, rank),
+            )
+        resize_out(dst, shape, rank)
+    if op == "aten::threshold":
+        threshold_scalar_check(args, 1, 2, dst.stype)
+    else:
+        threshold_scalar_check(args, 2, 2, dst.stype)
     # Computed in out's dtype: every operand converted to it first.
     var held = List[Owned]()
     var call_args = List[Value]()
