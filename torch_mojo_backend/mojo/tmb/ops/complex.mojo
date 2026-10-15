@@ -2249,7 +2249,25 @@ def _check_bool_mask(args: Values) raises:
         )
 
 
+def _check_value_rank(args: Values) raises:
+    """masked_fill__cuda's Tensor overload checks a 0-d value first, before
+    the mask and the dtype dispatch."""
+    var val = args[unsafe_offset=2].copy()
+    if val.tag == TAG_TENSOR or val.tag == TAG_TENSOR_REF:
+        var vt = v_tensor_c(val)
+        if vt.rank != 0:
+            raise Error(
+                (
+                    "masked_fill_ only supports a 0-dimensional value"
+                    " tensor, but got tensor with "
+                ),
+                vt.rank,
+                " dimension(s).",
+            )
+
+
 def _masked_fill(args: Values) raises -> Owned:
+    _check_value_rank(args)
     _check_bool_mask(args)
     var x = v_tensor_c(args[unsafe_offset=0])
     # the result has the broadcast shape of self and mask
@@ -2316,6 +2334,7 @@ def cx_masked_fill_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     """masked_fill_.Scalar / .Tensor(self, mask, value)"""
+    _check_value_rank(args)
     _check_bool_mask(args)
     var self = v_tensor_c(args[unsafe_offset=0])
     # masked_fill_'s own check: a mask sharing part of self's memory would
@@ -2336,25 +2355,20 @@ def _masked_fill_real_(self: T, args: Values) raises:
     """masked_fill_ of a REAL self with a complex value: value.item()
     converted checked (a zero imaginary part fits), then the real op. A
     uint16 / uint32 / uint64 self is declined first, as CUDA's dtype
-    dispatch is (its kernel is not instantiated for them)."""
-    refuse_masked_fill_dtype(self.stype)
+    dispatch is (its kernel is not instantiated for them), after a value
+    tensor's rank check."""
     var val = args[unsafe_offset=2].copy()
     if val.tag == TAG_TENSOR or val.tag == TAG_TENSOR_REF:
         var vt = v_tensor_c(val)
-        if vt.rank != 0:
-            raise Error(
-                (
-                    "masked_fill_ only supports a 0-dimensional value"
-                    " tensor, but got tensor with "
-                ),
-                vt.rank,
-                " dimension(s).",
-            )
+        _check_value_rank(args)
+        refuse_masked_fill_dtype(self.stype)
         val = fill_item(
             vt,
             self.stype,
             vt.on_mojo() and self.on_mojo() and vt.device == self.device,
         )
+    else:
+        refuse_masked_fill_dtype(self.stype)
     check_real_scalar_fits(self.stype, val)
     var c = scalar_parts(val, self.stype)  # an integer: one rounding
     var m = _Call("aten::masked_fill_", "Scalar")

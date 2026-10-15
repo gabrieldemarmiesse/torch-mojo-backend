@@ -1070,8 +1070,6 @@ def _masked_fill_validate(a: T, mask: T, in_place: Bool = False) raises:
         # would change under the write
         assert_no_partial_overlap(a, mask)
         check_expands_to(mask, a)  # expand_inplace(self, mask)
-    # the dtype dispatch refuses before the value converts
-    refuse_masked_fill_dtype(a.stype)
 
 
 def _is_int_fill(st: Int32) -> Bool:
@@ -1306,6 +1304,7 @@ def op_masked_fill_scalar(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     _masked_fill_validate(a, mask)
+    refuse_masked_fill_dtype(a.stype)
     var ae = _masked_fill_expanded(a, mask)
     var out = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
     _masked_fill_scalar_dispatch(mask, ae, args[unsafe_offset=2], out.t)
@@ -1320,6 +1319,7 @@ def op_masked_fill_scalar_out(
     var mask = v_tensor(args[unsafe_offset=1])
     var out_arg = v_tensor(args[unsafe_offset=3])
     _masked_fill_validate(a, mask)
+    refuse_masked_fill_dtype(a.stype)
     var ae = _masked_fill_expanded(a, mask)
     _ = _masked_fill_value(args[unsafe_offset=2], a)  # the value first
     _masked_fill_out_dtype(out_arg, ae, a)
@@ -1351,6 +1351,7 @@ def op_masked_fill__scalar(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     _masked_fill_validate(a, mask, in_place=True)
+    refuse_masked_fill_dtype(a.stype)
     if a.contig:
         # Writing dst == a is safe: each element reads and writes the same
         # flat index (a's own strides are the output layout).
@@ -1364,6 +1365,8 @@ def op_masked_fill__scalar(
 
 
 def _masked_fill_check_value(value_arg: Value) raises -> T:
+    """The Tensor overloads' first check (masked_fill__cuda): a 0-d value,
+    before the mask checks and the dtype dispatch."""
     var val = v_tensor(value_arg)
     if val.rank != 0:
         raise Error(
@@ -1397,8 +1400,9 @@ def op_masked_fill_tensor(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
-    _masked_fill_validate(a, mask)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
+    _masked_fill_validate(a, mask)
+    refuse_masked_fill_dtype(a.stype)
     var ae = _masked_fill_expanded(a, mask)
     var out = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
     if _value_is_direct(a, val):
@@ -1422,8 +1426,9 @@ def op_masked_fill_tensor_out(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     var out_arg = v_tensor(args[unsafe_offset=3])
-    _masked_fill_validate(a, mask)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
+    _masked_fill_validate(a, mask)
+    refuse_masked_fill_dtype(a.stype)
     var ae = _masked_fill_expanded(a, mask)
     if not _value_is_direct(a, val):
         _ = _masked_fill_value(_value_item(val, a), a)  # the value first
@@ -1456,8 +1461,9 @@ def op_masked_fill__tensor(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
-    _masked_fill_validate(a, mask, in_place=True)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
+    _masked_fill_validate(a, mask, in_place=True)
+    refuse_masked_fill_dtype(a.stype)
     if a.contig:
         _masked_fill_value_into(mask, a, val, a)
     else:
