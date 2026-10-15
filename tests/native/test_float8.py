@@ -3242,3 +3242,125 @@ def test_float8_round14_shapes_match_stock_cuda(mojo_device):
 )
 def test_float8_round14_data_regenerates_on_stock_cuda():
     assert list(_r14_lines("cuda")) == _F8_ITER["round14"]
+
+
+def _threshold_value_lines(dev):
+    """threshold / threshold_backward values: inf, nan and -0 in grad and
+    self, float8 / float16 / float32 operands, broadcast shapes, and every
+    kind of out= (none, fresh, empty, expanded, aliased, another dtype)."""
+    a = torch.ops.aten
+    f32, f16 = torch.float32, torch.float16
+    e4, e5 = torch.float8_e4m3fn, torch.float8_e5m2
+    gv = [float("inf"), float("nan"), -0.0, 2.0]
+    sv = [0.0, -0.0, float("nan"), 1.0]
+
+    def t(vals, dt):
+        return torch.tensor(vals).to(dt).to(dev)
+
+    def outs(n):
+        yield "none", None
+        yield "fresh_f32", lambda: torch.empty(n, device=dev)
+        yield "empty_f32", lambda: torch.empty(0, device=dev)
+        yield "expanded_f32", lambda: torch.empty(1, device=dev).expand(n)
+        yield "empty_f16", lambda: torch.empty(0, dtype=f16, device=dev)
+
+    for thr in (0.0, 0.5):
+        for gdt, sdt in (
+            (f32, f32),
+            (e5, f32),
+            (f32, e5),
+            (e5, e5),
+            (f16, f32),
+            (e4, f16),
+        ):
+            for gshape, sshape in (((4,), (4,)), ((4,), (1,)), ((1,), (4,))):
+
+                def grad():
+                    return t(gv[: gshape[0]] if gshape[0] == 4 else [gv[0]], gdt)
+
+                def selfv():
+                    return t(sv[: sshape[0]] if sshape[0] == 4 else [sv[2]], sdt)
+
+                tag = f"{thr} {str(gdt)[6:]}/{str(sdt)[6:]} {gshape}/{sshape}"
+                for oname, mk in outs(4):
+                    if mk is None:
+                        yield f"thrb {tag} {oname} " + _act_res(
+                            lambda: a.threshold_backward(grad(), selfv(), thr)
+                        )
+                        yield f"thr {tag} {oname} " + _act_res(
+                            lambda: a.threshold(selfv(), thr, -2.0)
+                        )
+                        continue
+                    o = mk()
+                    yield f"thrb {tag} {oname} " + _act_res(
+                        lambda: a.threshold_backward.grad_input(
+                            grad(), selfv(), thr, grad_input=o
+                        ),
+                        o,
+                    )
+                    o = mk()
+                    yield f"thr {tag} {oname} " + _act_res(
+                        lambda: a.threshold.out(selfv(), thr, -2.0, out=o), o
+                    )
+            # Aliased outs: grad_input = grad, threshold out = self.
+            g = t(gv, gdt)
+            yield f"thrb {thr} {str(gdt)[6:]}/{str(sdt)[6:]} aliased_grad " + _act_res(
+                lambda: a.threshold_backward.grad_input(
+                    g, t(sv, sdt), thr, grad_input=g
+                ),
+                g,
+            )
+            s = t(sv, sdt)
+            yield f"thr {thr} {str(sdt)[6:]} aliased_self " + _act_res(
+                lambda: a.threshold.out(s, thr, -2.0, out=s), s
+            )
+            s2 = t(sv, sdt)
+            yield f"thr_ {thr} {str(sdt)[6:]} inplace " + _act_res(
+                lambda: a.threshold_(s2, thr, -2.0)
+            )
+
+
+def test_float8_threshold_values_match_stock_cuda(mojo_device):
+    _compare(list(_threshold_value_lines(mojo_device)), _F8_ITER["threshold_values"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_float8_threshold_values_regenerate_on_stock_cuda():
+    assert list(_threshold_value_lines("cuda")) == _F8_ITER["threshold_values"]
+
+
+def _threshold_scalar_lines(dev):
+    """threshold's Scalars convert to the kernel's dtype with c10's overflow
+    check (an infinity converts)."""
+    a = torch.ops.aten
+    x = torch.ones(4, device=dev)
+    h = torch.float16
+
+    def out0():
+        return torch.empty(0, dtype=h, device=dev)
+
+    yield _act_res(lambda: a.threshold.out(x, 0.5, 1e6, out=out0()))
+    yield _act_res(lambda: a.threshold.out(x, 1e6, 0.5, out=out0()))
+    yield _act_res(lambda: a.threshold(x.half(), 0.5, 1e6))
+    yield _act_res(
+        lambda: a.threshold.out(
+            x, 0.5, 1e6, out=torch.empty(1, dtype=h, device=dev).expand(4)
+        )
+    )
+    yield _act_res(lambda: a.threshold.out(x, 0.5, float("inf"), out=out0()))
+    yield _act_res(lambda: a.threshold_(x.half(), 0.5, 1e6))
+    e5 = torch.ones(4).to(torch.float8_e5m2).to(dev)
+    yield _act_res(lambda: a.threshold.out(e5, 0.5, 1e6, out=out0()))
+
+
+def test_threshold_scalar_overflow_matches_stock_cuda(mojo_device):
+    _compare(list(_threshold_scalar_lines(mojo_device)), _F8_ITER["threshold_scalars"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_threshold_scalar_data_regenerates_on_stock_cuda():
+    assert list(_threshold_scalar_lines("cuda")) == _F8_ITER["threshold_scalars"]
