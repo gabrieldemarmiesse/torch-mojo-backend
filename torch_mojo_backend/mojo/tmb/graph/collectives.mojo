@@ -179,6 +179,8 @@ struct C10dWait:
     ) raises:
         comptime if target == "gpu":
             _wait(Int(started.unsafe_ptr()), started.size(), handles, ctx)
+            # TODO: drop this copy once MAX keeps live in-graph buffers apart
+            # (agents_docs/optimization_backlog.md, Q6).
             var n = output.size()
             if n > 0:
                 ctx.enqueue_copy(

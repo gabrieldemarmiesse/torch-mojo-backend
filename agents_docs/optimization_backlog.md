@@ -97,6 +97,7 @@ different kind of item.
 | [Q2](#q2) | Graph GroupNorm is reimplemented and returns `NotImplementedError` objects for mean/rstd | Graph | Low + a latent hazard | Low | — |
 | [Q4](#q4) | Graph SDPA with `attn_mask` decomposes to full-matrix attention | Graph | Medium for HF models | Medium | — |
 | [Q5](#q5) | Graph conv/pool insert explicit NCHW↔NHWC permutes | Graph | UNMEASURED, possibly zero | Low | verify MAX does not elide them |
+| [Q6](#q6) | Every compiled collective copies its output once after the wait | Graph | UNMEASURED; one output-sized device copy per collective | Low once MAX is fixed | MAX 26.6 `buffer_create` aliasing |
 | [P4](#p4) | Cold start is 11.6 s and `__mojocache__` cannot be shipped | Compile pipeline | First-run only | Low | — |
 
 ---
@@ -1383,6 +1384,35 @@ descriptor-batched body for the whole family)
 * **Expected win.** **UNMEASURED** and possibly zero.
 * **How to measure it.** `TORCH_MOJO_BACKEND_VERBOSE=1` to dump the graph, then
   `bench_mojo.py resnet` and `demo_scripts/vgg.py` through `torch.compile`.
+
+### Q6
+**Every compiled collective copies its output once after the wait**
+
+* **What.** `c10d_wait` in `tmb/graph/collectives.mojo` (the `enqueue_copy`),
+  lowered by `torch_compile_backend/collectives.py` (`wait`).
+* **Current implementation.** `c10d_start` writes the collective into its own
+  MAX output; `c10d_wait` joins the comm stream, then copies that output into
+  the result its consumers read. A MAX op cannot return an input as its
+  output, so the copy is what orders consumers after the wait.
+* **Why it is not optimal.** One extra output-sized device copy (read + write)
+  per collective, on the graph stream, serialized after the wait. Eager mode
+  has none.
+* **What the optimized version looks like.** Start and wait as in-place ops on
+  a `buffer_create`d buffer, `buffer_load` after the wait: the load aliases the
+  buffer (measured, no copy). Blocked by MAX 26.6, which gave two live
+  `buffer_create` buffers of one type the same address, even with different
+  `init_value`s (measured on H100 with two buffers each written by an in-place
+  op, then both loaded), so two in-flight collectives of one shape wrote the
+  same bytes; `mo.mutable.load` also rejects buffer dims that are not static
+  or graph-input symbols (`s0 // 2`). Recheck on each MAX upgrade, or ask
+  Modular for an aliasing/in-place output on custom ops.
+* **Expected win.** **UNMEASURED.** The copy runs at HBM bandwidth (~2x output
+  bytes); a 2-rank NVLink all-reduce of the same tensor takes several times
+  longer, so an estimated (not measured) 10-30% on top of each collective's
+  own time.
+* **How to measure it.** nsys on the compiled TP MLP of
+  `tests/compile_c10d_worker.py` (`tensor_parallel`): the `c10d_wait` copy
+  kernels next to the NCCL kernels.
 
 ---
 
