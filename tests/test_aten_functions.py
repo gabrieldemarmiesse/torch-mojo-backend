@@ -3563,6 +3563,27 @@ def test_aten_index_put(
 
 
 @pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_aten_index_put_2d_index(
+    conf: Conf, accumulate: bool, call_checker: CallChecker
+):
+    """A 2-D index writes `index.shape + x.shape[1:]` (the embedding
+    backward's `[batch, seq]` token ids, accumulated into the table)."""
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, accumulate)
+
+    x = torch.randn(7, 3)
+    index = torch.tensor(
+        [[3, 0, 3], [1, 6, 0]] if accumulate else [[3, 0, 5], [1, 6, 2]],
+        dtype=torch.int64,
+    )
+    values = torch.randn(2, 3, 3)
+    check_outputs(fn, conf, [x, index, values])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_index_put_negative_indices(conf: Conf, call_checker: CallChecker):
     """Advanced indexing — unlike gather/index_select/scatter_add — DOES
     define negative indices, and wraps them python-style."""
