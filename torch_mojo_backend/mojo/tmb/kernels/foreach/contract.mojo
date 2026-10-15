@@ -68,3 +68,16 @@ def foreach_apple_supported(kind: StringSlice, v: Int) -> Bool:
             and v == fe_variant(1, False, FE_ROLE_NONE, False)
         )
     )
+
+
+# The foreach reductions (reduce.mojo): the reduction kinds the `norm` / `max`
+# builds take as FE_NORM, and the chunk the host sizes the partials scratch
+# by -- CUDA's kChunkSize.
+comptime FE_REDUCE_CHUNK = 65_536
+comptime FR_L0 = 0
+comptime FR_L1 = 1
+comptime FR_L2 = 2
+comptime FR_LINF = 3
+comptime FR_MAX = 4
+comptime FR_LNEGINF = 5  # the -inf norm: min of |x|
+comptime FR_LP = 6  # any other order p: sum(|x|^p) (and its 1/p root)
