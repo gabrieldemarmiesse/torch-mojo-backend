@@ -30,9 +30,16 @@ from tmb.backend.abi import (
     is_complex_stype,
     TAG_BOOL,
     TAG_COMPLEX,
+    TAG_DOUBLE,
+    TAG_INT,
     TAG_SCALAR_BOOL,
+    TAG_SCALAR_DOUBLE,
+    TAG_SCALAR_INT,
     OpFn,
+    Results,
+    ST_BOOL,
     ST_FLOAT32,
+    ST_INT64,
     Owned,
     T,
     TAG_TENSOR,
@@ -42,7 +49,9 @@ from tmb.backend.abi import (
     dtype_name,
     is_float8_stype,
     max_dtype,
+    none_arg,
     own,
+    ret_ref,
     tensor_arg,
     unsupported,
     v_f64,
@@ -59,6 +68,7 @@ from tmb.ops.common import (
     cast_complex,
     cast_to,
     combine_categories,
+    copy_strided_into,
     device_str,
     is_float_stype,
     promote_types,
@@ -178,6 +188,10 @@ def _common_of(args: Values, ins: Int, rev: Bool = False) raises -> Int32:
             continue
         var v = args[unsafe_offset=i].copy()
         if not _rec_tensor(v):
+            # a Scalar operand (a `.Scalar` overload): a wrapped number
+            var sst = _scalar_rec_stype(v)
+            if sst != ST_UNDEFINED:
+                wrapped = promote_types(wrapped, sst)
             continue
         var t = T(Int(v.a))
         if t.rank == 0:
@@ -193,6 +207,44 @@ def _common_of(args: Values, ins: Int, rev: Bool = False) raises -> Int32:
         else:
             dim = promote_types(dim, t.stype)
     return combine_categories(dim, combine_categories(zero, wrapped))
+
+
+def _scalar_rec_stype(v: Value) -> Int32:
+    """The dtype a Scalar record wraps into (`wrapped_scalar_tensor`): the
+    default dtype of its category; ST_UNDEFINED for any other record."""
+    if v.tag == TAG_COMPLEX:
+        return default_complex_dtype()
+    if v.tag == TAG_SCALAR_DOUBLE or v.tag == TAG_DOUBLE:
+        return default_dtype()
+    if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
+        return ST_INT64
+    if v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL:
+        return ST_BOOL
+    return ST_UNDEFINED
+
+
+def _alpha_check(dt: Int32, a: Value) raises:
+    """ATen's alpha_check (add / sub / rsub), on the iterator's common
+    dtype, before the kernel's dtype dispatch."""
+    var is_bool = a.tag == TAG_SCALAR_BOOL or a.tag == TAG_BOOL
+    if is_bool and dt != ST_BOOL:
+        raise Error("Boolean alpha only supported for Boolean results.")
+    var floating = is_float_stype(dt) or is_float8_stype(dt)
+    var cplx = is_complex_stype(dt)
+    if (
+        not floating
+        and not cplx
+        and (a.tag == TAG_SCALAR_DOUBLE or a.tag == TAG_DOUBLE)
+    ):
+        raise Error(
+            "For integral input tensors, argument alpha must not be a"
+            " floating point number."
+        )
+    if not cplx and a.tag == TAG_COMPLEX:
+        raise Error(
+            "For non-complex input tensors, argument alpha must not be a"
+            " complex number."
+        )
 
 
 def _shape_is(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
@@ -599,9 +651,12 @@ def f8_iter[
     pre: Int = PRE_NONE,
     label: StaticString = "",
     overlap: Bool = True,
+    alpha_idx: Int = -1,
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """`ins`: bitmask of the operand args; `out_idx`: the out= (or, inside
-    `ins`, the in-place self) arg, -1 for none."""
+    `ins`, the in-place self) arg, -1 for none; `alpha_idx`: add / sub's
+    alpha Scalar (alpha_check on the common dtype, after the out's resize),
+    -1 for none."""
     _complex_meta[pre, ins, out_idx, label](args)
     var touched = False
     for i in range(_MAX_ARGS):
@@ -637,6 +692,8 @@ def f8_iter[
         if not it.shape_ok:
             raise Error(it.err)
         compute = _common_of(args, p.ins, p.rev)
+        comptime if alpha_idx >= 0:
+            _alpha_check(compute, args[unsafe_offset=alpha_idx].copy())
         if is_float8_stype(compute):
             _refuse(String(kernel), compute)
         var o = T(Int(args[unsafe_offset=out_idx].a))
@@ -713,6 +770,8 @@ def f8_iter[
             and not _shape_is(o, it.shape, it.rank)
         ):
             resize_out(o, it.shape, it.rank)
+        comptime if alpha_idx >= 0:
+            _alpha_check(common, args[unsafe_offset=alpha_idx].copy())
         compute = o.stype if eff_mode == MODE_OUTDT else common
     else:
         if not it.shape_ok:
@@ -721,6 +780,8 @@ def f8_iter[
         var fdev = _first_device(args, p.shape_ins)
         if fdev.byte_length() > 0:
             _inputs_on_device(args, p.shape_ins, fdev, p.cpu_scalars)
+        comptime if alpha_idx >= 0:
+            _alpha_check(compute, args[unsafe_offset=alpha_idx].copy())
     # (e)
     var k = String(kernel) if p.kernel.byte_length() == 0 else p.kernel
     comptime if pre == PRE_DIV_MODE:
@@ -780,3 +841,45 @@ def f8_iter[
     )
     _ = held^
     _ = recs^
+
+
+def generated_out[
+    op: OpFn, n_in: Int, out_idx: Int
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """torch's generated `out=` wrapper of an op with no out kernel of its
+    own (rsub.*_out): the functional result `op` over the first `n_in`
+    arguments (every check of its, the out untouched), then
+    resize_output, copy_arg's exact dtype and device checks, the copy."""
+    var r_list = List[Value](capacity=1)
+    r_list.append(none_arg())
+    op(
+        args,
+        n_in,
+        r_list.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
+        1,
+    )
+    var results = Results(r_list^)
+    var res = own(results.take_tensor(0))
+    var dest = T(Int(args[unsafe_offset=out_idx].a))
+    if not _shape_is(dest, res.t.shape, res.t.rank):
+        resize_out(dest, res.t.shape, res.t.rank)
+        dest = T(Int(args[unsafe_offset=out_idx].a))
+    if dest.stype != res.t.stype:
+        raise Error(
+            "Expected out tensor to have dtype ",
+            dtype_name(res.t.stype),
+            ", but got ",
+            dtype_name(dest.stype),
+            " instead",
+        )
+    if device_str(dest) != device_str(res.t):
+        raise Error(
+            "Expected out tensor to have device ",
+            device_str(res.t),
+            ", but got ",
+            device_str(dest),
+            " instead",
+        )
+    copy_strided_into(dest, res.t)
+    _ = res^
+    ret_ref(rets, 0, dest)

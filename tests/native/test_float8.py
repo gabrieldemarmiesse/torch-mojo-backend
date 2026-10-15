@@ -3897,3 +3897,111 @@ def test_complex_meta_refusals_without_float8(mojo_device):
     ):
         with pytest.raises(exc, match=msg):
             fn()
+
+
+# ---------------------------------------------------------------------------
+# review round 4: rsub's generated out= wrappers, alpha_check, pow.Scalar_out
+# ---------------------------------------------------------------------------
+
+
+def _rsub_pow_alpha_lines(dev):
+    """rsub.Scalar_out / rsub.Tensor_out over other x alpha x out dtype x
+    out shape (empty, right-sized, an expanded one-element tensor), the
+    functional rsub, add / sub's alpha_check against float8, and
+    pow.Scalar_out's resize / base-equal-to-1 fill (stock CUDA 2.11)."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+    selves = {
+        "x8": lambda: torch.tensor([1.0, 0.5, 2.0]).to(f8).to(dev),
+        "f32": lambda: torch.tensor([1.0, 0.5, 2.0], device=dev),
+    }
+    scalars = {"2": 2, "True": True, "2j": 2j, "2.5": 2.5}
+    tensors = {
+        "x8": lambda: torch.tensor([1.0, 0.5, 2.0]).to(f8).to(dev),
+        "f32": lambda: torch.tensor([3.0, 1.0, 0.0], device=dev),
+        "bool": lambda: torch.tensor([True, False, True], device=dev),
+        "c64": lambda: torch.tensor([1 + 1j, 2j, 3 + 0j], device=dev),
+    }
+    alphas = {"1": 1, "True": True, "2j": 2j}
+    odts = {"f8": f8, "c64": torch.complex64, "f32": torch.float32}
+
+    def out_of(dt, shape):
+        if shape == "exp":
+            return torch.zeros(1, dtype=dt, device=dev).expand(6)
+        return torch.zeros(int(shape), dtype=dt, device=dev)
+
+    for s, al in itertools.product(selves, alphas):
+        for o in scalars:
+            yield f"rsub {s} S{o} a={al} " + _act_res(
+                lambda s=s, o=o, al=al: torch.rsub(
+                    selves[s](), scalars[o], alpha=alphas[al]
+                )
+            )
+            for od, shp in itertools.product(odts, ("0", "3", "exp")):
+                out = out_of(odts[od], shp)
+                yield f"rsub.Scalar_out {s} {o} a={al} {od}{shp} " + _act_res(
+                    lambda s=s, o=o, al=al, out=out: a.rsub.Scalar_out(
+                        selves[s](), scalars[o], alphas[al], out=out
+                    ),
+                    out,
+                )
+        for o in tensors:
+            yield f"rsub {s} T{o} a={al} " + _act_res(
+                lambda s=s, o=o, al=al: torch.rsub(
+                    selves[s](), tensors[o](), alpha=alphas[al]
+                )
+            )
+            for od, shp in itertools.product(odts, ("0", "3", "exp")):
+                out = out_of(odts[od], shp)
+                yield f"rsub.Tensor_out {s} {o} a={al} {od}{shp} " + _act_res(
+                    lambda s=s, o=o, al=al, out=out: a.rsub.Tensor_out(
+                        selves[s](), tensors[o](), alpha=alphas[al], out=out
+                    ),
+                    out,
+                )
+    for op, other, al in itertools.product(
+        ("add", "sub"), ("x8", "2.5"), (1, True, 2j, 2.0)
+    ):
+
+        def oth(other=other):
+            return selves["x8"]() if other == "x8" else 2.5
+
+        fn = getattr(torch, op)
+        yield f"{op} x8 {other} a={al} " + _act_res(
+            lambda fn=fn, oth=oth, al=al: fn(selves["x8"](), oth(), alpha=al)
+        )
+        out = torch.empty(0, device=dev)
+        yield f"{op}.out x8 {other} a={al} " + _act_res(
+            lambda fn=fn, oth=oth, al=al, out=out: fn(
+                selves["x8"](), oth(), alpha=al, out=out
+            ),
+            out,
+        )
+    for base, ex, od, shp in itertools.product(
+        (1, 1.0, 1 + 0j, True, 2, 2j),
+        ("f32", "x8"),
+        ("i32", "c64", "f8", "f32"),
+        ("0", "exp3"),
+    ):
+        dt = {"i32": torch.int32, "c64": torch.complex64, "f8": f8}.get(
+            od, torch.float32
+        )
+        out = (
+            torch.zeros(1, dtype=dt, device=dev).expand(3)
+            if shp == "exp3"
+            else torch.zeros(0, dtype=dt, device=dev)
+        )
+        yield f"pow.Scalar_out {base} {ex} {od}{shp} " + _act_res(
+            lambda base=base, ex=ex, out=out: torch.pow(base, selves[ex](), out=out),
+            out,
+        )
+
+
+def test_rsub_pow_alpha_match_stock_cuda(mojo_device):
+    _compare(list(_rsub_pow_alpha_lines(mojo_device)), _F8_ITER["rsub_pow_alpha"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_rsub_pow_alpha_data_regenerates_on_stock_cuda():
+    assert list(_rsub_pow_alpha_lines("cuda")) == _F8_ITER["rsub_pow_alpha"]

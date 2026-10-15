@@ -1195,31 +1195,6 @@ def cx_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
-def cx_rsub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    """rsub.Tensor_out / rsub.Scalar_out(self, other, *, alpha, out)"""
-    if _real_out(
-        "aten::rsub",
-        _tensor_or_scalar(args[unsafe_offset=1], "Tensor", "Scalar"),
-        args,
-        3,
-        3,
-        rets,
-        structured=False,
-    ):
-        return
-    # rsub.*_out is a generated wrapper: the functional result, the out's
-    # exact dtype, then resize and copy (no overlap check with the inputs)
-    var dest = v_tensor_c(args[unsafe_offset=3])
-    var res = _arith(
-        "sub",
-        args[unsafe_offset=1],
-        args[unsafe_offset=0],
-        args[unsafe_offset=2].copy(),
-    )
-    _exact_dtype(dest, res.t.stype)
-    _store(dest, res^, rets)
-
-
 def _cumsum(args: Values, out_st: Int32 = -1) raises -> Owned:
     """cumsum(self, dim, *, dtype) with a complex self, dtype= or out=. The
     accumulation dtype is dtype=, else the out='s dtype, else self's

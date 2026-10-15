@@ -56,6 +56,7 @@ from tmb.backend.abi import (
     ret_owned,
     ret_tensor,
     tensor_arg,
+    v_tensor_c,
     unsupported,
     v_bool,
     v_f64,
@@ -71,10 +72,10 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.ops.f8_iter import (
     f8_cx_scalar,
     f8_iter,
+    generated_out,
     MODE_CAST,
     MODE_FN,
     MODE_INPLACE,
-    MODE_COPY_OUT,
     MODE_OUTDT,
     MODE_SAME,
     PRE_BOOL_OUT,
@@ -96,15 +97,16 @@ from tmb.ops.f8_iter import (
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.float8 import is_float8
 from tmb.ops.complex import (
+    resize_any,
     routed,
 )
 from tmb.ops.complex_math import (
+    _base_is_one,
     cx_pow_tensor,
     cx_pow_tensor_out,
     cx_pow_tensor_scalar,
     cx_pow_tensor_scalar_out,
     cx_rsub,
-    cx_rsub_out,
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.binary import (
@@ -132,7 +134,6 @@ from tmb.ops.binary import (
     op_pow_tensor,
     op_pow_tensor_out,
     op_rsub,
-    op_rsub_out,
 )
 from tmb.ops.common import (
     threshold_into_overlapping,
@@ -146,6 +147,7 @@ from tmb.ops.common import (
     scalar_type_name,
     ST_UNDEFINED,
     assert_no_internal_overlap,
+    assert_no_partial_overlap,
     combine_categories as _pw_combine_known,
     contiguous,
     copy_strided_into,
@@ -1440,16 +1442,6 @@ def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_rsub_check(args)
     if not _pw_rsub_alpha(args, rets, -1):
         op_rsub(args, n_args, rets, n_rets)
-
-
-# aten::rsub.Tensor_out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
-# aten::rsub.Scalar_out(Tensor self, Scalar other, Scalar alpha=1, *, Tensor(a!) out) -> Tensor(a!)
-def op_rsub_out_any(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_rsub_check(args)
-    if not _pw_rsub_alpha(args, rets, 3):
-        op_rsub_out(args, n_args, rets, n_rets)
 
 
 # aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
@@ -4292,6 +4284,54 @@ def op_sample_dirichlet(
     ret_owned(rets, 0, g)
 
 
+# aten::pow.Scalar_out(Scalar self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
+def op_pow_scalar_out_meta(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """pow.Scalar_out (Pow.cpp): its meta takes the dtype from the out (no
+    result type) and resizes the out to the exponent's shape; then a base
+    EQUAL to 1 (Scalar::equal: not a bool) is `out.fill_(1)` with no other
+    check, and any other base is pow.Tensor_Tensor's out= (the real or
+    complex route)."""
+    var ex = v_tensor_c(args[unsafe_offset=1])
+    var dest = v_tensor_c(args[unsafe_offset=2])
+    if not dest.same_shape(ex):
+        resize_any(dest, ex.shape, ex.rank)
+        dest = v_tensor_c(args[unsafe_offset=2])
+    if _base_is_one(args[unsafe_offset=0]):
+        var f = call_op(
+            "aten::fill_",
+            "Scalar",
+            [tensor_arg(dest), Value(TAG_SCALAR_INT, 0, 1, 0)],
+            1,
+        )
+        _ = f^
+        ret_ref(rets, 0, dest)
+        return
+    # at::pow_out(out, wrapped_scalar_tensor(base), exponent): its
+    # TensorIterator checks the out's memory overlaps before the result type
+    assert_no_internal_overlap(dest)
+    assert_no_partial_overlap(dest, ex)
+    routed[op_pow_scalar_base_out, cx_pow_tensor_out, 3](
+        args, n_args, rets, n_rets
+    )
+
+
+# rsub.Tensor / rsub.Scalar(self, other, alpha): sub(other, self) -- its
+# bool check, the result type of both operands (a Scalar other as a wrapped
+# number), alpha_check, then the kernel's dtype dispatch
+comptime _rsub_fn = f8_iter[
+    routed[op_rsub_any, cx_rsub, 3],
+    "ufunc_add_CUDA",
+    3,
+    -1,
+    MODE_FN,
+    False,
+    PRE_RSUB,
+    alpha_idx=2,
+]
+
+
 def register_pointwise(site: Site) raises:
     impl[op_sample_dirichlet, "_sample_dirichlet"](site)
     impl[
@@ -5044,55 +5084,20 @@ def register_pointwise(site: Site) raises:
         ],
         "nextafter.out",
     ](site)
-    impl[
-        f8_iter[
-            routed[op_rsub_any, cx_rsub, 3],
-            "ufunc_add_CUDA",
-            3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_RSUB,
-        ],
-        "rsub.Tensor",
-    ](site)
-    impl[routed[op_rsub_any, cx_rsub, 3], "rsub.Scalar"](site)
-    impl[
-        f8_iter[
-            routed[op_rsub_out_any, cx_rsub_out, 4],
-            "ufunc_add_CUDA",
-            3,
-            3,
-            MODE_COPY_OUT,
-            False,
-            PRE_RSUB,
-        ],
-        "rsub.Tensor_out",
-    ](site)
+    impl[_rsub_fn, "rsub.Tensor"](site)
+    impl[_rsub_fn, "rsub.Scalar"](site)
     # rsub's out= overloads are generated wrappers: the functional result
-    # (its float8 refusal leaves out untouched), then resize and copy
-    impl[
-        f8_iter[
-            routed[op_rsub_out_any, cx_rsub_out, 4],
-            "ufunc_add_CUDA",
-            1,
-            3,
-            MODE_COPY_OUT,
-            False,
-            PRE_NONE,
-        ],
-        "rsub.Scalar_out",
-    ](site)
+    # (its checks and float8 refusal leave out untouched), then resize,
+    # copy_arg's exact dtype check, the copy
+    impl[generated_out[_rsub_fn, 3, 3], "rsub.Tensor_out"](site)
+    impl[generated_out[_rsub_fn, 3, 3], "rsub.Scalar_out"](site)
     impl[
         f8_cx_scalar[routed[op_pow_scalar_base, cx_pow_tensor, 2]], "pow.Scalar"
     ](site)
     # pow.Scalar_out takes its dtype from the out (no result type): the out
     # is resized, a base equal to 1 fills ones, any other complex base
     # meets the float8 exponent in pow.Tensor_Tensor (cx_pow_tensor_out)
-    impl[
-        routed[op_pow_scalar_base_out, cx_pow_tensor_out, 3],
-        "pow.Scalar_out",
-    ](site)
+    impl[op_pow_scalar_out_meta, "pow.Scalar_out"](site)
     impl[
         f8_cx_scalar[routed[op_pow_scalar_any, cx_pow_tensor_scalar, 2]],
         "pow.Tensor_Scalar",
