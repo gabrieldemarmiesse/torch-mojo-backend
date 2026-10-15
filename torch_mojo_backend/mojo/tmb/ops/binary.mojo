@@ -1970,34 +1970,6 @@ def _rsub_promote(lhs: Side, rhs: Side) raises -> Optional[T]:
     return casted^
 
 
-# aten::rsub.Tensor_out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
-# aten::rsub.Scalar_out(Tensor self, Scalar other, Scalar alpha=1, *, Tensor(a!) out) -> Tensor(a!)
-def op_rsub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var lhs = _b_side(args[unsafe_offset=1])
-    var rhs = _b_side(args[unsafe_offset=0])
-    var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
-    _b_out_guard(dest, lhs, rhs)
-    # rsub's out dtype is the result's own (sub's structured meta with
-    # `out` built from self): no cast into another dtype.
-    if v_f64(args[unsafe_offset=2]) == 1.0:
-        # The functional op's one launch, so `out=` rounds the same way
-        # (`other` stays in opmath instead of being embedded in self's
-        # dtype first: float16 self with other=1.0001).
-        var fast = _b_try_scalar(
-            "RsubScalarSpec", rhs, lhs, False, Optional[T](dest.copy())
-        )
-        if fast.__bool__():
-            _b_store_out(rets, dest, fast.value().copy(), exact_dtype=True)
-            return
-    var promoted = _rsub_promote(lhs, rhs)
-    if promoted:
-        rhs = _b_tside(promoted.value())
-    var r = _b_sub(lhs, rhs, args[unsafe_offset=2], Optional[T](dest.copy()))
-    if promoted:
-        release(promoted.value().h)
-    _b_store_out(rets, dest, r^, exact_dtype=True)
-
-
 # aten::mul.Tensor(Tensor self, Tensor other) -> Tensor
 def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if _b_fast_route("MulSpec", "MulScalarSpec", False, args, rets, 0):
@@ -3303,6 +3275,7 @@ def register_binary(site: Site) raises:
             MODE_FN,
             False,
             PRE_NONE,
+            alpha_idx=2,
         ],
         "add.Tensor",
     ](site)
@@ -3315,6 +3288,7 @@ def register_binary(site: Site) raises:
             MODE_INPLACE,
             False,
             PRE_NONE,
+            alpha_idx=2,
         ],
         "add_.Tensor",
     ](site)
@@ -3327,6 +3301,7 @@ def register_binary(site: Site) raises:
             MODE_CAST,
             False,
             PRE_NONE,
+            alpha_idx=2,
         ],
         "add.out",
     ](site)
@@ -3740,6 +3715,7 @@ def register_binary(site: Site) raises:
             MODE_FN,
             False,
             PRE_SUB,
+            alpha_idx=2,
         ],
         "sub.Tensor",
     ](site)
@@ -3752,6 +3728,7 @@ def register_binary(site: Site) raises:
             MODE_INPLACE,
             False,
             PRE_SUB,
+            alpha_idx=2,
         ],
         "sub_.Tensor",
     ](site)
@@ -3764,6 +3741,7 @@ def register_binary(site: Site) raises:
             MODE_CAST,
             False,
             PRE_SUB,
+            alpha_idx=2,
         ],
         "sub.out",
     ](site)
