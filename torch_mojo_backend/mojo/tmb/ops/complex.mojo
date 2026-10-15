@@ -340,6 +340,7 @@ def _real_out(
     n_in: Int,
     out_idx: Int,
     rets: Values,
+    structured: Bool = True,
 ) raises -> Bool:
     """An elementwise `out=` op reaching the complex route only for its
     complex `out` (no complex input): ATen computes in the inputs' common
@@ -357,12 +358,21 @@ def _real_out(
             var t = v_tensor_c(v)
             _broadcast_into(shape, rank, t)
             f8 = f8 or is_float8_stype(t.stype)
-    if f8:
-        # TensorIterator resizes the out before the kernel's dtype dispatch
-        # refuses a float8 computation (the functional call below would
-        # refuse with the out untouched)
+    if f8 and structured:
+        # A structured op's TensorIterator checks the out's memory overlaps,
+        # then resizes it, before the kernel's dtype dispatch refuses a
+        # float8 computation (the functional call below would refuse with
+        # the out untouched). A generated out= wrapper (`structured` False:
+        # rsub) computes the functional result first and never gets here.
         var dest0 = v_tensor_c(args[unsafe_offset=out_idx])
-        resize_any(dest0, shape, rank)
+        _ew_overlaps(args, n_in, dest0)
+        var aliased = False
+        for i in range(n_in):
+            var v = args[unsafe_offset=i].copy()
+            if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+                aliased = aliased or _is_same(dest0, v_tensor_c(v))
+        if not aliased:
+            resize_any(dest0, shape, rank)
     var c = _Call(op, overload)
     for i in range(n_in):
         c.v(args[unsafe_offset=i])

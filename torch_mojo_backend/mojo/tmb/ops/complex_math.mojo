@@ -1204,6 +1204,7 @@ def cx_rsub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         3,
         3,
         rets,
+        structured=False,
     ):
         return
     # rsub.*_out is a generated wrapper: the functional result, the out's
