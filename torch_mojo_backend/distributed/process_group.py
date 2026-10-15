@@ -16,13 +16,14 @@ import contextlib
 import ctypes
 import datetime
 import functools
+import inspect
 import os
 import platform
 import sys
 import threading
 import traceback
 from collections.abc import Callable
-from typing import cast
+from typing import TypeVar, cast
 
 import torch
 import torch.distributed as dist
@@ -99,6 +100,10 @@ def _nccl_red_op(
     )
 
 
+# The collective entry points `_loud` wrapped, for `_never_traced`.
+_LOUD: set[Callable[..., object]] = set()
+
+
 def _loud(method: Callable[..., object]) -> Callable[..., object]:
     """torch swallows exceptions raised inside a Python ProcessGroup method
     called from the autograd thread; print the traceback before re-raising.
@@ -119,9 +124,39 @@ def _loud(method: Callable[..., object]) -> Callable[..., object]:
             self._abort_coalescing()
             raise
 
+    _LOUD.add(wrapper)
     return wrapper
 
 
+_C = TypeVar("_C", bound=type)
+# Private methods of MojoProcessGroup that torch.distributed calls itself.
+_C10D_HOOKS = frozenset(
+    {"_get_backend", "_set_group_name", "_start_coalescing", "_end_coalescing"}
+)
+
+
+def _never_traced(cls: _C) -> _C:
+    """Keep dynamo out of every method of `cls`.
+
+    torch calls a Python process group (and its Work) back from C++, so when
+    compiled code runs a collective eagerly -- after a graph break, or a
+    DDP/FSDP hook dynamo does not trace -- the method's frame starts under
+    dynamo's frame hook, which then tries to compile it (and fails on
+    `record_stream`, which functionalization rejects). ProcessGroupNCCL is
+    C++ and never meets the hook; this makes ours behave the same.
+
+    Only the methods torch calls are wrapped -- the public ones, the `_loud`
+    collectives and `_C10D_HOOKS` -- not their helpers: `disable` is
+    recursive, and each wrapper costs ~0.4 us on the eager path."""
+    for name, attr in list(vars(cls).items()):
+        if inspect.isfunction(attr) and (
+            not name.startswith("_") or attr in _LOUD or name in _C10D_HOOKS
+        ):
+            setattr(cls, name, torch.compiler.disable(attr))
+    return cls
+
+
+@_never_traced
 class _StreamWork(Work):
     """Completion is a point on the comm stream: `wait()` makes the waiter's
     current stream follow it. The device Future is only built for callers
@@ -202,12 +237,16 @@ class _Core:
         self.async_error = ctypes.CFUNCTYPE(i32, vp, i32)(table[15])
         self.abort = ctypes.CFUNCTYPE(i32, vp, i32)(table[16])
         self.synchronize_comm = ctypes.CFUNCTYPE(i32, vp, i32)(table[17])
+        # called by the compiled-graph ops (tmb/graph/collectives.mojo), not here
+        self.graph_entries = (table[18], table[19])
+        self.get_error = ctypes.cast(native.shim().tmb_get_error, vp).value
 
     def check(self, rc: int, what: str):
         if rc != 0:
             raise RuntimeError(f"{what} failed: {native.last_error()}")
 
 
+@_never_traced
 class MojoProcessGroup(dist.ProcessGroup):
     def __init__(
         self, store: Store, rank: int, world_size: int, timeout: datetime.timedelta
@@ -1023,6 +1062,11 @@ class MojoProcessGroup(dist.ProcessGroup):
         staged_in = self._stage_in(index, input)
         staged_out = [self._stage_out(index, t) for t in outputs]
         comm.wait_stream(torch.accelerator.current_stream(index))
+        if nccl.uses_mojoccl():
+            self._gather_by_all_gather(index, staged_in, staged_out)
+            self._finish(index, *zip(outputs, staged_out))
+            self._record(index, input, staged_in)
+            return self._result(index, outputs if root else input_tensors)
         with self._group():
             if root:
                 for peer, o in enumerate(staged_out):
@@ -1057,6 +1101,63 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._record(index, input, staged_in)
         return self._result(index, outputs if root else input_tensors)
 
+    # MojoCCL has no point-to-point operations: gather and scatter (what
+    # DTensor's distribute_tensor uses to shard a module) go through the
+    # collectives it has, moving world_size times the data of the root's
+    # sends -- fine for setup traffic, which is what they carry.
+
+    def _gather_by_all_gather(
+        self, index: int, input: torch.Tensor, outputs: list[torch.Tensor]
+    ):
+        with device_module.stream(self._ready[index]):
+            gathered = torch.empty(
+                self.size() * input.numel(), dtype=input.dtype, device=input.device
+            )
+        self._core.check(
+            self._core.allgather(
+                self._handle,
+                index,
+                input.data_ptr(),
+                gathered.data_ptr(),
+                input.numel(),
+                _nccl_dtype(input.dtype),
+            ),
+            "ncclAllGather",
+        )
+        with device_module.stream(self._ready[index]):
+            for o, chunk in zip(outputs, gathered.view(self.size(), -1)):
+                o.copy_(chunk.view_as(o))
+
+    def _scatter_by_broadcast(
+        self,
+        index: int,
+        output: torch.Tensor,
+        inputs: list[torch.Tensor],
+        root_rank: int,
+    ):
+        with device_module.stream(self._ready[index]):
+            if inputs:
+                full = torch.cat([i.reshape(-1) for i in inputs])
+            else:
+                full = torch.empty(
+                    self.size() * output.numel(),
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+        self._core.check(
+            self._core.broadcast(
+                self._handle,
+                index,
+                full.data_ptr(),
+                full.numel(),
+                _nccl_dtype(output.dtype),
+                root_rank,
+            ),
+            "ncclBroadcast",
+        )
+        with device_module.stream(self._ready[index]):
+            output.copy_(full.view(self.size(), -1)[self.rank()].view_as(output))
+
     @_loud
     def scatter(
         self,
@@ -1083,6 +1184,11 @@ class MojoProcessGroup(dist.ProcessGroup):
         staged_out = self._stage_out(index, output)
         staged_in = [self._stage_in(index, t) for t in inputs]
         comm.wait_stream(torch.accelerator.current_stream(index))
+        if nccl.uses_mojoccl():
+            self._scatter_by_broadcast(index, staged_out, staged_in, opts.rootRank)
+            self._record(index, *inputs, *staged_in)
+            self._finish(index, (output, staged_out))
+            return self._result(index, output_tensors)
         with self._group():
             if root:
                 for peer, i in enumerate(staged_in):

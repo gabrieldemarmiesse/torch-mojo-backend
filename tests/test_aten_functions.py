@@ -2591,6 +2591,20 @@ def test_aten_div_promotes_and_broadcasts_compiled(
 
 
 @pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_div_trailing_one_by_number_compiled(
+    conf: Conf, call_checker: CallChecker
+):
+    """A size-1 dim against a Python divisor keeps its 1 (LayerNorm's
+    backward divides a [b, t, 1] tensor by the feature count)."""
+    call_checker.register(aten_functions.aten_div)
+
+    def fn(x):
+        return torch.div(x, 1600)
+
+    check_outputs(fn, conf, [torch.randn(2, 5, 1)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
 @pytest.mark.parametrize("divisor", ["number", "one_element", "tensor"])
 def test_aten_div_rounding_mode_bf16_compiled(
@@ -3560,6 +3574,56 @@ def test_aten_index_put(
     )
     values = _index_payload((4, 4), dtype)
     check_outputs(fn, conf, [x, index, values])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("accumulate", [False, True])
+@pytest.mark.parametrize("values_shape", [(2, 3, 3), (3,)])
+def test_aten_index_put_2d_index(
+    conf: Conf,
+    accumulate: bool,
+    values_shape: tuple[int, ...],
+    call_checker: CallChecker,
+):
+    """A 2-D index writes `index.shape + x.shape[1:]` (the embedding
+    backward's `[batch, seq]` token ids, accumulated into the table)."""
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, accumulate)
+
+    x = torch.randn(7, 3)
+    index = torch.tensor(
+        [[3, 0, 3], [1, 6, 0]] if accumulate else [[3, 0, 5], [1, 6, 2]],
+        dtype=torch.int64,
+    )
+    values = torch.randn(values_shape)
+    check_outputs(fn, conf, [x, index, values])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_aten_index_put_2d_index_empty_rows(
+    conf: Conf, accumulate: bool, call_checker: CallChecker
+):
+    """A zero-size trailing dim: a no-op write, not an ambiguous reshape."""
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, accumulate)
+
+    index = torch.tensor([[3, 0, 5], [1, 6, 2]], dtype=torch.int64)
+    check_outputs(fn, conf, [torch.randn(7, 0), index, torch.randn(2, 3, 0)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_index_put_0d_index(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, False)
+
+    check_outputs(fn, conf, [torch.randn(7, 3), torch.tensor(4), torch.randn(3)])
 
 
 @pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)

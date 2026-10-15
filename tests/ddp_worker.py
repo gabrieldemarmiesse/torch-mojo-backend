@@ -37,9 +37,10 @@ from torch_mojo_backend.distributed.process_group import MojoProcessGroup
 from torch_mojo_backend.native import device_module
 
 # mojoccl (torch_mojo_backend/mojo/tmb/ccl) implements AllReduce/
-# Broadcast/AllGather/ReduceScatter -- Reduce/Send/Recv/AllToAll/Gather/
-# Scatter return ncclInvalidUsage (DDP needs only the first three). Every mode
-# below skips the checks that need an op mojoccl does not implement.
+# Broadcast/AllGather/ReduceScatter -- Reduce/Send/Recv/AllToAll return
+# ncclInvalidUsage (DDP needs only the first three; gather and scatter are
+# built from all-gather and broadcast). Every mode below skips the checks
+# that need an op mojoccl does not implement.
 _MOJO_CCL = os.environ.get("TORCH_MOJO_BACKEND_CCL") == "mojo"
 
 
@@ -258,35 +259,28 @@ def run_collectives(failures: list[str]):
             _check(failures, "all_to_all.list", ok)
 
     # ---- gather / scatter ---------------------------------------------------
-    if _MOJO_CCL:
-        _skip(rank, "gather")
-        _skip(rank, "scatter")
-    else:
-        with _tolerate_missing_ops(rank, "gather"):
-            mine_g = torch.full((6,), float(rank), device="mojo")
-            gather_list = (
-                [torch.zeros(6, device="mojo") for _ in range(world)]
-                if rank == 0
-                else None
+    with _tolerate_missing_ops(rank, "gather"):
+        mine_g = torch.full((6,), float(rank), device="mojo")
+        gather_list = (
+            [torch.zeros(6, device="mojo") for _ in range(world)] if rank == 0 else None
+        )
+        dist.gather(mine_g, gather_list, dst=0)
+        if rank == 0:
+            assert gather_list is not None
+            ok = all(
+                (gather_list[r].cpu() == float(r)).all().item() for r in range(world)
             )
-            dist.gather(mine_g, gather_list, dst=0)
-            if rank == 0:
-                assert gather_list is not None
-                ok = all(
-                    (gather_list[r].cpu() == float(r)).all().item()
-                    for r in range(world)
-                )
-                _check(failures, "gather", ok)
+            _check(failures, "gather", ok)
 
-        with _tolerate_missing_ops(rank, "scatter"):
-            scatter_out = torch.zeros(6, device="mojo")
-            scatter_list = (
-                [torch.full((6,), float(r), device="mojo") for r in range(world)]
-                if rank == 0
-                else None
-            )
-            dist.scatter(scatter_out, scatter_list, src=0)
-            _check(failures, "scatter", bool((scatter_out.cpu() == float(rank)).all()))
+    with _tolerate_missing_ops(rank, "scatter"):
+        scatter_out = torch.zeros(6, device="mojo")
+        scatter_list = (
+            [torch.full((6,), float(r), device="mojo") for r in range(world)]
+            if rank == 0
+            else None
+        )
+        dist.scatter(scatter_out, scatter_list, src=0)
+        _check(failures, "scatter", bool((scatter_out.cpu() == float(rank)).all()))
 
     # ---- send/recv ring -------------------------------------------------
     if world > 1:

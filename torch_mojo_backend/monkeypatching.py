@@ -16,6 +16,7 @@ monkeypatches and stay in ``mojo_device/register.py``.
 """
 
 import functools
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch._tensor_str
 import torch.distributed.distributed_c10d as c10d
+import torch.distributed.tensor as dtensor
 import torch.utils._triton
 
 from torch_mojo_backend.native import device_module
@@ -189,6 +191,48 @@ def fix_batch_isend_irecv_for_python_process_groups():
     batch_isend_irecv._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
     c10d.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
     torch.distributed.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
+
+
+def let_dtensor_differentiate_a_native_linear():
+    """DTensor has no sharding rule for ``aten.linear_backward``, which a
+    backend that implements ``aten.linear`` itself produces.
+
+    ``aten::linear`` is CompositeImplicitAutograd, but a backend kernel for
+    it (the mojo device has a fused one) makes autograd record
+    ``derivatives.yaml``'s ``linear`` formula, whose backward is
+    ``aten::linear_backward``. DTensor wrappers carry the device's autograd
+    key, so tensor parallelism on such a device reaches that op, and
+    ``torch/distributed/tensor/_dispatch.py`` has neither a strategy nor a
+    decomposition for it (``linear`` itself decomposes, being composite).
+    The handler below is the formula in DTensor ops: ``grad @ weight``,
+    ``grad.T @ input`` and the row sum over the flattened leading dims, the
+    same way ``_custom_op_handlers`` already does ``convolution_backward``.
+    """
+    dispatcher = dtensor.DTensor._op_dispatcher
+    op = torch.ops.aten.linear_backward.default
+    if op in dispatcher._custom_op_handlers:
+        return
+
+    def linear_backward(
+        op_call: torch._ops.OpOverload,
+        args: tuple[object, ...],
+        kwargs: dict[str, object],
+    ) -> tuple[torch.Tensor | None, ...]:
+        input, grad, weight, mask = args
+        assert isinstance(input, torch.Tensor)
+        assert isinstance(grad, torch.Tensor)
+        assert isinstance(weight, torch.Tensor)
+        assert isinstance(mask, list | tuple)
+        # explicit row counts: reshape(-1, 0) is ambiguous for empty features
+        rows = math.prod(grad.shape[:-1])
+        grad_2d = grad.reshape(rows, grad.shape[-1])
+        return (
+            torch.matmul(grad, weight) if mask[0] else None,
+            grad_2d.t() @ input.reshape(rows, input.shape[-1]) if mask[1] else None,
+            grad_2d.sum(0) if mask[2] else None,
+        )
+
+    dispatcher._custom_op_handlers[op] = linear_backward
 
 
 def add_mojo_to_the_inductor_gpu_types():

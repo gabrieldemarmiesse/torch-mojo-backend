@@ -23,9 +23,11 @@ get a tensor onto the accelerator.
   nodes are aarch64, for example), `init_process_group` raises
   `NotImplementedError`.
 - The multi-GPU runs behind this page used H100 (NVIDIA) and MI300A (AMD)
-  GPUs, in eager mode. `torch.compile` isn't supported on the accelerator
-  yet (see the [home page](index.md)).
-- Tensor and pipeline parallelism, 2-D device meshes (HSDP), FSDP1
+  GPUs, in eager mode. `torch.compile` on the accelerator isn't generally
+  supported yet (see the [home page](index.md)); what was tested for
+  collectives inside compiled code is in [`torch.compile`](#torchcompile)
+  below.
+- Pipeline parallelism, 2-D device meshes (HSDP), FSDP1
   (`FullyShardedDataParallel`), and DDP's `find_unused_parameters=True` and
   `static_graph=True` are not covered by tests yet.
 
@@ -256,7 +258,7 @@ gloo.
 | `reduce_scatter`, `reduce_scatter_tensor` | yes | SUM, AVG |
 | `reduce` | yes | no |
 | `all_to_all`, `all_to_all_single` | yes, uneven splits included | no |
-| `gather`, `scatter` | yes | no |
+| `gather`, `scatter` | yes | yes (through broadcast and all-gather) |
 | `send`, `recv`, `isend`, `irecv` | yes | no |
 | `batch_isend_irecv` | implemented, not covered by the tests | no |
 | `barrier` | yes | yes |
@@ -285,6 +287,48 @@ how streams work on the device.
     The tests also cover waiting from a different stream, but that pattern
     has failed intermittently in the past, and the root cause was never
     found.
+
+## `torch.compile`
+
+Collectives in code compiled with `mojo_backend` become part of the
+compiled graph, the way they do with Inductor on CUDA: functional
+collectives (`torch.distributed._functional_collectives`), the
+`dist.all_reduce`-style calls `torch.compile` rewrites into them, and the
+redistributions of DTensor tensor parallelism. Nothing changes in the model
+or in the setup lines:
+
+```python
+import torch.distributed as dist
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    RowwiseParallel,
+    parallelize_module,
+)
+from torch_mojo_backend import mojo_backend
+
+# after the setup lines of train_ddp.py, device and init_process_group included
+mesh = init_device_mesh(device.type, (dist.get_world_size(),))
+model = parallelize_module(
+    MLP().to(device), mesh, {"up": ColwiseParallel(), "down": RowwiseParallel()}
+)
+model = torch.compile(model, backend=mojo_backend)
+```
+
+Each collective runs on the same stream as the eager collectives of that
+process group, and the computation between the start of a collective and
+the first use of its result overlaps with it. Both collective libraries
+work, with the reductions of the table above. Compiled collectives were
+tested on NVIDIA GPUs only; on AMD they're untested.
+
+- `all_to_all_single` raises an error when the graph is compiled, and so do
+  collectives on more than one GPU in one compiled graph.
+- FSDP2 with its default settings runs its collectives in eager mode,
+  outside the graph. Tracing FSDP2's hooks into the graph
+  (`torch._dynamo.config.skip_fsdp_hooks = False` or compiled autograd)
+  isn't supported.
+- Each collective in a compiled graph costs one device copy of its output
+  more than in eager mode.
 
 ## Multi-node
 

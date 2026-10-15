@@ -1,5 +1,6 @@
 import datetime as dt
 import functools
+import operator
 import time
 import traceback
 import weakref
@@ -33,6 +34,14 @@ from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
 from torch_mojo_backend.mojo_device import dlpack as mojo_dlpack
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.torch_compile_backend import debug
+from torch_mojo_backend.torch_compile_backend.collectives import (
+    START_OPS,
+    WAIT_TENSOR,
+    CollectiveLoweringError,
+    GraphCollectives,
+    wait,
+    waited_inputs,
+)
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,
     get_error_message,
@@ -202,6 +211,9 @@ class _GraphFactory:
         # Whether the graph takes one trailing uint64 seed input (a random op
         # of GRAPH_SEEDED_OPS is in it; set by create_graph).
         self.takes_seed = False
+        # The graph's collectives, whose process-group handles are host
+        # inputs after the seed (set by create_graph).
+        self.collectives: GraphCollectives | None = None
 
     def initialize_graph(self):
         if self.graph is not None:
@@ -209,16 +221,25 @@ class _GraphFactory:
 
         if self.takes_seed:
             self.graph_inputs.append(max_ops.random.SeedType(DeviceRef.CPU()))
+        n_handles = 0
+        if self.collectives is not None:
+            handle_types = self.collectives.input_types()
+            n_handles = len(handle_types)
+            self.graph_inputs.extend(handle_types)
         self.graph = Graph(
             "torch_mojo_backend",
             input_types=self.graph_inputs,
             kernel_library=global_max_objects().kernel_library,
         ).__enter__()
         self._graph_open = True
+        if self.collectives is not None:
+            values = [v.tensor for v in self.graph.inputs]
+            self.collectives.bind(values[len(values) - n_handles :])
         if self.takes_seed:
             # A constant seed would make every execution draw the same
             # numbers; the caller feeds a fresh one per call (graph_seed()).
-            max_ops.random.set_seed(self.graph.inputs[-1].tensor)
+            seed_index = len(self.graph.inputs) - n_handles - 1
+            max_ops.random.set_seed(self.graph.inputs[seed_index].tensor)
         # Let's fill the tensor book
         for tensor_name, idx in self.names_to_input_idx.items():
             self.tensor_book[tensor_name] = self.graph.inputs[idx]
@@ -302,6 +323,27 @@ class _GraphFactory:
             self.tensor_book[node.name] = func_to_execute(*all_bases, *input_tensors)
             return
         key = node.target
+        if key == WAIT_TENSOR:
+            self.tensor_book[node.name] = wait(func_args[0])
+            return
+        # A collective's result is ready for ordinary ops once waited for:
+        # an op (a view, typically) reaching it before its wait_tensor waits.
+        # getitem only selects a coalesced op's results, and must not.
+        if key is not operator.getitem:
+            func_args = [wait(a) for a in func_args]
+            func_kwargs = {k: wait(v) for k, v in func_kwargs.items()}
+        if key in START_OPS:
+            # scan() found this node, so the graph has its collectives
+            assert self.collectives is not None
+            try:
+                self.tensor_book[node.name] = self.collectives.start(node, func_args)
+            except Exception as e:
+                raise MojoCompilerError(
+                    get_error_message(node, node_idx, func_args, func_kwargs)
+                    + f"Lowering the collective failed: {e}\n"
+                    f"{traceback.format_exc()}"
+                ) from e
+            return
 
         # TODO: refactor this
         if (
@@ -393,7 +435,8 @@ class _GraphFactory:
         output_args = node.args[0]
         assert isinstance(output_args, list | tuple)
         for x in output_args:
-            converted = self.tensor_book.convert_to_max(x)
+            # A collective nothing waited for still completes inside the graph.
+            converted = wait(self.tensor_book.convert_to_max(x))
             if converted is None:
                 output_blueprint.append((OutputBlueprintKind.NONE, None))
             elif isinstance(converted, max.graph.Dim):
@@ -406,6 +449,8 @@ class _GraphFactory:
                     (OutputBlueprintKind.TENSOR, len(output_tensors))
                 )
                 output_tensors.append(converted)
+        if self.collectives is not None:
+            self.collectives.finish()
         # Store the none indices for runtime handling
         self.graph.output(
             *cast("list[max.graph.value.TensorValueLike]", output_tensors)
@@ -422,6 +467,10 @@ class _GraphFactory:
             node.op == "call_function" and node.target in GRAPH_SEEDED_OPS
             for node in graph.nodes
         )
+        try:
+            self.collectives = GraphCollectives.scan(graph)
+        except CollectiveLoweringError as e:
+            raise MojoCompilerError(str(e)) from e
         try:
             for node_idx, node in enumerate(graph.nodes):
                 if node.op == "placeholder":
@@ -561,6 +610,11 @@ class BaseMaxCompiler:
         factory = _GraphFactory()
         graph, self.output_blueprint = factory.create_graph(gm.graph)
         self.takes_seed = factory.takes_seed
+        self.collectives = factory.collectives
+        try:
+            self.waited_inputs = waited_inputs(gm.graph)
+        except CollectiveLoweringError as e:
+            raise MojoCompilerError(str(e)) from e
         if verbose_enabled():
             print(graph)
         if profiling_enabled():
@@ -596,12 +650,30 @@ class BaseMaxCompiler:
         # Detach tensors to avoid gradient tracking issues with DLpack
         if profiling_enabled():
             start_inference_time = time.time_ns()
+        for i in self.waited_inputs:
+            # An eager collective still writing this input on the comm stream:
+            # the wait the graph traced, done here, orders the current stream
+            # (and so the graph, see fast_from_dlpack) after it.
+            torch.ops._c10d_functional.wait_tensor(args[i])
         input_tensors = [
             _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
         ]
         if self.takes_seed:
             input_tensors.append(graph_seed())
-        outputs = self.model.execute(*input_tensors)
+        if self.collectives is not None:
+            input_tensors.extend(self.collectives.runtime_inputs())
+        try:
+            outputs = self.model.execute(*input_tensors)
+        except BaseException as e:
+            if self.collectives is not None:
+                failed = self.collectives.synchronize()
+                if failed:
+                    e.add_note(
+                        "The collectives this graph started could not be "
+                        "drained, so their memory may still be in use; abort "
+                        "the process group. " + "; ".join(failed)
+                    )
+            raise
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
             # buffers zero-copy as eager mojo tensors (DIM outputs become
