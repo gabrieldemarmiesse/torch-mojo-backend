@@ -9,17 +9,22 @@ inputs, with buffer mutations, with `torch.cond`, from `draft_export`, and
 after a `torch.export.save` / `torch.export.load` round trip.
 """
 
+import contextlib
+import inspect
 import io
 import re
+import threading
 from collections.abc import Callable
 
 import pytest
 import torch
 from _pytest.mark.structures import ParameterSet
 from torch import nn
+from torch._subclasses import functional_tensor
 from torch.export import Dim
+from torch.fx.experimental import proxy_tensor
 from torch.fx.node import Target
-from torch.utils import _pytree as pytree
+from torch.utils import _python_dispatch as python_dispatch, _pytree as pytree
 
 aten = torch.ops.aten
 
@@ -173,42 +178,195 @@ def _linear_mm(
     return out if b is None else out + b
 
 
-@pytest.mark.parametrize("table", ["core_aten", "inference", "default", "custom"])
-def test_run_decompositions(mojo_gpu, table):
-    """`None` is the core ATen opset, `{}` the inference IR (functional, no
-    decomposition), `default_decompositions()` spelled out, and a table
-    whose gelu and linear entries are overridden by hand-written ones.
-
-    `aten.linear` is CompositeImplicitAutograd with a mojo kernel of its
-    own: the core ATen and custom cases are the regression tests of
-    `monkeypatching.decompose_composite_ops_with_mojo_kernels_in_export`,
-    without which the program kept `aten.linear` whatever the table said.
-    The inference IR preserves it, as on CPU."""
-    cpu, model = _pair(_MLP, mojo_gpu)
-    x = _input(23, 37)
-    ep = torch.export.export(model, (x.to(mojo_gpu),))
-    if table == "core_aten":
-        ep = ep.run_decompositions(None)
-        assert aten.linear.default not in _targets(ep)
-    elif table == "inference":
-        ep = ep.run_decompositions({})
-        assert aten.linear.default in _targets(ep)
-    elif table == "default":
-        ep = ep.run_decompositions(torch.export.default_decompositions())
-        assert aten.linear.default not in _targets(ep)
-    else:
-        decomp = torch.export.default_decompositions()
+def _table(name: str) -> dict[torch._ops.OperatorBase, Callable[..., object]] | None:
+    if name == "core_aten":
+        return None
+    if name == "inference":
+        return {}
+    decomp = torch.export.default_decompositions()
+    if name == "preserve_linear":
+        del decomp[aten.linear.default]
+    elif name == "custom":
         decomp[aten.gelu.default] = _gelu_erf
         decomp[aten.linear.default] = _linear_mm
-        ep = ep.run_decompositions(decomp)
-        targets = _targets(ep)
+    else:
+        assert name in ("default", "core_aten_inference_mode")
+    return decomp
+
+
+def _ops(ep: torch.export.ExportedProgram) -> list[Target]:
+    return [n.target for n in ep.graph.nodes if n.op == "call_function"]
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "core_aten",
+        "inference",
+        "default",
+        "custom",
+        "preserve_linear",
+        "core_aten_inference_mode",
+    ],
+)
+def test_run_decompositions(mojo_gpu, table):
+    """`None` is the core ATen opset, `{}` the inference IR (functional, no
+    decomposition), `default_decompositions()` spelled out, a table whose
+    gelu and linear entries are overridden by hand-written ones, one with
+    linear deleted (so kept whole), and core ATen under inference_mode. The
+    mojo program's graph is the CPU program's, op for op.
+
+    `aten.linear` is CompositeImplicitAutograd with a mojo kernel of its
+    own: these are the regression tests of
+    `monkeypatching.decompose_composite_ops_with_mojo_kernels_in_export`,
+    without which the program kept `aten.linear` whatever the table said."""
+    cpu, model = _pair(_MLP, mojo_gpu)
+    x = _input(23, 37)
+    mode = (
+        torch.inference_mode()
+        if table == "core_aten_inference_mode"
+        else contextlib.nullcontext()
+    )
+    with mode:
+        ep = torch.export.export(model, (x.to(mojo_gpu),))
+        ep = ep.run_decompositions(_table(table))
+        cpu_ep = torch.export.export(cpu, (x,)).run_decompositions(_table(table))
+    assert _ops(ep) == _ops(cpu_ep)
+    targets = _targets(ep)
+    if table in ("inference", "preserve_linear"):
+        assert aten.linear.default in targets
+    else:
+        assert aten.linear.default not in targets
+    if table == "custom":
         assert aten.gelu.default not in targets
         assert aten.erf.default in targets
-        assert aten.linear.default not in targets
         assert aten.addmm.default not in targets
         assert aten.mm.default in targets
     _assert_on(ep, mojo_gpu)
     _close(ep.module()(x.to(mojo_gpu)), cpu(x))
+
+
+def _nested_decompositions(device: str) -> list[Target]:
+    """Core ATen on an MLP program whose gelu decomposition, mid-retrace,
+    runs `run_decompositions({})` on another program."""
+    torch.manual_seed(0)
+    inner_ep = torch.export.export(_MLP().to(device), (_input(3, 37).to(device),))
+
+    def gelu(x: torch.Tensor, approximate: str = "none") -> torch.Tensor:
+        inner_ep.run_decompositions({})
+        return _gelu_erf(x)
+
+    decomp = torch.export.default_decompositions()
+    decomp[aten.gelu.default] = gelu
+    outer_ep = torch.export.export(_MLP().to(device), (_input(5, 37).to(device),))
+    return _ops(outer_ep.run_decompositions(decomp))
+
+
+def _assert_no_decomposition_left(device: str):
+    """Outside run_decompositions the hook answers as upstream does, and
+    `{}` / core ATen give the CPU program's graphs."""
+    x = torch.ones(2, 3, device=device)
+    assert not python_dispatch.autograd_would_have_decomposed(
+        aten.linear.default, [x, x]
+    )
+    for name in ("inference", "core_aten"):
+        cpu, model = _pair(_MLP, device)
+        ep = torch.export.export(model, (_input(5, 37).to(device),))
+        cpu_ep = torch.export.export(cpu, (_input(5, 37),))
+        assert _ops(ep.run_decompositions(_table(name))) == _ops(
+            cpu_ep.run_decompositions(_table(name))
+        )
+
+
+def test_run_decompositions_nested(mojo_gpu):
+    """torch does not support a run_decompositions inside another one's
+    retrace: on CPU the inner call fails the outer trace. A mojo program
+    fails the same way and leaves no decomposition state behind."""
+    with pytest.raises(RuntimeError, match="tensor_tracker") as on_cpu:
+        _nested_decompositions("cpu")
+    with pytest.raises(type(on_cpu.value), match="tensor_tracker"):
+        _nested_decompositions(mojo_gpu)
+    _assert_no_decomposition_left(mojo_gpu)
+
+
+def test_run_decompositions_is_per_thread(mojo_gpu):
+    """The patch's only state is per thread: while one thread is inside
+    run_decompositions, another thread's tracing (torch.compile, say) still
+    keeps the fused mojo linear, and the first thread still decomposes.
+    (Concurrent run_decompositions calls race in upstream's own
+    process-wide table override, on CPU too, so they are not tested.)"""
+    inside, release = threading.Event(), threading.Event()
+    x = torch.ones(2, 3, device=mojo_gpu)
+    seen, graphs = [], []
+
+    def gelu(t: torch.Tensor, approximate: str = "none") -> torch.Tensor:
+        if not inside.is_set():
+            seen.append(
+                python_dispatch.autograd_would_have_decomposed(
+                    aten.linear.default, [x, x]
+                )
+            )
+            inside.set()
+            assert release.wait(timeout=120)
+        return _gelu_erf(t)
+
+    def run():
+        decomp = torch.export.default_decompositions()
+        decomp[aten.gelu.default] = gelu
+        _, model = _pair(_MLP, mojo_gpu)
+        ep = torch.export.export(model, (_input(5, 37).to(mojo_gpu),))
+        graphs.append(_ops(ep.run_decompositions(decomp)))
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert inside.wait(timeout=300)
+        assert not python_dispatch.autograd_would_have_decomposed(
+            aten.linear.default, [x, x]
+        )
+    finally:
+        release.set()
+        worker.join(timeout=300)
+    assert not worker.is_alive()
+    assert seen == [True]
+    assert len(graphs) == 1 and aten.linear.default not in graphs[0]
+    _assert_no_decomposition_left(mojo_gpu)
+
+
+def test_run_decompositions_raising(mojo_gpu):
+    """A decomposition that raises leaves nothing behind either."""
+
+    def broken(x: torch.Tensor, approximate: str = "none") -> torch.Tensor:
+        raise RuntimeError("broken decomposition")
+
+    decomp = torch.export.default_decompositions()
+    decomp[aten.gelu.default] = broken
+    _, model = _pair(_MLP, mojo_gpu)
+    ep = torch.export.export(model, (_input(5, 37).to(mojo_gpu),))
+    with pytest.raises(RuntimeError, match="broken decomposition"):
+        ep.run_decompositions(decomp)
+    _assert_no_decomposition_left(mojo_gpu)
+
+
+@pytest.mark.skipif(
+    not hasattr(python_dispatch, "autograd_would_have_decomposed"),
+    reason="torch < 2.10 decomposes every CIA op it traces: nothing is patched",
+)
+def test_decomposition_patch_matches_upstream(mojo_gpu):
+    """The patched hook still has upstream's signature and is installed
+    everywhere torch reads it; outside run_decompositions it answers as
+    upstream does, so torch.compile still traces the fused mojo linear."""
+    hook = python_dispatch.autograd_would_have_decomposed
+    assert getattr(hook, "_torch_mojo_backend", False)
+    assert list(inspect.signature(inspect.unwrap(hook)).parameters) == [
+        "func",
+        "flat_args",
+    ]
+    assert functional_tensor.autograd_would_have_decomposed is hook
+    assert proxy_tensor.autograd_would_have_decomposed is hook
+    x = torch.ones(2, 3, device=mojo_gpu)
+    assert not hook(aten.linear.default, [x, x])
+    assert hook(aten.linear.default, [x.cpu(), x.cpu()])
 
 
 def _cases_per_op() -> list[ParameterSet]:
