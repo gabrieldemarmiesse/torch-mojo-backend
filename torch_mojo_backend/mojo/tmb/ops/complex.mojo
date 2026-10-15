@@ -2374,6 +2374,10 @@ def cx_masked_fill_(
     """masked_fill_.Scalar / .Tensor(self, mask, value)"""
     _check_bool_mask(args)
     var self = v_tensor_c(args[unsafe_offset=0])
+    # masked_fill_'s own check: a mask sharing part of self's memory would
+    # change under the write (the real part is written before the mask is
+    # read for the imaginary one)
+    assert_no_partial_overlap(self, v_tensor_c(args[unsafe_offset=1]))
     if not self.is_complex():
         _masked_fill_real_(self, args)
         ret_ref(rets, 0, self)

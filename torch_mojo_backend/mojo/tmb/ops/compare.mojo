@@ -64,6 +64,7 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     device_str,
     fill_item,
+    assert_no_partial_overlap,
     check_real_scalar_fits,
     is_wide_unsigned,
     real_fill_value,
@@ -896,11 +897,15 @@ def op_where_self(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
-def _masked_fill_validate(a: T, mask: T) raises:
+def _masked_fill_validate(a: T, mask: T, in_place: Bool = False) raises:
     if mask.dtype != DType.bool:
         unsupported("masked_fill: mask must be a bool tensor")
     if not a.on_mojo() or not mask.on_mojo() or a.device != mask.device:
         raise Error("expected both operands on the same mojo device")
+    if in_place:
+        # masked_fill_'s own check: a mask sharing part of self's memory
+        # would change under the write
+        assert_no_partial_overlap(a, mask)
     if is_wide_unsigned(a.stype):
         # CUDA's (and the CPU's) kernel is not instantiated for them: the
         # dtype dispatch refuses before the value converts
@@ -1187,7 +1192,7 @@ def op_masked_fill__scalar(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
-    _masked_fill_validate(a, mask)
+    _masked_fill_validate(a, mask, in_place=True)
     if a.contig:
         # Writing dst == a is safe: each element reads and writes the same
         # flat index (a's own strides are the output layout).
@@ -1293,7 +1298,7 @@ def op_masked_fill__tensor(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
-    _masked_fill_validate(a, mask)
+    _masked_fill_validate(a, mask, in_place=True)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
     if a.contig:
         _masked_fill_value_into(mask, a, val, a)
