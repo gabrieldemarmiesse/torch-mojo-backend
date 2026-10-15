@@ -20,6 +20,7 @@ from tmb.ops.batch_norm import register_batch_norm
 from tmb.ops.binary import register_binary
 from tmb.ops.compare import register_compare
 from tmb.ops.complex import register_complex
+from tmb.ops.complex_math import register_complex_math
 from tmb.ops.composed import register_composed
 from tmb.ops.core import register_core
 from tmb.ops.data_movement import register_data_movement
@@ -42,6 +43,7 @@ from tmb.ops.resample import register_resample
 from tmb.ops.rnn import register_rnn
 from tmb.ops.roi import register_roi
 from tmb.ops.scans import register_scans
+from tmb.ops.spectral import register_spectral
 from tmb.ops.stats import register_stats
 from tmb.ops.transformer import register_transformer
 from tmb.ops.unary import register_unary
@@ -63,6 +65,7 @@ def _register_ops(lib: Int) raises:
     _group[register_binary](lib)
     _group[register_compare](lib)
     _group[register_complex](lib)
+    _group[register_complex_math](lib)
     _group[register_data_movement](lib)
     _group[register_factories](lib)
     _group[register_indexing](lib)
@@ -70,6 +73,7 @@ def _register_ops(lib: Int) raises:
     _group[register_random](lib)
     _group[register_reductions](lib)
     _group[register_scans](lib)
+    _group[register_spectral](lib)
     _group[register_stats](lib)
     _group[register_matmul](lib)
     _group[register_linalg](lib)

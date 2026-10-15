@@ -96,6 +96,7 @@ comptime PRE_COMPLEX_TO_FLOAT = 16  # complex self, real out: no iterator on out
 # A complex self is refused by the op's meta (TORCH_CHECK_NOT_IMPLEMENTED,
 # `label` is its message) before the iterator: ceil / floor / trunc / sign.
 comptime PRE_COMPLEX_NOT_IMPL = 17
+comptime PRE_RSUB = 18  # PRE_SUB on sub(other, self): promoted last to first
 
 comptime _MAX_ARGS = 16
 
@@ -361,7 +362,7 @@ def _pre[
 ](args: Values) raises -> _Pre:
     """The checks an op makes before building its iterator, on the
     operands' ORIGINAL dtypes."""
-    comptime if pre == PRE_SUB:
+    comptime if pre == PRE_SUB or pre == PRE_RSUB:
         for i in range(2):
             var v = args[unsafe_offset=i].copy()
             var is_bool: Bool
@@ -551,6 +552,8 @@ def _pre[
         if T(Int(args[unsafe_offset=0].a)).dtype == DType.bool:
             raise Error("Boolean inputs not supported for relu")
     elif pre == PRE_SELF_FIRST:
+        return _Pre(-1, ins, True, "", ins, True)
+    comptime if pre == PRE_RSUB:
         return _Pre(-1, ins, True, "", ins, True)
     return _Pre(-1, ins, False, "", ins, True)
 

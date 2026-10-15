@@ -79,6 +79,7 @@ FAMILY_MODULES = (
     "test_gemm",
     "test_elementwise",
     "test_binary",
+    "test_complex",
     "test_inplace",
     "test_reduction",
     "test_softmax",
@@ -91,6 +92,7 @@ FAMILY_MODULES = (
     "test_torchvision_ops",
     "test_data_movement",
     "test_linalg",
+    "test_fft",
 )
 
 _VIEW = "pure view/metadata op: zero-copy metadata math, no kernel launched"

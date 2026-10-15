@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,7 +7,11 @@ name = "torch-mojo-backend"
 version = "0.3.1"
 description = "A PyTorch backend powered by Mojo kernels and Modular's MAX framework"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT AND BSD-2-Clause AND BSD-3-Clause AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception"
+# LICENSE is ours; THIRD_PARTY_NOTICES.txt carries the notices and licence
+# texts of the code ported into the Mojo kernels (both ship in the wheel and
+# the sdist).
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.txt"]
 requires-python = ">=3.11"
 dependencies = [
     "mojo==1.1",
