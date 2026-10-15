@@ -120,10 +120,15 @@ def _loud(method: Callable[..., object]) -> Callable[..., object]:
             self._abort_coalescing()
             raise
 
+    wrapper._loud = True  # ty: ignore[unresolved-attribute]
     return wrapper
 
 
 _C = TypeVar("_C", bound=type)
+# Private methods of MojoProcessGroup that torch.distributed calls itself.
+_C10D_HOOKS = frozenset(
+    {"_get_backend", "_set_group_name", "_start_coalescing", "_end_coalescing"}
+)
 
 
 def _never_traced(cls: _C) -> _C:
@@ -134,9 +139,17 @@ def _never_traced(cls: _C) -> _C:
     DDP/FSDP hook dynamo does not trace -- the method's frame starts under
     dynamo's frame hook, which then tries to compile it (and fails on
     `record_stream`, which functionalization rejects). ProcessGroupNCCL is
-    C++ and never meets the hook; this makes ours behave the same."""
+    C++ and never meets the hook; this makes ours behave the same.
+
+    Only the methods torch calls are wrapped -- the public ones, the `_loud`
+    collectives and `_C10D_HOOKS` -- not their helpers: `disable` is
+    recursive, and each wrapper costs ~0.4 us on the eager path."""
     for name, attr in list(vars(cls).items()):
-        if inspect.isfunction(attr) and not name.startswith("__"):
+        if inspect.isfunction(attr) and (
+            not name.startswith("_")
+            or getattr(attr, "_loud", False)
+            or name in _C10D_HOOKS
+        ):
             setattr(cls, name, torch.compiler.disable(attr))
     return cls
 

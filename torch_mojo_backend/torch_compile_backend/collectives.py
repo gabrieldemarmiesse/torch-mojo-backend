@@ -28,8 +28,6 @@ from max.graph import (
     BufferValue,
     DeviceRef,
     Dim,
-    StaticDim,
-    SymbolicDim,
     TensorType,
     TensorValue,
     ops,
@@ -45,6 +43,7 @@ from torch_mojo_backend.types import MaxTensor
 
 _functional = torch.ops._c10d_functional
 _autograd = torch.ops._c10d_functional_autograd
+WAIT_TENSOR = _functional.wait_tensor.default
 
 # tmb/backend/pg.mojo GRAPH_* kinds
 _ALLREDUCE = 0
@@ -94,6 +93,17 @@ class GroupHandles:
     group: MojoProcessGroup
     device_index: int
     buffer: max.driver.Buffer
+    address: int
+
+    def check_alive(self):
+        """The graph holds the group's address: refuse to run once the group
+        was shut down (destroy_process_group) or rebuilt, instead of handing
+        the ops freed memory."""
+        if self.group._handle != self.address:
+            raise RuntimeError(
+                f"process group {self.group.getGroupName()!r} was destroyed after "
+                "this graph was compiled; compile it again (torch._dynamo.reset())"
+            )
 
     @staticmethod
     def resolve(group_name: str, device_index: int) -> GroupHandles:
@@ -110,27 +120,28 @@ class GroupHandles:
         # Collective, like every communicator creation: every rank compiles
         # the same graph at the same point of the program.
         group._ensure(device_index)
+        address = group._handle
+        assert address is not None  # _ensure created the communicator
         start, wait = group._core.graph_entries
         handles = np.array(
-            [group._handle, device_index, start, wait, group._core.get_error],
-            dtype=np.int64,
+            [address, device_index, start, wait, group._core.get_error], dtype=np.int64
         )
-        return GroupHandles(group, device_index, max.driver.Buffer.from_numpy(handles))
+        return GroupHandles(
+            group, device_index, max.driver.Buffer.from_numpy(handles), address
+        )
 
 
 @dataclass
 class _Pending:
-    """A started collective, written on the comm stream until the graph
-    waits for it: into `buffer` (loaded, then viewed as `shape`, after the
-    wait), or -- when MAX cannot load a buffer of that shape -- into
-    `started`, which the wait copies. `input` is what the wait keeps alive."""
+    """A started collective: `started` is written on the comm stream until
+    the graph waits for it, `input` is read there until then; `result` is
+    the waited value, once there is one (a second wait reuses it)."""
 
+    started: TensorValue
     input: TensorValue
     handles: TensorValue
-    shape: list[Dim]
-    buffer: BufferValue | None = None
-    started: TensorValue | None = None
-    token: BufferValue | None = None
+    token: BufferValue
+    result: TensorValue | None = None
 
 
 class GraphCollectives:
@@ -147,8 +158,8 @@ class GraphCollectives:
                     name, _mojo_device_index(node)
                 )
         self._values: dict[str, TensorValue] = {}
-        self._input_symbols: set[str] = set()
         self._token: BufferValue | None = None
+        self._started: list[_Pending] = []
 
     @staticmethod
     def scan(graph: torch.fx.Graph) -> GraphCollectives | None:
@@ -163,25 +174,15 @@ class GraphCollectives:
         return [TensorType(DType.int64, [5], DeviceRef.CPU()) for _ in self.handles]
 
     def runtime_inputs(self) -> list[max.driver.Buffer]:
+        for h in self.handles.values():
+            h.check_alive()
         return [h.buffer for h in self.handles.values()]
 
-    def bind(self, inputs: Sequence[TensorValue], handles: Sequence[TensorValue]):
+    def bind(self, handles: Sequence[TensorValue]):
         self._values = dict(zip(self.handles, handles, strict=True))
-        self._input_symbols = {
-            str(d) for x in inputs for d in x.shape if isinstance(d, SymbolicDim)
-        }
-
-    def loadable(self, shape: Sequence[Dim]) -> bool:
-        """Whether MAX can load a graph buffer of `shape`: every dim static
-        or a graph input's symbol."""
-        return all(
-            isinstance(d, StaticDim)
-            or (isinstance(d, SymbolicDim) and str(d) in self._input_symbols)
-            for d in shape
-        )
 
     def token(self, device: DeviceRef) -> BufferValue:
-        """The buffer that chains the ops of the `_out`/`_copy` variants."""
+        """The buffer that chains every start and wait on the device chain."""
         if self._token is None:
             self._token = ops.buffer_create(BufferType(DType.int8, [1], device))
         return self._token
@@ -189,142 +190,185 @@ class GraphCollectives:
     def handles_value(self, node: torch.fx.Node) -> TensorValue:
         return self._values[_group_name(node)]
 
-    def lower(self, node: torch.fx.Node, args: list[object]) -> object:
-        if node.target == _functional.wait_tensor.default:
-            return wait(args[0])
+    def start(self, node: torch.fx.Node, args: list[object]) -> object:
+        handles = self.handles[_group_name(node)]
+        if _mojo_device_index(node) != handles.device_index:
+            raise CollectiveLoweringError(
+                f"{node.target}: one graph uses process group "
+                f"{_group_name(node)!r} on two devices"
+            )
         return _START_OPS[node.target](self, node, *args)
+
+    def finish(self):
+        """Wait for every collective the graph started and nothing waited
+        for (dynamo's dead-code pass drops the wait of an unused result,
+        never the collective): its output and input must stay allocated
+        until the transfer is over, and every start needs its wait."""
+        for pending in self._started:
+            wait(pending)
 
 
 def _start(
     collectives: GraphCollectives,
     node: torch.fx.Node,
     x: TensorValue,
+    dtype: torch.dtype,
     shape: list[Dim],
     kind: int,
     arg: int,
-    buffer_shape: list[Dim] | None = None,
 ) -> _Pending:
-    """`buffer_shape` is the same memory as `shape`, spelled with loadable
-    dims (all-gather's `[group, n, ...]` for `[group * n, ...]`)."""
     handles = collectives.handles_value(node)
-    parameters: dict[str, bool | int | str | DType] = {
-        "kind": kind,
-        "nccl_dtype": _nccl_dtype(_torch_dtype(node)),
-        "arg": arg,
-    }
-    buffer_shape = buffer_shape or shape
-    if collectives.loadable(buffer_shape):
-        buffer = ops.buffer_create(BufferType(x.dtype, buffer_shape, x.device))
-        ops.inplace_custom(
-            "c10d_start", x.device, [buffer, x, handles], parameters=parameters
-        )
-        return _Pending(x, handles, shape, buffer=buffer)
     token = collectives.token(x.device)
     (started,) = ops.inplace_custom(
-        "c10d_start_out",
+        "c10d_start",
         x.device,
         [token, x, handles],
         out_types=[TensorType(x.dtype, shape, x.device)],
-        parameters=parameters,
+        parameters={"kind": kind, "nccl_dtype": _nccl_dtype(dtype), "arg": arg},
     )
-    return _Pending(x, handles, shape, started=started.tensor, token=token)
+    pending = _Pending(started.tensor, x, handles, token)
+    collectives._started.append(pending)
+    return pending
 
 
 def wait(value: object) -> object:
     """The result of a started collective, once the graph stream waited
-    for it; anything else (an already-waited value) as is."""
+    for it; anything else as is. A `wait_tensor` on a graph input (an
+    eager collective's result passed in) is waited for before the graph
+    runs: `BaseMaxCompiler.__call__`, `waited_inputs`."""
     if isinstance(value, list):
         return [wait(v) for v in value]
     if not isinstance(value, _Pending):
         return value
-    device = value.input.device
-    if value.buffer is not None:
-        ops.inplace_custom(
-            "c10d_wait", device, [value.buffer, value.input, value.handles]
+    if value.result is None:
+        (copied,) = ops.inplace_custom(
+            "c10d_wait",
+            value.input.device,
+            [value.token, value.started, value.input, value.handles],
+            out_types=[value.started.type],
         )
-        loaded = ops.buffer_load(value.buffer)
-        return loaded if loaded.shape == value.shape else loaded.reshape(value.shape)
-    assert value.started is not None and value.token is not None
-    (result,) = ops.inplace_custom(
-        "c10d_wait_copy",
-        device,
-        [value.token, value.started, value.input, value.handles],
-        out_types=[value.started.type],
-    )
-    return result.tensor
+        value.result = copied.tensor
+    return value.result
 
 
-def _torch_dtype(node: torch.fx.Node) -> torch.dtype:
+def waited_inputs(graph: torch.fx.Graph) -> list[int]:
+    """Positions of the graph inputs a `wait_tensor` reads directly: eager
+    collectives' results (an AsyncCollectiveTensor passed to compiled code
+    traces to one), which the caller waits for before the graph runs."""
+    placeholders = [n for n in graph.nodes if n.op == "placeholder"]
+    waited = {
+        n.args[0]
+        for n in graph.nodes
+        if n.op == "call_function" and n.target == WAIT_TENSOR
+    }
+    return [i for i, p in enumerate(placeholders) if p in waited]
+
+
+def _dtypes(node: torch.fx.Node) -> list[torch.dtype]:
+    """The torch dtype of each output (one per input of a coalesced op,
+    whose inputs may differ)."""
     val = node.meta["val"]
-    if isinstance(val, list | tuple):
-        val = val[0]
-    assert isinstance(val, torch.Tensor)
-    return val.dtype
+    vals = val if isinstance(val, list | tuple) else [val]
+    assert all(isinstance(v, torch.Tensor) for v in vals)
+    return [v.dtype for v in vals]
 
 
-def _red_op(node: torch.fx.Node, reduce_op: str) -> int:
+def _red_op(dtype: torch.dtype, reduce_op: str) -> int:
     op = _REDUCE_OPS.get(reduce_op.lower())
     if op is None:
         raise CollectiveLoweringError(
             f"reduce op {reduce_op!r} is not supported in a compiled graph"
         )
-    return _nccl_red_op(op, _torch_dtype(node))
+    return _nccl_red_op(op, dtype)
+
+
+# One collective each: (collectives, node, input, its torch dtype, the op's
+# remaining arguments, group name last).
 
 
 def _all_reduce(
-    c: GraphCollectives, node: torch.fx.Node, input: MaxTensor, reduce_op: str, _: str
+    c: GraphCollectives,
+    node: torch.fx.Node,
+    input: MaxTensor,
+    dtype: torch.dtype,
+    reduce_op: str,
+    _: str,
 ) -> _Pending:
     x = TensorValue(input)
-    return _start(c, node, x, list(x.shape), _ALLREDUCE, _red_op(node, reduce_op))
+    op = _red_op(dtype, reduce_op)
+    return _start(c, node, x, dtype, list(x.shape), _ALLREDUCE, op)
 
 
 def _all_gather(
-    c: GraphCollectives, node: torch.fx.Node, input: MaxTensor, group_size: int, _: str
+    c: GraphCollectives,
+    node: torch.fx.Node,
+    input: MaxTensor,
+    dtype: torch.dtype,
+    group_size: int,
+    _: str,
 ) -> _Pending:
     x = TensorValue(input)
-    shape = [x.shape[0] * group_size, *x.shape[1:]]
-    return _start(c, node, x, shape, _ALLGATHER, 0, [Dim(group_size), *x.shape])
+    # a 0-d input gathers into [group_size]
+    shape = [x.shape[0] * group_size, *x.shape[1:]] if x.rank else [Dim(group_size)]
+    return _start(c, node, x, dtype, shape, _ALLGATHER, 0)
 
 
 def _reduce_scatter(
     c: GraphCollectives,
     node: torch.fx.Node,
     input: MaxTensor,
+    dtype: torch.dtype,
     reduce_op: str,
     group_size: int,
     _: str,
 ) -> _Pending:
     x = TensorValue(input)
     shape = [x.shape[0] // group_size, *x.shape[1:]]
-    return _start(c, node, x, shape, _REDUCE_SCATTER, _red_op(node, reduce_op))
+    op = _red_op(dtype, reduce_op)
+    return _start(c, node, x, dtype, shape, _REDUCE_SCATTER, op)
 
 
 def _broadcast(
-    c: GraphCollectives, node: torch.fx.Node, input: MaxTensor, src: int, _: str
+    c: GraphCollectives,
+    node: torch.fx.Node,
+    input: MaxTensor,
+    dtype: torch.dtype,
+    src: int,
+    _: str,
 ) -> _Pending:
     x = TensorValue(input)
-    return _start(c, node, x, list(x.shape), _BROADCAST, src)
+    return _start(c, node, x, dtype, list(x.shape), _BROADCAST, src)
+
+
+def _single(one: Callable[..., _Pending]) -> Callable[..., _Pending]:
+    def lower(
+        c: GraphCollectives, node: torch.fx.Node, input: MaxTensor, *rest: object
+    ) -> _Pending:
+        return one(c, node, input, _dtypes(node)[0], *rest)
+
+    return lower
 
 
 def _coalesced(one: Callable[..., _Pending]) -> Callable[..., list[_Pending]]:
     def lower(
         c: GraphCollectives, node: torch.fx.Node, inputs: list[MaxTensor], *rest: object
     ) -> list[_Pending]:
-        return [one(c, node, x, *rest) for x in inputs]
+        dtypes = _dtypes(node)
+        return [one(c, node, x, d, *rest) for x, d in zip(inputs, dtypes, strict=True)]
 
     return lower
 
 
 _START_OPS: dict[object, Callable[..., object]] = {
-    _functional.all_reduce.default: _all_reduce,
+    _functional.all_reduce.default: _single(_all_reduce),
     _functional.all_reduce_coalesced.default: _coalesced(_all_reduce),
-    _functional.all_gather_into_tensor.default: _all_gather,
+    _functional.all_gather_into_tensor.default: _single(_all_gather),
     _functional.all_gather_into_tensor_coalesced.default: _coalesced(_all_gather),
-    _functional.reduce_scatter_tensor.default: _reduce_scatter,
+    _functional.reduce_scatter_tensor.default: _single(_reduce_scatter),
     _functional.reduce_scatter_tensor_coalesced.default: _coalesced(_reduce_scatter),
-    _functional.broadcast.default: _broadcast,
-    _autograd.all_gather_into_tensor.default: _all_gather,
-    _autograd.reduce_scatter_tensor.default: _reduce_scatter,
+    _functional.broadcast.default: _single(_broadcast),
+    _autograd.all_gather_into_tensor.default: _single(_all_gather),
+    _autograd.reduce_scatter_tensor.default: _single(_reduce_scatter),
 }
 
 _UNSUPPORTED = {
@@ -335,4 +379,4 @@ _UNSUPPORTED = {
     )
 }
 
-COLLECTIVE_OPS = frozenset({*_START_OPS, _functional.wait_tensor.default})
+START_OPS = frozenset(_START_OPS)

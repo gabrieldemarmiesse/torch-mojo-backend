@@ -23,9 +23,10 @@ get a tensor onto the accelerator.
   nodes are aarch64, for example), `init_process_group` raises
   `NotImplementedError`.
 - The multi-GPU runs behind this page used H100 (NVIDIA) and MI300A (AMD)
-  GPUs, in eager mode. Compiling for the accelerator is experimental (see
-  the [home page](index.md)); collectives inside compiled code are covered
-  in [`torch.compile`](#torchcompile) below.
+  GPUs, in eager mode. `torch.compile` on the accelerator isn't generally
+  supported yet (see the [home page](index.md)); what was tested for
+  collectives inside compiled code is in [`torch.compile`](#torchcompile)
+  below.
 - Pipeline parallelism, 2-D device meshes (HSDP), FSDP1
   (`FullyShardedDataParallel`), and DDP's `find_unused_parameters=True` and
   `static_graph=True` are not covered by tests yet.
@@ -324,9 +325,8 @@ work, with the reductions of the table above.
   outside the graph. Tracing FSDP2's hooks into the graph
   (`torch._dynamo.config.skip_fsdp_hooks = False` or compiled autograd)
   isn't supported.
-- A collective whose output size isn't known until run time, typically a
-  `reduce_scatter_tensor` after `torch.compile` switched to dynamic shapes,
-  costs one extra device copy of its output.
+- Each collective in a compiled graph costs one device copy of its output
+  more than in eager mode.
 
 ## Multi-node
 

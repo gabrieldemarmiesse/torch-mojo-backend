@@ -21,8 +21,10 @@ import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
+    ParallelStyle,
     RowwiseParallel,
     parallelize_module,
 )
@@ -30,6 +32,12 @@ from torch.distributed.tensor.parallel import (
 from torch_mojo_backend import mojo_backend, register_mojo_devices
 
 _MOJO_CCL = os.environ.get("TORCH_MOJO_BACKEND_CCL") == "mojo"
+
+
+def _world() -> dist.ProcessGroup:
+    group = dist.group.WORLD
+    assert group is not None
+    return group
 
 
 def _check(failures: list[str], name: str, ok: bool, detail: str = ""):
@@ -76,13 +84,13 @@ def _compare(
 
 def run_functional(failures: list[str]):
     rank, world = dist.get_rank(), dist.get_world_size()
-    group = dist.group.WORLD
+    group = _world()
     dev = torch.accelerator.current_accelerator()
     assert dev is not None
     g = torch.Generator().manual_seed(1234 + rank)
 
     def rand(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        return torch.randn(*shape, generator=g).to(dtype).to(dev)
+        return torch.randn(shape, generator=g).to(dtype).to(dev)
 
     def all_reduce_sum(x: torch.Tensor) -> torch.Tensor:
         return funcol.all_reduce(x * 2, "sum", group) + 1
@@ -121,6 +129,22 @@ def run_functional(failures: list[str]):
         scattered = funcol.reduce_scatter_tensor(gathered * 3, "avg", 0, group)
         return funcol.all_reduce(scattered, "sum", group) + gathered.sum()
 
+    def mixed_dtypes(a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
+        # one coalesced call, one NCCL dtype per tensor
+        ra, rb = funcol.all_reduce_coalesced([a, b.bfloat16()], "sum", group)
+        return [ra, rb.float()]
+
+    def same_shape_in_flight(a: torch.Tensor, b: torch.Tensor) -> list[torch.Tensor]:
+        # two outputs of one type alive at once must not share memory
+        ra = funcol.all_reduce(a, "sum", group)
+        rb = funcol.all_reduce(b * 2, "sum", group)
+        return [ra, rb]
+
+    def unused_result(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # dead-code elimination drops rb's wait, never the collective
+        ra, rb = funcol.all_reduce_coalesced([a, b * 2], "sum", group)
+        return ra + 1
+
     def overlapped(x: torch.Tensor, w: torch.Tensor) -> list[torch.Tensor]:
         # Two collectives in flight over independent compute: the temporary
         # each one reads (x * 2, x + 1) dies at its start in the graph, so a
@@ -139,6 +163,7 @@ def run_functional(failures: list[str]):
     )
     _compare(failures, "dist_all_reduce_in_place", dist_all_reduce_in_place, rand(33))
     _compare(failures, "all_gather_dim0", all_gather_dim0, rand(7, 5), exact=True)
+    _compare(failures, "all_gather_scalar", all_gather_dim0, rand(), exact=True)
     _compare(
         failures,
         "all_gather_dim1",
@@ -151,6 +176,11 @@ def run_functional(failures: list[str]):
     _compare(failures, "broadcast", broadcast, rand(4, 4), exact=True)
     _compare(failures, "coalesced", coalesced, rand(10), rand(3, 3))
     _compare(failures, "chain", chain, rand(world * 8, 16))
+    _compare(failures, "mixed_dtypes", mixed_dtypes, rand(1000), rand(77, 3))
+    _compare(failures, "unused_result", unused_result, rand(4096), rand(4096))
+    _compare(
+        failures, "same_shape_in_flight", same_shape_in_flight, rand(4096), rand(4096)
+    )
     _compare(failures, "overlapped", overlapped, rand(4096, 1024), rand(1024, 1024))
 
 
@@ -158,6 +188,7 @@ def run_interleaved(failures: list[str]):
     """Eager and compiled collectives on one communicator, alternating: both
     reach the comm stream in program order, and every rank in the same one."""
     rank, world = dist.get_rank(), dist.get_world_size()
+    group = _world()
     dev = torch.accelerator.current_accelerator()
     assert dev is not None
 
@@ -169,14 +200,10 @@ def run_interleaved(failures: list[str]):
     def step(
         x: torch.Tensor, z: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        y = funcol.all_reduce(x, "sum", dist.group.WORLD)
-        gathered = funcol.all_gather_tensor(y * 2, 0, dist.group.WORLD)
-        scattered = funcol.reduce_scatter_tensor(gathered, "sum", 0, dist.group.WORLD)
-        return (
-            gathered,
-            scattered,
-            funcol.reduce_scatter_tensor(z, "sum", 0, dist.group.WORLD),
-        )
+        y = funcol.all_reduce(x, "sum", group)
+        gathered = funcol.all_gather_tensor(y * 2, 0, group)
+        scattered = funcol.reduce_scatter_tensor(gathered, "sum", 0, group)
+        return (gathered, scattered, funcol.reduce_scatter_tensor(z, "sum", 0, group))
 
     total = sum(r + 1 for r in range(world))
     ok = True
@@ -200,6 +227,29 @@ def run_interleaved(failures: list[str]):
     _check(failures, "interleaved_eager_and_compiled", ok)
 
 
+def run_eager_result_into_graph(failures: list[str]):
+    """An eager functional collective's result (an AsyncCollectiveTensor,
+    still being written on the comm stream) passed to compiled code: the
+    graph's traced wait_tensor reads a graph input."""
+    rank, world = dist.get_rank(), dist.get_world_size()
+    group = _world()
+    dev = torch.accelerator.current_accelerator()
+    assert dev is not None
+
+    @torch.compile(backend=mojo_backend)
+    def use(t: torch.Tensor) -> torch.Tensor:
+        return t * 2
+
+    total = sum(r + 1 for r in range(world))
+    ok = True
+    for _ in range(5):
+        pending = funcol.all_reduce(
+            torch.full((1 << 22,), float(rank + 1), device=dev), "sum", group
+        )
+        ok &= bool((use(pending).cpu() == 2 * total).all())
+    _check(failures, "eager_result_into_graph", ok)
+
+
 class _MLP(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -210,18 +260,22 @@ class _MLP(torch.nn.Module):
         return self.down(torch.nn.functional.gelu(self.up(x)))
 
 
+def _megatron_plan() -> dict[str, ParallelStyle]:
+    return {"up": ColwiseParallel(), "down": RowwiseParallel()}
+
+
 def run_tensor_parallel(failures: list[str]):
     """The standard Megatron MLP split: the compiled module's forward and
     backward graphs carry the all-reduces DTensor inserts."""
     dev = torch.accelerator.current_accelerator()
     assert dev is not None
     mesh = init_device_mesh(dev.type, (dist.get_world_size(),))
-    plan = {"up": ColwiseParallel(), "down": RowwiseParallel()}
 
     def build() -> _MLP:
         torch.manual_seed(0)
         model = _MLP().to(dev)
-        return parallelize_module(model, mesh, plan)
+        parallelize_module(model, mesh, _megatron_plan())
+        return model
 
     torch.manual_seed(1)
     x = torch.randn(8, 16, 64).to(dev)
@@ -235,7 +289,7 @@ def run_tensor_parallel(failures: list[str]):
         ok = torch.allclose(out_e.cpu(), out_c.cpu(), rtol=1e-4, atol=1e-5)
         for (name, pe), pc in zip(eager.named_parameters(), compiled.parameters()):
             ge, gc = pe.grad, pc.grad
-            assert ge is not None and gc is not None
+            assert isinstance(ge, DTensor) and isinstance(gc, DTensor)
             ok &= torch.allclose(
                 ge.full_tensor().cpu(), gc.full_tensor().cpu(), rtol=1e-4, atol=1e-5
             )
@@ -246,8 +300,10 @@ def run_unsupported(failures: list[str]):
     dev = torch.accelerator.current_accelerator()
     assert dev is not None
 
+    group = _world()
+
     def all_to_all(x: torch.Tensor) -> torch.Tensor:
-        return funcol.all_to_all_single(x, None, None, dist.group.WORLD)
+        return funcol.all_to_all_single(x, None, None, group)
 
     try:
         torch.compile(all_to_all, backend=mojo_backend, fullgraph=True)(
@@ -264,11 +320,12 @@ def main():
     mode = sys.argv[1]
     register_mojo_devices()
     dist.init_process_group(backend="mojo", timeout=datetime.timedelta(seconds=300))
-    failures: list[str] = []
+    failures = list[str]()
     if mode == "functional":
         run_functional(failures)
     elif mode == "interleaved":
         run_interleaved(failures)
+        run_eager_result_into_graph(failures)
     elif mode == "tensor_parallel":
         run_tensor_parallel(failures)
     elif mode == "unsupported":

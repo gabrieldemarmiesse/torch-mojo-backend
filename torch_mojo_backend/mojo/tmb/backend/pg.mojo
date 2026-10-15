@@ -594,8 +594,13 @@ def tmb_pg_graph_start(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
-            if recv in pg[].graph_pending:
-                raise Error("a graph collective into this buffer is pending")
+            # An entry for this address can only be stale (an execute failed
+            # between a start and its wait, and MAX's memory plan handed the
+            # address out again): a live one's buffer is still allocated.
+            # The comm stream already orders that collective before this one.
+            var stale = pg[].graph_pending.pop(recv, -1)
+            if stale != -1:
+                pg[].graph_release(c.device, stale)
             _need_vendor()
             var graph_raw = raw_stream_of(be()[].vendor.value(), stream)
             var ready = pg[].graph_event(c.device)
@@ -644,10 +649,10 @@ def tmb_pg_graph_wait(
         try:
             var pg = _pg(p)
             _need_vendor()
-            var done = pg[].graph_pending.pop(recv)
-            be()[].vendor.value().stream_wait_event(
-                raw_stream_of(be()[].vendor.value(), stream), done
-            )
+            var graph_raw = raw_stream_of(be()[].vendor.value(), stream)
+            var done = pg[].graph_pending[recv]
+            be()[].vendor.value().stream_wait_event(graph_raw, done)
+            _ = pg[].graph_pending.pop(recv)
             pg[].graph_release(Int(device), done)
             return 0
         except e:

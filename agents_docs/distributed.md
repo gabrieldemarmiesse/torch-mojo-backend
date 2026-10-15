@@ -335,14 +335,31 @@ redistributions) into the MAX graph itself
 time.
 
 - **Two custom ops per collective** (`tmb/graph/collectives.mojo`).
-  `c10d_start` enqueues the collective; `c10d_wait`, emitted at the FX
-  `wait_tensor`, makes the graph stream wait for it. Both are
-  `inplace_custom` ops on one `buffer_create`d output buffer, so the device
-  chain keeps every start and wait in program order (each rank issues the
-  same sequence), and the `buffer_load` after the wait aliases the buffer —
-  measured: no copy, as long as nothing mutates the buffer after the load.
-  Pure compute between the two floats freely, which is the overlap. A
-  collective nothing waits for is waited for at the graph output.
+  `c10d_start` enqueues the collective into its own output; `c10d_wait`,
+  emitted at the FX `wait_tensor`, makes the graph stream wait for it and
+  copies that output into the result consumers read. Both are
+  `inplace_custom` ops on a one-byte token buffer, so the device chain
+  keeps every start and wait in program order (each rank issues the same
+  sequence); pure compute between them floats freely, which is the
+  overlap. The wait reads the start's output and the collective's input, so
+  ordinary liveness keeps both allocated until the transfer is over.
+  Every started collective is waited for before the graph's outputs
+  (dynamo's dead-code pass drops an unused result's `wait_tensor`, never
+  the collective); a second wait on one start reuses the first's result.
+- **Why the copy.** A MAX op cannot return its input as its output, so
+  without the copy consumers would depend on the start, not the wait. The
+  copy-free alternative -- start and wait as in-place ops on a
+  `buffer_create`d buffer, `buffer_load` after the wait (which aliases, no
+  copy) -- is unusable in MAX 26.6: two live `buffer_create` buffers of one
+  type get the same memory, even with different `init_value`s (measured
+  with two buffers each written by an in-place op, then both loaded), so
+  two in-flight collectives
+  of one shape write the same bytes; and `mo.mutable.load` rejects a buffer
+  whose dims are not static or graph-input symbols (`s0 // 2`).
+- **A `wait_tensor` on a graph input** (an eager collective's
+  `AsyncCollectiveTensor` passed into compiled code) is run eagerly before
+  `execute` (`waited_inputs`): it orders the current stream after the comm
+  stream, and the DLPack import orders the graph after that.
 - **The comm stream is the eager one.** `tmb_pg_graph_start` (`pg.mojo`)
   records an event on the graph's stream, makes the communicator's comm
   stream wait on it, issues the library call there and records a
@@ -351,11 +368,15 @@ time.
   rank therefore share one stream per communicator in host program order.
   MAX calls custom ops from one worker thread, but strictly inside
   `model.execute()` (measured), so the host order is the program order.
-- **The wait op takes the collective's input too**, so MAX keeps it alive
-  until the graph stream has waited for the comm stream; otherwise a
-  temporary consumed only by the collective is released at the start and
-  reused while the comm stream still reads it (the cross-stream free hazard
-  of the eager path, fenced there with `record_stream`).
+- Without the wait reading the input, a temporary consumed only by the
+  collective would be released at the start and reused while the comm
+  stream still reads it (the cross-stream free hazard of the eager path,
+  fenced there with `record_stream`).
+- **A failed execute cannot wedge the next one**: a completion event still
+  keyed by an address when a new start lands there is stale (a live
+  output's address cannot be reused), so it is released and replaced.
+  A graph refuses to run once its process group was destroyed
+  (`GroupHandles.check_alive`), instead of passing freed memory to the ops.
 - **The ops reach the process group through a host graph input**, one int64
   `[pg, device, graph_start, graph_wait, tmb_get_error]` per group
   (`GroupHandles`), fed at every `execute` like the RNG seed. These are

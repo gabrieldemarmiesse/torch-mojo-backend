@@ -3,15 +3,17 @@
 A traced collective is a start and a `wait_tensor`. `c10d_start` enqueues
 it, through the process group of the native backend (`tmb/backend/pg.mojo`,
 `tmb_pg_graph_start`), on the communicator's comm stream after the graph
-stream's work so far; `c10d_wait` makes the graph stream wait for it. Both
-write into one MAX buffer the Python lowering
-(`torch_compile_backend/collectives.py`) creates and loads after the wait,
-and both are in-place ops, so MAX keeps them in program order on the
-device chain -- every rank issues its collectives in the same order -- while
-the compute between them overlaps the transfer. The wait also takes the
-collective's input, so MAX cannot release it while the comm stream reads it.
-`c10d_start_out` / `c10d_wait_copy` are the same pair for an output MAX
-cannot hold in a buffer (see there).
+stream's work so far, writing into its own output; `c10d_wait` makes the
+graph stream wait for it and copies that output into the result its
+consumers read. The wait reads the start's output and the collective's
+input, so MAX keeps both allocated until the transfer is over, and the
+copy is what orders every consumer after the wait: a MAX op cannot hand an
+input back as its output. In-graph buffers would avoid the copy, but MAX
+26.6 gives two live `buffer_create` buffers of one type the same memory
+(measured). Both ops are chained through `token`, a buffer nothing reads,
+so MAX keeps them in program order on the device chain -- every rank
+issues its collectives in the same order -- while the compute between a
+start and its wait overlaps the transfer.
 
 The backend is another library with its own globals: these ops reach it
 only through `handles`, a host int64 graph input of
@@ -121,69 +123,6 @@ def _wait(
 
 @compiler.register("c10d_start")
 struct C10dStart:
-    """Into a graph buffer the lowering loads after `c10d_wait`."""
-
-    @staticmethod
-    def execute[
-        dtype: DType,
-        out_rank: Int,
-        in_rank: Int,
-        //,
-        kind: Int,
-        nccl_dtype: Int,
-        arg: Int,
-        target: StaticString,
-    ](
-        output: MutableInputTensor[dtype=dtype, rank=out_rank, ...],
-        input: InputTensor[dtype=dtype, rank=in_rank, ...],
-        handles: InputTensor[dtype=DType.int64, rank=1, ...],
-        ctx: DeviceContext,
-    ) raises:
-        comptime if target == "gpu":
-            _start[kind, nccl_dtype, arg](
-                Int(output.unsafe_ptr()),
-                Int(input.unsafe_ptr()),
-                output.size() if kind == REDUCE_SCATTER else input.size(),
-                handles,
-                ctx,
-            )
-        else:
-            raise Error("graph collectives run on an accelerator only")
-
-
-@compiler.register("c10d_wait")
-struct C10dWait:
-    @staticmethod
-    def execute[
-        dtype: DType,
-        rank: Int,
-        in_dtype: DType,
-        in_rank: Int,
-        //,
-        target: StaticString,
-    ](
-        output: MutableInputTensor[dtype=dtype, rank=rank, ...],
-        input: InputTensor[dtype=in_dtype, rank=in_rank, ...],
-        handles: InputTensor[dtype=DType.int64, rank=1, ...],
-        ctx: DeviceContext,
-    ) raises:
-        comptime if target == "gpu":
-            _wait(Int(output.unsafe_ptr()), handles, ctx)
-        else:
-            raise Error("graph collectives run on an accelerator only")
-
-
-# MAX loads a graph buffer only when every dim of its shape is static or a
-# graph input's symbol ('mo.mutable.load' fails to verify otherwise, even for
-# a symbol a `rebind` introduces), so an output shaped like `s0 // 2` cannot
-# be a buffer. These two variants let MAX allocate it as an ordinary output
-# instead; they stay on the device chain through `token`, a buffer nothing
-# reads, and the wait hands its consumers a copy -- a tensor output cannot
-# alias the start's.
-
-
-@compiler.register("c10d_start_out")
-struct C10dStartOut:
     @staticmethod
     def execute[
         dtype: DType,
@@ -213,8 +152,8 @@ struct C10dStartOut:
             raise Error("graph collectives run on an accelerator only")
 
 
-@compiler.register("c10d_wait_copy")
-struct C10dWaitCopy:
+@compiler.register("c10d_wait")
+struct C10dWait:
     @staticmethod
     def execute[
         dtype: DType,
