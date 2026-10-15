@@ -2591,6 +2591,20 @@ def test_aten_div_promotes_and_broadcasts_compiled(
 
 
 @pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_div_trailing_one_by_number_compiled(
+    conf: Conf, call_checker: CallChecker
+):
+    """A size-1 dim against a Python divisor keeps its 1 (LayerNorm's
+    backward divides a [b, t, 1] tensor by the feature count)."""
+    call_checker.register(aten_functions.aten_div)
+
+    def fn(x):
+        return torch.div(x, 1600)
+
+    check_outputs(fn, conf, [torch.randn(2, 5, 1)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("rounding_mode", ["floor", "trunc"])
 @pytest.mark.parametrize("divisor", ["number", "one_element", "tensor"])
 def test_aten_div_rounding_mode_bf16_compiled(
