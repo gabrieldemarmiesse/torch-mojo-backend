@@ -61,6 +61,13 @@ OWN_ENV_VARS: dict[str, str] = {
         "Absolute path of libnccl.so.2, overriding the search order "
         "(the nvidia-nccl-cu12 wheel, then the system loader)."
     ),
+    "TORCH_MOJO_BACKEND_PG_WATCHDOG": (
+        "What the distributed backend does when a GPU collective has not "
+        "completed within init_process_group's timeout: `abort` (default) "
+        "prints a report, aborts the communicators and exits the process "
+        "with status 1; `report` prints the report and keeps waiting; `off` "
+        "does not watch collectives at all."
+    ),
     "TORCH_MOJO_BACKEND_PREBUILT": (
         "`0` ignores the libraries shipped prebuilt in the wheel and compiles "
         "the shim and base library here instead."

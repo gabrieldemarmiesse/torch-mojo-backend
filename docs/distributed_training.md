@@ -458,6 +458,7 @@ suit the hardware the library was measured on:
 | `ROCM_PATH` | `/opt/rocm` | ROCm install to take the HIP runtime and RCCL from |
 | `TORCH_MOJO_BACKEND_CACHE_DIR` | user cache directory | where compiled kernels (and `libmojoccl.so`) are cached |
 | `TORCH_MOJO_BACKEND_TRACE` | on | `0` hides the `[TRACE]` lines (library in use, build timings) |
+| `TORCH_MOJO_BACKEND_PG_WATCHDOG` | `abort` | what a collective that outlives the `init_process_group` timeout does: `abort` reports and exits, `report` only reports, `off` disables the check ([A run hangs](#a-run-hangs)) |
 
 `register_mojo_devices()` warns about any `TORCH_MOJO_BACKEND_*` or
 `MOJOCCL_*` variable that it doesn't recognise, and suggests the real name
@@ -492,15 +493,51 @@ you started more processes per node than there are visible GPUs.
 
 ### A run hangs
 
-NCCL and RCCL collectives have no watchdog here. The `timeout=` of
-`init_process_group` applies only to the rendezvous and to CPU work
-(`barrier`, object collectives). When a worker crashes, torchrun stops the
-others. A hang with every process still alive usually means the ranks
-issued different collectives, or issued them in a different order.
-`NCCL_DEBUG=INFO` shows how the communicators were set up, and
-`py-spy dump --pid <pid>` shows where each rank is waiting. With Mojo
-collectives, a rank stops waiting after `MOJOCCL_IB_TIMEOUT_S` and its next
-collective raises, so the run fails instead of hanging.
+A GPU collective that hasn't completed within the `timeout=` of
+`init_process_group` (30 minutes by default) ends the run, as with NCCL in
+stock PyTorch. Pass a shorter timeout to fail sooner:
+
+```python
+dist.init_process_group(
+    backend=dist.get_default_backend_for_device(device),
+    timeout=datetime.timedelta(minutes=5),
+)
+```
+
+The rank whose collective timed out prints it, with its sequence number,
+operation, arguments and the last collectives that rank issued:
+
+```text
+[rank 0] Watchdog caught collective operation timeout: collective #2 (allreduce 1024 x float32 sum) on device 0 has not completed 10.0 s after it was issued (timeout 10.0 s, the timeout= of init_process_group).
+[rank 0]   last collectives issued on device 0, oldest first:
+[rank 0]     #1 allreduce 1024 x float32 sum  completed
+[rank 0]     #2 allreduce 1024 x float32 sum  pending for 10.0 s  <-- timed out
+```
+
+It then waits up to 10 seconds for the other ranks' reports and prints a
+desync report: which ranks are waiting in the same collective, which are in
+a different one or at a different position, and which sent no report. A
+rank without a report usually never issued that collective, or is blocked
+somewhere else; that's where to look first, and
+`py-spy dump --pid <pid>` shows where it is. When every rank reports the
+same collective, or the ranks wait in point-to-point transfers (which
+don't compare across ranks), the report says it can't tell why. Every rank has to issue
+the same collectives, in the same order, with the same arguments. Finally
+the rank aborts its communicators and exits with status 1, and torchrun
+stops the other workers. A device error on the rank (a faulted kernel) ends
+the run the same way.
+
+`TORCH_MOJO_BACKEND_PG_WATCHDOG=report` prints the same reports but leaves
+the process waiting, so you can inspect it, and `off` turns the watchdog
+off. Collectives in graphs compiled with `mojo_backend` are watched like
+the others. A collective call that blocks on the host instead of the GPU is
+caught the same way, and so is the first use of a collective that compiles its
+kernels for longer than the timeout: keep the timeout well above a cold
+compile, or warm the kernel cache first. A collective still in flight
+when the script ends (Ctrl-C included) gets two seconds to finish, then
+is reported like a timeout; `destroy_process_group()` waits for this
+rank's collectives but not for its peers. CPU work (`barrier`, object collectives) goes through gloo,
+which raises after the same timeout.
 
 ### The first training step takes minutes
 

@@ -9,11 +9,14 @@ demo_scripts/nanogpt_ddp and tests/multinode/.
 
 import datetime
 import os
+import re
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
@@ -21,7 +24,13 @@ import torch.distributed as dist
 
 from torch_mojo_backend import get_accelerators, register_mojo_devices
 from torch_mojo_backend.distributed import nccl, use_local_rank_gpu
-from torch_mojo_backend.distributed.process_group import _nccl_dtype, _nccl_red_op
+from torch_mojo_backend.distributed.process_group import (
+    _nccl_dtype,
+    _nccl_red_op,
+    _report_desync,
+    _set_index,
+    _StoreWorker,
+)
 from torch_mojo_backend.mojo_device import hip_peer
 from torch_mojo_backend.torch_compile_backend import utils
 
@@ -336,6 +345,150 @@ def test_gpu_torch_on_hip_hint_never_breaks_registration(monkeypatch):
     hip_peer.warn_if_gpu_torch_on_hip()  # swallowed: a hint, not a gate
 
 
+def _watchdog_line(
+    seq: int, op: str, count: int, root: int = -1, cpos: int | None = None
+) -> str:
+    """watchdog.mojo's line; the fingerprint stands in for the arguments.
+    `cpos` (the collective position) defaults to `seq` for collectives and
+    to 0, uncounted, for point-to-point."""
+    if cpos is None:
+        cpos = 0 if op in ("send", "recv") else seq
+    return (
+        f"id=1 tid=0 seq={seq} cpos={cpos} done={seq - 1} last={seq} op={op}"
+        f" count={count} dtype=float32 root={root} redop=-1 nops=1"
+        f" fp={hash((op, count, root))} device=0 pending_ms=10000 where=device"
+    )
+
+
+def _publish(store: dist.Store, rank: int, line: str):
+    """What another rank's reporter leaves in the store for an incident."""
+    store.set(f"mojo_watchdog/{rank}/1", line)
+    store.set(f"mojo_watchdog/{rank}", f"1 mojo_watchdog/{rank}/1")
+
+
+def _report(line: str, store: dist.Store, world: int):
+    _report_desync(line, _StoreWorker(store, clone=False), 0, world, 0.3)
+
+
+def test_desync_report_names_the_diverging_ranks(capsys):
+    """The report the watchdog's Python thread prints from the store: rank 1
+    is in a broadcast with another root at the same position, rank 2 is
+    behind, rank 3 never answers (rank 5's incident is over: an empty
+    index), rank 4 waits where this rank does, rank 6 too although a
+    send before it gave it another local sequence number."""
+    store = dist.HashStore()
+    _publish(store, 1, _watchdog_line(2, "broadcast", 4, root=1))
+    _publish(store, 2, _watchdog_line(1, "broadcast", 4, root=0))
+    _publish(store, 4, _watchdog_line(2, "broadcast", 4, root=0))
+    store.set("mojo_watchdog/5", "2")
+    _publish(store, 6, _watchdog_line(3, "broadcast", 4, root=0, cpos=2))
+    _report(_watchdog_line(2, "broadcast", 4, root=0), store, 7)
+    err = capsys.readouterr().err
+    assert (
+        "[rank 0] desync report for #2 (collective #2) (broadcast 4 x float32"
+        " root 0)" in err
+    )
+    assert (
+        "[rank 0]   rank 1: waiting in collective #2 broadcast 4 x float32 root 1"
+        "  <-- the same position, different arguments" in err
+    )
+    assert (
+        "[rank 0]   rank 2: waiting in collective #1 broadcast 4 x float32 root 0"
+        "  <-- behind" in err
+    )
+    assert "[rank 0]   waiting in this same collective: ranks 0, 4, 6\n" in err
+    assert "[rank 0]   no report: ranks 3, 5." in err
+    assert "Inconclusive" not in err
+
+
+def test_desync_report_with_every_rank_in_the_same_collective_is_inconclusive(capsys):
+    store = dist.HashStore()
+    _publish(store, 1, _watchdog_line(5, "allreduce", 8))
+    _report(_watchdog_line(5, "allreduce", 8), store, 2)
+    err = capsys.readouterr().err
+    assert "[rank 0]   waiting in this same collective: ranks 0, 1\n" in err
+    assert "Inconclusive: every rank that reported is waiting where this one" in err
+
+
+def test_desync_report_does_not_compare_point_to_point(capsys):
+    """A send and its matching recv differ in op and peer by construction:
+    a P2P wait is listed, never called a desync."""
+    store = dist.HashStore()
+    _publish(store, 1, _watchdog_line(3, "recv", 8, root=0))
+    _report(_watchdog_line(4, "send", 8, root=1), store, 2)
+    err = capsys.readouterr().err
+    assert "rank 1: waiting in #3 recv 8 x float32 peer 0 (not compared" in err
+    assert "<--" not in err
+    assert "Inconclusive" in err
+
+
+def test_desync_index_never_goes_back_a_generation():
+    """An index update that lands late (its store worker was abandoned)
+    does not roll a newer index back."""
+    store = dist.HashStore()
+    assert _set_index(store, 3, 5, ["mojo_watchdog/3/9"])
+    assert _set_index(store, 3, 4, ["mojo_watchdog/3/1"])  # stale: ignored
+    assert bytes(store.get("mojo_watchdog/3")).decode() == "5 mojo_watchdog/3/9"
+    assert _set_index(store, 3, 6, [])
+    assert bytes(store.get("mojo_watchdog/3")).decode() == "6"
+
+
+def test_desync_report_does_not_compare_different_groupings(capsys):
+    """Two allreduces grouped on this rank, issued one by one on rank 1: the
+    same calls (overlapping positions), fingerprints different by
+    construction -- not compared, and not called a desync."""
+    store = dist.HashStore()
+    _publish(store, 1, _watchdog_line(2, "allreduce", 8))
+    grouped = _watchdog_line(2, "allreduce", 16).replace("nops=1", "nops=2")
+    _report(grouped, store, 2)
+    err = capsys.readouterr().err
+    assert "rank 1: waiting in collective #2 allreduce 8 x float32" in err
+    assert "(not compared: grouped differently)" in err
+    assert "<--" not in err
+    assert "Inconclusive" in err
+
+
+def test_desync_report_outranks_an_earlier_incarnation(capsys):
+    """A group re-created under the same name on the same store: its first
+    report replaces the index the previous incarnation left behind."""
+    store = dist.HashStore()
+    store.set("mojo_watchdog/0", "7 mojo_watchdog/0/1")  # the old group's
+    _publish(store, 1, _watchdog_line(2, "allreduce", 8))
+    _report_desync(
+        _watchdog_line(2, "allreduce", 8),
+        _StoreWorker(store, clone=False),
+        0,
+        2,
+        0.3,
+        gen=time.time_ns(),
+    )
+    index = bytes(store.get("mojo_watchdog/0")).decode().split()
+    assert int(index[0]) > 7 and index[1:] == ["mojo_watchdog/0/0/1"]
+    assert "waiting in this same collective: ranks 0, 1" in capsys.readouterr().err
+
+
+def test_desync_report_survives_a_store_that_does_not_answer(capsys):
+    """A store stuck in a blocking call: the report still comes out, with
+    the store's silence said, within the window plus a margin."""
+
+    class _Stuck:
+        def set(self, *args: object):
+            time.sleep(3600)
+
+    start = time.monotonic()
+    _report_desync(
+        _watchdog_line(2, "allreduce", 8),
+        _StoreWorker(cast(dist.Store, _Stuck()), clone=False),
+        0,
+        2,
+        0.3,
+    )
+    err = capsys.readouterr().err
+    assert time.monotonic() - start < 5
+    assert "the c10d store did not answer in time" in err
+    assert "[rank 0] desync report for #2" in err
+
+
 def test_cpu_collectives_through_gloo_delegation():
     """World-size-1 init with backend="mojo": CPU tensors ride the private gloo."""
     register_mojo_devices()
@@ -365,7 +518,9 @@ def _run_torchrun(
     mode: str,
     extra_env: dict[str, str] | None = None,
     worker: Path = _WORKER,
-):
+    expect_success: bool = True,
+    timeout: float = 900,
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     # The worker pins per-rank visibility from LOCAL_RANK, slicing whichever
     # vendor list the launcher left (SLURM sets ROCR_VISIBLE_DEVICES on AMD).
@@ -383,14 +538,15 @@ def _run_torchrun(
         env=env,
         capture_output=True,
         text=True,
-        timeout=900,
+        timeout=timeout,
         cwd=Path(__file__).parent.parent,
     )
-    if result.returncode != 0:
+    if expect_success and result.returncode != 0:
         raise AssertionError(
             f"torchrun {mode} failed (rc={result.returncode})\n"
             f"stdout:\n{result.stdout[-4000:]}\nstderr:\n{result.stderr[-4000:]}"
         )
+    return result
 
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
@@ -421,6 +577,240 @@ def test_two_rank_nccl(mode: str, ccl: str):
     _run_torchrun(2, mode, extra_env)
 
 
+def _run_desync(mode: str, ccl: str, extra_env: dict[str, str] | None = None):
+    if _gpu_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    start = time.monotonic()
+    result = _run_torchrun(
+        2,
+        mode,
+        {"TORCH_MOJO_BACKEND_CCL": ccl, **(extra_env or {})},
+        expect_success=False,
+        timeout=600,
+    )
+    elapsed = time.monotonic() - start
+    output = result.stdout + result.stderr
+    context = f"rc={result.returncode}, {elapsed:.0f} s\n{output[-8000:]}"
+    assert "UNEXPECTED" not in output, context
+    return result.returncode, output, context
+
+
+def _assert_aborted(rc: int, output: str, context: str, seq: int, what: str):
+    """Rank 0 reported collective `seq` within the timeout and exited."""
+    assert rc != 0, context
+    assert (
+        f"[rank 0] Watchdog caught collective operation timeout: collective #{seq}"
+        f" ({what}) on device 0 has not completed" in output
+    ), context
+    assert f"[rank 0] desync report for #{seq} (collective #{seq})" in output, context
+    assert "[rank 0]   waiting in this same collective: ranks 0\n" in output, context
+    assert "[rank 0]   no report: ranks 1." in output, context
+    assert "Aborting the communicators and exiting with status 1" in output, context
+    pending = re.search(r"has not completed (\d+\.\d) s after it was issued", output)
+    assert pending and 10.0 <= float(pending.group(1)) < 15.0, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_desync_watchdog(ccl: str):
+    """A collective one rank never matches fails the run instead of hanging.
+
+    ddp_worker.py's `desync` mode: on a group with a 10 s timeout, rank 0
+    issues an all_reduce (#2) that rank 1 never issues. Rank 0's watchdog
+    must name the collective, print the desync report (rank 1 never answers:
+    it is not in a collective), and exit non-zero; torchrun then stops rank 1.
+    """
+    rc, output, context = _run_desync("desync", ccl)
+    _assert_aborted(rc, output, context, 2, "allreduce 1024 x float32 sum")
+    assert "#1 allreduce 1024 x float32 sum  completed" in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_desync_watchdog_after_a_burst(ccl: str):
+    """3000 collectives in flight at once overflow the watchdog's 1024-slot
+    ring; the unmatched one issued right behind them is still the one
+    reported, with its exact sequence number."""
+    rc, output, context = _run_desync("desync_burst", ccl)
+    _assert_aborted(rc, output, context, 3002, "allreduce 4 x float32 sum")
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_desync_watchdog_destroy(ccl: str):
+    """Destroying a group whose collective hangs is not a hang either: the
+    destroy waits for the collective, the watchdog reports it and exits."""
+    rc, output, context = _run_desync("desync_destroy", ccl)
+    _assert_aborted(rc, output, context, 2, "allreduce 1024 x float32 sum")
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_desync_watchdog_report_mode(ccl: str):
+    """TORCH_MOJO_BACKEND_PG_WATCHDOG=report: three late collectives (#2 late
+    on rank 0, #3 on rank 1, #4 on rank 0) are each reported by the rank
+    left waiting, which keeps running; the run then finishes cleanly. A
+    record of an earlier incident is gone from the store by the next one,
+    so every report names the late rank as silent, never as behind."""
+    rc, output, context = _run_desync(
+        "desync_report_twice", ccl, {"TORCH_MOJO_BACKEND_PG_WATCHDOG": "report"}
+    )
+    assert rc == 0, context
+    assert output.count("report_twice finished") == 2, context
+    for waiting, late, seq in ((1, 0, 2), (0, 1, 3), (1, 0, 4)):
+        assert (
+            f"[rank {waiting}] Watchdog caught collective operation timeout:"
+            f" collective #{seq} " in output
+        ), context
+        report = re.search(
+            rf"\[rank {waiting}\] desync report for #{seq} .*?"
+            rf"\[rank {waiting}\]   no report: ranks {late}\.",
+            output,
+            re.S,
+        )
+        assert report and "<-- behind" not in report.group(0), context
+    assert "Aborting the communicators" not in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_desync_watchdog_recovers_after_overflow(ccl: str):
+    """A full queue (lowered to 256 in flight) drops the burst's newest
+    collectives with a warning; once the burst drained, tracking resumes and
+    the unmatched collective after it is reported."""
+    rc, output, context = _run_desync("desync_overflow", ccl)
+    _assert_aborted(rc, output, context, 4002, "allreduce 4 x float32 sum")
+    assert "the newest ones are not watched until some complete" in output, context
+    assert "watching new ones again" in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+@pytest.mark.parametrize("mode", ["desync_at_exit", "desync_ctrl_c"])
+def test_two_rank_desync_watchdog_at_interpreter_exit(mode: str, ccl: str):
+    """An unmatched collective in flight when the script ends (sys.exit,
+    Ctrl-C), without destroy_process_group: reported after a short grace,
+    not after the timeout, and the run fails."""
+    rc, output, context = _run_desync(mode, ccl)
+    assert rc != 0, context
+    found = re.search(
+        r"\[rank 0\] Watchdog: the process is exiting with collective #2 \(allreduce"
+        r" 1024 x float32 sum\) on device 0 still in flight, (\d+\.\d) s after",
+        output,
+    )
+    assert found and float(found.group(1)) < 5.0, context
+    assert "[rank 0] desync report for #2 (collective #2)" in output, context
+    assert "Aborting the communicators and exiting with status 1" in output, context
+
+
+@pytest.mark.gpu
+def test_two_rank_desync_watchdog_exit_with_a_call_blocked_on_the_host():
+    """The main thread exits while a daemon thread is blocked on the host in
+    the library (vendor NCCL's lazy p2p connect): the exit does not swallow
+    the report. The blocked thread holds the backend mutex, so the exiting
+    thread may itself block freeing a tensor before the exit hook runs; the
+    watchdog's timeout then reports it, so either report is the right one."""
+    rc, output, context = _run_desync("desync_exit_host_blocked", "vendor")
+    assert rc != 0, context
+    assert (
+        "the ncclGroupEnd call has been blocked on the host inside the"
+        " collectives library" in output
+    ), context
+    assert "Aborting the communicators and exiting with status 1" in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_off_destroy_completes_collectives(ccl: str):
+    """With the watchdog off, destroying a group still lets its collectives
+    in flight finish (rank 1 issues its side 3 s late) instead of cancelling
+    them with the local abort."""
+    rc, output, context = _run_desync(
+        "watchdog_off_destroy", ccl, {"TORCH_MOJO_BACKEND_PG_WATCHDOG": "off"}
+    )
+    assert rc == 0, context
+    assert "[rank 0] off destroy correct: True" in output, context
+    assert "[rank 1] off destroy correct: True" in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_slow_peer_at_destroy(ccl: str):
+    """Rank 0 reaches destroy_process_group 15 s after rank 1 (a final
+    checkpoint, say), past the 10 s timeout: a healthy run, which must not
+    fail -- the destroy does not wait for its peers."""
+    rc, output, context = _run_desync("watchdog_slow_destroy", ccl)
+    assert rc == 0, context
+    assert output.count("slow_destroy finished") == 2, context
+    assert "Watchdog" not in output, context
+
+
+@pytest.mark.gpu
+def test_two_rank_desync_watchdog_host_blocked():
+    """A call that blocks on the host instead of the GPU: vendor NCCL's first
+    point-to-point call to a peer connects the pair inside ncclGroupEnd and
+    waits there for the peer, which never comes. The in-call mark reports
+    it and the process exits (mojoccl has no point-to-point)."""
+    rc, output, context = _run_desync("desync_host_blocked", "vendor")
+    assert rc != 0, context
+    assert (
+        "[rank 0] Watchdog caught collective operation timeout: the ncclGroupEnd"
+        " call has been blocked on the host inside the collectives library for"
+        in output
+    ), context
+    assert "Aborting the communicators and exiting with status 1" in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_never_blocks_the_issuer(ccl: str):
+    """900 async all_reduces issued on rank 0 before the store signal that
+    lets rank 1 issue its own: the issuing thread must return from every
+    call before the peer can progress, so the watchdog must not wait for
+    the GPU. (Past ~1024 both libraries block the host themselves -- vendor
+    NCCL's work FIFO, mojoccl's queue -- and the watchdog then reports the
+    blocked call.)"""
+    rc, output, context = _run_desync("watchdog_async_burst", ccl)
+    assert rc == 0, context
+    assert "[rank 0] async burst correct: True" in output, context
+    assert "[rank 1] async burst correct: True" in output, context
+    assert "Watchdog" not in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_clean_exit_without_destroy(ccl: str):
+    """Collectives in flight at interpreter exit, no destroy_process_group:
+    the exit hook stops the watchdog before teardown, so nothing is
+    reported and the run exits 0."""
+    rc, output, context = _run_desync("watchdog_clean_exit", ccl)
+    assert rc == 0, context
+    assert output.count("exiting without destroy_process_group") == 2, context
+    assert "Watchdog" not in output and "watchdog:" not in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_fault_then_destroy_report_mode(ccl: str):
+    """A driver error on a communicator (injected on every rank) is reported
+    in report mode; the group's destroy then aborts that communicator
+    instead of destroying it on the word of a queue nobody watches any
+    more."""
+    rc, output, context = _run_desync(
+        "watchdog_fault_destroy", ccl, {"TORCH_MOJO_BACKEND_PG_WATCHDOG": "report"}
+    )
+    assert rc == 0, context
+    assert output.count("fault_destroy finished") == 2, context
+    assert (
+        "[rank 0] Watchdog: an event record on device 0 failed with driver error -2"
+        in output
+    ), context
+    assert (
+        "[rank 0] watchdog: collectives of this process group are unaccounted for;"
+        " aborting its communicators without waiting for them" in output
+    ), context
+
+
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.parametrize(
     "mode", ["parity", "reduce_scatter", "fsdp_collectives_stress"]
@@ -443,6 +833,30 @@ def test_two_rank_compiled_collectives(mode: str, ccl: str):
         pytest.skip("needs at least 2 GPUs")
     extra_env = {"TORCH_MOJO_BACKEND_CCL": ccl}
     _run_torchrun(2, mode, extra_env, Path(__file__).parent / "compile_c10d_worker.py")
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_desync_watchdog_compiled_graph(ccl: str):
+    """A collective issued from a graph compiled with `mojo_backend` that
+    rank 1 never issues is watched like an eager one: reported, and the run
+    exits."""
+    if _gpu_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    result = _run_torchrun(
+        2,
+        "desync_compiled",
+        {"TORCH_MOJO_BACKEND_CCL": ccl},
+        Path(__file__).parent / "compile_c10d_worker.py",
+        expect_success=False,
+        timeout=600,
+    )
+    output = result.stdout + result.stderr
+    context = f"rc={result.returncode}\n{output[-8000:]}"
+    assert "UNEXPECTED" not in output, context
+    _assert_aborted(
+        result.returncode, output, context, 2, "allreduce 1024 x float32 sum"
+    )
 
 
 def test_two_rank_reduce_scatter_chunked():
