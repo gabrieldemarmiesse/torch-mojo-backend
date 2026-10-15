@@ -97,7 +97,6 @@ from tmb.ops.f8_iter import (
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.float8 import is_float8
 from tmb.ops.complex import (
-    resize_any,
     routed,
 )
 from tmb.ops.complex_math import (
@@ -148,6 +147,9 @@ from tmb.ops.common import (
     ST_UNDEFINED,
     assert_no_internal_overlap,
     assert_no_partial_overlap,
+    check_out_as,
+    out_device_error,
+    resize_any,
     combine_categories as _pw_combine_known,
     contiguous,
     copy_strided_into,
@@ -551,13 +553,15 @@ def _pw_out_of(
     overlap, no partial overlap with an input, and never resized when it is
     one of the inputs (see `_b_out_guard`)."""
     var dest = v_tensor(v)
-    if not dest.on_mojo():
-        raise Error("expected `out` to be a mojo tensor")
+    assert_no_internal_overlap(dest)  # compute_mem_overlaps, then the device
     for k in range(3):
         var side = a.copy() if k == 0 else (b.copy() if k == 1 else c.copy())
-        if side.is_t and side.t.value().device != dest.device:
-            raise Error("expected `out` and the inputs on the same mojo device")
-    assert_no_internal_overlap(dest)
+        if side.is_t and (
+            not dest.on_mojo() or side.t.value().device != dest.device
+        ):
+            out_device_error(side.t.value().device, dest)
+    if not dest.on_mojo():
+        raise Error("expected `out` to be a mojo tensor")
     _b_out_guard3(dest, a, b, c, common_out)
     return dest^
 
@@ -4289,12 +4293,16 @@ def op_pow_scalar_out_meta(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     """pow.Scalar_out (Pow.cpp): its meta takes the dtype from the out (no
-    result type) and resizes the out to the exponent's shape; then a base
+    result type), checks the out's device and resizes it to the exponent's
+    shape; then a base
     EQUAL to 1 (Scalar::equal: not a bool) is `out.fill_(1)` with no other
     check, and any other base is pow.Tensor_Tensor's out= (the real or
     complex route)."""
     var ex = v_tensor_c(args[unsafe_offset=1])
     var dest = v_tensor_c(args[unsafe_offset=2])
+    # the structured out's set_output: the out's device (its dtype is the
+    # out's own here), before the resize
+    check_out_as(dest, dest.stype, ex)
     if not dest.same_shape(ex):
         resize_any(dest, ex.shape, ex.rank)
         dest = v_tensor_c(args[unsafe_offset=2])

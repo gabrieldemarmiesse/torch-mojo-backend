@@ -4005,3 +4005,118 @@ def test_rsub_pow_alpha_match_stock_cuda(mojo_device):
 )
 def test_rsub_pow_alpha_data_regenerates_on_stock_cuda():
     assert list(_rsub_pow_alpha_lines("cuda")) == _F8_ITER["rsub_pow_alpha"]
+
+
+# ---------------------------------------------------------------------------
+# review round 5: out= validation (device, internal / partial overlap)
+# ---------------------------------------------------------------------------
+
+
+def _ov_res(fn, out, extra=()):
+    """`_act_res` plus where the out's storage lives (a host out must keep
+    host storage) and the state of any tensor the out overlaps."""
+    s = _act_res(fn, out)
+    kind = out.untyped_storage().device.type
+    s += " storage=" + ("host" if kind == "cpu" else "dev")
+    for e in extra:
+        s += " in=" + _mx_enc(e)
+    return s
+
+
+def _out_validation_lines(dev):
+    """Every out= path of this PR's float8 / complex work with an out on the
+    host, an expanded out (internal overlap), an out partially overlapping
+    an input and an out aliasing it, plus add / sub's alpha_check on the
+    out's dtype (stock CUDA 2.11)."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+
+    def x8():
+        return torch.tensor([1.0, 0.5, 2.0]).to(f8).to(dev)
+
+    def f32():
+        return torch.tensor([1.0, 2.0, 3.0], device=dev)
+
+    def cx():
+        return torch.tensor([1 + 1j, 0.5 - 1j, 2 + 0j], device=dev)
+
+    forms = []
+    for odt in (torch.float32, f8, torch.complex64):
+        on = str(odt)[6:]
+        for xn, xs in (("f32", f32), ("x8", x8)):
+            forms += [
+                (f"rsub.Scalar_out {xn} {on}", odt,
+                 lambda o, xs=xs: a.rsub.Scalar_out(xs(), 4.5, out=o)),
+                (f"rsub.Tensor_out {xn} {on}", odt,
+                 lambda o, xs=xs: a.rsub.Tensor_out(xs(), f32(), out=o)),
+            ]  # fmt: skip
+            for base in (1, 2, 1 + 0j, 2j):
+                forms.append(
+                    (f"pow.Scalar_out {base} {xn} {on}", odt,
+                     lambda o, xs=xs, base=base: torch.pow(base, xs(), out=o))
+                )  # fmt: skip
+        forms += [
+            (f"eq x8 {on}", odt, lambda o: torch.eq(x8(), 2, out=o)),
+            (f"add x8 {on}", odt, lambda o: torch.add(x8(), x8(), out=o)),
+            (f"pow x8 {on}", odt, lambda o: torch.pow(x8(), 2, out=o)),
+            (f"abs cx {on}", odt, lambda o: torch.abs(cx(), out=o)),
+            (f"neg x8 {on}", odt, lambda o: torch.neg(x8(), out=o)),
+            (f"relu f32 {on}", odt, lambda o: a.relu.out(f32(), out=o)),
+            (f"irfft cx {on}", odt, lambda o: torch.fft.irfft(cx(), out=o)),
+            (f"hfft cx {on}", odt, lambda o: torch.fft.hfft(cx(), out=o)),
+        ]  # fmt: skip
+    outs = {
+        "host0": lambda dt: torch.empty(0, dtype=dt),
+        "host3": lambda dt: torch.zeros(3, dtype=dt),
+        "exp3": lambda dt: torch.zeros(1, dtype=dt, device=dev).expand(3),
+        "exp6": lambda dt: torch.zeros(1, dtype=dt, device=dev).expand(6),
+    }
+    for name, odt, fn in forms:
+        for oname, mk in outs.items():
+            out = mk(odt)
+            yield f"{name} out={oname} " + _ov_res(lambda fn=fn, out=out: fn(out), out)
+    for name, fn in (
+        ("rsub.Scalar_out", lambda x, o: a.rsub.Scalar_out(x, 4.5, out=o)),
+        ("rsub.Tensor_out", lambda x, o: a.rsub.Tensor_out(x, x.flip(0), out=o)),
+        ("pow.Scalar_out 1", lambda x, o: torch.pow(1, x, out=o)),
+        ("pow.Scalar_out 2", lambda x, o: torch.pow(2, x, out=o)),
+        ("add", lambda x, o: torch.add(x, 1, out=o)),
+    ):
+        buf = torch.tensor([1.0, 2.0, 3.0, 4.0], device=dev)
+        yield f"{name} partial " + _ov_res(
+            lambda fn=fn, buf=buf: fn(buf[:3], buf[1:4]), buf[1:4], (buf,)
+        )
+        buf = torch.tensor([1.0, 2.0, 3.0, 4.0], device=dev)
+        yield f"{name} alias " + _ov_res(
+            lambda fn=fn, buf=buf: fn(buf[:3], buf[:3]), buf[:3], (buf,)
+        )
+    ins = {
+        "i32": lambda: torch.ones(2, dtype=torch.int32, device=dev),
+        "bool": lambda: torch.ones(2, dtype=torch.bool, device=dev),
+        "f32": lambda: torch.ones(2, device=dev),
+        "x8": lambda: torch.ones(2).to(f8).to(dev),
+    }
+    # float8 on either side: a float8 out of any input, a float8 input
+    # into any out
+    pairs = [(xn, "f8") for xn in ins] + [("x8", "f32"), ("x8", "i32")]
+    for op, (xn, od), al in itertools.product(
+        ("add", "sub"), pairs, (1, 1.5, True, 2j)
+    ):
+        dt = {"f8": f8, "f32": torch.float32, "i32": torch.int32}[od]
+        out = torch.empty(0, dtype=dt, device=dev)
+        yield f"{op}.out {xn} a={al} {od} " + _act_res(
+            lambda op=op, xn=xn, al=al, out=out: getattr(torch, op)(
+                ins[xn](), ins[xn](), alpha=al, out=out
+            ),
+            out,
+        )
+
+
+def test_out_validation_matches_stock_cuda(mojo_device):
+    _compare(list(_out_validation_lines(mojo_device)), _F8_ITER["out_validation"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_out_validation_data_regenerates_on_stock_cuda():
+    assert list(_out_validation_lines("cuda")) == _F8_ITER["out_validation"]

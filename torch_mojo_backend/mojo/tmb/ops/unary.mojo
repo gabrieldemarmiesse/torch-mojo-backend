@@ -67,8 +67,8 @@ from tmb.ops.common import (
 )
 from tmb.ops.f8_iter import (
     f8_iter,
+    generated_out,
     MODE_CAST,
-    MODE_COPY_OUT,
     MODE_FN,
     MODE_INPLACE,
     MODE_NOCHECK,
@@ -516,15 +516,6 @@ def op_relu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _relu_check(t)
     var out = own(_direct_unary("ReluSpec", t))
     ret_owned(rets, 0, out)
-
-
-# aten::relu.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_relu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    _relu_check(t)
-    var dst = v_tensor(args[unsafe_offset=1])
-    _direct_unary_out("ReluSpec", t, dst)
-    ret_ref(rets, 0, dst)
 
 
 # aten::relu_(Tensor(a!) self) -> Tensor(a!)
@@ -2377,6 +2368,11 @@ def op_fill_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
+comptime _relu_fn = f8_iter[
+    op_relu, "clamp_scalar_cuda", 1, -1, MODE_FN, False, PRE_RELU
+]
+
+
 def register_unary(site: Site) raises:
     impl[
         f8_iter[
@@ -3375,22 +3371,10 @@ def register_unary(site: Site) raises:
         ],
         "trunc",
     ](site)
-    impl[
-        f8_iter[op_relu, "clamp_scalar_cuda", 1, -1, MODE_FN, False, PRE_RELU],
-        "relu",
-    ](site)
-    impl[
-        f8_iter[
-            op_relu_out,
-            "clamp_scalar_cuda",
-            1,
-            1,
-            MODE_COPY_OUT,
-            False,
-            PRE_RELU,
-        ],
-        "relu.out",
-    ](site)
+    impl[_relu_fn, "relu"](site)
+    # relu.out is a generated wrapper (relu has no out kernel): the
+    # functional result, then resize, copy_arg's checks, the copy
+    impl[generated_out[_relu_fn, 1, 1], "relu.out"](site)
     impl[
         f8_iter[
             op_relu_, "clamp_scalar_cuda", 1, 0, MODE_INPLACE, False, PRE_RELU

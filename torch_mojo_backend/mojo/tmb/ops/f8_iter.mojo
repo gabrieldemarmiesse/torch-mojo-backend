@@ -68,12 +68,12 @@ from tmb.ops.common import (
     cast_complex,
     cast_to,
     combine_categories,
-    copy_strided_into,
     device_str,
     is_float_stype,
     promote_types,
     resize_out,
     scalar_type_name,
+    store_generated_out,
 )
 
 # out= dtype rule of the op's TensorIterator (MODE_FN: no out, functional).
@@ -83,7 +83,6 @@ comptime MODE_SAME = 2  # out must hold the common dtype ("Found dtype")
 comptime MODE_NOCHECK = 3  # any out (a bool result casts anywhere)
 comptime MODE_OUTDT = 4  # canCast; the kernel dispatches on out's dtype
 comptime MODE_INPLACE = 5  # self is out: canCast(common, self)
-comptime MODE_COPY_OUT = 6  # functional result, then resize_out + exact dtype
 
 # Checks an op makes before its TensorIterator.
 comptime PRE_NONE = 0
@@ -245,6 +244,20 @@ def _alpha_check(dt: Int32, a: Value) raises:
             "For non-complex input tensors, argument alpha must not be a"
             " complex number."
         )
+
+
+def _kernel_alpha(dt: Int32, a: Value) raises -> Value:
+    """alpha as the add / sub kernel reads it in an integral or bool
+    computation dtype (`alpha.to<int64_t>()` / `.to<bool>()`): a float
+    alpha the out's floating dtype let through alpha_check, truncated
+    (bool: nonzero). Any other alpha is passed as given."""
+    if a.tag != TAG_SCALAR_DOUBLE and a.tag != TAG_DOUBLE:
+        return a.copy()
+    if dt == ST_BOOL:
+        return Value(TAG_SCALAR_BOOL, 0, Int64(1) if v_f64(a) != 0.0 else 0, 0)
+    if is_float_stype(dt) or is_float8_stype(dt) or is_complex_stype(dt):
+        return a.copy()
+    return Value(TAG_SCALAR_INT, 0, Int64(Int(v_f64(a))), 0)
 
 
 def _shape_is(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
@@ -447,6 +460,8 @@ def _pre[
     """The checks an op makes before building its iterator, on the
     operands' ORIGINAL dtypes."""
     comptime if pre == PRE_SUB or pre == PRE_RSUB:
+        # sub_check: two bool operands, then either one
+        var n_bool = 0
         for i in range(2):
             var v = args[unsafe_offset=i].copy()
             var is_bool: Bool
@@ -455,11 +470,18 @@ def _pre[
             else:
                 is_bool = v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL
             if is_bool:
-                raise Error(
-                    "Subtraction, the `-` operator, with a bool tensor is not"
-                    " supported. If you are trying to invert a mask, use the"
-                    " `~` or `logical_not()` operator instead."
-                )
+                n_bool += 1
+        if n_bool == 2:
+            raise Error(
+                "Subtraction, the `-` operator, with two bool tensors is not"
+                " supported. Use the `^` or `logical_xor()` operator instead."
+            )
+        if n_bool == 1:
+            raise Error(
+                "Subtraction, the `-` operator, with a bool tensor is not"
+                " supported. If you are trying to invert a mask, use the"
+                " `~` or `logical_not()` operator instead."
+            )
     elif pre == PRE_HEAVISIDE:
         var a = T(Int(args[unsafe_offset=0].a))
         var b = T(Int(args[unsafe_offset=1].a))
@@ -685,29 +707,10 @@ def f8_iter[
     var eff_mode = mode if p.mode < 0 else p.mode
     var it = _shape_of(args, p.shape_ins)
     var compute: Int32
-    comptime if mode == MODE_COPY_OUT:
-        # A composite out=: the functional result first (its dispatch
-        # refuses with out untouched), then resize_output, then the exact
-        # dtype check of the copy.
-        if not it.shape_ok:
-            raise Error(it.err)
-        compute = _common_of(args, p.ins, p.rev)
-        comptime if alpha_idx >= 0:
-            _alpha_check(compute, args[unsafe_offset=alpha_idx].copy())
-        if is_float8_stype(compute):
-            _refuse(String(kernel), compute)
-        var o = T(Int(args[unsafe_offset=out_idx].a))
-        if not _shape_is(o, it.shape, it.rank):
-            resize_out(o, it.shape, it.rank)
-        if o.stype != compute:
-            raise Error(
-                "Expected out tensor to have dtype ",
-                dtype_name(compute),
-                ", but got ",
-                dtype_name(o.stype),
-                " instead",
-            )
-    elif out_idx >= 0:
+    # the dtype the kernel converts alpha to (`alpha.to<opmath_t>()`): the
+    # common one, which an out= of another dtype may not share
+    var alpha_dt = ST_UNDEFINED
+    comptime if out_idx >= 0:
         var o = T(Int(args[unsafe_offset=out_idx].a))
         comptime inplace = (ins >> out_idx) & 1 == 1
         # (b) memory overlap, then the shape of a read-write out: one that
@@ -771,7 +774,10 @@ def f8_iter[
         ):
             resize_out(o, it.shape, it.rank)
         comptime if alpha_idx >= 0:
-            _alpha_check(common, args[unsafe_offset=alpha_idx].copy())
+            # alpha_check(dtype(), alpha): the iterator's dtype() is its
+            # output's -- the out (or in-place self), resized by now
+            _alpha_check(o.stype, args[unsafe_offset=alpha_idx].copy())
+            alpha_dt = common
         compute = o.stype if eff_mode == MODE_OUTDT else common
     else:
         if not it.shape_ok:
@@ -832,6 +838,10 @@ def f8_iter[
                     held.append(own(cast_to(t, compute, False)))
                 recs.append(tensor_arg(held[len(held) - 1].t))
                 continue
+        comptime if alpha_idx >= 0:
+            if i == alpha_idx and alpha_dt != ST_UNDEFINED:
+                recs.append(_kernel_alpha(alpha_dt, v))
+                continue
         recs.append(v^)
     op(
         recs.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
@@ -848,8 +858,9 @@ def generated_out[
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """torch's generated `out=` wrapper of an op with no out kernel of its
     own (rsub.*_out): the functional result `op` over the first `n_in`
-    arguments (every check of its, the out untouched), then
-    resize_output, copy_arg's exact dtype and device checks, the copy."""
+    arguments (every check of its, the out untouched), then common's
+    `store_generated_out` (resize_output on the out's device, copy_arg's
+    dtype and device checks, copy_'s internal-overlap check, the copy)."""
     var r_list = List[Value](capacity=1)
     r_list.append(none_arg())
     op(
@@ -859,27 +870,7 @@ def generated_out[
         1,
     )
     var results = Results(r_list^)
-    var res = own(results.take_tensor(0))
-    var dest = T(Int(args[unsafe_offset=out_idx].a))
-    if not _shape_is(dest, res.t.shape, res.t.rank):
-        resize_out(dest, res.t.shape, res.t.rank)
-        dest = T(Int(args[unsafe_offset=out_idx].a))
-    if dest.stype != res.t.stype:
-        raise Error(
-            "Expected out tensor to have dtype ",
-            dtype_name(res.t.stype),
-            ", but got ",
-            dtype_name(dest.stype),
-            " instead",
-        )
-    if device_str(dest) != device_str(res.t):
-        raise Error(
-            "Expected out tensor to have device ",
-            device_str(res.t),
-            ", but got ",
-            device_str(dest),
-            " instead",
-        )
-    copy_strided_into(dest, res.t)
-    _ = res^
+    var dest = store_generated_out(
+        args[unsafe_offset=out_idx], results.take_tensor(0)
+    )
     ret_ref(rets, 0, dest)

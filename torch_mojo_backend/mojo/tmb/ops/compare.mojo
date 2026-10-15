@@ -66,6 +66,7 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import is_float8
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.common import (
+    out_device_error,
     device_str,
     fill_item,
     assert_no_partial_overlap,
@@ -165,7 +166,7 @@ def _prepare_out(
     but a non-contiguous layout, since a resize always leaves it contiguous.
     """
     if not out_arg.on_mojo() or out_arg.device != device:
-        raise Error("expected the out= tensor on the operands' mojo device")
+        out_device_error(device, out_arg)
     if out_arg.stype != stype:
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
@@ -187,7 +188,7 @@ def _ensure_out_shape(
     temporary and copy (searchsorted/bucketize): only the dtype/shape
     checks matter, not contiguity."""
     if not out_arg.on_mojo() or out_arg.device != device:
-        raise Error("expected the out= tensor on the operands' mojo device")
+        out_device_error(device, out_arg)
     if out_arg.stype != stype:
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
@@ -256,9 +257,10 @@ def _compare_out_guard(out_arg: T, a: T, b: T) raises:
     path runs): no internal overlap in `out`, no partial overlap with an
     input, and an `out` that IS an input (the in-place `x.eq_(y)`) never
     resized -- a broadcast shape larger than it raises."""
-    if not out_arg.on_mojo():
-        raise Error("expected the out= tensor on the operands' mojo device")
-    assert_no_internal_overlap(out_arg)
+    assert_no_internal_overlap(out_arg)  # compute_mem_overlaps first
+    var device = a.device if a.on_mojo() else b.device
+    if not out_arg.on_mojo() or out_arg.device != device:
+        out_device_error(device, out_arg)  # then compute_types
     _b_out_guard(out_arg, _b_tside(a), _b_tside(b), False)
 
 
@@ -276,7 +278,7 @@ def _cast_into_out(
     is the bool result, computed apart so an `out` aliasing an operand is
     only written once every element has been read."""
     if not out_arg.on_mojo() or out_arg.device != device:
-        raise Error("expected the out= tensor on the operands' mojo device")
+        out_device_error(device, out_arg)
     if not _shape_eq(out_arg, shape, rank):
         resize_out(out_arg, shape, rank)
     var casted = own(cast_for_copy(res, out_arg.stype, False))

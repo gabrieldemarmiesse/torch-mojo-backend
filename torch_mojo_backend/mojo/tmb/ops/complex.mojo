@@ -103,6 +103,7 @@ from tmb.backend.device import current_device
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    resize_any,
     can_cast,
     combine_categories,
     int_to_component,
@@ -288,6 +289,9 @@ def _store(
         _ = res^
     else:
         _check_cast(res.t.stype, dest.stype)
+        # copy_'s own first check, raised here without the nested call's
+        # "aten::copy_:" prefix
+        assert_no_internal_overlap(dest)
         var c = _Call("aten::copy_")
         c.t(dest)
         c.t(res.t)
@@ -349,6 +353,7 @@ def _real_out(
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     var f8 = False
+    var first = -1
     for i in range(n_in):
         var v = args[unsafe_offset=i].copy()
         if v_is_complex(v):
@@ -357,9 +362,11 @@ def _real_out(
             var t = v_tensor_c(v)
             _broadcast_into(shape, rank, t)
             f8 = f8 or is_float8_stype(t.stype)
+            if first < 0 and t.on_mojo():
+                first = i
     if f8:
         # A structured op's TensorIterator checks the out's memory overlaps,
-        # then resizes it, before the kernel's dtype dispatch refuses a
+        # then its device, then resizes it, before the kernel's dtype dispatch refuses a
         # float8 computation (the functional call below would refuse with
         # the out untouched). The complex out cannot be one of these real
         # inputs, so there is no read-write out to keep from resizing.
@@ -367,6 +374,8 @@ def _real_out(
         # is f8_iter's `generated_out`.)
         var dest0 = v_tensor_c(args[unsafe_offset=out_idx])
         _ew_overlaps(args, n_in, dest0)
+        if first >= 0:  # compute_types' device check, before the resize
+            _same_device(dest0, v_tensor_c(args[unsafe_offset=first]))
         resize_any(dest0, shape, rank)
     var c = _Call(op, overload)
     for i in range(n_in):
@@ -2318,22 +2327,6 @@ def _masked_fill(args: Values) raises -> Owned:
 def cx_masked_fill(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """masked_fill.Scalar / .Tensor(self, mask, value)"""
     _ret(rets, _masked_fill(args))
-
-
-def resize_any(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
-    """`resize_output` on an out of any device (a host out is resized by
-    torch's own resize_)."""
-    if t.on_mojo():
-        resize_out(t, shape, rank)
-        return
-    var sizes = List[Int]()
-    for i in range(rank):
-        sizes.append(shape[MAX_RANK - rank + i])
-    var c = _Call("aten::resize_")
-    c.t(t)
-    c.ints(sizes)
-    c.none()
-    _ = c.run(1)
 
 
 def cx_masked_fill_out(

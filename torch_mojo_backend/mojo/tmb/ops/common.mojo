@@ -39,7 +39,9 @@ from tmb.backend.abi import (
     ST_COMPLEX64,
     Owned,
     T,
+    TAG_INT_LIST,
     Value,
+    none_arg,
     Values,
     _channels_last_strides,
     check,
@@ -240,6 +242,22 @@ def device_str(t: T) -> String:
     if t.on_cpu():
         return String("cpu")
     return String("device type ") + String(t.device_type)
+
+
+def out_device_error(device: Int, dest: T) raises:
+    """TensorIterator's compute_types device error for an `out=` that is
+    not on the operands' mojo device `device` (CUDA's message, operands'
+    device first)."""
+    raise Error(
+        (
+            "Expected all tensors to be on the same device, but found at"
+            " least two devices, "
+        ),
+        String("mojo:") + String(device),
+        " and ",
+        device_str(dest),
+        "!",
+    )
 
 
 def _repeats_elements(t: T) -> Bool:
@@ -1364,6 +1382,48 @@ def forward_args(args: Values, n: Int) -> List[Value]:
     for i in range(n):
         out.append(args[unsafe_offset=i].copy())
     return out^
+
+
+def resize_any(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
+    """`resize_output` on an out of any device: a mojo out in place
+    (`resize_out`), a host out by torch's own resize_ on its device (its
+    storage stays where it is). A host out's cached view fields are stale
+    afterwards: the caller reads it again."""
+    if t.on_mojo():
+        resize_out(t, shape, rank)
+        return
+    var sizes = List[Int64](capacity=max(rank, 1))
+    for i in range(rank):
+        sizes.append(Int64(shape[MAX_RANK - rank + i]))
+    var r = call_op(
+        "aten::resize_",
+        "",
+        [
+            tensor_arg(t),
+            Value(TAG_INT_LIST, Int32(rank), Int64(Int(sizes.unsafe_ptr())), 0),
+            none_arg(),
+        ],
+        1,
+    )
+    _ = r^
+    _ = sizes^  # the list is read by the call
+
+
+def store_generated_out(out_v: Value, var src: T) raises -> T:
+    """The tail of torch's generated `out=` wrapper, after the functional
+    result `src` (owned, released here) was computed with all its checks:
+    `resize_out_helper` (resize_output on the out's own device), copy_arg's
+    dtype then device checks, then `copy_` (no internal overlap in the out,
+    then the copy). Returns the out, read again after its resize."""
+    var held = own(src^)
+    var dst = T(Int(out_v.a))
+    if not dst.same_shape(held.t):
+        resize_any(dst, held.t.shape, held.t.rank)
+        dst = T(Int(out_v.a))
+    check_out_as(dst, held.t.stype, held.t)
+    assert_no_internal_overlap(dst)
+    copy_strided_into(dst, held.t)
+    return dst^
 
 
 def store_out(mut dst: T, var src: T) raises:
