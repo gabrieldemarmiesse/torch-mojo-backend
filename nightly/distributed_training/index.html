@@ -488,6 +488,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#torchcompile" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        torch.compile
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#multi-node" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -721,6 +732,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#torchcompile" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        torch.compile
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#multi-node" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -913,9 +935,11 @@ get a tensor onto the accelerator.</p>
   nodes are aarch64, for example), <code>init_process_group</code> raises
   <code>NotImplementedError</code>.</li>
 <li>The multi-GPU runs behind this page used H100 (NVIDIA) and MI300A (AMD)
-  GPUs, in eager mode. <code>torch.compile</code> isn't supported on the accelerator
-  yet (see the <a href="../">home page</a>).</li>
-<li>Tensor and pipeline parallelism, 2-D device meshes (HSDP), FSDP1
+  GPUs, in eager mode. <code>torch.compile</code> on the accelerator isn't generally
+  supported yet (see the <a href="../">home page</a>); what was tested for
+  collectives inside compiled code is in <a href="#torchcompile"><code>torch.compile</code></a>
+  below.</li>
+<li>Pipeline parallelism, 2-D device meshes (HSDP), FSDP1
   (<code>FullyShardedDataParallel</code>), and DDP's <code>find_unused_parameters=True</code> and
   <code>static_graph=True</code> are not covered by tests yet.</li>
 </ul>
@@ -1181,7 +1205,7 @@ gloo.</p>
 <tr>
 <td><code>gather</code>, <code>scatter</code></td>
 <td>yes</td>
-<td>no</td>
+<td>yes (through broadcast and all-gather)</td>
 </tr>
 <tr>
 <td><code>send</code>, <code>recv</code>, <code>isend</code>, <code>irecv</code></td>
@@ -1228,21 +1252,59 @@ The tests also cover waiting from a different stream, but that pattern
 has failed intermittently in the past, and the root cause was never
 found.</p>
 </div>
+<h2 id="torchcompile"><code>torch.compile</code><a class="headerlink" href="#torchcompile" title="Permanent link">&para;</a></h2>
+<p>Collectives in code compiled with <code>mojo_backend</code> become part of the
+compiled graph, the way they do with Inductor on CUDA: functional
+collectives (<code>torch.distributed._functional_collectives</code>), the
+<code>dist.all_reduce</code>-style calls <code>torch.compile</code> rewrites into them, and the
+redistributions of DTensor tensor parallelism. Nothing changes in the model
+or in the setup lines:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">torch.distributed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">dist</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.device_mesh</span><span class="w"> </span><span class="kn">import</span> <span class="n">init_device_mesh</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch.distributed.tensor.parallel</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>    <span class="n">ColwiseParallel</span><span class="p">,</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>    <span class="n">RowwiseParallel</span><span class="p">,</span>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>    <span class="n">parallelize_module</span><span class="p">,</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="p">)</span>
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="kn">from</span><span class="w"> </span><span class="nn">torch_mojo_backend</span><span class="w"> </span><span class="kn">import</span> <span class="n">mojo_backend</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="c1"># after the setup lines of train_ddp.py, device and init_process_group included</span>
+<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="n">mesh</span> <span class="o">=</span> <span class="n">init_device_mesh</span><span class="p">(</span><span class="n">device</span><span class="o">.</span><span class="n">type</span><span class="p">,</span> <span class="p">(</span><span class="n">dist</span><span class="o">.</span><span class="n">get_world_size</span><span class="p">(),))</span>
+<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="n">model</span> <span class="o">=</span> <span class="n">parallelize_module</span><span class="p">(</span>
+<a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>    <span class="n">MLP</span><span class="p">()</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">),</span> <span class="n">mesh</span><span class="p">,</span> <span class="p">{</span><span class="s2">&quot;up&quot;</span><span class="p">:</span> <span class="n">ColwiseParallel</span><span class="p">(),</span> <span class="s2">&quot;down&quot;</span><span class="p">:</span> <span class="n">RowwiseParallel</span><span class="p">()}</span>
+<a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a><span class="p">)</span>
+<a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a><span class="n">model</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">backend</span><span class="o">=</span><span class="n">mojo_backend</span><span class="p">)</span>
+</code></pre></div>
+<p>Each collective runs on the same stream as the eager collectives of that
+process group, and the computation between the start of a collective and
+the first use of its result overlaps with it. Both collective libraries
+work, with the reductions of the table above. Compiled collectives were
+tested on NVIDIA GPUs only; on AMD they're untested.</p>
+<ul>
+<li><code>all_to_all_single</code> raises an error when the graph is compiled, and so do
+  collectives on more than one GPU in one compiled graph.</li>
+<li>FSDP2 with its default settings runs its collectives in eager mode,
+  outside the graph. Tracing FSDP2's hooks into the graph
+  (<code>torch._dynamo.config.skip_fsdp_hooks = False</code> or compiled autograd)
+  isn't supported.</li>
+<li>Each collective in a compiled graph costs one device copy of its output
+  more than in eager mode.</li>
+</ul>
 <h2 id="multi-node">Multi-node<a class="headerlink" href="#multi-node" title="Permanent link">&para;</a></h2>
 <p>Run one <code>torchrun</code> per node, with the same rendezvous arguments on every
 node:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="nv">$MASTER_ADDR</span>:29500<span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="nv">$JOB_ID</span><span class="w"> </span>train_ddp.py
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="m">2</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="nv">$MASTER_ADDR</span>:29500<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="nv">$JOB_ID</span><span class="w"> </span>train_ddp.py
 </code></pre></div>
 <p>Under SLURM, start one task per node and let torchrun start the per-GPU
 workers:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="ch">#!/bin/bash</span>
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="c1">#SBATCH --nodes=2 --ntasks-per-node=1 --gpus-per-node=8 --exclusive</span>
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="nv">MASTER_ADDR</span><span class="o">=</span><span class="k">$(</span>scontrol<span class="w"> </span>show<span class="w"> </span>hostnames<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NODELIST</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="k">)</span>
-<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>srun<span class="w"> </span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NUM_NODES</span><span class="s2">&quot;</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$MASTER_ADDR</span><span class="s2">:29500&quot;</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_ID</span><span class="s2">&quot;</span><span class="w"> </span>train_ddp.py
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="ch">#!/bin/bash</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="c1">#SBATCH --nodes=2 --ntasks-per-node=1 --gpus-per-node=8 --exclusive</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="nv">MASTER_ADDR</span><span class="o">=</span><span class="k">$(</span>scontrol<span class="w"> </span>show<span class="w"> </span>hostnames<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NODELIST</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-n<span class="w"> </span><span class="m">1</span><span class="k">)</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>srun<span class="w"> </span>torchrun<span class="w"> </span>--nnodes<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_NUM_NODES</span><span class="s2">&quot;</span><span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="w">    </span>--rdzv-backend<span class="o">=</span>c10d<span class="w"> </span>--rdzv-endpoint<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$MASTER_ADDR</span><span class="s2">:29500&quot;</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a><span class="w">    </span>--rdzv-id<span class="o">=</span><span class="s2">&quot;</span><span class="nv">$SLURM_JOB_ID</span><span class="s2">&quot;</span><span class="w"> </span>train_ddp.py
 </code></pre></div>
 <p>The backend needs no extra setup for multi-node runs: communicators bootstrap
 through the torchrun rendezvous, and <code>use_local_rank_gpu()</code> splits the GPU
@@ -1282,7 +1344,7 @@ same; only the loaded library changes, and the <code>[TRACE] collectives via ...
 line then names <code>libmojoccl.so</code>. The library is compiled the first time you
 use it, which takes about a minute, and is then cached with the kernels.
 NCCL/RCCL remain the default.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nv">TORCH_MOJO_BACKEND_CCL</span><span class="o">=</span>mojo<span class="w"> </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span>train_ddp.py
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nv">TORCH_MOJO_BACKEND_CCL</span><span class="o">=</span>mojo<span class="w"> </span>torchrun<span class="w"> </span>--standalone<span class="w"> </span>--nproc-per-node<span class="o">=</span><span class="m">8</span><span class="w"> </span>train_ddp.py
 </code></pre></div>
 <p>Set the variable on every rank of every node. Consider Mojo collectives
 when NCCL or RCCL isn't available, or when you want to try a collective
