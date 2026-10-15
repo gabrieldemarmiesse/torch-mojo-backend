@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from operator import getitem
 
 import max.driver
 import numpy as np
@@ -72,18 +73,20 @@ def _group_name(node: torch.fx.Node) -> str:
     return name
 
 
-def _mojo_device_index(node: torch.fx.Node) -> int:
+def _mojo_device_indices(node: torch.fx.Node) -> set[int]:
+    """The mojo device of every output (one per operand of a coalesced op)."""
     val = node.meta.get("val")
-    if isinstance(val, list | tuple):
-        val = val[0]
-    if not isinstance(val, torch.Tensor) or val.device.type != "mojo":
-        device = val.device if isinstance(val, torch.Tensor) else None
-        raise CollectiveLoweringError(
-            f"{node.target} on {device}: collectives in a compiled graph run "
-            "on the mojo device only"
-        )
-    index = val.device.index
-    return index if index is not None else device_module.current_device()
+    indices = set()
+    for v in val if isinstance(val, list | tuple) else [val]:
+        if not isinstance(v, torch.Tensor) or v.device.type != "mojo":
+            device = v.device if isinstance(v, torch.Tensor) else None
+            raise CollectiveLoweringError(
+                f"{node.target} on {device}: collectives in a compiled graph run "
+                "on the mojo device only"
+            )
+        index = v.device.index
+        indices.add(index if index is not None else device_module.current_device())
+    return indices
 
 
 @dataclass
@@ -150,13 +153,20 @@ class GraphCollectives:
     are values, then `lower` for every collective node in graph order."""
 
     def __init__(self, nodes: list[torch.fx.Node]):
+        # One device per graph: MAX chains in-place ops per device, so the
+        # program order every rank must follow holds within one device only.
+        devices = set().union(*(_mojo_device_indices(n) for n in nodes))
+        if len(devices) > 1:
+            raise CollectiveLoweringError(
+                f"collectives on mojo devices {sorted(devices)} in one compiled "
+                "graph: a graph's collectives must all run on one device"
+            )
+        (device,) = devices
         self.handles: dict[str, GroupHandles] = {}
         for node in nodes:
             name = _group_name(node)
             if name not in self.handles:
-                self.handles[name] = GroupHandles.resolve(
-                    name, _mojo_device_index(node)
-                )
+                self.handles[name] = GroupHandles.resolve(name, device)
         self._values: dict[str, TensorValue] = {}
         self._token: BufferValue | None = None
         self._started: list[_Pending] = []
@@ -191,13 +201,15 @@ class GraphCollectives:
         return self._values[_group_name(node)]
 
     def start(self, node: torch.fx.Node, args: list[object]) -> object:
-        handles = self.handles[_group_name(node)]
-        if _mojo_device_index(node) != handles.device_index:
-            raise CollectiveLoweringError(
-                f"{node.target}: one graph uses process group "
-                f"{_group_name(node)!r} on two devices"
-            )
         return _START_OPS[node.target](self, node, *args)
+
+    def synchronize(self):
+        """Host-wait for every collective the graph's process groups issued:
+        after a failed execute, before MAX can hand out memory a collective
+        it started still reads or writes."""
+        for h in self.handles.values():
+            if h.group._handle == h.address:
+                h.group._core.synchronize_comm(h.group._handle, h.device_index)
 
     def finish(self):
         """Wait for every collective the graph started and nothing waited
@@ -251,16 +263,45 @@ def wait(value: object) -> object:
     return value.result
 
 
+def _aliased_input(node: object) -> torch.fx.Node | None:
+    """The graph input `node` is, or is a view of; None otherwise."""
+    while isinstance(node, torch.fx.Node):
+        if node.op == "placeholder":
+            return node
+        target = node.target
+        is_view = target == torch.ops.aten._unsafe_view.default or (
+            isinstance(target, torch._ops.OpOverload) and target.is_view
+        )
+        if not (node.op == "call_function" and is_view and node.args):
+            return None
+        node = node.args[0]
+    return None
+
+
 def waited_inputs(graph: torch.fx.Graph) -> list[int]:
-    """Positions of the graph inputs a `wait_tensor` reads directly: eager
-    collectives' results (an AsyncCollectiveTensor passed to compiled code
-    traces to one), which the caller waits for before the graph runs."""
+    """Positions of the graph inputs a `wait_tensor` reads, directly or
+    through views: eager collectives' results (an AsyncCollectiveTensor
+    passed to compiled code traces to one), which the caller waits for
+    before the graph runs. A wait on anything else that is not a collective
+    of the graph cannot be honored, and is refused."""
     placeholders = [n for n in graph.nodes if n.op == "placeholder"]
-    waited = {
-        n.args[0]
-        for n in graph.nodes
-        if n.op == "call_function" and n.target == WAIT_TENSOR
-    }
+    waited = set()
+    for n in graph.nodes:
+        if n.op != "call_function" or n.target != WAIT_TENSOR:
+            continue
+        arg = n.args[0]
+        source = arg
+        while isinstance(source, torch.fx.Node) and source.target == getitem:
+            source = source.args[0]
+        if isinstance(source, torch.fx.Node) and source.target in _START_OPS:
+            continue
+        aliased = _aliased_input(arg)
+        if aliased is None:
+            raise CollectiveLoweringError(
+                f"wait_tensor on {arg}, which is neither a collective of this "
+                "graph nor a graph input (or a view of one)"
+            )
+        waited.add(aliased)
     return [i for i, p in enumerate(placeholders) if p in waited]
 
 

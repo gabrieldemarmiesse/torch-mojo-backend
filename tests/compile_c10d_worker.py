@@ -240,6 +240,12 @@ def run_eager_result_into_graph(failures: list[str]):
     def use(t: torch.Tensor) -> torch.Tensor:
         return t * 2
 
+    @torch.compile(backend=mojo_backend)
+    def use_view(t: torch.Tensor) -> torch.Tensor:
+        # an AsyncCollectiveTensor stays pending through views: the traced
+        # wait reads a view of the graph input
+        return t.view(2, -1) * 2
+
     total = sum(r + 1 for r in range(world))
     ok = True
     for _ in range(5):
@@ -247,6 +253,10 @@ def run_eager_result_into_graph(failures: list[str]):
             torch.full((1 << 22,), float(rank + 1), device=dev), "sum", group
         )
         ok &= bool((use(pending).cpu() == 2 * total).all())
+        pending = funcol.all_reduce(
+            torch.full((1 << 22,), float(rank + 1), device=dev), "sum", group
+        )
+        ok &= bool((use_view(pending).cpu() == 2 * total).all())
     _check(failures, "eager_result_into_graph", ok)
 
 

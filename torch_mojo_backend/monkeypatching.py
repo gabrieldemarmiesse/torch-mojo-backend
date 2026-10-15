@@ -16,6 +16,7 @@ monkeypatches and stay in ``mojo_device/register.py``.
 """
 
 import functools
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -222,10 +223,12 @@ def let_dtensor_differentiate_a_native_linear():
         assert isinstance(grad, torch.Tensor)
         assert isinstance(weight, torch.Tensor)
         assert isinstance(mask, list | tuple)
-        grad_2d = grad.reshape(-1, grad.shape[-1])
+        # explicit row counts: reshape(-1, 0) is ambiguous for empty features
+        rows = math.prod(grad.shape[:-1])
+        grad_2d = grad.reshape(rows, grad.shape[-1])
         return (
             torch.matmul(grad, weight) if mask[0] else None,
-            grad_2d.t() @ input.reshape(-1, input.shape[-1]) if mask[1] else None,
+            grad_2d.t() @ input.reshape(rows, input.shape[-1]) if mask[1] else None,
             grad_2d.sum(0) if mask[2] else None,
         )
 

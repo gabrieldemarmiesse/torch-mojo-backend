@@ -604,7 +604,10 @@ class BaseMaxCompiler:
         graph, self.output_blueprint = factory.create_graph(gm.graph)
         self.takes_seed = factory.takes_seed
         self.collectives = factory.collectives
-        self.waited_inputs = waited_inputs(gm.graph)
+        try:
+            self.waited_inputs = waited_inputs(gm.graph)
+        except CollectiveLoweringError as e:
+            raise MojoCompilerError(str(e)) from e
         if verbose_enabled():
             print(graph)
         if profiling_enabled():
@@ -652,7 +655,12 @@ class BaseMaxCompiler:
             input_tensors.append(graph_seed())
         if self.collectives is not None:
             input_tensors.extend(self.collectives.runtime_inputs())
-        outputs = self.model.execute(*input_tensors)
+        try:
+            outputs = self.model.execute(*input_tensors)
+        except BaseException:
+            if self.collectives is not None:
+                self.collectives.synchronize()
+            raise
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
             # buffers zero-copy as eager mojo tensors (DIM outputs become
