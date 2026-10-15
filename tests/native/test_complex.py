@@ -1558,38 +1558,41 @@ def _outcome(fn):
         return ("raised", type(e))
 
 
-@pytest.mark.parametrize("v", [1e19 + 0j, 2**63 + 0j, -1 + 0j, 300 + 0j, 2.5 + 0j])
+@pytest.mark.parametrize(
+    "v", [1e19 + 0j, 2**63 + 0j, -1 + 0j, 300 + 0j, 2.5 + 0j, 2.0**64 + 0j, 2.0**64]
+)
 @pytest.mark.parametrize("dtype", _REAL_DTYPES)
-def test_complex_scalar_converts_as_its_real_part(mojo_gpu: str, v, dtype):
+def test_complex_scalar_into_a_real_dtype_matches_the_host(mojo_gpu: str, v, dtype):
     """A complex Scalar with no imaginary part meets a real destination as
-    its real part would (CUDA's c10 conversion), at every Scalar entry."""
-    msk = torch.tensor([True, False], device=mojo_gpu)
+    CUDA's c10 conversion has it, at every Scalar entry. The CPU is the
+    oracle: on this whole matrix it agrees with stock CUDA, except an
+    explicit out-of-range half scalar_tensor (inf on the CPU and here, an
+    error on CUDA)."""
 
-    def setitem(val, key):
-        x = torch.zeros(2, dtype=dtype, device=mojo_gpu)
-        x[msk if key == "mask" else key] = val
-        return x
+    def entries(dev):
+        msk = torch.tensor([True, False], device=dev)
 
-    def entries(val):
+        def setitem(key):
+            x = torch.zeros(2, dtype=dtype, device=dev)
+            x[msk if key == "mask" else key] = v
+            return x
+
         return {
-            "scalar_tensor": lambda: torch.scalar_tensor(
-                val, dtype=dtype, device=mojo_gpu
+            "scalar_tensor": lambda: torch.scalar_tensor(v, dtype=dtype, device=dev),
+            "full": lambda: torch.full((2,), v, dtype=dtype, device=dev),
+            "fill_": lambda: torch.zeros(2, dtype=dtype, device=dev).fill_(v),
+            "masked_fill": lambda: torch.zeros(2, dtype=dtype, device=dev).masked_fill(
+                msk, v
             ),
-            "full": lambda: torch.full((2,), val, dtype=dtype, device=mojo_gpu),
-            "fill_": lambda: torch.zeros(2, dtype=dtype, device=mojo_gpu).fill_(val),
-            "masked_fill": lambda: torch.zeros(
-                2, dtype=dtype, device=mojo_gpu
-            ).masked_fill(msk, val),
-            "x[0]": lambda: setitem(val, 0),
-            "x[:]": lambda: setitem(val, slice(None)),
-            "x[mask]": lambda: setitem(val, "mask"),
+            "x[0]": lambda: setitem(0),
+            "x[:]": lambda: setitem(slice(None)),
+            "x[mask]": lambda: setitem("mask"),
         }
 
-    for name, fn in entries(v).items():
-        if name == "scalar_tensor" and dtype in (torch.float16, torch.bfloat16):
-            continue  # an explicit out-of-range half raises on CUDA, inf here
+    want_all = entries("cpu")
+    for name, fn in entries(mojo_gpu).items():
         got = _outcome(fn)
-        want = _outcome(entries(v.real)[name])
+        want = _outcome(want_all[name])
         assert got[0] == want[0], (name, got, want)
         if got[0] == "ok":
             assert torch.equal(got[1], want[1]), (name, got, want)
@@ -1658,7 +1661,7 @@ def test_wide_unsigned_masked_and_index_fill_decline(mojo_gpu: str, dtype):
     # the conversion error there, as on CUDA)
     with pytest.raises(NotImplementedError, match=f"masked_fill_.*{name}"):
         x[msk] = 3
-    with pytest.raises(NotImplementedError, match=f"index_fill_.*{name}"):
+    with pytest.raises(NotImplementedError, match=f"index_fill_cuda.*{name}"):
         x.index_fill_(0, idx, 1e19)
     with pytest.raises(NotImplementedError, match=f"index_put.*{name}"):
         x[torch.tensor([True, False])] = 3  # a CPU mask: index_put's kernel
@@ -1673,6 +1676,44 @@ def test_index_fill_refuses_a_complex_scalar(mojo_gpu: str, dtype):
     with pytest.raises(RuntimeError, match="Converting complex Scalar"):
         x.index_fill_(0, torch.tensor([0], device=mojo_gpu), 1 + 0j)
     assert x.cpu().tolist() == [0, 0]
+
+
+def _part_overlapping_mask(x):
+    """A bool mask over the first bytes of `x`, all true."""
+    m = x.view(torch.bool)[: x.numel()]
+    m.fill_(True)
+    return m
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.float32])
+def test_masked_fill_refuses_a_mask_overlapping_self(mojo_gpu: str, dtype):
+    """masked_fill_'s assert_no_partial_overlap(self, mask): CUDA raises
+    before writing (the complex route would otherwise change the mask with
+    its real-part write)."""
+    vals = [1 + 2j, 3 + 4j] if dtype.is_complex else [1.0, 2.0]
+    fill = 5 + 6j if dtype.is_complex else 5.0
+    for value in (fill, torch.tensor(fill, device=mojo_gpu)):
+        x = torch.tensor(vals, dtype=dtype, device=mojo_gpu)
+        m = _part_overlapping_mask(x)
+        before = x.cpu().clone()
+        with pytest.raises(RuntimeError, match="refer to a single memory"):
+            x.masked_fill_(m, value)
+        assert torch.equal(x.cpu(), before)
+    # the functional form writes a new tensor: no overlap
+    x = torch.tensor(vals, dtype=dtype, device=mojo_gpu)
+    got = x.masked_fill(_part_overlapping_mask(x), fill)
+    assert got.cpu().tolist() == [fill, fill]
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.float32])
+def test_where_out_refuses_an_out_overlapping_the_condition(mojo_gpu: str, dtype):
+    vals = [1 + 2j, 3 + 4j] if dtype.is_complex else [1.0, 2.0]
+    x = torch.tensor(vals, dtype=dtype, device=mojo_gpu)
+    c = _part_overlapping_mask(x)
+    before = x.cpu().clone()
+    with pytest.raises(RuntimeError, match="refer to a single memory"):
+        torch.where(c, torch.full((2,), 5, dtype=dtype, device=mojo_gpu), x, out=x)
+    assert torch.equal(x.cpu(), before)
 
 
 def test_index_add_integer_alpha_rounds_once(mojo_gpu: str):
