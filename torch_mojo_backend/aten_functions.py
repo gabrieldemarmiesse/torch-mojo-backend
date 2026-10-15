@@ -90,7 +90,7 @@ def find_broadcast_shape(shape_a: list[Dim], shape_b: list[Dim]) -> list[Dim]:
     # missing dims with None, which resolve to the other shape's dims.
     result = []
     for dim_a, dim_b in itertools.zip_longest(reversed(shape_a), reversed(shape_b)):
-        # None first: `Dim(1) in (Dim(1), None)` must not pick a missing dim
+        # a missing dim first: a size-1 dim against it keeps its 1
         if dim_b is None:
             result.append(dim_a)
         elif dim_a is None or dim_a == dim_b or dim_a == Dim(1):
