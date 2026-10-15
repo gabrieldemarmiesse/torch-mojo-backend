@@ -246,6 +246,14 @@ def test_run_decompositions(mojo_gpu, table):
     _close(ep.module()(x.to(mojo_gpu)), cpu(x))
 
 
+# torch < 2.10 has no autograd_would_have_decomposed: it decomposes every CIA
+# op it traces, so nothing is patched and these state tests have no subject.
+_needs_decomposition_hook = pytest.mark.skipif(
+    not hasattr(python_dispatch, "autograd_would_have_decomposed"),
+    reason="torch < 2.10 decomposes every CIA op it traces: nothing is patched",
+)
+
+
 def _nested_decompositions(device: str) -> list[Target]:
     """Core ATen on an MLP program whose gelu decomposition, mid-retrace,
     runs `run_decompositions({})` on another program."""
@@ -278,6 +286,7 @@ def _assert_no_decomposition_left(device: str):
         )
 
 
+@_needs_decomposition_hook
 def test_run_decompositions_nested(mojo_gpu):
     """torch does not support a run_decompositions inside another one's
     retrace: on CPU the inner call fails the outer trace. A mojo program
@@ -289,6 +298,7 @@ def test_run_decompositions_nested(mojo_gpu):
     _assert_no_decomposition_left(mojo_gpu)
 
 
+@_needs_decomposition_hook
 def test_run_decompositions_is_per_thread(mojo_gpu):
     """The patch's only state is per thread: while one thread is inside
     run_decompositions, another thread's tracing (torch.compile, say) still
@@ -333,6 +343,7 @@ def test_run_decompositions_is_per_thread(mojo_gpu):
     _assert_no_decomposition_left(mojo_gpu)
 
 
+@_needs_decomposition_hook
 def test_run_decompositions_raising(mojo_gpu):
     """A decomposition that raises leaves nothing behind either."""
 
@@ -348,10 +359,7 @@ def test_run_decompositions_raising(mojo_gpu):
     _assert_no_decomposition_left(mojo_gpu)
 
 
-@pytest.mark.skipif(
-    not hasattr(python_dispatch, "autograd_would_have_decomposed"),
-    reason="torch < 2.10 decomposes every CIA op it traces: nothing is patched",
-)
+@_needs_decomposition_hook
 def test_decomposition_patch_matches_upstream(mojo_gpu):
     """The patched hook still has upstream's signature and is installed
     everywhere torch reads it; outside run_decompositions it answers as

@@ -195,10 +195,13 @@ def fix_batch_isend_irecv_for_python_process_groups():
     torch.distributed.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
 
 
+@functools.cache
 def _stock_backends_decompose(op: torch._ops.OpOverload) -> bool:
     """`op` is CompositeImplicitAutograd with a mojo kernel, and neither CPU
     nor CUDA has a kernel of its own, so a CPU or CUDA program decomposes it
-    where a mojo program keeps it whole."""
+    where a mojo program keeps it whole. Cached per op: it is only asked
+    inside run_decompositions, after register_mojo_devices has registered
+    every mojo kernel."""
     has_kernel = torch._C._dispatch_has_kernel_for_dispatch_key
     key = torch._C.DispatchKey
     return (
