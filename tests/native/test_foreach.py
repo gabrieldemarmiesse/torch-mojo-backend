@@ -26,6 +26,8 @@ this file.
 """
 
 import contextlib
+import math
+import re
 from collections.abc import Sequence
 
 import pytest
@@ -1056,16 +1058,8 @@ def test_foreach_norm_scalar_matches_cpu(mojo_gpu: str):
     _assert_ran("aten::_foreach_norm.Scalar")
 
 
-@pytest.mark.xfail(
-    reason=(
-        "sequential fallback needs linalg_vector_norm registered by the"
-        " reductions group; not yet present in this worktree"
-    ),
-    strict=False,
-)
-def test_foreach_norm_scalar_ord_one_uses_fallback(mojo_gpu: str):
-    """ord != 2 always takes the per-tensor `linalg_vector_norm` fallback,
-    for any ord -- it is ATen's own `foreach_tensor_norm_slow` composition."""
+def test_foreach_norm_scalar_ord_one(mojo_gpu: str):
+    """ord 1 is a batched reduction too (CUDA's L1 LpNormFunctor)."""
     tensors = [t.abs().add(0.1) for t in _foreach_lists("cpu")[0] if t.numel() > 0]
     mojo_tensors = [t.to(mojo_gpu) for t in tensors]
     expected = torch._foreach_norm(tensors, 1)
@@ -1101,14 +1095,6 @@ def test_batched_foreach_mixed_dtype_list_falls_back(mojo_gpu: str):
     )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "unregistered Scalar[] ops (see ops_foreach.mojo module docstring):"
-        " ATen's own sequential decomposition needs div_.Scalar / addcdiv_"
-        " registered by the binary group; not yet present in this worktree"
-    ),
-    strict=False,
-)
 @pytest.mark.parametrize(
     ("op_name", "apply"),
     [
@@ -1121,13 +1107,9 @@ def test_batched_foreach_mixed_dtype_list_falls_back(mojo_gpu: str):
         ),
     ],
 )
-def test_foreach_scalarlist_ops_unregistered_still_correct(
-    mojo_gpu: str, op_name: str, apply
-):
-    """`_foreach_div_.ScalarList` / `_foreach_addcdiv_.ScalarList` are not
-    registered here at all (Scalar[] cannot reach our boxed kernel yet), so
-    these must produce ATen's ordinary answer through its own
-    CompositeExplicitAutograd decomposition end to end."""
+def test_foreach_scalarlist_ops_match_cpu(mojo_gpu: str, op_name: str, apply):
+    """`_foreach_div_.ScalarList` / `_foreach_addcdiv_.ScalarList`: a
+    `Scalar[]` reaches the boxed kernel element by element."""
     cpu_lists = _foreach_lists("cpu")
     mojo_lists = _foreach_lists(mojo_gpu)
     apply(*cpu_lists)
@@ -1198,13 +1180,6 @@ def test_foreach_norm_over_the_descriptor_cap(mojo_gpu: str, dtype_arg):
     assert len(set(pointers)) == len(pointers)  # distinct allocations
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the strided fallback calls linalg_vector_norm through "
-    "tmb_call_op with an argument the schema reads as a bool, which trips "
-    "an ATen IValue INTERNAL ASSERT. The batched path handles contiguous "
-    "inputs; only the per-tensor fallback is broken.",
-)
 def test_foreach_norm_strided_inputs(mojo_gpu: str):
     cpu = [
         torch.arange(24, dtype=torch.float32).reshape(4, 6).t(),
@@ -2414,8 +2389,8 @@ _CPU_SCALARS = [
     (torch.bfloat16, torch.tensor([0.25], dtype=torch.float64)),
 ]
 _CPU_SCALAR_IDS = ["f32-f32", "f32-i64", "i64-i64", "i64-f32", "bf16-f64-1d"]
-_CPU_SCALAR_OPS = ["mul"]
-_CPU_SCALAR_INPLACE = [True]
+_CPU_SCALAR_OPS = ["mul", "div", "add"]
+_CPU_SCALAR_INPLACE = [False, True]
 
 
 @pytest.mark.parametrize(
@@ -2435,6 +2410,10 @@ def test_mta_tensor_overload_with_a_cpu_scalar(
     cpu = [torch.full((5,), 2, dtype=dtype), (torch.arange(1030) % 9).to(dtype)]
     dev = [t.to(mojo_gpu) for t in cpu]
     schema = getattr(torch.ops.aten, f"_foreach_{op}_" if inplace else f"_foreach_{op}")
+    if op == "add" and other.dim() != 0:
+        with pytest.raises(RuntimeError, match="scalar tensor expected to be 0 dim"):
+            schema.Tensor(dev, other)
+        return
     if op == "add" and other.dtype == dtype:
         word = "is expected" if inplace else "expected"
         with pytest.raises(RuntimeError, match=f"scalar tensor {word} to be on mojo:0"):
@@ -2568,3 +2547,934 @@ def test_mta_torch_optim_foreach_matches_cpu(mojo_gpu: str, make):
         results[device] = [p.detach().cpu() for p in params]
     for a, e in zip(results[mojo_gpu], results["cpu"], strict=True):
         torch.testing.assert_close(a, e, rtol=2e-5, atol=2e-6)
+
+
+# --- unary ---------------------------------------------------------------------
+
+
+_MTA_UNARY = {
+    "abs": (-3, 3),
+    "acos": (-0.99, 0.99),
+    "asin": (-0.99, 0.99),
+    "atan": (-3, 3),
+    "ceil": (-3, 3),
+    "cos": (-3, 3),
+    "cosh": (-3, 3),
+    "erf": (-2, 2),
+    "erfc": (-2, 2),
+    "exp": (-3, 3),
+    "expm1": (-1, 1),
+    "floor": (-3, 3),
+    "frac": (-3, 3),
+    "lgamma": (0.1, 5),
+    "log": (0.1, 5),
+    "log10": (0.1, 5),
+    "log1p": (-0.5, 3),
+    "log2": (0.1, 5),
+    "neg": (-3, 3),
+    "reciprocal": (0.5, 3),
+    "round": (-3, 3),
+    "rsqrt": (0.1, 5),
+    "sigmoid": (-3, 3),
+    "sign": (-3, 3),
+    "sin": (-3, 3),
+    "sinh": (-2, 2),
+    "sqrt": (0, 5),
+    "tan": (-1, 1),
+    "tanh": (-3, 3),
+    "trunc": (-3, 3),
+}
+# The unary kinds whose float64 math lowers on the GPU (the rest decline
+# float64 per tensor too, so their foreach falls back and declines).
+_MTA_UNARY_F64 = {
+    "abs", "ceil", "floor", "frac", "neg", "reciprocal", "round",
+    "sign", "sqrt", "trunc",
+}  # fmt: skip
+_MTA_UNARY_CASES = [
+    (name, dtype_id)
+    for name in _MTA_UNARY
+    for dtype_id in _MTA_FLOATS
+    if dtype_id != "f64" or name in _MTA_UNARY_F64
+]
+
+
+@pytest.mark.parametrize("inplace", [False, True], ids=["out", "inplace"])
+@pytest.mark.parametrize(("name", "dtype_id"), _MTA_UNARY_CASES)
+def test_mta_unary_matches_cpu(mojo_gpu: str, name: str, dtype_id: str, inplace: bool):
+    dtype = _MTA_FLOATS[dtype_id]
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    lo, hi = _MTA_UNARY[name]
+    cpu, dev = _mta_lists(mojo_gpu, dtype, lo, hi, seed=len(name))
+    if inplace:
+        expected = [getattr(torch, name)(t) for t in cpu]
+        before = [t._version for t in dev]
+        with _one_launch(f"_foreach_{name}_"):
+            getattr(torch, f"_foreach_{name}_")(dev)
+        actual = dev
+        assert [t._version - v for t, v in zip(dev, before)] == [1] * len(dev)
+    else:
+        expected = [getattr(torch, name)(t) for t in cpu]
+        with _one_launch(f"_foreach_{name}"):
+            actual = getattr(torch, f"_foreach_{name}")(dev)
+    _assert_lists(actual, expected, **_mta_tol(dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int32, torch.int64, torch.uint8])
+@pytest.mark.parametrize("name", ["abs", "neg"])
+def test_mta_unary_integers(mojo_gpu: str, name: str, dtype: torch.dtype):
+    lo, hi = (0, 200) if dtype == torch.uint8 else (-100, 100)
+    cpu, dev = _mta_lists(mojo_gpu, dtype, lo, hi, seed=3)
+    with _one_launch(f"_foreach_{name}"):
+        actual = getattr(torch, f"_foreach_{name}")(dev)
+    _assert_lists(actual, [getattr(torch, name)(t) for t in cpu])
+
+
+def test_mta_abs_and_zero_on_bool(mojo_gpu: str):
+    """CUDA's abs takes bool (the CPU kernel does not), as the identity."""
+    cpu = [torch.tensor([True, False, True]), torch.zeros(1025, dtype=torch.bool)]
+    dev = [t.to(mojo_gpu) for t in cpu]
+    with _one_launch("_foreach_abs"):
+        actual = torch._foreach_abs(dev)
+    _assert_lists(actual, cpu)
+    with _one_launch("_foreach_zero_"):
+        torch._foreach_zero_(dev)
+    _assert_lists(dev, [torch.zeros_like(t) for t in cpu])
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.float64, torch.int64, torch.bool]
+)
+def test_mta_zero_(mojo_gpu: str, dtype: torch.dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    cpu, dev = _mta_lists(mojo_gpu, dtype, 1, 5, seed=1)
+    with _one_launch("_foreach_zero_"):
+        torch._foreach_zero_(dev)
+    _assert_lists(dev, [torch.zeros_like(t) for t in cpu])
+
+
+def test_mta_unary_fallbacks_match_cpu(mojo_gpu: str):
+    """Lists the fast route does not take still get ATen's answer."""
+    # Mixed dtypes.
+    cpu = [torch.randn(5), torch.randn(9).to(torch.bfloat16)]
+    dev = [t.to(mojo_gpu) for t in cpu]
+    _assert_lists(
+        torch._foreach_exp(dev), [t.exp() for t in cpu], **_mta_tol(torch.bfloat16)
+    )
+    # Not dense.
+    base = torch.randn(40)
+    dev_base = base.to(mojo_gpu)
+    _assert_lists(
+        torch._foreach_sigmoid([dev_base[::2], dev_base[1::4]]),
+        [base[::2].sigmoid(), base[1::4].sigmoid()],
+    )
+    # An integer list: the per-tensor op promotes it.
+    ints = [torch.arange(5), torch.arange(1025) % 7]
+    _assert_lists(
+        torch._foreach_exp([t.to(mojo_gpu) for t in ints]), [t.exp() for t in ints]
+    )
+
+
+# --- binary: Scalar, ScalarList, List, Tensor ----------------------------------
+
+
+# Binary overloads: (op, the overloads it has, (lo, hi) of self, of other).
+_MTA_BINARY = {
+    "add": (("Scalar", "ScalarList", "List", "Tensor"), (-3, 3), (-3, 3)),
+    "sub": (("Scalar", "ScalarList", "List"), (-3, 3), (-3, 3)),
+    "mul": (("Scalar", "ScalarList", "List", "Tensor"), (-3, 3), (-3, 3)),
+    "div": (("Scalar", "ScalarList", "List", "Tensor"), (-3, 3), (0.5, 3)),
+    "clamp_max": (("Scalar", "ScalarList", "List"), (-3, 3), (-1, 1)),
+    "clamp_min": (("Scalar", "ScalarList", "List"), (-3, 3), (-1, 1)),
+    "maximum": (("Scalar", "ScalarList", "List"), (-3, 3), (-1, 1)),
+    "minimum": (("Scalar", "ScalarList", "List"), (-3, 3), (-1, 1)),
+    "pow": (("Scalar", "ScalarList", "List"), (0.25, 2), (-2, 2)),
+}
+_MTA_BINARY_CASES = [
+    (op, overload, dtype_id)
+    for op, (overloads, _, _) in _MTA_BINARY.items()
+    for overload in overloads
+    for dtype_id in _MTA_FLOATS
+]
+_MTA_INT_DTYPES = {"i32": torch.int32, "i64": torch.int64, "u8": torch.uint8}
+
+
+def _per_tensor_ref(op: str):
+    """What ATen's slow kernel calls per tensor for `_foreach_<op>`."""
+    return {"maximum": torch.clamp_min, "minimum": torch.clamp_max}.get(
+        op, getattr(torch, op)
+    )
+
+
+def _binary_call(
+    op: str,
+    overload: str,
+    inplace: bool,
+    selves: list[torch.Tensor],
+    others: list[torch.Tensor],
+    scalar: float | int | bool,
+    scalars: list[float] | list[int],
+    device: torch.Tensor,
+    alpha: float | int | None,
+):
+    fn = getattr(torch, f"_foreach_{op}_" if inplace else f"_foreach_{op}")
+    kwargs = {} if alpha is None else {"alpha": alpha}
+    if overload == "Scalar":
+        return fn(selves, scalar)
+    if overload == "ScalarList":
+        return fn(selves, scalars)
+    if overload == "List":
+        return fn(selves, others, **kwargs)
+    return fn(selves, device, **kwargs)
+
+
+def _binary_expected(op, overload, selves, others, scalar, scalars, alpha):
+    ref = _per_tensor_ref(op)
+    kwargs = {} if alpha is None else {"alpha": alpha}
+    out = []
+    for i, t in enumerate(selves):
+        if overload == "Scalar":
+            out.append(ref(t, scalar))
+        elif overload == "ScalarList":
+            out.append(ref(t, scalars[i]))
+        elif overload == "List":
+            out.append(ref(t, others[i], **kwargs))
+        else:
+            out.append(ref(t, torch.tensor(scalar, dtype=t.dtype), **kwargs))
+    return out
+
+
+def _run_binary(mojo_gpu, op, overload, dtype, inplace, scalar, scalars, alpha):
+    _, lo_hi, other_lo_hi = _MTA_BINARY[op]
+    cpu, dev = _mta_lists(mojo_gpu, dtype, *lo_hi, seed=11)
+    cpu_o, dev_o = _mta_lists(mojo_gpu, dtype, *other_lo_hi, seed=12)
+    if op == "div" and not dtype.is_floating_point:
+        pytest.skip("integer division promotes: not a fast-route case")
+    alpha = alpha if op in ("add", "sub") and overload in ("List", "Tensor") else None
+    expected = _binary_expected(op, overload, cpu, cpu_o, scalar, scalars, alpha)
+    suffix = "_" if inplace else ""
+    other = torch.tensor(scalar, dtype=dtype, device=mojo_gpu)
+    with _one_launch(f"_foreach_{op}{suffix}.{overload}"):
+        result = _binary_call(
+            op, overload, inplace, dev, dev_o, scalar, scalars, other, alpha
+        )
+    actual = dev if inplace else result
+    tol = _mta_tol(dtype)
+    if op == "pow" and dtype == torch.float32:
+        tol = {"rtol": 2e-5, "atol": 1e-6}
+    _assert_lists(actual, expected, **tol)
+
+
+@pytest.mark.parametrize("inplace", [False, True], ids=["out", "inplace"])
+@pytest.mark.parametrize(("op", "overload", "dtype_id"), _MTA_BINARY_CASES)
+def test_mta_binary_matches_cpu(
+    mojo_gpu: str, op: str, overload: str, dtype_id: str, inplace: bool
+):
+    dtype = _MTA_FLOATS[dtype_id]
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    scalars = [0.5 + 0.25 * i for i in range(len(_MTA_SIZES))]
+    if op == "div":
+        scalars = [s + 0.1 for s in scalars]
+    _run_binary(mojo_gpu, op, overload, dtype, inplace, 0.75, scalars, alpha=-1.5)
+
+
+@pytest.mark.parametrize("inplace", [False, True], ids=["out", "inplace"])
+@pytest.mark.parametrize("dtype_id", list(_MTA_INT_DTYPES))
+@pytest.mark.parametrize(
+    ("op", "overload"),
+    [(op, overload) for op in ("add", "sub", "mul") for overload in _MTA_BINARY[op][0]],
+)
+def test_mta_binary_integers(
+    mojo_gpu: str, op: str, overload: str, dtype_id: str, inplace: bool
+):
+    """CUDA's add / sub / mul take integer lists on the fast route (an
+    integral Scalar keeps the dtype)."""
+    dtype = _MTA_INT_DTYPES[dtype_id]
+    scalars = [i - 3 for i in range(len(_MTA_SIZES))]
+    _run_binary(mojo_gpu, op, overload, dtype, inplace, 3, scalars, alpha=2)
+
+
+@pytest.mark.parametrize("op", ["add", "mul"])
+def test_mta_binary_bool(mojo_gpu: str, op: str):
+    cpu, dev = _mta_lists(mojo_gpu, torch.bool, 0, 2, seed=5)
+    cpu_o, dev_o = _mta_lists(mojo_gpu, torch.bool, 0, 2, seed=6)
+    ref = getattr(torch, op)
+    with _one_launch(f"_foreach_{op}.Scalar"):
+        actual = getattr(torch, f"_foreach_{op}")(dev, True)
+    _assert_lists(actual, [ref(t, True) for t in cpu])
+    with _one_launch(f"_foreach_{op}_.ScalarList"):
+        getattr(torch, f"_foreach_{op}_")(dev, [i % 2 == 0 for i in range(len(dev))])
+    expected = [ref(t, i % 2 == 0) for i, t in enumerate(cpu)]
+    _assert_lists(dev, expected)
+    # A list operand: add's default alpha=1 is an int, which promotes a bool
+    # list (ForeachUtils.h), so only mul takes the fast route here.
+    actual = getattr(torch, f"_foreach_{op}")(dev, dev_o)
+    _assert_lists(actual, [ref(t, o) for t, o in zip(expected, cpu_o)])
+
+
+@pytest.mark.parametrize("dtype_id", list(_MTA_FLOATS))
+def test_mta_pow_scalar_and_tensor(mojo_gpu: str, dtype_id: str):
+    dtype = _MTA_FLOATS[dtype_id]
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    cpu, dev = _mta_lists(mojo_gpu, dtype, -2, 2, seed=9)
+    with _one_launch("_foreach_pow.ScalarAndTensor"):
+        actual = torch._foreach_pow(1.75, dev)
+    _assert_lists(actual, [torch.pow(1.75, t) for t in cpu], **_mta_tol(dtype))
+
+
+def test_mta_pow_scalar_and_integer_tensors_promote(mojo_gpu: str):
+    """`_foreach_pow(1.5, int_list)` follows result_type, like CPU torch and
+    the per-tensor `pow(Scalar, Tensor)`: float32 [1.5, 2.25]. Stock CUDA
+    (torch 2.11, H100) returns int64 [1, 1]: its fast route
+    (ForeachBinaryOpScalar.cu:184, `can_use_fast_route(exponent)` without
+    the scalar) keeps the integer list and the functor's
+    `scalar.to<opmath_t>()` (:47) truncates 1.5 to 1. Pinned on purpose."""
+    exponents = [torch.tensor([1, 2]), torch.arange(5)]
+    actual = torch._foreach_pow(1.5, [t.to(mojo_gpu) for t in exponents])
+    _assert_lists(actual, [torch.pow(1.5, t) for t in exponents])
+    assert actual[0].dtype == torch.float32
+    assert actual[0].cpu().tolist() == [1.5, 2.25]
+
+
+_SIGNED_ZEROS = [(0.0, -0.0), (-0.0, 0.0), (0.0, 0.0), (-0.0, -0.0)]
+
+
+@pytest.mark.parametrize("overload", ["Scalar", "ScalarList", "List"])
+@pytest.mark.parametrize("op", ["maximum", "minimum", "clamp_min", "clamp_max"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=str)
+def test_mta_min_max_signed_zeros_and_nan(
+    mojo_gpu: str, dtype: torch.dtype, op: str, overload: str
+):
+    """ForeachMinMaxFunctors.cuh: `(isnan(a) || a > b) ? a : b`. Equal
+    operands give the second one, so maximum(+0, -0) is -0 and
+    maximum(-0, +0) is +0 (measured on stock CUDA, every op, overload and
+    argument order) -- unlike the per-tensor ops; NaN on either side wins."""
+    nan = float("nan")
+    pairs = [*_SIGNED_ZEROS, (nan, 1.0), (1.0, nan), (2.0, 1.0), (1.0, 2.0)]
+    selves = [torch.tensor([a], dtype=dtype, device=mojo_gpu) for a, _ in pairs]
+    others = [b for _, b in pairs]
+    fn = getattr(torch, f"_foreach_{op}")
+    if overload == "Scalar":
+        actual = [fn([t], b)[0] for t, b in zip(selves, others)]
+    elif overload == "ScalarList":
+        actual = fn(selves, others)
+    else:
+        actual = fn(
+            selves, [torch.tensor([b], dtype=dtype, device=mojo_gpu) for b in others]
+        )
+    keep_max = op in ("maximum", "clamp_min")
+    for (a, b), r in zip(pairs, actual, strict=True):
+        if math.isnan(a) or math.isnan(b):
+            want = nan
+        elif a == b:
+            want = b
+        else:
+            want = max(a, b) if keep_max else min(a, b)
+        got = r.item()
+        if math.isnan(want):
+            assert math.isnan(got)
+        else:
+            assert got == want and math.copysign(1, got) == math.copysign(1, want)
+
+
+def test_mta_sub_bool_rules(mojo_gpu: str):
+    """sub_check like CUDA: the ScalarList overload checks every pair before
+    anything runs (the float tensor stays untouched), the Scalar one the
+    first tensor; the List overload computes bool lists with a bool alpha on
+    its fast route and raises in the per-tensor sub otherwise."""
+    a = torch.tensor([10.0], device=mojo_gpu)
+    b = torch.tensor([True], device=mojo_gpu)
+    with pytest.raises((RuntimeError, NotImplementedError), match="with a bool tensor"):
+        torch._foreach_sub_([a, b], [1, 1])
+    assert a.cpu().tolist() == [10.0]
+    with pytest.raises((RuntimeError, NotImplementedError), match="with a bool tensor"):
+        torch._foreach_sub_([b, a], 1)
+    assert a.cpu().tolist() == [10.0]
+    x = torch.tensor([True, False], device=mojo_gpu)
+    y = torch.tensor([True, True], device=mojo_gpu)
+    # Stock CUDA: [False, True] and [True, False].
+    assert torch._foreach_sub([x], [y], alpha=True)[0].cpu().tolist() == [False, True]
+    assert torch._foreach_sub([x], [y], alpha=False)[0].cpu().tolist() == [True, False]
+    # The per-tensor sub.Tensor declines bool operands (CUDA: "two bool
+    # tensors"); either way nothing is computed.
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        torch._foreach_sub([x], [y])
+
+
+def test_mta_dense_non_contiguous_lists(mojo_gpu: str):
+    """Transposed (dense, non-contiguous) tensors with matching strides take
+    the fast route and keep their layout in the out-of-place result."""
+    cpu = [torch.randn(5, 7).t(), torch.randn(33, 65).t()]
+    other = [torch.randn(5, 7).t(), torch.randn(33, 65).t()]
+    dev = [t.to(mojo_gpu) for t in cpu]
+    dev_o = [t.to(mojo_gpu) for t in other]
+    assert all(t.stride() == o.stride() for t, o in zip(dev, dev_o))
+    with _one_launch("_foreach_mul.List"):
+        actual = torch._foreach_mul(dev, dev_o)
+    for a, t in zip(actual, dev):
+        assert a.stride() == t.stride()
+    _assert_lists(actual, [a * b for a, b in zip(cpu, other)])
+
+
+def test_mta_inplace_aliasing_is_sequential(mojo_gpu: str):
+    """An in-place list reading another entry's tensor (here a swap) has the
+    sequential result: the second update sees the first."""
+    a, b = torch.randn(1000), torch.randn(1000)
+    da, db = a.to(mojo_gpu), b.to(mojo_gpu)
+    torch._foreach_add_([da, db], [db, da])
+    a.add_(b)
+    b.add_(a)
+    _assert_lists([da, db], [a, b])
+    # The same tensor at the same index is elementwise and takes the launch.
+    x = torch.randn(3000)
+    dx = x.to(mojo_gpu)
+    with _one_launch("_foreach_mul_.List"):
+        torch._foreach_mul_([dx], [dx])
+    _assert_lists([dx], [x * x])
+
+
+def test_mta_scalar_tensor_overloads(mojo_gpu: str):
+    xs = [torch.randn(5), torch.randn(1030)]
+    dev = [t.to(mojo_gpu) for t in xs]
+    # A CPU tensor is its `item()` (div by its reciprocal, as CUDA does).
+    two = torch.tensor(2.0)
+    _assert_lists(torch._foreach_mul(dev, two), [t * 2.0 for t in xs])
+    _assert_lists(torch._foreach_div(dev, torch.tensor([4.0])), [t / 4.0 for t in xs])
+    # A device 0-d tensor of another dtype falls back to the per-tensor op.
+    s = torch.tensor(3, device=mojo_gpu)
+    _assert_lists(torch._foreach_mul(dev, s), [t * 3 for t in xs])
+    with pytest.raises(RuntimeError, match="0 dim"):
+        torch._foreach_add(dev, torch.ones(2, device=mojo_gpu))
+    half = torch.tensor(0.5, device=mojo_gpu)
+    with _one_launch("_foreach_add_.Tensor"):
+        torch._foreach_add_(dev, half, alpha=-2)
+    _assert_lists(dev, [t - 1.0 for t in xs])
+
+
+def test_mta_binary_fallbacks_match_cpu(mojo_gpu: str):
+    # Mismatched layouts across lists.
+    a, b = torch.randn(4, 6), torch.randn(6, 4).t()
+    _assert_lists(torch._foreach_add([a.to(mojo_gpu)], [b.to(mojo_gpu)]), [a + b])
+    # An integer list with a float Scalar promotes (out of place) ...
+    ints = [torch.arange(5), torch.arange(1025) % 7]
+    dev_ints = [t.to(mojo_gpu) for t in ints]
+    _assert_lists(torch._foreach_add(dev_ints, 1.5), [t + 1.5 for t in ints])
+    _assert_lists(
+        torch._foreach_mul(dev_ints, [0.5, 2.0]), [ints[0] * 0.5, ints[1] * 2.0]
+    )
+    _assert_lists(torch._foreach_div(dev_ints, 4), [t / 4 for t in ints])
+    # ... and in place it raises like the per-tensor op.
+    with pytest.raises(RuntimeError, match="can't be cast"):
+        torch._foreach_div_(dev_ints, 4)
+
+
+def test_mta_binary_argument_errors(mojo_gpu: str):
+    xs = [torch.ones(3, device=mojo_gpu), torch.ones(4, device=mojo_gpu)]
+    with pytest.raises(RuntimeError, match="same number of tensors, got 2 and 1"):
+        torch._foreach_add(xs, xs[:1])
+    with pytest.raises(RuntimeError, match="same number of elements as scalar list"):
+        torch._foreach_mul_(xs, [1.0])
+
+
+def _binary_calls(a, b, c, w) -> list[torch.Tensor]:
+    return [
+        *torch._foreach_add(a, b, alpha=0.3),
+        *torch._foreach_sub(a, 0.7),
+        *torch._foreach_mul(a, [0.1, 0.2, 0.3]),
+        *torch._foreach_div(a, c),
+        *torch._foreach_div(a, 3.0),
+        *torch._foreach_maximum(a, b),
+        *torch._foreach_clamp_max(a, 0.25),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_mta_binary_is_bit_exact_with_stock_cuda(mojo_gpu: str, dtype: torch.dtype):
+    """add / sub with an alpha are one fma, div by a Scalar is CUDA's
+    multiply by the reciprocal, maximum / minimum propagate NaN."""
+    _stock_cuda_parity(dtype, mojo_gpu, _binary_calls)
+
+
+# --- pointwise (addcmul, addcdiv) and ternary (lerp) ---------------------------
+
+
+_MTA_POINTWISE_CASES = [
+    (op, overload, dtype_id)
+    for op in ("addcmul", "addcdiv")
+    for overload in ("Scalar", "ScalarList", "Tensor")
+    for dtype_id in _MTA_FLOATS
+]
+
+
+@pytest.mark.parametrize("inplace", [False, True], ids=["out", "inplace"])
+@pytest.mark.parametrize(("op", "overload", "dtype_id"), _MTA_POINTWISE_CASES)
+def test_mta_pointwise_matches_cpu(
+    mojo_gpu: str, op: str, overload: str, dtype_id: str, inplace: bool
+):
+    dtype = _MTA_FLOATS[dtype_id]
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    cpu, dev = _mta_lists(mojo_gpu, dtype, -3, 3, seed=21)
+    cpu1, dev1 = _mta_lists(mojo_gpu, dtype, -2, 2, seed=22)
+    cpu2, dev2 = _mta_lists(mojo_gpu, dtype, 0.5, 2, seed=23)
+    values = [0.5 - 0.3 * i for i in range(len(cpu))]
+    if overload == "Scalar":
+        arg, per = -0.75, [-0.75] * len(cpu)
+    elif overload == "ScalarList":
+        arg, per = values, values
+    else:
+        arg, per = torch.tensor(values, dtype=torch.float64), values
+    expected = [
+        getattr(torch, op)(t, a, b, value=v)
+        for t, a, b, v in zip(cpu, cpu1, cpu2, per, strict=True)
+    ]
+    name = f"_foreach_{op}_" if inplace else f"_foreach_{op}"
+    with _one_launch(f"{name}.{overload}"):
+        result = getattr(torch, name)(dev, dev1, dev2, arg)
+    _assert_lists(dev if inplace else result, expected, **_mta_tol(dtype))
+
+
+@pytest.mark.parametrize("inplace", [False, True], ids=["out", "inplace"])
+@pytest.mark.parametrize("dtype_id", list(_MTA_FLOATS))
+@pytest.mark.parametrize("overload", ["List", "Scalar", "ScalarList"])
+def test_mta_lerp_matches_cpu(
+    mojo_gpu: str, overload: str, dtype_id: str, inplace: bool
+):
+    dtype = _MTA_FLOATS[dtype_id]
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    cpu, dev = _mta_lists(mojo_gpu, dtype, -3, 3, seed=31)
+    cpu_e, dev_e = _mta_lists(mojo_gpu, dtype, -3, 3, seed=32)
+    cpu_w, dev_w = _mta_lists(mojo_gpu, dtype, -0.5, 1.5, seed=33)
+    weights = [0.1, 0.4999, 0.5, 0.9, -0.25, 1.25, 0.75]
+    if overload == "List":
+        arg, per = dev_w, cpu_w
+    elif overload == "Scalar":
+        arg, per = 0.3, [0.3] * len(cpu)
+    else:
+        arg, per = weights, weights
+    expected = [torch.lerp(t, e, w) for t, e, w in zip(cpu, cpu_e, per)]
+    name = "_foreach_lerp_" if inplace else "_foreach_lerp"
+    with _one_launch(f"{name}.{overload}"):
+        result = getattr(torch, name)(dev, dev_e, arg)
+    _assert_lists(dev if inplace else result, expected, **_mta_tol(dtype))
+
+
+def test_mta_pointwise_long_lists_span_several_launches(mojo_gpu: str):
+    sizes = [(i * 37) % 700 for i in range(130)]
+    cpu, dev = _mta_lists(mojo_gpu, torch.float32, -2, 2, seed=41, sizes=sizes)
+    cpu_o, dev_o = _mta_lists(mojo_gpu, torch.float32, -2, 2, seed=42, sizes=sizes)
+    with _one_launch("_foreach_lerp.List"):
+        actual = torch._foreach_lerp(dev, dev_o, dev_o)
+    _assert_lists(actual, [torch.lerp(a, b, b) for a, b in zip(cpu, cpu_o)])
+    with _one_launch("_foreach_addcdiv_.ScalarList"):
+        torch._foreach_addcdiv_(dev, dev_o, dev, [0.01 * i for i in range(130)])
+    for a, b, i in zip(cpu, cpu_o, range(130)):
+        a.addcdiv_(b, a.clone(), value=0.01 * i)
+    _assert_lists(dev, cpu, **_mta_tol(torch.float32))
+
+
+def test_mta_pointwise_argument_errors(mojo_gpu: str):
+    xs = [torch.ones(3, device=mojo_gpu), torch.ones(4, device=mojo_gpu)]
+    with pytest.raises(RuntimeError, match="Expected scalars to be on CPU"):
+        torch._foreach_addcmul(xs, xs, xs, torch.ones(2, device=mojo_gpu))
+    with pytest.raises(RuntimeError, match="Expected length of scalars"):
+        torch._foreach_addcmul(xs, xs, xs, torch.ones(3))
+    with pytest.raises(RuntimeError, match="same number of elements as scalar list"):
+        torch._foreach_lerp(xs, xs, [0.5])
+
+
+def _pointwise_calls(a, b, c, w) -> list[torch.Tensor]:
+    return [
+        *torch._foreach_addcmul(a, b, c, 0.3),
+        *torch._foreach_addcmul(a, b, c),
+        *torch._foreach_addcdiv(a, b, c, [0.1, -0.2, 0.3]),
+        *torch._foreach_addcdiv(a, b, c),
+        *torch._foreach_lerp(a, b, w),
+        *torch._foreach_lerp(a, b, 0.7),
+        *torch._foreach_lerp(a, b, [0.2, 0.5, 0.9]),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_mta_pointwise_is_bit_exact_with_stock_cuda(mojo_gpu: str, dtype: torch.dtype):
+    _stock_cuda_parity(dtype, mojo_gpu, _pointwise_calls)
+
+
+# --- the reductions: _foreach_norm, _foreach_powsum, _foreach_max -----------
+
+_MTA_NORM_DTYPES = {
+    "f32": (torch.float32, None),
+    "f16": (torch.float16, None),
+    "bf16": (torch.bfloat16, None),
+    "f64": (torch.float64, None),
+    "f16-to-f32": (torch.float16, torch.float32),
+    "f32-to-f64": (torch.float32, torch.float64),
+}
+
+
+@pytest.mark.parametrize(
+    "ord_", [0, 1, 2, float("inf")], ids=["l0", "l1", "l2", "linf"]
+)
+@pytest.mark.parametrize("dtype_id", list(_MTA_NORM_DTYPES))
+def test_mta_norm_matches_cpu(mojo_gpu: str, dtype_id: str, ord_: float):
+    dtype, out_dtype = _MTA_NORM_DTYPES[dtype_id]
+    if torch.float64 in (dtype, out_dtype):
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    sizes = [7, 1, 65_537, 131_072, 3, 200_001]
+    if ord_ != float("inf"):
+        sizes.insert(1, 0)
+    cpu, dev = _mta_lists(mojo_gpu, dtype, -2, 2, seed=51, sizes=sizes)
+    cpu[0][3] = 0.0
+    dev[0][3] = 0.0
+    kwargs = {} if out_dtype is None else {"dtype": out_dtype}
+    with _one_launch("_foreach_norm.Scalar"):
+        actual = torch._foreach_norm(dev, ord_, **kwargs)
+    expected = [
+        torch.linalg.vector_norm(t.double(), ord_).to(out_dtype or dtype) for t in cpu
+    ]
+    tol = _mta_tol(out_dtype or dtype)
+    if (out_dtype or dtype) == torch.float32:
+        tol = {"rtol": 2e-5, "atol": 1e-5}
+    _assert_lists(actual, expected, **tol)
+
+
+@pytest.mark.parametrize("ord_", [1, 2])
+@pytest.mark.parametrize(
+    ("dtype", "out_dtype"),
+    [
+        (torch.float32, None),
+        (torch.bfloat16, None),
+        (torch.float16, torch.float32),
+        (torch.float32, torch.float64),
+    ],
+    ids=["f32", "bf16", "f16-to-f32", "f32-to-f64"],
+)
+def test_mta_powsum_matches_cpu(
+    mojo_gpu: str, dtype: torch.dtype, out_dtype: torch.dtype | None, ord_: int
+):
+    if out_dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    cpu, dev = _mta_lists(mojo_gpu, dtype, -2, 2, seed=52)
+    kwargs = {} if out_dtype is None else {"dtype": out_dtype}
+    with _one_launch("_foreach_powsum.Scalar"):
+        actual = torch._foreach_powsum(dev, ord_, **kwargs)
+    result = out_dtype or dtype
+    expected = [
+        torch.linalg.vector_norm(t.double(), ord_).pow(ord_).to(result) for t in cpu
+    ]
+    tol = (
+        {"rtol": 2e-5, "atol": 1e-5}
+        if result != dtype or dtype == torch.float32
+        else _mta_tol(dtype)
+    )
+    _assert_lists(actual, expected, **tol)
+
+
+def test_mta_norm_fallbacks_and_errors(mojo_gpu: str):
+    cpu = [torch.randn(10), torch.randn(65_540)]
+    dev = [t.to(mojo_gpu) for t in cpu]
+    # An ord with no batched functor is the per-tensor linalg_vector_norm.
+    _assert_lists(
+        torch._foreach_norm(dev, 3.5),
+        [torch.linalg.vector_norm(t, 3.5) for t in cpu],
+        rtol=2e-5,
+        atol=1e-5,
+    )
+    _assert_lists(
+        torch._foreach_powsum(dev, 3),
+        [torch.linalg.vector_norm(t.double(), 3).pow(3).float() for t in cpu],
+        rtol=2e-5,
+        atol=1e-4,
+    )
+    with pytest.raises(RuntimeError, match="infinity norm on an empty tensor"):
+        torch._foreach_norm([torch.empty(0, device=mojo_gpu)], float("inf"))
+    with pytest.raises(RuntimeError, match="convertible without narrowing"):
+        torch._foreach_norm(dev, 2, dtype=torch.float16)
+    with pytest.raises(
+        RuntimeError, match="should be real for real inputs, but got ComplexFloat"
+    ):
+        torch._foreach_norm(dev, 2, dtype=torch.complex64)
+    with pytest.raises(RuntimeError, match="floating point or complex, but got Int"):
+        torch._foreach_norm(dev, 2, dtype=torch.int32)
+    with pytest.raises(
+        NotImplementedError, match="\"powsum_cuda\" not implemented for 'Long'"
+    ):
+        torch._foreach_powsum([torch.arange(5, device=mojo_gpu)], 2)
+    with pytest.raises(RuntimeError, match="expects ord to be integer or float"):
+        torch._foreach_norm(dev, True)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float32, torch.float16, torch.bfloat16, torch.float64, torch.int8,
+     torch.int16, torch.int32, torch.int64, torch.uint8, torch.bool],
+    ids=str,
+)  # fmt: skip
+def test_mta_max_matches_cpu(mojo_gpu: str, dtype: torch.dtype):
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    sizes = [7, 1, 65_537, 131_072, 3, 200_001]
+    lo, hi = (0, 2) if dtype == torch.bool else (-100, 100)
+    if dtype == torch.uint8:
+        lo = 0
+    cpu, dev = _mta_lists(mojo_gpu, dtype, lo, hi, seed=53, sizes=sizes)
+    if dtype.is_floating_point:
+        cpu[3][70_000] = float("nan")
+        dev[3][70_000] = float("nan")
+        cpu[4][:] = float("-inf")
+        dev[4][:] = float("-inf")
+    with _one_launch("_foreach_max"):
+        actual = torch._foreach_max(dev)
+    _assert_lists(actual, [t.max() for t in cpu])
+    with pytest.raises(RuntimeError, match="Expected reduction dim to be specified"):
+        torch._foreach_max([*dev, torch.empty(0, dtype=dtype, device=mojo_gpu)])
+
+
+def test_mta_max_of_negative_infinities_is_negative_infinity(mojo_gpu: str):
+    """-inf, as CPU torch and the per-tensor max. Stock CUDA (torch 2.11,
+    H100) returns -3.4028e38 for float32 (-1.7977e308 for float64): its
+    reduction is seeded with `std::numeric_limits<T>::lowest()`
+    (ForeachReduceOp.cu:77/:105/:127, the scratch fill at :192). Pinned on
+    purpose."""
+    for dtype in (torch.float32, torch.bfloat16):
+        x = torch.full((3,), float("-inf"), dtype=dtype)
+        (actual,) = torch._foreach_max([x.to(mojo_gpu)])
+        assert actual.cpu().item() == float("-inf")
+        assert torch._foreach_max([x])[0].item() == float("-inf")
+
+
+def _reduce_outcome(fn, tensors: list[torch.Tensor], ord_: float, dtype) -> str:
+    """A reduction's result (value, dtype) or its error (type, message
+    without the mojo device's `[aten::...]` suffix), as one comparable
+    string."""
+    kwargs = {} if dtype is None else {"dtype": dtype}
+    try:
+        (r,) = fn(tensors, ord_, **kwargs)
+    except (RuntimeError, NotImplementedError) as error:
+        message = str(error).split(" [aten::")[0].split("\n")[0]
+        return f"{type(error).__name__}: {message}"
+    return f"{r.cpu().item()!r} {r.dtype}"
+
+
+_REDUCE_ORDS = (2, 3, -2, 0, 1, 2.5, -1, float("inf"), float("-inf"), 0.5,
+                float("nan"), 1e100, -1e100, 1e-100, -1 / 3)  # fmt: skip
+_REDUCE_INPUTS = [torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8,
+                  torch.uint16, torch.uint32, torch.uint64, torch.bool,
+                  torch.float16, torch.bfloat16, torch.float32,
+                  torch.float64]  # fmt: skip
+_REDUCE_DTYPES = [None, torch.int64, torch.int32, torch.bool, torch.float16,
+                  torch.bfloat16, torch.float32, torch.float64, torch.complex64,
+                  torch.complex128]  # fmt: skip
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
+@pytest.mark.parametrize("fn_name", ["norm", "powsum"])
+@pytest.mark.parametrize("dtype", _REDUCE_DTYPES, ids=str)
+@pytest.mark.parametrize("input_dtype", _REDUCE_INPUTS, ids=str)
+def test_mta_norm_and_powsum_match_stock_cuda(
+    mojo_gpu: str, input_dtype: torch.dtype, dtype: torch.dtype | None, fn_name: str
+):
+    """Every (input dtype, `dtype=`, ord, size) against stock CUDA: its fast
+    route, and the per-tensor linalg_vector_norm / linalg__powsum of its slow
+    route -- their errors (an integer computation dtype has no powsum
+    kernel, an integer input no norm) and their arithmetic (the elements
+    cast to the result dtype, accumulated in its opmath, rounded once)."""
+    fn = getattr(torch, f"_foreach_{fn_name}")
+    for n in (5, 0, 1):
+        base = torch.arange(1, n + 1) if n != 1 else torch.tensor([-3])
+        for ord_ in _REDUCE_ORDS:
+            if dtype == torch.float64 and is_metal(mojo_gpu):
+                continue
+            outcomes = [
+                _reduce_outcome(fn, [base.to(input_dtype).to(device)], ord_, dtype)
+                for device in ("cuda", mojo_gpu)
+            ]
+            stock, ours = (o.replace("powsum_cuda", "powsum") for o in outcomes)
+            assert ours == stock, (n, ord_)
+
+
+def test_mta_powsum_rounds_once(mojo_gpu: str):
+    """An int32 list summed in float16: each 10000 ** -2 is a float16
+    subnormal, but the powers accumulate in float32 and the sum rounds once
+    -- 1.0013580322265625e-05 on stock CUDA."""
+    x = [torch.full((1000,), 10000, dtype=torch.int32, device=mojo_gpu)]
+    (r,) = torch._foreach_powsum(x, -2, dtype=torch.float16)
+    assert r.dtype == torch.float16
+    assert r.cpu().item() == 1.0013580322265625e-05
+    with pytest.raises(
+        NotImplementedError, match="\"powsum_cuda\" not implemented for 'Long'"
+    ):
+        torch._foreach_powsum(x, 2, dtype=torch.int64)
+
+
+# CUDA-free pins of the stock-CUDA behaviours above (torch 2.11, H100),
+# so a machine without stock CUDA still checks them.
+
+
+@pytest.mark.parametrize("ord_", [float("nan"), 1e100, 3.0, 0.5, 1e-100])
+@pytest.mark.parametrize("fn_name", ["norm", "powsum"])
+def test_mta_empty_reductions_are_zero(mojo_gpu: str, fn_name: str, ord_: float):
+    """No kernel runs on an empty tensor: the result is the identity, 0,
+    with no root -- for ord nan and 1e100 too (not nan, not 1)."""
+    fn = getattr(torch, f"_foreach_{fn_name}")
+    (r,) = fn([torch.empty(0, device=mojo_gpu)], ord_)
+    assert r.dtype == torch.float32 and r.cpu().item() == 0.0
+
+
+def test_mta_reductions_on_integer_lists_without_cuda(mojo_gpu: str):
+    """Ord 3 is off the fast route, whose own dtype check (ord 2) refuses an
+    integer `dtype` with a different message."""
+    x = [torch.arange(5, device=mojo_gpu)]
+    with pytest.raises(
+        RuntimeError,
+        match="Expected a floating point or complex tensor as input. Got Long",
+    ):
+        torch._foreach_norm(x, 2, dtype=torch.float32)
+    (zero,) = torch._foreach_powsum(
+        [torch.empty(0, dtype=torch.int32, device=mojo_gpu)], 2
+    )
+    assert zero.dtype == torch.int64 and zero.cpu().item() == 0
+    (zero,) = torch._foreach_powsum(
+        [torch.empty(0, device=mojo_gpu)], 3, dtype=torch.int32
+    )
+    assert zero.dtype == torch.int32 and zero.cpu().item() == 0
+    with pytest.raises(
+        NotImplementedError, match="\"powsum_cuda\" not implemented for 'Int'"
+    ):
+        torch._foreach_powsum([torch.ones(3, device=mojo_gpu)], 3, dtype=torch.int32)
+    (r,) = torch._foreach_powsum(x, 2, dtype=torch.float32)
+    assert r.cpu().item() == 30.0
+    for ord_, text in ((-1 / 3, "-0.333333"), (-1e100, "-1e+100"), (-2.5, "-2.5"),
+                       (-123456789.0, "-1.23457e+08"), (-0.0001234567, "-0.000123457"),
+                       (-2, "-2")):  # fmt: skip
+        with pytest.raises(
+            RuntimeError, match=f"cannot compute the {re.escape(text)} norm"
+        ):
+            torch._foreach_norm([torch.empty(0, device=mojo_gpu)], ord_)
+
+
+def test_mta_max_refusals(mojo_gpu: str):
+    for dtype, name in ((torch.uint16, "UInt16"), (torch.uint32, "UInt32")):
+        x = torch.ones(3, dtype=dtype, device=mojo_gpu)
+        with pytest.raises(
+            NotImplementedError,
+            match=f"\"foreach_tensor_max_cuda_scalar_type\" not implemented for '{name}'",
+        ):
+            torch._foreach_max([x])
+    with pytest.raises(RuntimeError, match="Expected reduction dim to be specified"):
+        torch._foreach_max(
+            [torch.ones(2, device=mojo_gpu), torch.empty(0, device=mojo_gpu)]
+        )
+
+
+def test_mta_reductions_on_mixed_device_lists(mojo_gpu: str):
+    """A list mixing the mojo device and the CPU takes the per-tensor route:
+    each result on its input's device, as on stock CUDA."""
+    a = torch.tensor([3.0, -4.0])
+    b = torch.tensor([1.5, 2.0])
+    lists = [a.to(mojo_gpu), b]
+    for fn, args, want in (
+        (torch._foreach_norm, (2,), [5.0, 2.5]),
+        (
+            torch._foreach_norm,
+            (3,),
+            [
+                torch.linalg.vector_norm(a, 3).item(),
+                torch.linalg.vector_norm(b, 3).item(),
+            ],
+        ),
+        (torch._foreach_norm, (float("inf"),), [4.0, 2.0]),
+        (torch._foreach_powsum, (2,), [25.0, 6.25]),
+        (lambda ts, *_: torch._foreach_max(ts), (), [3.0, 2.0]),
+    ):
+        got = fn(lists, *args)
+        assert [t.device.type for t in got] == [torch.device(mojo_gpu).type, "cpu"]
+        assert [t.cpu().item() for t in got] == pytest.approx(want, rel=1e-6)
+    got = torch._foreach_add(lists, [b.to(mojo_gpu), a], alpha=2)
+    assert [t.device.type for t in got] == [torch.device(mojo_gpu).type, "cpu"]
+    torch.testing.assert_close(got[1], a * 2 + b)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "real"),
+    [(torch.complex64, torch.float32), (torch.complex128, torch.float64),
+     (torch.complex32, torch.float16)],
+    ids=["c64", "c128", "c32"],
+)  # fmt: skip
+def test_mta_powsum_complex_dtype_is_its_real_dtype(
+    mojo_gpu: str, dtype: torch.dtype, real: torch.dtype
+):
+    """Off the fast route (ord 1 / 2 refuse a complex `dtype` for a real
+    list), powsum computes in the complex dtype's real value dtype, as on
+    stock CUDA: `_foreach_powsum([ones(2)], 3, dtype=complex64)` is float32
+    2.0; norm refuses it (linalg.vector_norm's check)."""
+    if real == torch.float64:
+        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    ones = [torch.ones(2, device=mojo_gpu)]
+    for ord_, want in ((3, 2.0), (0, 2.0), (-1, 2.0), (float("inf"), 2.0)):
+        (r,) = torch._foreach_powsum(ones, ord_, dtype=dtype)
+        assert r.dtype == real and r.cpu().item() == want
+    (r,) = torch._foreach_powsum([torch.arange(3, device=mojo_gpu)], 2, dtype=dtype)
+    assert r.dtype == real and r.cpu().item() == 5.0
+    (r,) = torch._foreach_powsum([torch.empty(0, device=mojo_gpu)], 3, dtype=dtype)
+    assert r.dtype == real and r.cpu().item() == 0.0
+    with pytest.raises(RuntimeError, match="dtype should be real for real inputs"):
+        torch._foreach_powsum(ones, 2, dtype=dtype)
+    with pytest.raises(
+        RuntimeError, match="linalg.vector_norm: dtype should be real for real inputs"
+    ):
+        torch._foreach_norm(ones, 3, dtype=dtype)
+
+
+def test_mta_norm_message_prints_integer_orders_exactly(mojo_gpu: str):
+    with pytest.raises(RuntimeError, match="the -9007199254740993 norm"):
+        torch._foreach_norm([torch.empty(0, device=mojo_gpu)], -9007199254740993)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs stock CUDA")
+@pytest.mark.parametrize("input_dtype", _REDUCE_INPUTS, ids=str)
+def test_mta_max_matches_stock_cuda(mojo_gpu: str, input_dtype: torch.dtype):
+    """_foreach_max of every input dtype the device holds, on and off the
+    fast route (dense / strided), against stock CUDA."""
+    if input_dtype == torch.float64 and is_metal(mojo_gpu):
+        pytest.skip("no float64 on Apple GPUs")
+
+    def outcome(tensors: list[torch.Tensor]) -> str:
+        try:
+            (r,) = torch._foreach_max(tensors)
+        except (RuntimeError, NotImplementedError) as error:
+            message = str(error).split(" [aten::")[0].split("\n")[0]
+            return f"{type(error).__name__}: {message}"
+        return f"{r.cpu().item()!r} {r.dtype}"
+
+    for n in (5, 0, 1):
+        base = torch.arange(1, 2 * n + 1).to(input_dtype)
+        for view in (lambda t: t[:n], lambda t: t[::2]):
+            stock, ours = (
+                outcome([view(base.to(device))]) for device in ("cuda", mojo_gpu)
+            )
+            assert ours == stock, n
+
+
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64], ids=str)
+def test_mta_wide_unsigned_norm_and_powsum(mojo_gpu: str, dtype: torch.dtype):
+    """Wide unsigned lists take the same slow route as the other integers:
+    cast to the result dtype, accumulated in its opmath, rounded once (the
+    values stock CUDA returns)."""
+    ones = [torch.ones(2, dtype=dtype, device=mojo_gpu)]
+    (r,) = torch._foreach_powsum(ones, 3, dtype=torch.complex64)
+    assert r.dtype == torch.float32 and r.cpu().item() == 2.0
+    x = [torch.full((1000,), 10000, dtype=dtype, device=mojo_gpu)]
+    (r,) = torch._foreach_powsum(x, -2, dtype=torch.float16)
+    assert r.cpu().item() == 1.0013580322265625e-05
+    with pytest.raises(NotImplementedError, match="not implemented for 'Long'"):
+        torch._foreach_powsum(ones, 2)
+    names = {torch.uint16: "UInt16", torch.uint32: "UInt32", torch.uint64: "UInt64"}
+    with pytest.raises(RuntimeError, match=f"Got {names[dtype]}"):
+        torch._foreach_norm(ones, 2, dtype=torch.float32)
