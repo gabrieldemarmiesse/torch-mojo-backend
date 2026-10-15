@@ -10,9 +10,12 @@ after a `torch.export.save` / `torch.export.load` round trip.
 """
 
 import io
+import re
+from collections.abc import Callable
 
 import pytest
 import torch
+from _pytest.mark.structures import ParameterSet
 from torch import nn
 from torch.export import Dim
 from torch.fx.node import Target
@@ -208,6 +211,105 @@ def test_run_decompositions(mojo_gpu, table):
     _close(ep.module()(x.to(mojo_gpu)), cpu(x))
 
 
+def _cases_per_op() -> list[ParameterSet]:
+    """(fn, inputs, runs) for every CompositeImplicitAutograd op the mojo
+    device has a kernel for (and isclose's equal_nan branch, mish_backward
+    with mixed dtypes), plus F.interpolate's nearest modes. `runs` is False
+    where the decomposed program needs an `aten::index.Tensor` with several
+    index tensors, which the device declines: those still compare graphs
+    and assert the decline, so supporting it flips them."""
+    g = torch.Generator().manual_seed(7)
+    x = torch.randn(4, 6, generator=g)
+    special = x.clone()
+    special[0, :3] = torch.tensor([float("nan"), float("inf"), -float("inf")])
+    close = special + torch.randn(4, 6, generator=g) * 1e-6
+    close[1, ::2] += 1
+    grad = torch.randn(4, 6, generator=g)
+    weight, bias = torch.randn(5, 6, generator=g), torch.randn(5, generator=g)
+    cases = [
+        pytest.param(nn.functional.linear, (x, weight, bias), True, id="linear"),
+        pytest.param(torch.isclose, (special, close), True, id="isclose"),
+        pytest.param(
+            lambda a, b: torch.isclose(a, b, equal_nan=True),
+            (special, close),
+            True,
+            id="isclose_equal_nan",
+        ),
+        pytest.param(torch.isfinite, (special,), True, id="isfinite"),
+        pytest.param(aten.silu_backward, (grad, x), True, id="silu_backward"),
+        pytest.param(aten.mish_backward, (grad, x), True, id="mish_backward"),
+        pytest.param(
+            aten.mish_backward, (grad, x.half()), True, id="mish_backward_f32_f16"
+        ),
+    ]
+    # The `.default` upsamplings are the CIA overloads with a mojo kernel;
+    # they have a CPU kernel too, so they stay whole. F.interpolate goes
+    # through the `.vec` overloads, which decompose to index ops.
+    for rank, size in ((1, [7]), (2, [7, 9]), (3, [7, 9, 4])):
+        t = torch.randn(2, 3, *(5, 4, 3)[:rank], generator=g)
+        for name, mode in (
+            (f"upsample_nearest{rank}d", "nearest"),
+            (f"_upsample_nearest_exact{rank}d", "nearest-exact"),
+        ):
+            op = getattr(aten, name).default
+            cases.append(
+                pytest.param(
+                    lambda a, op=op, size=size: op(a, size), (t,), True, id=name
+                )
+            )
+            cases.append(
+                pytest.param(
+                    lambda a, size=size, mode=mode: nn.functional.interpolate(
+                        a, size=size, mode=mode
+                    ),
+                    (t,),
+                    (rank, mode) == (2, "nearest"),
+                    id=f"interpolate_{mode}_{rank}d",
+                )
+            )
+    return cases
+
+
+class _Call(nn.Module):
+    def __init__(self, fn: Callable[..., torch.Tensor]):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, *args: torch.Tensor) -> torch.Tensor:
+        return self.fn(*args)
+
+
+def _decomposed(fn: Callable[..., torch.Tensor], args: tuple[torch.Tensor, ...]):
+    ep = torch.export.export(_Call(fn), args).run_decompositions()
+    nodes = [n for n in ep.graph.nodes if n.op == "call_function"]
+    return ep, [(n.target, n.meta["val"].dtype) for n in nodes]
+
+
+@pytest.mark.parametrize(("fn", "args", "runs"), _cases_per_op())
+def test_run_decompositions_per_op(mojo_gpu, fn, args, runs):
+    """A mojo program decomposes to the very graph a CPU program does: the
+    same ops with the same dtypes, in the same order. A CUDA program, when
+    there is one, does too: the mojo registration must not change it. Ops
+    with a CPU kernel (silu_backward, mish_backward, the upsamplings) stay
+    whole; isclose's decomposition has in-place ops that must come out
+    functional."""
+    cpu_ep, want = _decomposed(fn, args)
+    ep, got = _decomposed(fn, tuple(a.to(mojo_gpu) for a in args))
+    assert got == want
+    if torch.cuda.is_available():
+        assert _decomposed(fn, tuple(a.cuda() for a in args))[1] == want
+    want_out = cpu_ep.module()(*args)
+    if not runs:
+        with pytest.raises(NotImplementedError, match="index.Tensor"):
+            ep.module()(*(a.to(mojo_gpu) for a in args))
+        return
+    out = ep.module()(*(a.to(mojo_gpu) for a in args))
+    assert out.dtype == want_out.dtype
+    torch.testing.assert_close(
+        out.cpu(), want_out, atol=1e-3, rtol=1e-3, equal_nan=True
+    )
+
+
 @pytest.mark.parametrize("train", [False, True], ids=["eval", "train"])
 def test_export_conv_batchnorm(mojo_gpu, train):
     """Eval mode reads the running statistics; train mode normalizes with
@@ -347,8 +449,19 @@ def test_export_derived_dim(mojo_gpu):
     for n in (1, 7, 256):
         x, y = _input(n, 37, seed=n), _input(2 * n, 37, seed=n + 1)
         _close(module(x.to(mojo_gpu), y.to(mojo_gpu)), cpu(x, y))
-    with pytest.raises(Exception):  # y must have exactly 2 * len(x) rows
-        module(_input(3, 37).to(mojo_gpu), _input(7, 37).to(mojo_gpu))
+    # y must have exactly 2 * len(x) rows. One row still broadcasts against
+    # the 2 * len(x) rows of the other operand, so only the exported guard
+    # rejects it: the same error as the CPU program's.
+    cpu_module = torch.export.export(
+        cpu,
+        (_input(4, 37), _input(8, 37)),
+        dynamic_shapes={"x": {0: d}, "y": {0: 2 * d}},
+    ).module()
+    x, y = _input(3, 37), _input(1, 37)
+    with pytest.raises(AssertionError, match="Guard failed") as on_cpu:
+        cpu_module(x, y)
+    with pytest.raises(AssertionError, match=re.escape(str(on_cpu.value))):
+        module(x.to(mojo_gpu), y.to(mojo_gpu))
 
 
 @pytest.mark.parametrize("strict", [False, True], ids=["nonstrict", "strict"])

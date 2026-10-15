@@ -15,10 +15,11 @@ PrivateUse1 backend module, ``torch.__future__`` toggles) are not
 monkeypatches and stay in ``mojo_device/register.py``.
 """
 
+import contextlib
 import functools
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from functools import wraps
 from typing import TYPE_CHECKING
 
@@ -196,51 +197,76 @@ def fix_batch_isend_irecv_for_python_process_groups():
 _Decomposition = Callable[..., object]
 
 
-def decompose_composite_ops_with_mojo_kernels_in_export():
-    """`ExportedProgram.run_decompositions` ignores the requested
-    decomposition of a CompositeImplicitAutograd op the PrivateUse1 backend
-    has its own kernel for.
-
-    ``torch/export/exported_program.py`` splits the table: every
-    CompositeImplicitAutograd (CIA) op goes to
-    ``_override_composite_implicit_decomp``, which installs its decomposition
-    as the op's CIA Python kernel, and is dropped from the table the proxy
-    tracer consults. The autograd key only falls through to a CIA kernel
-    when the device has no kernel of its own (the dispatcher's rule, mirrored
-    by ``autograd_would_have_decomposed``), so an op the mojo device
-    registers directly -- ``aten::linear``, ``isclose``, ``isfinite``,
-    ``silu_backward``, ``mish_backward`` -- reaches the tracer whole and is
-    recorded as is: ``run_decompositions()`` left ``aten.linear`` in a "core
-    ATen" program, and a custom table entry for it was silently ignored.
-    No in-tree backend registers a kernel on a CIA op, so upstream never
-    meets this. Keep those ops in the tracer's table as well, where the
-    requested decomposition then runs; an op the table preserves (one the
-    caller deleted from it) is left alone.
-    """
-    original = getattr(
-        exported_program, "_split_decomp_table_to_cia_and_python_decomp", None
+def _stock_backends_decompose(op: torch._ops.OpOverload) -> bool:
+    """`op` is CompositeImplicitAutograd with a mojo kernel, and neither CPU
+    nor CUDA has a kernel of its own, so a CPU or CUDA program decomposes it
+    where a mojo program keeps it whole."""
+    has_kernel = torch._C._dispatch_has_kernel_for_dispatch_key
+    return (
+        has_kernel(op.name(), torch._C.DispatchKey.PrivateUse1)
+        and not has_kernel(op.name(), torch._C.DispatchKey.CPU)
+        and not has_kernel(op.name(), torch._C.DispatchKey.CUDA)
     )
+
+
+def decompose_composite_ops_with_mojo_kernels_in_export():
+    """`ExportedProgram.run_decompositions` keeps whole, in a mojo program, the
+    CompositeImplicitAutograd (CIA) ops the mojo device has a kernel for,
+    where a CPU or CUDA program decomposes them.
+
+    A CIA op decomposes at the autograd key: the dispatcher hands
+    ``Autograd<Backend>`` the CIA kernel only when ``<Backend>`` has no
+    kernel of its own. ``run_decompositions``
+    (``torch/export/exported_program.py``) installs the requested
+    decomposition as the op's CIA Python kernel for the duration of the
+    retrace (``_override_composite_implicit_decomp``), and nothing below
+    the autograd key decomposes a functional CIA op the device has a kernel
+    for (``autograd_would_have_decomposed``). So a mojo program kept every
+    such op: ``run_decompositions()`` left ``aten.linear``, ``isclose`` and
+    ``isfinite`` in a "core ATen" program, and a custom table entry for them
+    was ignored. No in-tree backend registers a kernel on a CIA op it
+    expects decomposed, so upstream never meets this.
+
+    For the duration of the same retrace, give ``AutogradPrivateUse1`` the
+    requested decomposition, but only for an op CPU and CUDA both decompose
+    (no CPU or CUDA kernel). It then runs where it runs on CPU, above
+    functionalization, which turns a decomposition's in-place ops
+    (isclose's ``|=``) into functional ones. An op with a CPU or CUDA kernel
+    (``silu_backward``, ``mish_backward``, the ``.default`` nearest
+    upsamplings) stays whole, as it does on those devices; so does one the
+    table preserves. Programs on any other device never reach that key, so
+    their graphs are unchanged.
+    """
+    original = getattr(exported_program, "_override_composite_implicit_decomp", None)
     preserve = getattr(exported_program, "_special_op_to_preserve_cia", None)
     if original is None or getattr(original, "_torch_mojo_backend", False):
         return
+    autograd_key = torch._C.DispatchKey.AutogradPrivateUse1
 
-    @wraps(original)
-    def split(
-        decomp_table: dict[torch._ops.OperatorBase, _Decomposition],
-    ) -> tuple[dict[torch._ops.OperatorBase, _Decomposition], ...]:
-        cia_to_decomp, python_decomp_table = original(decomp_table)
-        for op, decomp in cia_to_decomp.items():
+    @contextlib.contextmanager
+    def override(
+        cia_ops_to_callable: dict[torch._ops.OpOverload, _Decomposition],
+    ) -> Iterator[None]:
+        added = []
+        for op, decomp in cia_ops_to_callable.items():
             if (
                 decomp is not preserve
-                and torch._C._dispatch_has_kernel_for_dispatch_key(
-                    op.name(), torch._C.DispatchKey.PrivateUse1
-                )
+                and autograd_key not in op.py_kernels
+                and _stock_backends_decompose(op)
             ):
-                python_decomp_table[op] = decomp
-        return cia_to_decomp, python_decomp_table
+                op.py_impl(autograd_key)(decomp)
+                added.append(op)
+        try:
+            with original(cia_ops_to_callable):
+                yield
+        finally:
+            for op in added:
+                op.py_kernels.pop(autograd_key, None)
+                op._dispatch_cache.clear()
 
-    split._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
-    exported_program._split_decomp_table_to_cia_and_python_decomp = split  # ty: ignore[invalid-assignment]
+    functools.update_wrapper(override, original)
+    override._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    exported_program._override_composite_implicit_decomp = override
 
 
 def add_mojo_to_the_inductor_gpu_types():
