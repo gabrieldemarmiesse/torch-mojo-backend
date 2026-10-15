@@ -74,6 +74,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    out_device_error,
     is_cast_pair_on,
     decline_float8,
     ST_UNDEFINED,
@@ -1390,11 +1391,9 @@ def _b_out_tensor(v: Value, device: Int) raises -> T:
     elements at one address (`at::assert_no_internal_overlap`, which every
     TensorIterator op with `check_mem_overlap` runs)."""
     var out = v_tensor(v)
-    if not out.on_mojo():
-        raise Error("expected `out` to be a mojo tensor")
-    if out.device != device:
-        raise Error("expected `out` and the inputs on the same mojo device")
-    assert_no_internal_overlap(out)
+    assert_no_internal_overlap(out)  # compute_mem_overlaps, then the device
+    if not out.on_mojo() or out.device != device:
+        out_device_error(device, out)
     return out^
 
 

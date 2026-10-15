@@ -45,6 +45,7 @@ from tmb.ops.complex import (
     cx_unary_out,
 )
 from tmb.ops.common import (
+    assert_no_internal_overlap,
     can_cast,
     is_float_stype,
     scalar_type_name,
@@ -719,6 +720,9 @@ def cx_to_real_out[
     rz.none()
     _ = rz.run(1)
     var dest2 = v_tensor_c(args[unsafe_offset=1])
+    # copy_'s own first check, raised here without the nested call's
+    # "aten::copy_:" prefix
+    assert_no_internal_overlap(dest2)
     var cp = _Call("aten::copy_")
     cp.t(dest2)
     cp.t(res.t)
