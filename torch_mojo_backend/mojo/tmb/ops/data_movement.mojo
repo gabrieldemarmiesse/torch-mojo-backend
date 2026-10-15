@@ -3251,8 +3251,8 @@ def op_index_put_impl_(
         if not accumulate and _dispatches_to_masked_fill(
             target, present, indices, values
         ):
-            unsupported("\"masked_fill_\" not implemented for '" + name + "'")
-        unsupported("\"index_put\" not implemented for '" + name + "'")
+            unsupported('"masked_fill_" not implemented for \'' + name + "'")
+        unsupported('"index_put" not implemented for \'' + name + "'")
     if (
         len(indices) == 1
         and len(present) >= 1
