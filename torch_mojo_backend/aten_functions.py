@@ -3809,10 +3809,10 @@ def aten_index_put(
     """``out = input.clone(); out[indices] = values`` (``+=`` when
     ``accumulate``) — the write mirror of ``aten_index``.
 
-    Only a single index tensor on axis 0 is served, of any rank (an N-D
-    index writes `index.shape + input.shape[1:]`, flattened here to a 1-D
-    index -- the embedding backward's `[batch, seq]` token ids); anything
-    else (a boolean mask, several index tensors, an
+    Only a single index tensor on axis 0 is served, of any rank: an N-D
+    index writes ``index.shape + input.shape[1:]``, flattened here to the
+    1-D index ``scatter_nd`` takes (the embedding backward's ``[batch, seq]``
+    token ids). Anything else (a boolean mask, several index tensors, an
     index on a later axis) raises rather than silently computing the wrong
     thing. The MAX primitives are the ``_nd`` scatters and not the axis-based
     ``F.scatter``/``F.scatter_add``, because those have no GPU kernel and
@@ -3832,8 +3832,10 @@ def aten_index_put(
         )
     if len(index.shape) != 1:
         values = _broadcast_to(values, [*index.shape, *input.shape[1:]])
-        values = F.reshape(values, [-1, *input.shape[1:]])
+        # the index first: its length is then known, where reshape cannot
+        # infer -1 against a zero-size trailing dim
         index = F.reshape(index, [-1])
+        values = F.reshape(values, [index.shape[0], *input.shape[1:]])
     # scatter_nd's updates carry the trailing (unindexed) axes of `input`:
     # indices [rows, 1] pairs with updates [rows, *input.shape[1:]].
     updates = _broadcast_to(values, [index.shape[0], *input.shape[1:]])

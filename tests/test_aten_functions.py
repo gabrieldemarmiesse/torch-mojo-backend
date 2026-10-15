@@ -3564,8 +3564,12 @@ def test_aten_index_put(
 
 @pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 @pytest.mark.parametrize("accumulate", [False, True])
+@pytest.mark.parametrize("values_shape", [(2, 3, 3), (3,)])
 def test_aten_index_put_2d_index(
-    conf: Conf, accumulate: bool, call_checker: CallChecker
+    conf: Conf,
+    accumulate: bool,
+    values_shape: tuple[int, ...],
+    call_checker: CallChecker,
 ):
     """A 2-D index writes `index.shape + x.shape[1:]` (the embedding
     backward's `[batch, seq]` token ids, accumulated into the table)."""
@@ -3579,8 +3583,18 @@ def test_aten_index_put_2d_index(
         [[3, 0, 3], [1, 6, 0]] if accumulate else [[3, 0, 5], [1, 6, 2]],
         dtype=torch.int64,
     )
-    values = torch.randn(2, 3, 3)
+    values = torch.randn(values_shape)
     check_outputs(fn, conf, [x, index, values])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+def test_aten_index_put_0d_index(conf: Conf, call_checker: CallChecker):
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, False)
+
+    check_outputs(fn, conf, [torch.randn(7, 3), torch.tensor(4), torch.randn(3)])
 
 
 @pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
