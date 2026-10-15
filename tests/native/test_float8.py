@@ -3510,3 +3510,163 @@ def test_threshold_scalar_overflow_matches_stock_cuda(mojo_device):
 )
 def test_threshold_scalar_data_regenerates_on_stock_cuda():
     assert list(_threshold_scalar_lines("cuda")) == _F8_ITER["threshold_scalars"]
+
+
+# ---------------------------------------------------------------------------
+# float8 meets complex (review of the complex-tensor merge)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cdt", [torch.complex64, torch.complex128])
+@pytest.mark.parametrize("dst", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_complex_to_float8_never_saturates(mojo_device, cdt, dst):
+    """A complex source takes Copy.cu's default float8 branch (c10's
+    conversion of the real part), not the float / half / bfloat16 SATFINITE
+    one: [1000+2j, 3+1j, inf] -> e4m3fn is [nan, 3, nan] on stock CUDA
+    (measured 2.11, H100; v2.14.0's float8_copy_kernel_cuda keys the
+    intrinsic on kFloat / kHalf / kBFloat16 sources only)."""
+    if cdt == torch.complex128:
+        _skip_f64(mojo_device, cdt)
+    host = torch.tensor([1000 + 2j, 3 + 1j, complex(float("inf"), 0.0)], dtype=cdt)
+    want = host.real.to(dst)
+    d = host.to(mojo_device)
+    _assert_same(d.to(dst), want)
+    out = torch.empty(3, dtype=dst, device=mojo_device)
+    _assert_same(out.copy_(d), want)
+
+
+@pytest.mark.parametrize("op", ["logical_and", "logical_or", "logical_xor"])
+def test_float8_logical_with_complex_0d(mojo_device, op):
+    """float8[3] against a complex 0-d tensor: combine_categories needs
+    toComplexType(Float8_e4m3fn), a RuntimeError raised before `out` is
+    resized (stock CUDA 2.11: out keeps its shape)."""
+    x = torch.tensor([1.0, 0.0, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    z = torch.tensor(1 + 1j, device=mojo_device)
+    msg = "Unknown Complex ScalarType for Float8_e4m3fn"
+    with pytest.raises(RuntimeError, match=msg):
+        getattr(torch, op)(x, z)
+    out = torch.empty(0, dtype=torch.bool, device=mojo_device)
+    with pytest.raises(RuntimeError, match=msg):
+        getattr(torch, op)(x, z, out=out)
+    assert out.shape == (0,)
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("n", [4, 0])
+@pytest.mark.parametrize("value", [1 + 1j, 1000 + 0j, 2 + 0j])
+def test_float8_masked_fill_complex_value_declined(mojo_device, dtype, n, value):
+    """masked_fill_'s dtype dispatch refuses float8 before the (complex)
+    value converts, empty or not (stock CUDA 2.11: NotImplementedError,
+    never the value's overflow RuntimeError); index_put_ with a complex
+    value names both dtypes."""
+    x = torch.zeros(n).to(dtype).to(mojo_device)
+    m = torch.ones(n, dtype=torch.bool, device=mojo_device)
+    with pytest.raises(NotImplementedError, match='"masked_fill_" not implemented'):
+        x.masked_fill_(m, value)
+    with pytest.raises(NotImplementedError, match='"masked_fill_" not implemented'):
+        x.masked_fill(m, torch.tensor(value, device=mojo_device))
+    name = "Float8_" + str(dtype).removeprefix("torch.float8_")
+    with pytest.raises(
+        RuntimeError,
+        match=f"got {name} for the destination and ComplexFloat for the source",
+    ):
+        x.index_put_((m,), torch.tensor(value, device=mojo_device))
+
+
+@pytest.mark.parametrize("op", ["maximum", "minimum", "fmax", "fmin", "heaviside"])
+@pytest.mark.parametrize("cshape", [(), (3,)], ids=["0d", "1d"])
+def test_float8_vs_complex_meta_checks_first(mojo_device, op, cshape):
+    """These ops refuse a complex operand in their meta function, before
+    the iterator promotes (stock CUDA 2.11), out untouched."""
+    x = torch.tensor([1.0, 0.0, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    z = torch.full(cshape, 1 + 1j, device=mojo_device)
+    word = "is not yet implemented" if op == "heaviside" else "not implemented"
+    msg = f"{op} {word} for complex tensors"
+    for a, b in ((x, z), (z, x)):
+        with pytest.raises(RuntimeError, match=msg):
+            getattr(torch, op)(a, b)
+        out = torch.empty(0, device=mojo_device)
+        with pytest.raises(RuntimeError, match=msg):
+            getattr(torch, op)(a, b, out=out)
+        assert out.shape == (0,)
+
+
+def test_float8_with_wrapped_complex_scalar(mojo_device):
+    """A Python complex is a wrapped number of the default complex dtype in
+    the result type: against float8 it needs toComplexType(float8), a
+    RuntimeError on stock CUDA 2.11; a Python float still leaves float8 the
+    computation dtype (the kernel's NotImplementedError)."""
+    x = torch.tensor([1.0, 0.0, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    msg = "Unknown Complex ScalarType for Float8_e4m3fn"
+    z = torch.tensor(1j, device=mojo_device)
+    for fn in (
+        lambda: x + 1j,
+        lambda: x * 2j,
+        lambda: 2j * x,
+        lambda: x.clone().add_(1j),
+        lambda: x.clone().mul_(z),
+    ):
+        with pytest.raises(RuntimeError, match=msg):
+            fn()
+    with pytest.raises(NotImplementedError, match='"ufunc_add_CUDA" not implemented'):
+        x + 2.5  # noqa: B018
+    i = torch.ones(3, dtype=torch.int32, device=mojo_device)
+    out = torch.empty(0, dtype=torch.float8_e4m3fn, device=mojo_device)
+    assert torch.add(i, 2.5, out=out).float().cpu().tolist() == [3.5, 3.5, 3.5]
+    out = torch.empty(0, dtype=torch.float8_e4m3fn, device=mojo_device)
+    with pytest.raises(RuntimeError, match="ComplexFloat can't be cast"):
+        torch.add(i, 1j, out=out)
+    assert out.shape == (0,)
+
+
+@pytest.mark.parametrize("op,kernel", [("mul", "mul_cuda"), ("add", "ufunc_add_CUDA")])
+def test_float8_into_complex_out(mojo_device, op, kernel):
+    """float8 operands with a complex out: canCast(float8, complex) holds,
+    the out is resized, then the float8 kernel dispatch refuses."""
+    x = torch.tensor([1.0, 0.0, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    out = torch.empty(0, dtype=torch.complex64, device=mojo_device)
+    with pytest.raises(NotImplementedError, match=f'"{kernel}" not implemented'):
+        getattr(torch, op)(x, x, out=out)
+    assert out.shape == (3,)
+
+
+@pytest.mark.parametrize("src", ["float32", "int64", "complex64", "float8_e4m3fn"])
+def test_logical_not_float8_out_declined(mojo_device, src):
+    """logical_not_cuda dispatches on out's dtype first: a float8 out is
+    refused after the resize, whatever the input (stock CUDA 2.11)."""
+    x = torch.tensor([1.0, 0.0, 2.0]).to(getattr(torch, src)).to(mojo_device)
+    out = torch.empty(0, dtype=torch.float8_e4m3fn, device=mojo_device)
+    with pytest.raises(NotImplementedError, match='"logical_not_cuda" not implemented'):
+        torch.logical_not(x, out=out)
+    assert out.shape == (3,)
+    if src != "float8_e4m3fn":
+        b = torch.logical_not(
+            x, out=torch.empty(0, dtype=torch.bool, device=mojo_device)
+        )
+        assert b.cpu().tolist() == [False, True, False]
+
+
+def test_complex_with_float8_computes_or_declines(mojo_device):
+    """complex64[3] + float8 0-d and abs(complex, out=float8) compute on
+    stock CUDA (complex64; the real result copied into out). Where the mojo
+    device has no complex kernel for the op yet they decline with
+    NotImplementedError, never a promotion RuntimeError."""
+    c = torch.tensor([1 + 1j, 3 + 4j, 0j], device=mojo_device)
+    z8 = torch.tensor(2.0).to(torch.float8_e4m3fn).to(mojo_device)
+    cases = [
+        (lambda: c + z8, [3 + 1j, 5 + 4j, 2 + 0j]),
+        (lambda: z8 * c, [2 + 2j, 6 + 8j, 0j]),
+        (
+            lambda: torch.abs(
+                c, out=torch.empty(0, dtype=torch.float8_e4m3fn, device=mojo_device)
+            ),
+            [1.375, 5.0, 0.0],
+        ),
+    ]
+    for fn, want in cases:
+        try:
+            got = fn()
+        except NotImplementedError:
+            continue
+        vals = got.cpu().tolist() if got.is_complex() else got.float().cpu().tolist()
+        assert vals == want

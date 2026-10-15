@@ -432,6 +432,9 @@ def cast_for_copy(src: T, stype: Int32, saturate: Bool = True) raises -> T:
     rule; an out= / in-place store of a TensorIterator op converts in its
     kernel (c10's static_cast) and passes False."""
     if src.is_complex() or is_complex_stype(stype):
+        # `saturate` cannot apply: a complex source never saturates (stock
+        # CUDA's SATFINITE path is keyed on a float / half / bfloat16 source)
+        # and no complex dtype is float8.
         return cast_complex(src, stype)
     if is_cast_pair_on(src.dtype, max_dtype(stype), src):
         return cast_to(src, stype, saturate)

@@ -8,6 +8,7 @@ from std.ffi import external_call
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    complex_of,
     is_float8_stype,
     ST_FLOAT8_E4M3FN,
     ST_FLOAT8_E5M2,
@@ -1068,7 +1069,8 @@ def _pw_float_rank(st: Int32) -> Int:
 
 
 def promote_types(a: Int32, b: Int32) raises -> Int32:
-    """c10::promoteTypes over the dtypes the mojo device computes on."""
+    """c10::promoteTypes over the dtypes the mojo device computes on,
+    complex included."""
     if a == ST_UNDEFINED:
         return b
     if b == ST_UNDEFINED or a == b:
@@ -1083,6 +1085,10 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
             " and ",
             scalar_type_name(b),
         )
+    if is_complex_stype(a) or is_complex_stype(b):
+        # the complex type of the promoted value types (complex64 + float64
+        # is complex128)
+        return complex_of(promote_types(real_of(a), real_of(b)))
     if not known_stype(a) or not known_stype(b):
         unsupported(
             "type promotion of dtypes " + String(a) + " and " + String(b)
@@ -1111,8 +1117,20 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
 
 
 def combine_categories(higher: Int32, lower: Int32) raises -> Int32:
-    """c10's combine_categories (the ResultTypeState fold); float8 is a
-    floating category there."""
+    """c10's combine_categories (TypeProperties.cpp, the ResultTypeState
+    fold), complex included; float8 is a floating category there. A float8
+    `higher` meeting a complex `lower` needs toComplexType(float8), which
+    c10 does not have: its "Unknown Complex ScalarType" RuntimeError."""
+    if is_complex_stype(higher):
+        return higher
+    if is_complex_stype(lower):
+        if is_float8_stype(higher):
+            raise Error(
+                "Unknown Complex ScalarType for ", scalar_type_name(higher)
+            )
+        if is_float_stype(higher):
+            return complex_of(higher)
+        return lower
     if is_float_stype(higher) or is_float8_stype(higher):
         return higher
     if higher == ST_BOOL or is_float_stype(lower) or is_float8_stype(lower):
@@ -1122,19 +1140,40 @@ def combine_categories(higher: Int32, lower: Int32) raises -> Int32:
     return lower
 
 
+def dtype_category(st: Int32) -> Int:
+    """bool < integral < floating < complex: c10's canCast order (float8 is
+    floating)."""
+    if st == ST_BOOL:
+        return 0
+    if is_complex_stype(st):
+        return 3
+    if is_float_stype(st) or is_float8_stype(st):
+        return 2
+    return 1
+
+
 def can_cast(src: Int32, dst: Int32) -> Bool:
-    """`c10::canCast` over real dtypes: a cast that does not lower the
-    category (bool < integral < floating). What TensorIterator's
+    """`c10::canCast`: a cast that does not lower the category (bool <
+    integral < floating < complex). What TensorIterator's
     `enforce_safe_casting_to_output` asks of an `out=` / in-place output."""
-    # float8 is floating for canCast (isFloatingType), though no op here
-    # computes in it.
-    var s = 2 if is_float_stype(src) or is_float8_stype(src) else (
-        0 if src == ST_BOOL else 1
-    )
-    var d = 2 if is_float_stype(dst) or is_float8_stype(dst) else (
-        0 if dst == ST_BOOL else 1
-    )
-    return s <= d
+    return dtype_category(src) <= dtype_category(dst)
+
+
+def has_masked_fill_kernel(st: Int32) -> Bool:
+    """Whether CUDA's masked_fill_ kernel is instantiated for `st`
+    (Indexing.cu's AT_DISPATCH: neither uint16 / uint32 / uint64 nor float8,
+    which where.self has). Its dtype dispatch refuses before the value is
+    converted, so a caller checks this before the value."""
+    return not is_wide_unsigned(st) and not is_float8_stype(st)
+
+
+def refuse_masked_fill_dtype(st: Int32) raises:
+    """masked_fill_'s dtype dispatch error (NotImplementedError) for a
+    dtype `has_masked_fill_kernel` rejects."""
+    if not has_masked_fill_kernel(st):
+        unsupported(
+            '"masked_fill_" not implemented for \'' + scalar_type_name(st) + "'"
+        )
 
 
 def result_type(a: T, b: T) raises -> Int32:
@@ -1845,7 +1884,11 @@ def cast_complex(t: T, stype: Int32) raises -> T:
     _ = src^
     if stype == re.t.stype:
         return re.take()
-    var out = own(cast_to(re.t, stype))
+    # Never saturating: stock CUDA's SATFINITE e4m3fn conversion is keyed on
+    # a float / half / bfloat16 SOURCE (Copy.cu's float8_copy_kernel_cuda);
+    # a complex source takes its default branch, c10's conversion of the
+    # real part (1000+2j -> NaN).
+    var out = own(cast_to(re.t, stype, saturate=False))
     _ = re^
     return out.take()
 

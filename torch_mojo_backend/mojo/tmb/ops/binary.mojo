@@ -107,6 +107,7 @@ from tmb.ops.f8_iter import (
     PRE_HEAVISIDE,
     PRE_LDEXP,
     PRE_NAN_TO_NUM,
+    PRE_NO_COMPLEX,
     PRE_NONE,
     PRE_SUB,
 )
@@ -3570,7 +3571,14 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_maximum, "max_elementwise_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            op_maximum,
+            "max_elementwise_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NO_COMPLEX,
+            "maximum",
         ],
         "maximum",
     ](site)
@@ -3582,13 +3590,21 @@ def register_binary(site: Site) raises:
             2,
             MODE_OUTDT,
             False,
-            PRE_NONE,
+            PRE_NO_COMPLEX,
+            "maximum",
         ],
         "maximum.out",
     ](site)
     impl[
         f8_iter[
-            op_minimum, "min_elementwise_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            op_minimum,
+            "min_elementwise_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NO_COMPLEX,
+            "minimum",
         ],
         "minimum",
     ](site)
@@ -3600,7 +3616,8 @@ def register_binary(site: Site) raises:
             2,
             MODE_OUTDT,
             False,
-            PRE_NONE,
+            PRE_NO_COMPLEX,
+            "minimum",
         ],
         "minimum.out",
     ](site)

@@ -71,9 +71,8 @@ from tmb.ops.common import (
     assert_no_partial_overlap,
     check_expands_to,
     check_real_scalar_fits,
-    is_wide_unsigned,
     real_fill_value,
-    scalar_type_name,
+    refuse_masked_fill_dtype,
     assert_no_internal_overlap,
     binary_promotion,
     broadcast_shape,
@@ -1071,15 +1070,8 @@ def _masked_fill_validate(a: T, mask: T, in_place: Bool = False) raises:
         # would change under the write
         assert_no_partial_overlap(a, mask)
         check_expands_to(mask, a)  # expand_inplace(self, mask)
-    if is_wide_unsigned(a.stype) or is_float8(a.dtype):
-        # CUDA's (and the CPU's) kernel is not instantiated for them (nor
-        # for float8, which where.self has): the dtype dispatch refuses
-        # before the value converts
-        unsupported(
-            '"masked_fill_" not implemented for \''
-            + scalar_type_name(a.stype)
-            + "'"
-        )
+    # the dtype dispatch refuses before the value converts
+    refuse_masked_fill_dtype(a.stype)
 
 
 def _is_int_fill(st: Int32) -> Bool:
