@@ -163,8 +163,10 @@ def run_functional(failures: list[str]):
         return funcol.wait_tensor(funcol.all_reduce(x, "sum", group)) + 1
 
     def view_before_wait(x: torch.Tensor) -> torch.Tensor:
-        # the view reaches the collective's result before its wait does
-        return funcol.all_reduce(x, "sum", group).view(2, -1) * 2
+        # the raw ops trace as written (funcol would wait first): the view
+        # reaches the collective's result before its wait does
+        started = torch.ops._c10d_functional.all_reduce(x, "sum", group.group_name)
+        return torch.ops._c10d_functional.wait_tensor(started.view(2, -1)) * 2
 
     def empty(x: torch.Tensor) -> torch.Tensor:
         return funcol.all_reduce(x, "sum", group) + 1
