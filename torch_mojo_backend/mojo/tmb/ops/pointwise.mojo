@@ -84,6 +84,7 @@ from tmb.ops.f8_iter import (
     PRE_HEAVISIDE,
     PRE_LDEXP,
     PRE_NAN_TO_NUM,
+    PRE_NO_COMPLEX,
     PRE_NONE,
     PRE_SELF_FIRST,
     PRE_SOFTSHRINK,
@@ -4408,19 +4409,55 @@ def register_pointwise(site: Site) raises:
         "elu_backward.grad_input",
     ](site)
     impl[
-        f8_iter[op_fmax, "fmax_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_fmax,
+            "fmax_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NO_COMPLEX,
+            "fmax",
+        ],
         "fmax",
     ](site)
     impl[
-        f8_iter[op_fmax_out, "fmax_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            op_fmax_out,
+            "fmax_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NO_COMPLEX,
+            "fmax",
+        ],
         "fmax.out",
     ](site)
     impl[
-        f8_iter[op_fmin, "fmin_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_fmin,
+            "fmin_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NO_COMPLEX,
+            "fmin",
+        ],
         "fmin",
     ](site)
     impl[
-        f8_iter[op_fmin_out, "fmin_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            op_fmin_out,
+            "fmin_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NO_COMPLEX,
+            "fmin",
+        ],
         "fmin.out",
     ](site)
     impl[op_fmod, "fmod.Scalar"](site)

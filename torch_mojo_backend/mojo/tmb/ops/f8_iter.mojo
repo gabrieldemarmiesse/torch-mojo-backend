@@ -25,6 +25,9 @@ for every registered op; tests/native/test_float8.py pins them.
 from std.ffi import external_call
 
 from tmb.backend.abi import (
+    default_complex_dtype,
+    default_dtype,
+    is_complex_stype,
     TAG_BOOL,
     TAG_SCALAR_BOOL,
     OpFn,
@@ -52,6 +55,7 @@ from tmb.ops.common import (
     assert_no_internal_overlap,
     assert_no_partial_overlap,
     can_cast,
+    cast_complex,
     cast_to,
     combine_categories,
     device_str,
@@ -85,6 +89,9 @@ comptime PRE_SELF_FIRST = 10  # the iterator adds self (arg 1) before arg 0
 comptime PRE_SOFTSHRINK = 11  # softshrink_check dispatches on self first
 comptime PRE_RELU = 12  # relu's own check: no bool self
 comptime PRE_THRESHOLD = 13  # self is added twice (self and other)
+comptime PRE_NO_COMPLEX = 14  # "<label> not implemented for complex tensors."
+comptime PRE_DISPATCH_OUT = 15  # the kernel dispatches on out's dtype first
+comptime PRE_COMPLEX_TO_FLOAT = 16  # complex self, real out: no iterator on out
 
 comptime _MAX_ARGS = 16
 
@@ -151,11 +158,15 @@ def _shape_of(args: Values, ins: Int) raises -> _Iter:
 
 
 def _common_of(args: Values, ins: Int, rev: Bool = False) raises -> Int32:
-    """(a): c10's ResultTypeState over the tensor operands. A wrapped Python
-    number cannot change a float8 result, so only tensors take part. Raises
-    c10's float8 promotion error."""
+    """(a): c10's ResultTypeState over the tensor operands: dimensioned,
+    0-dim and wrapped-number results folded with combine_categories. A
+    wrapped number counts as the default dtype of its category (a Python
+    float as the default float, a complex as the default complex), so a
+    float8 tensor against a complex one raises toComplexType's error.
+    Raises c10's float8 promotion error."""
     var dim = ST_UNDEFINED
     var zero = ST_UNDEFINED
+    var wrapped = ST_UNDEFINED
     for j in range(_MAX_ARGS):
         var i = _MAX_ARGS - 1 - j if rev else j
         if (ins >> i) & 1 == 0:
@@ -165,11 +176,18 @@ def _common_of(args: Values, ins: Int, rev: Bool = False) raises -> Int32:
             continue
         var t = T(Int(v.a))
         if t.rank == 0:
-            if not t.is_wrapped_number():
+            if t.is_wrapped_number():
+                var st = t.stype
+                if is_complex_stype(st):
+                    st = default_complex_dtype()
+                elif is_float_stype(st):
+                    st = default_dtype()
+                wrapped = promote_types(wrapped, st)
+            else:
                 zero = promote_types(zero, t.stype)
         else:
             dim = promote_types(dim, t.stype)
-    return combine_categories(dim, zero)
+    return combine_categories(dim, combine_categories(zero, wrapped))
 
 
 def _shape_is(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
@@ -323,6 +341,17 @@ struct _Pre(Movable):
     var cpu_scalars: Bool  # the iterator allows one CPU 0-d operand
 
 
+def _any_complex(args: Values, ins: Int) raises -> Bool:
+    """Whether a tensor operand among `ins` is complex."""
+    for i in range(_MAX_ARGS):
+        if (ins >> i) & 1 == 0:
+            continue
+        var v = args[unsafe_offset=i].copy()
+        if _rec_tensor(v) and T(Int(v.a)).is_complex():
+            return True
+    return False
+
+
 def _pre[
     pre: Int, ins: Int, out_idx: Int, label: StaticString
 ](args: Values) raises -> _Pre:
@@ -342,9 +371,18 @@ def _pre[
                     " supported. If you are trying to invert a mask, use the"
                     " `~` or `logical_not()` operator instead."
                 )
+    elif pre == PRE_NO_COMPLEX:
+        # maximum / minimum / fmax / fmin's meta, before their iterator
+        if _any_complex(args, ins):
+            raise Error(String(label), " not implemented for complex tensors.")
     elif pre == PRE_HEAVISIDE:
         var a = T(Int(args[unsafe_offset=0].a))
         var b = T(Int(args[unsafe_offset=1].a))
+        var cx = _any_complex(args, ins)
+        comptime if out_idx >= 0:
+            cx = cx or T(Int(args[unsafe_offset=out_idx].a)).is_complex()
+        if cx:
+            raise Error("heaviside is not yet implemented for complex tensors.")
         var same = a.stype == b.stype
         comptime if out_idx >= 0:
             same = (
@@ -526,6 +564,19 @@ def f8_iter[
     if not touched:
         op(args, n_args, rets, n_rets)
         return
+    comptime if pre == PRE_COMPLEX_TO_FLOAT and out_idx >= 0:
+        # unary_op_impl_with_complex_to_float_out: a complex self with a
+        # real (here float8) out computes complex -> complex, then copy_s
+        # the real part into out (canCast(float, float8) holds): no
+        # iterator ever sees out, so `op` handles it as any real out.
+        var s0 = args[unsafe_offset=0].copy()
+        if (
+            _rec_tensor(s0)
+            and T(Int(s0.a)).is_complex()
+            and not T(Int(args[unsafe_offset=out_idx].a)).is_complex()
+        ):
+            op(args, n_args, rets, n_rets)
+            return
     var p = _pre[pre, ins, out_idx, label](args)
     var eff_mode = mode if p.mode < 0 else p.mode
     var it = _shape_of(args, p.shape_ins)
@@ -631,6 +682,12 @@ def f8_iter[
                 k = "div_floor_cuda"
             elif name == "trunc":
                 k = "div_trunc_cuda"
+    comptime if pre == PRE_DISPATCH_OUT and out_idx >= 0:
+        # e.g. logical_not_cuda: an AT_DISPATCH on out's dtype, then on
+        # self's (the common one here)
+        var od = T(Int(args[unsafe_offset=out_idx].a))
+        if is_float8_stype(od.stype):
+            _refuse(k, od.stype)
     comptime if pre == PRE_DISPATCH_SELF:
         # The kernel dispatches on self's dtype (arg 1), not the common one.
         var a = T(Int(args[unsafe_offset=1].a))
@@ -656,7 +713,13 @@ def f8_iter[
                 all_ops and t.stype != compute
             )
             if swap and convert and not t.on_cpu():
-                held.append(own(cast_to(t, compute, False)))
+                # exactly, never saturating (a promotion, not a copy_);
+                # a complex computation dtype takes the real value as its
+                # real part
+                if is_complex_stype(compute):
+                    held.append(own(cast_complex(t, compute)))
+                else:
+                    held.append(own(cast_to(t, compute, False)))
                 recs.append(tensor_arg(held[len(held) - 1].t))
                 continue
         recs.append(v^)

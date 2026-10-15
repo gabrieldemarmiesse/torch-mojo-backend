@@ -75,6 +75,8 @@ from tmb.ops.f8_iter import (
     MODE_OUTDT,
     MODE_SAME,
     PRE_BOOL_OUT,
+    PRE_COMPLEX_TO_FLOAT,
+    PRE_DISPATCH_OUT,
     PRE_DIV_MODE,
     PRE_HEAVISIDE,
     PRE_LDEXP,
@@ -2355,7 +2357,15 @@ def register_unary(site: Site) raises:
         "abs",
     ](site)
     impl[
-        f8_iter[op_abs_out, "abs_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        f8_iter[
+            op_abs_out,
+            "abs_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_COMPLEX_TO_FLOAT,
+        ],
         "abs.out",
     ](site)
     impl[
@@ -2379,7 +2389,15 @@ def register_unary(site: Site) raises:
         "angle",
     ](site)
     impl[
-        f8_iter[op_angle_out, "angle_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            op_angle_out,
+            "angle_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_COMPLEX_TO_FLOAT,
+        ],
         "angle.out",
     ](site)
     impl[
@@ -3226,7 +3244,7 @@ def register_unary(site: Site) raises:
             1,
             MODE_NOCHECK,
             False,
-            PRE_NONE,
+            PRE_DISPATCH_OUT,
         ],
         "logical_not.out",
     ](site)

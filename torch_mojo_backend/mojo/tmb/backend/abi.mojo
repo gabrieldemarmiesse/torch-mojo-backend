@@ -1421,6 +1421,11 @@ def default_dtype() -> Int32:
     return external_call["tmb_default_dtype", Int32]()
 
 
+def default_complex_dtype() -> Int32:
+    """`get_default_complex_dtype()`: complex128 under a float64 default."""
+    return ST_COMPLEX128 if default_dtype() == ST_FLOAT64 else ST_COMPLEX64
+
+
 # --- op entry -----------------------------------------------------------------
 comptime OpFn = def(Values, Int, Values, Int) raises thin -> None
 
