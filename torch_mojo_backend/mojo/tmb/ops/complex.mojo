@@ -288,10 +288,11 @@ def _store(
         copy_strided_into(dest, res.t)
         _ = res^
     else:
-        _check_cast(res.t.stype, dest.stype)
-        # copy_'s own first check, raised here without the nested call's
-        # "aten::copy_:" prefix
-        assert_no_internal_overlap(dest)
+        # (cast checked above) copy_'s own first check, the internal
+        # overlap, raised here without the nested call's "aten::copy_:"
+        # prefix when the caller did not already make it
+        if not internal:
+            assert_no_internal_overlap(dest)
         var c = _Call("aten::copy_")
         c.t(dest)
         c.t(res.t)

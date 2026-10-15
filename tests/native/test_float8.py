@@ -2550,8 +2550,10 @@ _F8_ITER = json.loads(
 # tensors on cpu (when checking argument in method wrapper_CUDA_...)") for a
 # CPU operand or out of an op without CPU scalars (logaddexp, nextafter,
 # igamma, the backward ops, silu / mish / glu out=); sigmoid/tanh_backward's
-# -0.0 where CUDA has 0.0; silu's last float32 bit; relu.out's float32 copy
-# message; the "aten::mul:" prefix of a decomposed backward op's cast error.
+# -0.0 where CUDA has 0.0; silu's last float32 bit; the "aten::mul:" prefix
+# of a decomposed backward op's cast error; and int8 / int16 / uint8 add /
+# sub with alpha != 1, which the mojo device declines (NotImplementedError)
+# into any out dtype -- it has no scale kernel for those integer dtypes.
 _KNOWN = set(_F8_ITER["known_differences"])
 
 
@@ -4120,3 +4122,48 @@ def test_out_validation_matches_stock_cuda(mojo_device):
 )
 def test_out_validation_data_regenerates_on_stock_cuda():
     assert list(_out_validation_lines("cuda")) == _F8_ITER["out_validation"]
+
+
+# ---------------------------------------------------------------------------
+# review round 6: alpha converted to an integral / bool computation dtype
+# ---------------------------------------------------------------------------
+
+
+def _alpha_convert_lines(dev):
+    """add / sub of integer and bool operands into a float8 out (alpha_check
+    passes on the out's floating dtype), so the kernel converts alpha to the
+    integral / bool computation dtype with c10's checked_convert: an alpha
+    out of range, a negative fraction into an unsigned dtype, NaN / inf
+    (stock CUDA 2.11). Fractions within a unit of an integer bound are left
+    out: torch 2.11 and 2.14 round that boundary differently."""
+    f8 = torch.float8_e4m3fn
+    dts = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.bool)
+    alphas = (
+        1e20, -1e20, -0.5, 0.5, 2.5, -2.5, float("nan"), float("inf"),
+        float("-inf"), 300, -1, -300, 2**40,
+    )  # fmt: skip
+    for op, dt, al, other, shp in itertools.product(
+        ("add", "sub"), dts, alphas, ("t", "3"), ("0", "2")
+    ):
+
+        def x(dt=dt):
+            return torch.tensor([1, 2], device=dev).to(dt)
+
+        out = torch.zeros(int(shp), dtype=f8, device=dev)
+        yield f"{op} {str(dt)[6:]} a={al} o={other} out{shp} " + _act_res(
+            lambda op=op, x=x, al=al, other=other, out=out: getattr(torch, op)(
+                x(), x() if other == "t" else 3, alpha=al, out=out
+            ),
+            out,
+        )
+
+
+def test_alpha_convert_matches_stock_cuda(mojo_device):
+    _compare(list(_alpha_convert_lines(mojo_device)), _F8_ITER["alpha_convert"])
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_alpha_convert_data_regenerates_on_stock_cuda():
+    assert list(_alpha_convert_lines("cuda")) == _F8_ITER["alpha_convert"]

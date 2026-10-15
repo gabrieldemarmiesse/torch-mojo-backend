@@ -47,6 +47,7 @@ from tmb.backend.abi import (
     Value,
     Values,
     dtype_name,
+    f64_bits,
     is_float8_stype,
     max_dtype,
     none_arg,
@@ -66,6 +67,7 @@ from tmb.ops.common import (
     assert_no_partial_overlap,
     can_cast,
     cast_complex,
+    check_real_scalar_fits,
     cast_to,
     combine_categories,
     device_str,
@@ -246,17 +248,31 @@ def _alpha_check(dt: Int32, a: Value) raises:
         )
 
 
-def _kernel_alpha(dt: Int32, a: Value) raises -> Value:
+def _kernel_alpha(dt: Int32, a: Value, negate: Bool) raises -> Value:
     """alpha as the add / sub kernel reads it in an integral or bool
-    computation dtype (`alpha.to<int64_t>()` / `.to<bool>()`): a float
-    alpha the out's floating dtype let through alpha_check, truncated
-    (bool: nonzero). Any other alpha is passed as given."""
-    if a.tag != TAG_SCALAR_DOUBLE and a.tag != TAG_DOUBLE:
+    computation dtype `dt` (`alpha.to<scalar_t>()`, c10's checked_convert:
+    common's `check_real_scalar_fits` -- an alpha out of range, a negative
+    fraction into an unsigned dtype, NaN / inf raise; bool takes anything),
+    then a float alpha the out's floating dtype let through alpha_check,
+    truncated (bool: nonzero). sub / rsub hand the add kernel `-alpha`
+    (`negate`): that is the value checked. A floating `dt` gets alpha as
+    given."""
+    if is_float_stype(dt) or is_float8_stype(dt) or is_complex_stype(dt):
+        return a.copy()
+    var is_double = a.tag == TAG_SCALAR_DOUBLE or a.tag == TAG_DOUBLE
+    var is_int = a.tag == TAG_SCALAR_INT or a.tag == TAG_INT
+    if negate and is_double:
+        check_real_scalar_fits(
+            dt, Value(TAG_SCALAR_DOUBLE, 0, f64_bits(-v_f64(a)), 0)
+        )
+    elif negate and is_int:
+        check_real_scalar_fits(dt, Value(TAG_SCALAR_INT, 0, -a.a, 0))
+    else:
+        check_real_scalar_fits(dt, a)
+    if not is_double:
         return a.copy()
     if dt == ST_BOOL:
         return Value(TAG_SCALAR_BOOL, 0, Int64(1) if v_f64(a) != 0.0 else 0, 0)
-    if is_float_stype(dt) or is_float8_stype(dt) or is_complex_stype(dt):
-        return a.copy()
     return Value(TAG_SCALAR_INT, 0, Int64(Int(v_f64(a))), 0)
 
 
@@ -840,7 +856,11 @@ def f8_iter[
                 continue
         comptime if alpha_idx >= 0:
             if i == alpha_idx and alpha_dt != ST_UNDEFINED:
-                recs.append(_kernel_alpha(alpha_dt, v))
+                recs.append(
+                    _kernel_alpha(
+                        alpha_dt, v, pre == PRE_SUB or pre == PRE_RSUB
+                    )
+                )
                 continue
         recs.append(v^)
     op(
