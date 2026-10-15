@@ -39,6 +39,7 @@ from torch_mojo_backend.distributed.process_group import (
     _nccl_dtype,
     _nccl_red_op,
 )
+from torch_mojo_backend import native
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.types import MaxTensor
 
@@ -208,13 +209,18 @@ class GraphCollectives:
     def started(self, pending: _Pending):
         self._started.append(pending)
 
-    def synchronize(self):
+    def synchronize(self) -> list[str]:
         """Host-wait for every collective the graph's process groups issued:
         after a failed execute, before MAX can hand out memory a collective
-        it started still reads or writes."""
-        for h in self.handles.values():
-            if h.group._handle == h.address:
-                h.group._core.synchronize_comm(h.group._handle, h.device_index)
+        it started still reads or writes. Returns the groups that could not
+        be drained (their memory is not safe to reuse)."""
+        failed = []
+        for name, h in self.handles.items():
+            if h.group._handle != h.address:
+                continue
+            if h.group._core.synchronize_comm(h.group._handle, h.device_index):
+                failed.append(f"{name!r}: {native.last_error()}")
+        return failed
 
     def finish(self):
         """Wait for every collective the graph started and nothing waited
@@ -268,45 +274,50 @@ def wait(value: object) -> object:
     return value.result
 
 
-def _aliased_input(node: object) -> torch.fx.Node | None:
-    """The graph input `node` is, or is a view of; None otherwise."""
+def _is_view(node: torch.fx.Node) -> bool:
+    target = node.target
+    return target == torch.ops.aten._unsafe_view.default or (
+        isinstance(target, torch._ops.OpOverload) and target.is_view
+    )
+
+
+def _wait_source(node: object) -> torch.fx.Node | bool:
+    """What a `wait_tensor` on `node` waits for: through views, selections
+    (`getitem` of a coalesced collective or of a split) and earlier waits,
+    the graph input it reads (a placeholder), True for a collective of the
+    graph, False for anything else."""
     while isinstance(node, torch.fx.Node):
         if node.op == "placeholder":
             return node
-        target = node.target
-        is_view = target == torch.ops.aten._unsafe_view.default or (
-            isinstance(target, torch._ops.OpOverload) and target.is_view
-        )
-        if not (node.op == "call_function" and is_view and node.args):
-            return None
+        if node.op != "call_function" or not node.args:
+            return False
+        if node.target in _START_OPS:
+            return True
+        if not (node.target in (getitem, WAIT_TENSOR) or _is_view(node)):
+            return False
         node = node.args[0]
-    return None
+    return False
 
 
 def waited_inputs(graph: torch.fx.Graph) -> list[int]:
     """Positions of the graph inputs a `wait_tensor` reads, directly or
     through views: eager collectives' results (an AsyncCollectiveTensor
     passed to compiled code traces to one), which the caller waits for
-    before the graph runs. A wait on anything else that is not a collective
-    of the graph cannot be honored, and is refused."""
+    before the graph runs. A wait on anything that is neither cannot be
+    honored, and is refused."""
     placeholders = [n for n in graph.nodes if n.op == "placeholder"]
     waited = set()
     for n in graph.nodes:
         if n.op != "call_function" or n.target != WAIT_TENSOR:
             continue
-        arg = n.args[0]
-        source = arg
-        while isinstance(source, torch.fx.Node) and source.target == getitem:
-            source = source.args[0]
-        if isinstance(source, torch.fx.Node) and source.target in _START_OPS:
-            continue
-        aliased = _aliased_input(arg)
-        if aliased is None:
+        source = _wait_source(n.args[0])
+        if source is False:
             raise CollectiveLoweringError(
-                f"wait_tensor on {arg}, which is neither a collective of this "
-                "graph nor a graph input (or a view of one)"
+                f"wait_tensor on {n.args[0]}, which is neither a collective of "
+                "this graph nor a graph input (or a view of one)"
             )
-        waited.add(aliased)
+        if isinstance(source, torch.fx.Node):
+            waited.add(source)
     return [i for i, p in enumerate(placeholders) if p in waited]
 
 

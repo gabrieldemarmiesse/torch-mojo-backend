@@ -158,6 +158,14 @@ def run_functional(failures: list[str]):
         a = funcol.all_reduce(x, "sum", group)
         return funcol.all_reduce(a * 2, "avg", second_group)
 
+    def explicit_wait(x: torch.Tensor) -> torch.Tensor:
+        # funcol's own wait, then the user's: the second one is a no-op
+        return funcol.wait_tensor(funcol.all_reduce(x, "sum", group)) + 1
+
+    def view_before_wait(x: torch.Tensor) -> torch.Tensor:
+        # the view reaches the collective's result before its wait does
+        return funcol.all_reduce(x, "sum", group).view(2, -1) * 2
+
     def empty(x: torch.Tensor) -> torch.Tensor:
         return funcol.all_reduce(x, "sum", group) + 1
 
@@ -209,6 +217,8 @@ def run_functional(failures: list[str]):
         _compare(failures, "bool_any", bool_any, rand(64), exact=True)
     _compare(failures, "two_groups", two_groups, rand(100))
     _compare(failures, "empty", empty, rand(0, 4))
+    _compare(failures, "explicit_wait", explicit_wait, rand(64))
+    _compare(failures, "view_before_wait", view_before_wait, rand(64))
     _compare(failures, "unused_result", unused_result, rand(4096), rand(4096))
     _compare(
         failures, "same_shape_in_flight", same_shape_in_flight, rand(4096), rand(4096)
@@ -272,6 +282,11 @@ def run_eager_result_into_graph(failures: list[str]):
         return t * 2
 
     @torch.compile(backend=mojo_backend)
+    def use_split(t: torch.Tensor) -> torch.Tensor:
+        # a wait through getitem(split(input))
+        return t.split(t.shape[0] // 2)[1] * 2
+
+    @torch.compile(backend=mojo_backend)
     def use_view(t: torch.Tensor) -> torch.Tensor:
         # an AsyncCollectiveTensor stays pending through views: the traced
         # wait reads a view of the graph input
@@ -288,6 +303,10 @@ def run_eager_result_into_graph(failures: list[str]):
             torch.full((1 << 22,), float(rank + 1), device=dev), "sum", group
         )
         ok &= bool((use_view(pending).cpu() == 2 * total).all())
+        pending = funcol.all_reduce(
+            torch.full((1 << 22,), float(rank + 1), device=dev), "sum", group
+        )
+        ok &= bool((use_split(pending).cpu() == 2 * total).all())
     _check(failures, "eager_result_into_graph", ok)
 
 

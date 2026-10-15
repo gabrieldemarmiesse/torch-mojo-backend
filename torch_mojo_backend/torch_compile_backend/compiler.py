@@ -1,5 +1,6 @@
 import datetime as dt
 import functools
+import operator
 import time
 import traceback
 import weakref
@@ -325,6 +326,12 @@ class _GraphFactory:
         if key == WAIT_TENSOR:
             self.tensor_book[node.name] = wait(func_args[0])
             return
+        # A collective's result is ready for ordinary ops once waited for:
+        # an op (a view, typically) reaching it before its wait_tensor waits.
+        # getitem only selects a coalesced op's results, and must not.
+        if key is not operator.getitem:
+            func_args = [wait(a) for a in func_args]
+            func_kwargs = {k: wait(v) for k, v in func_kwargs.items()}
         if key in START_OPS:
             # scan() found this node, so the graph has its collectives
             assert self.collectives is not None
@@ -657,9 +664,15 @@ class BaseMaxCompiler:
             input_tensors.extend(self.collectives.runtime_inputs())
         try:
             outputs = self.model.execute(*input_tensors)
-        except BaseException:
+        except BaseException as e:
             if self.collectives is not None:
-                self.collectives.synchronize()
+                failed = self.collectives.synchronize()
+                if failed:
+                    e.add_note(
+                        "The collectives this graph started could not be "
+                        "drained, so their memory may still be in use; abort "
+                        "the process group. " + "; ".join(failed)
+                    )
             raise
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output

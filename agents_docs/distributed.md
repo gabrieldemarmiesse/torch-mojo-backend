@@ -357,9 +357,19 @@ time.
   of one shape write the same bytes; and `mo.mutable.load` rejects a buffer
   whose dims are not static or graph-input symbols (`s0 // 2`).
 - **A `wait_tensor` on a graph input** (an eager collective's
-  `AsyncCollectiveTensor` passed into compiled code) is run eagerly before
+  `AsyncCollectiveTensor` passed into compiled code, which stays pending
+  through views, `split` and `unbind` included) is run eagerly before
   `execute` (`waited_inputs`): it orders the current stream after the comm
-  stream, and the DLPack import orders the graph after that.
+  stream, and the DLPack import orders the graph after that. A wait the
+  graph can trace to neither a collective of its own nor an input is a
+  compile error. An ordinary op (a view) reaching a collective's result
+  before its `wait_tensor` waits for it there.
+- **Failures.** A failed `execute` host-waits the graph's comm streams
+  before re-raising, so MAX cannot reuse memory a started collective still
+  touches. That wait does not return if another rank failed before issuing
+  the same collective (the hang watchdog is what reports that). Zero-element
+  collectives issue nothing. One device per graph: MAX chains in-place ops
+  per device, so a cross-device graph would have no program order.
 - **The comm stream is the eager one.** `tmb_pg_graph_start` (`pg.mojo`)
   records an event on the graph's stream, makes the communicator's comm
   stream wait on it, issues the library call there and records a
