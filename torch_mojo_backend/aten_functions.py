@@ -3806,8 +3806,9 @@ def aten_index_put(
     values: MaxTensor,
     accumulate: bool = False,
 ) -> MaxTensor:
-    """``out = input.clone(); out[indices] = values`` (``+=`` when
-    ``accumulate``) — the write mirror of ``aten_index``.
+    """``out = input.clone(); out[indices] = values``, or, when
+    ``accumulate``, every update summed into its destination (repeated
+    indices included) — the write mirror of ``aten_index``.
 
     Only a single index tensor on axis 0 is served, of any rank: an N-D
     index writes ``index.shape + input.shape[1:]``, flattened here to the

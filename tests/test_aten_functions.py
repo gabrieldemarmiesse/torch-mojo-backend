@@ -3588,6 +3588,21 @@ def test_aten_index_put_2d_index(
 
 
 @pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_aten_index_put_2d_index_empty_rows(
+    conf: Conf, accumulate: bool, call_checker: CallChecker
+):
+    """A zero-size trailing dim: a no-op write, not an ambiguous reshape."""
+    call_checker.register(aten_functions.aten_index_put)
+
+    def fn(x, index, values):
+        return aten.index_put(x, [index], values, accumulate)
+
+    index = torch.tensor([[3, 0, 5], [1, 6, 2]], dtype=torch.int64)
+    check_outputs(fn, conf, [torch.randn(7, 0), index, torch.randn(2, 3, 0)])
+
+
+@pytest.mark.parametrize("conf", [Conf("cpu", True)], indirect=True)
 def test_aten_index_put_0d_index(conf: Conf, call_checker: CallChecker):
     call_checker.register(aten_functions.aten_index_put)
 
