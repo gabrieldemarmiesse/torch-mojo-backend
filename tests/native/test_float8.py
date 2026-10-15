@@ -3646,21 +3646,28 @@ def test_logical_not_float8_out_declined(mojo_device, src):
         assert b.cpu().tolist() == [False, True, False]
 
 
-def test_complex_with_float8_declines_where_cuda_computes(mojo_device):
-    """complex64[3] + float8 0-d and abs(complex, out=float8) compute on
-    stock CUDA (complex64 [3+1j, ...]; the real result copied into out).
-    The mojo device has no complex add / abs.out kernel yet: both decline
-    with NotImplementedError, never a promotion RuntimeError. Implementing
-    them must update this test (CUDA's values are in the docstring)."""
+def test_complex_with_float8_computes(mojo_device):
+    """complex64[3] + float8 0-d computes in complex64 (the float8 operand
+    converted exactly), and abs(complex, out=float8) copies the real result
+    into out (stock CUDA 2.11 values)."""
     c = torch.tensor([1 + 1j, 3 + 4j, 0j], device=mojo_device)
     z8 = torch.tensor(2.0).to(torch.float8_e4m3fn).to(mojo_device)
-    with pytest.raises(NotImplementedError, match="complex tensors"):
-        c + z8  # noqa: B018
-    with pytest.raises(NotImplementedError, match="complex tensors"):
-        z8 * c  # noqa: B018
+    assert (c + z8).cpu().tolist() == [3 + 1j, 5 + 4j, 2 + 0j]
+    assert (z8 * c).cpu().tolist() == [2 + 2j, 6 + 8j, 0j]
     out = torch.empty(0, dtype=torch.float8_e4m3fn, device=mojo_device)
-    with pytest.raises(NotImplementedError, match="complex tensors"):
-        torch.abs(c, out=out)
+    torch.abs(c, out=out)
+    assert out.float().cpu().tolist() == [1.375, 5.0, 0.0]
+
+
+def test_complex_abs_into_e4m3fn_out_is_a_copy(mojo_device):
+    """abs(complex, out=e4m3fn) is unary_op_impl_with_complex_to_float_out:
+    `result.copy_(at::real(complex_result))`, a float32 -> e4m3fn copy_,
+    which v2.14 saturates on sm_89+ (c10's NaN elsewhere)."""
+    c = torch.tensor([1000 + 0j, 460 + 0j, 470 + 0j], device=mojo_device)
+    out = torch.empty(0, dtype=torch.float8_e4m3fn, device=mojo_device)
+    torch.abs(c, out=out)
+    want = _stock_cast(torch.tensor([1000.0, 460.0, 470.0]), out.dtype, mojo_device)
+    _assert_same(out, want)
 
 
 @pytest.mark.parametrize(
@@ -3730,3 +3737,52 @@ def test_float8_complex_scalar_overloads(mojo_device, i):
         RuntimeError, match="Unknown Complex ScalarType for Float8_e4m3fn"
     ):
         _F8_CX_SCALAR[i](x)
+
+
+def test_float8_complex_reductions(mojo_device):
+    """Reductions where float8 meets complex (stock CUDA 2.11): float8 is a
+    floating dtype for mean's checks, a float8 accumulation dtype is the
+    kernel's dtype dispatch error, and a float8 self accumulates in a
+    complex out."""
+    x8 = torch.tensor([1.0, 0.5, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    c = torch.tensor([1 + 1j, 3 + 4j, -2j], device=mojo_device)
+    out = torch.empty(0, dtype=torch.complex64, device=mojo_device)
+    torch.mean(x8, 0, out=out)
+    assert out.cpu().tolist() == pytest.approx(7 / 6 + 0j)
+    for fn, kernel in (
+        (lambda: torch.mean(c, dtype=torch.float8_e4m3fn), "mean_cuda"),
+        (lambda: torch.sum(c, dtype=torch.float8_e4m3fn), "sum_cuda"),
+        (lambda: torch.cumsum(c, 0, dtype=torch.float8_e4m3fn), "cumsum_cuda"),
+    ):
+        with pytest.raises(NotImplementedError, match=f'"{kernel}" not implemented'):
+            fn()
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [lambda x, o: torch.pow(x, 2, out=o), lambda x, o: torch.square(x, out=o)],
+    ids=["pow", "square"],
+)
+def test_float8_pow_scalar_into_complex_out(mojo_device, fn):
+    """pow.Tensor_Scalar_out of a float8 base with a complex out: the
+    iterator resizes out, then pow_cuda refuses float8 (stock CUDA 2.11)."""
+    x8 = torch.tensor([1.0, 0.5, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    out = torch.empty(0, dtype=torch.complex64, device=mojo_device)
+    with pytest.raises(NotImplementedError, match='"pow_cuda" not implemented'):
+        fn(x8, out)
+    assert out.shape == (3,)
+
+
+def test_float8_rsub_promotes_other_first(mojo_device):
+    """rsub(self, other) is sub(other, self): the promotion error names
+    other's dtype first (stock CUDA 2.11)."""
+    x8 = torch.tensor([1.0, 0.5, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    f = torch.ones(3, device=mojo_device)
+    msg = "attempted to promote "
+    with pytest.raises(RuntimeError, match=msg + "Float and Float8_e4m3fn"):
+        torch.rsub(x8, f)
+    with pytest.raises(RuntimeError, match=msg + "Float8_e4m3fn and Float"):
+        torch.rsub(f, x8)
+    c = torch.ones(3, dtype=torch.complex64, device=mojo_device)
+    with pytest.raises(RuntimeError, match=msg + "ComplexFloat and Float8_e4m3fn"):
+        torch.rsub(x8, c)

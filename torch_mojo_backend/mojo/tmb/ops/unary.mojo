@@ -93,6 +93,31 @@ from tmb.ops.complex import (
     cx_via_bool,
     routed,
 )
+from tmb.ops.complex_math import (
+    cx_abs,
+    cx_abs_out,
+    cx_angle,
+    cx_angle_out,
+    cx_exp,
+    cx_exp_out,
+    cx_isfinite,
+    cx_isinf,
+    cx_isinf_out,
+    cx_isnan,
+    cx_isnan_out,
+    cx_log,
+    cx_log_out,
+    cx_neg,
+    cx_neg_out,
+    cx_reciprocal,
+    cx_reciprocal_out,
+    cx_rsqrt,
+    cx_rsqrt_out,
+    cx_sgn,
+    cx_sgn_out,
+    cx_sqrt,
+    cx_sqrt_out,
+)
 from tmb.ops.core import cast_for_copy
 from tmb.ops.data_movement import _scalar_type_name
 
@@ -2354,12 +2379,20 @@ def op_fill_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def register_unary(site: Site) raises:
     impl[
-        f8_iter[op_abs, "abs_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_abs, cx_abs, 1],
+            "abs_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "abs",
     ](site)
     impl[
         f8_iter[
-            op_abs_out,
+            routed[op_abs_out, cx_abs_out, 2],
             "abs_cuda",
             1,
             1,
@@ -2386,12 +2419,20 @@ def register_unary(site: Site) raises:
         "acosh.out",
     ](site)
     impl[
-        f8_iter[op_angle, "angle_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_angle, cx_angle, 1],
+            "angle_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "angle",
     ](site)
     impl[
         f8_iter[
-            op_angle_out,
+            routed[op_angle_out, cx_angle_out, 2],
             "angle_cuda",
             1,
             1,
@@ -2501,11 +2542,27 @@ def register_unary(site: Site) raises:
         "erfinv.out",
     ](site)
     impl[
-        f8_iter[op_exp, "exp_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_exp, cx_exp, 1],
+            "exp_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "exp",
     ](site)
     impl[
-        f8_iter[op_exp_out, "exp_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_exp_out, cx_exp_out, 2],
+            "exp_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "exp.out",
     ](site)
     impl[
@@ -2566,11 +2623,27 @@ def register_unary(site: Site) raises:
         "lgamma.out",
     ](site)
     impl[
-        f8_iter[op_log, "log_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_log, cx_log, 1],
+            "log_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "log",
     ](site)
     impl[
-        f8_iter[op_log_out, "log_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_log_out, cx_log_out, 2],
+            "log_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "log.out",
     ](site)
     impl[
@@ -2630,11 +2703,27 @@ def register_unary(site: Site) raises:
         "nan_to_num.out",
     ](site)
     impl[
-        f8_iter[op_neg, "neg_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_neg, cx_neg, 1],
+            "neg_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "neg",
     ](site)
     impl[
-        f8_iter[op_neg_out, "neg_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        f8_iter[
+            routed[op_neg_out, cx_neg_out, 2],
+            "neg_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
         "neg.out",
     ](site)
     impl[
@@ -2653,13 +2742,19 @@ def register_unary(site: Site) raises:
     impl[op_polygamma_out, "polygamma.out"](site)
     impl[
         f8_iter[
-            op_reciprocal, "reciprocal_cuda", 1, -1, MODE_FN, False, PRE_NONE
+            routed[op_reciprocal, cx_reciprocal, 1],
+            "reciprocal_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
         ],
         "reciprocal",
     ](site)
     impl[
         f8_iter[
-            op_reciprocal_out,
+            routed[op_reciprocal_out, cx_reciprocal_out, 2],
             "reciprocal_cuda",
             1,
             1,
@@ -2681,19 +2776,51 @@ def register_unary(site: Site) raises:
     ](site)
     impl[op_round__decimals, "round_.decimals"](site)
     impl[
-        f8_iter[op_rsqrt, "rsqrt_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_rsqrt, cx_rsqrt, 1],
+            "rsqrt_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "rsqrt",
     ](site)
     impl[
-        f8_iter[op_rsqrt_out, "rsqrt_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_rsqrt_out, cx_rsqrt_out, 2],
+            "rsqrt_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "rsqrt.out",
     ](site)
     impl[
-        f8_iter[op_sgn, "sign_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_sgn, cx_sgn, 1],
+            "sign_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "sgn",
     ](site)
     impl[
-        f8_iter[op_sgn_out, "sign_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        f8_iter[
+            routed[op_sgn_out, cx_sgn_out, 2],
+            "sign_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
         "sgn.out",
     ](site)
     impl[
@@ -3144,11 +3271,27 @@ def register_unary(site: Site) raises:
         "special_spherical_bessel_j0.out",
     ](site)
     impl[
-        f8_iter[op_sqrt, "sqrt_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_sqrt, cx_sqrt, 1],
+            "sqrt_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "sqrt",
     ](site)
     impl[
-        f8_iter[op_sqrt_out, "sqrt_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_sqrt_out, cx_sqrt_out, 2],
+            "sqrt_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "sqrt.out",
     ](site)
     impl[
@@ -3216,18 +3359,42 @@ def register_unary(site: Site) raises:
         ],
         "gelu.out",
     ](site)
-    impl[op_isnan, "isnan"](site)
-    impl[op_isnan_out, "isnan.out"](site)
+    impl[routed[op_isnan, cx_isnan, 1], "isnan"](site)
+    impl[routed[op_isnan_out, cx_isnan_out, 2], "isnan.out"](site)
     impl[
-        f8_iter[op_isinf, "isinf", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_isinf, cx_isinf, 1],
+            "isinf",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "isinf",
     ](site)
     impl[
-        f8_iter[op_isinf_out, "isinf", 1, 1, MODE_NOCHECK, False, PRE_NONE],
+        f8_iter[
+            routed[op_isinf_out, cx_isinf_out, 2],
+            "isinf",
+            1,
+            1,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
         "isinf.out",
     ](site)
     impl[
-        f8_iter[op_isfinite, "isfinite", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_isfinite, cx_isfinite, 1],
+            "isfinite",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "isfinite",
     ](site)
     impl[

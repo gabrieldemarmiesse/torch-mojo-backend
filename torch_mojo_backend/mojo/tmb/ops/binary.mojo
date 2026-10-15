@@ -117,6 +117,21 @@ from tmb.ops.complex import (
     cx_via_bool,
     routed,
 )
+from tmb.ops.complex_math import (
+    cx_add,
+    cx_add_,
+    cx_add_out,
+    cx_div,
+    cx_div_mode,
+    cx_div_out,
+    cx_div_out_mode,
+    cx_mul,
+    cx_mul_,
+    cx_mul_out,
+    cx_sub,
+    cx_sub_,
+    cx_sub_out,
+)
 from tmb.ops.foreach import foreach_addc_inplace, foreach_lerp_inplace
 
 # ---------------------------------------------------------------------------
@@ -3281,16 +3296,38 @@ def op_lerp_scalar_(
 def register_binary(site: Site) raises:
     impl[
         f8_iter[
-            op_add_tensor, "ufunc_add_CUDA", 3, -1, MODE_FN, False, PRE_NONE
+            routed[op_add_tensor, cx_add, 3],
+            "ufunc_add_CUDA",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
         ],
         "add.Tensor",
     ](site)
     impl[
-        f8_iter[op_add_, "ufunc_add_CUDA", 3, 0, MODE_INPLACE, False, PRE_NONE],
+        f8_iter[
+            routed[op_add_, cx_add_, 3],
+            "ufunc_add_CUDA",
+            3,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
         "add_.Tensor",
     ](site)
     impl[
-        f8_iter[op_add_out, "ufunc_add_CUDA", 3, 3, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_add_out, cx_add_out, 4],
+            "ufunc_add_CUDA",
+            3,
+            3,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "add.out",
     ](site)
     impl[
@@ -3441,23 +3478,43 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_div_tensor, "div_true_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            routed[op_div_tensor, cx_div, 2],
+            "div_true_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
         ],
         "div.Tensor",
     ](site)
     impl[
         f8_iter[
-            op_div_mode, "div_true_cuda", 3, -1, MODE_FN, False, PRE_DIV_MODE
+            routed[op_div_mode, cx_div_mode, 2],
+            "div_true_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_DIV_MODE,
         ],
         "div.Tensor_mode",
     ](site)
     impl[
-        f8_iter[op_div_out, "div_true_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_div_out, cx_div_out, 3],
+            "div_true_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "div.out",
     ](site)
     impl[
         f8_iter[
-            op_div_out_mode,
+            routed[op_div_out_mode, cx_div_out_mode, 4],
             "div_true_cuda",
             3,
             3,
@@ -3623,16 +3680,40 @@ def register_binary(site: Site) raises:
         "minimum.out",
     ](site)
     impl[
-        f8_iter[op_mul_tensor, "mul_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_mul_tensor, cx_mul, 2],
+            "mul_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "mul.Tensor",
     ](site)
     impl[
-        f8_iter[op_mul_, "mul_cuda", 3, 0, MODE_INPLACE, False, PRE_NONE],
+        f8_iter[
+            routed[op_mul_, cx_mul_, 2],
+            "mul_cuda",
+            3,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
         "mul_.Tensor",
     ](site)
-    impl[op_mul_, "mul_.Scalar"](site)
+    impl[routed[op_mul_, cx_mul_, 2], "mul_.Scalar"](site)
     impl[
-        f8_iter[op_mul_out, "mul_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_mul_out, cx_mul_out, 3],
+            "mul_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "mul.out",
     ](site)
     impl[f8_cx_scalar[op_remainder], "remainder.Scalar"](site)
@@ -3652,15 +3733,37 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_sub_tensor, "ufunc_add_CUDA", 3, -1, MODE_FN, False, PRE_SUB
+            routed[op_sub_tensor, cx_sub, 3],
+            "ufunc_add_CUDA",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_SUB,
         ],
         "sub.Tensor",
     ](site)
     impl[
-        f8_iter[op_sub_, "ufunc_add_CUDA", 3, 0, MODE_INPLACE, False, PRE_SUB],
+        f8_iter[
+            routed[op_sub_, cx_sub_, 3],
+            "ufunc_add_CUDA",
+            3,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_SUB,
+        ],
         "sub_.Tensor",
     ](site)
     impl[
-        f8_iter[op_sub_out, "ufunc_add_CUDA", 3, 3, MODE_CAST, False, PRE_SUB],
+        f8_iter[
+            routed[op_sub_out, cx_sub_out, 4],
+            "ufunc_add_CUDA",
+            3,
+            3,
+            MODE_CAST,
+            False,
+            PRE_SUB,
+        ],
         "sub.out",
     ](site)

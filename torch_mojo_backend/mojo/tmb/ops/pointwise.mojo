@@ -89,12 +89,23 @@ from tmb.ops.f8_iter import (
     PRE_NONE,
     PRE_SELF_FIRST,
     PRE_SOFTSHRINK,
-    PRE_SUB,
+    PRE_RSUB,
     PRE_THRESHOLD,
     softshrink_check,
 )
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.float8 import is_float8
+from tmb.ops.complex import (
+    routed,
+)
+from tmb.ops.complex_math import (
+    cx_pow_tensor,
+    cx_pow_tensor_out,
+    cx_pow_tensor_scalar,
+    cx_pow_tensor_scalar_out,
+    cx_rsub,
+    cx_rsub_out,
+)
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.binary import (
     Res,
@@ -5034,34 +5045,69 @@ def register_pointwise(site: Site) raises:
         "nextafter.out",
     ](site)
     impl[
-        f8_iter[op_rsub_any, "ufunc_add_CUDA", 3, -1, MODE_FN, False, PRE_SUB],
+        f8_iter[
+            routed[op_rsub_any, cx_rsub, 3],
+            "ufunc_add_CUDA",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_RSUB,
+        ],
         "rsub.Tensor",
     ](site)
-    impl[op_rsub_any, "rsub.Scalar"](site)
+    impl[routed[op_rsub_any, cx_rsub, 3], "rsub.Scalar"](site)
     impl[
         f8_iter[
-            op_rsub_out_any,
+            routed[op_rsub_out_any, cx_rsub_out, 4],
             "ufunc_add_CUDA",
             3,
             3,
             MODE_NOCHECK,
             False,
-            PRE_SUB,
+            PRE_RSUB,
         ],
         "rsub.Tensor_out",
     ](site)
-    impl[op_rsub_out_any, "rsub.Scalar_out"](site)
-    impl[f8_cx_scalar[op_pow_scalar_base], "pow.Scalar"](site)
-    impl[f8_cx_scalar[op_pow_scalar_base_out], "pow.Scalar_out"](site)
-    impl[f8_cx_scalar[op_pow_scalar_any], "pow.Tensor_Scalar"](site)
-    impl[f8_cx_scalar[op_pow_scalar_out_any], "pow.Tensor_Scalar_out"](site)
+    impl[routed[op_rsub_out_any, cx_rsub_out, 4], "rsub.Scalar_out"](site)
     impl[
-        f8_iter[op_pow_tensor_any, "pow_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        f8_cx_scalar[routed[op_pow_scalar_base, cx_pow_tensor, 2]], "pow.Scalar"
+    ](site)
+    impl[
+        f8_cx_scalar[routed[op_pow_scalar_base_out, cx_pow_tensor_out, 3]],
+        "pow.Scalar_out",
+    ](site)
+    impl[
+        f8_cx_scalar[routed[op_pow_scalar_any, cx_pow_tensor_scalar, 2]],
+        "pow.Tensor_Scalar",
+    ](site)
+    impl[
+        f8_cx_scalar[
+            routed[op_pow_scalar_out_any, cx_pow_tensor_scalar_out, 3]
+        ],
+        "pow.Tensor_Scalar_out",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_pow_tensor_any, cx_pow_tensor, 2],
+            "pow_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "pow.Tensor_Tensor",
     ](site)
     impl[
         f8_iter[
-            op_pow_tensor_out_any, "pow_cuda", 3, 2, MODE_CAST, False, PRE_NONE
+            routed[op_pow_tensor_out_any, cx_pow_tensor_out, 3],
+            "pow_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
         ],
         "pow.Tensor_Tensor_out",
     ](site)

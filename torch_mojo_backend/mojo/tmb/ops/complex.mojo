@@ -10,10 +10,13 @@ read theirs with `v_tensor_c`.
 Three ways a complex op is computed:
 
 * elementwise kernels on the pairs: the complex kernel family
-  (tmb/kernels/complex), through `cx_launch`;
+  (tmb/kernels/complex), through `cx_launch` -- the arithmetic and math
+  ops are tmb/ops/complex_math.mojo, built on the routing, promotion,
+  operand and `out=` helpers here;
 * an existing real op on `view_as_real` (cat, indexing, the random
-  fills): a complex element is two adjacent reals, so the real op over the
-  trailing pair dimension is the complex op;
+  fills; sum and mean in complex_math): a complex element is two adjacent
+  reals, so the real op over the trailing pair dimension is the complex
+  op;
 * the byte movers (copy, clone, views) need nothing: they move `itemsize`
   bytes per element (tmb/ops/core.mojo, tmb/ops/data_movement.mojo).
 
@@ -343,9 +346,23 @@ def _real_out(
     dtype and casts into the out, so run the real functional op and store
     its result (real -> complex is a valid cast). False when an input is
     complex (the caller's complex route applies)."""
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    var f8 = False
     for i in range(n_in):
-        if v_is_complex(args[unsafe_offset=i]):
+        var v = args[unsafe_offset=i].copy()
+        if v_is_complex(v):
             return False
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            var t = v_tensor_c(v)
+            _broadcast_into(shape, rank, t)
+            f8 = f8 or is_float8_stype(t.stype)
+    if f8:
+        # TensorIterator resizes the out before the kernel's dtype dispatch
+        # refuses a float8 computation (the functional call below would
+        # refuse with the out untouched)
+        var dest0 = v_tensor_c(args[unsafe_offset=out_idx])
+        resize_any(dest0, shape, rank)
     var c = _Call(op, overload)
     for i in range(n_in):
         c.v(args[unsafe_offset=i])
