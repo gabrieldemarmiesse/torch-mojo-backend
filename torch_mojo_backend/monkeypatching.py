@@ -26,6 +26,7 @@ import torch
 import torch._tensor_str
 import torch.distributed.distributed_c10d as c10d
 import torch.utils._triton
+from torch.export import exported_program
 
 from torch_mojo_backend.native import device_module
 
@@ -189,6 +190,57 @@ def fix_batch_isend_irecv_for_python_process_groups():
     batch_isend_irecv._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
     c10d.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
     torch.distributed.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
+
+
+# An ATen decomposition: the op's arguments in, any pytree of its outputs out.
+_Decomposition = Callable[..., object]
+
+
+def decompose_composite_ops_with_mojo_kernels_in_export():
+    """`ExportedProgram.run_decompositions` ignores the requested
+    decomposition of a CompositeImplicitAutograd op the PrivateUse1 backend
+    has its own kernel for.
+
+    ``torch/export/exported_program.py`` splits the table: every
+    CompositeImplicitAutograd (CIA) op goes to
+    ``_override_composite_implicit_decomp``, which installs its decomposition
+    as the op's CIA Python kernel, and is dropped from the table the proxy
+    tracer consults. The autograd key only falls through to a CIA kernel
+    when the device has no kernel of its own (the dispatcher's rule, mirrored
+    by ``autograd_would_have_decomposed``), so an op the mojo device
+    registers directly -- ``aten::linear``, ``isclose``, ``isfinite``,
+    ``silu_backward``, ``mish_backward`` -- reaches the tracer whole and is
+    recorded as is: ``run_decompositions()`` left ``aten.linear`` in a "core
+    ATen" program, and a custom table entry for it was silently ignored.
+    No in-tree backend registers a kernel on a CIA op, so upstream never
+    meets this. Keep those ops in the tracer's table as well, where the
+    requested decomposition then runs; an op the table preserves (one the
+    caller deleted from it) is left alone.
+    """
+    original = getattr(
+        exported_program, "_split_decomp_table_to_cia_and_python_decomp", None
+    )
+    preserve = getattr(exported_program, "_special_op_to_preserve_cia", None)
+    if original is None or getattr(original, "_torch_mojo_backend", False):
+        return
+
+    @wraps(original)
+    def split(
+        decomp_table: dict[torch._ops.OperatorBase, _Decomposition],
+    ) -> tuple[dict[torch._ops.OperatorBase, _Decomposition], ...]:
+        cia_to_decomp, python_decomp_table = original(decomp_table)
+        for op, decomp in cia_to_decomp.items():
+            if (
+                decomp is not preserve
+                and torch._C._dispatch_has_kernel_for_dispatch_key(
+                    op.name(), torch._C.DispatchKey.PrivateUse1
+                )
+            ):
+                python_decomp_table[op] = decomp
+        return cia_to_decomp, python_decomp_table
+
+    split._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
+    exported_program._split_decomp_table_to_cia_and_python_decomp = split  # ty: ignore[invalid-assignment]
 
 
 def add_mojo_to_the_inductor_gpu_types():
