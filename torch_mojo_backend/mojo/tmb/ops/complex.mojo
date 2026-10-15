@@ -2426,7 +2426,7 @@ def _masked_fill_real_(self: T, args: Values) raises:
     dispatch is (its kernel is not instantiated for them)."""
     if is_wide_unsigned(self.stype):
         unsupported(
-            "\"masked_fill_\" not implemented for '"
+            '"masked_fill_" not implemented for \''
             + scalar_type_name(self.stype)
             + "'"
         )

@@ -912,7 +912,7 @@ def _masked_fill_validate(a: T, mask: T, in_place: Bool = False) raises:
         # CUDA's (and the CPU's) kernel is not instantiated for them: the
         # dtype dispatch refuses before the value converts
         unsupported(
-            "\"masked_fill_\" not implemented for '"
+            '"masked_fill_" not implemented for \''
             + scalar_type_name(a.stype)
             + "'"
         )
