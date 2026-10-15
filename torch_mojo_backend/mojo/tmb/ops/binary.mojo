@@ -93,6 +93,21 @@ from tmb.ops.complex import (
     cx_via_bool,
     routed,
 )
+from tmb.ops.complex_math import (
+    cx_add,
+    cx_add_,
+    cx_add_out,
+    cx_div,
+    cx_div_mode,
+    cx_div_out,
+    cx_div_out_mode,
+    cx_mul,
+    cx_mul_,
+    cx_mul_out,
+    cx_sub,
+    cx_sub_,
+    cx_sub_out,
+)
 from tmb.ops.foreach import foreach_addc_inplace, foreach_lerp_inplace
 
 # ---------------------------------------------------------------------------
@@ -2965,9 +2980,9 @@ def op_lerp_scalar_(
 
 
 def register_binary(site: Site) raises:
-    impl[op_add_tensor, "add.Tensor"](site)
-    impl[op_add_, "add_.Tensor"](site)
-    impl[op_add_out, "add.out"](site)
+    impl[routed[op_add_tensor, cx_add, 3], "add.Tensor"](site)
+    impl[routed[op_add_, cx_add_, 3], "add_.Tensor"](site)
+    impl[routed[op_add_out, cx_add_out, 4], "add.out"](site)
     impl[op_addcdiv, "addcdiv"](site)
     impl[op_addcdiv_, "addcdiv_"](site)
     impl[op_addcdiv_out, "addcdiv.out"](site)
@@ -2996,10 +3011,10 @@ def register_binary(site: Site) raises:
     impl[op_clamp_min_out, "clamp_min.out"](site)
     impl[op_clamp_min_tensor, "clamp_min.Tensor"](site)
     impl[op_clamp_min_tensor_out, "clamp_min.Tensor_out"](site)
-    impl[op_div_tensor, "div.Tensor"](site)
-    impl[op_div_mode, "div.Tensor_mode"](site)
-    impl[op_div_out, "div.out"](site)
-    impl[op_div_out_mode, "div.out_mode"](site)
+    impl[routed[op_div_tensor, cx_div, 2], "div.Tensor"](site)
+    impl[routed[op_div_mode, cx_div_mode, 2], "div.Tensor_mode"](site)
+    impl[routed[op_div_out, cx_div_out, 3], "div.out"](site)
+    impl[routed[op_div_out_mode, cx_div_out_mode, 4], "div.out_mode"](site)
     impl[op_floor_divide, "floor_divide"](site)
     impl[op_floor_divide, "floor_divide.Scalar"](site)
     impl[op_floor_divide_out, "floor_divide.out"](site)
@@ -3031,15 +3046,15 @@ def register_binary(site: Site) raises:
     impl[op_maximum_out, "maximum.out"](site)
     impl[op_minimum, "minimum"](site)
     impl[op_minimum_out, "minimum.out"](site)
-    impl[op_mul_tensor, "mul.Tensor"](site)
-    impl[op_mul_, "mul_.Tensor"](site)
-    impl[op_mul_, "mul_.Scalar"](site)
-    impl[op_mul_out, "mul.out"](site)
+    impl[routed[op_mul_tensor, cx_mul, 2], "mul.Tensor"](site)
+    impl[routed[op_mul_, cx_mul_, 2], "mul_.Tensor"](site)
+    impl[routed[op_mul_, cx_mul_, 2], "mul_.Scalar"](site)
+    impl[routed[op_mul_out, cx_mul_out, 3], "mul.out"](site)
     impl[op_remainder, "remainder.Scalar"](site)
     impl[op_remainder, "remainder.Scalar_Tensor"](site)
     impl[op_remainder, "remainder.Tensor"](site)
     impl[op_remainder_out, "remainder.Scalar_out"](site)
     impl[op_remainder_out, "remainder.Tensor_out"](site)
-    impl[op_sub_tensor, "sub.Tensor"](site)
-    impl[op_sub_, "sub_.Tensor"](site)
-    impl[op_sub_out, "sub.out"](site)
+    impl[routed[op_sub_tensor, cx_sub, 3], "sub.Tensor"](site)
+    impl[routed[op_sub_, cx_sub_, 3], "sub_.Tensor"](site)
+    impl[routed[op_sub_out, cx_sub_out, 4], "sub.out"](site)

@@ -76,6 +76,7 @@ FAMILY_MODULES = (
     "test_gemm",
     "test_elementwise",
     "test_binary",
+    "test_complex",
     "test_inplace",
     "test_reduction",
     "test_softmax",

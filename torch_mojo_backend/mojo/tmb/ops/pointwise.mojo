@@ -69,6 +69,17 @@ from tmb.backend.abi import (
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    routed,
+)
+from tmb.ops.complex_math import (
+    cx_pow_tensor,
+    cx_pow_tensor_out,
+    cx_pow_tensor_scalar,
+    cx_pow_tensor_scalar_out,
+    cx_rsub,
+    cx_rsub_out,
+)
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.binary import (
     Res,
@@ -4198,16 +4209,26 @@ def register_pointwise(site: Site) raises:
     impl[op_mish_backward, "mish_backward"](site)
     impl[op_nextafter, "nextafter"](site)
     impl[op_nextafter_out, "nextafter.out"](site)
-    impl[op_rsub_any, "rsub.Tensor"](site)
-    impl[op_rsub_any, "rsub.Scalar"](site)
-    impl[op_rsub_out_any, "rsub.Tensor_out"](site)
-    impl[op_rsub_out_any, "rsub.Scalar_out"](site)
-    impl[op_pow_scalar_base, "pow.Scalar"](site)
-    impl[op_pow_scalar_base_out, "pow.Scalar_out"](site)
-    impl[op_pow_scalar_any, "pow.Tensor_Scalar"](site)
-    impl[op_pow_scalar_out_any, "pow.Tensor_Scalar_out"](site)
-    impl[op_pow_tensor_any, "pow.Tensor_Tensor"](site)
-    impl[op_pow_tensor_out_any, "pow.Tensor_Tensor_out"](site)
+    impl[routed[op_rsub_any, cx_rsub, 3], "rsub.Tensor"](site)
+    impl[routed[op_rsub_any, cx_rsub, 3], "rsub.Scalar"](site)
+    impl[routed[op_rsub_out_any, cx_rsub_out, 4], "rsub.Tensor_out"](site)
+    impl[routed[op_rsub_out_any, cx_rsub_out, 4], "rsub.Scalar_out"](site)
+    impl[routed[op_pow_scalar_base, cx_pow_tensor, 2], "pow.Scalar"](site)
+    impl[
+        routed[op_pow_scalar_base_out, cx_pow_tensor_out, 3], "pow.Scalar_out"
+    ](site)
+    impl[
+        routed[op_pow_scalar_any, cx_pow_tensor_scalar, 2], "pow.Tensor_Scalar"
+    ](site)
+    impl[
+        routed[op_pow_scalar_out_any, cx_pow_tensor_scalar_out, 3],
+        "pow.Tensor_Scalar_out",
+    ](site)
+    impl[routed[op_pow_tensor_any, cx_pow_tensor, 2], "pow.Tensor_Tensor"](site)
+    impl[
+        routed[op_pow_tensor_out_any, cx_pow_tensor_out, 3],
+        "pow.Tensor_Tensor_out",
+    ](site)
     impl[op_rrelu_with_noise, "rrelu_with_noise"](site)
     impl[op_rrelu_with_noise_out, "rrelu_with_noise.out"](site)
     impl[op_rrelu_with_noise_, "rrelu_with_noise_"](site)

@@ -99,6 +99,16 @@ from tmb.ops.complex import (
     cx_via_bool,
     routed,
 )
+from tmb.ops.complex_math import (
+    cx_mean,
+    cx_mean_dim,
+    cx_mean_dtype_out,
+    cx_mean_out,
+    cx_sum,
+    cx_sum_dim,
+    cx_sum_out,
+    routed_red,
+)
 
 # Smallest contiguous inner extent that makes the strided arg-reduction kernel
 # (one thread per output column) worth taking over materializing a transposed
@@ -3668,10 +3678,13 @@ def register_reductions(site: Site) raises:
     impl[op_max_dim, "max.dim"](site)
     impl[op_max_dim_max, "max.dim_max"](site)
     impl[op_max_unary_out, "max.unary_out"](site)
-    impl[op_mean, "mean"](site)
-    impl[op_mean_dim, "mean.dim"](site)
-    impl[op_mean_dtype_out, "mean.dtype_out"](site)
-    impl[op_mean_out, "mean.out"](site)
+    impl[routed_red[op_mean, cx_mean, 1, 1, -1], "mean"](site)
+    impl[routed_red[op_mean_dim, cx_mean_dim, 1, 3, -1], "mean.dim"](site)
+    impl[
+        routed_red[op_mean_dtype_out, cx_mean_dtype_out, 1, 1, 2],
+        "mean.dtype_out",
+    ](site)
+    impl[routed_red[op_mean_out, cx_mean_out, 1, 3, 4], "mean.out"](site)
     impl[op_median, "median"](site)
     impl[op_median_dim, "median.dim"](site)
     impl[op_median_dim_values, "median.dim_values"](site)
@@ -3695,9 +3708,13 @@ def register_reductions(site: Site) raises:
     impl[op_prod_int_out, "prod.int_out"](site)
     impl[op_sort_stable, "sort.stable"](site)
     impl[op_sort_values_stable, "sort.values_stable"](site)
-    impl[op_sum, "sum"](site)
-    impl[op_sum_dim_intlist, "sum.dim_IntList"](site)
-    impl[op_sum_intlist_out, "sum.IntList_out"](site)
+    impl[routed_red[op_sum, cx_sum, 1, 1, -1], "sum"](site)
+    impl[
+        routed_red[op_sum_dim_intlist, cx_sum_dim, 1, 3, -1], "sum.dim_IntList"
+    ](site)
+    impl[
+        routed_red[op_sum_intlist_out, cx_sum_out, 1, 3, 4], "sum.IntList_out"
+    ](site)
     impl[op_topk, "topk"](site)
     impl[op_topk_values, "topk.values"](site)
     impl[op_var_correction, "var.correction"](site)

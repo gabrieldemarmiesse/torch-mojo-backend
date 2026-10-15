@@ -70,6 +70,31 @@ from tmb.ops.complex import (
     cx_via_bool,
     routed,
 )
+from tmb.ops.complex_math import (
+    cx_abs,
+    cx_abs_out,
+    cx_angle,
+    cx_angle_out,
+    cx_exp,
+    cx_exp_out,
+    cx_isfinite,
+    cx_isinf,
+    cx_isinf_out,
+    cx_isnan,
+    cx_isnan_out,
+    cx_log,
+    cx_log_out,
+    cx_neg,
+    cx_neg_out,
+    cx_reciprocal,
+    cx_reciprocal_out,
+    cx_rsqrt,
+    cx_rsqrt_out,
+    cx_sgn,
+    cx_sgn_out,
+    cx_sqrt,
+    cx_sqrt_out,
+)
 from tmb.ops.core import cast_for_copy
 from tmb.ops.data_movement import _scalar_type_name
 
@@ -2256,14 +2281,14 @@ def op_fill_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def register_unary(site: Site) raises:
-    impl[op_abs, "abs"](site)
-    impl[op_abs_out, "abs.out"](site)
+    impl[routed[op_abs, cx_abs, 1], "abs"](site)
+    impl[routed[op_abs_out, cx_abs_out, 2], "abs.out"](site)
     impl[op_acos, "acos"](site)
     impl[op_acos_out, "acos.out"](site)
     impl[op_acosh, "acosh"](site)
     impl[op_acosh_out, "acosh.out"](site)
-    impl[op_angle, "angle"](site)
-    impl[op_angle_out, "angle.out"](site)
+    impl[routed[op_angle, cx_angle, 1], "angle"](site)
+    impl[routed[op_angle_out, cx_angle_out, 2], "angle.out"](site)
     impl[op_asin, "asin"](site)
     impl[op_asin_out, "asin.out"](site)
     impl[op_asinh, "asinh"](site)
@@ -2286,8 +2311,8 @@ def register_unary(site: Site) raises:
     impl[op_erfc_out, "erfc.out"](site)
     impl[op_erfinv, "erfinv"](site)
     impl[op_erfinv_out, "erfinv.out"](site)
-    impl[op_exp, "exp"](site)
-    impl[op_exp_out, "exp.out"](site)
+    impl[routed[op_exp, cx_exp, 1], "exp"](site)
+    impl[routed[op_exp_out, cx_exp_out, 2], "exp.out"](site)
     impl[op_exp2, "exp2"](site)
     impl[op_exp2_out, "exp2.out"](site)
     impl[op_expm1, "expm1"](site)
@@ -2300,8 +2325,8 @@ def register_unary(site: Site) raises:
     impl[op_i0_out, "i0.out"](site)
     impl[op_lgamma, "lgamma"](site)
     impl[op_lgamma_out, "lgamma.out"](site)
-    impl[op_log, "log"](site)
-    impl[op_log_out, "log.out"](site)
+    impl[routed[op_log, cx_log, 1], "log"](site)
+    impl[routed[op_log_out, cx_log_out, 2], "log.out"](site)
     impl[op_log10, "log10"](site)
     impl[op_log10_out, "log10.out"](site)
     impl[op_log1p, "log1p"](site)
@@ -2315,25 +2340,27 @@ def register_unary(site: Site) raises:
     impl[op_mvlgamma_out, "mvlgamma.out"](site)
     impl[op_nan_to_num, "nan_to_num"](site)
     impl[op_nan_to_num_out, "nan_to_num.out"](site)
-    impl[op_neg, "neg"](site)
-    impl[op_neg_out, "neg.out"](site)
+    impl[routed[op_neg, cx_neg, 1], "neg"](site)
+    impl[routed[op_neg_out, cx_neg_out, 2], "neg.out"](site)
     impl[
         routed[op_conj_physical_out, cx_conj_physical_out, 2],
         "conj_physical.out",
     ](site)
     impl[op_polygamma, "polygamma"](site)
     impl[op_polygamma_out, "polygamma.out"](site)
-    impl[op_reciprocal, "reciprocal"](site)
-    impl[op_reciprocal_out, "reciprocal.out"](site)
+    impl[routed[op_reciprocal, cx_reciprocal, 1], "reciprocal"](site)
+    impl[routed[op_reciprocal_out, cx_reciprocal_out, 2], "reciprocal.out"](
+        site
+    )
     impl[op_round, "round"](site)
     impl[op_round_decimals, "round.decimals"](site)
     impl[op_round_decimals_out, "round.decimals_out"](site)
     impl[op_round_out, "round.out"](site)
     impl[op_round__decimals, "round_.decimals"](site)
-    impl[op_rsqrt, "rsqrt"](site)
-    impl[op_rsqrt_out, "rsqrt.out"](site)
-    impl[op_sgn, "sgn"](site)
-    impl[op_sgn_out, "sgn.out"](site)
+    impl[routed[op_rsqrt, cx_rsqrt, 1], "rsqrt"](site)
+    impl[routed[op_rsqrt_out, cx_rsqrt_out, 2], "rsqrt.out"](site)
+    impl[routed[op_sgn, cx_sgn, 1], "sgn"](site)
+    impl[routed[op_sgn_out, cx_sgn_out, 2], "sgn.out"](site)
     impl[op_sigmoid, "sigmoid"](site)
     impl[op_sigmoid_out, "sigmoid.out"](site)
     impl[op_sign, "sign"](site)
@@ -2408,8 +2435,8 @@ def register_unary(site: Site) raises:
     impl[op_special_spherical_bessel_j0_out, "special_spherical_bessel_j0.out"](
         site
     )
-    impl[op_sqrt, "sqrt"](site)
-    impl[op_sqrt_out, "sqrt.out"](site)
+    impl[routed[op_sqrt, cx_sqrt, 1], "sqrt"](site)
+    impl[routed[op_sqrt_out, cx_sqrt_out, 2], "sqrt.out"](site)
     impl[op_tan, "tan"](site)
     impl[op_tan_out, "tan.out"](site)
     impl[op_tanh, "tanh"](site)
@@ -2421,11 +2448,11 @@ def register_unary(site: Site) raises:
     impl[op_relu_, "relu_"](site)
     impl[op_gelu, "gelu"](site)
     impl[op_gelu_out, "gelu.out"](site)
-    impl[op_isnan, "isnan"](site)
-    impl[op_isnan_out, "isnan.out"](site)
-    impl[op_isinf, "isinf"](site)
-    impl[op_isinf_out, "isinf.out"](site)
-    impl[op_isfinite, "isfinite"](site)
+    impl[routed[op_isnan, cx_isnan, 1], "isnan"](site)
+    impl[routed[op_isnan_out, cx_isnan_out, 2], "isnan.out"](site)
+    impl[routed[op_isinf, cx_isinf, 1], "isinf"](site)
+    impl[routed[op_isinf_out, cx_isinf_out, 2], "isinf.out"](site)
+    impl[routed[op_isfinite, cx_isfinite, 1], "isfinite"](site)
     impl[op_isposinf, "isposinf"](site)
     impl[op_isposinf_out, "isposinf.out"](site)
     impl[op_isneginf, "isneginf"](site)
