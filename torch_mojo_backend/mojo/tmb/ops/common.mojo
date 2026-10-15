@@ -48,6 +48,7 @@ from tmb.backend.abi import (
     unsupported,
     v_f64,
     v_scalar_is_integral,
+    v_scalar_is_bool,
     v_tensor,
     ret_ref,
     tensor_arg,
@@ -1275,32 +1276,111 @@ def like_layout(var r: Owned, like: T, any_dense: Bool = False) raises -> Owned:
     return out^
 
 
-def threshold_scalar_check(
-    args: Values, first: Int, last: Int, st: Int32
-) raises:
-    """`Scalar::to<scalar_t>()` of threshold's Scalar args in the kernel's
-    dtype: a finite value past the dtype's range overflows (c10::overflows;
-    an infinity converts)."""
-    var top: Float64
+def _scalar_to_name(st: Int32) -> String:
+    """The C++ type `Scalar::to<scalar_t>()` names in its overflow error
+    (c10/core/Scalar.h's accessor `#type`), "" for a dtype threshold's
+    kernel does not dispatch on."""
+    if st == ST_UINT8:
+        return "uint8_t"
+    if st == ST_INT8:
+        return "int8_t"
+    if st == ST_INT16:
+        return "int16_t"
+    if st == ST_INT32:
+        return "int"
+    if st == ST_INT64:
+        return "int64_t"
     if st == ST_FLOAT16:
-        top = 65504.0
+        return "c10::Half"
+    if st == ST_BFLOAT16:
+        return "c10::BFloat16"
+    if st == ST_FLOAT32:
+        return "float"
+    return ""
+
+
+def threshold_scalar_overflows(
+    args: Values, first: Int, last: Int, st: Int32
+) raises -> Bool:
+    """Whether `Scalar::to<scalar_t>()` of a threshold Scalar arg in the
+    kernel's dtype `st` trips c10::overflows (c10/util/overflows.h): a bool
+    never; an int against the dtype's range (a negative one wraps into an
+    unsigned dtype while |v| <= its max); a double -- inf and nan convert
+    to a float dtype, never to an integer one, whose range is
+    [lowest, 2^digits)."""
+    if _scalar_to_name(st) == "":
+        return False
+    var is_int = (
+        st == ST_UINT8
+        or st == ST_INT8
+        or st == ST_INT16
+        or st == ST_INT32
+        or st == ST_INT64
+    )
+    var lo: Float64
+    var hi: Float64  # exclusive bound for an integer dtype, inclusive else
+    if st == ST_UINT8:
+        lo, hi = 0.0, 256.0
+    elif st == ST_INT8:
+        lo, hi = -128.0, 128.0
+    elif st == ST_INT16:
+        lo, hi = -32768.0, 32768.0
+    elif st == ST_INT32:
+        lo, hi = -2147483648.0, 2147483648.0
+    elif st == ST_INT64:
+        lo, hi = -9223372036854775808.0, 9223372036854775808.0
+    elif st == ST_FLOAT16:
+        lo, hi = -65504.0, 65504.0
     elif st == ST_BFLOAT16:
-        top = 3.3895313892515355e38
-    elif st == ST_FLOAT32:
-        top = 3.4028234663852886e38
+        lo, hi = -3.3895313892515355e38, 3.3895313892515355e38
     else:
-        return
+        lo, hi = -3.4028234663852886e38, 3.4028234663852886e38
     for i in range(first, last + 1):
         var v = args[unsafe_offset=i].copy()
+        if v_scalar_is_bool(v):
+            continue
+        if v_scalar_is_integral(v):
+            var n = v_int(v)
+            if is_int:
+                if st == ST_INT64:
+                    continue
+                var top = Int(hi) - 1
+                if n > top:
+                    return True
+                if st == ST_UINT8:
+                    if n < 0 and -n > top:
+                        return True
+                elif n < Int(lo):
+                    return True
+            elif Float64(n) < lo or Float64(n) > hi:
+                return True
+            continue
         if v.tag != TAG_SCALAR_DOUBLE:
             continue
         var f = v_f64(v)
-        if f == f and abs(f) <= 1.7976931348623157e308 and abs(f) > top:
-            raise Error(
-                "value cannot be converted to type ",
-                dtype_name(st),
-                " without overflow",
-            )
+        if f != f:
+            if is_int:
+                return True
+            continue
+        if is_int:
+            if f < lo or f >= hi:
+                return True
+        elif abs(f) <= 1.7976931348623157e308 and (f < lo or f > hi):
+            return True
+    return False
+
+
+def threshold_scalar_check(
+    args: Values, first: Int, last: Int, st: Int32
+) raises:
+    """Raises c10's `checked_convert` error when a threshold Scalar arg
+    overflows the kernel's dtype `st` (`threshold_scalar_overflows`)."""
+    if threshold_scalar_overflows(args, first, last, st):
+        raise Error(
+            "value cannot be converted to type ",
+            _scalar_to_name(st),
+            " without overflow",
+        )
 
 
 def threshold_into_overlapping(
@@ -1348,6 +1428,30 @@ def threshold_into_overlapping(
     var shape = IndexList[MAX_RANK](1)
     var rank = 0
     var first = v_tensor(args[unsafe_offset=0])
+    # compute_shape (resizable out skipped) before the device and dtype
+    # checks: infer_size's error, the trailing dims first, in the
+    # iterator's operand order (threshold_backward's is (self, grad)).
+    var bwd = op == "aten::threshold_backward"
+    for j0 in range(n_in):
+        var i = (1 - j0 if j0 < 2 else j0) if bwd else j0
+        var v = args[unsafe_offset=i].copy()
+        if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
+            continue
+        var t = v_tensor(v)
+        rank = max(rank, t.rank)
+        for j in range(MAX_RANK):
+            var k = MAX_RANK - 1 - j
+            if shape[k] == 1:
+                shape[k] = t.shape[k]
+            elif t.shape[k] != 1 and t.shape[k] != shape[k]:
+                raise Error(
+                    "The size of tensor a (",
+                    shape[k],
+                    ") must match the size of tensor b (",
+                    t.shape[k],
+                    ") at non-singleton dimension ",
+                    k - (MAX_RANK - rank),
+                )
     for i in range(n_in):
         var v = args[unsafe_offset=i].copy()
         if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
@@ -1362,14 +1466,6 @@ def threshold_into_overlapping(
                 device_str(t),
                 "!",
             )
-        # The operands broadcast (an incompatible pair is the plain path's
-        # error).
-        rank = max(rank, t.rank)
-        for k in range(MAX_RANK):
-            if shape[k] == 1:
-                shape[k] = t.shape[k]
-            elif t.shape[k] != 1 and t.shape[k] != shape[k]:
-                return False
         common = t.stype if n_t == 0 else result_type(first, t)
         if n_t == 0:
             first = t.copy()
@@ -1402,6 +1498,10 @@ def threshold_into_overlapping(
                 _shape_list_str(shape, rank),
             )
         resize_out(dst, shape, rank)
+    # The kernel's dispatch on out's dtype (no bool), then its Scalar
+    # conversion.
+    if dst.stype == ST_BOOL:
+        unsupported("\"threshold_cuda\" not implemented for 'Bool'")
     if op == "aten::threshold":
         threshold_scalar_check(args, 1, 2, dst.stype)
     else:

@@ -9,6 +9,7 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    ST_BOOL,
     ST_BFLOAT16,
     ST_FLOAT16,
     ST_FLOAT32,
@@ -65,6 +66,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.ops.matmul import _sm90_cuda
 from tmb.ops.common import (
     threshold_into_overlapping,
+    threshold_scalar_check,
     assert_no_internal_overlap,
     assert_no_overlap,
     assert_no_partial_overlap,
@@ -136,6 +138,7 @@ def op_threshold_backward(
     with value 0 and other = grad), a SELECTION in the promoted dtype of
     (self, grad): an inf / nan grad where self is at or below the
     threshold is 0, not a product's nan."""
+    _thrb_same_device(args, -1, "wrapper_CUDA_threshold_backward")
     var grad = v_tensor(args[unsafe_offset=0])
     var self = v_tensor(args[unsafe_offset=1])
     var common = result_type(self, grad)
@@ -159,16 +162,48 @@ def op_threshold_backward(
             ],
         )
     )
+    # The kernel's dispatch (no bool), then its `threshold.to<scalar_t>()`,
+    # after the iterator's checks.
+    if common == ST_BOOL:
+        unsupported("\"threshold_cuda\" not implemented for 'Bool'")
+    threshold_scalar_check(args, 2, 2, common)
     _ = cond^
     _ = g^
     _ = s^
     ret_owned(rets, 0, r)
 
 
+def _thrb_same_device(args: Values, out_idx: Int, method: StaticString) raises:
+    """The CUDA dispatcher wrapper's `check_and_update_common_device` over
+    (grad_input, grad_output, self): every tensor on the first one's device,
+    a CPU 0-d one included (it runs before TensorIterator)."""
+    var idx = List[Int]()
+    if out_idx >= 0:
+        idx.append(out_idx)
+    idx.append(0)
+    idx.append(1)
+    var first = v_tensor(args[unsafe_offset=idx[0]])
+    for j in range(1, len(idx)):
+        var t = v_tensor(args[unsafe_offset=idx[j]])
+        if t.device_type != first.device_type or t.device != first.device:
+            raise Error(
+                "Expected all tensors to be on the same device, but got ",
+                "grad_output" if idx[j] == 0 else "self",
+                " is on ",
+                device_str(t),
+                ", different from other tensors on ",
+                device_str(first),
+                " (when checking argument in method ",
+                method,
+                ")",
+            )
+
+
 # aten::threshold_backward.grad_input(Tensor grad_output, Tensor self, Scalar threshold, *, Tensor(a!) grad_input)
 def op_threshold_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _thrb_same_device(args, 3, "wrapper_CUDA_threshold_backward_out_grad_input")
     # Always the iterator sequence of threshold's config (out dtype
     # dispatch, safe casting, no overlap check), then the selection.
     if threshold_into_overlapping(
