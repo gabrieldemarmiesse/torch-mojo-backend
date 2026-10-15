@@ -69,6 +69,7 @@ from tmb.backend.abi import (
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.f8_iter import (
+    f8_cx_scalar,
     f8_iter,
     MODE_CAST,
     MODE_FN,
@@ -4364,12 +4365,12 @@ def register_pointwise(site: Site) raises:
     ](site)
     impl[op_clamp_tensor, "clamp.Tensor"](site)
     impl[op_clamp_tensor_out, "clamp.Tensor_out"](site)
-    impl[op_copysign, "copysign.Scalar"](site)
+    impl[f8_cx_scalar[op_copysign], "copysign.Scalar"](site)
     impl[
         f8_iter[op_copysign, "copysign_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "copysign.Tensor",
     ](site)
-    impl[op_copysign_out, "copysign.Scalar_out"](site)
+    impl[f8_cx_scalar[op_copysign_out], "copysign.Scalar_out"](site)
     impl[
         f8_iter[
             op_copysign_out, "copysign_cuda", 3, 2, MODE_CAST, False, PRE_NONE
@@ -4460,12 +4461,12 @@ def register_pointwise(site: Site) raises:
         ],
         "fmin.out",
     ](site)
-    impl[op_fmod, "fmod.Scalar"](site)
+    impl[f8_cx_scalar[op_fmod], "fmod.Scalar"](site)
     impl[
         f8_iter[op_fmod, "fmod_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "fmod.Tensor",
     ](site)
-    impl[op_fmod_out, "fmod.Scalar_out"](site)
+    impl[f8_cx_scalar[op_fmod_out], "fmod.Scalar_out"](site)
     impl[
         f8_iter[op_fmod_out, "fmod_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "fmod.Tensor_out",
@@ -5050,10 +5051,10 @@ def register_pointwise(site: Site) raises:
         "rsub.Tensor_out",
     ](site)
     impl[op_rsub_out_any, "rsub.Scalar_out"](site)
-    impl[op_pow_scalar_base, "pow.Scalar"](site)
-    impl[op_pow_scalar_base_out, "pow.Scalar_out"](site)
-    impl[op_pow_scalar_any, "pow.Tensor_Scalar"](site)
-    impl[op_pow_scalar_out_any, "pow.Tensor_Scalar_out"](site)
+    impl[f8_cx_scalar[op_pow_scalar_base], "pow.Scalar"](site)
+    impl[f8_cx_scalar[op_pow_scalar_base_out], "pow.Scalar_out"](site)
+    impl[f8_cx_scalar[op_pow_scalar_any], "pow.Tensor_Scalar"](site)
+    impl[f8_cx_scalar[op_pow_scalar_out_any], "pow.Tensor_Scalar_out"](site)
     impl[
         f8_iter[op_pow_tensor_any, "pow_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "pow.Tensor_Tensor",

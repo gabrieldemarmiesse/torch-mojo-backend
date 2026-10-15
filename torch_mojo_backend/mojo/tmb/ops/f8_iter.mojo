@@ -29,6 +29,7 @@ from tmb.backend.abi import (
     default_dtype,
     is_complex_stype,
     TAG_BOOL,
+    TAG_COMPLEX,
     TAG_SCALAR_BOOL,
     OpFn,
     ST_FLOAT32,
@@ -92,6 +93,9 @@ comptime PRE_THRESHOLD = 13  # self is added twice (self and other)
 comptime PRE_NO_COMPLEX = 14  # "<label> not implemented for complex tensors."
 comptime PRE_DISPATCH_OUT = 15  # the kernel dispatches on out's dtype first
 comptime PRE_COMPLEX_TO_FLOAT = 16  # complex self, real out: no iterator on out
+# A complex self is refused by the op's meta (TORCH_CHECK_NOT_IMPLEMENTED,
+# `label` is its message) before the iterator: ceil / floor / trunc / sign.
+comptime PRE_COMPLEX_NOT_IMPL = 17
 
 comptime _MAX_ARGS = 16
 
@@ -393,7 +397,17 @@ def _pre[
                 "heaviside is not yet implemented for tensors with different"
                 " dtypes."
             )
+    elif pre == PRE_COMPLEX_NOT_IMPL:
+        if _any_complex(args, ins):
+            unsupported(String(label))
     elif pre == PRE_BOOL_OUT:
+        # the meta's complex check comes first: signbit's is a
+        # TORCH_CHECK_NOT_IMPLEMENTED, isposinf / isneginf's a TORCH_CHECK
+        if _any_complex(args, ins):
+            comptime if label == "signbit":
+                unsupported("signbit is not implemented for complex tensors.")
+            else:
+                raise Error(String(label), " does not support complex inputs.")
         comptime if out_idx >= 0:
             if T(Int(args[unsafe_offset=out_idx].a)).dtype != DType.bool:
                 raise Error(
@@ -539,6 +553,24 @@ def _pre[
     elif pre == PRE_SELF_FIRST:
         return _Pre(-1, ins, True, "", ins, True)
     return _Pre(-1, ins, False, "", ins, True)
+
+
+def f8_cx_scalar[
+    op: OpFn
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """A Scalar overload of a binary op (`(Tensor, Scalar)` or
+    `(Scalar, Tensor)` in args 0 and 1): a complex Scalar meeting a float8
+    tensor is wrapped into a complex number whose result type needs
+    toComplexType(float8), c10's "Unknown Complex ScalarType" RuntimeError,
+    as `float8 + 1j` raises through the Tensor overload."""
+    for i in range(2):
+        var t = args[unsafe_offset=i].copy()
+        if args[unsafe_offset=1 - i].tag == TAG_COMPLEX and _f8_rec(t):
+            raise Error(
+                "Unknown Complex ScalarType for ",
+                _tname(T(Int(t.a)).stype),
+            )
+    op(args, n_args, rets, n_rets)
 
 
 def f8_iter[

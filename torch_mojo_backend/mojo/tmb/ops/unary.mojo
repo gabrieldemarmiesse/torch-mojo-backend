@@ -75,6 +75,7 @@ from tmb.ops.f8_iter import (
     MODE_OUTDT,
     MODE_SAME,
     PRE_BOOL_OUT,
+    PRE_COMPLEX_NOT_IMPL,
     PRE_COMPLEX_TO_FLOAT,
     PRE_DISPATCH_OUT,
     PRE_DIV_MODE,
@@ -2437,7 +2438,16 @@ def register_unary(site: Site) raises:
         "ceil",
     ](site)
     impl[
-        f8_iter[op_ceil_out, "ceil_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        f8_iter[
+            op_ceil_out,
+            "ceil_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_COMPLEX_NOT_IMPL,
+            "ceil is not supported for complex inputs",
+        ],
         "ceil.out",
     ](site)
     impl[
@@ -2519,7 +2529,16 @@ def register_unary(site: Site) raises:
         "floor",
     ](site)
     impl[
-        f8_iter[op_floor_out, "floor_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        f8_iter[
+            op_floor_out,
+            "floor_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_COMPLEX_NOT_IMPL,
+            "floor is not supported for complex inputs",
+        ],
         "floor.out",
     ](site)
     impl[
@@ -2692,7 +2711,19 @@ def register_unary(site: Site) raises:
         "sign",
     ](site)
     impl[
-        f8_iter[op_sign_out, "sign_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        f8_iter[
+            op_sign_out,
+            "sign_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_COMPLEX_NOT_IMPL,
+            (
+                "Unlike NumPy, torch.sign is not intended to support complex"
+                " numbers. Please use torch.sgn instead."
+            ),
+        ],
         "sign.out",
     ](site)
     impl[
@@ -3137,7 +3168,16 @@ def register_unary(site: Site) raises:
         "tanh.out",
     ](site)
     impl[
-        f8_iter[op_trunc_out, "trunc_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        f8_iter[
+            op_trunc_out,
+            "trunc_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_COMPLEX_NOT_IMPL,
+            "trunc is not supported for complex inputs",
+        ],
         "trunc.out",
     ](site)
     impl[

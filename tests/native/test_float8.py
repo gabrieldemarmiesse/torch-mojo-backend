@@ -2724,27 +2724,87 @@ def test_logical_not_float8_out_declined(mojo_device, src):
         assert b.cpu().tolist() == [False, True, False]
 
 
-def test_complex_with_float8_computes_or_declines(mojo_device):
+def test_complex_with_float8_declines_where_cuda_computes(mojo_device):
     """complex64[3] + float8 0-d and abs(complex, out=float8) compute on
-    stock CUDA (complex64; the real result copied into out). Where the mojo
-    device has no complex kernel for the op yet they decline with
-    NotImplementedError, never a promotion RuntimeError."""
+    stock CUDA (complex64 [3+1j, ...]; the real result copied into out).
+    The mojo device has no complex add / abs.out kernel yet: both decline
+    with NotImplementedError, never a promotion RuntimeError. Implementing
+    them must update this test (CUDA's values are in the docstring)."""
     c = torch.tensor([1 + 1j, 3 + 4j, 0j], device=mojo_device)
     z8 = torch.tensor(2.0).to(torch.float8_e4m3fn).to(mojo_device)
-    cases = [
-        (lambda: c + z8, [3 + 1j, 5 + 4j, 2 + 0j]),
-        (lambda: z8 * c, [2 + 2j, 6 + 8j, 0j]),
-        (
-            lambda: torch.abs(
-                c, out=torch.empty(0, dtype=torch.float8_e4m3fn, device=mojo_device)
-            ),
-            [1.375, 5.0, 0.0],
-        ),
-    ]
-    for fn, want in cases:
-        try:
-            got = fn()
-        except NotImplementedError:
-            continue
-        vals = got.cpu().tolist() if got.is_complex() else got.float().cpu().tolist()
-        assert vals == want
+    with pytest.raises(NotImplementedError, match="complex tensors"):
+        c + z8  # noqa: B018
+    with pytest.raises(NotImplementedError, match="complex tensors"):
+        z8 * c  # noqa: B018
+    out = torch.empty(0, dtype=torch.float8_e4m3fn, device=mojo_device)
+    with pytest.raises(NotImplementedError, match="complex tensors"):
+        torch.abs(c, out=out)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float8_e4m3fn, torch.float8_e5m2, torch.uint16, torch.float32]
+)
+@pytest.mark.parametrize("value", [[1j], [1.0]], ids=["complex", "real"])
+@pytest.mark.parametrize("on_cpu", [False, True], ids=["dev", "cpu"])
+def test_masked_fill_value_rank_checked_first(mojo_device, dtype, value, on_cpu):
+    """masked_fill__cuda's Tensor overload checks a 0-d value before the
+    dtype dispatch (stock CUDA 2.11: RuntimeError, not the float8 / uint16
+    NotImplementedError)."""
+    x = torch.zeros(3).to(dtype).to(mojo_device)
+    m = torch.ones(3, dtype=torch.bool, device=mojo_device)
+    v = torch.tensor(value, device="cpu" if on_cpu else mojo_device)
+    msg = "only supports a 0-dimensional value tensor, but got tensor with 1"
+    with pytest.raises(RuntimeError, match=msg):
+        x.masked_fill_(m, v)
+    with pytest.raises(RuntimeError, match=msg):
+        x.masked_fill(m, v)
+
+
+@pytest.mark.parametrize(
+    "op,exc,msg",
+    [
+        ("ceil", NotImplementedError, "ceil is not supported for complex inputs"),
+        ("floor", NotImplementedError, "floor is not supported for complex inputs"),
+        ("trunc", NotImplementedError, "trunc is not supported for complex inputs"),
+        ("sign", NotImplementedError, "Unlike NumPy, torch.sign is not intended"),
+        ("signbit", NotImplementedError, "signbit is not implemented for complex"),
+        ("isposinf", RuntimeError, "isposinf does not support complex inputs"),
+        ("isneginf", RuntimeError, "isneginf does not support complex inputs"),
+    ],
+)
+def test_complex_self_float8_out_meta_refusal(mojo_device, op, exc, msg):
+    """The op's meta refuses a complex self before the iterator checks a
+    float8 out (stock CUDA 2.11), out untouched."""
+    c = torch.tensor([1 + 1j, 2.5 + 0j, -3j], device=mojo_device)
+    out = torch.empty(0, dtype=torch.float8_e4m3fn, device=mojo_device)
+    with pytest.raises(exc, match=msg):
+        getattr(torch, op)(c, out=out)
+    assert out.shape == (0,)
+
+
+_F8_CX_SCALAR = [
+    lambda x: torch.pow(x, 2j),
+    lambda x: torch.pow(2j, x),
+    lambda x: x**2j,
+    lambda x: 2j**x,
+    lambda x: torch.remainder(x, 2j),
+    lambda x: torch.remainder(2j, x),
+    lambda x: x % 2j,
+    lambda x: torch.fmod(x, 2j),
+    lambda x: torch.copysign(x, 2j),
+    lambda x: torch.bitwise_and(x, 2j),
+    lambda x: torch.bitwise_or(x, 2j),
+    lambda x: torch.bitwise_xor(x, 2j),
+    lambda x: x & 2j,
+]
+
+
+@pytest.mark.parametrize("i", range(len(_F8_CX_SCALAR)))
+def test_float8_complex_scalar_overloads(mojo_device, i):
+    """The Scalar overloads wrap the complex number as the Tensor ones do:
+    toComplexType(float8) fails (stock CUDA 2.11 RuntimeError)."""
+    x = torch.tensor([1.0, 0.0, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    with pytest.raises(
+        RuntimeError, match="Unknown Complex ScalarType for Float8_e4m3fn"
+    ):
+        _F8_CX_SCALAR[i](x)

@@ -95,6 +95,7 @@ from tmb.ops.common import (
 )
 from tmb.ops.core import cast_for_copy
 from tmb.ops.f8_iter import (
+    f8_cx_scalar,
     f8_iter,
     MODE_CAST,
     MODE_FN,
@@ -3324,7 +3325,7 @@ def register_binary(site: Site) raises:
         ],
         "addcmul.out",
     ](site)
-    impl[op_bitwise_and, "bitwise_and.Scalar"](site)
+    impl[f8_cx_scalar[op_bitwise_and], "bitwise_and.Scalar"](site)
     impl[
         f8_iter[
             op_bitwise_and, "bitwise_and_cuda", 3, -1, MODE_FN, True, PRE_NONE
@@ -3343,8 +3344,8 @@ def register_binary(site: Site) raises:
         ],
         "bitwise_and.Tensor_out",
     ](site)
-    impl[op_bitwise_and_out, "bitwise_and.Scalar_out"](site)
-    impl[op_bitwise_or, "bitwise_or.Scalar"](site)
+    impl[f8_cx_scalar[op_bitwise_and_out], "bitwise_and.Scalar_out"](site)
+    impl[f8_cx_scalar[op_bitwise_or], "bitwise_or.Scalar"](site)
     impl[
         f8_iter[
             op_bitwise_or, "bitwise_or_cuda", 3, -1, MODE_FN, True, PRE_NONE
@@ -3363,8 +3364,8 @@ def register_binary(site: Site) raises:
         ],
         "bitwise_or.Tensor_out",
     ](site)
-    impl[op_bitwise_or_out, "bitwise_or.Scalar_out"](site)
-    impl[op_bitwise_xor, "bitwise_xor.Scalar"](site)
+    impl[f8_cx_scalar[op_bitwise_or_out], "bitwise_or.Scalar_out"](site)
+    impl[f8_cx_scalar[op_bitwise_xor], "bitwise_xor.Scalar"](site)
     impl[
         f8_iter[
             op_bitwise_xor, "bitwise_xor_cuda", 3, -1, MODE_FN, True, PRE_NONE
@@ -3383,7 +3384,7 @@ def register_binary(site: Site) raises:
         ],
         "bitwise_xor.Tensor_out",
     ](site)
-    impl[op_bitwise_xor_out, "bitwise_xor.Scalar_out"](site)
+    impl[f8_cx_scalar[op_bitwise_xor_out], "bitwise_xor.Scalar_out"](site)
     impl[op_clamp, "clamp"](site)
     impl[op_clamp_out, "clamp.out"](site)
     impl[op_clamp_max, "clamp_max"](site)
@@ -3634,15 +3635,15 @@ def register_binary(site: Site) raises:
         f8_iter[op_mul_out, "mul_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "mul.out",
     ](site)
-    impl[op_remainder, "remainder.Scalar"](site)
-    impl[op_remainder, "remainder.Scalar_Tensor"](site)
+    impl[f8_cx_scalar[op_remainder], "remainder.Scalar"](site)
+    impl[f8_cx_scalar[op_remainder], "remainder.Scalar_Tensor"](site)
     impl[
         f8_iter[
             op_remainder, "remainder_cuda", 3, -1, MODE_FN, False, PRE_NONE
         ],
         "remainder.Tensor",
     ](site)
-    impl[op_remainder_out, "remainder.Scalar_out"](site)
+    impl[f8_cx_scalar[op_remainder_out], "remainder.Scalar_out"](site)
     impl[
         f8_iter[
             op_remainder_out, "remainder_cuda", 3, 2, MODE_CAST, False, PRE_NONE
