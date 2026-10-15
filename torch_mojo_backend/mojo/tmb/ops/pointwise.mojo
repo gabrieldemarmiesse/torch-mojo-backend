@@ -125,6 +125,7 @@ from tmb.ops.common import (
     threshold_into_overlapping,
     threshold_scalar_check,
     threshold_scalar_overflows,
+    threshold_scalar_value,
     _repeats_elements,
     can_cast,
     decline_float8,
@@ -2579,9 +2580,15 @@ def op_gelu_backward_any(
 
 def _threshold_p(args: Values) raises -> SIMD[DType.float64, 4]:
     var st = _self_stype(args, 0)
+    if _pw_is_int(st):
+        return _p(
+            _int_exact_param(args[unsafe_offset=1], st),
+            _int_exact_param(args[unsafe_offset=2], st),
+        )
+    # An int64 Scalar past 2**53 rounds once, to float32, as C++ does.
     return _p(
-        _round_to(_int_exact_param(args[unsafe_offset=1], st), st),
-        _round_to(_int_exact_param(args[unsafe_offset=2], st), st),
+        v_f64(threshold_scalar_value(args[unsafe_offset=1], st)),
+        v_f64(threshold_scalar_value(args[unsafe_offset=2], st)),
     )
 
 

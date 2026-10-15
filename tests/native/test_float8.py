@@ -3373,6 +3373,33 @@ def _threshold_scalar_lines(dev):
             xd = torch.ones(2, dtype=dt, device=dev)
             yield _act_res(lambda xd=xd, v=v: a.threshold(xd, 0, v))
             yield _act_res(lambda xd=xd, v=v: a.threshold(xd, v, 0))
+    # Integers past 2**53 travel exactly and round once to the computation
+    # dtype: inputs straddling each threshold expose the converted value.
+    bigs = [2**53 - 1, 2**53, 2**53 + 1, 2**53 + 3, -(2**53 + 1)]
+    bigs += [2**63 - 1, -(2**63)]
+    for dt in dts:
+        for v in bigs:
+            if dt.is_floating_point:
+                b = torch.tensor(float(v), dtype=dt)
+                xs = torch.stack(
+                    [
+                        torch.nextafter(b, torch.tensor(-float("inf"), dtype=dt)),
+                        b,
+                        torch.nextafter(b, torch.tensor(float("inf"), dtype=dt)),
+                    ]
+                )
+            elif dt == torch.int64:
+                lo, hi = max(v - 1, -(2**63)), min(v + 1, 2**63 - 1)
+                xs = torch.tensor([lo, v, hi], dtype=dt)
+            else:
+                xs = torch.tensor([0, 1, 2], dtype=dt)
+            xb = xs.to(dev)
+            gf = torch.tensor([1.0, 2.0, 3.0], device=dev)
+            yield _act_res(lambda xb=xb, v=v: a.threshold(xb, v, -5))
+            yield _act_res(lambda xb=xb, v=v: a.threshold_backward(gf, xb, v))
+            yield _act_res(lambda xb=xb, v=v: a.threshold_backward(xb, xb, v))
+            o = torch.empty(0, dtype=dt, device=dev)
+            yield _act_res(lambda xb=xb, v=v, o=o: a.threshold.out(xb, 0, v, out=o), o)
     # The overflow raises in the kernel, after the iterator resized out.
     for v in (1e6, 100000):
         o = out0()

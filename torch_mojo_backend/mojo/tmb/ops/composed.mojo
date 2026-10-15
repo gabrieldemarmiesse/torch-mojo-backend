@@ -9,6 +9,7 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    new_scalar,
     ST_BOOL,
     ST_BFLOAT16,
     ST_FLOAT16,
@@ -67,6 +68,8 @@ from tmb.ops.matmul import _sm90_cuda
 from tmb.ops.common import (
     threshold_into_overlapping,
     threshold_scalar_check,
+    threshold_scalar_overflows,
+    threshold_scalar_value,
     assert_no_internal_overlap,
     assert_no_overlap,
     assert_no_partial_overlap,
@@ -144,11 +147,23 @@ def op_threshold_backward(
     var common = result_type(self, grad)
     var g = own_if_new(cast_to(grad, common, False), grad)
     var s = own_if_new(cast_to(self, common, False), self)
+    # The kernel compares in the common dtype against `threshold.to<
+    # scalar_t>()`: that exact value as a 0-d operand of the common dtype
+    # (an int64 past 2**53 kept whole, never declined). An overflowing or
+    # bool case still runs the iterator's shape checks, then raises.
+    var bad = common == ST_BOOL or threshold_scalar_overflows(
+        args, 2, 2, common
+    )
+    var thr = own(new_scalar(common, s.t.device))
+    if not bad:
+        fill_value(thr.t, threshold_scalar_value(args[unsafe_offset=2], common))
+    else:
+        fill_value(thr.t, 0.0)
     var cond = own(
         _dispatch(
             "aten::le",
-            "Scalar",
-            [_tensor_value(s.t), args[unsafe_offset=2].copy()],
+            "Tensor",
+            [_tensor_value(s.t), _tensor_value(thr.t)],
         )
     )
     var r = own(
@@ -167,6 +182,7 @@ def op_threshold_backward(
     if common == ST_BOOL:
         unsupported("\"threshold_cuda\" not implemented for 'Bool'")
     threshold_scalar_check(args, 2, 2, common)
+    _ = thr^
     _ = cond^
     _ = g^
     _ = s^
