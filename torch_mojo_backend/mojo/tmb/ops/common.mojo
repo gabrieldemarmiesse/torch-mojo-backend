@@ -155,6 +155,52 @@ def broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
     return shape
 
 
+def _sizes_str(t: T) -> String:
+    var s = String("[")
+    for i in range(t.rank):
+        if i > 0:
+            s += ", "
+        s += String(t.dim(i))
+    return s + "]"
+
+
+def check_expands_to(t: T, target: T) raises:
+    """`t.expand(target.sizes())` would succeed (ATen's `expand_inplace`):
+    no more dims than the target, and each dim equal to the target's or 1.
+    Raises expand's own errors."""
+    if t.rank > target.rank:
+        raise Error(
+            "expand(",
+            scalar_type_name(t.stype),
+            "Type{",
+            _sizes_str(t),
+            "}, size=",
+            _sizes_str(target),
+            "): the number of sizes provided (",
+            target.rank,
+            ") must be greater or equal to the number of dimensions in the"
+            " tensor (",
+            t.rank,
+            ")",
+        )
+    for i in range(1, t.rank + 1):
+        var have = t.dim(t.rank - i)
+        var want = target.dim(target.rank - i)
+        if have != want and have != 1:
+            raise Error(
+                "The expanded size of the tensor (",
+                want,
+                ") must match the existing size (",
+                have,
+                ") at non-singleton dimension ",
+                target.rank - i,
+                ".  Target sizes: ",
+                _sizes_str(target),
+                ".  Tensor sizes: ",
+                _sizes_str(t),
+            )
+
+
 def device_str(t: T) -> String:
     """`c10::Device::str()`: the lower-case device-type name plus an index
     when the tensor carries one. PrivateUse1 prints under the name torch was

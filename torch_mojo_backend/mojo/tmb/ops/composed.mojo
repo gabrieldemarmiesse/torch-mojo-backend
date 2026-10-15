@@ -81,7 +81,7 @@ from tmb.ops.common import (
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
-    _ew_overlaps,
+    where_out_overlaps,
     cx_where_out,
     routed,
 )
@@ -518,10 +518,9 @@ def op_where_self_out(
             " but got ",
             String(out.dtype),
         )
-    # TensorIterator's memory-overlap checks, on the out as given: an out
-    # sharing part of the condition or an operand would change under the
-    # write
-    _ew_overlaps(args, 3, out)
+    # TensorIterator's memory-overlap checks on the out as given, against
+    # the operands it reads unconverted
+    where_out_overlaps(args, out)
     if not out.same_shape(r.t):
         resize_out(out, r.t.shape, r.t.rank)
     _copy_into(out, r)

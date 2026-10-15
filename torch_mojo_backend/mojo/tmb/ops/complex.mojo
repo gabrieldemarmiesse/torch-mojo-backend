@@ -128,6 +128,7 @@ from tmb.ops.common import (
     assert_no_overlap,
     assert_no_internal_overlap,
     assert_no_partial_overlap,
+    check_expands_to,
     store_out,
 )
 
@@ -435,22 +436,50 @@ def _ew_overlaps(args: Values, n_in: Int, dest: T) raises:
                 assert_no_partial_overlap(dest, t)
 
 
+def where_out_overlaps(args: Values, dest: T) raises:
+    """where.self_out's memory-overlap checks, on the operands its
+    TensorIterator actually reads: `where_self_out` first converts a uint8
+    condition to bool and an operand of another dtype than the result's
+    into a new tensor, so only a bool condition and the operands already
+    of the out's dtype (the result type, checked before) can alias it."""
+    assert_no_internal_overlap(dest)
+    for i in range(3):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
+            continue
+        var t = v_tensor_c(v)
+        if not t.on_mojo() or t.device != dest.device:
+            continue
+        if i == 0 and t.dtype != DType.bool:
+            continue
+        if i > 0 and t.stype != dest.stype:
+            continue
+        assert_no_partial_overlap(dest, t)
+
+
 def _is_same(a: T, b: T) -> Bool:
     """TensorBase::is_same: the same TensorImpl."""
     return a.impl() == b.impl()
 
 
 def _store_ew_n(
-    args: Values, n_in: Int, mut dest: T, var res: Owned, rets: Values
+    args: Values,
+    n_in: Int,
+    mut dest: T,
+    var res: Owned,
+    rets: Values,
+    check_overlaps: Bool = True,
 ) raises:
     """`_store` for an elementwise op (a TensorIterator in ATen): the out's
     device, then its memory-overlap checks against itself and against each
     of the first `n_in` arguments that is a tensor -- made on the out as
     given, before it is resized, as TensorIterator's compute_mem_overlaps
     is -- then the cast check, resize and copy. An out that IS one of the
-    inputs (an in-place op, or out= aliasing an input) is never resized."""
+    inputs (an in-place op, or out= aliasing an input) is never resized.
+    `check_overlaps` False: the caller made its own overlap checks."""
     _same_device(dest, res.t)
-    _ew_overlaps(args, n_in, dest)
+    if check_overlaps:
+        _ew_overlaps(args, n_in, dest)
     if not dest.same_shape(res.t):
         for i in range(n_in):
             var v = args[unsafe_offset=i].copy()
@@ -2239,7 +2268,9 @@ def cx_where_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             " but got ",
             _st_name(dest.stype),
         )
-    _store_ew[3](args, dest, res^, rets)
+    _same_device(dest, res.t)
+    where_out_overlaps(args, dest)
+    _store_ew_n(args, 3, dest, res^, rets, check_overlaps=False)
 
 
 def _masked_fill_into(target: T, mask: Value, value: Value) raises:
@@ -2380,7 +2411,9 @@ def cx_masked_fill_(
     # masked_fill_'s own check: a mask sharing part of self's memory would
     # change under the write (the real part is written before the mask is
     # read for the imaginary one)
-    assert_no_partial_overlap(self, v_tensor_c(args[unsafe_offset=1]))
+    var mask = v_tensor_c(args[unsafe_offset=1])
+    assert_no_partial_overlap(self, mask)
+    check_expands_to(mask, self)  # expand_inplace(self, mask)
     if not self.is_complex():
         _masked_fill_real_(self, args)
         ret_ref(rets, 0, self)
