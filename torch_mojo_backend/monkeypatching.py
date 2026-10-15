@@ -18,18 +18,14 @@ monkeypatches and stay in ``mojo_device/register.py``.
 import functools
 import os
 import sys
-import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from functools import wraps
 from typing import TYPE_CHECKING
 
 import torch
 import torch._tensor_str
 import torch.distributed.distributed_c10d as c10d
-import torch.utils._python_dispatch as python_dispatch
 import torch.utils._triton
-from torch._subclasses import functional_tensor
-from torch.fx.experimental import proxy_tensor
 
 from torch_mojo_backend.native import device_module
 
@@ -193,105 +189,6 @@ def fix_batch_isend_irecv_for_python_process_groups():
     batch_isend_irecv._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
     c10d.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
     torch.distributed.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
-
-
-@functools.cache
-def _stock_backends_decompose(op: torch._ops.OpOverload) -> bool:
-    """`op` is CompositeImplicitAutograd with a mojo kernel, and neither CPU
-    nor CUDA has a kernel of its own, so a CPU or CUDA program decomposes it
-    where a mojo program keeps it whole. Cached per op: it is only asked
-    inside run_decompositions, after register_mojo_devices has registered
-    every mojo kernel."""
-    has_kernel = torch._C._dispatch_has_kernel_for_dispatch_key
-    key = torch._C.DispatchKey
-    return (
-        has_kernel(op.name(), key.CompositeImplicitAutograd)
-        and has_kernel(op.name(), key.PrivateUse1)
-        and not has_kernel(op.name(), key.CPU)
-        and not has_kernel(op.name(), key.CUDA)
-    )
-
-
-# Per thread: how many `ExportedProgram.run_decompositions` calls are on the
-# stack. A counter, not a flag, so a nested call returning does not end the
-# outer one's decompositions.
-_run_decompositions_depth = threading.local()
-
-
-def decompose_composite_ops_with_mojo_kernels_in_export():
-    """`ExportedProgram.run_decompositions` keeps whole, in a mojo program, the
-    CompositeImplicitAutograd (CIA) ops the mojo device has a kernel for,
-    where a CPU or CUDA program decomposes them.
-
-    Since torch 2.10, functionalization and proxy tracing decompose a
-    functional CIA op only if ``autograd_would_have_decomposed``
-    (``torch/utils/_python_dispatch.py``) says so: only when the device has
-    no kernel of its own, as the dispatcher's autograd key would. That is
-    right for torch.compile, which must trace the fused kernel eager runs,
-    but ``run_decompositions`` asks for a decomposition table to be applied:
-    a mojo program kept ``aten.linear``, ``isclose`` and ``isfinite`` in a
-    "core ATen" program, and a custom table entry for them was ignored. No
-    in-tree backend has a kernel on a CIA op that CPU decomposes, so upstream
-    never meets this. Torch 2.7-2.9 decompose every CIA op they trace, so
-    there is nothing to patch there.
-
-    While a ``run_decompositions`` call is running in this thread, answer
-    True also for a mojo program's CIA op that CPU and CUDA both decompose
-    (no CPU or CUDA kernel). The decomposition is then the one the table
-    gives, run by functionalization, above the proxy tracer, as on CPU --
-    so isclose's in-place ``|=`` comes out functional, a table that
-    preserves an op still keeps it, and ``inference_mode`` makes no
-    difference. An op with a CPU or CUDA kernel (``silu_backward``,
-    ``mish_backward``, the ``.default`` nearest upsamplings) stays whole, as
-    it does on those devices. Only the answer for a mojo tensor changes, so
-    other programs' graphs are untouched, and torch.compile, outside
-    ``run_decompositions``, still traces the fused mojo kernels.
-
-    The only state is a per-thread depth counter: nested calls and calls in
-    other threads do not see each other's. (Upstream's
-    ``_override_composite_implicit_decomp``, which installs the table for
-    the call, mutates ``OpOverload.py_kernels`` process-wide, so concurrent
-    ``run_decompositions`` calls in several threads race there regardless.)
-    """
-    modules = (python_dispatch, functional_tensor, proxy_tensor)
-    if not all(hasattr(m, "autograd_would_have_decomposed") for m in modules):
-        return
-    original = python_dispatch.autograd_would_have_decomposed
-    if getattr(original, "_torch_mojo_backend", False):
-        return
-    run = torch.export.ExportedProgram.run_decompositions
-
-    @wraps(original)
-    def autograd_would_have_decomposed(
-        func: torch._ops.OpOverload, flat_args: Sequence[object]
-    ) -> bool:
-        if original(func, flat_args):
-            return True
-        if not getattr(_run_decompositions_depth, "value", 0):
-            return False
-        # the device of the first tensor, as upstream decides
-        tensor = next((a for a in flat_args if isinstance(a, torch.Tensor)), None)
-        return (
-            tensor is not None
-            and tensor.device.type == "mojo"
-            and _stock_backends_decompose(func)
-        )
-
-    @wraps(run)
-    def run_decompositions(
-        self: torch.export.ExportedProgram, *args: object, **kwargs: object
-    ) -> torch.export.ExportedProgram:
-        depth = _run_decompositions_depth
-        depth.value = getattr(depth, "value", 0) + 1
-        try:
-            return run(self, *args, **kwargs)
-        finally:
-            depth.value -= 1
-
-    autograd_would_have_decomposed._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
-    for module in modules:
-        module.autograd_would_have_decomposed = autograd_would_have_decomposed  # ty: ignore[invalid-assignment]
-    torch.export.ExportedProgram.run_decompositions = run_decompositions
 
 
 def add_mojo_to_the_inductor_gpu_types():

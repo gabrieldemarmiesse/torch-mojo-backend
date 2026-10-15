@@ -9,7 +9,6 @@ from torch_mojo_backend.distributed import register_distributed_backend
 from torch_mojo_backend.env_vars import warn_about_unknown_env_vars
 from torch_mojo_backend.mojo_device.hip_peer import warn_if_gpu_torch_on_hip
 from torch_mojo_backend.monkeypatching import (
-    decompose_composite_ops_with_mojo_kernels_in_export,
     fix_batch_isend_irecv_for_python_process_groups,
     fix_privateuse1_dlpack_device_type,
     print_apple_gpu_tensors_from_the_host,
@@ -55,7 +54,6 @@ def register_mojo_devices():
         fix_privateuse1_dlpack_device_type()
         fix_batch_isend_irecv_for_python_process_groups()
         print_apple_gpu_tensors_from_the_host()
-        decompose_composite_ops_with_mojo_kernels_in_export()
         native.register()
         install_triton_hook()
         warn_if_gpu_torch_on_hip()
