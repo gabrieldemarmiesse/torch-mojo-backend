@@ -16,7 +16,6 @@ from collections.abc import Callable
 
 import pytest
 import torch
-from _pytest.mark.structures import ParameterSet
 from torch import nn
 from torch._decomp import core_aten_decompositions
 from torch.export import Dim
@@ -194,12 +193,41 @@ def _linear_mm(
 # (`autograd_would_have_decomposed`), so that export and compile trace what
 # eager runs; `run_decompositions` follows it (pytorch#171897 closed as
 # expected). A mojo program therefore keeps the CIA ops the mojo device has
-# kernels for and CPU / CUDA have not, whatever the table says. Torch
+# kernels for and CPU has not, whatever the table says. Torch
 # 2.7-2.9 decompose every CIA op they trace.
-_KEPT_WHOLE_ON_MOJO = (
-    (aten.linear.default, aten.isclose.default, aten.isfinite.default)
-    if hasattr(python_dispatch, "autograd_would_have_decomposed")
-    else ()
+def _kept_whole_on_mojo() -> list[torch._ops.OpOverload]:
+    """The CIA ops a mojo program keeps whole that a CPU program decomposes:
+    those with a mojo kernel and no CPU kernel, read from the dispatcher
+    (so only once the mojo device has registered its kernels: call it from
+    a test). Empty before torch 2.10."""
+    if not hasattr(python_dispatch, "autograd_would_have_decomposed"):
+        return []
+    has_kernel = torch._C._dispatch_has_kernel_for_dispatch_key
+    key = torch._C.DispatchKey
+    ops = []
+    for name in torch._C._dispatch_get_registrations_for_dispatch_key("PrivateUse1"):
+        if has_kernel(name, key.CompositeImplicitAutograd) and not has_kernel(
+            name, key.CPU
+        ):
+            namespace, _, qualified = name.partition("::")
+            op_name, _, overload = qualified.partition(".")
+            packet = getattr(getattr(torch.ops, namespace), op_name)
+            ops.append(getattr(packet, overload or "default"))
+    return ops
+
+
+# Torch < 2.10 registers no AutogradPrivateUse1 fallback (pytorch#165315
+# added it), so a CompositeImplicitAutograd op with no autograd formula of its
+# own has no AutogradPrivateUse1 kernel once the mojo device registers a kernel
+# for it: isclose and isfinite on a mojo tensor raise NotImplementedError,
+# eagerly and while tracing.
+_NEEDS_AUTOGRAD_FALLBACK = pytest.mark.xfail(
+    not torch._C._dispatch_has_backend_fallback(
+        torch._C.DispatchKey.AutogradPrivateUse1
+    ),
+    reason="torch < 2.10 has no AutogradPrivateUse1 fallback: isclose / isfinite"
+    " have a mojo kernel and no autograd kernel there",
+    strict=True,
 )
 
 
@@ -220,7 +248,7 @@ def _table(
     else:
         assert name in ("core_aten", "default", "core_aten_inference_mode")
     if device == "mojo":
-        for op in _KEPT_WHOLE_ON_MOJO:
+        for op in _kept_whole_on_mojo():
             decomp.pop(op, None)
     elif name == "core_aten":
         return None
@@ -263,8 +291,9 @@ def test_run_decompositions(mojo_gpu, table):
         ep = ep.run_decompositions(_table(table))
         want = torch.export.export(cpu, (x,)).run_decompositions(_table(table, "mojo"))
     assert _ops(ep) == _ops(want)
-    keeps_linear = table in ("inference", "preserve_linear") or bool(
-        _KEPT_WHOLE_ON_MOJO
+    keeps_linear = (
+        table in ("inference", "preserve_linear")
+        or aten.linear.default in _kept_whole_on_mojo()
     )
     assert (aten.linear.default in _targets(ep)) == keeps_linear
     if table == "custom":
@@ -274,6 +303,7 @@ def test_run_decompositions(mojo_gpu, table):
     _close(ep.module()(x.to(mojo_gpu)), cpu(x))
 
 
+@_NEEDS_AUTOGRAD_FALLBACK
 def test_make_fx_decomposes_kept_ops(mojo_gpu):
     """The workaround pytorch#171897 points to: re-trace the program with
     make_fx and a decomposition table, then export and decompose again. A
@@ -291,17 +321,15 @@ def test_make_fx_decomposes_kept_ops(mojo_gpu):
     ep = torch.export.export(gm, on_device).run_decompositions()
     want = torch.export.export(cpu, args).run_decompositions()
     assert _ops(ep) == _ops(want)
-    assert not set(_KEPT_WHOLE_ON_MOJO) & _targets(ep)
+    assert not set(_kept_whole_on_mojo()) & _targets(ep)
     _close(ep.module()(*on_device), cpu(*args))
 
 
-def _cases_per_op() -> list[ParameterSet]:
-    """(fn, inputs, runs) for every CompositeImplicitAutograd op the mojo
-    device has a kernel for (and isclose's equal_nan branch, mish_backward
-    with mixed dtypes), plus F.interpolate's nearest modes. `runs` is False
-    where the decomposed program needs an `aten::index.Tensor` with several
-    index tensors, which the device declines: those still compare graphs
-    and assert the decline, so supporting it flips them."""
+def _cases_per_op():
+    """(fn, inputs) for every CompositeImplicitAutograd op the mojo device
+    has a kernel for (and isclose's equal_nan branch, mish_backward with
+    mixed dtypes), plus the nearest upsamplings and F.interpolate's nearest
+    modes."""
     g = torch.Generator().manual_seed(7)
     x = torch.randn(4, 6, generator=g)
     special = x.clone()
@@ -310,25 +338,24 @@ def _cases_per_op() -> list[ParameterSet]:
     close[1, ::2] += 1
     grad = torch.randn(4, 6, generator=g)
     weight, bias = torch.randn(5, 6, generator=g), torch.randn(5, generator=g)
+    needs_fallback = {"marks": _NEEDS_AUTOGRAD_FALLBACK}
     cases = [
-        pytest.param(nn.functional.linear, (x, weight, bias), True, id="linear"),
-        pytest.param(torch.isclose, (special, close), True, id="isclose"),
+        pytest.param(nn.functional.linear, (x, weight, bias), id="linear"),
+        pytest.param(torch.isclose, (special, close), id="isclose", **needs_fallback),
         pytest.param(
             lambda a, b: torch.isclose(a, b, equal_nan=True),
             (special, close),
-            True,
             id="isclose_equal_nan",
+            **needs_fallback,
         ),
-        pytest.param(torch.isfinite, (special,), True, id="isfinite"),
-        pytest.param(aten.silu_backward, (grad, x), True, id="silu_backward"),
-        pytest.param(aten.mish_backward, (grad, x), True, id="mish_backward"),
-        pytest.param(
-            aten.mish_backward, (grad, x.half()), True, id="mish_backward_f32_f16"
-        ),
+        pytest.param(torch.isfinite, (special,), id="isfinite", **needs_fallback),
+        pytest.param(aten.silu_backward, (grad, x), id="silu_backward"),
+        pytest.param(aten.mish_backward, (grad, x), id="mish_backward"),
+        pytest.param(aten.mish_backward, (grad, x.half()), id="mish_backward_f32_f16"),
     ]
-    # The `.default` upsamplings are the CIA overloads with a mojo kernel;
-    # they have a CPU kernel too, so they stay whole. F.interpolate goes
-    # through the `.vec` overloads, which decompose to index ops.
+    # The `.default` upsamplings have a CPU and a mojo kernel (no CIA one),
+    # so they stay whole from torch 2.10. F.interpolate goes through the
+    # `.vec` overloads, CIA with no mojo kernel, which decompose to index ops.
     for rank, size in ((1, [7]), (2, [7, 9]), (3, [7, 9, 4])):
         t = torch.randn(2, 3, *(5, 4, 3)[:rank], generator=g)
         for name, mode in (
@@ -337,9 +364,7 @@ def _cases_per_op() -> list[ParameterSet]:
         ):
             op = getattr(aten, name).default
             cases.append(
-                pytest.param(
-                    lambda a, op=op, size=size: op(a, size), (t,), True, id=name
-                )
+                pytest.param(lambda a, op=op, size=size: op(a, size), (t,), id=name)
             )
             cases.append(
                 pytest.param(
@@ -347,11 +372,21 @@ def _cases_per_op() -> list[ParameterSet]:
                         a, size=size, mode=mode
                     ),
                     (t,),
-                    (rank, mode) == (2, "nearest"),
                     id=f"interpolate_{mode}_{rank}d",
                 )
             )
     return cases
+
+
+def _needs_multi_index(ep: torch.export.ExportedProgram) -> bool:
+    """The program calls `aten.index.Tensor` with an index anywhere but on
+    the leading dim alone, which the mojo device declines."""
+    for node in ep.graph.nodes:
+        if node.target is aten.index.Tensor:
+            present = [i for i, t in enumerate(node.args[1]) if t is not None]
+            if present != [0]:
+                return True
+    return False
 
 
 class _Call(nn.Module):
@@ -370,24 +405,29 @@ def _decomposed(
 ):
     ep = torch.export.export(_Call(fn), args).run_decompositions(table)
     nodes = [n for n in ep.graph.nodes if n.op == "call_function"]
-    return ep, [(n.target, n.meta["val"].dtype) for n in nodes]
+    # Some nodes carry no value (torch 2.7's _assert_tensor_metadata):
+    # those compare by target alone.
+    return ep, [(n.target, getattr(n.meta.get("val"), "dtype", None)) for n in nodes]
 
 
-@pytest.mark.parametrize(("fn", "args", "runs"), _cases_per_op())
-def test_run_decompositions_per_op(mojo_gpu, fn, args, runs):
+@pytest.mark.parametrize(("fn", "args"), _cases_per_op())
+def test_run_decompositions_per_op(mojo_gpu, fn, args):
     """Core ATen on a one-op program. The mojo program's graph (ops and
     dtypes, in order) is upstream's: the CPU program's with the ops the
     mojo device keeps whole left whole. A CUDA program, when there is one,
     gets the CPU program's graph: registering the mojo device does not
     change it. Values and dtypes match CPU; isclose stays whole on mojo, or
-    decomposes functionally on torch < 2.10."""
+    decomposes functionally on torch < 2.10. A program decomposed to an
+    `aten.index.Tensor` with several index tensors (the nearest upsamplings
+    but 2d nearest; the `.default` ones only before torch 2.10) asserts the
+    device's decline instead, so supporting it flips them."""
     cpu_ep, want = _decomposed(fn, args)
     ep, got = _decomposed(fn, tuple(a.to(mojo_gpu) for a in args))
     assert got == _decomposed(fn, args, _table("core_aten", "mojo"))[1]
     if torch.cuda.is_available():
         assert _decomposed(fn, tuple(a.cuda() for a in args))[1] == want
     want_out = cpu_ep.module()(*args)
-    if not runs:
+    if _needs_multi_index(ep):
         with pytest.raises(NotImplementedError, match="index.Tensor"):
             ep.module()(*(a.to(mojo_gpu) for a in args))
         return
@@ -511,9 +551,11 @@ def test_export_dynamic_batch(mojo_gpu, form):
         cpu_module = torch.export.export(
             cpu, (_input(8, 37),), dynamic_shapes=({0: Dim("batch", min=2, max=512)},)
         ).module()
-        with pytest.raises(AssertionError, match="<= 512") as on_cpu:
+        # (AssertionError from the guards since torch 2.9, RuntimeError
+        # from the input-constraint hook before)
+        with pytest.raises((AssertionError, RuntimeError), match="512") as on_cpu:
             cpu_module(_input(513, 37))
-        with pytest.raises(type(on_cpu.value), match="<= 512"):
+        with pytest.raises(type(on_cpu.value), match=re.escape(str(on_cpu.value))):
             module(_input(513, 37).to(mojo_gpu))
         x = _input(1, 37)
         _close(module(x.to(mojo_gpu)), cpu_module(x))
@@ -546,9 +588,9 @@ def test_export_derived_dim(mojo_gpu):
         dynamic_shapes={"x": {0: d}, "y": {0: 2 * d}},
     ).module()
     x, y = _input(3, 37), _input(1, 37)
-    with pytest.raises(AssertionError, match="Guard failed") as on_cpu:
+    with pytest.raises((AssertionError, RuntimeError)) as on_cpu:
         cpu_module(x, y)
-    with pytest.raises(AssertionError, match=re.escape(str(on_cpu.value))):
+    with pytest.raises(type(on_cpu.value), match=re.escape(str(on_cpu.value))):
         module(x.to(mojo_gpu), y.to(mojo_gpu))
 
 
