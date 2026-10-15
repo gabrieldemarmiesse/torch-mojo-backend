@@ -55,6 +55,7 @@ from tmb.backend.abi import (
     TAG_TENSOR,
     TAG_TENSOR_REF,
     TAG_SCALAR_DOUBLE,
+    TAG_SCALAR_INT,
     v_int,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
@@ -1348,7 +1349,9 @@ def threshold_scalar_overflows(
                 if n > top:
                     return True
                 if st == ST_UINT8:
-                    if n < 0 and -n > top:
+                    # A negative wraps while its magnitude fits (compared
+                    # without negating: -(-2**63) overflows).
+                    if n < -top:
                         return True
                 elif n < Int(lo):
                     return True
@@ -1368,6 +1371,33 @@ def threshold_scalar_overflows(
         elif abs(f) <= 1.7976931348623157e308 and (f < lo or f > hi):
             return True
     return False
+
+
+def threshold_scalar_value(v: Value, st: Int32) raises -> Value:
+    """`Scalar::to<scalar_t>()` of a threshold Scalar (already checked for
+    overflow) as a Scalar record exact in `st`: an integer dtype keeps the
+    int64 (no float on the way), a floating one takes the value C++ makes --
+    an int64 rounded once to float32 (c10::Half / BFloat16 are built from a
+    float; a double only from an int64 directly), a double through float32
+    for Half / BFloat16."""
+    if is_int_stype(st):
+        return Value(TAG_SCALAR_INT, 0, Int64(scalar_to_int(v, st)), 0)
+    var f: Float64
+    if v_scalar_is_integral(v):
+        var i = Int64(v_int(v))
+        if st == ST_FLOAT64:
+            f = i.cast[DType.float64]()
+        else:
+            f = i.cast[DType.float32]().cast[DType.float64]()
+    else:
+        f = v_f64(v)
+        if st == ST_FLOAT32 or st == ST_FLOAT16 or st == ST_BFLOAT16:
+            f = f.cast[DType.float32]().cast[DType.float64]()
+    if st == ST_FLOAT16:
+        f = f.cast[DType.float32]().cast[DType.float16]().cast[DType.float64]()
+    elif st == ST_BFLOAT16:
+        f = f.cast[DType.float32]().cast[DType.bfloat16]().cast[DType.float64]()
+    return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(f), 0)
 
 
 def threshold_scalar_check(
