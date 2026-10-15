@@ -74,7 +74,7 @@ from tmb.ops.f8_iter import (
     MODE_CAST,
     MODE_FN,
     MODE_INPLACE,
-    MODE_NOCHECK,
+    MODE_COPY_OUT,
     MODE_OUTDT,
     MODE_SAME,
     PRE_BOOL_OUT,
@@ -5063,18 +5063,34 @@ def register_pointwise(site: Site) raises:
             "ufunc_add_CUDA",
             3,
             3,
-            MODE_NOCHECK,
+            MODE_COPY_OUT,
             False,
             PRE_RSUB,
         ],
         "rsub.Tensor_out",
     ](site)
-    impl[routed[op_rsub_out_any, cx_rsub_out, 4], "rsub.Scalar_out"](site)
+    # rsub's out= overloads are generated wrappers: the functional result
+    # (its float8 refusal leaves out untouched), then resize and copy
+    impl[
+        f8_iter[
+            routed[op_rsub_out_any, cx_rsub_out, 4],
+            "ufunc_add_CUDA",
+            1,
+            3,
+            MODE_COPY_OUT,
+            False,
+            PRE_NONE,
+        ],
+        "rsub.Scalar_out",
+    ](site)
     impl[
         f8_cx_scalar[routed[op_pow_scalar_base, cx_pow_tensor, 2]], "pow.Scalar"
     ](site)
+    # pow.Scalar_out takes its dtype from the out (no result type): the out
+    # is resized, a base equal to 1 fills ones, any other complex base
+    # meets the float8 exponent in pow.Tensor_Tensor (cx_pow_tensor_out)
     impl[
-        f8_cx_scalar[routed[op_pow_scalar_base_out, cx_pow_tensor_out, 3]],
+        routed[op_pow_scalar_base_out, cx_pow_tensor_out, 3],
         "pow.Scalar_out",
     ](site)
     impl[

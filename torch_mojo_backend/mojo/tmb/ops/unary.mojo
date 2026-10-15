@@ -2475,7 +2475,16 @@ def register_unary(site: Site) raises:
         "atanh.out",
     ](site)
     impl[
-        f8_iter[op_ceil, "ceil_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_ceil,
+            "ceil_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_COMPLEX_NOT_IMPL,
+            "ceil is not supported for complex inputs",
+        ],
         "ceil",
     ](site)
     impl[
@@ -2582,7 +2591,16 @@ def register_unary(site: Site) raises:
         "expm1.out",
     ](site)
     impl[
-        f8_iter[op_floor, "floor_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_floor,
+            "floor_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_COMPLEX_NOT_IMPL,
+            "floor is not supported for complex inputs",
+        ],
         "floor",
     ](site)
     impl[
@@ -2834,7 +2852,19 @@ def register_unary(site: Site) raises:
         "sigmoid.out",
     ](site)
     impl[
-        f8_iter[op_sign, "sign_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_sign,
+            "sign_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_COMPLEX_NOT_IMPL,
+            (
+                "Unlike NumPy, torch.sign is not intended to support complex"
+                " numbers. Please use torch.sgn instead."
+            ),
+        ],
         "sign",
     ](site)
     impl[
@@ -2854,7 +2884,16 @@ def register_unary(site: Site) raises:
         "sign.out",
     ](site)
     impl[
-        f8_iter[op_signbit, "signbit_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_signbit,
+            "signbit_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_BOOL_OUT,
+            "signbit",
+        ],
         "signbit",
     ](site)
     impl[
@@ -3324,7 +3363,16 @@ def register_unary(site: Site) raises:
         "trunc.out",
     ](site)
     impl[
-        f8_iter[op_trunc, "trunc_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_trunc,
+            "trunc_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_COMPLEX_NOT_IMPL,
+            "trunc is not supported for complex inputs",
+        ],
         "trunc",
     ](site)
     impl[
@@ -3398,7 +3446,16 @@ def register_unary(site: Site) raises:
         "isfinite",
     ](site)
     impl[
-        f8_iter[op_isposinf, "isposinf_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_isposinf,
+            "isposinf_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_BOOL_OUT,
+            "isposinf",
+        ],
         "isposinf",
     ](site)
     impl[
@@ -3415,7 +3472,16 @@ def register_unary(site: Site) raises:
         "isposinf.out",
     ](site)
     impl[
-        f8_iter[op_isneginf, "isneginf_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            op_isneginf,
+            "isneginf_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_BOOL_OUT,
+            "isneginf",
+        ],
         "isneginf",
     ](site)
     impl[

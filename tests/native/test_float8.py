@@ -2864,3 +2864,114 @@ def test_float8_rsub_promotes_other_first(mojo_device):
     c = torch.ones(3, dtype=torch.complex64, device=mojo_device)
     with pytest.raises(RuntimeError, match=msg + "ComplexFloat and Float8_e4m3fn"):
         torch.rsub(x8, c)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x, o: torch.eq(x, x, out=o),
+        lambda x, o: torch.ne(x, 2, out=o),
+        lambda x, o: torch.pow(x, 2, out=o),
+    ],
+    ids=["eq", "ne_scalar", "pow"],
+)
+def test_float8_into_complex_out_overlap_checked_before_resize(mojo_device, fn):
+    """TensorIterator checks the out's internal overlap before resizing it
+    (stock CUDA 2.11: RuntimeError, out keeps its expanded shape)."""
+    x8 = torch.tensor([1.0, 0.5, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    out = torch.zeros(1, dtype=torch.complex64, device=mojo_device).expand(6)
+    with pytest.raises(RuntimeError, match="more than one element of the written-to"):
+        fn(x8, out)
+    assert out.shape == (6,)
+
+
+@pytest.mark.parametrize("odt", [torch.complex64, torch.float8_e4m3fn])
+def test_float8_rsub_out_is_a_generated_wrapper(mojo_device, odt):
+    """rsub's out= overloads compute the functional result first: its
+    float8 refusal leaves out untouched (stock CUDA 2.11)."""
+    x8 = torch.tensor([1.0, 0.5, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    aten = torch.ops.aten
+    for fn in (
+        lambda o: aten.rsub.Scalar_out(x8, 2, out=o),
+        lambda o: aten.rsub.Tensor_out(x8, x8, out=o),
+    ):
+        out = torch.empty(0, dtype=odt, device=mojo_device)
+        with pytest.raises(
+            NotImplementedError, match='"ufunc_add_CUDA" not implemented'
+        ):
+            fn(out)
+        assert out.shape == (0,)
+
+
+@pytest.mark.parametrize("odt", [torch.complex64, torch.float8_e4m3fn, torch.float32])
+def test_float8_pow_complex_scalar_base_out(mojo_device, odt):
+    """pow.Scalar_out takes its dtype from out (no result type): the out is
+    resized, a base equal to 1 fills ones, any other complex base meets the
+    float8 exponent in pow.Tensor_Tensor (stock CUDA 2.11)."""
+    x8 = torch.tensor([1.0, 0.5, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    out = torch.empty(0, dtype=odt, device=mojo_device)
+    torch.pow(1 + 0j, x8, out=out)
+    assert out.shape == (3,)
+    vals = out.cpu().tolist() if odt.is_complex else out.float().cpu().tolist()
+    assert vals == [1, 1, 1]
+    out = torch.empty(0, dtype=odt, device=mojo_device)
+    with pytest.raises(
+        RuntimeError, match="Unknown Complex ScalarType for Float8_e4m3fn"
+    ):
+        torch.pow(2j, x8, out=out)
+    assert out.shape == (3,)
+    with pytest.raises(
+        RuntimeError, match="Unknown Complex ScalarType for Float8_e4m3fn"
+    ):
+        torch.pow(1 + 0j, x8)
+
+
+@pytest.mark.parametrize("odt", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_fft_into_float8_out(mojo_device, odt):
+    """A real transform into a float8 out: castable, stored by mul_out's
+    TensorIterator with c10's conversion (never saturating: 2000 / 4 is
+    NaN in e4m3fn), as stock CUDA 2.11 does."""
+    for vals in ([1 + 1j, 0.5 - 1j, 2 + 0j], [2000 + 0j, 0j, 0j]):
+        c = torch.tensor(vals)
+        for name, fn in (
+            ("irfft", lambda t, o: torch.fft.irfft(t, out=o)),
+            ("hfft", lambda t, o: torch.fft.hfft(t, out=o)),
+            ("c2r", lambda t, o: torch.ops.aten._fft_c2r.out(t, [0], 2, 4, out=o)),
+        ):
+            want = fn(c, torch.empty(0)).to(odt)
+            out = torch.empty(0, dtype=odt, device=mojo_device)
+            fn(c.to(mojo_device), out)
+            torch.testing.assert_close(
+                out.float().cpu(), want.float(), equal_nan=True, msg=name
+            )
+
+
+def test_complex_meta_refusals_without_float8(mojo_device):
+    """A complex operand meets these ops' own checks before anything else,
+    float8 or not (stock CUDA 2.11 error kinds and messages)."""
+    c = torch.tensor([1 + 1j, 0.5 - 1j, 2 + 0j], device=mojo_device)
+    x8 = torch.tensor([1.0, 0.5, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    for fn, exc, msg in (
+        (lambda: torch.isposinf(c), RuntimeError, "isposinf does not support complex"),
+        (lambda: torch.isneginf(c), RuntimeError, "isneginf does not support complex"),
+        (lambda: torch.signbit(c), NotImplementedError, "signbit is not implemented"),
+        (lambda: torch.ceil(c), NotImplementedError, "ceil is not supported for"),
+        (lambda: torch.maximum(c, c), RuntimeError, "maximum not implemented for"),
+        (
+            lambda: torch.dot(c, x8),
+            RuntimeError,
+            "same dtype, but found ComplexFloat and Float8_e4m3fn",
+        ),
+        (
+            lambda: torch.vdot(x8, c),
+            RuntimeError,
+            "same dtype, but found Float8_e4m3fn and ComplexFloat",
+        ),
+        (
+            lambda: torch.ops.aten._fft_r2c(x8, [0], 0, True),
+            RuntimeError,
+            "Unknown Complex ScalarType for Float8_e4m3fn",
+        ),
+    ):
+        with pytest.raises(exc, match=msg):
+            fn()

@@ -346,15 +346,47 @@ struct _Pre(Movable):
     var cpu_scalars: Bool  # the iterator allows one CPU 0-d operand
 
 
-def _any_complex(args: Values, ins: Int) raises -> Bool:
+def _cx_rec(v: Value) -> Bool:
+    """A complex tensor record (one dtype query, as `_f8_rec`)."""
+    if not _rec_tensor(v):
+        return False
+    return is_complex_stype(external_call["tmb_tensor_dtype", Int32](Int(v.a)))
+
+
+def _any_complex(args: Values, ins: Int) -> Bool:
     """Whether a tensor operand among `ins` is complex."""
     for i in range(_MAX_ARGS):
-        if (ins >> i) & 1 == 0:
-            continue
-        var v = args[unsafe_offset=i].copy()
-        if _rec_tensor(v) and T(Int(v.a)).is_complex():
+        if (ins >> i) & 1 == 1 and _cx_rec(args[unsafe_offset=i]):
             return True
     return False
+
+
+def _complex_meta[
+    pre: Int, ins: Int, out_idx: Int, label: StaticString
+](args: Values) raises:
+    """The op's meta-function refusal of a complex operand: it comes before
+    anything else (float8 or not), so it runs on every call of these ops."""
+    comptime if pre == PRE_NO_COMPLEX:
+        # maximum / minimum / fmax / fmin
+        if _any_complex(args, ins):
+            raise Error(String(label), " not implemented for complex tensors.")
+    elif pre == PRE_COMPLEX_NOT_IMPL:
+        if _any_complex(args, ins):
+            unsupported(String(label))
+    elif pre == PRE_HEAVISIDE:
+        var cx = _any_complex(args, ins)
+        comptime if out_idx >= 0:
+            cx = cx or _cx_rec(args[unsafe_offset=out_idx])
+        if cx:
+            raise Error("heaviside is not yet implemented for complex tensors.")
+    elif pre == PRE_BOOL_OUT:
+        # signbit's is a TORCH_CHECK_NOT_IMPLEMENTED, isposinf / isneginf's
+        # a TORCH_CHECK
+        if _any_complex(args, ins):
+            comptime if label == "signbit":
+                unsupported("signbit is not implemented for complex tensors.")
+            else:
+                raise Error(String(label), " does not support complex inputs.")
 
 
 def _pre[
@@ -376,18 +408,9 @@ def _pre[
                     " supported. If you are trying to invert a mask, use the"
                     " `~` or `logical_not()` operator instead."
                 )
-    elif pre == PRE_NO_COMPLEX:
-        # maximum / minimum / fmax / fmin's meta, before their iterator
-        if _any_complex(args, ins):
-            raise Error(String(label), " not implemented for complex tensors.")
     elif pre == PRE_HEAVISIDE:
         var a = T(Int(args[unsafe_offset=0].a))
         var b = T(Int(args[unsafe_offset=1].a))
-        var cx = _any_complex(args, ins)
-        comptime if out_idx >= 0:
-            cx = cx or T(Int(args[unsafe_offset=out_idx].a)).is_complex()
-        if cx:
-            raise Error("heaviside is not yet implemented for complex tensors.")
         var same = a.stype == b.stype
         comptime if out_idx >= 0:
             same = (
@@ -398,17 +421,7 @@ def _pre[
                 "heaviside is not yet implemented for tensors with different"
                 " dtypes."
             )
-    elif pre == PRE_COMPLEX_NOT_IMPL:
-        if _any_complex(args, ins):
-            unsupported(String(label))
     elif pre == PRE_BOOL_OUT:
-        # the meta's complex check comes first: signbit's is a
-        # TORCH_CHECK_NOT_IMPLEMENTED, isposinf / isneginf's a TORCH_CHECK
-        if _any_complex(args, ins):
-            comptime if label == "signbit":
-                unsupported("signbit is not implemented for complex tensors.")
-            else:
-                raise Error(String(label), " does not support complex inputs.")
         comptime if out_idx >= 0:
             if T(Int(args[unsafe_offset=out_idx].a)).dtype != DType.bool:
                 raise Error(
@@ -589,6 +602,7 @@ def f8_iter[
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """`ins`: bitmask of the operand args; `out_idx`: the out= (or, inside
     `ins`, the in-place self) arg, -1 for none."""
+    _complex_meta[pre, ins, out_idx, label](args)
     var touched = False
     for i in range(_MAX_ARGS):
         if (ins >> i) & 1 == 1 and _f8_rec(args[unsafe_offset=i]):

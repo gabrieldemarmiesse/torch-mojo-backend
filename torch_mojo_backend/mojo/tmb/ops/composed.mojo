@@ -9,6 +9,8 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    v_tensor_c,
+    no_complex,
     new_scalar,
     ST_BOOL,
     ST_BFLOAT16,
@@ -66,6 +68,7 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.matmul import _sm90_cuda
 from tmb.ops.common import (
+    scalar_type_name,
     threshold_into_overlapping,
     threshold_scalar_check,
     threshold_scalar_overflows,
@@ -1221,8 +1224,10 @@ def op_trace(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _dot(args: Values, rets: Values) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
+    # complex operands are read for dot's own checks (a mixed-dtype pair is
+    # its RuntimeError), then declined
+    var a = v_tensor_c(args[unsafe_offset=0])
+    var b = v_tensor_c(args[unsafe_offset=1])
     if a.rank != 1 or b.rank != 1:
         raise Error(
             "1D tensors expected, but got ",
@@ -1234,10 +1239,11 @@ def _dot(args: Values, rets: Values) raises:
     if a.stype != b.stype:
         raise Error(
             "dot : expected both vectors to have same dtype, but found ",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.stype),
             " and ",
-            _scalar_type_name(b.dtype),
+            scalar_type_name(b.stype),
         )
+    no_complex(a)
     if a.numel != b.numel:
         raise Error(
             "inconsistent tensor size, expected tensor [",
