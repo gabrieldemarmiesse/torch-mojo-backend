@@ -1,7 +1,9 @@
 // ATen's own view kernels, registered for this device.
 //
 // `view`, `_unsafe_view`, `_reshape_alias` and `as_strided` produce a tensor that shares its
-// input's storage and differs only in sizes, strides and storage offset.
+// input's storage and differs only in sizes, strides and storage offset;
+// `view_as_real` / `view_as_complex` also reinterpret its dtype (a complex
+// element as two real ones), which only a C++ TensorImpl can express.
 // There is no device code in them: ATen's kernels are what CPU, CUDA, MPS and
 // XPU all register (native_functions.yaml), and they are what this file
 // registers for PrivateUse1 -- unboxed, so a call skips the IValue boxing a
@@ -15,9 +17,12 @@
 #include "tmb_internal.h"
 
 #include <ATen/core/Tensor.h>
+#include <ATen/native/MathBitsFallback.h>
 #include <ATen/ops/_reshape_alias_native.h>
 #include <ATen/ops/_unsafe_view_native.h>
 #include <ATen/ops/as_strided_native.h>
+#include <ATen/ops/view_as_complex_native.h>
+#include <ATen/ops/view_as_real_native.h>
 #include <ATen/ops/view_native.h>
 #include <c10/core/SymIntArrayRef.h>
 #include <torch/library.h>
@@ -62,6 +67,16 @@ at::Tensor as_strided_pu1(const at::Tensor& self, c10::SymIntArrayRef size,
           : std::nullopt);
 }
 
+at::Tensor view_as_real_pu1(const at::Tensor& self) {
+  tmb_count_op_call("aten::view_as_real");
+  return at::native::view_as_real(self);
+}
+
+at::Tensor view_as_complex_pu1(const at::Tensor& self) {
+  tmb_count_op_call("aten::view_as_complex");
+  return at::native::view_as_complex(self);
+}
+
 }  // namespace
 
 extern "C" int32_t tmb_library_impl_aten_view(TmbLibrary lib, const char* name) {
@@ -76,6 +91,10 @@ extern "C" int32_t tmb_library_impl_aten_view(TmbLibrary lib, const char* name) 
       m.impl("_reshape_alias", TORCH_FN(reshape_alias_pu1));
     } else if (which == "as_strided") {
       m.impl("as_strided", TORCH_FN(as_strided_pu1));
+    } else if (which == "view_as_real") {
+      m.impl("view_as_real", TORCH_FN(view_as_real_pu1));
+    } else if (which == "view_as_complex") {
+      m.impl("view_as_complex", TORCH_FN(view_as_complex_pu1));
     } else {
       tmb_set_error(("mojo backend: no ATen view kernel named " + which).c_str());
       return 1;
@@ -85,4 +104,58 @@ extern "C" int32_t tmb_library_impl_aten_view(TmbLibrary lib, const char* name) 
     tmb_set_error(e.what());
     return 1;
   }
+}
+
+// `_copy_from` writes into its `dst` argument, but its schema does not mark
+// it mutable, so the Conjugate and Negative keys' boxed fallback hands the
+// backend kernel a bit-resolved CLONE of a conj / neg destination
+// (`x.conj().copy_(y)`, `x.conj().imag.copy_(y)`, and the write-back of every
+// in-place op on such a view) and the write is lost. For a call with a mojo
+// tensor, skip the fallback instead: the Mojo `_copy_from` resolves the bits
+// on both sides itself (tmb/ops/core.mojo, `_copy_bits`), as `copy_`, on
+// the fallback's fallthrough list, already sees them. Any other call
+// (another out-of-tree backend's `_copy_from` in the same process) runs
+// torch's own fallback, unchanged: this registration is per op and
+// process-global, so it must not alter theirs.
+namespace {
+
+template <c10::DispatchKey Key>
+struct BitFallbackForOthers : at::native::MathOpFallback {
+  BitFallbackForOthers()
+      : MathOpFallback(Key, Key == c10::DispatchKey::Conjugate ? "conjugate" : "negation") {}
+  bool is_bit_set(const at::Tensor& tensor) override {
+    return Key == c10::DispatchKey::Conjugate ? tensor.is_conj() : tensor.is_neg();
+  }
+};
+
+template <c10::DispatchKey Key>
+void copy_from_math_bit(const c10::OperatorHandle& op, c10::DispatchKeySet ks,
+                        torch::jit::Stack* stack) {
+  const auto n = op.schema().arguments().size();
+  bool ours = false;
+  for (size_t i = stack->size() - n; i < stack->size(); ++i) {
+    const auto& v = (*stack)[i];
+    if (v.isTensor() && v.toTensor().defined() &&
+        v.toTensor().device().type() == c10::DeviceType::PrivateUse1) {
+      ours = true;
+    }
+  }
+  if (ours) {
+    op.redispatchBoxed(ks & c10::DispatchKeySet(c10::DispatchKeySet::FULL_AFTER, Key), stack);
+    return;
+  }
+  BitFallbackForOthers<Key> fallback;
+  fallback.fallback_impl(op, ks, stack);
+}
+
+}  // namespace
+
+TORCH_LIBRARY_IMPL(aten, Conjugate, m) {
+  m.impl("_copy_from", torch::CppFunction::makeFromBoxedFunction<
+                           &copy_from_math_bit<c10::DispatchKey::Conjugate>>());
+}
+
+TORCH_LIBRARY_IMPL(aten, Negative, m) {
+  m.impl("_copy_from", torch::CppFunction::makeFromBoxedFunction<
+                           &copy_from_math_bit<c10::DispatchKey::Negative>>());
 }

@@ -25,7 +25,13 @@ from tmb.backend.abi import (
     Values,
     ST_BOOL,
     ST_FLOAT64,
+    ST_INT8,
+    ST_INT16,
+    ST_INT32,
+    ST_INT64,
+    ST_UINT8,
     default_dtype,
+    f64_bits,
     dtype_code,
     dtype_name,
     max_dtype,
@@ -60,6 +66,14 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import is_float8
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.common import (
+    device_str,
+    fill_item,
+    assert_no_partial_overlap,
+    check_expands_to,
+    check_real_scalar_fits,
+    is_wide_unsigned,
+    real_fill_value,
+    scalar_type_name,
     assert_no_internal_overlap,
     binary_promotion,
     broadcast_shape,
@@ -95,6 +109,19 @@ from tmb.ops.f8_iter import (
     PRE_SUB,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    resize_any,
+    cx_eq,
+    cx_eq_out,
+    cx_equal,
+    cx_masked_fill,
+    cx_masked_fill_,
+    cx_masked_fill_out,
+    cx_ne,
+    cx_ne_out,
+    cx_where,
+    routed,
+)
 from tmb.ops.core import _host_copy, cast_for_copy
 from tmb.ops.binary import _b_out_guard, _b_tside
 
@@ -1034,18 +1061,49 @@ def op_where_self(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_owned(rets, 0, out)
 
 
-def _masked_fill_validate(a: T, mask: T) raises:
-    if is_float8(a.dtype):
-        # CUDA's masked_fill kernel has no float8 case (where.self has).
-        unsupported(
-            '"masked_fill_" not implemented for \''
-            + _scalar_type_name(a.dtype)
-            + "'"
-        )
+def _masked_fill_validate(a: T, mask: T, in_place: Bool = False) raises:
     if mask.dtype != DType.bool:
         unsupported("masked_fill: mask must be a bool tensor")
     if not a.on_mojo() or not mask.on_mojo() or a.device != mask.device:
         raise Error("expected both operands on the same mojo device")
+    if in_place:
+        # masked_fill_'s own check: a mask sharing part of self's memory
+        # would change under the write
+        assert_no_partial_overlap(a, mask)
+        check_expands_to(mask, a)  # expand_inplace(self, mask)
+    if is_wide_unsigned(a.stype) or is_float8(a.dtype):
+        # CUDA's (and the CPU's) kernel is not instantiated for them (nor
+        # for float8, which where.self has): the dtype dispatch refuses
+        # before the value converts
+        unsupported(
+            '"masked_fill_" not implemented for \''
+            + scalar_type_name(a.stype)
+            + "'"
+        )
+
+
+def _is_int_fill(st: Int32) -> Bool:
+    """An integer masked_fill self: its value fills exactly (64 bits), not
+    through a Float64."""
+    return (
+        st == ST_INT8
+        or st == ST_INT16
+        or st == ST_INT32
+        or st == ST_INT64
+        or st == ST_UINT8
+    )
+
+
+def _masked_fill_value(v: Value, a: T) raises -> Value:
+    """masked_fill's `value.to<scalar_t>()` for a real self `a`, as the record
+    the fill kernels take: an integer self converts as fill_ does (checked,
+    then `real_fill_value`: a complex Scalar as its real part, 2**63 into
+    int64 as the host static_cast's INT64_MIN), any other self through
+    `scalar_as_fill`."""
+    if _is_int_fill(a.stype):
+        check_real_scalar_fits(a.stype, v)
+        return real_fill_value(a.stype, v)
+    return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(scalar_as_fill(v, a.dtype)), 0)
 
 
 def _is_masked_fill_scalar_dtype(dtype: DType) -> Bool:
@@ -1162,7 +1220,19 @@ def scalar_as_fill(v: Value, dtype: DType) raises -> Float64:
 def _masked_fill_scalar_dispatch(
     mask: T, a: T, value_arg: Value, dst: T
 ) raises:
-    var value = scalar_as_fill(value_arg, a.dtype)
+    var rec = _masked_fill_value(value_arg, a)
+    if _is_int_fill(a.stype):
+        if dst.numel == 0:
+            return
+        var ifill = own(new_scalar(a.stype, a.device))
+        fill_value(ifill.t, rec)
+        _masked_fill_where(mask, ifill.t, a, dst)
+        _ = ifill^  # alive past the launch
+        return
+    var value = v_f64(rec)
+    if a.dtype == DType.float16 or a.dtype == DType.bfloat16:
+        # through float, as c10's Half / BFloat16 conversions from double
+        value = Float64(Float32(value))
     if dst.numel == 0:
         return
     if _is_masked_fill_scalar_dtype(a.dtype) and mask.rank <= 4 and a.rank <= 4:
@@ -1192,6 +1262,31 @@ def _shares_storage(dest: T, t: T) -> Bool:
     """`dest` and `t` live in one storage (resizing `dest` can move `t`)."""
     var sp = dest.storage_ptr()
     return sp != 0 and sp == t.storage_ptr()
+
+
+def _masked_fill_out_dtype(mut out_arg: T, ae: T, a: T) raises:
+    """masked_fill's generated out= wrapper: the out is resized to the
+    result's shape, then its dtype must be self's (CUDA's order)."""
+    var other_device = not out_arg.on_mojo() or out_arg.device != a.device
+    if out_arg.stype == a.stype and not other_device:
+        return
+    if not _shape_eq(out_arg, ae.shape, ae.rank):
+        resize_any(out_arg, ae.shape, ae.rank)
+    if out_arg.stype == a.stype:
+        raise Error(
+            "Expected out tensor to have device ",
+            device_str(a),
+            ", but got ",
+            device_str(out_arg),
+            " instead",
+        )
+    raise Error(
+        "Expected out tensor to have dtype ",
+        dtype_name(a.stype),
+        ", but got ",
+        dtype_name(out_arg.stype),
+        " instead",
+    )
 
 
 def _masked_fill_expanded(a: T, mask: T) raises -> T:
@@ -1234,6 +1329,8 @@ def op_masked_fill_scalar_out(
     var out_arg = v_tensor(args[unsafe_offset=3])
     _masked_fill_validate(a, mask)
     var ae = _masked_fill_expanded(a, mask)
+    _ = _masked_fill_value(args[unsafe_offset=2], a)  # the value first
+    _masked_fill_out_dtype(out_arg, ae, a)
     if _shares_storage(out_arg, a) or _shares_storage(out_arg, mask):
         # The autogenerated out= overload's order: the functional result
         # first, then resize + copy. A resize of an `out` sharing storage
@@ -1261,7 +1358,7 @@ def op_masked_fill__scalar(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
-    _masked_fill_validate(a, mask)
+    _masked_fill_validate(a, mask, in_place=True)
     if a.contig:
         # Writing dst == a is safe: each element reads and writes the same
         # flat index (a's own strides are the output layout).
@@ -1295,9 +1392,11 @@ def _value_is_direct(a: T, val: T) -> Bool:
     return val.dtype == a.dtype and val.on_mojo() and val.device == a.device
 
 
-def _value_item(val: T) raises -> Value:
-    var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(val)], 1)
-    return r[0]
+def _value_item(val: T, a: T) raises -> Value:
+    """`value.item()` for self `a` (a uint64 value read unsigned)."""
+    return fill_item(
+        val, a.stype, val.on_mojo() and a.on_mojo() and val.device == a.device
+    )
 
 
 # aten::masked_fill.Tensor(Tensor self, Tensor mask, Tensor value) -> Tensor
@@ -1313,7 +1412,7 @@ def op_masked_fill_tensor(
     if _value_is_direct(a, val):
         _masked_fill_where(mask, val, ae, out.t)
     else:
-        _masked_fill_scalar_dispatch(mask, ae, _value_item(val), out.t)
+        _masked_fill_scalar_dispatch(mask, ae, _value_item(val, a), out.t)
     ret_owned(rets, 0, out)
 
 
@@ -1321,7 +1420,7 @@ def _masked_fill_value_into(mask: T, a: T, val: T, dst: T) raises:
     if _value_is_direct(a, val):
         _masked_fill_where(mask, val, a, dst)
     else:
-        _masked_fill_scalar_dispatch(mask, a, _value_item(val), dst)
+        _masked_fill_scalar_dispatch(mask, a, _value_item(val, a), dst)
 
 
 # aten::masked_fill.Tensor_out(Tensor self, Tensor mask, Tensor value, *, Tensor(a!) out) -> Tensor(a!)
@@ -1334,6 +1433,9 @@ def op_masked_fill_tensor_out(
     _masked_fill_validate(a, mask)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
     var ae = _masked_fill_expanded(a, mask)
+    if not _value_is_direct(a, val):
+        _ = _masked_fill_value(_value_item(val, a), a)  # the value first
+    _masked_fill_out_dtype(out_arg, ae, a)
     if (
         _shares_storage(out_arg, a)
         or _shares_storage(out_arg, mask)
@@ -1362,7 +1464,7 @@ def op_masked_fill__tensor(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
-    _masked_fill_validate(a, mask)
+    _masked_fill_validate(a, mask, in_place=True)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
     if a.contig:
         _masked_fill_value_into(mask, a, val, a)
@@ -1960,14 +2062,14 @@ def register_compare(site: Site) raises:
     impl[op_assert_async, "_assert_async"](site)
     impl[op_assert_async_msg, "_assert_async.msg"](site)
     impl[op_functional_assert_async_msg, "_functional_assert_async.msg"](site)
-    impl[op_eq_tensor, "eq.Tensor"](site)
-    impl[op_eq_tensor_out, "eq.Tensor_out"](site)
-    impl[op_eq_scalar, "eq.Scalar"](site)
-    impl[op_eq_scalar_out, "eq.Scalar_out"](site)
-    impl[op_ne_tensor, "ne.Tensor"](site)
-    impl[op_ne_tensor_out, "ne.Tensor_out"](site)
-    impl[op_ne_scalar, "ne.Scalar"](site)
-    impl[op_ne_scalar_out, "ne.Scalar_out"](site)
+    impl[routed[op_eq_tensor, cx_eq, 2], "eq.Tensor"](site)
+    impl[routed[op_eq_tensor_out, cx_eq_out, 3], "eq.Tensor_out"](site)
+    impl[routed[op_eq_scalar, cx_eq, 2], "eq.Scalar"](site)
+    impl[routed[op_eq_scalar_out, cx_eq_out, 3], "eq.Scalar_out"](site)
+    impl[routed[op_ne_tensor, cx_ne, 2], "ne.Tensor"](site)
+    impl[routed[op_ne_tensor_out, cx_ne_out, 3], "ne.Tensor_out"](site)
+    impl[routed[op_ne_scalar, cx_ne, 2], "ne.Scalar"](site)
+    impl[routed[op_ne_scalar_out, cx_ne_out, 3], "ne.Scalar_out"](site)
     impl[
         f8_iter[op_lt_tensor, "compare_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "lt.Tensor",
@@ -2046,14 +2148,30 @@ def register_compare(site: Site) raises:
     impl[op_isin_tensor_scalar_out, "isin.Tensor_Scalar_out"](site)
     impl[op_isin_tensor_tensor, "isin.Tensor_Tensor"](site)
     impl[op_isin_tensor_tensor_out, "isin.Tensor_Tensor_out"](site)
-    impl[op_where_self, "where.self"](site)
-    impl[op_masked_fill_scalar, "masked_fill.Scalar"](site)
-    impl[op_masked_fill_scalar_out, "masked_fill.Scalar_out"](site)
-    impl[op_masked_fill_tensor, "masked_fill.Tensor"](site)
-    impl[op_masked_fill_tensor_out, "masked_fill.Tensor_out"](site)
-    impl[op_masked_fill__scalar, "masked_fill_.Scalar"](site)
-    impl[op_masked_fill__tensor, "masked_fill_.Tensor"](site)
-    impl[op_equal, "equal"](site)
+    impl[routed[op_where_self, cx_where, 3], "where.self"](site)
+    impl[
+        routed[op_masked_fill_scalar, cx_masked_fill, 3], "masked_fill.Scalar"
+    ](site)
+    impl[
+        routed[op_masked_fill_scalar_out, cx_masked_fill_out, 4],
+        "masked_fill.Scalar_out",
+    ](site)
+    impl[
+        routed[op_masked_fill_tensor, cx_masked_fill, 3], "masked_fill.Tensor"
+    ](site)
+    impl[
+        routed[op_masked_fill_tensor_out, cx_masked_fill_out, 4],
+        "masked_fill.Tensor_out",
+    ](site)
+    impl[
+        routed[op_masked_fill__scalar, cx_masked_fill_, 3],
+        "masked_fill_.Scalar",
+    ](site)
+    impl[
+        routed[op_masked_fill__tensor, cx_masked_fill_, 3],
+        "masked_fill_.Tensor",
+    ](site)
+    impl[routed[op_equal, cx_equal, 2], "equal"](site)
     impl[op_searchsorted_tensor, "searchsorted.Tensor"](site)
     impl[op_searchsorted_tensor_out, "searchsorted.Tensor_out"](site)
     impl[op_searchsorted_scalar, "searchsorted.Scalar"](site)

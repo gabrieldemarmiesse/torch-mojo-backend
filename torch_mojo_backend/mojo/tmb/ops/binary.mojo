@@ -111,6 +111,10 @@ from tmb.ops.f8_iter import (
     PRE_SUB,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    cx_via_bool,
+    routed,
+)
 from tmb.ops.foreach import foreach_addc_inplace, foreach_lerp_inplace
 
 # ---------------------------------------------------------------------------
@@ -892,11 +896,16 @@ def _b_fast_route(
     if not _b_is_tensor_rec(av):
         return False
     var a = T(Int(av.a))
-    if not a.on_mojo() or not a.contig:
+    if not a.on_mojo() or not a.contig or a.is_complex():
         return False
     var bv = args[unsafe_offset=1].copy()
     if _b_is_tensor_rec(bv):
         var b = T(Int(bv.a))
+        if b.is_complex():
+            # a complex operand (a wrapped complex number included): the
+            # real routes would read its pairs as reals; the slow path
+            # declines it (`v_tensor`) where no complex route took it
+            return False
         if b.on_mojo():
             if tt.byte_length() == 0:
                 return False
@@ -2210,11 +2219,16 @@ def _b_fast_div(args: Values, rets: Values, dest_h: Int) raises -> Bool:
     if not _b_is_tensor_rec(av):
         return False
     var a = T(Int(av.a))
-    if not a.on_mojo() or not a.contig:
+    if not a.on_mojo() or not a.contig or a.is_complex():
         return False
     var bv = args[unsafe_offset=1].copy()
     if _b_is_tensor_rec(bv):
         var b = T(Int(bv.a))
+        if b.is_complex():
+            # a complex operand (a wrapped complex number included): the
+            # real routes would read its pairs as reals; the slow path
+            # declines it (`v_tensor`) where no complex route took it
+            return False
         if b.on_mojo():
             if a.stype != b.stype or not _b_is_floating(a.stype):
                 return False
@@ -3484,13 +3498,19 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_logical_and, "logical_and_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            routed[op_logical_and, cx_via_bool["logical_and", "", 2], 2],
+            "logical_and_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
         ],
         "logical_and",
     ](site)
     impl[
         f8_iter[
-            op_logical_and_out,
+            routed[op_logical_and_out, cx_via_bool["logical_and", "out", 2], 3],
             "logical_and_cuda",
             3,
             2,
@@ -3502,13 +3522,19 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_logical_or, "logical_or_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            routed[op_logical_or, cx_via_bool["logical_or", "", 2], 2],
+            "logical_or_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
         ],
         "logical_or",
     ](site)
     impl[
         f8_iter[
-            op_logical_or_out,
+            routed[op_logical_or_out, cx_via_bool["logical_or", "out", 2], 3],
             "logical_or_cuda",
             3,
             2,
@@ -3520,13 +3546,19 @@ def register_binary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_logical_xor, "logical_xor_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            routed[op_logical_xor, cx_via_bool["logical_xor", "", 2], 2],
+            "logical_xor_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
         ],
         "logical_xor",
     ](site)
     impl[
         f8_iter[
-            op_logical_xor_out,
+            routed[op_logical_xor_out, cx_via_bool["logical_xor", "out", 2], 3],
             "logical_xor_cuda",
             3,
             2,

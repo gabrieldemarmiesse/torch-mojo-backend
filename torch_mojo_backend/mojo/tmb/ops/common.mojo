@@ -9,16 +9,33 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     is_float8_stype,
+    ST_FLOAT8_E4M3FN,
+    ST_FLOAT8_E5M2,
+    ST_FLOAT8_E4M3FNUZ,
+    ST_FLOAT8_E5M2FNUZ,
+    ST_FLOAT8_E8M0FNU,
     ST_BFLOAT16,
+    TAG_BOOL,
+    TAG_COMPLEX,
+    TAG_DOUBLE,
+    TAG_SCALAR_DOUBLE,
+    TAG_INT,
+    TAG_SCALAR_BOOL,
+    TAG_SCALAR_INT,
     ST_BOOL,
     ST_FLOAT16,
     ST_FLOAT32,
     ST_FLOAT64,
+    ST_COMPLEX128,
     ST_INT16,
     ST_INT32,
     ST_INT64,
     ST_INT8,
     ST_UINT8,
+    ST_UINT16,
+    ST_UINT32,
+    ST_UINT64,
+    ST_COMPLEX64,
     Owned,
     T,
     Value,
@@ -35,7 +52,12 @@ from tmb.backend.abi import (
     dtype_name,
     is_dense,
     f64_bits,
+    is_complex_stype,
     max_dtype,
+    real_of,
+    cpu_empty,
+    tensor_arg,
+    bool_arg,
     new_like,
     new_like_dtype,
     new_strided,
@@ -57,8 +79,17 @@ from tmb.backend.abi import (
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
     v_int,
+    v_complex,
 )
-from tmb.backend.device import ctx_for, ctx_ptr, dev, memset_bytes, memset_typed
+from tmb.backend.device import (
+    copy_from_host,
+    copy_to_host,
+    ctx_for,
+    ctx_ptr,
+    dev,
+    memset_bytes,
+    memset_typed,
+)
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import f64_to_fp8_bits, is_float8
@@ -118,6 +149,10 @@ def copy_strided_into(dst: T, src: T) raises:
         )
     if dst.numel == 0:
         return
+    if dst.itemsize == 16:
+        # complex128: no 16-byte element kernel; move the component pairs.
+        copy_strided_into(dst.pairs(), src.pairs())
+        return
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("memory", "CopyStrided")
@@ -145,6 +180,54 @@ def broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
         else:
             raise Error("shapes are not broadcastable")
     return shape
+
+
+def _sizes_str(t: T) -> String:
+    var s = String("[")
+    for i in range(t.rank):
+        if i > 0:
+            s += ", "
+        s += String(t.dim(i))
+    return s + "]"
+
+
+def check_expands_to(t: T, target: T) raises:
+    """`t.expand(target.sizes())` would succeed (ATen's `expand_inplace`):
+    no more dims than the target, and each dim equal to the target's or 1.
+    Raises expand's own errors."""
+    if t.rank > target.rank:
+        raise Error(
+            "expand(",
+            scalar_type_name(t.stype),
+            "Type{",
+            _sizes_str(t),
+            "}, size=",
+            _sizes_str(target),
+            "): the number of sizes provided (",
+            target.rank,
+            (
+                ") must be greater or equal to the number of dimensions in the"
+                " tensor ("
+            ),
+            t.rank,
+            ")",
+        )
+    for i in range(1, t.rank + 1):
+        var have = t.dim(t.rank - i)
+        var want = target.dim(target.rank - i)
+        if have != want and have != 1:
+            raise Error(
+                "The expanded size of the tensor (",
+                want,
+                ") must match the existing size (",
+                have,
+                ") at non-singleton dimension ",
+                target.rank - i,
+                ".  Target sizes: ",
+                _sizes_str(target),
+                ".  Tensor sizes: ",
+                _sizes_str(t),
+            )
 
 
 def device_str(t: T) -> String:
@@ -546,10 +629,24 @@ def check_float8_scalar(s: FillScalar, dt: DType, stype: Int32) raises:
         )
 
 
-def _fill(t: T, s: FillScalar) raises:
-    """A memset when contiguous, else the strided fill kernel."""
+def _fill(t: T, s_in: FillScalar) raises:
+    """A memset when contiguous, else the strided fill kernel. A half /
+    bfloat16 destination takes the value through float first, as c10's
+    Half / BFloat16 conversions from double do (1 + 2**-11 + 2**-30 fills
+    a half with 1.0, not 1.0009765625)."""
     if t.numel == 0:
         return
+    var s = s_in.copy()
+    if s.integral and (
+        t.dtype == DType.float32
+        or t.dtype == DType.float16
+        or t.dtype == DType.bfloat16
+    ):
+        # an integer converts to float in one rounding (int64 -> float), not
+        # through a double
+        s.f = Float64(Int64(s.i).cast[DType.float32]())
+    elif t.dtype == DType.float16 or t.dtype == DType.bfloat16:
+        s.f = Float64(Float32(s.f))
     if is_float8(t.dtype):
         # One byte, computed here the way c10 converts (through float32):
         # a byte memset, or the strided fill of that byte as uint8. An
@@ -582,7 +679,8 @@ def _fill(t: T, s: FillScalar) raises:
         # The StridedFill kernel narrows a Float64 into the destination
         # dtype, which cannot carry a 64-bit integer past 2**53. Fill a dense
         # buffer exactly (memset) and lay that out instead.
-        if abs(s.i) > _MAX_EXACT_INT:
+        # (not abs(): it overflows for INT64_MIN, a uint64 2**63's bits)
+        if s.i > _MAX_EXACT_INT or s.i < -_MAX_EXACT_INT:
             var dense = own(new_like(t))
             _fill_contiguous(dense.t, s)
             copy_strided_into(t, dense.t)
@@ -906,7 +1004,11 @@ def scalar_to_int(v: Value, st: Int32) raises -> Int:
     var lo_f = 0.0 if st == ST_UINT8 else Float64(lo)
     var ok = f >= lo_f and f <= Float64(hi)
     if st == ST_INT64:
-        ok = f >= -9223372036854775808.0 and f < 9223372036854775808.0
+        # c10::overflows compares with double(INT64_MAX), which is 2**63:
+        # 2**63 itself passes, and the host static_cast gives INT64_MIN
+        ok = f >= -9223372036854775808.0 and f <= 9223372036854775808.0
+        if ok and f == 9223372036854775808.0:
+            return Int.MIN
     if not ok:
         raise Error(
             "value cannot be converted to type ", name, " without overflow"
@@ -921,6 +1023,10 @@ def scalar_to_float(v: Value, st: Int32) raises -> Float64:
     `c10::overflows` does, while inf and NaN pass. The result is the float64
     the caller narrows into `st` (a float64 target never overflows)."""
     var f = v_f64(v)
+    if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
+        # an integer: one rounding into the target (int64 -> float for the
+        # single-precision ones), not through a double
+        f = int_to_component(v.a, st)
     if st != ST_FLOAT16 and st != ST_BFLOAT16 and st != ST_FLOAT32:
         return f
     var top = 3.4028234663852886e38  # float32
@@ -973,9 +1079,9 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
                 "Promotion for Float8 Types is not supported, attempted to"
                 " promote "
             ),
-            scalar_type_name(max_dtype(a)),
+            scalar_type_name(a),
             " and ",
-            scalar_type_name(max_dtype(b)),
+            scalar_type_name(b),
         )
     if not known_stype(a) or not known_stype(b):
         unsupported(
@@ -1557,3 +1663,552 @@ def threshold_into_overlapping(
     _ = res^
     ret_ref(rets, 0, dst)
     return True
+
+
+# ---------------------------------------------------------------------------
+# complex dtypes: casts to and from them, and the launch of the complex
+# kernel family (tmb/kernels/complex), shared by the copy paths (core,
+# data_movement) and the complex ops (tmb/ops/complex.mojo).
+# ---------------------------------------------------------------------------
+
+comptime CX_FULL = 0
+comptime CX_DEVICE = 1
+comptime CX_HOST = 2
+
+
+def cx_launch(
+    kind: StaticString,
+    out_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    mode_a: Int,
+    mode_b: Int,
+    a_re: Float64,
+    a_im: Float64,
+    b_re: Float64,
+    b_im: Float64,
+    numel: Int,
+    component: DType,
+    device: Int,
+    p_re: Float64 = 1.0,
+    p_im: Float64 = 0.0,
+) raises:
+    """One elementwise kernel of the complex family over `numel` complex
+    elements (header of tmb/kernels/complex/entry.mojo): flat operands only,
+    each full (dense, the output's extent), one device element or a host
+    value."""
+    if numel == 0:
+        return
+    var ctx = ctx_for(device)
+    var cp = ctx_ptr(ctx)
+    var call = KernelCall("complex", kind)
+    call.arg_dtype(0, component)
+    call.int(out_addr)
+    call.int(a_addr)
+    call.int(b_addr)
+    call.int(mode_a | (mode_b << 2))
+    call.f64(a_re)
+    call.f64(a_im)
+    call.f64(b_re)
+    call.f64(b_im)
+    call.int(numel)
+    call.f64(p_re)
+    call.f64(p_im)
+    call.int(cp)
+    call.run()
+    _ = ctx
+
+
+def cx_unary_into(kind: StaticString, dst: T, src: T) raises:
+    """dst = kind(src) for two DENSE buffers of `src.numel` elements (src
+    complex; dst complex, real or bool by kind)."""
+    cx_launch(
+        kind,
+        dst.ptr,
+        src.ptr,
+        0,
+        CX_FULL,
+        CX_FULL,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        src.numel,
+        src.dtype,
+        src.device,
+    )
+
+
+def warn_complex_to_real() raises:
+    """torch's `TORCH_WARN_ONCE("Casting complex values to real discards the
+    imaginary part")` (Copy.cpp's copy_impl), raised by having CPU torch run
+    the one statement that emits it: a 1-element complex-to-float host copy.
+    Its once-per-process state is torch's own, as on CUDA."""
+    var shape = IndexList[MAX_RANK](1)
+    var src = own(cpu_empty(shape, 1, ST_COMPLEX64))
+    var dst = own(cpu_empty(shape, 1, ST_FLOAT32))
+    _ = call_op(
+        "aten::copy_",
+        "",
+        [
+            tensor_arg(dst.t),
+            tensor_arg(src.t),
+            bool_arg(False),
+        ],
+        1,
+    )
+    _ = src^
+    _ = dst^
+
+
+def host_convert(t: T, stype: Int32) raises -> T:
+    """`t.to(stype)` through CPU torch (a dense download, torch's CPU copy_,
+    one upload): the conversions no device kernel has (the unsigned wide
+    integers, float64 on Metal), with torch's exact semantics."""
+    var dense = own_if_new(contiguous(t), t)
+    var host_src = own(cpu_empty(t.shape, t.rank, t.stype))
+    copy_to_host(
+        ctx_for(t.device), dense.t.ptr, host_src.t.ptr, t.numel * t.itemsize
+    )
+    _ = dense^
+    var host_dst = own(cpu_empty(t.shape, t.rank, stype))
+    _ = call_op(
+        "aten::copy_",
+        "",
+        [tensor_arg(host_dst.t), tensor_arg(host_src.t), bool_arg(False)],
+        1,
+    )
+    _ = host_src^
+    var out = own(new_like_dtype(t, stype))
+    copy_from_host(
+        t.device,
+        ctx_for(t.device),
+        out.t.ptr,
+        host_dst.t.ptr,
+        out.t.numel * out.t.itemsize,
+    )
+    _ = host_dst^
+    return out.take()
+
+
+def cast_complex(t: T, stype: Int32) raises -> T:
+    """`t.to(stype)` on t's device where `t` or `stype` is complex: a
+    contiguous result (t itself when the dtype is unchanged). torch's
+    conversions: real -> complex sets the imaginary part to 0; complex ->
+    real keeps the real part (and warns, as copy_ does); complex -> bool is
+    `re != 0 || im != 0`; complex64 <-> complex128 converts both parts.
+    `t` carries no conj bit (the callers resolve it)."""
+    if t.stype == stype:
+        return t.copy()
+    var src = own_if_new(contiguous(t), t)
+    if src.t.is_complex() and is_complex_stype(stype):
+        if not is_cast_dtype_on(DType.float64, src.t):
+            var converted = own(host_convert(src.t, stype))
+            _ = src^
+            return converted.take()
+        var both = own(new_like_dtype(src.t, stype))
+        cast_into(both.t.pairs(), src.t.pairs())
+        _ = src^
+        return both.take()
+    if is_complex_stype(stype):
+        # real -> complex: zero the pairs, then the real parts in place
+        var part = real_of(stype)
+        if src.t.stype != part and not (
+            is_cast_dtype_on(src.t.dtype, src.t)
+            and is_cast_dtype_on(max_dtype(part), src.t)
+        ):
+            var converted = own(host_convert(src.t, stype))
+            _ = src^
+            return converted.take()
+        var made = own(new_like_dtype(src.t, stype))
+        fill_value(made.t, 0.0)
+        var re = own_if_new(cast_to(src.t, part), src.t)
+        copy_strided_into(made.t.component(0), re.t)
+        _ = re^
+        _ = src^
+        return made.take()
+    # complex -> real
+    if stype == ST_BOOL:
+        var truth = own(new_like_dtype(src.t, ST_BOOL))
+        cx_unary_into("nonzero", truth.t, src.t)
+        _ = src^
+        return truth.take()
+    if stype != real_of(src.t.stype) and not (
+        is_cast_dtype_on(src.t.dtype, src.t)
+        and is_cast_dtype_on(max_dtype(stype), src.t)
+    ):
+        var converted = own(host_convert(src.t, stype))
+        _ = src^
+        return converted.take()
+    warn_complex_to_real()
+    var re = own(contiguous(src.t.component(0)))
+    _ = src^
+    if stype == re.t.stype:
+        return re.take()
+    var out = own(cast_to(re.t, stype))
+    _ = re^
+    return out.take()
+
+
+def conj_copy(t: T) raises -> T:
+    """A fresh contiguous complex tensor holding conj(t's stored values):
+    what resolving a conj bit takes (torch's `conj_physical` of the raw
+    data)."""
+    var dense = own_if_new(contiguous(t), t)
+    var out = own(new_like(dense.t))
+    cx_unary_into("conj", out.t, dense.t)
+    _ = dense^
+    return out.take()
+
+
+def scalar_type_token(st: Int32) -> String:
+    """The C++ type a checked_convert overflow error names (c10's
+    AT_FORALL_SCALAR_TYPES spelling)."""
+    if st == ST_FLOAT32:
+        return "float"
+    if st == ST_FLOAT64:
+        return "double"
+    if st == ST_FLOAT16:
+        return "c10::Half"
+    if st == ST_BFLOAT16:
+        return "c10::BFloat16"
+    if st == ST_INT64:
+        return "int64_t"
+    if st == ST_INT32:
+        return "int"
+    if st == ST_INT16:
+        return "int16_t"
+    if st == ST_INT8:
+        return "int8_t"
+    if st == ST_UINT8:
+        return "uint8_t"
+    if st == ST_UINT16:
+        return "uint16_t"
+    if st == ST_UINT32:
+        return "uint32_t"
+    if st == ST_UINT64:
+        return "uint64_t"
+    if st == ST_COMPLEX64:
+        return "c10::complex<float>"
+    return "c10::complex<double>"
+
+
+def check_real_scalar_fits(st: Int32, v: Value) raises:
+    """c10::checked_convert of a Scalar record (`v`) to the REAL dtype `st`
+    (c10::overflows): bool takes anything; a complex value with a nonzero
+    imaginary part fits no other real dtype; a float dtype refuses a finite
+    value past its range (inf / NaN pass); an integer dtype refuses NaN /
+    inf and a double past its range, and an integer past it (an unsigned
+    dtype also takes -x for x within it, as C++'s wrap)."""
+    if st == ST_BOOL or is_complex_stype(st):
+        return
+    var known = (
+        st == ST_FLOAT16
+        or st == ST_BFLOAT16
+        or st == ST_FLOAT32
+        or st == ST_FLOAT64
+        or st == ST_UINT8
+        or st == ST_UINT16
+        or st == ST_UINT32
+        or st == ST_UINT64
+        or st == ST_INT8
+        or st == ST_INT16
+        or st == ST_INT32
+        or st == ST_INT64
+    )
+    if is_float8_stype(st) and v.tag == TAG_COMPLEX:
+        # c10::overflows<Float8_*, complex<double>>: a nonzero imaginary part
+        # overflows, else each part is checked as a double (e8m0fnu's lowest
+        # is 2**-127, so even a zero imaginary part overflows it).
+        var c = v_complex(v)
+        if c[1] != 0.0:
+            raise Error(
+                "value cannot be converted to type ",
+                dtype_name(st),
+                " without overflow",
+            )
+        check_float8_scalar(FillScalar(c[0]), max_dtype(st), st)
+        check_float8_scalar(FillScalar(c[1]), max_dtype(st), st)
+        return
+    if not known:
+        return  # (float8 and the rest: the fill kernels decide)
+    var bad = False
+    var is_int_value = v.tag == TAG_SCALAR_INT or v.tag == TAG_INT
+    if v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL:
+        return
+    var re: Float64
+    if is_int_value:
+        re = Float64(v.a)
+    else:
+        var c = v_complex(v)
+        re = c[0]
+        if c[1] != 0.0:
+            bad = True
+    var finite = re - re == 0.0
+    if st == ST_FLOAT16 or st == ST_BFLOAT16 or st == ST_FLOAT32:
+        var fmax = 65504.0 if st == ST_FLOAT16 else (
+            3.3895313892515355e38 if st
+            == ST_BFLOAT16 else 3.4028234663852886e38
+        )
+        if finite and abs(re) > fmax:
+            bad = True
+    elif st != ST_FLOAT64:
+        var lo: Float64
+        var hi: Float64
+        var unsigned = (
+            st == ST_UINT8
+            or st == ST_UINT16
+            or st == ST_UINT32
+            or st == ST_UINT64
+        )
+        if st == ST_UINT8:
+            lo = 0.0
+            hi = 255.0
+        elif st == ST_UINT16:
+            lo = 0.0
+            hi = 65535.0
+        elif st == ST_UINT32:
+            lo = 0.0
+            hi = 4294967295.0
+        elif st == ST_UINT64:
+            lo = 0.0
+            hi = 18446744073709551615.0
+        elif st == ST_INT8:
+            lo = -128.0
+            hi = 127.0
+        elif st == ST_INT16:
+            lo = -32768.0
+            hi = 32767.0
+        elif st == ST_INT32:
+            lo = -2147483648.0
+            hi = 2147483647.0
+        else:
+            lo = -9223372036854775808.0
+            hi = 9223372036854775807.0
+        if is_int_value:
+            var iv = v.a
+            if st == ST_UINT64:
+                pass  # every int64 fits, a negative one by C++'s wrap
+            elif unsigned:
+                # -iv as an unsigned magnitude (INT64_MIN has no int64 -iv)
+                var imax = UInt64(hi)
+                var mag = UInt64(-(iv + 1)) + 1 if iv < 0 else UInt64(iv)
+                bad = bad or mag > imax
+            elif st != ST_INT64:
+                bad = bad or re < lo or re > hi
+        else:
+            bad = bad or not finite or re < lo or re > hi
+    if bad:
+        raise Error(
+            "value cannot be converted to type ",
+            scalar_type_token(st),
+            " without overflow",
+        )
+
+
+def uint64_cross_item(value: T, dst: Int32 = -1) raises -> Value:
+    """`fill_item(value, dst, False)`: a uint64 value read for a fill on
+    another device."""
+    return fill_item(value, dst, False)
+
+
+def fill_item(value: T, dst: Int32, same_device: Bool) raises -> Value:
+    """`value.item()` as a fill / masked_fill / index_put value for a
+    destination of dtype `dst`, the Scalar CUDA would convert. A uint64
+    value is read unsigned (the call boundary has no unsigned Scalar):
+    below 2**63 an int Scalar, which converts like CUDA's (an integer
+    into a float rounds once); from 2**63 on, into a float or complex dtype
+    the value itself, rounded once into float32 for the single-precision
+    dtypes; into bool its truth; into uint64 the same 64 bits; into any
+    other integer the overflow error. From another device (`same_device`
+    False) a value of 2**63 or more is declined instead, except into uint64.
+    """
+    if value.stype != ST_UINT64:
+        var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+        return r[0].copy()
+    var bits: Int64
+    if value.on_cpu():
+        bits = Pointer[Int64, MutUntrackedOrigin](
+            unsafe_from_address=value.ptr
+        )[]
+    else:
+        var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+        bits = r[0].a
+    if bits >= 0 or dst == ST_UINT64:
+        return Value(TAG_SCALAR_INT, 0, bits, 0)
+    if not same_device:
+        unsupported("a uint64 value of 2**63 or more from another device")
+    var u = UInt64(bits)
+    if dst == ST_BOOL:
+        return Value(TAG_SCALAR_BOOL, 0, 1, 0)
+    if dst == ST_FLOAT64 or dst == ST_COMPLEX128:
+        return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(Float64(u)), 0)
+    if (
+        dst == ST_FLOAT32
+        or dst == ST_FLOAT16
+        or dst == ST_BFLOAT16
+        or dst == ST_COMPLEX64
+    ):
+        var f = Float64(u.cast[DType.float32]())
+        return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(f), 0)
+    raise Error(
+        "value cannot be converted to type ",
+        scalar_type_token(dst),
+        " without overflow",
+    )
+
+
+def real_fill_value(st: Int32, v: Value) raises -> Value:
+    """The Scalar record `v`, already range-checked for the real dtype `st`
+    (`check_real_scalar_fits`), as the record the fill kernels take: the one
+    conversion every Scalar entry point into a real tensor shares (fill_,
+    scalar_tensor, full, masked_fill, item assignment).
+    - A complex Scalar (its imaginary part is zero, or the check raised)
+      becomes its real part as a double, then converts as that double does.
+      A bool destination keeps the record: its truth reads either part.
+    - Into uint64, a double of 2**63 or more becomes an int record holding
+      the 64 bits of C++'s host `static_cast<uint64_t>` (the fill kernels go
+      through int64): exact below 2**64, and 0 for 2**64 itself, which
+      c10::overflows lets through (it compares with double(UINT64_MAX)).
+    Anything else is returned unchanged."""
+    if st == ST_BOOL or is_complex_stype(st):
+        return v.copy()
+    var r = v.copy()
+    if r.tag == TAG_COMPLEX:
+        r = Value(TAG_SCALAR_DOUBLE, 0, f64_bits(v_complex(v)[0]), 0)
+    if st == ST_UINT64 and (r.tag == TAG_SCALAR_DOUBLE or r.tag == TAG_DOUBLE):
+        var d = v_complex(r)[0]
+        if d >= 9223372036854775808.0:
+            var bits = Int64(0)
+            if d < 18446744073709551616.0:
+                bits = Int64(
+                    Scalar[DType.uint64](UInt64(d)).cast[DType.int64]()
+                )
+            return Value(TAG_SCALAR_INT, 0, bits, 0)
+    return r^
+
+
+def scalar_type_name(st: Int32) -> String:
+    """c10::toString(ScalarType): the name ATen's dispatch errors print
+    (`"index_put" not implemented for 'UInt64'`)."""
+    if st == ST_FLOAT32:
+        return "Float"
+    if st == ST_FLOAT64:
+        return "Double"
+    if st == ST_FLOAT16:
+        return "Half"
+    if st == ST_BFLOAT16:
+        return "BFloat16"
+    if st == ST_INT64:
+        return "Long"
+    if st == ST_INT32:
+        return "Int"
+    if st == ST_INT16:
+        return "Short"
+    if st == ST_INT8:
+        return "Char"
+    if st == ST_UINT8:
+        return "Byte"
+    if st == ST_BOOL:
+        return "Bool"
+    if st == ST_UINT16:
+        return "UInt16"
+    if st == ST_UINT32:
+        return "UInt32"
+    if st == ST_UINT64:
+        return "UInt64"
+    if st == ST_COMPLEX64:
+        return "ComplexFloat"
+    if st == ST_COMPLEX128:
+        return "ComplexDouble"
+    if st == ST_FLOAT8_E4M3FN:
+        return "Float8_e4m3fn"
+    if st == ST_FLOAT8_E5M2:
+        return "Float8_e5m2"
+    if st == ST_FLOAT8_E4M3FNUZ:
+        return "Float8_e4m3fnuz"
+    if st == ST_FLOAT8_E5M2FNUZ:
+        return "Float8_e5m2fnuz"
+    if st == ST_FLOAT8_E8M0FNU:
+        return "Float8_e8m0fnu"
+    return String(st)
+
+
+def is_wide_unsigned(st: Int32) -> Bool:
+    """uint16 / uint32 / uint64: the dtypes CUDA's masked_fill, index_fill
+    and index_put kernels are not instantiated for."""
+    return st == ST_UINT16 or st == ST_UINT32 or st == ST_UINT64
+
+
+def check_scalar_fits(st: Int32, re: Float64, im: Float64) raises:
+    """c10::checked_convert of a Scalar to complex64: a finite part out of
+    float's range raises, as CUDA's Scalar conversions do (complex128 holds
+    any double)."""
+    if st != ST_COMPLEX64:
+        return
+    comptime FMAX = 3.4028234663852886e38
+    # (x - x == 0: finite; an inf or NaN converts as is)
+    var bad_re = re - re == 0.0 and abs(re) > FMAX
+    var bad_im = im - im == 0.0 and abs(im) > FMAX
+    if bad_re or bad_im:
+        raise Error(
+            "value cannot be converted to type c10::complex<float> without"
+            " overflow"
+        )
+
+
+def int_to_component(i: Int64, st: Int32) -> Float64:
+    """An integer as dtype `st`'s real component in ONE rounding: int64 ->
+    float for complex64 / float32 / half / bfloat16 (the latter two round
+    on from that float, as c10 does), int64 -> double otherwise (never a
+    double first for a float32 target)."""
+    if (
+        st == ST_COMPLEX64
+        or st == ST_FLOAT32
+        or st == ST_FLOAT16
+        or st == ST_BFLOAT16
+    ):
+        return Float64(Scalar[DType.int64](i).cast[DType.float32]())
+    return Float64(i)
+
+
+def uint_to_component(u: UInt64, st: Int32) -> Float64:
+    """`int_to_component` of an unsigned 64-bit integer."""
+    if (
+        st == ST_COMPLEX64
+        or st == ST_FLOAT32
+        or st == ST_FLOAT16
+        or st == ST_BFLOAT16
+    ):
+        return Float64(Scalar[DType.uint64](u).cast[DType.float32]())
+    return Float64(u)
+
+
+def scalar_parts(v: Value, st: Int32) raises -> Tuple[Float64, Float64]:
+    """A Scalar record's (re, im) as dtype `st` will hold them: an integer
+    rounded once into the component type (`int_to_component`), any other
+    record as `v_complex` reads it."""
+    if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
+        return (int_to_component(v.a, st), 0.0)
+    return v_complex(v)
+
+
+def fill_complex(t: T, v: Value) raises:
+    """fill_ of a complex tensor: the two parts of the Scalar (a real one has
+    a zero imaginary part) into the two strided component views; one memset
+    for an all-zero value."""
+    var c = scalar_parts(v, t.stype)  # an integer: one rounding
+    var re = c[0]
+    var im = c[1]
+    if t.is_conj():
+        im = -im
+    if t.numel == 0:
+        return
+    if f64_bits(re) == 0 and f64_bits(im) == 0:
+        if t.contig:
+            fill_value(t, 0.0)
+        else:
+            fill_value(t.pairs(), 0.0)
+        return
+    fill_value(t.component(0), re)
+    fill_value(t.component(1), im)

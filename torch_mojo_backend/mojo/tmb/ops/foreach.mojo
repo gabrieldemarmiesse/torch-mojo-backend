@@ -32,8 +32,19 @@ from std.math import ceildiv
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    ST_FLOAT16,
+    ST_INT64,
+    ST_COMPLEX32,
+    ST_COMPLEX64,
+    ST_COMPLEX128,
     ST_FLOAT32,
     ST_FLOAT64,
+    ST_UINT8,
+    TAG_BOOL,
+    TAG_DOUBLE,
+    TAG_INT,
+    max_dtype,
+    new_scalar,
     TAG_BOOL_LIST,
     TAG_COMPLEX,
     TAG_DOUBLE_LIST,
@@ -76,6 +87,14 @@ from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
 from tmb.kernels.foreach.contract import (
+    FE_REDUCE_CHUNK,
+    FR_L0,
+    FR_L1,
+    FR_L2,
+    FR_LINF,
+    FR_LNEGINF,
+    FR_LP,
+    FR_MAX,
     FE_ROLE_ALPHA,
     FE_ROLE_B,
     FE_ROLE_C,
@@ -87,7 +106,11 @@ from tmb.ops.common import (
     cast_into,
     cast_to,
     copy_strided_into,
+    fill_value,
     device_str,
+    is_float_stype,
+    known_stype,
+    promote_types,
     scalar_to_float,
     scalar_to_int,
 )
@@ -112,14 +135,18 @@ def _none_value() -> Value:
     return Value(TAG_NONE, 0, 0, 0)
 
 
-def _seq_vector_norm(t: T, ord_v: Value, dtype_v: Value) raises -> T:
+def _seq_vector_norm(
+    op: String, t: T, ord_v: Value, dtype_v: Value
+) raises -> T:
+    """`linalg_vector_norm` / `linalg__powsum` of the whole tensor, what
+    ATen's slow `_foreach_norm` / `_foreach_powsum` call per tensor."""
     var args = List[Value](capacity=5)
     args.append(_tensor_value(t))
     args.append(ord_v.copy())
     args.append(_none_value())  # dim=None
-    args.append(Value(TAG_SCALAR_INT, 0, 0, 0))  # keepdim=False
+    args.append(Value(TAG_BOOL, 0, 0, 0))  # keepdim=False
     args.append(dtype_v.copy())
-    var rets = call_op("aten::linalg_vector_norm", "", args^, 1)
+    var rets = call_op(op, "", args^, 1)
     return rets.take_tensor(0)
 
 
@@ -181,7 +208,7 @@ def _qualifies1(a: List[T], allow_half: Bool) raises -> Bool:
     return True
 
 
-# --- _foreach_norm: the optimizer family's ForeachL2Norm ---------------------
+# --- Apple's _foreach_norm: the optimizer family's float32 ForeachL2Norm ------
 
 
 def _foreach_norm_launch(tensors: List[T]) raises -> List[T]:
@@ -346,14 +373,90 @@ def _binary(
 # One row per overload pair, one line per row: a table read across.
 # fmt: off
 comptime FOREACH_OVERLOADS: List[ForeachOverload] = [
-    # The overloads the multi-tensor apply started with; the other
-    # families join in the commits that follow.
-    _unary("_foreach_sqrt", "", "sqrt", "aten::sqrt", "aten::sqrt_", D_FLOAT, True, apple=True),
-    _binary("", "_foreach_add_.Scalar", "add", S_SCALAR, "aten::add", "Scalar", "aten::add_", "Scalar", D_ALL, alpha=True, apple=True),
-    _binary("", "_foreach_mul_.Scalar", "mul", S_SCALAR, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL, apple=True),
-    _binary("", "_foreach_mul_.Tensor", "mul", S_TENSOR, "aten::mul", "Tensor", "aten::mul_", "Tensor", D_ALL, apple=True),
-    _binary("", "_foreach_addcmul_.Scalar", "addcmul", S_PW_SCALAR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT, apple=True),
-    _binary("", "_foreach_lerp_.Scalar", "lerp", S_LERP_SCALAR, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT, apple=True),
+    # unary: ForeachUnaryOp.cu. Floating lists only, except abs (every
+    # dtype), neg (not bool) and zero_; float64 where the GPU lowers it.
+    _unary("_foreach_abs", "_foreach_abs_", "abs", "aten::abs", "aten::abs_", D_ALL, True),
+    _unary("_foreach_acos", "_foreach_acos_", "acos", "aten::acos", "aten::acos_", D_FLOAT, False),
+    _unary("_foreach_asin", "_foreach_asin_", "asin", "aten::asin", "aten::asin_", D_FLOAT, False),
+    _unary("_foreach_atan", "_foreach_atan_", "atan", "aten::atan", "aten::atan_", D_FLOAT, False),
+    _unary("_foreach_ceil", "_foreach_ceil_", "ceil", "aten::ceil", "aten::ceil_", D_FLOAT, True),
+    _unary("_foreach_cos", "_foreach_cos_", "cos", "aten::cos", "aten::cos_", D_FLOAT, False),
+    _unary("_foreach_cosh", "_foreach_cosh_", "cosh", "aten::cosh", "aten::cosh_", D_FLOAT, False),
+    _unary("_foreach_erf", "_foreach_erf_", "erf", "aten::erf", "aten::erf_", D_FLOAT, False),
+    _unary("_foreach_erfc", "_foreach_erfc_", "erfc", "aten::erfc", "aten::erfc_", D_FLOAT, False),
+    _unary("_foreach_exp", "_foreach_exp_", "exp", "aten::exp", "aten::exp_", D_FLOAT, False),
+    _unary("_foreach_expm1", "_foreach_expm1_", "expm1", "aten::expm1", "aten::expm1_", D_FLOAT, False),
+    _unary("_foreach_floor", "_foreach_floor_", "floor", "aten::floor", "aten::floor_", D_FLOAT, True),
+    _unary("_foreach_frac", "_foreach_frac_", "frac", "aten::frac", "aten::frac_", D_FLOAT, True),
+    _unary("_foreach_lgamma", "_foreach_lgamma_", "lgamma", "aten::lgamma", "aten::lgamma_", D_FLOAT, False),
+    _unary("_foreach_log", "_foreach_log_", "log", "aten::log", "aten::log_", D_FLOAT, False),
+    _unary("_foreach_log10", "_foreach_log10_", "log10", "aten::log10", "aten::log10_", D_FLOAT, False),
+    _unary("_foreach_log1p", "_foreach_log1p_", "log1p", "aten::log1p", "aten::log1p_", D_FLOAT, False),
+    _unary("_foreach_log2", "_foreach_log2_", "log2", "aten::log2", "aten::log2_", D_FLOAT, False),
+    _unary("_foreach_neg", "_foreach_neg_", "neg", "aten::neg", "aten::neg_", D_INT, True),
+    _unary("_foreach_reciprocal", "_foreach_reciprocal_", "reciprocal", "aten::reciprocal", "aten::reciprocal_", D_FLOAT, True),
+    _unary("_foreach_round", "_foreach_round_", "round", "aten::round", "aten::round_", D_FLOAT, True),
+    _unary("_foreach_rsqrt", "_foreach_rsqrt_", "rsqrt", "aten::rsqrt", "aten::rsqrt_", D_FLOAT, False),
+    _unary("_foreach_sigmoid", "_foreach_sigmoid_", "sigmoid", "aten::sigmoid", "aten::sigmoid_", D_FLOAT, False),
+    _unary("_foreach_sign", "_foreach_sign_", "sign", "aten::sign", "aten::sign_", D_FLOAT, True),
+    _unary("_foreach_sin", "_foreach_sin_", "sin", "aten::sin", "aten::sin_", D_FLOAT, False),
+    _unary("_foreach_sinh", "_foreach_sinh_", "sinh", "aten::sinh", "aten::sinh_", D_FLOAT, False),
+    _unary("_foreach_sqrt", "_foreach_sqrt_", "sqrt", "aten::sqrt", "aten::sqrt_", D_FLOAT, True, apple=True),
+    _unary("_foreach_tan", "_foreach_tan_", "tan", "aten::tan", "aten::tan_", D_FLOAT, False),
+    _unary("_foreach_tanh", "_foreach_tanh_", "tanh", "aten::tanh", "aten::tanh_", D_FLOAT, False),
+    _unary("_foreach_trunc", "_foreach_trunc_", "trunc", "aten::trunc", "aten::trunc_", D_FLOAT, True),
+    _unary("", "_foreach_zero_", "zero", "", "aten::zero_", D_ALL, True),
+    # binary: ForeachBinaryOp{Scalar,ScalarList,List,ScalarTensor}.cu.
+    _binary("_foreach_add.Scalar", "_foreach_add_.Scalar", "add", S_SCALAR, "aten::add", "Scalar", "aten::add_", "Scalar", D_ALL, alpha=True, apple=True),
+    _binary("_foreach_add.ScalarList", "_foreach_add_.ScalarList", "add", S_SCALARLIST, "aten::add", "Scalar", "aten::add_", "Scalar", D_ALL, alpha=True),
+    _binary("_foreach_add.List", "_foreach_add_.List", "add", S_LIST, "aten::add", "Tensor", "aten::add_", "Tensor", D_ALL, alpha=True),
+    _binary("_foreach_add.Tensor", "_foreach_add_.Tensor", "add", S_TENSOR, "aten::add", "Tensor", "aten::add_", "Tensor", D_ALL, alpha=True),
+    _binary("_foreach_sub.Scalar", "_foreach_sub_.Scalar", "sub", S_SCALAR, "aten::sub", "Scalar", "aten::sub_", "Scalar", D_ALL, alpha=True),
+    _binary("_foreach_sub.ScalarList", "_foreach_sub_.ScalarList", "sub", S_SCALARLIST, "aten::sub", "Scalar", "aten::sub_", "Scalar", D_ALL, alpha=True),
+    _binary("_foreach_sub.List", "_foreach_sub_.List", "sub", S_LIST, "aten::sub", "Tensor", "aten::sub_", "Tensor", D_ALL, alpha=True),
+    _binary("_foreach_mul.Scalar", "_foreach_mul_.Scalar", "mul", S_SCALAR, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL, apple=True),
+    _binary("_foreach_mul.ScalarList", "_foreach_mul_.ScalarList", "mul", S_SCALARLIST, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_ALL),
+    _binary("_foreach_mul.List", "_foreach_mul_.List", "mul", S_LIST, "aten::mul", "Tensor", "aten::mul_", "Tensor", D_ALL),
+    _binary("_foreach_mul.Tensor", "_foreach_mul_.Tensor", "mul", S_TENSOR, "aten::mul", "Tensor", "aten::mul_", "Tensor", D_ALL, apple=True),
+    # div by a Scalar is CUDA's multiply by its reciprocal, slow path too.
+    _binary("_foreach_div.Scalar", "_foreach_div_.Scalar", "mul", S_SCALAR, "aten::mul", "Scalar", "aten::mul_", "Scalar", D_FLOAT, reciprocal=True),
+    _binary("_foreach_div.ScalarList", "_foreach_div_.ScalarList", "div", S_SCALARLIST, "aten::div", "Scalar", "aten::div_", "Scalar", D_FLOAT),
+    _binary("_foreach_div.List", "_foreach_div_.List", "div", S_LIST, "aten::div", "Tensor", "aten::div_", "Tensor", D_FLOAT),
+    _binary("_foreach_div.Tensor", "_foreach_div_.Tensor", "div", S_TENSOR, "aten::div", "Tensor", "aten::div_", "Tensor", D_FLOAT),
+    # clamp_max / minimum are CUDA's `minimum`, clamp_min / maximum its
+    # `maximum`; the slow path is clamp_max / clamp_min for all four.
+    _binary("_foreach_clamp_max.Scalar", "_foreach_clamp_max_.Scalar", "minimum", S_SCALAR, "aten::clamp_max", "", "aten::clamp_max_", "", D_FLOAT),
+    _binary("_foreach_clamp_max.ScalarList", "_foreach_clamp_max_.ScalarList", "minimum", S_SCALARLIST, "aten::clamp_max", "", "aten::clamp_max_", "", D_FLOAT),
+    _binary("_foreach_clamp_max.List", "_foreach_clamp_max_.List", "minimum", S_LIST, "aten::clamp_max", "Tensor", "aten::clamp_max_", "Tensor", D_FLOAT),
+    _binary("_foreach_minimum.Scalar", "_foreach_minimum_.Scalar", "minimum", S_SCALAR, "aten::clamp_max", "", "aten::clamp_max_", "", D_FLOAT),
+    _binary("_foreach_minimum.ScalarList", "_foreach_minimum_.ScalarList", "minimum", S_SCALARLIST, "aten::clamp_max", "", "aten::clamp_max_", "", D_FLOAT),
+    _binary("_foreach_minimum.List", "_foreach_minimum_.List", "minimum", S_LIST, "aten::clamp_max", "Tensor", "aten::clamp_max_", "Tensor", D_FLOAT),
+    _binary("_foreach_clamp_min.Scalar", "_foreach_clamp_min_.Scalar", "maximum", S_SCALAR, "aten::clamp_min", "", "aten::clamp_min_", "", D_FLOAT),
+    _binary("_foreach_clamp_min.ScalarList", "_foreach_clamp_min_.ScalarList", "maximum", S_SCALARLIST, "aten::clamp_min", "", "aten::clamp_min_", "", D_FLOAT),
+    _binary("_foreach_clamp_min.List", "_foreach_clamp_min_.List", "maximum", S_LIST, "aten::clamp_min", "Tensor", "aten::clamp_min_", "Tensor", D_FLOAT),
+    _binary("_foreach_maximum.Scalar", "_foreach_maximum_.Scalar", "maximum", S_SCALAR, "aten::clamp_min", "", "aten::clamp_min_", "", D_FLOAT),
+    _binary("_foreach_maximum.ScalarList", "_foreach_maximum_.ScalarList", "maximum", S_SCALARLIST, "aten::clamp_min", "", "aten::clamp_min_", "", D_FLOAT),
+    _binary("_foreach_maximum.List", "_foreach_maximum_.List", "maximum", S_LIST, "aten::clamp_min", "Tensor", "aten::clamp_min_", "Tensor", D_FLOAT),
+    _binary("_foreach_pow.Scalar", "_foreach_pow_.Scalar", "pow", S_SCALAR, "aten::pow", "Tensor_Scalar", "aten::pow_", "Scalar", D_FLOAT),
+    _binary("_foreach_pow.ScalarList", "_foreach_pow_.ScalarList", "pow", S_SCALARLIST, "aten::pow", "Tensor_Scalar", "aten::pow_", "Scalar", D_FLOAT),
+    _binary("_foreach_pow.List", "_foreach_pow_.List", "pow", S_LIST, "aten::pow", "Tensor_Tensor", "aten::pow_", "Tensor", D_FLOAT),
+    # An integer exponent list promotes, as result_type and CPU torch say;
+    # stock CUDA truncates the base instead (ForeachBinaryOpScalar.cu:184
+    # takes its fast route without looking at the scalar, :47 converts it
+    # with `scalar.to<opmath_t>()`): _foreach_pow(1.5, [int [1, 2]]) is
+    # int64 [1, 1] there, float32 [1.5, 2.25] here.
+    _binary("_foreach_pow.ScalarAndTensor", "", "rpow", S_RPOW, "aten::pow", "Scalar", "", "", D_FLOAT),
+    # pointwise: ForeachPointwiseOp.cu (floating lists only).
+    _binary("_foreach_addcmul.Scalar", "_foreach_addcmul_.Scalar", "addcmul", S_PW_SCALAR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT, apple=True),
+    _binary("_foreach_addcmul.ScalarList", "_foreach_addcmul_.ScalarList", "addcmul", S_PW_SCALARLIST, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT),
+    _binary("_foreach_addcmul.Tensor", "_foreach_addcmul_.Tensor", "addcmul", S_PW_TENSOR, "aten::addcmul", "", "aten::addcmul_", "", D_FLOAT),
+    _binary("_foreach_addcdiv.Scalar", "_foreach_addcdiv_.Scalar", "addcdiv", S_PW_SCALAR, "aten::addcdiv", "", "aten::addcdiv_", "", D_FLOAT),
+    _binary("_foreach_addcdiv.ScalarList", "_foreach_addcdiv_.ScalarList", "addcdiv", S_PW_SCALARLIST, "aten::addcdiv", "", "aten::addcdiv_", "", D_FLOAT),
+    _binary("_foreach_addcdiv.Tensor", "_foreach_addcdiv_.Tensor", "addcdiv", S_PW_TENSOR, "aten::addcdiv", "", "aten::addcdiv_", "", D_FLOAT),
+    # ternary: ForeachTernaryOp.cu (floating lists only).
+    _binary("_foreach_lerp.List", "_foreach_lerp_.List", "lerp", S_LERP_LIST, "aten::lerp", "Tensor", "aten::lerp_", "Tensor", D_FLOAT),
+    _binary("_foreach_lerp.Scalar", "_foreach_lerp_.Scalar", "lerp", S_LERP_SCALAR, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT, apple=True),
+    _binary("_foreach_lerp.ScalarList", "_foreach_lerp_.ScalarList", "lerp", S_LERP_SCALARLIST, "aten::lerp", "Scalar", "aten::lerp_", "Scalar", D_FLOAT),
 ]
 # fmt: on
 
@@ -716,13 +819,6 @@ def _fast_route(
     if (s == S_LIST or s == S_TENSOR) and e.alpha:
         if not _scalar_keeps_dtype(p.alpha, dt):
             return False
-    if e.kind == "sub":
-        # sub_check: a bool operand raises, which the per-tensor sub does.
-        if v_scalar_is_bool(p.scalar) or v_scalar_is_bool(p.alpha):
-            return False
-        for v in p.scalars:
-            if v_scalar_is_bool(v):
-                return False
     if s == S_TENSOR:
         ref other = p.other[0]
         if other.dtype != dt:
@@ -874,6 +970,23 @@ def _per_tensor(
     ret_tensor_list(rets, 0, result)
 
 
+def _sub_check(t: T, v: Value) raises:
+    """BinaryOps.h's `sub_check(self, scalar)`: no bool on either side."""
+    var bool_self = t.dtype == DType.bool
+    var bool_scalar = v_scalar_is_bool(v)
+    if bool_self and bool_scalar:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if bool_self or bool_scalar:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+
+
 def _scalar_twin(e: ForeachOverload) -> ForeachOverload:
     """The `.Scalar` overload a `.Tensor` row (mul, div) runs when its
     operand is a CPU tensor: ForeachBinaryOpScalarTensor.cu calls
@@ -925,6 +1038,17 @@ def _foreach(
             _per_tensor(scalar_row, inplace, p, rets)
         return
     p.check(e)
+    if e.kind == "sub":
+        # ForeachBinaryOpScalar{,List}.cu check before anything runs: the
+        # Scalar overload the first tensor, the ScalarList one every pair.
+        # The List overload checks nothing up front: a bool pair on the
+        # fast route (bool alpha) computes, any other raises in the
+        # per-tensor sub, as on CUDA.
+        if e.shape == S_SCALAR:
+            _sub_check(p.lists[0][0], p.scalar)
+        elif e.shape == S_SCALARLIST:
+            for i in range(len(p.lists[0])):
+                _sub_check(p.lists[0][i], p.scalars[i])
     if e.shape == S_TENSOR:
         ref other = p.other[0]
         if other.rank != 0 or other.numel != 1:
@@ -1303,26 +1427,462 @@ def op_foreach_copy_(
         _ = call_op("aten::copy_", "", copy_args^, 1)
 
 
+# --- reductions: _foreach_norm, _foreach_powsum, _foreach_max ---------------
+#
+# ForeachReduceOp.cu: one 0-d result per tensor, two launches of the foreach
+# family's reduction kernels (tmb/kernels/foreach/reduce.mojo) for a list on
+# the fast route, the per-tensor reduction otherwise.
+
+
+def _reduce_launch(
+    tensors: List[T],
+    norm: Int,
+    root: Bool,
+    out_stype: Int32,
+    p: Float64 = 0.0,
+    one_element_abs: Bool = False,
+) raises -> List[T]:
+    var outs = List[Owned]()
+    var total_chunks = 0
+    var metadata = List[Int](capacity=3 * len(tensors))
+    for t in tensors:
+        outs.append(own(new_scalar(out_stype, t.device)))
+        total_chunks += ceildiv(t.numel, FE_REDUCE_CHUNK)
+    for i in range(len(tensors)):
+        metadata.append(tensors[i].ptr)
+        metadata.append(outs[i].t.ptr)
+        metadata.append(tensors[i].numel)
+    var dtype = tensors[0].dtype
+    var acc = ST_FLOAT64 if out_stype == ST_FLOAT64 else ST_FLOAT32
+    if norm == FR_MAX:
+        acc = ST_UINT8 if dtype == DType.bool else tensors[0].stype
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = max(total_chunks, 1)
+    var partials = own(new_tensor(shape, 1, acc, tensors[0].device))
+    var ctx = ctx_for(tensors[0].device)
+    var call = KernelCall("foreach", "max" if norm == FR_MAX else "norm")
+    call.flag("FE_NORM", norm)
+    call.flag("FE_ROOT", 1 if root else 0)
+    call.arg_dtype(0, dtype)
+    call.out_dtype(max_dtype(out_stype))
+    call.tuple(metadata)
+    call.int(partials.t.ptr)
+    call.f64(p)
+    call.int(1 if one_element_abs else 0)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = partials  # alive past the launch (its last use above is the pointer read)
+    _ = ctx
+    var result = List[T]()
+    for i in range(len(outs)):
+        result.append(outs[i].take())
+    return result^
+
+
+def _ord_value(ord_v: Value, name: String) raises -> Float64:
+    """`ord.isIntegral(false) ? ord.to<int64_t>() : ord.to<double>()`."""
+    if ord_v.tag == TAG_SCALAR_INT or ord_v.tag == TAG_INT:
+        return Float64(v_int(ord_v))
+    if ord_v.tag == TAG_SCALAR_DOUBLE or ord_v.tag == TAG_DOUBLE:
+        return v_f64(ord_v)
+    raise Error(name, " expects ord to be integer or float")
+
+
+def _check_norm_dtype(dtype_v: Value, self_stype: Int32, name: String) raises:
+    """ForeachReduceOp.cu's `check_foreach_norm_dtype`."""
+    if dtype_v.tag == TAG_NONE:
+        return
+    var dt = v_dtype_or(dtype_v, ST_FLOAT32)
+    if dt == ST_COMPLEX32 or dt == ST_COMPLEX64 or dt == ST_COMPLEX128:
+        raise Error(
+            name,
+            ": dtype should be real for real inputs, but got ",
+            "ComplexHalf" if dt
+            == ST_COMPLEX32 else (
+                "ComplexFloat" if dt == ST_COMPLEX64 else "ComplexDouble"
+            ),
+        )
+    if not is_float_stype(dt):
+        raise Error(
+            name,
+            ": dtype should be floating point or complex, but got ",
+            _scalar_type_name(max_dtype(dt)),
+        )
+    if promote_types(self_stype, dt) != dt:
+        raise Error(
+            name,
+            ": the dtype of the input (",
+            _scalar_type_name(max_dtype(self_stype)),
+            (
+                ") should be convertible without narrowing to the specified"
+                " dtype ("
+            ),
+            _scalar_type_name(max_dtype(dt)),
+            ")",
+        )
+
+
+def _reduce_on_route(tensors: List[T], floating: Bool) raises -> Bool:
+    var lists = List[List[T]]()
+    lists.append(tensors.copy())
+    if not _lists_on_route(lists):
+        return False
+    var dt = tensors[0].dtype
+    var api = dev(tensors[0].device)[].api
+    if api == "metal":
+        return False
+    if floating:
+        return (
+            dt == DType.float32
+            or dt == DType.float16
+            or dt == DType.bfloat16
+            or dt == DType.float64
+        )
+    # max: the dtypes the reduction builds (float8 and the wide unsigned
+    # types take the per-tensor max).
+    return (
+        dt == DType.float32
+        or dt == DType.float16
+        or dt == DType.bfloat16
+        or dt == DType.float64
+        or dt == DType.bool
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
+        or dt == DType.uint8
+    )
+
+
+def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
+    """`_foreach_norm` (root) and `_foreach_powsum`."""
+    var name = String(
+        "_foreach_tensor_norm_cuda" if root else "_foreach_tensor_powsum_cuda"
+    )
+    var self_list = v_tensor_list(args[unsafe_offset=0])
+    var ord_v = args[unsafe_offset=1].copy()
+    var dtype_v = args[unsafe_offset=2].copy()
+    var p = _ord_value(
+        ord_v,
+        "foreach_tensor_norm_cuda" if root else "foreach_tensor_powsum_cuda",
+    )
+    if len(self_list) == 0:
+        raise Error("Tensor list must have at least one tensor.")
+    var inf = Float64.MAX * 2
+    if root and p == inf:
+        for t in self_list:
+            if t.numel == 0:
+                raise Error(
+                    "_foreach_norm cannot compute the infinity norm on an"
+                    " empty tensor because the operation does not have an"
+                    " identity"
+                )
+    # Stock CUDA (torch 2.11) takes ord 0 off its fast route: the slow
+    # route's linalg_vector_norm runs it (measured: its dtype errors are
+    # linalg.vector_norm's).
+    var norm = -1
+    if p == 1:
+        norm = FR_L1
+    elif p == 2:
+        norm = FR_L2
+    elif p == inf and root:
+        norm = FR_LINF
+    if norm >= 0 and _reduce_on_route(self_list, True):
+        _check_norm_dtype(dtype_v, self_list[0].stype, name)
+        var out_stype = v_dtype_or(dtype_v, self_list[0].stype)
+        ret_tensor_list(
+            rets, 0, _reduce_launch(self_list, norm, root, out_stype)
+        )
+        return
+    if (
+        root
+        and p == 2
+        and _qualifies1(self_list, False)
+        and dev(self_list[0].device)[].api == "metal"
+        and (
+            dtype_v.tag == TAG_NONE
+            or v_dtype_or(dtype_v, ST_FLOAT32) == ST_FLOAT32
+        )
+    ):
+        # Apple: the float32 L2 norm's fixed-arity kernels.
+        ret_tensor_list(rets, 0, _foreach_norm_launch(self_list))
+        return
+    var result = List[Owned]()
+    for t in self_list:
+        result.append(own(_lp_one(t, root, ord_v, p, dtype_v)))
+    var out = List[T]()
+    for i in range(len(result)):
+        out.append(result[i].take())
+    ret_tensor_list(rets, 0, out)
+
+
+def _digits(var n: Int) -> String:
+    """The decimal digits of n >= 0."""
+    if n == 0:
+        return "0"
+    var out = String()
+    while n > 0:
+        out = String(chr(48 + n % 10)) + out
+        n //= 10
+    return out^
+
+
+def _format_g(x: Float64) -> String:
+    """`std::ostream << double` with the default precision: printf's %g
+    with 6 significant digits, how c10::Scalar prints a double."""
+    if x != x:
+        return "nan"
+    if x == Float64.MAX * 2:
+        return "inf"
+    if x == -Float64.MAX * 2:
+        return "-inf"
+    if x == 0:
+        return "-0" if String(x).startswith("-") else "0"
+    var sign = String("-") if x < 0 else String()
+    var a = abs(x)
+    # The decimal exponent of the value rounded to 6 significant digits.
+    var e = 0
+    var m = a
+    while m >= 10:
+        m /= 10
+        e += 1
+    while m < 1:
+        m *= 10
+        e -= 1
+    var digits = Int(m * 100000 + 0.5)  # 6 significant digits
+    if digits >= 1000000:
+        digits //= 10
+        e += 1
+    var text = _digits(digits)  # d.ddddd without the point
+    if e < -4 or e >= 6:
+        var mant = String(text[byte=0:1])
+        var frac = String(text[byte=1:])
+        while frac.byte_length() > 0 and frac.endswith("0"):
+            var shorter = String(frac[byte = 0 : frac.byte_length() - 1])
+            frac = shorter^
+        if frac.byte_length() > 0:
+            mant += "." + frac
+        var ee = abs(e)
+        var es = _digits(ee)
+        if ee < 10:
+            es = "0" + es
+        return sign + mant + "e" + ("-" if e < 0 else "+") + es
+    var int_part: String
+    var frac_part: String
+    if e >= 0:
+        int_part = String(text[byte = 0 : e + 1])
+        frac_part = String(text[byte = e + 1 :])
+    else:
+        int_part = "0"
+        frac_part = "0" * (-e - 1) + text
+    while frac_part.byte_length() > 0 and frac_part.endswith("0"):
+        var shorter = String(frac_part[byte = 0 : frac_part.byte_length() - 1])
+        frac_part = shorter^
+    if frac_part.byte_length() > 0:
+        return sign + int_part + "." + frac_part
+    return sign + int_part
+
+
+def _ord_text(ord_v: Value, p: Float64) -> String:
+    """The order as c10::Scalar prints it in linalg.vector_norm's messages:
+    an integer as itself, a double as %g with 6 digits ("-0.333333",
+    "-1e+100")."""
+    if ord_v.tag == TAG_SCALAR_INT or ord_v.tag == TAG_INT:
+        return String(Int(ord_v.a))  # exact, not through the double
+    return _format_g(p)
+
+
+def _reduce_input_ok(dt: DType) -> Bool:
+    """The input dtypes the norm reduction builds (bool as uint8)."""
+    return (
+        dt.is_floating_point()
+        and dt != DType.float8_e4m3fn
+        and dt != DType.float8_e5m2
+        or dt == DType.bool
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
+        or dt == DType.uint8
+        or dt == DType.uint16
+        or dt == DType.uint32
+        or dt == DType.uint64
+    )
+
+
+def _lp_one(
+    t: T, root: Bool, ord_v: Value, p: Float64, dtype_v: Value
+) raises -> T:
+    """One tensor of CUDA's slow route: `linalg_vector_norm` (root) or
+    `linalg__powsum` of the whole tensor, with their checks and their
+    arithmetic (LinearAlgebra.cpp, ReduceNormKernel.cu), measured on stock
+    CUDA: the elements converted to the result dtype, then accumulated in
+    its opmath (float32 for the half types) and rounded once."""
+    var inf = Float64.MAX * 2
+    if not t.on_mojo():
+        # A list may mix devices (CUDA's fast route then declines): a
+        # tensor elsewhere is that device's own per-tensor reduction.
+        return _seq_vector_norm(
+            String(
+                "aten::linalg_vector_norm" if root else "aten::linalg__powsum"
+            ),
+            t,
+            ord_v,
+            dtype_v,
+        )
+    var out_stype: Int32
+    if root:
+        if not t.dtype.is_floating_point():
+            raise Error(
+                (
+                    "linalg.vector_norm: Expected a floating point or"
+                    " complex tensor as input. Got "
+                ),
+                _scalar_type_name(t.dtype),
+            )
+        if t.numel == 0 and (p < 0 or p == inf):
+            raise Error(
+                "linalg.vector_norm cannot compute the ",
+                _ord_text(ord_v, p),
+                (
+                    " norm on an empty tensor because the operation does not"
+                    " have an identity"
+                ),
+            )
+        _check_norm_dtype(dtype_v, t.stype, "linalg.vector_norm")
+        out_stype = v_dtype_or(dtype_v, t.stype)
+    else:
+        # get_dtype_from_self(promote_integers=True): `dtype`, else int64
+        # for an integer or bool tensor. Only a floating computation dtype
+        # has a powsum kernel: an empty tensor is a 0 of the computation
+        # dtype (no kernel runs), any other raises.
+        out_stype = v_dtype_or(
+            dtype_v, t.stype if t.dtype.is_floating_point() else ST_INT64
+        )
+        # A complex computation dtype computes |x| ** p in its real value
+        # dtype (`toRealValueType`, measured on stock CUDA: dtype=complex64
+        # gives a float32 result).
+        if out_stype == ST_COMPLEX32:
+            out_stype = ST_FLOAT16
+        elif out_stype == ST_COMPLEX64:
+            out_stype = ST_FLOAT32
+        elif out_stype == ST_COMPLEX128:
+            out_stype = ST_FLOAT64
+        if not is_float_stype(out_stype):
+            if t.numel == 0 and known_stype(out_stype):
+                var zero = new_scalar(out_stype, t.device)
+                fill_value(zero, 0.0)
+                return zero^
+            unsupported(
+                '"powsum_cuda" not implemented for \''
+                + _scalar_type_name(max_dtype(out_stype))
+                + "'"
+            )
+    if dev(t.device)[].api == "metal" or not _reduce_input_ok(t.dtype):
+        var op = String(
+            "aten::linalg_vector_norm" if root else "aten::linalg__powsum"
+        )
+        return _seq_vector_norm(op, t, ord_v, dtype_v)
+    # ReduceNormKernel.cu: the norm specializes 0, 1, 2, inf and -inf, the
+    # powsum only 2 (its order 1 is NormOps' pow(|x|, 1), which CUDA's
+    # double pow does not keep exact: pow(3., 1.) = 2.9999999999999996).
+    var norm = FR_LP
+    if root and p == 0:
+        norm = FR_L0
+    elif root and p == 1:
+        norm = FR_L1
+    elif p == 2:
+        norm = FR_L2
+    elif root and p == inf:
+        norm = FR_LINF
+    elif root and p == -inf:
+        norm = FR_LNEGINF
+    var one = List[T]()
+    if t.contig or is_dense(t.shape, t.strides, t.rank):
+        one.append(t.copy())
+        var r = _reduce_launch(
+            one, norm, root, out_stype, p, one_element_abs=root
+        )
+        return r[0].copy()
+    var tmp = own(new_like(t))
+    copy_strided_into(tmp.t, t)
+    one.append(tmp.t.copy())
+    var r = _reduce_launch(one, norm, root, out_stype, p, one_element_abs=root)
+    _ = tmp  # alive past the launch
+    return r[0].copy()
+
+
 # aten::_foreach_norm.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]
 def op_foreach_norm_scalar(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _foreach_lp(args, rets, True)
+
+
+# aten::_foreach_powsum.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]
+def op_foreach_powsum_scalar(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _foreach_lp(args, rets, False)
+
+
+# aten::_foreach_max(Tensor[] self) -> Tensor[]
+def op_foreach_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self_list = v_tensor_list(args[unsafe_offset=0])
     if len(self_list) == 0:
         raise Error("Tensor list must have at least one tensor.")
-    var ord_v = args[unsafe_offset=1].copy()
-    var dtype_v = args[unsafe_offset=2].copy()
-    var ord_is_two = not v_scalar_is_bool(ord_v) and v_f64(ord_v) == 2.0
-    var dtype_ok = (
-        dtype_v.tag == TAG_NONE or v_dtype_or(dtype_v, ST_FLOAT32) == ST_FLOAT32
-    )
-    if ord_is_two and dtype_ok and _qualifies1(self_list, False):
-        ret_tensor_list(rets, 0, _foreach_norm_launch(self_list))
-        return
-    var result = List[T]()
     for t in self_list:
-        result.append(_seq_vector_norm(t, ord_v, dtype_v))
-    ret_tensor_list(rets, 0, result)
+        if t.numel == 0:
+            # Stock CUDA (torch 2.11) takes a list with an empty tensor to
+            # the per-tensor max, which refuses it (the v2.14 source has a
+            # foreach-specific message instead).
+            raise Error(
+                "max(): Expected reduction dim to be specified for"
+                " input.numel() == 0. Specify the reduction dim with the"
+                " 'dim' argument."
+            )
+    var lists = List[List[T]]()
+    lists.append(self_list.copy())
+    var dt = self_list[0].dtype
+    if (
+        dt == DType.uint16 or dt == DType.uint32 or dt == DType.uint64
+    ) and _lists_on_route(lists):
+        # On CUDA's fast route the kernel's dispatch has no wide unsigned
+        # type.
+        unsupported(
+            '"foreach_tensor_max_cuda_scalar_type" not implemented for \''
+            + _scalar_type_name(dt)
+            + "'"
+        )
+    if _reduce_on_route(self_list, False):
+        ret_tensor_list(
+            rets,
+            0,
+            _reduce_launch(self_list, FR_MAX, False, self_list[0].stype),
+        )
+        return
+    var result = List[Owned]()
+    for t in self_list:
+        if t.on_mojo() and (
+            t.dtype == DType.uint16
+            or t.dtype == DType.uint32
+            or t.dtype == DType.uint64
+        ):
+            # The per-tensor max of CUDA's slow route has no wide unsigned
+            # kernel either.
+            unsupported(
+                '"max_all_cuda" not implemented for \''
+                + _scalar_type_name(t.dtype)
+                + "'"
+            )
+        var one = List[Value](capacity=1)
+        one.append(_tensor_value(t))
+        var r = call_op("aten::max", "", one^, 1)
+        result.append(own(r.take_tensor(0)))
+    var out = List[T]()
+    for i in range(len(result)):
+        out.append(result[i].take())
+    ret_tensor_list(rets, 0, out)
 
 
 def _scalar_f32_tensor(
@@ -1939,6 +2499,8 @@ def register_foreach(site: Site) raises:
     impl[op_amp_update_scale_, "_amp_update_scale_"](site)
     impl[op_foreach_copy_, "_foreach_copy_"](site)
     impl[op_foreach_norm_scalar, "_foreach_norm.Scalar"](site)
+    impl[op_foreach_powsum_scalar, "_foreach_powsum.Scalar"](site)
+    impl[op_foreach_max, "_foreach_max"](site)
     comptime for row in range(len(FOREACH_OVERLOADS)):
         comptime e = FOREACH_OVERLOADS[row]
         comptime if e.name != "":

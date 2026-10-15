@@ -84,6 +84,12 @@ from tmb.ops.f8_iter import (
     PRE_SUB,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    cx_conj_physical_out,
+    cx_fill,
+    cx_via_bool,
+    routed,
+)
 from tmb.ops.core import cast_for_copy
 from tmb.ops.data_movement import _scalar_type_name
 
@@ -2596,7 +2602,13 @@ def register_unary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_conj_physical_out, "conj_cuda", 1, 1, MODE_SAME, False, PRE_NONE
+            routed[op_conj_physical_out, cx_conj_physical_out, 2],
+            "conj_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_NONE,
         ],
         "conj_physical.out",
     ](site)
@@ -3196,13 +3208,19 @@ def register_unary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            op_logical_not, "logical_not_cuda", 1, -1, MODE_FN, False, PRE_NONE
+            routed[op_logical_not, cx_via_bool["logical_not", "", 1], 1],
+            "logical_not_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
         ],
         "logical_not",
     ](site)
     impl[
         f8_iter[
-            op_logical_not_out,
+            routed[op_logical_not_out, cx_via_bool["logical_not", "out", 1], 2],
             "logical_not_cuda",
             1,
             1,
@@ -3230,4 +3248,4 @@ def register_unary(site: Site) raises:
         ],
         "bitwise_not.out",
     ](site)
-    impl[op_fill_scalar, "fill.Scalar"](site)
+    impl[routed[op_fill_scalar, cx_fill, 1], "fill.Scalar"](site)

@@ -37,9 +37,11 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     v_bool_or,
+    TAG_COMPLEX,
     IntList,
     Owned,
     ST_BOOL,
+    ST_UINT64,
     ST_INT64,
     T,
     TAG_MEMORY_FORMAT,
@@ -78,9 +80,24 @@ from tmb.backend.device import (
 )
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.float8 import is_float8
+from tmb.ops.complex import (
+    cx_fill_tensor_,
+    cx_flip,
+    cx_index_copy,
+    cx_index_copy_,
+    cx_index_copy_out,
+    cx_roll,
+    cx_via_bool,
+    routed,
+)
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     decline_float8,
+    uint64_cross_item,
+    check_real_scalar_fits,
+    real_fill_value,
+    is_wide_unsigned,
+    scalar_type_name,
     assert_no_internal_overlap,
     assert_no_overlap,
     call_op,
@@ -94,8 +111,6 @@ from tmb.ops.common import (
     is_int_stype,
     resize_out,
     same_view,
-    scalar_to_float,
-    scalar_to_int,
     shape_str,
 )
 from tmb.ops.compare import _where_select, scalar_as_fill
@@ -771,6 +786,12 @@ def _index_fill(a: T, dim_in: Int, index: T, value_v: Value) raises:
     if index.dtype != DType.int64:
         raise Error("index_fill_(): Expected dtype int64 for index.")
     assert_no_overlap(a, index)
+    if not a.is_complex() and value_v.tag == TAG_COMPLEX:
+        # ATen's own check, before the dtype dispatch: even 1+0j is refused
+        raise Error(
+            "index_fill_(): Converting complex Scalar to non-complex type is"
+            " not supported"
+        )
     var dim = _norm_dim(dim_in, a.rank, "index_fill_")
     if index.rank > 1:
         raise Error("Index has to be a vector/scalar")
@@ -778,6 +799,14 @@ def _index_fill(a: T, dim_in: Int, index: T, value_v: Value) raises:
         unsupported("index_fill_ with the index on a different device")
     # The value converts (and is range-checked) before any early return, as
     # ATen's `source.to<scalar_t>()` does even for an empty fill.
+    if is_wide_unsigned(a.stype):
+        # CUDA's kernel is not instantiated for them: declined before the
+        # value converts, as its dtype dispatch does (in its words)
+        unsupported(
+            '"index_fill_cuda" not implemented for \''
+            + scalar_type_name(a.stype)
+            + "'"
+        )
     var value = scalar_as_fill(value_v, a.dtype)
     if index.numel == 0:
         return
@@ -2189,25 +2218,56 @@ def op_fill__tensor(
     # The value is read once, on the host (a device value costs one sync,
     # where CUDA copies on the stream), then filled with fill_.Scalar's
     # conversion rules. Reading it first also covers a value aliasing self.
-    var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
-    if value.on_mojo() and value.device == t.device:
+    var same = t.on_mojo() and value.on_mojo() and value.device == t.device
+    if same and (value.stype == ST_UINT64 or t.stype == ST_UINT64):
+        # A same-device value is a copy_ (CUDA's fill_ copies on the
+        # stream): a uint64 converts as copy_ does (unsigned into a float,
+        # wrapping into a signed integer), and so does a value into uint64
+        # (a double of 2**63 or more exactly, which no Scalar record holds).
+        assert_no_internal_overlap(t)
+        var expanded = own(
+            view_strided(
+                value, t.shape, IndexList[MAX_RANK](0), t.rank, value.offset
+            )
+        )
+        _ = call_op(
+            "aten::copy_",
+            "",
+            [tensor_arg(t), tensor_arg(expanded.t), bool_arg(False)],
+            1,
+        )
+        _ = expanded^
+        ret_ref(rets, 0, t)
+        return
+    var item: Value
+    if value.stype == ST_UINT64 and not same:
+        item = uint64_cross_item(value, t.stype)
+    else:
+        var r = call_op("aten::_local_scalar_dense", "", [tensor_arg(value)], 1)
+        item = r[0].copy()
+    if not t.on_mojo():
+        # a host self with a device 0-d value: its item() fills it (fill_'s
+        # own route for a 0-d value on another device)
+        _ = call_op("aten::fill_", "Scalar", [tensor_arg(t), item.copy()], 1)
+        ret_ref(rets, 0, t)
+        return
+    if same:
         # A same-device value is a `copy_`: it converts without a range
         # check, but keeps copy_'s overlap check on self.
         assert_no_internal_overlap(t)
     else:
         # A value on another device (the CPU or another GPU) goes through
         # `fill_(Scalar)`, whose `Scalar::to<scalar_t>()` raises on overflow.
-        if is_int_stype(t.stype):
-            _ = scalar_to_int(r[0], t.stype)
-        elif t.dtype.is_floating_point():
-            _ = scalar_to_float(r[0], t.stype)
-    fill_value(t, r[0])
+        # (one checked conversion for fill_: the Scalar route's)
+        check_real_scalar_fits(t.stype, item)
+        item = real_fill_value(t.stype, item)
+    fill_value(t, item)
     ret_ref(rets, 0, t)
 
 
 def register_indexing(site: Site) raises:
-    impl[op_flip, "flip"](site)
-    impl[op_roll, "roll"](site)
+    impl[routed[op_flip, cx_flip, 1], "flip"](site)
+    impl[routed[op_roll, cx_roll, 1], "roll"](site)
     impl[op_unfold, "unfold"](site)
     impl[op_unfold_backward, "unfold_backward"](site)
     impl[op_channel_shuffle, "channel_shuffle"](site)
@@ -2216,9 +2276,11 @@ def register_indexing(site: Site) raises:
     impl[op_put_, "put_"](site)
     impl[op_index_fill__int_scalar, "index_fill_.int_Scalar"](site)
     impl[op_index_fill__int_tensor, "index_fill_.int_Tensor"](site)
-    impl[op_index_copy, "index_copy"](site)
-    impl[op_index_copy_, "index_copy_"](site)
-    impl[op_index_copy_out, "index_copy.out"](site)
+    impl[routed[op_index_copy, cx_index_copy, 4], "index_copy"](site)
+    impl[routed[op_index_copy_, cx_index_copy_, 4], "index_copy_"](site)
+    impl[routed[op_index_copy_out, cx_index_copy_out, 4], "index_copy.out"](
+        site
+    )
     impl[op_masked_scatter_, "masked_scatter_"](site)
     impl[op_repeat_interleave_tensor, "repeat_interleave.Tensor"](site)
     impl[op_scatter_value_out, "scatter.value_out"](site)
@@ -2235,9 +2297,12 @@ def register_indexing(site: Site) raises:
     impl[op_index_reduce, "index_reduce"](site)
     impl[op_index_reduce_, "index_reduce_"](site)
     impl[op_index_reduce_out, "index_reduce.out"](site)
-    impl[op_nonzero_out, "nonzero.out"](site)
+    impl[
+        routed[op_nonzero_out, cx_via_bool["nonzero", "out", 1], 1],
+        "nonzero.out",
+    ](site)
     impl[op_nonzero_static, "nonzero_static"](site)
     impl[op_nonzero_static_out, "nonzero_static.out"](site)
     impl[op_index_tensor_out, "index.Tensor_out"](site)
     impl[op_narrow_copy_out, "narrow_copy.out"](site)
-    impl[op_fill__tensor, "fill_.Tensor"](site)
+    impl[routed[op_fill__tensor, cx_fill_tensor_, 2], "fill_.Tensor"](site)

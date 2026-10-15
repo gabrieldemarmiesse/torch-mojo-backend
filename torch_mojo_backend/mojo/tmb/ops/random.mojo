@@ -78,6 +78,11 @@ from tmb.ops.common import (
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    cx_normal_,
+    cx_uniform_,
+    routed,
+)
 
 comptime INT32_MAX = 2147483647
 comptime INT64_MIN = -9223372036854775808
@@ -2069,8 +2074,8 @@ def op_philox_normal_(
 
 
 def register_random(site: Site) raises:
-    impl[op_uniform_, "uniform_"](site)
-    impl[op_normal_, "normal_"](site)
+    impl[routed[op_uniform_, cx_uniform_, 1], "uniform_"](site)
+    impl[routed[op_normal_, cx_normal_, 1], "normal_"](site)
     impl[op_normal_tensor_float, "normal.Tensor_float"](site)
     impl[op_normal_float_tensor, "normal.float_Tensor"](site)
     impl[op_normal_tensor_tensor, "normal.Tensor_Tensor"](site)

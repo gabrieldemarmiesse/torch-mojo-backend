@@ -102,7 +102,7 @@ def _f8_rec(v: Value) -> Bool:
 
 
 def _tname(st: Int32) raises -> String:
-    return scalar_type_name(max_dtype(st))
+    return scalar_type_name(st)
 
 
 def _refuse(kernel: String, st: Int32) raises:

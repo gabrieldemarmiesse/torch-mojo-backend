@@ -193,6 +193,7 @@ void* tmb_tensor_storage_impl(TmbTensor t);  // the StorageImpl: two tensors sha
 int32_t tmb_tensor_storage_resizable(TmbTensor t);  // c10::StorageImpl::resizable() (false for DLPack imports)
 int32_t tmb_tensor_is_contiguous(TmbTensor t);
 int32_t tmb_tensor_is_neg(TmbTensor t);
+int32_t tmb_tensor_is_conj(TmbTensor t);  // the lazy conjugate bit (complex tensors)
 void* tmb_tensor_impl(TmbTensor t);  // the TensorImpl: two arguments are the same tensor iff these match
 int32_t tmb_tensor_is_wrapped_number(TmbTensor t);  // a Python number the arg parser wrapped in a 0-d CPU tensor
 int32_t tmb_tensor_requires_grad(TmbTensor t);
