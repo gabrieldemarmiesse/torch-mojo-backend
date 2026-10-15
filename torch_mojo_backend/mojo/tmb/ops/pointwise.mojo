@@ -178,9 +178,9 @@ def _pw_promote(a: Int32, b: Int32) raises -> Int32:
                     "Promotion for Float8 Types is not supported, attempted to"
                     " promote "
                 ),
-                scalar_type_name(max_dtype(a)),
+                scalar_type_name(a),
                 " and ",
-                scalar_type_name(max_dtype(b)),
+                scalar_type_name(b),
             )
     return promote_types(a, b)
 

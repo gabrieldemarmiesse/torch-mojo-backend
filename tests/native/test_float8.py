@@ -406,6 +406,58 @@ def test_float8_compare_complex_scalar(mojo_device):
         d == 1 + 1j  # noqa: B015
 
 
+def test_float8_meets_complex(mojo_device):
+    """float8 against complex64 (stock CUDA 2.11): no promotion either way
+    (promoteTypes' error, a wrapped complex number's toComplexType error),
+    while conversions between the two work."""
+    d = torch.tensor([1.0, 2.0]).to(torch.float8_e4m3fn).to(mojo_device)
+    c = torch.ones(2, dtype=torch.complex64, device=mojo_device)
+    msg = "Promotion for Float8 Types is not supported, attempted to promote "
+    with pytest.raises(RuntimeError, match=msg + "Float8_e4m3fn and ComplexFloat"):
+        d == c  # noqa: B015
+    with pytest.raises(RuntimeError, match=msg + "ComplexFloat and Float8_e4m3fn"):
+        c == d  # noqa: B015
+    with pytest.raises(RuntimeError, match=msg + "Float8_e4m3fn and ComplexFloat"):
+        d + c  # noqa: B015
+    zc = torch.tensor(1j, device=mojo_device)
+    with pytest.raises(
+        RuntimeError, match="Unknown Complex ScalarType for Float8_e4m3fn"
+    ):
+        d == zc  # noqa: B015
+    m = torch.tensor([True, False], device=mojo_device)
+    with pytest.raises(RuntimeError, match=msg + "Float8_e4m3fn and ComplexFloat"):
+        torch.where(m, d, c)
+    assert d.to(torch.complex64).cpu().tolist() == [1 + 0j, 2 + 0j]
+    assert c.clone().copy_(d).cpu().tolist() == [1 + 0j, 2 + 0j]
+    assert c.to(torch.float8_e5m2).float().cpu().tolist() == [1.0, 1.0]
+
+
+@pytest.mark.parametrize(
+    "dtype,value,ok",
+    [
+        (torch.float8_e4m3fn, 1 + 1j, None),
+        (torch.float8_e4m3fn, 2 + 0j, 2.0),
+        (torch.float8_e4m3fn, 1000 + 0j, None),
+        (torch.float8_e8m0fnu, 2 + 0j, None),
+        (torch.float8_e8m0fnu, True, 1.0),
+    ],
+)
+def test_float8_fill_complex_scalar(mojo_device, dtype, value, ok):
+    """A complex Scalar into float8 (stock CUDA 2.11): each part checked as
+    a double, a nonzero imaginary part overflowing (e8m0fnu even a zero one:
+    its lowest is 2**-127)."""
+    msg = f"value cannot be converted to type c10::{str(dtype)[6:].capitalize()}"
+    for make in (
+        lambda: torch.empty(2, dtype=dtype, device=mojo_device).fill_(value),
+        lambda: torch.full((2,), value, dtype=dtype, device=mojo_device),
+    ):
+        if ok is None:
+            with pytest.raises(RuntimeError, match=msg):
+                make()
+        else:
+            assert make().float().cpu().tolist() == [ok, ok]
+
+
 def test_float8_zero_dim_vs_dimensioned_float(mojo_device):
     """A 0-d float8 meets a dimensioned half / float in that float's dtype."""
     z = torch.tensor(1.5).to(torch.float8_e4m3fn)

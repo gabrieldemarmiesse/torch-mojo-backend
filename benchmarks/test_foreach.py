@@ -13,9 +13,11 @@ the kernels are data-oblivious so drift cannot skew timing.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 import torch
-from bench_lib.cases import DTYPES, both, both_list, unit_interval
+from bench_lib.cases import DTYPES, both, both_list, op_params, unit_interval
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
@@ -31,6 +33,8 @@ COVERS: dict[str, str] = {
     "aten::_amp_update_scale_": "test_amp_update_scale_",
     "aten::_foreach_copy_": "test_foreach_copy_cast",
     "aten::_foreach_add_.Scalar": "test_foreach_add_",
+    "aten::_foreach_addcdiv_.ScalarList": "test_foreach_addcdiv_",
+    "aten::_foreach_div_.ScalarList": "test_foreach_div_",
     "aten::_foreach_addcmul_.Scalar": "test_foreach_addcmul_",
     "aten::_foreach_lerp_.Scalar": "test_foreach_lerp_",
     "aten::_foreach_mul_.Scalar": "test_foreach_mul_scalar",
@@ -56,6 +60,90 @@ COVERS: dict[str, str] = {
 }
 
 SKIPPED: dict[str, str] = {}
+
+
+# Every other elementwise overload of the generic multi-tensor apply
+# (FOREACH_OVERLOADS in tmb/ops/foreach.mojo), one node each under its
+# schema name: the same launch as the ones above with another functor.
+_UNARY = (
+    "abs acos asin atan ceil cos cosh erf erfc exp expm1 floor frac lgamma"
+    " log log10 log1p log2 neg reciprocal round rsqrt sigmoid sign sin sinh"
+    " sqrt tan tanh trunc"
+).split()
+_BINARY = {
+    "add": ("Scalar", "ScalarList", "List", "Tensor"),
+    "sub": ("Scalar", "ScalarList", "List"),
+    "mul": ("Scalar", "ScalarList", "List", "Tensor"),
+    "div": ("Scalar", "ScalarList", "List", "Tensor"),
+    "clamp_max": ("Scalar", "ScalarList", "List"),
+    "clamp_min": ("Scalar", "ScalarList", "List"),
+    "maximum": ("Scalar", "ScalarList", "List"),
+    "minimum": ("Scalar", "ScalarList", "List"),
+    "pow": ("Scalar", "ScalarList", "List"),
+}
+_TERNARY = {
+    "addcmul": ("Scalar", "ScalarList", "Tensor"),
+    "addcdiv": ("Scalar", "ScalarList", "Tensor"),
+    "lerp": ("List", "Scalar", "ScalarList"),
+}
+
+
+_Call = Callable[
+    [list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], torch.Tensor], object
+]
+
+
+def _overload_call(name: str) -> _Call:
+    """The call of schema `name` on operand lists (a, b, c) and a 0-d
+    device scalar `s`; values stay finite across repeated in-place runs
+    (multipliers near 1, tiny addends) and the kernels are data-oblivious."""
+    base, _, overload = name.removeprefix("_foreach_").partition(".")
+    fn = getattr(torch, "_foreach_" + base)
+    op = base.rstrip("_")
+    if not overload:
+        return lambda a, b, c, s: fn(a)
+    if overload == "ScalarAndTensor":
+        return lambda a, b, c, s: fn(1.0001, a)
+    if op == "powsum":
+        return lambda a, b, c, s: fn(a, 2)
+    if op in _TERNARY and op != "lerp":
+        args = {
+            "Scalar": lambda a: 1e-4,
+            "ScalarList": lambda a: [1e-4] * len(a),
+            "Tensor": lambda a: torch.full((len(a),), 1e-4),
+        }[overload]
+        return lambda a, b, c, s: fn(a, b, c, args(a))
+    if op == "lerp":
+        if overload == "List":
+            return lambda a, b, c, s: fn(a, b, c)
+        if overload == "Scalar":
+            return lambda a, b, c, s: fn(a, b, 0.01)
+        return lambda a, b, c, s: fn(a, b, [0.01] * len(a))
+    value = 1.0001 if op in ("mul", "div", "pow") else 1e-5
+    if overload == "Scalar":
+        return lambda a, b, c, s: fn(a, value)
+    if overload == "ScalarList":
+        return lambda a, b, c, s: fn(a, [value] * len(a))
+    if overload == "List":
+        return lambda a, b, c, s: fn(a, b)
+    return lambda a, b, c, s: fn(a, s)
+
+
+def _overload_names() -> list[str]:
+    names = []
+    for op in _UNARY:
+        names += [f"_foreach_{op}", f"_foreach_{op}_"]
+    names.append("_foreach_zero_")
+    for op, overloads in (_BINARY | _TERNARY).items():
+        for overload in overloads:
+            names += [f"_foreach_{op}.{overload}", f"_foreach_{op}_.{overload}"]
+    names += ["_foreach_pow.ScalarAndTensor", "_foreach_max", "_foreach_powsum.Scalar"]
+    measured = {"_foreach_sqrt"} | {name.removeprefix("aten::") for name in COVERS}
+    return [name for name in names if name not in measured]
+
+
+OVERLOADS = {name: _overload_call(name) for name in _overload_names()}
+COVERS.update({f"aten::{name}": "test_foreach_overload" for name in OVERLOADS})
 
 
 COPY_LISTS = {
@@ -493,5 +581,28 @@ def test_fused_adagrad(
     bench.run(
         lambda: step([ref for ref, _ in lists], steps_ref),
         lambda: step([our for _, our in lists], steps_our),
+        flops=_total(shape_id),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("f32",))
+@pytest.mark.parametrize("shape_id", LISTS)
+@pytest.mark.parametrize("op_name", op_params(OVERLOADS))
+def test_foreach_overload(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    call = OVERLOADS[op_name]
+    (a_ref, a_our), (b_ref, b_our), (c_ref, c_our) = _lists(
+        shape_id, hw, mojo_device, count=3
+    )
+    s_ref, s_our = both(torch.tensor(1.0001), hw, mojo_device)
+    bench.run(
+        lambda: call(a_ref, b_ref, c_ref, s_ref),
+        lambda: call(a_our, b_our, c_our, s_our),
         flops=_total(shape_id),
     )

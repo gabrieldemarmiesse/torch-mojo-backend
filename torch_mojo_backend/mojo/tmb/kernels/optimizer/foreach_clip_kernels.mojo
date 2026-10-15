@@ -1,6 +1,9 @@
-"""Runtime-dynamic pure-Mojo FP32 foreach L2-norm kernels.
+"""Apple's FP32 foreach L2-norm kernels (`_foreach_norm` ord 2 on Metal).
 
-Norms use a two-stage reduction. A fixed-size chunk is reduced by one block
+Everywhere else `_foreach_norm` is the foreach family's reduction
+(tmb/kernels/foreach/reduce.mojo), which takes every ord, dtype and result
+dtype CUDA's fast route does; this file only keeps the float32 fixed-arity
+path Metal needs (see below). Norms use a two-stage reduction. A fixed-size chunk is reduced by one block
 into caller-owned scratch, then one block per tensor reduces its chunk
 partials and writes the ordered scalar result. The rescaling multiply that
 follows a norm is not here: it is `aten::_foreach_mul_.Tensor`, one overload
@@ -8,12 +11,10 @@ of the foreach family's multi-tensor apply (tmb/kernels/foreach).
 """
 
 from std.collections import Array
-from std.ffi import _get_global_or_null, external_call
 from max.gpu import block_idx, thread_idx
 from max.gpu.host import DeviceContext
 from max.gpu.primitives import block
 from std.math import min
-from std.memory.alloc import unsafe_alloc
 from std.sys.info import has_apple_gpu_accelerator
 
 from tmb.kernels.optimizer.foreach_clip_contract import (
@@ -42,87 +43,6 @@ def _ptr(addr: Int) -> Pointer[Scalar[DType.float32], MutUntrackedOrigin]:
     return Pointer[Scalar[DType.float32], MutUntrackedOrigin](
         unsafe_from_address=addr
     )
-
-
-@always_inline
-def _chunk_bounds(
-    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
-    desc_count: Int,
-    chunk: Int,
-) -> Tuple[ForeachDesc, Int, Int]:
-    var desc_index = 0
-    while desc_index + 1 < desc_count and chunk >= descs[desc_index].chunk_end:
-        desc_index += 1
-    var desc = descs[desc_index]
-    var first_chunk = 0
-    if desc_index != 0:
-        first_chunk = descs[desc_index - 1].chunk_end
-    var begin = (chunk - first_chunk) * FOREACH_CHUNK_ELEMENTS
-    return desc, begin, min(begin + FOREACH_CHUNK_ELEMENTS, desc.numel)
-
-
-@__name("foreach_l2_norm_f32_chunk_partials_v1")
-def _norm_chunk_partials(
-    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
-    desc_count_arg: Int64,
-    partials_addr_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var desc_count = Int(desc_count_arg)
-    var partials_addr = Int(partials_addr_arg)
-    var chunk = Int(block_idx.x)
-    var desc, begin, end = _chunk_bounds(descs, desc_count, chunk)
-    var values = _ptr(desc.tensor_addr)
-    var accum = SIMD[DType.float32, _VEC](0.0)
-    var index = begin + Int(thread_idx.x) * _VEC
-    var stride = FOREACH_THREADS * _VEC
-    while index + _VEC <= end:
-        var value = values.unsafe_load[width=_VEC, alignment=4](index)
-        accum = value.fma(value, accum)
-        index += stride
-
-    var scalar_accum = accum.reduce_add()
-    # The contract's chunk size is divisible by four, so only the last chunk
-    # of a tensor can need this scalar tail.
-    index = begin + ((end - begin) // _VEC) * _VEC + Int(thread_idx.x)
-    while index < end:
-        var value = values[unsafe_offset=index]
-        scalar_accum += value * value
-        index += FOREACH_THREADS
-
-    var total = block.sum[block_size=FOREACH_THREADS, broadcast=False](
-        scalar_accum
-    )
-    if thread_idx.x == 0:
-        _ptr(partials_addr)[unsafe_offset=chunk] = total
-
-
-@__name("foreach_l2_norm_f32_finalize_v1")
-def _norm_finalize(
-    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
-    desc_count_arg: Int64,
-    partials_addr_arg: Int64,
-):
-    # Int is not device-passable (host/device width mismatch); scalars cross
-    # the launch ABI as Int64 and index math stays in Int.
-    var desc_count = Int(desc_count_arg)
-    var partials_addr = Int(partials_addr_arg)
-    var desc_index = Int(block_idx.x)
-    if desc_index >= desc_count:
-        return
-    var desc = descs[desc_index]
-    var begin = 0
-    if desc_index != 0:
-        begin = descs[desc_index - 1].chunk_end
-    var accum = Float32(0.0)
-    for chunk in range(
-        begin + Int(thread_idx.x), desc.chunk_end, FOREACH_THREADS
-    ):
-        accum += _ptr(partials_addr)[unsafe_offset=chunk]
-    var total = block.sum[block_size=FOREACH_THREADS, broadcast=False](accum)
-    if thread_idx.x == 0:
-        _ptr(desc.output_addr)[unsafe_offset=0] = ieee_sqrt(total)
 
 
 # ---------------------------------------------------------------------------
@@ -215,79 +135,6 @@ def _norm_finalize_batched_apple(
         out_ptr[unsafe_offset=0] = ieee_sqrt(total)
 
 
-def _enqueue_norm_partials_cached(
-    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
-    desc_count: Int,
-    total_chunks: Int,
-    partials_addr: Int,
-    ctx: DeviceContext,
-) raises:
-    var cache_name = String(t"FOREACH_NORM_PARTIALS_F32_V1_{ctx.id()}")
-    comptime FuncT = type_of(ctx.compile_function[_norm_chunk_partials]())
-    var global_ptr = _get_global_or_null(cache_name)
-    if global_ptr:
-        var cached = global_ptr.value().unsafe_bitcast[FuncT]()
-        ctx.enqueue_function(
-            cached[],
-            descs,
-            Int64(desc_count),
-            Int64(partials_addr),
-            grid_dim=(total_chunks,),
-            block_dim=(FOREACH_THREADS,),
-        )
-        return
-    var compiled = ctx.compile_function[_norm_chunk_partials]()
-    var cached = unsafe_alloc[FuncT](1)
-    cached.unsafe_write(compiled^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(cache_name), cached.unsafe_bitcast[NoneType]()
-    )
-    ctx.enqueue_function(
-        cached[],
-        descs,
-        Int64(desc_count),
-        Int64(partials_addr),
-        grid_dim=(total_chunks,),
-        block_dim=(FOREACH_THREADS,),
-    )
-
-
-def _enqueue_norm_finalize_cached(
-    descs: Array[ForeachDesc, FOREACH_DESC_CAP],
-    desc_count: Int,
-    partials_addr: Int,
-    ctx: DeviceContext,
-) raises:
-    var cache_name = String(t"FOREACH_NORM_FINALIZE_F32_V1_{ctx.id()}")
-    comptime FuncT = type_of(ctx.compile_function[_norm_finalize]())
-    var global_ptr = _get_global_or_null(cache_name)
-    if global_ptr:
-        var cached = global_ptr.value().unsafe_bitcast[FuncT]()
-        ctx.enqueue_function(
-            cached[],
-            descs,
-            Int64(desc_count),
-            Int64(partials_addr),
-            grid_dim=(desc_count,),
-            block_dim=(FOREACH_THREADS,),
-        )
-        return
-    var compiled = ctx.compile_function[_norm_finalize]()
-    var cached = unsafe_alloc[FuncT](1)
-    cached.unsafe_write(compiled^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(cache_name), cached.unsafe_bitcast[NoneType]()
-    )
-    ctx.enqueue_function(
-        cached[],
-        descs,
-        Int64(desc_count),
-        Int64(partials_addr),
-        grid_dim=(desc_count,),
-        block_dim=(FOREACH_THREADS,),
-    )
-
-
 def enqueue_foreach_l2_norm_f32(
     descs: Array[ForeachDesc, FOREACH_DESC_CAP],
     desc_count: Int,
@@ -370,8 +217,7 @@ def enqueue_foreach_l2_norm_f32(
                 Int64(used_slots),
             )
     else:
-        if total_chunks > 0:
-            _enqueue_norm_partials_cached(
-                descs, desc_count, total_chunks, partials_addr, ctx
-            )
-        _enqueue_norm_finalize_cached(descs, desc_count, partials_addr, ctx)
+        raise Error(
+            "the fixed-arity float32 foreach L2 norm is Apple's: elsewhere"
+            " _foreach_norm is the foreach family's reduction"
+        )

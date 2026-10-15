@@ -94,6 +94,11 @@ from tmb.ops.f8_iter import (
     PRE_SELF_FIRST,
 )
 from tmb.backend.registry import Site, impl
+from tmb.ops.complex import (
+    where_out_overlaps,
+    cx_where_out,
+    routed,
+)
 
 
 def _tensor_value(t: T) -> Value:
@@ -585,6 +590,9 @@ def op_where_self_out(
             " but got ",
             _scalar_type_name(out.dtype),
         )
+    # TensorIterator's memory-overlap checks on the out as given, against
+    # the operands it reads unconverted
+    where_out_overlaps(args, out)
     if not out.same_shape(r.t):
         resize_out(out, r.t.shape, r.t.rank)
     _copy_into(out, r)
@@ -1716,7 +1724,7 @@ def register_composed(site: Site) raises:
         ],
         "tanh_backward.grad_input",
     ](site)
-    impl[op_where_self_out, "where.self_out"](site)
+    impl[routed[op_where_self_out, cx_where_out, 3], "where.self_out"](site)
     impl[op_native_batch_norm_backward, "native_batch_norm_backward"](site)
     impl[op_native_group_norm_backward, "native_group_norm_backward"](site)
     impl[op_softmax_backward_data, "_softmax_backward_data"](site)

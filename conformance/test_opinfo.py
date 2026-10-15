@@ -49,10 +49,16 @@ from torch.testing._internal.opinfo.core import OpInfo, SampleInput
 from torch_mojo_backend.testing import assert_close_fp64_anchored
 
 # The dtypes worth exercising on an accelerator backend.  Deliberately not the
-# full OpInfo set: float64 is absent on some GPUs we target and complex is not
-# implemented at all, so including them would report a backend-wide gap once
-# per operator instead of once.
-_DTYPES = (torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.bool)
+# full OpInfo set: float64 is absent on some GPUs we target (so complex128,
+# made of it, is left out too).
+_DTYPES = (
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+    torch.int64,
+    torch.bool,
+    torch.complex64,
+)
 
 
 def _to_cpu(value: object) -> object:

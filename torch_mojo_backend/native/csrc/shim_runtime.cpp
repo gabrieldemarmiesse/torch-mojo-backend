@@ -626,6 +626,7 @@ void* tmb_tensor_storage_impl(TmbTensor t) { return T(t).storage().unsafeGetStor
 int32_t tmb_tensor_storage_resizable(TmbTensor t) { return T(t).storage().resizable() ? 1 : 0; }
 int32_t tmb_tensor_is_contiguous(TmbTensor t) { return T(t).is_contiguous(); }
 int32_t tmb_tensor_is_neg(TmbTensor t) { return T(t).is_neg(); }
+int32_t tmb_tensor_is_conj(TmbTensor t) { return T(t).is_conj(); }
 void* tmb_tensor_impl(TmbTensor t) { return T(t).unsafeGetTensorImpl(); }
 int32_t tmb_tensor_is_wrapped_number(TmbTensor t) { return T(t).unsafeGetTensorImpl()->is_wrapped_number(); }
 int32_t tmb_tensor_requires_grad(TmbTensor t) { return T(t).requires_grad(); }

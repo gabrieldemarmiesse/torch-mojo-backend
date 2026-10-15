@@ -19,6 +19,7 @@ from tmb.ops.attention import register_attention
 from tmb.ops.batch_norm import register_batch_norm
 from tmb.ops.binary import register_binary
 from tmb.ops.compare import register_compare
+from tmb.ops.complex import register_complex
 from tmb.ops.composed import register_composed
 from tmb.ops.core import register_core
 from tmb.ops.data_movement import register_data_movement
@@ -61,6 +62,7 @@ def _register_ops(lib: Int) raises:
     _group[register_composed](lib)
     _group[register_binary](lib)
     _group[register_compare](lib)
+    _group[register_complex](lib)
     _group[register_data_movement](lib)
     _group[register_factories](lib)
     _group[register_indexing](lib)
