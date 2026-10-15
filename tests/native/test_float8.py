@@ -3213,12 +3213,17 @@ def _alpha_convert_lines(dev):
     integral / bool computation dtype with c10's checked_convert: an alpha
     out of range, a negative fraction into an unsigned dtype, NaN / inf
     (stock CUDA 2.11). Fractions within a unit of an integer bound are left
-    out: torch 2.11 and 2.14 round that boundary differently."""
+    out: torch 2.11 and 2.14 round that boundary differently. So are sub's
+    +128 (int8) and +2**31 (int32), whose -alpha fits: the non-float8 sub
+    path checks +alpha (a pre-existing difference of that path)."""
     f8 = torch.float8_e4m3fn
-    dts = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.bool)
+    dts = (
+        torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
+        torch.bool, torch.uint16, torch.uint32, torch.uint64,
+    )  # fmt: skip
     alphas = (
         1e20, -1e20, -0.5, 0.5, 2.5, -2.5, float("nan"), float("inf"),
-        float("-inf"), 300, -1, -300, 2**40,
+        float("-inf"), 300, -1, -300, 2**40, -128, 255, -255,
     )  # fmt: skip
     for op, dt, al, other, shp in itertools.product(
         ("add", "sub"), dts, alphas, ("t", "3"), ("0", "2")
