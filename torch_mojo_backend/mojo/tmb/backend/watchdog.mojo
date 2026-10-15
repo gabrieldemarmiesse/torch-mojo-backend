@@ -747,7 +747,7 @@ def _retire_now(w: Int, t: Int):
     if tail == head:
         return
     try:
-        var b = Boundary(tail, 0)
+        var b: Boundary
         with tr.ctx.push_context():
             b = _boundary(
                 tr, call_fn[EventQueryFn](_watch(w)[].f_query), tail, head
@@ -784,7 +784,7 @@ def _map_segment(w: Int, t: Int, k: Int):
     if tr.seg_lo < k and (tr.seg_lo + 1) * SEG > _ld(tr.words, T_TAIL):
         _retire_now(w, t)
     _unmap_retired(tr, k)
-    var seg = 0
+    var seg: Int
     if len(tr.seg_pool) > 0:
         seg = tr.seg_pool.pop()
     else:
@@ -933,7 +933,7 @@ def _drain(w: Int, t: Int, deadline_ns: Int) -> Bool:
         var head = _ld(tr.words, T_HEAD)
         if tail == head:
             return True
-        var b = Boundary(tail, 0)
+        var b: Boundary
         try:
             with tr.ctx.push_context():
                 b = _boundary(tr, query, tail, head)
@@ -1381,13 +1381,13 @@ def _poll_tracker(w: Int, t: Int, now: Int) -> Bool:
     var head = _ld(tr.words, T_HEAD)
     if tail == head:
         return True
-    var b = Boundary(tail, 0)
+    var b: Boundary
     try:
         var query = call_fn[EventQueryFn](wa.f_query)
         with tr.ctx.push_context():
             b = _boundary(tr, query, tail, head)
         tr.push_failures = 0
-    except e:
+    except:
         # MAX and the driver tear down at interpreter exit: that is a stop,
         # not a fault (the atexit hook normally stops the thread first).
         if _ld(wa.words, W_STOP) != 0 or _tearing_down(wa):

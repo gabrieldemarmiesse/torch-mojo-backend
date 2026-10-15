@@ -324,7 +324,7 @@ def tmb_pg_destroy(p: Int) abi("C"):
         return
     var box = _pg(p)
     var comms = List[Comm]()
-    var w = 0
+    var w: Int
     with Locked():
         if box[].closing:
             return
