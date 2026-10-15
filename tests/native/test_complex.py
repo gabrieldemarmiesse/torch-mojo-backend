@@ -1716,6 +1716,57 @@ def test_where_out_refuses_an_out_overlapping_the_condition(mojo_gpu: str, dtype
     assert torch.equal(x.cpu(), before)
 
 
+def test_where_out_checks_overlap_only_on_unconverted_operands(mojo_gpu: str):
+    """where_self_out converts an operand of another dtype into a new
+    tensor before its TensorIterator checks overlap: such an operand may
+    alias the out (stock CUDA values below)."""
+    c = torch.tensor([True, False], device=mojo_gpu)
+    x = torch.tensor([1.0, 2.0], device=mojo_gpu)
+    torch.where(c, x.view(torch.bool)[:2], x, out=x)
+    assert x.cpu().tolist() == [0.0, 2.0]
+    z = torch.tensor([1 + 1j, 2 + 2j], dtype=torch.complex64, device=mojo_gpu)
+    torch.where(c, z.view(torch.float32)[:2], z, out=z)
+    assert z.cpu().tolist() == [1 + 0j, 2 + 2j]
+    # an operand of the out's dtype is still checked
+    for dt in (torch.float32, torch.complex64):
+        y = torch.tensor([1, 2, 3], dtype=dt, device=mojo_gpu)
+        with pytest.raises(RuntimeError, match="refer to a single memory"):
+            torch.where(c, y[1:], torch.zeros(2, dtype=dt, device=mojo_gpu), out=y[:2])
+        assert y.cpu().tolist() == [1, 2, 3]
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.float32, torch.int64])
+@pytest.mark.parametrize(
+    ("self_shape", "mask_shape"),
+    [((), (1,)), ((2,), (2, 2)), ((2,), (3,)), ((0,), (3,)), ((2, 0), (3, 1))],
+)
+def test_masked_fill_inplace_mask_must_expand_to_self(
+    mojo_gpu: str, dtype, self_shape, mask_shape
+):
+    """masked_fill_ expands the mask to self (expand_inplace): a mask that
+    does not raises before anything is written, empty tensors included."""
+    fill = 5 + 6j if dtype.is_complex else 5
+    for value in (fill, torch.tensor(fill, device=mojo_gpu)):
+        x = torch.ones(self_shape, dtype=dtype, device=mojo_gpu)
+        m = torch.ones(mask_shape, dtype=torch.bool, device=mojo_gpu)
+        with pytest.raises(RuntimeError, match="expand"):
+            x.masked_fill_(m, value)
+        assert torch.equal(x.cpu(), torch.ones(self_shape, dtype=dtype))
+
+
+@pytest.mark.parametrize("dtype", [torch.complex64, torch.float32])
+def test_masked_fill_inplace_mask_broadcasts_from_the_right(mojo_gpu: str, dtype):
+    fill = 5 + 6j if dtype.is_complex else 5.0
+    x = torch.ones(2, 3, dtype=dtype, device=mojo_gpu)
+    x.masked_fill_(torch.tensor([True, False, True], device=mojo_gpu), fill)
+    want = torch.ones(2, 3, dtype=dtype)
+    want[:, [0, 2]] = fill
+    assert torch.equal(x.cpu(), want)
+    y = torch.ones(2, dtype=dtype, device=mojo_gpu)
+    y.masked_fill_(torch.tensor([True], device=mojo_gpu), fill)
+    assert y.cpu().tolist() == [fill, fill]
+
+
 def test_index_add_integer_alpha_rounds_once(mojo_gpu: str):
     got = torch.zeros(1, dtype=torch.complex64, device=mojo_gpu).index_add(
         0,

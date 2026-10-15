@@ -65,6 +65,7 @@ from tmb.ops.common import (
     device_str,
     fill_item,
     assert_no_partial_overlap,
+    check_expands_to,
     check_real_scalar_fits,
     is_wide_unsigned,
     real_fill_value,
@@ -906,6 +907,7 @@ def _masked_fill_validate(a: T, mask: T, in_place: Bool = False) raises:
         # masked_fill_'s own check: a mask sharing part of self's memory
         # would change under the write
         assert_no_partial_overlap(a, mask)
+        check_expands_to(mask, a)  # expand_inplace(self, mask)
     if is_wide_unsigned(a.stype):
         # CUDA's (and the CPU's) kernel is not instantiated for them: the
         # dtype dispatch refuses before the value converts
