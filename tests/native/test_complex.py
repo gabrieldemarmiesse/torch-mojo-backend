@@ -1760,7 +1760,7 @@ def test_masked_fill_inplace_mask_broadcasts_from_the_right(mojo_gpu: str, dtype
     x = torch.ones(2, 3, dtype=dtype, device=mojo_gpu)
     x.masked_fill_(torch.tensor([True, False, True], device=mojo_gpu), fill)
     want = torch.ones(2, 3, dtype=dtype)
-    want[:, [0, 2]] = fill
+    want[:, [0, 2]] = fill  # ty: ignore[invalid-assignment]
     assert torch.equal(x.cpu(), want)
     y = torch.ones(2, dtype=dtype, device=mojo_gpu)
     y.masked_fill_(torch.tensor([True], device=mojo_gpu), fill)
