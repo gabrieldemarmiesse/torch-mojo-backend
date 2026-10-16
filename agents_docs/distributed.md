@@ -324,6 +324,190 @@ communicators and does the actual library calls.
 - Errors raised inside collectives print a full traceback to stderr before
   propagating (`_loud`): an exception escaping into the autograd engine on
   this backend can otherwise kill the process with no Python traceback.
+- **A hang is loud: the collective watchdog** (`tmb/backend/watchdog.mojo`,
+  ProcessGroupNCCL's contract with `TORCH_NCCL_ASYNC_ERROR_HANDLING=1`).
+  - *Tracking* lives in the Mojo core so every entry that issues on the
+    comm stream is covered: each pg.mojo entry calls `PG.track(comm, op,
+    count, dtype, root, redop)` right after the library call. That records
+    one vendor event (resolved once, created per slot on first use) into a
+    per-communicator queue with a sequence number, a collective position
+    (calls of the five compared collectives, counted per call before any
+    group folds them -- inside a group mixing in point-to-point too), the
+    arguments, a fingerprint (FNV over every call's arguments in order; a
+    group of one hashes like the call) and the host issue time. The
+    compiled-graph entry `tmb_pg_graph_start` does the same (in-call mark,
+    `track`, the closing check), so a collective issued from a graph
+    compiled with `mojo_backend` is watched like an eager one
+    (`test_two_rank_desync_watchdog_compiled_graph`); anything new that
+    enqueues collective work on the comm stream must call `track` too.
+  - *Groups.* NCCL's group depth is per thread and per library, so ours is
+    too (a process-wide table, `group_enter`/`group_exit`): a collective of
+    group B issued inside group A's `ncclGroupStart` is folded with the
+    rest and committed by the outermost `ncclGroupEnd`, never before it is
+    submitted.
+  - *The issuer never waits for the GPU.* A thread whose next call is what
+    lets the peer progress would deadlock on a full queue
+    (`test_two_rank_watchdog_never_blocks_the_issuer`: 900 async
+    all_reduces before the store signal that lets the peer issue its own;
+    past ~1024 both libraries block the host themselves -- NCCL's work FIFO,
+    mojoccl's queue -- and the watchdog reports that call). So the queue
+    grows: segments of 1024 slots, up to a table of 1024 segments in
+    flight. Fully retired segments are unmapped into a pool and reused,
+    slots and events included (creating an event per collective cost
+    ~1 us); at a segment boundary, and while the table is full, the issuer
+    itself retires what completed with one non-blocking query. A full table
+    drops commits with a warning and resumes, with another line, once the
+    work drained (`test_two_rank_desync_watchdog_recovers_after_overflow`,
+    the in-flight limit lowered by a test hook). Segments are freed only with the
+    watch, so every read is of live memory (a segment moved away reads as a
+    zero segment). Each slot is seqlocked with every field an atomic word,
+    and every watchdog read is re-validated against the tail it loaded, so
+    a read racing a reuse is discarded, not torn. `tail` moves by
+    compare-exchange; entries the issuer retires are missing from the
+    report's history.
+  - *Retiring is O(log n):* events of one stream complete in order, so the
+    newest entry is queried first and a binary search finds where
+    completion stops (one query per collective cost ~1.7 us each).
+  - *The thread.* One pthread per group polls every 100 ms with the
+    device's context pushed. It never takes the backend mutex, which the
+    hung thread may hold (`barrier()`'s `synchronize_comm` does). The
+    library call itself runs inside `with InCall(...)`, so a call blocked on
+    the host is caught too, a first-use mojoccl kernel compile included
+    (documented: keep the timeout above a cold compile).
+    `ncclCommInitRank` is not marked: its waits are rendezvous waits;
+    `ncclCommAbort` is. Observed for real: vendor NCCL connects a
+    point-to-point pair lazily inside the first `ncclGroupEnd`, which
+    blocks on the host until the peer joins
+    (`test_two_rank_desync_watchdog_host_blocked`).
+  - *Interpreter exit.* An `atexit` hook (`tmb_pg_watchdog_exit`) gives
+    watched work 2 s to finish, then joins the thread before MAX and the
+    driver tear down. Work still pending then -- a collective in flight, a
+    call blocked on the host, a driver error not yet reported -- is
+    reported once (with a 1 s desync window; work reported already in
+    report mode is not reported again) and the communicators aborted under
+    a reaper in either mode (an abort can stall behind a stalled kernel),
+    in abort mode with exit status 1, instead of waiting up to the timeout
+    inside a GIL-released call no second Ctrl-C can interrupt
+    (`test_two_rank_desync_watchdog_at_interpreter_exit[...desync_ctrl_c]`,
+    `..._exit_with_a_call_blocked_on_the_host`; there the exiting thread
+    may itself block behind the hung thread's backend mutex while freeing a
+    tensor, and the regular timeout reports it). Stopping has one joiner
+    (compare-exchange). The hook marks each live group's entry in use under
+    a Python lock, re-reading it there (a `__del__` may run inside), and
+    calls into Mojo without the lock; `shutdown()` removes the entry and
+    waits for those uses before destroying (not on the hook's own thread,
+    where a GC-run `__del__` marks the entry dead instead), never holding
+    the lock across its own drain, and destroy drains without the backend
+    mutex, so a daemon thread's shutdown cannot stall the exit. Before any
+    of that the hook raises a process-wide exit flag every watch reads
+    (groups mid-shutdown included), so driver teardown is a quiet stop for
+    all of them. The child of a fork gets a fresh lock. Teardown
+    codes (deinitialized, invalid or destroyed context) stop the thread
+    (one line unless exiting), and a context push counts as a device fault
+    only after three failures in a row.
+  - *On timeout*, in abort mode, a reaper thread armed first `_exit(1)`s at
+    a deadline (ack window + 10 s) and writes nothing before; if it cannot
+    be started the process exits at once. Reports go to stderr reopened
+    non-blocking through `/proc/self/fd/2` (its own open file description:
+    the process's stderr stays blocking; a seekable file is written as it
+    is; a socket, the journal, gets `send(MSG_DONTWAIT)`; a pipe the reopen
+    is refused on -- root-owned 0600 in a container running as another user
+    -- gets `poll(POLLOUT)` before each chunk, another writer racing for the
+    room being the residual risk, which the reaper bounds in abort mode),
+    in PIPE_BUF chunks, EAGAIN waiting in `poll` up to 2 s, any other
+    error, hang-up or invalid fd ending the write. A `key=value` line
+    (incident id, communicator, position, fingerprint, ...) goes through a
+    non-blocking pipe to a Python thread (`_desync_reporter`) that publishes
+    it as an immutable record `mojo_watchdog/<rank>/<incarnation>/<incident>`
+    (the incarnation unique per reporter, so a late write of a previous
+    incarnation of the group never lands on a current record) and
+    rewrites `mojo_watchdog/<rank>`, the rank's index of active records
+    (a generation first, from the clock so a group re-created under the
+    same name on the same store outranks its previous incarnation;
+    `compare_set` never lets an older one replace a newer one, so a write
+    that lands late cannot roll it back),
+    collects the others for at most 10 s and prints the desync report, then
+    acks with the incident's byte (late acks of an earlier incident are
+    skipped). Store work runs on a thread of its own (`_StoreWorker`, its
+    `store.clone()` client made there): a client cannot be bounded from
+    outside (`check` blocks in a socket read that ignores `set_timeout`), so
+    a job that overruns is abandoned -- its thread exits once that
+    operation returns -- the next one gets a fresh client, queued index
+    updates of an older generation are dropped unrun, and the worker is
+    closed when the reporter ends. Then `ncclCommAbort` on every communicator it can
+    claim, and `_exit(1)`. Driver errors (event record or query) take the
+    same path.
+  - *Comparisons.* Only the five collectives every rank issues with the
+    same arguments compare across ranks, by the span of collective
+    positions an entry covers and its fingerprint (a send before them
+    shifts nothing; the same calls grouped differently overlap without
+    matching and are not compared); point-to-point and
+    mixed groups are listed as not compared, and a report with nothing
+    diverging or missing says it is inconclusive.
+  - *Report mode* keeps watching: when a reported collective, or a call
+    blocked on the host, completes, or its communicator is aborted or
+    destroyed (whatever was published for it: a timeout or a driver
+    error), a `resolved tid=` line takes that record out of the rank's
+    index, and the index is emptied when the reporter ends (records are
+    never deleted, so a concurrent read never waits on a vanished key).
+  - *Ownership and teardown.* Explicit `abort()`, destroy and the
+    watchdog's abort each `watch_claim` a communicator first
+    (compare-exchange); only the winner calls the library. Destroy waits
+    (bounded: timeout + ack window + 10 s; with the watchdog off, the comm
+    stream going idle within the timeout,
+    `test_two_rank_watchdog_off_destroy_completes_collectives`) for this
+    rank's collectives in flight, so a hung one is reported (and exits), then tears down with
+    `ncclCommAbort`, which never waits for the peers -- a peer still
+    writing its final checkpoint must not make this rank's teardown time
+    out (`test_two_rank_watchdog_slow_peer_at_destroy`; vendor NCCL's
+    `ncclCommDestroy` waits for them). A communicator whose tracking failed
+    (a fault, unwatched) is torn down without waiting, with a line saying
+    so. mojoccl's `ncclCommAbort` re-checks `released` under its lock.
+  - *Fork.* Pipe ends are created, registered and closed under the lock the
+    fork handlers take, and closed in the child; a child's `shutdown()`
+    does no native work (the communicators and threads are the parent's).
+  - *Known limitations* (reviewed, judged narrow, left as they are):
+    - Not done: `ncclCommGetAsyncError` polling (mojoccl's needs a
+      device-to-host read that blocks behind the hung kernel), dumps from
+      ranks whose own watchdog did not fire (their missing record is the
+      signal, and the report says a rank that could not send one looks
+      the same), pairing a send with its recv across ranks.
+    - A thread blocked inside a library call holds the backend mutex, so
+      an exiting thread that frees a tensor blocks behind it before the
+      exit hook runs; the watchdog's timeout then reports it (in report
+      mode the process stays hung, as report mode promises).
+    - A group a daemon thread is destroying at interpreter exit is not
+      waited for by the exit hook (its drain runs without the backend
+      mutex, so it does not block the exit either; process exit ends it).
+    - Writes to a blocking stderr pipe the `/proc` reopen was refused on
+      can still block if another writer takes the room between `poll` and
+      `write`; the reaper bounds that in abort mode only.
+    - Each reaper arming leaks its 16-byte cell (the thread is never
+      joined and may outlive the watch); armings are once per incident or
+      exit.
+    - A destroyed group's native shell (the `PG` struct and its library
+      handle, a few hundred bytes) is kept, not freed: destroy marks it
+      closing under the backend mutex -- after every call already on it
+      finished submitting -- and drains a snapshot of its communicators
+      without the mutex, so a call that races the destroy fails with an
+      error instead of reading freed memory.
+    - An exit-time reaper stays armed while another thread is inside a
+      library call (an abort that may hang), so such an exit can end with
+      status 1 even in report mode.
+    - Groups across process groups and RCCL/HIP are untested.
+  - *Host cost* (job 318657, 2 x H100, bare pg.mojo allreduce entry through
+    ctypes, 1 element, sync every 200 calls, median of the six ABBA legs,
+    legs the node slowed down for both sides left out): NCCL 7.11 ->
+    7.37 us, mojoccl 3.60 -> 3.92 us, about 0.25-0.3 us per collective (one
+    event record, the seqlocked slot stores, a clock read);
+    `dist.all_reduce` itself costs 16-27 us.
+  - Tests: `test_two_rank_desync_watchdog*` (plain, a 3000-collective
+    burst, a full table that recovers, destroy while hung, at interpreter
+    exit, report mode with three incidents, a call blocked on the host),
+    `test_two_rank_watchdog_*` (no blocking of the issuer, a clean exit
+    without destroy, a fault then destroy in report mode, a slow peer at
+    destroy, destroy with the watchdog off), on NCCL and mojoccl, and five
+    store-only report tests.
 
 ## Collectives in compiled graphs
 
@@ -367,7 +551,8 @@ time.
 - **Failures.** A failed `execute` host-waits the graph's comm streams
   before re-raising, so MAX cannot reuse memory a started collective still
   touches. That wait does not return if another rank failed before issuing
-  the same collective (the hang watchdog is what reports that). Zero-element
+  the same collective (the hang watchdog is what reports that: graph
+  collectives are tracked like eager ones, "Design notes"). Zero-element
   collectives issue nothing. One device per graph: MAX chains in-place ops
   per device, so a cross-device graph would have no program order.
 - **The comm stream is the eager one.** `tmb_pg_graph_start` (`pg.mojo`)

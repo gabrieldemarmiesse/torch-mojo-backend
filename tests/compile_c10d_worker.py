@@ -11,6 +11,7 @@ eagerly on the mojo device. Exits non-zero on failure.
 import datetime
 import os
 import sys
+import time
 from collections.abc import Callable
 
 from torch_mojo_backend.distributed import use_local_rank_gpu
@@ -378,6 +379,48 @@ def run_unsupported(failures: list[str]):
         )
 
 
+DESYNC_TIMEOUT_S = 10
+
+
+def run_desync_compiled():
+    """A collective issued from a graph compiled with `mojo_backend` that the
+    other rank never issues: the watchdog reports it (collective #2 of a
+    group with a 10 s timeout) and the process exits; torchrun stops rank 1.
+    Getting past the hang is the failure."""
+    rank = dist.get_rank()
+    group = dist.new_group(
+        list(range(dist.get_world_size())),
+        timeout=datetime.timedelta(seconds=DESYNC_TIMEOUT_S),
+    )
+    assert group is not None
+    dev = torch.accelerator.current_accelerator()
+    assert dev is not None
+
+    def compiled(pg: dist.ProcessGroup) -> Callable[[torch.Tensor], torch.Tensor]:
+        @torch.compile(backend=mojo_backend, fullgraph=True)
+        def reduce(x: torch.Tensor) -> torch.Tensor:
+            return funcol.all_reduce(x, "sum", pg) + 1
+
+        return reduce
+
+    x = torch.ones(1024, device=dev)
+    # The same graph on the default group (300 s timeout) first: a cold
+    # compile on one rank must not count against the 10 s group's timeout.
+    compiled(_world())(x).cpu()
+    reduce = compiled(group)
+    dist.barrier()
+    reduce(x).cpu()  # #1 on the timed group, on every rank (cache warm)
+    dist.barrier()
+    print(f"[rank {rank}] compiled all_reduce #1 done", flush=True)
+    if rank == 0:
+        reduce(x).cpu()  # #2: nobody else issues it
+        time.sleep(DESYNC_TIMEOUT_S)
+    else:
+        time.sleep(10 * DESYNC_TIMEOUT_S)
+    print(f"[rank {rank}] UNEXPECTED: still alive after the timeout", flush=True)
+    raise SystemExit(3)
+
+
 def main():
     mode = sys.argv[1]
     register_mojo_devices()
@@ -392,6 +435,8 @@ def main():
         run_tensor_parallel(failures)
     elif mode == "unsupported":
         run_unsupported(failures)
+    elif mode == "desync_compiled":
+        run_desync_compiled()
     else:
         raise ValueError(f"unknown mode {mode}")
     dist.destroy_process_group()

@@ -1245,6 +1245,9 @@ def ncclCommAbort(comm: Int64) -> Int32:
             " thread still holds the submission lock"
         )
         return NCCL_SUCCESS
+    if state.released:  # a destroy finished while this waited for the lock
+        _unlock(state)
+        return NCCL_SUCCESS
     var quiesced = _abort_quiesced(state, deadline)
     if quiesced and proxy_stopped:
         try:

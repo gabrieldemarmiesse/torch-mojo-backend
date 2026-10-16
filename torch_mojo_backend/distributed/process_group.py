@@ -12,6 +12,7 @@ ProcessGroupNCCL implements. CPU tensors go to a private gloo group.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import ctypes
 import datetime
@@ -19,8 +20,10 @@ import functools
 import inspect
 import os
 import platform
+import queue
 import sys
 import threading
+import time
 import traceback
 from collections.abc import Callable
 from typing import TypeVar, cast
@@ -102,6 +105,491 @@ def _nccl_red_op(
 
 # The collective entry points `_loud` wrapped, for `_never_traced`.
 _LOUD: set[Callable[..., object]] = set()
+
+# TORCH_MOJO_BACKEND_PG_WATCHDOG -> pg.mojo's watchdog action
+_WATCHDOG_ACTIONS = {"off": 0, "0": 0, "report": 1, "abort": 2}
+# How long a rank whose collective timed out waits for the other ranks'
+# reports before printing the desync report (bounded by the timeout too).
+_DESYNC_WAIT_S = 10.0
+_DESYNC_KEY = "mojo_watchdog"
+# Operations every rank issues with the same arguments: only these compare
+# across ranks (a send pairs with a differently-shaped recv).
+_COLLECTIVE_OPS = frozenset(
+    ("allreduce", "broadcast", "reduce", "allgather", "reduce_scatter")
+)
+
+# Every pipe end of every watchdog in this process. A forked child (a
+# DataLoader worker) closes its copies, or the reporter never sees EOF;
+# creating, registering and closing them happen under the lock fork takes.
+_FORK_LOCK = threading.Lock()
+_WATCHDOG_FDS: set[int] = set()
+
+
+class _Live:
+    """A process group whose watchdog thread runs, for the exit hook.
+    `users` counts exit-hook calls in flight on its handle: shutdown() waits
+    for them before destroying it, without holding the lock across its own
+    (possibly long) drain."""
+
+    def __init__(self, core: _Core, handle: int):
+        self.core = core
+        self.handle = handle
+        self.users = 0
+        self.dead = False  # destroyed by a __del__ on the hook's own thread
+
+
+_LIVE_WATCHDOGS: dict[int, _Live] = {}
+# Any core, for the process-wide exit flag (set before any group is looked
+# at, so a group being shut down on another thread is covered too).
+_EXIT_CORE: list[_Core] = []
+# The thread running the exit hook: a shutdown() on it (cyclic GC running a
+# __del__ inside the hook) must not wait for the hook's own use.
+_EXIT_THREAD: list[int] = []
+
+
+def _before_fork():
+    _FORK_LOCK.acquire()
+
+
+def _after_fork_in_parent():
+    _FORK_LOCK.release()
+
+
+def _after_fork_in_child():
+    for fd in _WATCHDOG_FDS:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+    _WATCHDOG_FDS.clear()
+    _LIVE_WATCHDOGS.clear()  # the threads did not survive the fork
+    global _LIVE_LOCK
+    _LIVE_LOCK = threading.Condition(threading.RLock())  # its owner may be gone
+    _FORK_LOCK.release()
+
+
+os.register_at_fork(
+    before=_before_fork,
+    after_in_parent=_after_fork_in_parent,
+    after_in_child=_after_fork_in_child,
+)
+
+
+def _watchdog_pipe() -> tuple[int, int]:
+    with _FORK_LOCK:
+        read, write = os.pipe()
+        _WATCHDOG_FDS.update((read, write))
+    return read, write
+
+
+def _close_watchdog_fd(fd: int):
+    with _FORK_LOCK:
+        _WATCHDOG_FDS.discard(fd)
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+# Guards _LIVE_WATCHDOGS and each entry's `users` (reentrant: a __del__ may
+# run inside); held only for bookkeeping, never across a native call.
+_LIVE_LOCK = threading.Condition(threading.RLock())
+
+
+@atexit.register
+def _stop_watchdogs():
+    """Give the collectives in flight a short grace, report what is still
+    pending (a hung job stopped by Ctrl-C or sys.exit included) and join the
+    watchdog threads before MAX and the driver tear down: one still polling
+    then would take the teardown for a device fault."""
+    for core in _EXIT_CORE[:1]:
+        core.watchdog_process_exiting()
+    _EXIT_THREAD.append(threading.get_ident())
+    with _LIVE_LOCK:
+        keys = list(_LIVE_WATCHDOGS)
+    for key in keys:
+        with _LIVE_LOCK:  # a group shut down meanwhile is gone from it
+            live = _LIVE_WATCHDOGS.get(key)
+            if live is None:
+                continue
+            live.users += 1
+        try:
+            if not live.dead:
+                live.core.watchdog_exit(live.handle)
+        finally:
+            with _LIVE_LOCK:
+                live.users -= 1
+                _LIVE_LOCK.notify_all()
+    with _LIVE_LOCK:
+        _LIVE_WATCHDOGS.clear()
+
+
+def _watchdog_action() -> int:
+    value = os.environ.get("TORCH_MOJO_BACKEND_PG_WATCHDOG", "abort").strip().lower()
+    try:
+        return _WATCHDOG_ACTIONS[value]
+    except KeyError:
+        raise ValueError(
+            f"TORCH_MOJO_BACKEND_PG_WATCHDOG={value!r}: expected abort, report or off"
+        ) from None
+
+
+def _parse_report(line: str) -> dict[str, str]:
+    """watchdog.mojo's machine line: `key=value` pairs."""
+    return dict(item.split("=", 1) for item in line.split() if "=" in item)
+
+
+_REDOP_NAMES = {"0": "sum", "1": "prod", "2": "max", "3": "min", "4": "avg"}
+
+
+def _describe(report: dict[str, str]) -> str:
+    where = report.get("where")
+    if where == "host":
+        return f"{report.get('op')} call blocked on the host"
+    if where == "error":
+        return "a device error"
+    text = f"{report.get('op')} {report.get('count')} x {report.get('dtype')}"
+    if report.get("root", "-1") != "-1":
+        peer = report.get("op") in ("send", "recv", "send/recv")
+        text += f" {'peer' if peer else 'root'} {report['root']}"
+    redop = report.get("redop", "-1")
+    if redop != "-1":
+        text += " " + _REDOP_NAMES.get(redop, f"redop {redop}")
+    if int(report.get("nops", "1")) > 1:
+        text += f" ({report['nops']} calls in one NCCL group)"
+    return text
+
+
+def _ranks(ranks: list[int]) -> str:
+    shown = ", ".join(map(str, ranks[:16]))
+    return shown + (f" and {len(ranks) - 16} more" if len(ranks) > 16 else "")
+
+
+_T = TypeVar("_T")
+
+
+_Job = tuple[Callable[[Store], object], int | None, list[object], threading.Event]
+
+
+class _StoreWorker:
+    """Store operations on a thread of their own, each bounded by a deadline
+    the caller enforces: a store client cannot be bounded from outside (its
+    `check` blocks in a socket read that ignores `set_timeout`, and `clone`
+    connects with the original timeout), so a job that overruns is
+    abandoned -- its thread exits once that operation returns -- and the
+    next job starts a fresh thread and client. A job tagged with an index
+    generation older than `latest` is dropped unrun: the index has moved
+    on."""
+
+    def __init__(self, store: Store, clone: bool = True):
+        self._store = store
+        self._clone = clone
+        self._jobs: queue.SimpleQueue[_Job | None] | None = None
+        self.latest = 0
+
+    def _serve(self, jobs: queue.SimpleQueue[_Job | None]):
+        client = None
+        while (item := jobs.get()) is not None:
+            job, gen, box, done = item
+            try:
+                if gen is not None and gen < self.latest:
+                    box.append(None)
+                else:
+                    if client is None:
+                        client = (
+                            _reporter_store(self._store) if self._clone else self._store
+                        )
+                    box.append(job(client))
+            except Exception as error:  # reported by the caller
+                box.append(error)
+            done.set()
+
+    def run(
+        self, job: Callable[[Store], _T], timeout: float, gen: int | None = None
+    ) -> _T | None:
+        """`job(client)`'s result, or None when it raised, overran or was
+        dropped as stale."""
+        if self._jobs is None:
+            self._jobs = queue.SimpleQueue()
+            threading.Thread(
+                target=self._serve,
+                args=(self._jobs,),
+                name="mojo-pg-desync-store",
+                daemon=True,
+            ).start()
+        box: list[object] = []
+        done = threading.Event()
+        self._jobs.put((job, gen, box, done))
+        if not done.wait(max(timeout, 0.1)):
+            self.close()  # stuck: that thread exits once its op returns
+            sys.stderr.write("mojo watchdog: the c10d store did not answer in time\n")
+            return None
+        if isinstance(box[0], Exception):
+            sys.stderr.write(f"mojo watchdog: c10d store error: {box[0]!r}\n")
+            return None
+        return cast(_T, box[0])
+
+    def close(self):
+        if self._jobs is not None:
+            self._jobs.put(None)
+            self._jobs = None
+
+
+def _set_index(client: Store, rank: int, gen: int, names: list[str]) -> bool:
+    """Rewrite the rank's index to `names` unless a newer generation is
+    already there: a write that lands late (its worker was abandoned)
+    never rolls a newer index back. compare_set makes it atomic."""
+    key = _index_key(rank)
+    new = " ".join([str(gen), *names])
+    for _ in range(8):
+        current = bytes(client.get(key)).decode() if client.check([key]) else ""
+        if current and int(current.split()[0]) >= gen:
+            return True
+        if bytes(client.compare_set(key, current, new)).decode() == new:
+            return True
+    return False
+
+
+def _reporter_store(store: Store) -> Store:
+    """A client of its own when the store can make one (`clone()`, torch >=
+    2.6): a TCPStore client holds its lock for a whole blocking op, so
+    sharing the main thread's would stall the report behind it."""
+    clone = getattr(store, "clone", None)
+    if clone is not None:
+        with contextlib.suppress(Exception):
+            return clone()
+    return store
+
+
+def _index_key(rank: int) -> str:
+    """A rank's index: a generation, then the names of its active incident
+    records; rewritten (never deleted) as incidents start and end."""
+    return f"{_DESYNC_KEY}/{rank}"
+
+
+def _collect(
+    store: Store, world: int, deadline: float
+) -> dict[int, list[dict[str, str]]]:
+    """The active incident records of every rank, waiting until each rank has
+    one or the deadline (time.monotonic) passes. Records are immutable and
+    indexes only ever rewritten, so a key read here never disappears under
+    the read."""
+    index = [_index_key(r) for r in range(world)]
+    while time.monotonic() < deadline:
+        if store.check(index) and all(
+            len(bytes(v).split()) > 1 for v in store.multi_get(index)
+        ):
+            break
+        time.sleep(0.2)
+    present = [r for r in range(world) if store.check([index[r]])]
+    names = store.multi_get([index[r] for r in present]) if present else []
+    listed = [
+        (r, n) for r, v in zip(present, names) for n in bytes(v).decode().split()[1:]
+    ]
+    lines = store.multi_get([n for _, n in listed]) if listed else []
+    return {
+        r: [
+            _parse_report(bytes(v).decode())
+            for (q, _), v in zip(listed, lines)
+            if q == r
+        ]
+        for r in present
+    }
+
+
+def _pick(records: list[dict[str, str]], mine: dict[str, str]) -> dict[str, str]:
+    """The record of the same communicator as this rank's, else the first."""
+    for report in records:
+        if report.get("tid") == mine.get("tid"):
+            return report
+    return records[0]
+
+
+def _comparable(report: dict[str, str]) -> bool:
+    """Only the collectives every rank issues identically compare: their
+    position counts nothing else (no point-to-point, no grouping)."""
+    return (
+        report.get("where") == "device"
+        and report.get("op") in _COLLECTIVE_OPS
+        and report.get("cpos", "0") != "0"
+    )
+
+
+def _desync_lines(
+    mine: dict[str, str], reports: dict[int, list[dict[str, str]]], world: int
+) -> list[str]:
+    seq = int(mine["seq"])
+    cpos = int(mine.get("cpos", "0"))
+    my_span = (cpos, cpos + int(mine.get("nops", "1")) - 1)
+    where_mine = f" (collective #{cpos})" if _comparable(mine) else ""
+    out = [
+        f"desync report for #{seq}{where_mine} ({_describe(mine)}), from the "
+        "ranks whose watchdog fired:"
+    ]
+    same, missing, diverged = [], [], []
+    for r in range(world):
+        records = reports.get(r)
+        if not records:
+            missing.append(r)
+            continue
+        report = _pick(records, mine)
+        k = int(report.get("seq", "0"))
+        if not (_comparable(report) and _comparable(mine)):
+            out.append(
+                f"  rank {r}: waiting in #{k} {_describe(report)} (not compared:"
+                " point-to-point, a mixed group or not a device wait)"
+            )
+            continue
+        c = int(report["cpos"])
+        span = (c, c + int(report.get("nops", "1")) - 1)
+        if span == my_span and report.get("fp") == mine.get("fp"):
+            same.append(r)
+            continue
+        if span != my_span and span[0] <= my_span[1] and my_span[0] <= span[1]:
+            # The same calls, grouped differently: their fingerprints differ
+            # by construction.
+            out.append(
+                f"  rank {r}: waiting in collective #{c} {_describe(report)}"
+                " (not compared: grouped differently)"
+            )
+            continue
+        diverged.append(r)
+        if span == my_span:
+            where = "the same position, different arguments"
+        else:
+            where = "behind" if c < cpos else "ahead"
+        out.append(
+            f"  rank {r}: waiting in collective #{c} {_describe(report)}  <-- {where}"
+        )
+    if same:
+        out.append(f"  waiting in this same collective: ranks {_ranks(same)}")
+    if missing:
+        out.append(
+            f"  no report: ranks {_ranks(missing)}. Their watchdog did not fire: "
+            "usually they never issued this collective or are blocked outside "
+            "a GPU collective of this group (on the host, in another process "
+            "group, or exited); a rank whose report could not be sent looks "
+            "the same. Look there first; `py-spy dump --pid <pid>` shows where "
+            "a process is."
+        )
+    if diverged:
+        out.append(
+            "  The ranks marked above issued a different collective, or a "
+            "different number of them, before this one."
+        )
+    if not (missing or diverged):
+        out.append(
+            "  Inconclusive: every rank that reported is waiting where this one "
+            "is, or in work that does not compare across ranks. Either it is "
+            "stuck itself (a peer GPU or link failure), or the ranks diverged "
+            "in a way the arguments do not show."
+        )
+    return out
+
+
+def _report_desync(
+    line: str,
+    store: _StoreWorker,
+    rank: int,
+    world: int,
+    wait_s: float,
+    published: dict[str, str] | None = None,
+    gen: int = 1,
+    incarnation: str = "0",
+):
+    """Publish this rank's stuck collective as an incident record (index
+    generation `gen`; the key carries the reporter's `incarnation`, so a
+    late write of a previous incarnation of the group never lands on this
+    one's record), collect the other ranks' for at most `wait_s` (1 s for a
+    report made at interpreter exit), and print which ranks diverged.
+    `published` maps this rank's communicators to their active record."""
+    mine = _parse_report(line)
+    if mine.get("exit") == "1":
+        wait_s = min(wait_s, 1.0)
+    deadline = time.monotonic() + wait_s
+    active = published if published is not None else {}
+    name = f"{_DESYNC_KEY}/{rank}/{incarnation}/{mine.get('id')}"
+    active[mine.get("tid", "0")] = name
+    names = list(active.values())
+
+    def publish(client: Store) -> bool:
+        client.set(name, line)
+        return _set_index(client, rank, gen, names)
+
+    reports: dict[int, list[dict[str, str]]] = {}
+    if store.run(publish, deadline - time.monotonic(), gen):
+        reports = (
+            store.run(
+                lambda client: _collect(client, world, deadline),
+                deadline - time.monotonic() + 2,
+            )
+            or {}
+        )
+    reports[rank] = [mine]
+    out = _desync_lines(mine, reports, world)
+    prefix = f"[rank {rank}] "
+    sys.stderr.write("".join(prefix + text + "\n" for text in out))
+    sys.stderr.flush()
+
+
+def _desync_reporter(
+    notify_fd: int, ack_fd: int, store: Store, rank: int, world: int, wait_s: float
+):
+    """Thread body: report each incident line of the Mojo watchdog and
+    acknowledge it with its incident's byte; a `resolved` line takes that
+    communicator's record out of this rank's index (report mode). Ends, with
+    the index emptied and its store worker closed, when the process group
+    closes the pipe."""
+    published: dict[str, str] = {}
+    worker = _StoreWorker(store)
+    pending = b""
+    gen = 0
+    incarnation = f"{time.time_ns():x}{os.getpid():x}"
+
+    def next_gen() -> int:
+        # The clock, not a count from 1: a group re-created under the same
+        # name on the same store must outrank the last incarnation's index.
+        nonlocal gen
+        gen = max(gen + 1, time.time_ns())
+        worker.latest = gen  # queued index updates of older ones are dropped
+        return gen
+
+    def rewrite_index():
+        g, names = next_gen(), list(published.values())
+        worker.run(lambda client: _set_index(client, rank, g, names), 2.0, g)
+
+    try:
+        while chunk := os.read(notify_fd, 4096):
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            for raw in lines:
+                line = raw.decode().strip()
+                fields = _parse_report(line)
+                if line.startswith("resolved"):
+                    if published.pop(fields.get("tid", ""), None) is not None:
+                        rewrite_index()
+                    continue
+                try:
+                    _report_desync(
+                        line,
+                        worker,
+                        rank,
+                        world,
+                        wait_s,
+                        published,
+                        next_gen(),
+                        incarnation,
+                    )
+                except Exception:
+                    traceback.print_exc(file=sys.stderr)
+                finally:
+                    with contextlib.suppress(Exception):
+                        sys.stdout.flush()  # the process may _exit next
+                    with contextlib.suppress(OSError):
+                        os.write(ack_fd, bytes([int(fields.get("id", "0")) % 255 + 1]))
+        if published:
+            published.clear()
+            rewrite_index()
+    finally:
+        worker.close()
+        _close_watchdog_fd(notify_fd)
+        _close_watchdog_fd(ack_fd)
 
 
 def _loud(method: Callable[..., object]) -> Callable[..., object]:
@@ -240,6 +728,11 @@ class _Core:
         # called by the compiled-graph ops (tmb/graph/collectives.mojo), not here
         self.graph_entries = (table[18], table[19])
         self.get_error = ctypes.cast(native.shim().tmb_get_error, vp).value
+        self.watchdog = ctypes.CFUNCTYPE(i32, vp, i64, i32, i32, i32, i64)(table[20])
+        self.watchdog_exit = ctypes.CFUNCTYPE(None, vp)(table[21])
+        self.watchdog_test_fault = ctypes.CFUNCTYPE(None, vp, i32)(table[22])
+        self.watchdog_test_limit = ctypes.CFUNCTYPE(None, vp, i32, i32)(table[23])
+        self.watchdog_process_exiting = ctypes.CFUNCTYPE(None)(table[24])
 
     def check(self, rc: int, what: str):
         if rc != 0:
@@ -262,6 +755,8 @@ class MojoProcessGroup(dist.ProcessGroup):
             ),
         )
         self._handle = None
+        self._watchdog_fds: tuple[int, int] | None = None
+        self._handle_pid = 0
         self._ready: dict[int, torch.Stream] = {}
         self._future_streams: dict[int, torch.Stream] = {}
         self._seq = 0
@@ -305,6 +800,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             raise RuntimeError(
                 f"could not load the collectives library: {native.last_error()}"
             )
+        self._handle_pid = os.getpid()
         version = self._core.version(self._handle)
         name = "mojoccl" if nccl.uses_mojoccl() else nccl.vendor_name()
         if os.environ.get("TORCH_MOJO_BACKEND_TRACE", "1") != "0":
@@ -313,6 +809,48 @@ class MojoProcessGroup(dist.ProcessGroup):
                 file=sys.stderr,
                 flush=True,
             )
+        self._start_watchdog()
+
+    def _start_watchdog(self):
+        """pg.mojo's collective watchdog, on `init_process_group(timeout=...)`,
+        plus the thread that writes its desync report through the store."""
+        action = _watchdog_action()
+        seconds = self._timeout.total_seconds()
+        timeout_ms = max(min(int(seconds * 1000), 10**12), 0)
+        if action == _WATCHDOG_ACTIONS["off"] or seconds <= 0:
+            # No watchdog; the timeout still bounds destroy's drain.
+            self._core.check(
+                self._core.watchdog(self._handle, timeout_ms, 0, -1, -1, 0),
+                "setting the process group timeout",
+            )
+            return
+        wait_s = min(_DESYNC_WAIT_S, seconds)
+        notify_r, notify_w = _watchdog_pipe()
+        try:
+            ack_r, ack_w = _watchdog_pipe()
+        except OSError:
+            _close_watchdog_fd(notify_r)
+            _close_watchdog_fd(notify_w)
+            raise
+        os.set_blocking(notify_w, False)  # the watchdog's writes never block
+        rc = self._core.watchdog(
+            self._handle, timeout_ms, action, notify_w, ack_r, int((wait_s + 5) * 1000)
+        )
+        if rc != 0:
+            for fd in (notify_r, notify_w, ack_r, ack_w):
+                _close_watchdog_fd(fd)
+            self._core.check(rc, "starting the collective watchdog")
+        self._watchdog_fds = (notify_w, ack_r)
+        with _LIVE_LOCK:
+            _LIVE_WATCHDOGS[id(self)] = _Live(self._core, cast(int, self._handle))
+            if not _EXIT_CORE:
+                _EXIT_CORE.append(self._core)
+        threading.Thread(
+            target=_desync_reporter,
+            args=(notify_r, ack_w, self._store, self.rank(), self.size(), wait_s),
+            name="mojo-pg-desync-report",
+            daemon=True,
+        ).start()
 
     # ---- plumbing ------------------------------------------------------------
 
@@ -341,9 +879,33 @@ class MojoProcessGroup(dist.ProcessGroup):
 
     def shutdown(self):
         handle, self._handle = self._handle, None
-        if handle:
-            self._core.destroy(handle)
+        fds, self._watchdog_fds = self._watchdog_fds, None
         self._ready.clear()
+        if self._handle_pid != os.getpid():
+            # A forked child's copy: the communicators, streams and watchdog
+            # thread belong to the parent (fork closed the pipe copies).
+            return
+        with _LIVE_LOCK:
+            live = _LIVE_WATCHDOGS.pop(id(self), None)
+            if live is not None and threading.get_ident() in _EXIT_THREAD:
+                live.dead = True  # the hook's use on this thread is not running
+            else:
+                while live is not None and live.users:  # the hook's, bounded
+                    _LIVE_LOCK.wait()
+        if handle:
+            self._core.destroy(handle)  # joins the watchdog thread
+        for fd in fds or ():  # the reporter thread sees EOF and ends
+            _close_watchdog_fd(fd)
+
+    def _test_watchdog_fault(self, index: int):
+        """Test hook: the watchdog sees a driver error on this device's
+        communicator, as after a failed event record."""
+        self._core.watchdog_test_fault(self._handle, index)
+
+    def _test_watchdog_limit(self, index: int, entries: int):
+        """Test hook: the watchdog keeps at most `entries` collectives in
+        flight on this device's communicator, then drops commits."""
+        self._core.watchdog_test_limit(self._handle, index, entries)
 
     def abort(self):
         for index in list(self._ready):
