@@ -97,6 +97,7 @@ from tmb.ops.common import (
 from tmb.ops.core import cast_for_copy
 from tmb.ops.f8_iter import (
     _alpha_check,
+    _kernel_alpha,
     f8_cx_scalar,
     f8_iter,
     MODE_CAST,
@@ -1632,10 +1633,39 @@ def _b_alpha_is_one(alpha_v: Value) -> Bool:
 
 
 def _b_negated_alpha(alpha_v: Value) -> Value:
-    """`-alpha` for an integer alpha (wrapping, as c10's int64 Scalar does):
-    ATen's sub is `add_stub(..., -alpha)`, so `-alpha` is what its kernel
-    converts, and range-checks, into the result dtype."""
+    """`-alpha` for an int64 alpha record: ATen's sub is
+    `add_stub(..., -alpha)`, so `-alpha` is what its kernel converts, and
+    range-checks, into the result dtype. (A Python int past int64 never
+    gets here: the dispatcher's `Scalar::toLong` refuses 2**63 and up,
+    which CUDA's unsigned Scalar would negate.)"""
     return Value(alpha_v.tag, 0, 0 - alpha_v.a, alpha_v.b)
+
+
+def _b_alpha_prologue(
+    lhs: Side, rhs: Side, alpha_v: Value, out_st: Int32, negate: Bool
+) raises -> Tuple[Int32, Value]:
+    """add / sub's meta and alpha conversion, in CUDA's order: an `out=`
+    (or in-place self) of dtype `out_st` (-1: the result dtype itself)
+    first takes the common dtype (compute_types' canCast), then
+    `alpha_check` runs against the iterator's output dtype -- so an
+    integral sum into a float32 out takes a floating alpha -- and the
+    kernel converts alpha into the integral / bool computation dtype
+    (f8_iter's `_kernel_alpha`: range-checked, -alpha for sub, a float
+    truncated, a bool from nonzero). Returns (common dtype, alpha)."""
+    var common = _b_common(lhs, rhs)
+    var checked = common
+    if out_st >= 0 and is_float8_stype(out_st):
+        # A float8 out only comes from f8_iter, which ran both checks on it
+        # and hands over alpha already converted (a bool for a bool sum).
+        checked = -1
+    elif out_st >= 0 and common >= 0:
+        if not _b_can_cast(common, out_st):
+            _b_cast_error(common, out_st)
+        checked = out_st
+    _b_alpha_check(checked, alpha_v)
+    if common >= 0 and (is_int_stype(common) or common == ST_BOOL):
+        return (common, _kernel_alpha(common, alpha_v, negate))
+    return (common, alpha_v.copy())
 
 
 def _b_alpha_int(alpha_v: Value, lhs: Side, rhs: Side) raises -> Optional[Int]:
@@ -1686,11 +1716,17 @@ def _b_bool_add(
 
 
 def _b_add(
-    lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
+    lhs: Side,
+    rhs: Side,
+    alpha_in: Value,
+    dst: Optional[T],
+    out_st: Int32 = -1,
 ) raises -> Res:
-    """The `fast_aten_add` cascade."""
-    var common = _b_common(lhs, rhs)
-    _b_alpha_check(common, alpha_v)
+    """The `fast_aten_add` cascade. `out_st`: the dtype of the `out=` or
+    in-place self the result goes into (-1 for a functional result)."""
+    var pro = _b_alpha_prologue(lhs, rhs, alpha_in, out_st, False)
+    var common = pro[0]
+    var alpha_v = pro[1].copy()
     if common == ST_BOOL:
         return _b_bool_add(lhs, rhs, v_f64(alpha_v) != 0.0, dst)
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
@@ -1741,12 +1777,17 @@ def _b_sub_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
 
 
 def _b_sub(
-    lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
+    lhs: Side,
+    rhs: Side,
+    alpha_in: Value,
+    dst: Optional[T],
+    out_st: Int32 = -1,
 ) raises -> Res:
-    """The `fast_aten_sub` cascade."""
+    """The `fast_aten_sub` cascade (`out_st` as `_b_add`'s)."""
     _b_sub_check(lhs, rhs)
-    var common = _b_common(lhs, rhs)
-    _b_alpha_check(common, alpha_v)
+    var pro = _b_alpha_prologue(lhs, rhs, alpha_in, out_st, True)
+    var common = pro[0]
+    var alpha_v = pro[1].copy()
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     if alpha == 1.0:
         return _b_sub_routes(lhs, rhs, dst)
@@ -1754,7 +1795,7 @@ def _b_sub(
         # ATen's sub is add with -alpha: -alpha is what its kernel converts
         # (and range-checks) into the result dtype -- int8 takes alpha=128
         # and refuses alpha=-128 -- and the product wraps as that add's does.
-        return _b_add(lhs, rhs, _b_negated_alpha(alpha_v), dst)
+        return _b_add(lhs, rhs, _b_negated_alpha(alpha_v), dst, out_st)
     var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
     if not rhs.is_t:
         var s = rhs.s.value().copy()
@@ -1852,7 +1893,10 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var rhs = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, rhs)
     if not _b_alpha_is_one(args[unsafe_offset=2]):
-        _b_alpha_check(_b_common(_b_tside(self), rhs), args[unsafe_offset=2])
+        # the cast into self, then alpha_check (and its conversion)
+        _ = _b_alpha_prologue(
+            _b_tside(self), rhs, args[unsafe_offset=2], self.stype, False
+        )
     var alpha = v_f64(args[unsafe_offset=2])
     if alpha == 1.0 and rhs.is_t:
         # Direct in-place kernel when every layout lines up.
@@ -1880,7 +1924,9 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
-        rets, self, _b_add(_b_tside(self), rhs, args[unsafe_offset=2], None)
+        rets,
+        self,
+        _b_add(_b_tside(self), rhs, args[unsafe_offset=2], None, self.stype),
     )
 
 
@@ -1902,7 +1948,13 @@ def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_store_out(
         rets,
         dest,
-        _b_add(lhs, rhs, args[unsafe_offset=2], Optional[T](dest.copy())),
+        _b_add(
+            lhs,
+            rhs,
+            args[unsafe_offset=2],
+            Optional[T](dest.copy()),
+            dest.stype,
+        ),
     )
 
 
@@ -1930,7 +1982,9 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_no_overlap_side(self, rhs)
     _b_sub_check(_b_tside(self), rhs)
     if not _b_alpha_is_one(args[unsafe_offset=2]):
-        _b_alpha_check(_b_common(_b_tside(self), rhs), args[unsafe_offset=2])
+        _ = _b_alpha_prologue(
+            _b_tside(self), rhs, args[unsafe_offset=2], self.stype, True
+        )
     var alpha = v_f64(args[unsafe_offset=2])
     if alpha == 1.0 and rhs.is_t:
         if _b_fast_inplace_t("SubSpec", self, rhs.t.value(), rets):
@@ -1942,7 +1996,9 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
-        rets, self, _b_sub(_b_tside(self), rhs, args[unsafe_offset=2], None)
+        rets,
+        self,
+        _b_sub(_b_tside(self), rhs, args[unsafe_offset=2], None, self.stype),
     )
 
 
@@ -1964,7 +2020,13 @@ def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_store_out(
         rets,
         dest,
-        _b_sub(lhs, rhs, args[unsafe_offset=2], Optional[T](dest.copy())),
+        _b_sub(
+            lhs,
+            rhs,
+            args[unsafe_offset=2],
+            Optional[T](dest.copy()),
+            dest.stype,
+        ),
     )
 
 

@@ -2931,6 +2931,15 @@ def test_mta_sub_bool_rules(mojo_gpu: str):
         xs, [y, torch.ones(3, dtype=torch.bool, device=mojo_gpu)], alpha=True
     )
     assert [t.cpu().tolist() for t in xs] == [[False, True], [True, False, False]]
+    # every entry's version bumps once, a false alpha and an empty tensor
+    # included (stock CUDA's increment_version)
+    for alpha in (True, False):
+        xs = [x.clone(), torch.zeros(0, dtype=torch.bool, device=mojo_gpu)]
+        ys = [y, torch.zeros(0, dtype=torch.bool, device=mojo_gpu)]
+        versions = [t._version for t in xs]
+        torch._foreach_sub_(xs, ys, alpha=alpha)
+        assert [t._version - v for t, v in zip(xs, versions)] == [1, 1], alpha
+        assert xs[0].cpu().tolist() == ([False, True] if alpha else [True, False])
     # Off the fast route (a strided list) the per-tensor sub refuses it, as
     # on CUDA.
     with pytest.raises((RuntimeError, NotImplementedError), match="bool"):

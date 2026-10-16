@@ -1123,26 +1123,38 @@ def _bool_sub_per_tensor(inplace: Bool, p: _ForeachArgs, rets: Values) raises:
     bools) where the multi-tensor apply does not run it (an Apple GPU, or an
     in-place list whose aliasing needs the sequential order): `x - alpha * y`
     is nonzero exactly where `x != (alpha and y)`, so it is a `logical_xor`
-    with `y` for a true alpha and `x` itself for a false one."""
+    with `y` for a true alpha and `x` itself for a false one. In place, the
+    result is copied back and every entry's version bumped once, as the
+    launch does (CUDA's increment_version, a false alpha and empty tensors
+    included)."""
     var alpha = v_bool(p.alpha)
     var results = List[Owned]()
     for i in range(len(p.lists[0])):
-        var x = _tensor_value(p.lists[0][i])
+        ref x = p.lists[0][i]
         if not alpha:
             if not inplace:
-                var r = call_op("aten::clone", "", [x^, _none_value()], 1)
+                var r = call_op(
+                    "aten::clone", "", [_tensor_value(x), _none_value()], 1
+                )
                 results.append(own(r.take_tensor(0)))
             continue
-        var y = _tensor_value(p.lists[1][i])
         var r = call_op(
-            "aten::logical_xor_" if inplace else "aten::logical_xor",
+            "aten::logical_xor",
             "",
-            [x^, y^],
+            [_tensor_value(x), _tensor_value(p.lists[1][i])],
             1,
         )
-        if not inplace:
-            results.append(own(r.take_tensor(0)))
+        var xor = own(r.take_tensor(0))
+        if inplace:
+            # sequentially: a later entry reads this one's update
+            if x.numel > 0:
+                copy_strided_into(x, xor.t)
+            _ = xor^  # alive past the copy
+        else:
+            results.append(xor^)
     if inplace:
+        for t in p.lists[0]:
+            t.bump_version()
         return
     var result = List[T]()
     for i in range(len(results)):

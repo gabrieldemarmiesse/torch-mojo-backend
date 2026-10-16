@@ -8,7 +8,11 @@ public API only; `CallChecker` (or `native.op_count` for the ops with no
 """
 
 import contextlib
+import itertools
+import json
 import math
+import pathlib
+import sys
 
 import pytest
 import torch
@@ -231,6 +235,106 @@ def test_bool_add_alpha_checks(mojo_gpu):
     ]
     for i, call in enumerate(calls):
         assert _outcome(lambda: call(mojo_gpu)) == _outcome(lambda: call("cpu")), i
+
+
+# add / sub / rsub with an alpha into an output of another dtype, against
+# stock CUDA (torch 2.11, H100; the JSON next to this file): CUDA's
+# alpha_check reads the iterator's OUTPUT dtype (the out=, or self in
+# place), after compute_types' canCast of the common dtype into it, and the
+# kernel then converts alpha into the computation dtype (a float truncated,
+# a bool from nonzero, -alpha for sub, range-checked). CPU torch shares the
+# meta, but a same-dtype out cannot show the difference.
+_ALPHA_IN = [torch.int8, torch.int16, torch.uint8, torch.int32, torch.int64, torch.bool]
+_ALPHA_OUT = [torch.float32, torch.int64, torch.int8, torch.bool]
+_ALPHA_VALUES = [1, 1.0, 2.5, True, False, -128, 128]
+_ALPHA_CUDA = json.loads(
+    (pathlib.Path(__file__).parent / "binary_alpha_cuda.json").read_text()
+)
+
+
+def _alpha_vals(dtype: torch.dtype, device: str) -> torch.Tensor:
+    if dtype == torch.bool:
+        values = [1, 0, 1]
+    else:
+        values = [1, 3, 200] if dtype == torch.uint8 else [1, -3, 100]
+    return torch.tensor(values, device=device).to(dtype)
+
+
+def _alpha_res(fn) -> str:
+    try:
+        t = fn()
+    except (RuntimeError, NotImplementedError) as error:
+        message = str(error).split(" [aten::")[0].split("\n")[0]
+        return f"{type(error).__name__} {message}"
+    return f"OK {str(t.dtype)[6:]}{t.cpu().tolist()}"
+
+
+def _alpha_out_lines(device: str):
+    for op, variant, idt, odt, alpha in itertools.product(
+        ("add", "sub", "rsub"),
+        ("fn", "inplace", "out"),
+        _ALPHA_IN,
+        _ALPHA_OUT,
+        _ALPHA_VALUES,
+    ):
+        if (variant == "fn" and odt != _ALPHA_OUT[0]) or (
+            variant == "inplace" and op == "rsub"
+        ):
+            continue  # a functional result has no out dtype; no rsub_
+        a = _alpha_vals(idt, device)
+        b = torch.tensor([2, 5, 7], device=device).to(idt)
+        fn = getattr(torch, op)
+        if variant == "fn":
+
+            def call(fn=fn, a=a, b=b, alpha=alpha):
+                return fn(a, b, alpha=alpha)
+        elif variant == "inplace":
+            s = _alpha_vals(odt, device)
+
+            def call(s=s, op=op, b=b, alpha=alpha):
+                return getattr(s, op + "_")(b, alpha=alpha)
+        else:
+            o = torch.empty(3, dtype=odt, device=device)
+            out_fn = torch.ops.aten.rsub.Tensor_out if op == "rsub" else fn
+
+            def call(out_fn=out_fn, a=a, b=b, alpha=alpha, o=o):
+                return out_fn(a, b, alpha=alpha, out=o)
+
+        o_name = "" if variant == "fn" else f" {str(odt)[6:]}"
+        yield f"{op} {variant} {str(idt)[6:]}{o_name} a={alpha!r} {_alpha_res(call)}"
+
+
+# The C++ type names in CUDA's messages are the host compiler's (Linux
+# GCC); the mojo device prints the names of the host it runs on.
+_MACOS_TYPE_NAMES = [
+    ("long unsigned int", "unsigned long long"),
+    ("short unsigned int", "unsigned short"),
+    ("long int", "long long"),
+    ("short int", "short"),
+]
+
+
+def _as_on_this_host(line: str) -> str:
+    if sys.platform == "darwin":
+        for linux, macos in _MACOS_TYPE_NAMES:
+            line = line.replace(linux, macos)
+    return line
+
+
+def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(mojo_gpu):
+    got = list(_alpha_out_lines(mojo_gpu))
+    want = [_as_on_this_host(w) for w in _ALPHA_CUDA]
+    assert len(got) == len(want)
+    assert [g for g, w in zip(got, want) if g != w] == [], [
+        w for g, w in zip(got, want) if g != w
+    ]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+)
+def test_add_sub_alpha_data_regenerates_on_stock_cuda():
+    assert list(_alpha_out_lines("cuda")) == _ALPHA_CUDA
 
 
 def test_inplace_add_rejects_partial_overlap(mojo_gpu):
