@@ -288,10 +288,10 @@ _ALPHA_SELF = [
 ]  # fmt: skip
 _INF = float("inf")
 _ALPHA_VALUES = [1, 1.0, 2.5, True, False, -128, 128, float("nan"), _INF, -_INF]
-# complex alphas, for add / sub into a complex output only (`_cx_out`):
-# there c10 converts one into the inputs' computation dtype (sub's -alpha, a
-# Half / BFloat16 sum's float), where any other output refuses it in
-# alpha_check
+# complex alphas: a complex output converts one into the inputs'
+# computation dtype (sub's -alpha, a Half / BFloat16 sum's float), any
+# other output refuses it in alpha_check (an integral one with the
+# "floating point" message, in CUDA's order)
 _ALPHA_COMPLEX_VALUES = [1j, 2 + 0j, -1 + 0j, 128 + 0j, -0.5 + 0j, 65505 + 0j, 1e5 + 0j]
 
 
@@ -327,25 +327,12 @@ def _alpha_outcome(fn) -> _Outcome:
     return {"dtype": _dtype_name(t.dtype), "values": values}
 
 
-def _cx_out(op: str, variant: str) -> bool:
-    """add / sub into a complex out= or self, which convert a complex alpha;
-    rsub's out= is its functional result copied, whose alpha_check sees the
-    real result (and refuses with the "integral" message first, where the
-    mojo device names the complex alpha: a known difference)."""
-    return op != "rsub" and variant != "fn"
-
-
 def _alpha_cases(device: str, op: str, variant: str) -> dict[str, _Outcome]:
     """The outcome of every (input dtype, out dtype, alpha) case of
     `op` / `variant` on `device`, keyed by case id."""
     cases = {}
     outs = {"fn": _ALPHA_OUT[:1], "inplace": _ALPHA_SELF, "out": _ALPHA_OUT}[variant]
-    combos = [
-        (idt, odt, alpha)
-        for idt, odt in itertools.product(_ALPHA_IN, outs)
-        for alpha in _ALPHA_VALUES
-        + (_ALPHA_COMPLEX_VALUES if odt.is_complex and _cx_out(op, variant) else [])
-    ]
+    combos = itertools.product(_ALPHA_IN, outs, _ALPHA_VALUES + _ALPHA_COMPLEX_VALUES)
     for idt, odt, alpha in combos:
         a = _alpha_vals(idt, device)
         b = torch.tensor([2, 5, 7], device=device).to(idt)
