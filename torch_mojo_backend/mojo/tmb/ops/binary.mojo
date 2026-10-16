@@ -93,6 +93,7 @@ from tmb.ops.common import (
     resize_out,
     scalar_to_float,
     scalar_to_int,
+    sub_check,
 )
 from tmb.ops.core import cast_for_copy
 from tmb.ops.f8_iter import (
@@ -1636,8 +1637,10 @@ def _b_negated_alpha(alpha_v: Value) -> Value:
     """`-alpha` for an int64 alpha record: ATen's sub is
     `add_stub(..., -alpha)`, so `-alpha` is what its kernel converts, and
     range-checks, into the result dtype. (A Python int past int64 never
-    gets here: the dispatcher's `Scalar::toLong` refuses 2**63 and up,
-    which CUDA's unsigned Scalar would negate.)"""
+    gets here: this backend's shim boxes an integral Scalar with
+    `Scalar::toLong`, which refuses 2**63 and up, where stock CUDA keeps
+    an unsigned Scalar and negates it: sub(int64, alpha=2**63) computes
+    there and raises here.)"""
     return Value(alpha_v.tag, 0, 0 - alpha_v.a, alpha_v.b)
 
 
@@ -1818,19 +1821,7 @@ def _b_is_bool_side(side: Side) -> Bool:
 
 def _b_sub_check(lhs: Side, rhs: Side) raises:
     """BinaryOps.cpp's sub_check, before any dtype dispatch."""
-    var a = _b_is_bool_side(lhs)
-    var b = _b_is_bool_side(rhs)
-    if a and b:
-        raise Error(
-            "Subtraction, the `-` operator, with two bool tensors is not"
-            " supported. Use the `^` or `logical_xor()` operator instead."
-        )
-    if a or b:
-        raise Error(
-            "Subtraction, the `-` operator, with a bool tensor is not"
-            " supported. If you are trying to invert a mask, use the `~` or"
-            " `logical_not()` operator instead."
-        )
+    sub_check(_b_is_bool_side(lhs), _b_is_bool_side(rhs))
 
 
 def _b_pow_float8(lhs: Side, rhs: Side) raises -> Optional[Res]:

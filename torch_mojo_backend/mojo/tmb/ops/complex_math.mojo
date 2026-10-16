@@ -44,9 +44,12 @@ from tmb.ops.complex import (
     as_real,
     cx_unary_out,
 )
+from tmb.ops.f8_iter import _alpha_check, _kernel_alpha
 from tmb.ops.common import (
     assert_no_internal_overlap,
     can_cast,
+    check_real_scalar_fits,
+    sub_check,
     is_float_stype,
     scalar_type_name,
     scalar_parts,
@@ -153,13 +156,8 @@ def _arith(
 ) raises -> Owned:
     """`kind(a, b)` (add / sub / mul / div / pow) where one side is complex:
     promoted, broadcast, one launch. `alpha` scales `b` (add, sub)."""
-    if kind == "sub" and (_is_bool_value(av) or _is_bool_value(bv)):
-        # BinaryOps.cpp sub_check
-        raise Error(
-            "Subtraction, the `-` operator, with a bool tensor is not"
-            " supported. If you are trying to invert a mask, use the `~` or"
-            " `logical_not()` operator instead."
-        )
+    if kind == "sub":
+        sub_check(_is_bool_value(av), _is_bool_value(bv))
     if alpha.tag == TAG_SCALAR_BOOL or alpha.tag == TAG_BOOL:
         # alpha_check: the result here is complex, never bool
         raise Error("Boolean alpha only supported for Boolean results.")
@@ -346,10 +344,68 @@ def cx_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+def _real_alpha_args(args: Values, negate: Bool) raises -> List[Value]:
+    """add / sub.out's arguments for a complex `out` with no complex input,
+    alpha as CUDA's kernel reads it: `alpha_check` against the out's
+    (complex) dtype, then alpha converted into the inputs' computation
+    dtype (f8_iter's `_kernel_alpha`; a complex alpha by c10's
+    complex -> real conversion, which a nonzero imaginary part overflows,
+    except into bool). The real functional op then computes, and its
+    result is cast into the out: `add(int8, int8, alpha=1.0,
+    out=complex64)` is int8 arithmetic. sub's `sub_check` comes first."""
+    if negate:
+        sub_check(
+            _is_bool_value(args[unsafe_offset=0]),
+            _is_bool_value(args[unsafe_offset=1]),
+        )
+    var alpha = args[unsafe_offset=2].copy()
+    _alpha_check(v_tensor_c(args[unsafe_offset=3]).stype, alpha)
+    var like = _first_tensor(args[unsafe_offset=0], args[unsafe_offset=1])
+    var common = _result_type(
+        _operand(args[unsafe_offset=0], like),
+        _operand(args[unsafe_offset=1], like),
+    )
+    if alpha.tag == TAG_COMPLEX and not is_complex_stype(common):
+        var parts = v_complex(alpha)
+        if common == ST_BOOL:
+            alpha = Value(
+                TAG_SCALAR_BOOL,
+                0,
+                Int64(1 if parts[0] != 0.0 or parts[1] != 0.0 else 0),
+                0,
+            )
+        else:
+            check_real_scalar_fits(common, alpha)
+            alpha = Value(TAG_SCALAR_DOUBLE, 0, alpha.a, 0)  # the real part
+    var out = List[Value](capacity=4)
+    out.append(args[unsafe_offset=0].copy())
+    out.append(args[unsafe_offset=1].copy())
+    out.append(_kernel_alpha(common, alpha, negate))
+    out.append(args[unsafe_offset=3].copy())
+    return out^
+
+
+def _real_inputs(args: Values) -> Bool:
+    return not v_is_complex(args[unsafe_offset=0]) and not v_is_complex(
+        args[unsafe_offset=1]
+    )
+
+
 def cx_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """add.out(self, other, *, alpha, out)"""
-    if _real_out("aten::add", "Tensor", args, 3, 3, rets):
-        return
+    if _real_inputs(args):
+        var real = _real_alpha_args(args, False)
+        var done = _real_out(
+            "aten::add",
+            "Tensor",
+            real.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
+            3,
+            3,
+            rets,
+        )
+        _ = real^  # alive past the call
+        if done:
+            return
     var dest = v_tensor_c(args[unsafe_offset=3])
     _store_ew[2](
         args,
@@ -392,8 +448,19 @@ def cx_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def cx_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if _real_out("aten::sub", "Tensor", args, 3, 3, rets):
-        return
+    if _real_inputs(args):
+        var real = _real_alpha_args(args, True)
+        var done = _real_out(
+            "aten::sub",
+            "Tensor",
+            real.unsafe_ptr().unsafe_origin_cast[MutUntrackedOrigin](),
+            3,
+            3,
+            rets,
+        )
+        _ = real^  # alive past the call
+        if done:
+            return
     var dest = v_tensor_c(args[unsafe_offset=3])
     _store_ew[2](
         args,

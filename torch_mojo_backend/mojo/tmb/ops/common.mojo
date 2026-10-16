@@ -1996,6 +1996,22 @@ def scalar_type_token(st: Int32) -> String:
     return "c10::complex<double>"
 
 
+def sub_check(self_is_bool: Bool, other_is_bool: Bool) raises:
+    """BinaryOps.h `sub_check`: sub refuses a bool tensor (or a bool
+    Scalar) on either side, before any dtype dispatch."""
+    if self_is_bool and other_is_bool:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if self_is_bool or other_is_bool:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+
+
 def check_real_scalar_fits(st: Int32, v: Value) raises:
     """c10::checked_convert of a Scalar record (`v`) to the REAL dtype `st`
     (c10::overflows): bool takes anything; a complex value with a nonzero
