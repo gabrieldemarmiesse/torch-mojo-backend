@@ -23,6 +23,7 @@ from std.utils.numerics import nan
 
 from tmb.backend.abi import (
     DEVICE_TYPE_CPU,
+    is_complex_stype,
     ST_BFLOAT16,
     ST_BOOL,
     ST_FLOAT16,
@@ -82,6 +83,7 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     is_cast_dtype_on,
+    is_float_stype,
     is_int_stype,
     resize_out,
     scalar_to_float,
@@ -818,9 +820,15 @@ def _b_fast_route(
     var a = T(Int(av.a))
     if not a.on_mojo() or not a.contig or a.is_complex():
         return False
+    # a bool operand of sub: the checked route raises sub_check's error
+    var sub = tt == "SubSpec"
+    if sub and a.stype == ST_BOOL:
+        return False
     var bv = args[unsafe_offset=1].copy()
     if _b_is_tensor_rec(bv):
         var b = T(Int(bv.a))
+        if sub and b.stype == ST_BOOL:
+            return False
         if b.is_complex():
             # a complex operand (a wrapped complex number included): the
             # real routes would read its pairs as reals; the slow path
@@ -836,7 +844,7 @@ def _b_fast_route(
     if ts.byte_length() == 0:
         return False
     var ms = _b_rec_scalar(bv)
-    if not ms.ok:
+    if not ms.ok or (sub and ms.s.is_bool):
         return False
     return _b_fast_ts(ts, a, ms.s, negate, rets, dest_h)
 
@@ -1435,20 +1443,85 @@ def _b_add_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
     return _b_binary("AddSpec", lhs, rhs, Int32(-1), dst)
 
 
+def _b_common(lhs: Side, rhs: Side) raises -> Int32:
+    """`torch.result_type` of the two operands (-1: declined, or no tensor)."""
+    if lhs.is_t and rhs.is_t:
+        return _b_promote(lhs.t.value(), rhs.t.value())
+    if lhs.is_t:
+        return _b_side_result(lhs.t.value(), rhs)
+    if rhs.is_t:
+        return _b_side_result(rhs.t.value(), lhs)
+    return -1
+
+
+def _b_is_bool_side(side: Side) -> Bool:
+    if side.is_t:
+        return side.t.value().stype == ST_BOOL
+    return side.s.value().is_bool
+
+
+def _b_sub_check(lhs: Side, rhs: Side) raises:
+    """BinaryOps.h `sub_check`: no bool operand (a bool Scalar included)."""
+    var a = _b_is_bool_side(lhs)
+    var b = _b_is_bool_side(rhs)
+    if a and b:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if a or b:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+
+
+def _b_alpha_check(common: Int32, alpha_v: Value) raises:
+    """BinaryOps.h `alpha_check` against the result dtype `common` (skipped
+    when the promotion was declined: the op declines later)."""
+    if common < 0:
+        return
+    var tag = alpha_v.tag
+    if (tag == TAG_SCALAR_BOOL or tag == TAG_BOOL) and common != ST_BOOL:
+        raise Error("Boolean alpha only supported for Boolean results.")
+    var floating = is_float_stype(common) or is_complex_stype(common)
+    if (tag == TAG_SCALAR_DOUBLE or tag == TAG_DOUBLE) and not floating:
+        raise Error(
+            "For integral input tensors, argument alpha must not be a"
+            " floating point number."
+        )
+    if tag == TAG_COMPLEX and not is_complex_stype(common):
+        raise Error(
+            "For non-complex input tensors, argument alpha must not be a"
+            " complex number."
+        )
+
+
+def _b_alpha_is_one(alpha_v: Value) -> Bool:
+    """An integer alpha of 1 (the default), the one alpha the fast routes
+    take without `alpha_check`: a bool or floating 1 still has to be checked
+    against the result dtype, so it goes the checked way."""
+    return (alpha_v.tag == TAG_SCALAR_INT or alpha_v.tag == TAG_INT) and (
+        alpha_v.a == 1
+    )
+
+
+def _b_negated_alpha(alpha_v: Value) -> Value:
+    """`-alpha` for an integer alpha (wrapping, as c10's int64 Scalar does):
+    ATen's sub is `add_stub(..., -alpha)`, so `-alpha` is what its kernel
+    converts, and range-checks, into the result dtype."""
+    return Value(alpha_v.tag, 0, 0 - alpha_v.a, alpha_v.b)
+
+
 def _b_alpha_int(alpha_v: Value, lhs: Side, rhs: Side) raises -> Optional[Int]:
     """An integer alpha, exact (never through a float), when the add/sub
     computes in an integral dtype -- checked against that dtype as ATen's
-    `alpha.to<scalar_t>()` checks it (int8 `sub(x, 1, alpha=300)` raises).
+    `alpha.to<scalar_t>()` checks it (int8 `add(x, 1, alpha=300)` raises).
     None for a float alpha or a floating result."""
     if not _b_scalar_is_int(alpha_v) or not (lhs.is_t or rhs.is_t):
         return None
-    var common: Int32
-    if lhs.is_t and rhs.is_t:
-        common = _b_promote(lhs.t.value(), rhs.t.value())
-    elif lhs.is_t:
-        common = _b_side_result(lhs.t.value(), rhs)
-    else:
-        common = _b_side_result(rhs.t.value(), lhs)
+    var common = _b_common(lhs, rhs)
     if not is_int_stype(common):
         return None
     return scalar_to_int(alpha_v, common)
@@ -1466,13 +1539,7 @@ def _b_scaled_scalar(s: Scal, alpha: Float64, alpha_i: Optional[Int]) -> Scal:
 
 def _b_bool_result(lhs: Side, rhs: Side) raises -> Bool:
     """Whether the operands promote to bool (`torch.result_type`)."""
-    if lhs.is_t and rhs.is_t:
-        return _b_promote(lhs.t.value(), rhs.t.value()) == ST_BOOL
-    if lhs.is_t:
-        return _b_side_result(lhs.t.value(), rhs) == ST_BOOL
-    if rhs.is_t:
-        return _b_side_result(rhs.t.value(), lhs) == ST_BOOL
-    return False
+    return _b_common(lhs, rhs) == ST_BOOL
 
 
 def _b_bool_add(
@@ -1498,13 +1565,9 @@ def _b_add(
     lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
 ) raises -> Res:
     """The `fast_aten_add` cascade."""
-    if _b_bool_result(lhs, rhs):
-        if alpha_v.tag == TAG_SCALAR_DOUBLE or alpha_v.tag == TAG_DOUBLE:
-            # BinaryOps.h alpha_check: a bool result is integral.
-            raise Error(
-                "For integral input tensors, argument alpha must not be a"
-                " floating point number."
-            )
+    var common = _b_common(lhs, rhs)
+    _b_alpha_check(common, alpha_v)
+    if common == ST_BOOL:
         return _b_bool_add(lhs, rhs, v_f64(alpha_v) != 0.0, dst)
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
@@ -1557,14 +1620,20 @@ def _b_sub(
     lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
 ) raises -> Res:
     """The `fast_aten_sub` cascade."""
+    _b_sub_check(lhs, rhs)
+    var common = _b_common(lhs, rhs)
+    _b_alpha_check(common, alpha_v)
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
-    var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
     if alpha == 1.0:
         return _b_sub_routes(lhs, rhs, dst)
+    if is_int_stype(common):
+        # ATen's sub is add with -alpha: -alpha is what its kernel converts
+        # (and range-checks) into the result dtype -- int8 takes alpha=128
+        # and refuses alpha=-128 -- and the product wraps as that add's does.
+        return _b_add(lhs, rhs, _b_negated_alpha(alpha_v), dst)
+    var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
     if not rhs.is_t:
         var s = rhs.s.value().copy()
-        if s.is_bool:
-            unsupported("a bool scalar operand with alpha != 1")
         var scaled_s = _b_sside(_b_scaled_scalar(s, alpha, alpha_i))
         scaled_s.zero_st = rhs.zero_st
         return _b_sub_routes(lhs, scaled_s^, dst)
@@ -1586,7 +1655,7 @@ def _b_mul(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
 
 # aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 def op_add_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+    if _b_alpha_is_one(args[unsafe_offset=2]) and _b_fast_route(
         "AddSpec", "AddScalarSpec", False, args, rets, 0
     ):
         return
@@ -1606,6 +1675,8 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "add_")
     var rhs = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, rhs)
+    if not _b_alpha_is_one(args[unsafe_offset=2]):
+        _b_alpha_check(_b_common(_b_tside(self), rhs), args[unsafe_offset=2])
     var alpha = v_f64(args[unsafe_offset=2])
     if alpha == 1.0 and rhs.is_t:
         # Direct in-place kernel when every layout lines up.
@@ -1639,7 +1710,7 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
 def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+    if _b_alpha_is_one(args[unsafe_offset=2]) and _b_fast_route(
         "AddSpec",
         "AddScalarSpec",
         False,
@@ -1661,7 +1732,7 @@ def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 def op_sub_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+    if _b_alpha_is_one(args[unsafe_offset=2]) and _b_fast_route(
         "SubSpec", "AddScalarSpec", True, args, rets, 0
     ):
         return
@@ -1681,6 +1752,9 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "sub_")
     var rhs = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, rhs)
+    _b_sub_check(_b_tside(self), rhs)
+    if not _b_alpha_is_one(args[unsafe_offset=2]):
+        _b_alpha_check(_b_common(_b_tside(self), rhs), args[unsafe_offset=2])
     var alpha = v_f64(args[unsafe_offset=2])
     if alpha == 1.0 and rhs.is_t:
         if _b_fast_inplace_t("SubSpec", self, rhs.t.value(), rets):
@@ -1698,7 +1772,7 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::sub.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
 def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+    if _b_alpha_is_one(args[unsafe_offset=2]) and _b_fast_route(
         "SubSpec",
         "AddScalarSpec",
         True,

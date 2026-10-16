@@ -2922,18 +2922,19 @@ def test_mta_sub_bool_rules(mojo_gpu: str):
     assert a.cpu().tolist() == [10.0]
     x = torch.tensor([True, False], device=mojo_gpu)
     y = torch.tensor([True, True], device=mojo_gpu)
-    if is_metal(mojo_gpu):
-        # No multi-tensor apply on Apple GPUs: the per-tensor sub raises,
-        # as it does for a bool list off CUDA's fast route.
-        for alpha in (True, False):
-            with pytest.raises((RuntimeError, NotImplementedError)):
-                torch._foreach_sub([x], [y], alpha=alpha)
-    else:
-        # Stock CUDA: [False, True] and [True, False].
-        got = torch._foreach_sub([x], [y], alpha=True)[0].cpu().tolist()
-        assert got == [False, True]
-        got = torch._foreach_sub([x], [y], alpha=False)[0].cpu().tolist()
-        assert got == [True, False]
+    # Stock CUDA: [False, True] and [True, False] (an Apple GPU, which has
+    # no multi-tensor apply, computes the same per tensor).
+    assert torch._foreach_sub([x], [y], alpha=True)[0].cpu().tolist() == [False, True]
+    assert torch._foreach_sub([x], [y], alpha=False)[0].cpu().tolist() == [True, False]
+    xs = [x.clone(), torch.tensor([False, True, True], device=mojo_gpu)]
+    torch._foreach_sub_(
+        xs, [y, torch.ones(3, dtype=torch.bool, device=mojo_gpu)], alpha=True
+    )
+    assert [t.cpu().tolist() for t in xs] == [[False, True], [True, False, False]]
+    # Off the fast route (a strided list) the per-tensor sub refuses it, as
+    # on CUDA.
+    with pytest.raises((RuntimeError, NotImplementedError), match="bool"):
+        torch._foreach_sub([x.repeat(2)[::2]], [y.repeat(2)[::2]], alpha=True)
     # The per-tensor sub.Tensor declines bool operands (CUDA: "two bool
     # tensors"); either way nothing is computed.
     with pytest.raises((RuntimeError, NotImplementedError)):

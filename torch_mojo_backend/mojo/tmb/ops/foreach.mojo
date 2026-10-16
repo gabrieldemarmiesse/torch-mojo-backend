@@ -150,9 +150,10 @@ def _seq_vector_norm(
 
 
 def _seq_to_dtype(t: T, stype: Int32) raises -> T:
-    """`t.to(stype)` through the dispatcher's `_to_copy` (every dtype the
-    device holds, the wide unsigned ones included); `t` itself when its
-    dtype already is `stype`, so wrap the result in `own_if_new`."""
+    """`t.to(stype)` through the dispatcher's `_to_copy`; `t` itself when its
+    dtype already is `stype`, so wrap the result in `own_if_new`. Not
+    common.mojo's `cast_to`: its CastSpec kernel has no uint16 / uint32 /
+    uint64 source, and the wide unsigned lists come through here."""
     if t.stype == stype:
         return t.copy()
     var args = List[Value](capacity=7)
@@ -807,6 +808,29 @@ def _scalar_slot(v: Value, t: T) raises -> Int:
 def _fast_route(
     e: ForeachOverload, inplace: Bool, p: _ForeachArgs
 ) raises -> Bool:
+    """The lists the multi-tensor apply runs: CUDA's fast route
+    (`_cuda_fast_route`), less what an Apple GPU has no kernel for and the
+    in-place lists whose aliasing needs the sequential order."""
+    if not _cuda_fast_route(e, inplace, p):
+        return False
+    ref first = p.lists[0][0]
+    if dev(first.device)[].api == "metal":
+        if (
+            first.dtype != DType.float32
+            or not e.apple
+            or not foreach_apple_supported(e.kind, _variant(e, inplace))
+        ):
+            return False
+    if inplace and _inplace_hazard(p):
+        return False
+    return True
+
+
+def _cuda_fast_route(
+    e: ForeachOverload, inplace: Bool, p: _ForeachArgs
+) raises -> Bool:
+    """`can_use_fast_route` as CUDA has it, with the errors its fast kernels
+    raise (a scalar tensor on another device)."""
     if not _lists_on_route(p.lists):
         return False
     ref first = p.lists[0][0]
@@ -843,18 +867,6 @@ def _fast_route(
                 " but is on ",
                 device_str(other),
             )
-    if dev(first.device)[].api == "metal":
-        # Only after the checks above: a list CUDA's fast route would take
-        # raises the same errors on an Apple GPU, which then runs it through
-        # its fixed-arity float32 kernels or per tensor.
-        if (
-            dt != DType.float32
-            or not e.apple
-            or not foreach_apple_supported(e.kind, _variant(e, inplace))
-        ):
-            return False
-    if inplace and _inplace_hazard(p):
-        return False
     return True
 
 
@@ -1061,8 +1073,9 @@ def _foreach(
         # ForeachBinaryOpScalar{,List}.cu check before anything runs: the
         # Scalar overload the first tensor, the ScalarList one every pair.
         # The List overload checks nothing up front: a bool pair on the
-        # fast route (bool alpha) computes, any other raises in the
-        # per-tensor sub, as on CUDA.
+        # fast route (bool alpha) computes (`_bool_sub_per_tensor` where no
+        # multi-tensor apply runs it), any other raises in the per-tensor
+        # sub, as on CUDA.
         if e.shape == S_SCALAR:
             _sub_check(p.lists[0][0], p.scalar)
         elif e.shape == S_SCALARLIST:
@@ -1091,8 +1104,46 @@ def _foreach(
         p.scalar = _reciprocal(p.scalar)
     if _fast_route(e, inplace, p):
         _launch(e, inplace, p, rets)
+    elif (
+        e.kind == "sub"
+        and p.lists[0][0].dtype == DType.bool
+        and _cuda_fast_route(e, inplace, p)
+    ):
+        _bool_sub_per_tensor(inplace, p, rets)
     else:
         _per_tensor(e, inplace, p, rets)
+
+
+def _bool_sub_per_tensor(inplace: Bool, p: _ForeachArgs, rets: Values) raises:
+    """A bool list CUDA's fast route subtracts (the per-tensor sub refuses
+    bools) where the multi-tensor apply does not run it (an Apple GPU, or an
+    in-place list whose aliasing needs the sequential order): `x - alpha * y`
+    is nonzero exactly where `x != (alpha and y)`, so it is a `logical_xor`
+    with `y` for a true alpha and `x` itself for a false one."""
+    var alpha = v_bool(p.alpha)
+    var results = List[Owned]()
+    for i in range(len(p.lists[0])):
+        var x = _tensor_value(p.lists[0][i])
+        if not alpha:
+            if not inplace:
+                var r = call_op("aten::clone", "", [x^, _none_value()], 1)
+                results.append(own(r.take_tensor(0)))
+            continue
+        var y = _tensor_value(p.lists[1][i])
+        var r = call_op(
+            "aten::logical_xor_" if inplace else "aten::logical_xor",
+            "",
+            [x^, y^],
+            1,
+        )
+        if not inplace:
+            results.append(own(r.take_tensor(0)))
+    if inplace:
+        return
+    var result = List[T]()
+    for i in range(len(results)):
+        result.append(results[i].take())
+    ret_tensor_list(rets, 0, result)
 
 
 def op_foreach[

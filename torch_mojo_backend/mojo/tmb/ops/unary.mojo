@@ -352,7 +352,7 @@ def _bool_unary_out(op: String, t: T, mut dst: T) raises:
 
 # ---------------------------------------------------------------------------
 # abs / neg / sign (direct dtypes: floats, float64, every signed/unsigned int
-# up to 64 bits and uint8 — no bool).
+# up to 64 bits and uint8 — no bool, except abs's identity on bool).
 # ---------------------------------------------------------------------------
 
 

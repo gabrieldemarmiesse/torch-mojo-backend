@@ -140,6 +140,99 @@ def test_add_sub_alpha_reduced_precision_rounds_like_cpu(mojo_gpu, dtype):
     assert not torch.equal(unrounded, got.cpu())
 
 
+def _outcome(fn):
+    """("ok", values, dtype) or (exception type, its message without the
+    backend's ` [aten::...]` op trail)."""
+    try:
+        t = fn()
+    except (RuntimeError, NotImplementedError) as error:
+        return (type(error), str(error).split(" [aten::")[0].split("\n")[0])
+    return ("ok", t.cpu().tolist(), t.dtype)
+
+
+_ALPHA_DTYPES = [torch.int8, torch.int16, torch.uint8, torch.int32, torch.int64]
+# Integer alphas at and past each dtype's range on both signs (sub converts
+# -alpha: int8 takes 128 and refuses -128), wrapping products, and the bool
+# and floating alphas `alpha_check` refuses for an integral result.
+_ALPHAS = [2, 3, -1, 0, 127, 128, -128, -129, 255, 256, -255, -256,
+           32767, 32768, -32768, -32769, 2**31, -(2**31), 0.5, 2.5, 1.0,
+           True, False]  # fmt: skip
+
+
+def _alpha_operands(device: str, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+    values = [1, 3, 200, 0] if dtype == torch.uint8 else [1, -3, 100, 0]
+    a = torch.tensor(values, dtype=dtype, device=device)
+    return a, torch.tensor([2, 5, 7, 1], dtype=dtype, device=device)
+
+
+@pytest.mark.parametrize("variant", ["functional", "inplace", "out"])
+@pytest.mark.parametrize("op", ["add", "sub"])
+@pytest.mark.parametrize("dtype", _ALPHA_DTYPES, ids=str)
+def test_integer_add_sub_alpha_matches_cpu(mojo_gpu, dtype, op, variant):
+    """add / sub of integer tensors with every kind of alpha: values (a
+    wrapping product included), the range check of alpha -- of -alpha for
+    sub, which ATen computes as add with -alpha -- and `alpha_check`'s
+    errors for a bool or floating alpha, in every variant. CPU torch runs
+    the same meta and the same alpha conversion as CUDA."""
+
+    def run(device: str, alpha):
+        a, b = _alpha_operands(device, dtype)
+        if variant == "inplace":
+            return lambda: getattr(a, op + "_")(b, alpha=alpha)
+        if variant == "out":
+            return lambda: getattr(torch, op)(
+                a, b, alpha=alpha, out=torch.empty_like(a)
+            )
+        return lambda: getattr(torch, op)(a, b, alpha=alpha)
+
+    for alpha in _ALPHAS:
+        got = _outcome(run(mojo_gpu, alpha))
+        want = _outcome(run("cpu", alpha))
+        assert got == want, alpha
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int32, torch.float32], ids=str)
+def test_sub_refuses_a_bool_operand(mojo_gpu, dtype):
+    """`sub_check`: a bool tensor (or a bool scalar) on either side of sub is
+    refused before anything runs, whatever alpha, in every variant."""
+    x = torch.tensor([1, 2, 3], dtype=dtype)
+    m = torch.tensor([True, False, True])
+    calls = [
+        lambda d: torch.sub(x.to(d), m.to(d)),
+        lambda d: torch.sub(m.to(d), x.to(d), alpha=2),
+        lambda d: torch.sub(x.to(d), m.to(d), alpha=2),
+        lambda d: torch.sub(m.to(d), m.to(d)),
+        lambda d: torch.sub(m.to(d), m.to(d), alpha=True),
+        lambda d: torch.sub(x.to(d), True),
+        lambda d: x.to(d).sub_(m.to(d), alpha=3),
+        lambda d: torch.sub(x.to(d), m.to(d), out=torch.empty_like(x.to(d))),
+        lambda d: torch.rsub(x.to(d), m.to(d)),
+    ]
+    for i, call in enumerate(calls):
+        got = _outcome(lambda: call(mojo_gpu))
+        want = _outcome(lambda: call("cpu"))
+        assert want[0] is RuntimeError and got == want, i
+
+
+def test_bool_add_alpha_checks(mojo_gpu):
+    """A bool result takes a bool or integer alpha, never a floating one; a
+    non-bool result never takes a bool alpha."""
+    m = torch.tensor([True, False, False])
+    f = torch.tensor([1.5, -2.0, 0.0])
+    calls = [
+        lambda d: torch.add(m.to(d), m.to(d), alpha=True),
+        lambda d: torch.add(m.to(d), m.to(d), alpha=False),
+        lambda d: torch.add(m.to(d), m.to(d), alpha=2),
+        lambda d: torch.add(m.to(d), m.to(d), alpha=0.5),
+        lambda d: torch.add(f.to(d), f.to(d), alpha=True),
+        lambda d: f.to(d).add_(f.to(d), alpha=False),
+        lambda d: f.to(d).sub_(f.to(d), alpha=True),
+        lambda d: torch.add(f.to(d), 2, alpha=True),
+    ]
+    for i, call in enumerate(calls):
+        assert _outcome(lambda: call(mojo_gpu)) == _outcome(lambda: call("cpu")), i
+
+
 def test_inplace_add_rejects_partial_overlap(mojo_gpu):
     """`x[1:].add_(x[:-1])` is a read/write race over one storage: ATen
     refuses it, and so must a backend that hands the kernel raw pointers."""

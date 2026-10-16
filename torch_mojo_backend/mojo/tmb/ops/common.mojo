@@ -1573,9 +1573,11 @@ def real_fill_value(st: Int32, v: Value) raises -> Value:
       through int64): exact below 2**64, and 0 for 2**64 itself, which
       c10::overflows lets through (it compares with double(UINT64_MAX)).
     - Into int64, the double 2**63 (c10::overflows compares with
-      double(INT64_MAX), which is 2**63) becomes the int record INT64_MIN,
-      what x86's host `static_cast<int64_t>` gives on CUDA. Left a double, a
-      kernel or an AArch64 host would convert it saturating, to INT64_MAX.
+      double(INT64_MAX), which is 2**63) becomes the int record INT64_MIN: a
+      chosen policy, what stock CUDA gives on an x86 host (its host
+      `static_cast<int64_t>`). On an AArch64 host (GH200, an Apple Mac)
+      that cast saturates to INT64_MAX, and so would a device conversion
+      of the double; the record keeps one answer on every machine.
     Anything else is returned unchanged."""
     if st == ST_BOOL or is_complex_stype(st):
         return v.copy()

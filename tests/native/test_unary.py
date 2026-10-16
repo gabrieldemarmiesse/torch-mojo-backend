@@ -284,6 +284,23 @@ def test_unary_launcher_bitwise_not_offsets(
     torch.testing.assert_close(storage.cpu(), expected)
 
 
+def test_abs_of_bool_is_the_identity(mojo_gpu: str):
+    """Stock CUDA's abs dispatches Bool (AbsKernel.cu) and returns its input;
+    CPU torch refuses it, so the expected values are written out."""
+    host = torch.tensor([[True, False, True], [False, False, True]])
+    x = host.to(mojo_gpu)
+    for view, want in ((x, host), (x.t(), host.t()), (x[:, :0], host[:, :0])):
+        got = torch.abs(view)
+        assert got.dtype == torch.bool and torch.equal(got.cpu(), want)
+        out = torch.empty(0, dtype=torch.bool, device=mojo_gpu)
+        torch.abs(view, out=out)
+        assert torch.equal(out.cpu(), want)
+    y = x.clone()
+    y.abs_()
+    assert torch.equal(y.cpu(), host)
+    assert torch.abs(torch.tensor(True, device=mojo_gpu)).cpu().item() is True
+
+
 @pytest.mark.parametrize("op", [torch.abs, torch.neg, torch.sign, torch.relu])
 def test_direct_unary_float64(mojo_gpu: str, op):
     skip_if_metal(mojo_gpu, "Metal does not support float64")

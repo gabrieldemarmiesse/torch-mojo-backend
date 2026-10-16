@@ -356,6 +356,40 @@ def test_masked_fill_scalar_fast_path(
     torch.testing.assert_close(got.cpu().float(), expected.float())
 
 
+def test_int64_fills_of_two_to_the_63(mojo_gpu: str):
+    """2.0**63 passes c10's overflow check (it compares with
+    double(INT64_MAX), which rounds up to 2**63), and the host conversion
+    then decides. The mojo device gives what stock CUDA gives on an x86
+    host, INT64_MIN, on every machine: a chosen policy, since an AArch64
+    host (GH200, an Apple Mac) saturates to INT64_MAX instead."""
+    m = torch.tensor([True, False], device=mojo_gpu)
+    lo = -(2**63)
+    for v in (2.0**63, 2.0**63 + 0j):
+        z = torch.zeros(2, dtype=torch.int64, device=mojo_gpu)
+        assert z.masked_fill(m, v).cpu().tolist() == [lo, 0]
+        assert torch.full(
+            (2,), v, dtype=torch.int64, device=mojo_gpu
+        ).cpu().tolist() == [lo, lo]
+        assert z.clone().fill_(v).cpu().tolist() == [lo, lo]
+        assert (
+            torch.scalar_tensor(v, dtype=torch.int64, device=mojo_gpu).cpu().item()
+            == lo
+        )
+        w = z.clone()
+        w[0] = v  # ty: ignore[invalid-assignment] -- torch stubs omit complex
+        assert w.cpu().tolist() == [lo, 0]
+    z = torch.zeros(2, dtype=torch.int64, device=mojo_gpu)
+    z.index_fill_(0, torch.tensor([1], device=mojo_gpu), 2.0**63)
+    assert z.cpu().tolist() == [0, lo]
+    # the largest double below 2**63 converts exactly; past 2**63 overflows
+    below = 2.0**63 - 1024
+    assert torch.full(
+        (1,), below, dtype=torch.int64, device=mojo_gpu
+    ).cpu().item() == int(below)
+    with pytest.raises(RuntimeError, match="without overflow"):
+        torch.zeros(1, dtype=torch.int64, device=mojo_gpu).fill_(2.0**64)
+
+
 def test_masked_fill_scalar_int_dtype(mojo_device: str, call_checker: CallChecker):
     """self is int64: falls back to the generic WhereSelect route."""
     call_checker.register(aten_functions.aten_masked_fill)
