@@ -1273,15 +1273,23 @@ def test_log2_domain(mojo_gpu: str, dtype: torch.dtype):
 
 @pytest.mark.parametrize("op", [torch.log, torch.log2])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_log_subnormal_inputs(mojo_gpu: str, op: Callable, dtype: torch.dtype):
+def test_log_subnormal_inputs(
+    mojo_gpu: str, op: Callable[[torch.Tensor], torch.Tensor], dtype: torch.dtype
+):
     skip_if_metal(mojo_gpu, "Apple GPUs flush subnormal inputs to zero, as MPS does")
-    tiny = torch.finfo(torch.float32).tiny
-    data = torch.tensor(
-        [1e-40, 1.4e-45, tiny / 2, tiny * (1 - 2**-23), tiny, tiny * 2, 1e-30]
-    ).to(dtype)
+    # Smallest and largest subnormal, the smallest normal and its successor,
+    # built from bits so bf16 gets its own boundaries rather than rounded ones.
+    if dtype == torch.float32:
+        bits = torch.tensor([0x1, 0x2, 0x400000, 0x7FFFFF, 0x800000, 0x800001])
+        positive = bits.to(torch.int32).view(torch.float32)
+    else:
+        bits = torch.tensor([0x1, 0x2, 0x40, 0x7F, 0x80, 0x81])
+        positive = bits.to(torch.int16).view(torch.bfloat16)
+    # Negative subnormals must give NaN, not the -inf of a flushed zero.
+    data = torch.cat((positive, -positive, torch.tensor([1e-30, 1.0]).to(dtype)))
     rtol, atol = _tol(dtype)
     torch.testing.assert_close(
-        op(data.to(mojo_gpu)).cpu(), op(data), rtol=rtol, atol=atol
+        op(data.to(mojo_gpu)).cpu(), op(data), rtol=rtol, atol=atol, equal_nan=True
     )
 
 

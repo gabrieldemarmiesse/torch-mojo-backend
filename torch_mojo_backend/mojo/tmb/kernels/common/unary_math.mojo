@@ -374,13 +374,16 @@ def _lift_subnormal[
 ](a: SIMD[dtype, width]) -> Tuple[SIMD[dtype, width], SIMD[dtype, width]]:
     """`(x, s)` with `log2(a) = log2(x) - s`, `x` never a float32 subnormal.
 
-    std.math's NVIDIA float32 log2 (and log, which is `ln2 * log2`) is
-    `lg2.approx.ftz.f32`, which flushes a subnormal input to zero and returns
-    -inf. Scaling by 2^24 is exact and lifts every subnormal into the normal
-    range; `s` is 0 for every other input, so their results do not change.
+    std.math's float32 log2/log mishandle subnormal inputs on GPUs: NVIDIA's
+    is `lg2.approx.ftz.f32` (log is `ln2 * log2`), which flushes them to
+    zero and returns -inf; AMD's log2 is `llvm.amdgcn.log`, which has no
+    subnormal support, and its log reads the exponent bits without
+    normalizing. Scaling by 2^24 is exact and lifts every subnormal, of either
+    sign, into the normal range; `s` is 0 for every other input, so their
+    results do not change.
     """
-    comptime if is_nvidia_gpu() and dtype == DType.float32:
-        var tiny = a.gt(0) & a.lt(1.17549435e-38)  # FLT_MIN = 2^-126
+    comptime if (is_nvidia_gpu() or is_amd_gpu()) and dtype == DType.float32:
+        var tiny = a.ne(0) & abs(a).lt(1.17549435e-38)  # FLT_MIN = 2^-126
         return (
             tiny.select(a * 16777216.0, a),
             tiny.select(SIMD[dtype, width](24), SIMD[dtype, width](0)),
