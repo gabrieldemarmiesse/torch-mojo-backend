@@ -11,16 +11,19 @@ it differs (`_stock_cast`), and, for the GEMMs, a float64 product of the
 dequantized operands.
 """
 
+import functools
 import itertools
 import json
+import math
 import pathlib
 import re
+from typing import Any
 
 import pytest
 import torch
 from torch.nn.functional import ScalingType, SwizzleType
 
-from tests.native.conftest import is_metal
+from tests.native.conftest import is_metal, require_stock_cuda
 from torch_mojo_backend.native import device_module
 
 FP8 = [
@@ -754,7 +757,8 @@ def test_nan_reads_as_true_and_unequal(mojo_device, dtype):
 
 
 # ---------------------------------------------------------------------------
-# review regressions
+# compares with scalars, complex and CPU 0-d tensors; scatter / fill
+# declines; scaled-mm scales, bounds and outputs
 # ---------------------------------------------------------------------------
 
 
@@ -1075,7 +1079,7 @@ def test_scaled_grouped_mm_offs_stride(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# review round 3
+# promotion, cross-device casts, scaled-mm bias and device checks
 # ---------------------------------------------------------------------------
 
 
@@ -1218,7 +1222,8 @@ def test_float8_index_reduce_and_nonzero_declined(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# review round 4
+# CPU 0-d conversion order, empty-index scatter, scaled-mm scale shapes
+# and bias strides
 # ---------------------------------------------------------------------------
 
 
@@ -1305,7 +1310,8 @@ def test_float8_promotion_error_names_dimensioned_first(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# PR review
+# refusals naming CUDA's kernels and what is checked before them; masked
+# assignment; float8 to integer conversions
 # ---------------------------------------------------------------------------
 
 
@@ -1671,7 +1677,7 @@ def test_float8_take_out_checks_before_refusal(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# scaled-mm PR review
+# scaled-mm out aliasing and block scales; grouped-mm edge cases
 # ---------------------------------------------------------------------------
 
 
@@ -1754,7 +1760,8 @@ def test_scaled_grouped_mm_requires_e4m3fn(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# scaled-mm PR review, round 2
+# scaled-mm scale lists and refusals; foreach copy; scalar ops, clamp and
+# the out= check order
 # ---------------------------------------------------------------------------
 
 
@@ -2448,18 +2455,49 @@ def test_float8_cpu_0d_operands_match_cuda(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# TensorIterator's pre-dispatch sequence (tmb/ops/f8_iter.mojo), op by op:
-# every unary / binary / comparison / logical op against stock CUDA in each
-# float8 situation -- float8 self / other / out, 0-d and CPU 0-d operands,
-# fresh / empty / wrong-dtype / partially and internally overlapping outs.
-# float8_elementwise_cuda.json holds the lines measured on stock CUDA (torch
-# 2.11 / H100) with exactly the generator below.
+# Stock-CUDA fixtures. TensorIterator's pre-dispatch sequence
+# (tmb/ops/f8_iter.mojo) and the per-op rules around it, case by case
+# against stock CUDA: float8_elementwise_cuda.json holds every unary /
+# binary / comparison / logical op in each float8 situation (float8 self /
+# other / out, 0-d and CPU 0-d operands, fresh / empty / wrong-dtype /
+# partially and internally overlapping outs), one group per op;
+# float8_iter_cuda.json the per-op dtype rules, the backward ops, the
+# activations, ldexp, threshold, rsub / pow / alpha and out= validation,
+# one group per topic (`_ITER_GROUPS`).
+#
+# Both files are what the generators below produce on stock CUDA torch
+# (2.11, H100), as
+#   "cases": {group: {case id: outcome}}. A case id names the op, its
+#     variant, operands, scalars and out= ("rsub/x8/S2/alpha=1",
+#     "threshold_backward/fn/f8_0d,f32"). An outcome is the result,
+#     {"dtype", "shape", "values"} ("bytes", the bit patterns, for a float8
+#     result; a non-finite float as "nan" / "inf" / "-inf", a complex as
+#     [re, im]), or the error, {"error", "message"} (its first line, cut
+#     short), plus what else the case records: "out", the out= tensor's
+#     dtype and shape after the call (for out_validation, also where its
+#     storage lives, "host" / "dev", and the tensor it is a view of), and
+#     "mutated", a watched input that changed, as it ended.
+#   "known_differences": {case id: {"mojo": outcome, "reason": why}}, where
+#     the mojo device differs from stock CUDA for a reason that is not
+#     float8's (each reproduces with float32 operands); the mojo device is
+#     held to the recorded mojo outcome there.
+#   "torch_2_14_overrides": {case id: outcome}, where torch 2.14's source
+#     changes what the installed 2.11 prints; the mojo device follows 2.14.
+# Each test builds one group on the mojo device and asserts that the dict of
+# mismatching case ids, {id: {"got": ..., "want": ...}}, is empty.
+#
+# To rewrite both files from stock CUDA torch (the "cases" only: the other
+# two sections are kept as they are), on a machine with an NVIDIA GPU:
+#   uv run python -c "from tests.native.test_float8 import write_float8_cuda_json; write_float8_cuda_json()"
+# The *_regenerates_on_stock_cuda tests check that the files still match.
 # ---------------------------------------------------------------------------
 
-_F8_MATRIX = json.loads(
-    (pathlib.Path(__file__).parent / "float8_elementwise_cuda.json").read_text()
-)
-_MATRIX_UNARY = {
+# a case's outcome, and a group's cases, as JSON
+Outcome = dict[str, Any]
+Cases = dict[str, Outcome]
+_EW_JSON = pathlib.Path(__file__).parent / "float8_elementwise_cuda.json"
+_ITER_JSON = pathlib.Path(__file__).parent / "float8_iter_cuda.json"
+_EW_UNARY = (
     "abs", "neg", "sign", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
     "sqrt", "rsqrt", "sin", "cos", "tan", "sinh", "cosh", "tanh", "asin", "acos",
     "atan", "asinh", "acosh", "atanh", "sigmoid", "erf", "erfc", "erfinv",
@@ -2467,58 +2505,187 @@ _MATRIX_UNARY = {
     "isnan", "isinf", "isfinite", "signbit", "bitwise_not", "logical_not", "sgn",
     "lgamma", "digamma", "i0", "square", "relu", "angle", "positive", "deg2rad",
     "rad2deg", "fix",
-}  # fmt: skip
+)  # fmt: skip
+_EW_BINARY = (
+    "add", "sub", "mul", "div", "true_divide", "floor_divide", "remainder",
+    "fmod", "pow", "atan2", "hypot", "copysign", "maximum", "minimum", "fmax",
+    "fmin", "eq", "ne", "lt", "le", "gt", "ge", "logical_and", "logical_or",
+    "logical_xor", "bitwise_and", "bitwise_or", "bitwise_xor", "nextafter",
+    "xlogy", "ldexp", "logaddexp", "logaddexp2", "heaviside", "igamma",
+    "float_power",
+)  # fmt: skip
 
 
-def _mx_enc(t):
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _json_value(v):
+    """A `tolist()` value as JSON: a non-finite float as its name, a complex
+    as [re, im]."""
+    if isinstance(v, list):
+        return [_json_value(x) for x in v]
+    if isinstance(v, complex):
+        return [_json_value(v.real), _json_value(v.imag)]
+    if isinstance(v, float) and not math.isfinite(v):
+        return str(v)
+    return v
+
+
+def _state(t) -> Outcome:
+    """A tensor (or a tuple of them, or another value) as JSON; a float8
+    tensor by its bit patterns."""
+    if isinstance(t, tuple):
+        return {"tuple": [_state(x) for x in t]}
     if not isinstance(t, torch.Tensor):
-        return repr(t)[:40]
-    v = t.view(torch.uint8) if t.dtype in FP8 else t
-    return f"{str(t.dtype)[6:]}{tuple(t.shape)}{v.cpu().tolist()}"
+        return {"value": repr(t)[:40]}
+    state = {"dtype": _dtype_name(t.dtype), "shape": list(t.shape)}
+    if t.dtype in FP8:
+        state["bytes"] = t.view(torch.uint8).cpu().tolist()
+    else:
+        state["values"] = _json_value(t.cpu().tolist())
+    return state
 
 
-def _mx_res(fn, out=None, inp=()):
-    before = [_mx_enc(i) for i in inp]
+def _dev_free(s):
+    return s.replace("cuda:0", "DEV").replace("mojo:0", "DEV")
+
+
+def _outcome(fn, out=None, watch=(), *, limit=100) -> Outcome:
+    """What `fn()` does: its result or its error (the message's first line,
+    device names as DEV, cut at `limit` characters), the `out` tensor after
+    it, and the `watch`ed tensors if it changed them."""
+    before = [_state(w) for w in watch]
     try:
-        s = "OK " + _mx_enc(fn())
+        outcome = _state(fn())
     except Exception as e:  # noqa: BLE001 -- the outcome itself is compared
-        msg = str(e).split("\n")[0].split(" [aten")[0][:90]
-        s = type(e).__name__ + " " + msg
+        message = _dev_free(str(e).split("\n")[0].split(" [aten")[0])
+        outcome = {"error": type(e).__name__, "message": message[:limit]}
     if out is not None:
-        s += f" | out={str(out.dtype)[6:]}{tuple(out.shape)}"
-    if [_mx_enc(i) for i in inp] != before:
-        s += " | INPUT MUTATED"
-    return s
+        outcome["out"] = {"dtype": _dtype_name(out.dtype), "shape": list(out.shape)}
+    after = [_state(w) for w in watch]
+    if after != before:
+        outcome["mutated"] = after
+    return outcome
 
 
-def _mx_unary(name, dev):
+def _collect(pairs) -> Cases:
+    """(case id, outcome) pairs as a dict; a case id is unique."""
+    cases = {}
+    for key, outcome in pairs:
+        assert key not in cases, f"duplicate case id {key!r}"
+        cases[key] = outcome
+    return cases
+
+
+_FLOAT_LIT = re.compile(r"-?\d+\.\d+(?:e[+-]?\d+)?|-?\d+e[+-]?\d+")
+
+
+def _hw_free(v):
+    """An outcome with its non-float8 float values (and the float literals of
+    its messages) rounded to 5 significant digits and signed zeros folded:
+    transcendental results (and the sign of a zero computed as a difference)
+    may differ in the last ulp between GPU generations (H100 vs L4). float8
+    values compare exactly, as bytes."""
+    if isinstance(v, dict):
+        return {k: _hw_free(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_hw_free(x) for x in v]
+    if isinstance(v, float):
+        return float(format(v + 0.0, ".5g"))
+    if isinstance(v, str):
+        return _FLOAT_LIT.sub(lambda m: format(float(m.group()) + 0.0, ".5g"), v)
+    return v
+
+
+_NO_F64 = "float64 is not supported on Apple GPU"
+
+
+def _metal_lacks_f64(device: str | None, got: Outcome, want: Outcome) -> bool:
+    """A case whose stock CUDA outcome is a float64 tensor (or names
+    float64), declined on an Apple GPU for want of float64 (an explicit
+    capability decline, not a difference)."""
+    return (
+        device is not None
+        and is_metal(device)
+        and _NO_F64 in got.get("message", "")
+        and (want.get("dtype") == "float64" or "float64" in want.get("message", ""))
+    )
+
+
+def _mismatches(
+    got: Cases, want: Cases, fixture: dict[str, Any], device: str | None = None
+) -> dict[str, dict[str, Outcome]]:
+    """{case id: {"got", "want"}} for every case of `got` (the mojo device)
+    that differs from `want` (stock CUDA), with the fixture's known
+    differences and torch-2.14 overrides applied. Neither may be empty: a
+    generator that yields nothing must not pass."""
+    assert want, "an empty group compares nothing"
+    assert list(got) == list(want)
+    known = fixture.get("known_differences", {})
+    v214 = fixture.get("torch_2_14_overrides", {})
+    bad = {}
+    for key, w in want.items():
+        w = known[key]["mojo"] if key in known else v214.get(key, w)
+        g = got[key]
+        if not _metal_lacks_f64(device, g, w) and _hw_free(g) != _hw_free(w):
+            bad[key] = {"got": g, "want": w}
+    return bad
+
+
+def _regenerated_mismatches(got: Cases, want: Cases) -> dict[str, dict[str, Outcome]]:
+    """{case id: {"got", "want"}} for every case stock CUDA (`got`) no longer
+    produces as recorded (`want`), up to the last-ulp rounding of
+    `_hw_free` (the recording is an H100's; CI's GPUs are L4s). Neither may
+    be empty."""
+    assert got, "the generator yields no case"
+    assert list(got) == list(want)
+    return {
+        key: {"got": got[key], "want": w}
+        for key, w in want.items()
+        if _hw_free(got[key]) != _hw_free(w)
+    }
+
+
+@functools.cache
+def _fixture(path: pathlib.Path) -> dict[str, Any]:
+    return json.loads(path.read_text())
+
+
+def _ew_unary(name, dev):
     f = getattr(torch, name)
     f8 = torch.float8_e4m3fn
 
     def mk(vals):
         return torch.tensor(vals).to(f8).to(dev)
 
+    def res(fn, out=None, watch=()):
+        return _outcome(fn, out, watch, limit=90)
+
     a = mk([1.0, 2.0])
-    yield f"{name} fn {_mx_res(lambda: f(a))}"
+    yield f"{name}/fn", res(lambda: f(a))
     for odt in (f8, torch.float32, torch.int32, torch.bool):
         o = torch.empty(0, dtype=odt, device=dev)
-        yield f"{name} out_empty {str(odt)[6:]} {_mx_res(lambda: f(a, out=o), o)}"
+        yield f"{name}/out_empty/{_dtype_name(odt)}", res(lambda: f(a, out=o), o)
     o = torch.empty(2, dtype=f8, device=dev)
-    yield f"{name} out_fresh {_mx_res(lambda: f(a, out=o), o)}"
+    yield f"{name}/out_fresh", res(lambda: f(a, out=o), o)
     b = mk([1.0, 2.0, 3.0, 4.0])
     o = b[1:]
-    yield f"{name} out_partial_overlap {_mx_res(lambda: f(b[:2], out=o), o, (b,))}"
+    yield f"{name}/out_partial_overlap", res(lambda: f(b[:2], out=o), o, (b,))
     o = torch.empty(1, dtype=f8, device=dev).expand(2)
-    yield f"{name} out_internal_overlap {_mx_res(lambda: f(a, out=o), o)}"
-    yield f"{name} fn_0d {_mx_res(lambda: f(mk(1.0)))}"
+    yield f"{name}/out_internal_overlap", res(lambda: f(a, out=o), o)
+    yield f"{name}/fn_0d", res(lambda: f(mk(1.0)))
 
 
-def _mx_binary(name, dev):
+def _ew_binary(name, dev):
     f = getattr(torch, name)
     f8 = torch.float8_e4m3fn
 
     def mk(vals, dt):
         return torch.tensor(vals).to(dt).to(dev)
+
+    def res(fn, out=None, watch=()):
+        return _outcome(fn, out, watch, limit=90)
 
     a8, a32 = mk([1.0, 2.0], f8), mk([1.0, 2.0], torch.float32)
     z8, z32 = mk(2.0, f8), mk(2.0, torch.float32)
@@ -2529,203 +2696,122 @@ def _mx_binary(name, dev):
         "f8_cpu0d8": (a8, torch.tensor(2.0).to(f8)),
     }  # fmt: skip
     for k, (x, y) in combos.items():
-        yield f"{name} fn {k} {_mx_res(lambda: f(x, y))}"
+        yield f"{name}/fn/{k}", res(lambda: f(x, y))
     for odt in (f8, torch.float32, torch.int32, torch.bool):
         o = torch.empty(0, dtype=odt, device=dev)
-        res = _mx_res(lambda: f(a8, a8, out=o), o)
-        yield f"{name} out_empty_f8f8 {str(odt)[6:]} {res}"
+        yield (
+            f"{name}/out_empty_f8f8/{_dtype_name(odt)}",
+            res(lambda: f(a8, a8, out=o), o),
+        )
     o = torch.empty(0, dtype=f8, device=dev)
-    yield f"{name} out_empty_f32f32_to_f8 {_mx_res(lambda: f(a32, a32, out=o), o)}"
+    yield f"{name}/out_empty_f32f32_to_f8", res(lambda: f(a32, a32, out=o), o)
     b = mk([1.0, 2.0, 3.0, 4.0], f8)
     o = b[1:]
-    res = _mx_res(lambda: f(b[:2], a8, out=o), o, (b,))
-    yield f"{name} out_partial_overlap {res}"
+    yield f"{name}/out_partial_overlap", res(lambda: f(b[:2], a8, out=o), o, (b,))
     o = torch.empty(1, dtype=f8, device=dev).expand(2)
-    yield f"{name} out_internal_overlap {_mx_res(lambda: f(a8, a8, out=o), o)}"
+    yield f"{name}/out_internal_overlap", res(lambda: f(a8, a8, out=o), o)
 
 
-_F8_ITER = json.loads(
-    (pathlib.Path(__file__).parent / "float8_iter_cuda.json").read_text()
-)
-# Lines where the mojo device differs from stock CUDA for reasons that are
-# not float8's (each reproduces with float32 operands): CUDA's per-op
-# dispatcher device check ("got self is on cuda:0, different from other
-# tensors on cpu (when checking argument in method wrapper_CUDA_...)") for a
-# CPU operand or out of an op without CPU scalars (logaddexp, nextafter,
-# igamma, the backward ops, silu / mish / glu out=); sigmoid/tanh_backward's
-# -0.0 where CUDA has 0.0; silu's last float32 bit; and the "aten::mul:"
-# prefix of a decomposed backward op's cast error.
-_KNOWN = set(_F8_ITER["known_differences"])
+def _ew_cases(op: str, dev: str) -> Cases:
+    return _collect((_ew_unary if op in _EW_UNARY else _ew_binary)(op, dev))
 
 
-# The JSON holds what the installed stock CUDA torch (2.11) prints; where
-# torch 2.14's source changes the outcome, the mojo device follows 2.14 and
-# this maps the measured line to the 2.14 one (ldexp's _ldexp_int_exponent
-# fast path also wants out.dtype == self.dtype since 2.14; otherwise the
-# fallback's _pow2 meets the float8 promotion error, out untouched).
-_V214 = _F8_ITER["torch_2_14_overrides"]
-
-
-_FLOAT_LIT = re.compile(r"-?\d+\.\d+(?:e[+-]?\d+)?|-?\d+e[+-]?\d+")
-
-
-def _hw_free(line):
-    """A line with its non-float8 float values rounded to 5 significant
-    digits and signed zeros folded: transcendental results (and the sign of
-    a zero computed as a difference) may differ in the last ulp between GPU
-    generations (H100 vs L4). float8 values compare exactly as bytes."""
-    return _FLOAT_LIT.sub(lambda m: format(float(m.group()) + 0.0, ".5g"), line)
-
-
-_NO_F64 = "float64 is not supported on Apple GPU"
-
-
-def _metal_lacks_f64(device: str | None, got: str, want: str) -> bool:
-    """A line whose stock CUDA outcome is a float64 tensor, declined on an
-    Apple GPU for want of float64 (an explicit capability decline, not a
-    difference)."""
-    return (
-        device is not None
-        and is_metal(device)
-        and _NO_F64 in got
-        and "float64" in want.split(" | ")[0]
-    )
-
-
-def _compare(got, want, device: str | None = None):
-    """`got` against stock CUDA's `want` line for line. With `device`, a
-    float64 result an Apple GPU declines (`_metal_lacks_f64`) is left out."""
-    pairs = [
-        (_hw_free(g), _hw_free(_V214.get(w, w)))
-        for g, w in zip(got, want, strict=True)
-        if w not in _KNOWN and not _metal_lacks_f64(device, g, w)
-    ]
-    assert [g for g, _ in pairs] == [w for _, w in pairs]
-
-
-@pytest.mark.parametrize("op", list(_F8_MATRIX))
+@pytest.mark.parametrize("op", _EW_UNARY + _EW_BINARY)
 def test_float8_elementwise_matches_stock_cuda(mojo_device, op):
-    gen = _mx_unary if op in _MATRIX_UNARY else _mx_binary
-    _compare(list(gen(op, mojo_device)), _F8_MATRIX[op], mojo_device)
+    fixture = _fixture(_EW_JSON)
+    want = fixture["cases"][op]
+    assert _mismatches(_ew_cases(op, mojo_device), want, fixture, mojo_device) == {}
 
 
-_R9_CUDA = [
-    'pow_0d8_f32 OK float32(2,)[8.0, 8.0]',
-    'pow_tt_out_torch.float8_e4m3fn NotImplementedError "pow_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'pow_tt_out_torch.float32 NotImplementedError "pow_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    "pow_tt_out_torch.int32 RuntimeError result type Float8_e4m3fn can't be cast to the desired output type Int | out=(0,)",
-    'gt_out_torch.float32 NotImplementedError "compare_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'gt_out_torch.bool NotImplementedError "compare_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_and_out_torch.float32 NotImplementedError "logical_and_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_and_out_torch.bool NotImplementedError "logical_and_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_or_out_torch.float32 NotImplementedError "logical_or_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_or_out_torch.bool NotImplementedError "logical_or_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_xor_out_torch.float32 NotImplementedError "logical_xor_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_xor_out_torch.bool NotImplementedError "logical_xor_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'neg_overlap RuntimeError unsupported operation: some elements of the input tensor and the written-to tensor refer to a single | out=(3,)',
-    'exp_overlap RuntimeError unsupported operation: some elements of the input tensor and the written-to tensor refer to a single | out=(3,)',
-    'nan_to_num_overlap RuntimeError unsupported operation: some elements of the input tensor and the written-to tensor refer to a single | out=(3,)',
-    'lt_cpu0d_out NotImplementedError "compare_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'maximum_e5out NotImplementedError "max_elementwise_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
-    'bitand_e5out NotImplementedError "bitwise_and_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
-    'clamp_tmin_e5out NotImplementedError "max_elementwise_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
-    'minimum_e5out NotImplementedError "min_elementwise_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
-    'pow_int_f8 RuntimeError Promotion for Float8 Types is not supported, attempted to promote Int and Float8_e4m3fn',
-    'pow_bool_f8 RuntimeError Promotion for Float8 Types is not supported, attempted to promote Bool and Float8_e4m3fn',
-    'isclose_tol NotImplementedError "mul_cuda" not implemented for \'Float8_e4m3fn\'',
-    'isclose_tol_cpu0d NotImplementedError "mul_cpu_reduced_float" not implemented for \'Float8_e4m3fn\'',
-    'div_floor NotImplementedError "div_floor_cuda" not implemented for \'Float8_e4m3fn\'',
-    'div_trunc NotImplementedError "div_trunc_cuda" not implemented for \'Float8_e4m3fn\'',
-    'div_floor_out NotImplementedError "div_floor_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-]  # fmt: skip
-
-
-def _r9_lines(dev):
+def _out_dtype_dispatch_cases(dev):
+    """Which kernel a float8 refusal names, and what comes before it: pow /
+    comparison / logical outs of other dtypes, a float8_e5m2 out of e4m3fn
+    operands, an out partially overlapping the input, a CPU 0-d operand,
+    integral and bool bases, isclose's tolerance arithmetic, div's rounding
+    modes."""
     f8, e5 = torch.float8_e4m3fn, torch.float8_e5m2
-
-    def run(name, fn, out=None):
-        try:
-            s = "OK " + _mx_enc(fn())
-        except Exception as e:  # noqa: BLE001 -- the outcome itself is compared
-            s = type(e).__name__ + " " + str(e).split("\n")[0].split(" [aten")[0][:100]
-        if out is not None:
-            s += f" | out={tuple(out.shape)}"
-        return f"{name} {s}"
-
     x = torch.tensor([1.0, 2.0]).to(f8).to(dev)
     base = torch.tensor(2.0).to(f8).to(dev)
-    yield run("pow_0d8_f32", lambda: torch.pow(base, torch.full((2,), 3.0, device=dev)))
+    yield (
+        "pow/f8_0d,f32",
+        _outcome(lambda: torch.pow(base, torch.full((2,), 3.0, device=dev))),
+    )
     for odt in (f8, torch.float32, torch.int32):
         o = torch.empty(0, dtype=odt, device=dev)
-        yield run(f"pow_tt_out_{odt}", lambda: torch.pow(x, x, out=o), o)
+        yield (
+            f"pow/f8,f8/out={_dtype_name(odt)}",
+            _outcome(lambda: torch.pow(x, x, out=o), o),
+        )
     for fn in ("gt", "logical_and", "logical_or", "logical_xor"):
         for odt in (torch.float32, torch.bool):
             o = torch.empty(0, dtype=odt, device=dev)
-            yield run(f"{fn}_out_{odt}", lambda: getattr(torch, fn)(x, x, out=o), o)
+            yield (
+                f"{fn}/f8,f8/out={_dtype_name(odt)}",
+                _outcome(lambda: getattr(torch, fn)(x, x, out=o), o),
+            )
     a = torch.ones(4).to(f8).to(dev)
     for fn in ("neg", "exp", "nan_to_num"):
         o = a[1:]
-        yield run(f"{fn}_overlap", lambda: getattr(torch, fn)(a[:2], out=o), o)
+        yield (
+            f"{fn}/f8/out=partial_overlap",
+            _outcome(lambda: getattr(torch, fn)(a[:2], out=o), o),
+        )
     o = torch.empty(0, dtype=torch.bool, device=dev)
-    yield run("lt_cpu0d_out", lambda: torch.lt(x, torch.tensor(1.5), out=o), o)
+    yield (
+        "lt/f8,cpu0d_f32/out=bool",
+        _outcome(lambda: torch.lt(x, torch.tensor(1.5), out=o), o),
+    )
     for name, f in [
-        ("maximum", lambda o: torch.maximum(x, x, out=o)),
-        ("bitand", lambda o: torch.bitwise_and(x, x, out=o)),
-        ("clamp_tmin", lambda o: torch.clamp(x, min=x, out=o)),
-        ("minimum", lambda o: torch.minimum(x, x, out=o)),
+        ("maximum/f8,f8", lambda o: torch.maximum(x, x, out=o)),
+        ("bitwise_and/f8,f8", lambda o: torch.bitwise_and(x, x, out=o)),
+        ("clamp/f8,min=f8", lambda o: torch.clamp(x, min=x, out=o)),
+        ("minimum/f8,f8", lambda o: torch.minimum(x, x, out=o)),
     ]:
         o = torch.empty(0, dtype=e5, device=dev)
-        yield run(f"{name}_e5out", lambda: f(o), o)
+        yield f"{name}/out=float8_e5m2", _outcome(lambda: f(o), o)
     ones_i = torch.ones(2, dtype=torch.int32, device=dev)
-    yield run("pow_int_f8", lambda: torch.pow(ones_i, x))
+    yield "pow/i32,f8", _outcome(lambda: torch.pow(ones_i, x))
     ones_b = torch.ones(2, dtype=torch.bool, device=dev)
-    yield run("pow_bool_f8", lambda: torch.pow(ones_b, x))
-    yield run("isclose_tol", lambda: torch.isclose(x, x))
-    yield run("isclose_tol_cpu0d", lambda: torch.isclose(x, torch.tensor(1.0).to(f8)))
-    yield run("div_floor", lambda: torch.div(x, x, rounding_mode="floor"))
-    yield run("div_trunc", lambda: torch.div(x, x, rounding_mode="trunc"))
+    yield "pow/bool,f8", _outcome(lambda: torch.pow(ones_b, x))
+    yield "isclose/f8,f8", _outcome(lambda: torch.isclose(x, x))
+    yield (
+        "isclose/f8,cpu0d_f8",
+        _outcome(lambda: torch.isclose(x, torch.tensor(1.0).to(f8))),
+    )
+    for mode in ("floor", "trunc"):
+        yield (
+            f"div/f8,f8/rounding_mode={mode}",
+            _outcome(lambda: torch.div(x, x, rounding_mode=mode)),
+        )
     o = torch.empty(0, dtype=f8, device=dev)
-    yield run("div_floor_out", lambda: torch.div(x, x, rounding_mode="floor", out=o), o)
+    yield (
+        "div/f8,f8/rounding_mode=floor/out=float8_e4m3fn",
+        _outcome(lambda: torch.div(x, x, rounding_mode="floor", out=o), o),
+    )
 
 
-def test_float8_review_items_match_stock_cuda(mojo_device):
-    assert list(_r9_lines(mojo_device)) == _R9_CUDA
+def _operands(dev):
+    """The operands of the dtype-rule and backward cases, by name."""
+    f8 = torch.float8_e4m3fn
+    return {
+        "f8_0d": lambda: torch.tensor(0.5).to(f8).to(dev),
+        "f8": lambda: torch.tensor([0.5, 1.0]).to(f8).to(dev),
+        "f32": lambda: torch.tensor([1.0, 2.0], device=dev),
+        "f32_0d": lambda: torch.tensor(0.5, device=dev),
+    }
 
 
-def _r10_res(fn, out=None, watch=()):
-    before = [_r10_enc(w) for w in watch]
-    try:
-        s = "OK " + _r10_enc(fn())
-    except Exception as e:  # noqa: BLE001 -- the outcome itself is compared
-        s = type(e).__name__ + " " + str(e).split("\n")[0].split(" [aten")[0][:100]
-    if out is not None:
-        s += f" | out={str(out.dtype)[6:]}{tuple(out.shape)}"
-    if [_r10_enc(w) for w in watch] != before:
-        s += " | MUTATED " + ",".join(_r10_enc(w) for w in watch)
-    return s
-
-
-def _r10_enc(t):
-    if isinstance(t, tuple):
-        return "(" + ",".join(_r10_enc(x) for x in t) + ")"
-    return _mx_enc(t)
-
-
-def _r10_lines(dev):
-    """Per-op dtype rules beyond TensorIterator's default (lerp,
-    log_sigmoid_backward's buffer, the backward ops, addcmul/addcdiv,
-    where, clamp with tensors) and an out= aliasing an input element."""
+def _operand_dtype_rule_cases(dev):
+    """Per-op dtype rules beyond TensorIterator's default (lerp, addcmul /
+    addcdiv, where, clamp with tensors, log_sigmoid_backward's buffer, the
+    two-operand backward ops) over operand combinations and out dtypes, and
+    the special polynomials' float8 out."""
     f8, a = torch.float8_e4m3fn, torch.ops.aten
 
     def t(vals, dt):
         return torch.tensor(vals).to(dt).to(dev)
 
-    k = {
-        "f8_0d": lambda: t(0.5, f8),
-        "f8": lambda: t([0.5, 1.0], f8),
-        "f32": lambda: t([1.0, 2.0], torch.float32),
-        "f32_0d": lambda: t(0.5, torch.float32),
-    }
+    k = _operands(dev)
     mask = torch.tensor([True, False], device=dev)
     ops3 = {
         "lerp.Tensor": torch.lerp,
@@ -2742,7 +2828,7 @@ def _r10_lines(dev):
     ]  # fmt: skip
     for name, f in ops3.items():
         for c in combos3:
-            yield f"{name} {'/'.join(c)} " + _r10_res(lambda: f(*[k[x]() for x in c]))
+            yield f"{name}/{','.join(c)}", _outcome(lambda: f(*[k[x]() for x in c]))
     ops2 = {
         "lerp.Scalar": lambda x, y: torch.lerp(x, y, 0.5),
         "sigmoid_backward": a.sigmoid_backward,
@@ -2766,53 +2852,77 @@ def _r10_lines(dev):
     ]  # fmt: skip
     for name, f in ops2.items():
         for c in combos2:
-            yield f"{name} {'/'.join(c)} " + _r10_res(lambda: f(*[k[x]() for x in c]))
+            yield f"{name}/{','.join(c)}", _outcome(lambda: f(*[k[x]() for x in c]))
     y, w8 = t([1.0, 2.0], torch.float32), t(0.5, f8)
     for odt in (torch.float16, torch.float32, f8):
+        dn = _dtype_name(odt)
         o = torch.empty(0, dtype=odt, device=dev)
-        r = _r10_res(lambda: torch.lerp(y, y, w8, out=o), o)
-        yield f"lerp_w8_out {str(odt)[6:]} {r}"
+        yield f"lerp_w8_out/{dn}", _outcome(lambda: torch.lerp(y, y, w8, out=o), o)
         o = torch.empty(0, dtype=odt, device=dev)
-        r = _r10_res(lambda: torch.lerp(y, y, 0.5, out=o), o)
-        yield f"lerp_s_out {str(odt)[6:]} {r}"
+        yield f"lerp_s_out/{dn}", _outcome(lambda: torch.lerp(y, y, 0.5, out=o), o)
         o = torch.empty(0, dtype=odt, device=dev)
         x8 = t([1.0, 2.0], f8)
-        r = _r10_res(lambda: torch.lerp(x8, x8, 0.5, out=o), o)
-        yield f"lerp_f8f8_out {str(odt)[6:]} {r}"
+        yield f"lerp_f8f8_out/{dn}", _outcome(lambda: torch.lerp(x8, x8, 0.5, out=o), o)
         o = torch.empty(0, dtype=odt, device=dev)
-        r = _r10_res(lambda: torch.addcmul(y, y, w8, out=o), o)
-        yield f"addcmul_0d8_out {str(odt)[6:]} {r}"
+        yield (
+            f"addcmul_0d8_out/{dn}",
+            _outcome(lambda: torch.addcmul(y, y, w8, out=o), o),
+        )
         o = torch.empty(0, dtype=odt, device=dev)
         b8 = t([1.0, 2.0], f8)
-        r = _r10_res(lambda: a.log_sigmoid_backward(y, y, b8, grad_input=o), o)
-        yield f"lsb_out {str(odt)[6:]} {r}"
+        yield (
+            f"lsb_out/{dn}",
+            _outcome(lambda: a.log_sigmoid_backward(y, y, b8, grad_input=o), o),
+        )
         o = torch.empty(0, dtype=odt, device=dev)
-        r = _r10_res(lambda: a.sigmoid_backward(y, w8, grad_input=o), o)
-        yield f"sigb_out {str(odt)[6:]} {r}"
+        yield (
+            f"sigb_out/{dn}",
+            _outcome(lambda: a.sigmoid_backward(y, w8, grad_input=o), o),
+        )
+    ones8 = torch.ones(2, device=dev).to(f8)
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield (
+        "special.scaled_modified_bessel_k0/f8/out=float8_e4m3fn",
+        _outcome(lambda: torch.special.scaled_modified_bessel_k0(ones8, out=o), o),
+    )
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield (
+        "special.shifted_chebyshev_polynomial_t/f8,f8/out=float8_e4m3fn",
+        _outcome(
+            lambda: torch.special.shifted_chebyshev_polynomial_t(ones8, ones8, out=o), o
+        ),
+    )
+
+
+def _out_aliasing_cases(dev):
+    """An out= that is an element (or a view) of an input."""
+    f8 = torch.float8_e4m3fn
+
+    def t(vals, dt):
+        return torch.tensor(vals).to(dt).to(dev)
+
     for op in ("add", "mul", "maximum", "atan2", "lt", "logical_and", "copysign"):
         for tag, other in (("alias0d", torch.float32), ("alias0d_f8f8", f8)):
             b = t([0.5, 7.0], f8)
             x = b[0]
             yy = t([1.0, 2.0], other)
-            r = _r10_res(lambda: getattr(torch, op)(x, yy, out=x), x, (b,))
-            yield f"{tag} {op} {r}"
+            yield (
+                f"{tag}/{op}",
+                _outcome(lambda: getattr(torch, op)(x, yy, out=x), x, (b,)),
+            )
     b = t([0.5, 7.0], f8)
     x = b[0]
-    yield "alias0d_neg_view " + _r10_res(lambda: torch.neg(b, out=x), x, (b,))
+    yield "alias0d_neg_view", _outcome(lambda: torch.neg(b, out=x), x, (b,))
     b = t([0.5, 7.0, 1.0, 2.0], f8)
     x = b[:2]
-    yield "alias_view_resize " + _r10_res(lambda: torch.add(b, b, out=x), x, (b,))
+    yield "alias_view_resize", _outcome(lambda: torch.add(b, b, out=x), x, (b,))
 
 
-def _backward_lines(dev):
-    """Every elementwise backward op: operand dtype pairs and out dtypes."""
+def _backward_cases(dev):
+    """Every elementwise backward op: operand dtype pairs and out dtypes; the
+    out dtype converting every operand; the shrink backward ops."""
     f8, a = torch.float8_e4m3fn, torch.ops.aten
-    k = {
-        "f8_0d": lambda: torch.tensor(0.5).to(f8).to(dev),
-        "f8": lambda: torch.tensor([0.5, 1.0]).to(f8).to(dev),
-        "f32": lambda: torch.tensor([1.0, 2.0], device=dev),
-        "f32_0d": lambda: torch.tensor(0.5, device=dev),
-    }
+    k = _operands(dev)
     ops = {
         "threshold_backward": (
             lambda x, y: a.threshold_backward(x, y, 0.5),
@@ -2882,59 +2992,38 @@ def _backward_lines(dev):
     ]  # fmt: skip
     for name, (f, fo) in ops.items():
         for c in fn_combos:
-            r = _r10_res(lambda: f(k[c[0]](), k[c[1]]()))
-            yield f"{name} fn {'/'.join(c)} {r}"
+            yield (
+                f"{name}/fn/{','.join(c)}",
+                _outcome(lambda: f(k[c[0]](), k[c[1]]())),
+            )
         if fo is None:
             continue
         for c in (("f8", "f8"), ("f32", "f8_0d"), ("f32", "f32")):
             for odt in (f8, torch.float16, torch.float32, torch.int32):
                 o = torch.empty(0, dtype=odt, device=dev)
-                r = _r10_res(lambda: fo(k[c[0]](), k[c[1]](), o), o)
-                yield f"{name} out {'/'.join(c)} {str(odt)[6:]} {r}"
-
-
-def test_float8_iterator_rules_match_stock_cuda(mojo_device):
-    _compare(list(_r10_lines(mojo_device)), _F8_ITER["rules_and_aliasing"])
-    _compare(list(_backward_lines(mojo_device)), _F8_ITER["backward_ops"])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_float8_cuda_data_regenerates_on_stock_cuda():
-    """The JSON files are exactly what these generators print on stock CUDA
-    (torch.cuda), so the comparisons above test against the real thing."""
-    for op, want in _F8_MATRIX.items():
-        gen = _mx_unary if op in _MATRIX_UNARY else _mx_binary
-        assert list(gen(op, "cuda")) == want
-    assert list(_r10_lines("cuda")) == _F8_ITER["rules_and_aliasing"]
-    assert list(_backward_lines("cuda")) == _F8_ITER["backward_ops"]
-
-
-def _r11_lines(dev):
-    """Out-dtype dispatch converting every operand, the shrink backward ops,
-    a CPU out=, the special polynomials and ldexp's own sequence."""
-    f8, a = torch.float8_e4m3fn, torch.ops.aten
-
-    def run(name, fn, o):
-        r = _r10_res(fn).replace("cuda:0", "DEV").replace("mojo:0", "DEV")
-        return f"{name} {r} {tuple(o.shape)}"
-
+                yield (
+                    f"{name}/out/{','.join(c)}/{_dtype_name(odt)}",
+                    _outcome(lambda: fo(k[c[0]](), k[c[1]](), o), o),
+                )
+    # The out dtype converts every operand before the kernel: 0.9999 is 1.0
+    # in float16.
     g = torch.tensor(0.5).to(f8).to(dev)
     xx = torch.tensor([0.9999], device=dev)
+    y3 = torch.tensor([0.33333], device=dev)
     for odt in (torch.float16, torch.float32):
+        dn = _dtype_name(odt)
         o = torch.empty(0, dtype=odt, device=dev)
-        yield run(
-            f"hardtanh_b_{odt}",
-            lambda: a.hardtanh_backward.grad_input(g, xx, -1.0, 1.0, grad_input=o),
-            o,
+        yield (
+            f"hardtanh_backward/out/f8_0d,f32=0.9999/{dn}",
+            _outcome(
+                lambda: a.hardtanh_backward.grad_input(g, xx, -1.0, 1.0, grad_input=o),
+                o,
+            ),
         )
         o = torch.empty(0, dtype=odt, device=dev)
-        y3 = torch.tensor([0.33333], device=dev)
-        yield run(
-            f"sigmoid_b_{odt}",
-            lambda: a.sigmoid_backward.grad_input(g, y3, grad_input=o),
-            o,
+        yield (
+            f"sigmoid_backward/out/f8_0d,f32=0.33333/{dn}",
+            _outcome(lambda: a.sigmoid_backward.grad_input(g, y3, grad_input=o), o),
         )
     b = torch.tensor([1.0, 2.0], device=dev)
     x = torch.tensor([2.0, 3.0], device=dev)
@@ -2942,82 +3031,18 @@ def _r11_lines(dev):
         f = getattr(a, name)
         for odt in (f8, torch.float16):
             o = torch.empty(0, dtype=odt, device=dev)
-            yield run(f"{name}_{odt}", lambda: f.grad_input(b, x, 0.5, grad_input=o), o)
-        yield run(f"{name}_f8", lambda: f(b.to(f8), x.to(f8), 0.5), b)
+            yield (
+                f"{name}/out/f32,f32/{_dtype_name(odt)}",
+                _outcome(lambda: f.grad_input(b, x, 0.5, grad_input=o), o),
+            )
+        yield f"{name}/fn/f8,f8", _outcome(lambda: f(b.to(f8), x.to(f8), 0.5))
         g8 = torch.tensor(0.5, device=dev).to(f8)
-        yield run(f"{name}_f8_0d", lambda: f(g8, x, 0.5), b)
-    ones = torch.ones(2, device=dev)
-    for odt in (f8, torch.int32, torch.float32):
-        o = torch.empty(0, dtype=odt)
-        yield run(
-            f"add_f8_cpuout_{odt}",
-            lambda: torch.add(ones.to(f8), ones.to(f8), out=o),
-            o,
-        )
-        o = torch.empty(0, dtype=odt)
-        yield run(f"neg_f8_cpuout_{odt}", lambda: torch.neg(ones.to(f8), out=o), o)
-    o = torch.empty(0, dtype=f8)
-    yield run("add_f32_cpuout_f8", lambda: torch.add(ones, ones, out=o), o)
-    o = torch.empty(0, dtype=f8, device=dev)
-    yield run(
-        "bessel_k0_out",
-        lambda: torch.special.scaled_modified_bessel_k0(ones.to(f8), out=o),
-        o,
-    )
-    o = torch.empty(0, dtype=f8, device=dev)
-    yield run(
-        "shifted_cheb_t_out",
-        lambda: torch.special.shifted_chebyshev_polynomial_t(
-            ones.to(f8), ones.to(f8), out=o
-        ),
-        o,
-    )
-    f8v = ones.to(f8)
-    for odt in (torch.float32, torch.int32, f8):
-        o = torch.empty(0, dtype=odt, device=dev)
-        yield run(f"ldexp_f32_f8_out_{odt}", lambda: torch.ldexp(ones, f8v, out=o), o)
-        o = torch.empty(0, dtype=odt, device=dev)
-        yield run(f"ldexp_f8_f8_out_{odt}", lambda: torch.ldexp(f8v, f8v, out=o), o)
-    yield run("ldexp_inplace_f32_f8", lambda: ones.clone().ldexp_(f8v), ones)
-    x8 = torch.ones(2, 1).to(f8).to(dev)
-    y13 = torch.ones(1, 3, device=dev)
-    yield run("ldexp_inplace_shape", lambda: x8.clone().ldexp_(y13), x8)
-    yield run("ldexp_f8_f32", lambda: torch.ldexp(f8v, ones), ones)
-    z8 = torch.tensor(1.0).to(f8).to(dev)
-    yield run("ldexp_f8_0d_f32", lambda: torch.ldexp(z8, ones), ones)
-    z32 = torch.tensor(1.0, device=dev)
-    yield run("ldexp_f8_f32_0d", lambda: torch.ldexp(f8v, z32), ones)
+        yield f"{name}/fn/f8_0d,f32", _outcome(lambda: f(g8, x, 0.5))
 
 
-def test_float8_round11_shapes_match_stock_cuda(mojo_device):
-    _compare(list(_r11_lines(mojo_device)), _F8_ITER["round11"])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_float8_round11_data_regenerates_on_stock_cuda():
-    assert list(_r11_lines("cuda")) == _F8_ITER["round11"]
-
-
-def _act_res(fn, out=None):
-    try:
-        s = "OK " + _mx_enc(fn())
-    except Exception as e:  # noqa: BLE001 -- the outcome itself is compared
-        msg = str(e).split("\n")[0].split(" [aten")[0]
-        s = type(e).__name__ + " " + _dev_free(msg)[:100]
-    if out is not None:
-        s += f" | out={str(out.dtype)[6:]}{tuple(out.shape)}"
-    return s
-
-
-def _dev_free(s):
-    return s.replace("cuda:0", "DEV").replace("mojo:0", "DEV")
-
-
-def _activation_lines(dev):
-    """The forward activations (functional, out= of every dtype, in-place,
-    a CPU out=), and broadcast errors before the dispatch."""
+def _activation_cases(dev):
+    """The forward activations: functional, in-place, out= of every dtype, a
+    CPU out=; relu's bool check."""
     f8, a = torch.float8_e4m3fn, torch.ops.aten
 
     def x32():
@@ -3071,20 +3096,66 @@ def _activation_lines(dev):
         "glu": (a.glu, lambda x, o: a.glu.out(x, out=o), None),
     }
     for name, (f, fo, fi) in ops.items():
-        yield f"{name} fn f8 " + _act_res(lambda: f(x8()))
+        yield f"{name}/fn/f8", _outcome(lambda: f(x8()))
         if fi is not None:
-            yield f"{name} inplace f8 " + _act_res(lambda: fi(x8()))
+            yield f"{name}/inplace/f8", _outcome(lambda: fi(x8()))
         if fo is None:
             continue
         for src, mk in (("f8", x8), ("f32", x32)):
             for odt in (f8, torch.float16, torch.float32, torch.int32):
                 o = torch.empty(0, dtype=odt, device=dev)
-                yield f"{name} out {src} {str(odt)[6:]} " + _act_res(
-                    lambda: fo(mk(), o), o
+                yield (
+                    f"{name}/out/{src}/{_dtype_name(odt)}",
+                    _outcome(lambda: fo(mk(), o), o),
                 )
         o = torch.empty(0, dtype=f8)
-        yield f"{name} out cpu f8 " + _act_res(lambda: fo(x8(), o), o)
+        yield f"{name}/out/cpu/f8", _outcome(lambda: fo(x8(), o), o)
+    b4 = torch.ones(4, dtype=torch.bool, device=dev)
+    for odt in (f8, torch.float32):
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield (
+            f"relu/out/bool/{_dtype_name(odt)}",
+            _outcome(lambda: a.relu.out(b4, out=o), o),
+        )
+    yield "relu/fn/bool", _outcome(lambda: a.relu(b4))
+
+
+def _softshrink_check_cases(dev):
+    """softshrink_check (v2.14 source): the lambda's range for the input
+    dtype, the dispatch over floating dtypes only, the out dtype."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+    src = {
+        "f32": lambda: torch.ones(4, device=dev),
+        "f16": lambda: torch.ones(4, device=dev, dtype=torch.float16),
+        "i32": lambda: torch.ones(4, dtype=torch.int32, device=dev),
+        "bool": lambda: torch.ones(4, dtype=torch.bool, device=dev),
+    }
+    outs = [("f32", f8), ("f32", torch.float32), ("f16", f8)]
+    for lam in (-1.0, float("nan"), 1e39, 0.5):
+        for s, odt in outs:
+            o = torch.empty(0, dtype=odt, device=dev)
+            yield (
+                f"softshrink.out/{s}/lambd={lam}/out={_dtype_name(odt)}",
+                _outcome(lambda: a.softshrink.out(src[s](), lam, out=o), o),
+            )
+        yield (
+            f"softshrink/f32/lambd={lam}",
+            _outcome(lambda: a.softshrink(src["f32"](), lam)),
+        )
+    for s, odt in (("i32", f8), ("bool", f8), ("i32", torch.float32)):
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield (
+            f"softshrink.out/{s}/lambd=0.5/out={_dtype_name(odt)}",
+            _outcome(lambda: a.softshrink.out(src[s](), 0.5, out=o), o),
+        )
+    yield "softshrink/i32/lambd=0.5", _outcome(lambda: a.softshrink(src["i32"](), 0.5))
+
+
+def _broadcast_error_cases(dev):
+    """The broadcast error comes before the float8 dispatch."""
+    f8 = torch.float8_e4m3fn
     for sa, sb in (((2,), (3,)), ((2, 3), (3, 2))):
+        shapes = "x".join(map(str, sa)) + "," + "x".join(map(str, sb))
         for name in ("add", "mul", "lt", "maximum", "atan2"):
             f = getattr(torch, name)
 
@@ -3094,232 +3165,242 @@ def _activation_lines(dev):
             def tb():
                 return torch.ones(sb).to(f8).to(dev)
 
-            yield f"{name} bcast {sa} {sb} " + _act_res(lambda: f(ta(), tb()))
+            yield f"{name}/shapes={shapes}", _outcome(lambda: f(ta(), tb()))
             o = torch.empty(0, dtype=f8, device=dev)
-            yield f"{name} bcast_out {sa} {sb} " + _act_res(
-                lambda: f(ta(), tb(), out=o), o
+            yield (
+                f"{name}/shapes={shapes}/out=float8_e4m3fn",
+                _outcome(lambda: f(ta(), tb(), out=o), o),
             )
 
 
-def _r12_lines(dev):
-    """ldexp's integral-exponent iterator, TensorIterator's device order and
-    its CPU scalars."""
-    f8, e5, a = torch.float8_e4m3fn, torch.float8_e5m2, torch.ops.aten
-
-    def run(name, fn, o=None):
-        r = _act_res(fn)
-        return f"{name} {r} {tuple(o.shape) if o is not None else ''}"
-
-    x8 = torch.ones(2).to(f8).to(dev)
-    for idt in (torch.int32, torch.int64, torch.bool):
-        e = torch.ones(2, dtype=idt, device=dev)
-        yield run(f"ldexp_f8_{idt}", lambda: torch.ldexp(x8, e))
-        for odt in (f8, torch.float32):
-            o = torch.empty(0, dtype=odt, device=dev)
-            yield run(f"ldexp_f8_{idt}_out_{odt}", lambda: torch.ldexp(x8, e, out=o), o)
-    i64 = torch.ones(2, dtype=torch.int64, device=dev)
-    yield run("ldexp_inplace_i64", lambda: x8.clone().ldexp_(i64))
-    e5v = torch.ones(2).to(e5).to(dev)
-    i32 = torch.ones(2, dtype=torch.int32, device=dev)
-    yield run("ldexp_e5_i32", lambda: torch.ldexp(e5v, i32))
+def _cpu_operand_cases(dev):
+    """TensorIterator's device order and its CPU scalars: a CPU out=, a CPU
+    operand with a device out=, CPU 0-d operands."""
+    f8, a = torch.float8_e4m3fn, torch.ops.aten
+    ones8 = torch.ones(2).to(f8).to(dev)
+    ones = torch.ones(2, device=dev)
+    for odt in (f8, torch.int32, torch.float32):
+        dn = _dtype_name(odt)
+        o = torch.empty(0, dtype=odt)
+        yield (
+            f"add/f8,f8/out=cpu_{dn}",
+            _outcome(lambda: torch.add(ones8, ones8, out=o), o),
+        )
+        o = torch.empty(0, dtype=odt)
+        yield f"neg/f8/out=cpu_{dn}", _outcome(lambda: torch.neg(ones8, out=o), o)
+    o = torch.empty(0, dtype=f8)
+    yield (
+        "add/f32,f32/out=cpu_float8_e4m3fn",
+        _outcome(lambda: torch.add(ones, ones, out=o), o),
+    )
     cpu2 = torch.ones(2).to(f8)
     for odt in (torch.int64, f8):
         o = torch.empty(0, dtype=odt, device=dev)
-        yield run(f"add_cpu2_dev_out_{odt}", lambda: torch.add(cpu2, x8, out=o), o)
-    o = torch.empty(0, dtype=f8)
-    yield run("add_dev_dev_out_cpu", lambda: torch.add(x8, x8, out=o), o)
+        yield (
+            f"add/cpu_f8,f8/out={_dtype_name(odt)}",
+            _outcome(lambda: torch.add(cpu2, ones8, out=o), o),
+        )
     c0 = torch.tensor(1.0).to(f8)
     for name in ("neg", "exp"):
         o = torch.empty(0, dtype=f8, device=dev)
-        yield run(f"{name}_cpu0d_out_dev", lambda: getattr(torch, name)(c0, out=o), o)
-    yield run("hardtanh_b_cpu0d", lambda: a.hardtanh_backward(c0, x8, -1.0, 1.0))
-    yield run("softshrink_b_cpu0d", lambda: a.softshrink_backward(c0, x8, 0.5))
+        yield (
+            f"{name}/cpu0d_f8/out=float8_e4m3fn",
+            _outcome(lambda: getattr(torch, name)(c0, out=o), o),
+        )
+    yield (
+        "hardtanh_backward/cpu0d_f8,f8",
+        _outcome(lambda: a.hardtanh_backward(c0, ones8, -1.0, 1.0)),
+    )
+    yield (
+        "softshrink_backward/cpu0d_f8,f8",
+        _outcome(lambda: a.softshrink_backward(c0, ones8, 0.5)),
+    )
     for name in ("eq", "lt"):
         o = torch.empty(0, dtype=torch.bool, device=dev)
-        yield run(
-            f"{name}_two_cpu0d_out", lambda: getattr(torch, name)(c0, c0, out=o), o
+        yield (
+            f"{name}/cpu0d_f8,cpu0d_f8/out=bool",
+            _outcome(lambda: getattr(torch, name)(c0, c0, out=o), o),
         )
     o = torch.empty(0, dtype=f8, device=dev)
-    yield run("add_two_cpu0d_out", lambda: torch.add(c0, c0, out=o), o)
-    yield run("logaddexp_cpu0d", lambda: torch.logaddexp(x8, c0))
-    yield run("add_cpu0d", lambda: torch.add(x8, c0))
+    yield (
+        "add/cpu0d_f8,cpu0d_f8/out=float8_e4m3fn",
+        _outcome(lambda: torch.add(c0, c0, out=o), o),
+    )
+    yield "logaddexp/f8,cpu0d_f8", _outcome(lambda: torch.logaddexp(ones8, c0))
+    yield "add/f8,cpu0d_f8", _outcome(lambda: torch.add(ones8, c0))
 
 
-def test_float8_round12_shapes_match_stock_cuda(mojo_device):
-    _compare(list(_activation_lines(mojo_device)), _F8_ITER["activations"])
-    _compare(list(_r12_lines(mojo_device)), _F8_ITER["round12"])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_float8_round12_data_regenerates_on_stock_cuda():
-    assert list(_activation_lines("cuda")) == _F8_ITER["activations"]
-    assert list(_r12_lines("cuda")) == _F8_ITER["round12"]
-
-
-def _r13_lines(dev):
-    """Per-op iterator flags and pre-checks (v2.14 source): ldexp's
-    integral-exponent iterator, relu's bool check, threshold without
-    overlap checks (self added twice), softshrink_check's dispatch."""
-    f8, a = torch.float8_e4m3fn, torch.ops.aten
-
-    def run(name, fn, o=None):
-        return f"{name} {_act_res(fn)} | {tuple(o.shape) if o is not None else ''}"
-
-    x8 = torch.ones(2).to(f8).to(dev)
+def _ldexp_cases(dev):
+    """ldexp's own sequence: a floating exponent's pow / mul fallback, the
+    integral-exponent iterator (since torch 2.14 its fast path also wants
+    out.dtype == self.dtype), broadcasting, in place, CPU exponents."""
+    f8, e5 = torch.float8_e4m3fn, torch.float8_e5m2
+    ones = torch.ones(2, device=dev)
+    x8 = ones.to(f8)
+    for odt in (torch.float32, torch.int32, f8):
+        dn = _dtype_name(odt)
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield (
+            f"ldexp/f32,f8/out={dn}",
+            _outcome(lambda: torch.ldexp(ones, x8, out=o), o),
+        )
+        o = torch.empty(0, dtype=odt, device=dev)
+        yield f"ldexp/f8,f8/out={dn}", _outcome(lambda: torch.ldexp(x8, x8, out=o), o)
+    yield "ldexp_/f32,f8", _outcome(lambda: ones.clone().ldexp_(x8))
+    x21 = torch.ones(2, 1).to(f8).to(dev)
+    y13 = torch.ones(1, 3, device=dev)
+    yield "ldexp_/f8[2x1],f32[1x3]", _outcome(lambda: x21.clone().ldexp_(y13))
+    yield "ldexp/f8,f32", _outcome(lambda: torch.ldexp(x8, ones))
+    z8 = torch.tensor(1.0).to(f8).to(dev)
+    yield "ldexp/f8_0d,f32", _outcome(lambda: torch.ldexp(z8, ones))
+    z32 = torch.tensor(1.0, device=dev)
+    yield "ldexp/f8,f32_0d", _outcome(lambda: torch.ldexp(x8, z32))
+    for idt, iname in (
+        (torch.int32, "i32"),
+        (torch.int64, "i64"),
+        (torch.bool, "bool"),
+    ):
+        e = torch.ones(2, dtype=idt, device=dev)
+        yield f"ldexp/f8,{iname}", _outcome(lambda: torch.ldexp(x8, e))
+        odts = (f8, torch.float32) + ((torch.float16,) if iname == "i32" else ())
+        for odt in odts:
+            o = torch.empty(0, dtype=odt, device=dev)
+            yield (
+                f"ldexp/f8,{iname}/out={_dtype_name(odt)}",
+                _outcome(lambda: torch.ldexp(x8, e, out=o), o),
+            )
+    i64 = torch.ones(2, dtype=torch.int64, device=dev)
+    yield "ldexp_/f8,i64", _outcome(lambda: x8.clone().ldexp_(i64))
+    e5v = torch.ones(2).to(e5).to(dev)
+    i32 = torch.ones(2, dtype=torch.int32, device=dev)
+    yield "ldexp/e5,i32", _outcome(lambda: torch.ldexp(e5v, i32))
+    o = torch.empty(0, dtype=f8, device=dev)
+    yield (
+        "ldexp/e5,i32/out=float8_e4m3fn",
+        _outcome(lambda: torch.ldexp(e5v, i32, out=o), o),
+    )
     x1 = torch.ones(1).to(f8).to(dev)
     i3 = torch.ones(3, dtype=torch.int32, device=dev)
     o = torch.empty(0, dtype=f8, device=dev)
-    yield run("ldexp_f8_i32_bcast_out", lambda: torch.ldexp(x8, i3, out=o), o)
-    yield run("ldexp_f8_i32_bcast", lambda: torch.ldexp(x8, i3))
-    yield run(
-        "ldexp_cpu_exp", lambda: torch.ldexp(x8, torch.ones(2, dtype=torch.int32))
+    yield (
+        "ldexp/f8[2],i32[3]/out=float8_e4m3fn",
+        _outcome(lambda: torch.ldexp(x8, i3, out=o), o),
     )
-    yield run(
-        "ldexp_cpu0d_exp", lambda: torch.ldexp(x8, torch.tensor(1, dtype=torch.int32))
+    yield "ldexp/f8[2],i32[3]", _outcome(lambda: torch.ldexp(x8, i3))
+    yield (
+        "ldexp/f8,cpu_i32",
+        _outcome(lambda: torch.ldexp(x8, torch.ones(2, dtype=torch.int32))),
     )
-    yield run("ldexp_inplace_bcast", lambda: x1.clone().ldexp_(i3), x1)
+    yield (
+        "ldexp/f8,cpu0d_i32",
+        _outcome(lambda: torch.ldexp(x8, torch.tensor(1, dtype=torch.int32))),
+    )
+    yield "ldexp_/f8[1],i32[3]", _outcome(lambda: x1.clone().ldexp_(i3))
     o = torch.empty(0, dtype=f8, device=dev)
-    yield run("ldexp_out_bcast_ok", lambda: torch.ldexp(x1, i3, out=o), o)
-    b4 = torch.ones(4, dtype=torch.bool, device=dev)
-    for odt in (f8, torch.float32):
-        o = torch.empty(0, dtype=odt, device=dev)
-        yield run(f"relu_out_bool_{odt}", lambda: a.relu.out(b4, out=o), o)
-    yield run("relu_bool", lambda: a.relu(b4))
-    ones8 = torch.ones(4).to(f8).to(dev)
-    o = torch.empty(1, dtype=torch.float32, device=dev).expand(4)
-    yield run("threshold_out_expanded", lambda: a.threshold.out(ones8, 2, -2, out=o), o)
-    o = torch.empty(1, dtype=f8, device=dev).expand(4)
-    yield run(
-        "threshold_out_expanded_f8", lambda: a.threshold.out(ones8, 2, -2, out=o), o
+    yield (
+        "ldexp/f8[1],i32[3]/out=float8_e4m3fn",
+        _outcome(lambda: torch.ldexp(x1, i3, out=o), o),
     )
-    b = torch.ones(4).to(f8).to(dev)
-    yield run(
-        "threshold_out_partial", lambda: a.threshold.out(b[:2], 2, -2, out=b[1:3]), b
-    )
-    o = torch.empty(1, device=dev).expand(4)
-    yield run(
-        "threshold_b_out_expanded",
-        lambda: a.threshold_backward.grad_input(ones8, ones8, 2, grad_input=o),
-        o,
-    )
-    o = torch.empty(0, dtype=torch.float32, device=dev)
-    c0 = torch.tensor(1.0).to(f8)
-    yield run("threshold_out_cpu0d_self", lambda: a.threshold.out(c0, 2, -2, out=o), o)
-    for idt in (torch.int32, torch.bool, torch.float16):
-        o = torch.empty(0, dtype=f8, device=dev)
-        t = torch.ones(4, dtype=idt, device=dev)
-        yield run(f"softshrink_out_{idt}", lambda: a.softshrink.out(t, 0.5, out=o), o)
 
 
-def test_float8_round13_shapes_match_stock_cuda(mojo_device):
-    _compare(list(_r13_lines(mojo_device)), _F8_ITER["round13"])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_float8_round13_data_regenerates_on_stock_cuda():
-    assert list(_r13_lines("cuda")) == _F8_ITER["round13"]
-
-
-def _r14_lines(dev):
-    """threshold's iterator config (inputs promoted, kernel dispatched on the
-    out dtype, no overlap check, safe casting) for every out= shape;
-    softshrink_check's lambda range; ldexp's 2.14 fast-path condition."""
+def _threshold_out_cases(dev):
+    """threshold's iterator config (v2.14 source: inputs promoted, the kernel
+    dispatched on the out dtype, no overlap check (self is added twice),
+    safe casting) for every out= shape: an operand written f32=1.0001 holds
+    that value, an out written float32[1->4] is one element expanded to 4."""
     f8, a = torch.float8_e4m3fn, torch.ops.aten
-
-    def run(name, fn, o=None):
-        return f"{name} {_act_res(fn)} | {tuple(o.shape) if o is not None else ''}"
-
     x = torch.full((4,), 1.0001, device=dev)
     ones = torch.ones(4, device=dev)
     for odt in (torch.float16, torch.bool, torch.float32, f8, torch.int32):
+        dn = _dtype_name(odt)
         o = torch.empty(1, dtype=odt, device=dev).expand(4)
-        yield run(f"thr_exp_{odt}", lambda: a.threshold.out(x, 1.00005, 0.5, out=o), o)
+        yield (
+            f"threshold.out/f32=1.0001/1.00005,0.5/out={dn}[1->4]",
+            _outcome(lambda: a.threshold.out(x, 1.00005, 0.5, out=o), o),
+        )
         o = torch.empty(4, dtype=odt, device=dev)
-        yield run(
-            f"thr_plain_{odt}", lambda: a.threshold.out(x, 1.00005, 0.5, out=o), o
+        yield (
+            f"threshold.out/f32=1.0001/1.00005,0.5/out={dn}[4]",
+            _outcome(lambda: a.threshold.out(x, 1.00005, 0.5, out=o), o),
         )
         o = torch.empty(1, dtype=odt, device=dev).expand(4)
-        yield run(
-            f"thrb_exp_{odt}",
-            lambda: a.threshold_backward.grad_input(ones, x, 1.00005, grad_input=o),
-            o,
-        )
-        o = torch.empty(1, dtype=odt, device=dev).expand(4)
-        yield run(f"thr_ones_exp_{odt}", lambda: a.threshold.out(ones, 2, -2, out=o), o)
-    for lam in (-1.0, float("nan"), 1e39, 0.5):
-        for odt in (f8, torch.float32):
-            o = torch.empty(0, dtype=odt, device=dev)
-            yield run(
-                f"softshrink_f32_lam{lam}_{odt}",
-                lambda: a.softshrink.out(ones, lam, out=o),
+        yield (
+            f"threshold_backward.grad_input/f32=1,f32=1.0001/1.00005/out={dn}[1->4]",
+            _outcome(
+                lambda: a.threshold_backward.grad_input(ones, x, 1.00005, grad_input=o),
                 o,
-            )
-        o = torch.empty(0, dtype=f8, device=dev)
-        h = torch.ones(4, device=dev, dtype=torch.float16)
-        yield run(
-            f"softshrink_f16_lam{lam}", lambda: a.softshrink.out(h, lam, out=o), o
+            ),
         )
-        yield run(f"softshrink_fn_f32_lam{lam}", lambda: a.softshrink(ones, lam))
-    x8 = torch.ones(2).to(f8).to(dev)
-    i32 = torch.ones(2, dtype=torch.int32, device=dev)
-    for odt in (torch.float32, f8, torch.float16):
-        o = torch.empty(0, dtype=odt, device=dev)
-        yield run(f"ldexp_f8_i32_out_{odt}", lambda: torch.ldexp(x8, i32, out=o), o)
-    e5 = torch.ones(2).to(torch.float8_e5m2).to(dev)
-    o = torch.empty(0, dtype=f8, device=dev)
-    yield run("ldexp_e5_i32_out_e4", lambda: torch.ldexp(e5, i32, out=o), o)
+        o = torch.empty(1, dtype=odt, device=dev).expand(4)
+        yield (
+            f"threshold.out/f32=1/2,-2/out={dn}[1->4]",
+            _outcome(lambda: a.threshold.out(ones, 2, -2, out=o), o),
+        )
+    ones8 = torch.ones(4).to(f8).to(dev)
+    for odt in (torch.float32, f8):
+        o = torch.empty(1, dtype=odt, device=dev).expand(4)
+        yield (
+            f"threshold.out/f8=1/2,-2/out={_dtype_name(odt)}[1->4]",
+            _outcome(lambda: a.threshold.out(ones8, 2, -2, out=o), o),
+        )
+    b = torch.ones(4).to(f8).to(dev)
+    yield (
+        "threshold.out/f8=1/2,-2/out=partial_overlap",
+        _outcome(lambda: a.threshold.out(b[:2], 2, -2, out=b[1:3]), watch=(b,)),
+    )
+    o = torch.empty(1, device=dev).expand(4)
+    yield (
+        "threshold_backward.grad_input/f8=1,f8=1/2/out=float32[1->4]",
+        _outcome(
+            lambda: a.threshold_backward.grad_input(ones8, ones8, 2, grad_input=o), o
+        ),
+    )
+    o = torch.empty(0, dtype=torch.float32, device=dev)
+    c0 = torch.tensor(1.0).to(f8)
+    yield (
+        "threshold.out/cpu0d_f8=1/2,-2/out=float32[0]",
+        _outcome(lambda: a.threshold.out(c0, 2, -2, out=o), o),
+    )
     ar = torch.arange(4.0, device=dev)
     o = torch.empty(1, device=dev).expand(4)
-    yield run(
-        "thr_cpu_self_exp_out",
-        lambda: a.threshold.out(torch.arange(4.0), 1.5, -1, out=o),
-        o,
+    yield (
+        "threshold.out/cpu_f32=arange/1.5,-1/out=float32[1->4]",
+        _outcome(lambda: a.threshold.out(torch.arange(4.0), 1.5, -1, out=o), o),
     )
     o = torch.empty(1, device=dev).expand(4)
-    yield run(
-        "thrb_cpu_grad_exp_out",
-        lambda: a.threshold_backward.grad_input(
-            torch.arange(4.0), ar, 1.5, grad_input=o
+    yield (
+        "threshold_backward.grad_input/cpu_f32=arange,f32=arange/1.5/out=float32[1->4]",
+        _outcome(
+            lambda: a.threshold_backward.grad_input(
+                torch.arange(4.0), ar, 1.5, grad_input=o
+            ),
+            o,
         ),
-        o,
     )
     b = torch.arange(4.0, device=dev)
-    yield run("thr_partial", lambda: a.threshold.out(b[:3], 1.5, -1, out=b[1:]), b)
+    yield (
+        "threshold.out/f32=arange/1.5,-1/out=partial_overlap",
+        _outcome(lambda: a.threshold.out(b[:3], 1.5, -1, out=b[1:]), watch=(b,)),
+    )
     e = torch.zeros(1, device=dev).expand(4)
-    yield run("thr_inplace_expanded", lambda: a.threshold_(e, 1.5, -1), e)
+    yield "threshold_/f32=0[1->4]/1.5,-1", _outcome(lambda: a.threshold_(e, 1.5, -1))
     o = torch.empty(1, device=dev).expand(3)
-    yield run("thr_exp_wrong_shape", lambda: a.threshold.out(ar, 1.5, -1, out=o), o)
-    o = torch.empty(0, device=dev)
-    yield run(
-        "thr_cpu0d_f32_self",
-        lambda: a.threshold.out(torch.tensor(1.0), 1.5, -1, out=o),
-        o,
+    yield (
+        "threshold.out/f32=arange/1.5,-1/out=float32[1->3]",
+        _outcome(lambda: a.threshold.out(ar, 1.5, -1, out=o), o),
     )
     o = torch.empty(0, device=dev)
-    i4 = torch.ones(4, dtype=torch.int32, device=dev)
-    yield run("softshrink_i32_f32out", lambda: a.softshrink.out(i4, 0.5, out=o), o)
-    yield run("softshrink_i32_fn", lambda: a.softshrink(i4, 0.5))
+    yield (
+        "threshold.out/cpu0d_f32=1/1.5,-1/out=float32[0]",
+        _outcome(lambda: a.threshold.out(torch.tensor(1.0), 1.5, -1, out=o), o),
+    )
 
 
-def test_float8_round14_shapes_match_stock_cuda(mojo_device):
-    _compare(list(_r14_lines(mojo_device)), _F8_ITER["round14"])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_float8_round14_data_regenerates_on_stock_cuda():
-    assert list(_r14_lines("cuda")) == _F8_ITER["round14"]
-
-
-def _threshold_value_lines(dev):
+def _threshold_value_cases(dev):
     """threshold / threshold_backward values: inf, nan and -0 in grad and
     self, float8 / float16 / float32 operands, broadcast shapes, and every
-    kind of out= (none, fresh, empty, expanded, aliased, another dtype)."""
+    kind of out= (none, fresh, empty, expanded, aliased, another dtype). An
+    operand written float32[4] is a 4-element float32 tensor."""
     a = torch.ops.aten
     f32, f16 = torch.float32, torch.float16
     e4, e5 = torch.float8_e4m3fn, torch.float8_e5m2
@@ -3329,12 +3410,19 @@ def _threshold_value_lines(dev):
     def t(vals, dt):
         return torch.tensor(vals).to(dt).to(dev)
 
-    def outs(n):
-        yield "none", None
-        yield "fresh_f32", lambda: torch.empty(n, device=dev)
-        yield "empty_f32", lambda: torch.empty(0, device=dev)
-        yield "expanded_f32", lambda: torch.empty(1, device=dev).expand(n)
-        yield "empty_f16", lambda: torch.empty(0, dtype=f16, device=dev)
+    outs = {
+        "fresh_f32": lambda: torch.empty(4, device=dev),
+        "empty_f32": lambda: torch.empty(0, device=dev),
+        "expanded_f32": lambda: torch.empty(1, device=dev).expand(4),
+        "empty_f16": lambda: torch.empty(0, dtype=f16, device=dev),
+    }
+    seen = set()
+
+    def once(key):
+        """threshold has no grad: its cases recur across the grad dtypes."""
+        new = key not in seen
+        seen.add(key)
+        return new
 
     for thr in (0.0, 0.5):
         for gdt, sdt in (
@@ -3345,67 +3433,73 @@ def _threshold_value_lines(dev):
             (f16, f32),
             (e4, f16),
         ):
-            for gshape, sshape in (((4,), (4,)), ((4,), (1,)), ((1,), (4,))):
+            for gn, sn in ((4, 4), (4, 1), (1, 4)):
 
                 def grad():
-                    return t(gv[: gshape[0]] if gshape[0] == 4 else [gv[0]], gdt)
+                    return t(gv if gn == 4 else [gv[0]], gdt)
 
                 def selfv():
-                    return t(sv[: sshape[0]] if sshape[0] == 4 else [sv[2]], sdt)
+                    return t(sv if sn == 4 else [sv[2]], sdt)
 
-                tag = f"{thr} {str(gdt)[6:]}/{str(sdt)[6:]} {gshape}/{sshape}"
-                for oname, mk in outs(4):
-                    if mk is None:
-                        yield f"thrb {tag} {oname} " + _act_res(
-                            lambda: a.threshold_backward(grad(), selfv(), thr)
-                        )
-                        yield f"thr {tag} {oname} " + _act_res(
-                            lambda: a.threshold(selfv(), thr, -2.0)
-                        )
-                        continue
+                g_id = f"{_dtype_name(gdt)}[{gn}]"
+                s_id = f"{_dtype_name(sdt)}[{sn}]"
+                bwd = f"threshold_backward/thr={thr}/{g_id},{s_id}"
+                fwd = f"threshold/thr={thr}/{s_id}"
+                yield bwd, _outcome(lambda: a.threshold_backward(grad(), selfv(), thr))
+                if once(fwd):
+                    yield fwd, _outcome(lambda: a.threshold(selfv(), thr, -2.0))
+                for oname, mk in outs.items():
                     o = mk()
-                    yield f"thrb {tag} {oname} " + _act_res(
-                        lambda: a.threshold_backward.grad_input(
-                            grad(), selfv(), thr, grad_input=o
+                    yield (
+                        f"{bwd}/out={oname}",
+                        _outcome(
+                            lambda: a.threshold_backward.grad_input(
+                                grad(), selfv(), thr, grad_input=o
+                            ),
+                            o,
                         ),
-                        o,
                     )
                     o = mk()
-                    yield f"thr {tag} {oname} " + _act_res(
-                        lambda: a.threshold.out(selfv(), thr, -2.0, out=o), o
-                    )
+                    if once(f"{fwd}/out={oname}"):
+                        yield (
+                            f"{fwd}/out={oname}",
+                            _outcome(
+                                lambda: a.threshold.out(selfv(), thr, -2.0, out=o), o
+                            ),
+                        )
             # Aliased outs: grad_input = grad, threshold out = self.
             g = t(gv, gdt)
-            yield f"thrb {thr} {str(gdt)[6:]}/{str(sdt)[6:]} aliased_grad " + _act_res(
-                lambda: a.threshold_backward.grad_input(
-                    g, t(sv, sdt), thr, grad_input=g
+            g_id, s_id = f"{_dtype_name(gdt)}[4]", f"{_dtype_name(sdt)}[4]"
+            yield (
+                f"threshold_backward/thr={thr}/{g_id},{s_id}/out=aliased_grad",
+                _outcome(
+                    lambda: a.threshold_backward.grad_input(
+                        g, t(sv, sdt), thr, grad_input=g
+                    ),
+                    g,
                 ),
-                g,
             )
             s = t(sv, sdt)
-            yield f"thr {thr} {str(sdt)[6:]} aliased_self " + _act_res(
-                lambda: a.threshold.out(s, thr, -2.0, out=s), s
-            )
+            if once(f"threshold/thr={thr}/{s_id}/out=aliased_self"):
+                yield (
+                    f"threshold/thr={thr}/{s_id}/out=aliased_self",
+                    _outcome(lambda: a.threshold.out(s, thr, -2.0, out=s), s),
+                )
             s2 = t(sv, sdt)
-            yield f"thr_ {thr} {str(sdt)[6:]} inplace " + _act_res(
-                lambda: a.threshold_(s2, thr, -2.0)
-            )
+            if once(f"threshold_/thr={thr}/{s_id}"):
+                yield (
+                    f"threshold_/thr={thr}/{s_id}",
+                    _outcome(lambda: a.threshold_(s2, thr, -2.0)),
+                )
 
 
-def test_float8_threshold_values_match_stock_cuda(mojo_device):
-    _compare(list(_threshold_value_lines(mojo_device)), _F8_ITER["threshold_values"])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_float8_threshold_values_regenerate_on_stock_cuda():
-    assert list(_threshold_value_lines("cuda")) == _F8_ITER["threshold_values"]
-
-
-def _threshold_scalar_lines(dev):
+def _threshold_scalar_cases(dev):
     """threshold's Scalars convert to the kernel's dtype with c10's overflow
-    check (an infinity converts)."""
+    check (an infinity converts). A case id lists the operands, then the
+    threshold and value (threshold_backward: the threshold); an operand
+    written int64=straddle is three values around the threshold (0, 1, 2
+    for the narrower integer dtypes), an out written float16[0] an empty
+    float16 out."""
     a = torch.ops.aten
     x = torch.ones(4, device=dev)
     h = torch.float16
@@ -3413,21 +3507,45 @@ def _threshold_scalar_lines(dev):
     def out0():
         return torch.empty(0, dtype=h, device=dev)
 
-    yield _act_res(lambda: a.threshold.out(x, 0.5, 1e6, out=out0()))
-    yield _act_res(lambda: a.threshold.out(x, 1e6, 0.5, out=out0()))
-    yield _act_res(lambda: a.threshold(x.half(), 0.5, 1e6))
-    yield _act_res(
-        lambda: a.threshold.out(
-            x, 0.5, 1e6, out=torch.empty(1, dtype=h, device=dev).expand(4)
-        )
+    yield (
+        "threshold.out/float32/0.5,1000000.0/out=float16[0]",
+        _outcome(lambda: a.threshold.out(x, 0.5, 1e6, out=out0())),
     )
-    yield _act_res(lambda: a.threshold.out(x, 0.5, float("inf"), out=out0()))
-    yield _act_res(lambda: a.threshold_(x.half(), 0.5, 1e6))
+    yield (
+        "threshold.out/float32/1000000.0,0.5/out=float16[0]",
+        _outcome(lambda: a.threshold.out(x, 1e6, 0.5, out=out0())),
+    )
+    yield (
+        "threshold/float16/0.5,1000000.0",
+        _outcome(lambda: a.threshold(x.half(), 0.5, 1e6)),
+    )
+    yield (
+        "threshold.out/float32/0.5,1000000.0/out=float16[1->4]",
+        _outcome(
+            lambda: a.threshold.out(
+                x, 0.5, 1e6, out=torch.empty(1, dtype=h, device=dev).expand(4)
+            )
+        ),
+    )
+    yield (
+        "threshold.out/float32/0.5,inf/out=float16[0]",
+        _outcome(lambda: a.threshold.out(x, 0.5, float("inf"), out=out0())),
+    )
+    yield (
+        "threshold_/float16/0.5,1000000.0",
+        _outcome(lambda: a.threshold_(x.half(), 0.5, 1e6)),
+    )
     e5 = torch.ones(4).to(torch.float8_e5m2).to(dev)
-    yield _act_res(lambda: a.threshold.out(e5, 0.5, 1e6, out=out0()))
+    yield (
+        "threshold.out/float8_e5m2/0.5,1000000.0/out=float16[0]",
+        _outcome(lambda: a.threshold.out(e5, 0.5, 1e6, out=out0())),
+    )
     # Every Scalar kind (int, float, bool) against every dispatched dtype.
     e5b = torch.tensor([0.0, 1.0]).to(torch.float8_e5m2).to(dev)
-    yield _act_res(lambda: a.threshold.out(e5b, 0, 100000, out=out0()))
+    yield (
+        "threshold.out/float8_e5m2/0,100000/out=float16[0]",
+        _outcome(lambda: a.threshold.out(e5b, 0, 100000, out=out0())),
+    )
     dts = [torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64]
     dts += [h, torch.bfloat16, torch.float32, torch.float64]
     vals = [100000, -1, -300, 300, -128, 128, 2**40, 2**63 - 1, True, False] + [
@@ -3441,15 +3559,17 @@ def _threshold_scalar_lines(dev):
         float("nan"),
     ]
     for dt in dts:
+        dn = _dtype_name(dt)
         for v in vals:
             xd = torch.ones(2, dtype=dt, device=dev)
-            yield _act_res(lambda xd=xd, v=v: a.threshold(xd, 0, v))
-            yield _act_res(lambda xd=xd, v=v: a.threshold(xd, v, 0))
+            yield f"threshold/{dn}/0,{v!r}", _outcome(lambda: a.threshold(xd, 0, v))
+            yield f"threshold/{dn}/{v!r},0", _outcome(lambda: a.threshold(xd, v, 0))
     # Integers past 2**53 travel exactly and round once to the computation
     # dtype: inputs straddling each threshold expose the converted value.
     bigs = [2**53 - 1, 2**53, 2**53 + 1, 2**53 + 3, -(2**53 + 1)]
     bigs += [2**63 - 1, -(2**63)]
     for dt in dts:
+        dn = _dtype_name(dt)
         for v in bigs:
             if dt.is_floating_point:
                 b = torch.tensor(float(v), dtype=dt)
@@ -3467,77 +3587,122 @@ def _threshold_scalar_lines(dev):
                 xs = torch.tensor([0, 1, 2], dtype=dt)
             xb = xs.to(dev)
             gf = torch.tensor([1.0, 2.0, 3.0], device=dev)
-            yield _act_res(lambda xb=xb, v=v: a.threshold(xb, v, -5))
-            yield _act_res(lambda xb=xb, v=v: a.threshold_backward(gf, xb, v))
-            yield _act_res(lambda xb=xb, v=v: a.threshold_backward(xb, xb, v))
+            yield (
+                f"threshold/{dn}=straddle/{v},-5",
+                _outcome(lambda: a.threshold(xb, v, -5)),
+            )
+            yield (
+                f"threshold_backward/float32,{dn}=straddle/{v}",
+                _outcome(lambda: a.threshold_backward(gf, xb, v)),
+            )
+            yield (
+                f"threshold_backward/{dn}=straddle,{dn}=straddle/{v}",
+                _outcome(lambda: a.threshold_backward(xb, xb, v)),
+            )
             o = torch.empty(0, dtype=dt, device=dev)
-            yield _act_res(lambda xb=xb, v=v, o=o: a.threshold.out(xb, 0, v, out=o), o)
+            yield (
+                f"threshold.out/{dn}=straddle/0,{v}/out={dn}[0]",
+                _outcome(lambda: a.threshold.out(xb, 0, v, out=o), o),
+            )
     # The overflow raises in the kernel, after the iterator resized out.
     for v in (1e6, 100000):
         o = out0()
-        yield _act_res(lambda o=o, v=v: a.threshold.out(x.half(), 0, v, out=o), o)
+        yield (
+            f"threshold.out/float16/0,{v!r}/out=float16[0]",
+            _outcome(lambda: a.threshold.out(x.half(), 0, v, out=o), o),
+        )
         o = out0()
-        yield _act_res(lambda o=o, v=v: a.threshold.out(x, 0, v, out=o), o)
+        yield (
+            f"threshold.out/float32/0,{v!r}/out=float16[0]",
+            _outcome(lambda: a.threshold.out(x, 0, v, out=o), o),
+        )
     y = x.half()
-    yield _act_res(lambda: a.threshold_(y, 0, 100000), y)
+    yield "threshold_/float16/0,100000", _outcome(lambda: a.threshold_(y, 0, 100000), y)
     # threshold_backward converts its threshold the same way.
     for v in (1e6, 100000, True, float("inf")):
-        yield _act_res(lambda v=v: a.threshold_backward(x.half(), x.half(), v))
+        yield (
+            f"threshold_backward/float16,float16/{v!r}",
+            _outcome(lambda: a.threshold_backward(x.half(), x.half(), v)),
+        )
         o = out0()
-        yield _act_res(
-            lambda o=o, v=v: a.threshold_backward.grad_input(x, x, v, grad_input=o), o
+        yield (
+            f"threshold_backward.grad_input/float32,float32/{v!r}/out=float16[0]",
+            _outcome(lambda: a.threshold_backward.grad_input(x, x, v, grad_input=o), o),
         )
     i8 = torch.ones(2, dtype=torch.int8, device=dev)
-    yield _act_res(lambda: a.threshold_backward(i8, i8, 300))
+    yield (
+        "threshold_backward/int8,int8/300",
+        _outcome(lambda: a.threshold_backward(i8, i8, 300)),
+    )
     # The dispatcher wrapper's device check (a CPU grad_input, a CPU 0-d
     # operand), then the kernel's refusal of bool.
     d = x[:2]
     c = torch.ones(2)
     c0 = torch.tensor(1.0)
-    yield _act_res(lambda: a.threshold_backward.grad_input(d, d, 0, grad_input=c))
-    yield _act_res(
-        lambda: a.threshold_backward.grad_input(c, d, 0, grad_input=d.clone())
+    yield (
+        "threshold_backward.grad_input/float32,float32/0/out=cpu_float32[2]",
+        _outcome(lambda: a.threshold_backward.grad_input(d, d, 0, grad_input=c)),
     )
-    yield _act_res(
-        lambda: a.threshold_backward.grad_input(d, c, 0, grad_input=d.clone())
+    yield (
+        "threshold_backward.grad_input/cpu_float32,float32/0/out=float32[2]",
+        _outcome(
+            lambda: a.threshold_backward.grad_input(c, d, 0, grad_input=d.clone())
+        ),
     )
-    yield _act_res(lambda: a.threshold_backward(c0, d, 0))
-    yield _act_res(lambda: a.threshold_backward(d, c0, 0))
+    yield (
+        "threshold_backward.grad_input/float32,cpu_float32/0/out=float32[2]",
+        _outcome(
+            lambda: a.threshold_backward.grad_input(d, c, 0, grad_input=d.clone())
+        ),
+    )
+    yield (
+        "threshold_backward/cpu0d_float32,float32/0",
+        _outcome(lambda: a.threshold_backward(c0, d, 0)),
+    )
+    yield (
+        "threshold_backward/float32,cpu0d_float32/0",
+        _outcome(lambda: a.threshold_backward(d, c0, 0)),
+    )
     bl = torch.ones(2, dtype=torch.bool, device=dev)
-    yield _act_res(lambda: a.threshold_backward(bl, bl, 0))
-    yield _act_res(lambda: a.threshold_backward(d, bl, 0))
-    yield _act_res(
-        lambda: a.threshold_backward.grad_input(bl, bl, 0, grad_input=bl.clone())
+    yield (
+        "threshold_backward/bool,bool/0",
+        _outcome(lambda: a.threshold_backward(bl, bl, 0)),
     )
-    yield _act_res(lambda: a.threshold.out(bl, 0, 0, out=bl.clone()))
+    yield (
+        "threshold_backward/float32,bool/0",
+        _outcome(lambda: a.threshold_backward(d, bl, 0)),
+    )
+    yield (
+        "threshold_backward.grad_input/bool,bool/0/out=bool[2]",
+        _outcome(
+            lambda: a.threshold_backward.grad_input(bl, bl, 0, grad_input=bl.clone())
+        ),
+    )
+    yield (
+        "threshold.out/bool/0,0/out=bool[2]",
+        _outcome(lambda: a.threshold.out(bl, 0, 0, out=bl.clone())),
+    )
     # The broadcast error comes first, in the iterator's (self, grad) order.
     for gs, ss in (((2,), (3,)), ((3,), (2,)), ((2, 3), (4, 1))):
         o = torch.empty(0, device=dev)
-        yield _act_res(
-            lambda o=o, gs=gs, ss=ss: a.threshold_backward.grad_input(
-                torch.ones(gs, device=dev), torch.ones(ss, device=dev), 0, grad_input=o
+        g_id, s_id = "x".join(map(str, gs)), "x".join(map(str, ss))
+        yield (
+            f"threshold_backward.grad_input/float32[{g_id}],float32[{s_id}]/0"
+            "/out=float32[0]",
+            _outcome(
+                lambda: a.threshold_backward.grad_input(
+                    torch.ones(gs, device=dev),
+                    torch.ones(ss, device=dev),
+                    0,
+                    grad_input=o,
+                ),
+                o,
             ),
-            o,
         )
 
 
-def test_threshold_scalar_overflow_matches_stock_cuda(mojo_device):
-    _compare(
-        list(_threshold_scalar_lines(mojo_device)),
-        _F8_ITER["threshold_scalars"],
-        mojo_device,
-    )
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_threshold_scalar_data_regenerates_on_stock_cuda():
-    assert list(_threshold_scalar_lines("cuda")) == _F8_ITER["threshold_scalars"]
-
-
 # ---------------------------------------------------------------------------
-# float8 meets complex (review of the complex-tensor merge)
+# float8 meets complex
 # ---------------------------------------------------------------------------
 
 
@@ -3924,15 +4089,18 @@ def test_complex_meta_refusals_without_float8(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# review round 4: rsub's generated out= wrappers, alpha_check, pow.Scalar_out
+# rsub's generated out= wrappers, alpha_check, pow.Scalar_out; out=
+# validation; alpha converted to an integral / bool computation dtype
+# (stock-CUDA fixture groups, see "Stock-CUDA fixtures" above)
 # ---------------------------------------------------------------------------
 
 
-def _rsub_pow_alpha_lines(dev):
+def _rsub_pow_alpha_cases(dev):
     """rsub.Scalar_out / rsub.Tensor_out over other x alpha x out dtype x
-    out shape (empty, right-sized, an expanded one-element tensor), the
-    functional rsub, add / sub's alpha_check against float8, and
-    pow.Scalar_out's resize / base-equal-to-1 fill (stock CUDA 2.11)."""
+    out shape (empty, right-sized, an expanded one-element tensor: f8[exp]),
+    the functional rsub (a Scalar other written S2, a tensor Tx8), add /
+    sub's alpha_check against float8, and pow.Scalar_out's resize /
+    base-equal-to-1 fill."""
     f8, a = torch.float8_e4m3fn, torch.ops.aten
     selves = {
         "x8": lambda: torch.tensor([1.0, 0.5, 2.0]).to(f8).to(dev),
@@ -3955,50 +4123,55 @@ def _rsub_pow_alpha_lines(dev):
 
     for s, al in itertools.product(selves, alphas):
         for o in scalars:
-            yield f"rsub {s} S{o} a={al} " + _act_res(
-                lambda s=s, o=o, al=al: torch.rsub(
-                    selves[s](), scalars[o], alpha=alphas[al]
-                )
+            yield (
+                f"rsub/{s}/S{o}/alpha={al}",
+                _outcome(lambda: torch.rsub(selves[s](), scalars[o], alpha=alphas[al])),
             )
             for od, shp in itertools.product(odts, ("0", "3", "exp")):
                 out = out_of(odts[od], shp)
-                yield f"rsub.Scalar_out {s} {o} a={al} {od}{shp} " + _act_res(
-                    lambda s=s, o=o, al=al, out=out: a.rsub.Scalar_out(
-                        selves[s](), scalars[o], alphas[al], out=out
+                yield (
+                    f"rsub.Scalar_out/{s}/{o}/alpha={al}/out={od}[{shp}]",
+                    _outcome(
+                        lambda: a.rsub.Scalar_out(
+                            selves[s](), scalars[o], alphas[al], out=out
+                        ),
+                        out,
                     ),
-                    out,
                 )
         for o in tensors:
-            yield f"rsub {s} T{o} a={al} " + _act_res(
-                lambda s=s, o=o, al=al: torch.rsub(
-                    selves[s](), tensors[o](), alpha=alphas[al]
-                )
+            yield (
+                f"rsub/{s}/T{o}/alpha={al}",
+                _outcome(
+                    lambda: torch.rsub(selves[s](), tensors[o](), alpha=alphas[al])
+                ),
             )
             for od, shp in itertools.product(odts, ("0", "3", "exp")):
                 out = out_of(odts[od], shp)
-                yield f"rsub.Tensor_out {s} {o} a={al} {od}{shp} " + _act_res(
-                    lambda s=s, o=o, al=al, out=out: a.rsub.Tensor_out(
-                        selves[s](), tensors[o](), alpha=alphas[al], out=out
+                yield (
+                    f"rsub.Tensor_out/{s}/{o}/alpha={al}/out={od}[{shp}]",
+                    _outcome(
+                        lambda: a.rsub.Tensor_out(
+                            selves[s](), tensors[o](), alpha=alphas[al], out=out
+                        ),
+                        out,
                     ),
-                    out,
                 )
-    for op, other, al in itertools.product(
+    for op, other, alpha in itertools.product(
         ("add", "sub"), ("x8", "2.5"), (1, True, 2j, 2.0)
     ):
 
-        def oth(other=other):
+        def oth():
             return selves["x8"]() if other == "x8" else 2.5
 
         fn = getattr(torch, op)
-        yield f"{op} x8 {other} a={al} " + _act_res(
-            lambda fn=fn, oth=oth, al=al: fn(selves["x8"](), oth(), alpha=al)
+        yield (
+            f"{op}/x8/{other}/alpha={alpha}",
+            _outcome(lambda: fn(selves["x8"](), oth(), alpha=alpha)),
         )
         out = torch.empty(0, device=dev)
-        yield f"{op}.out x8 {other} a={al} " + _act_res(
-            lambda fn=fn, oth=oth, al=al, out=out: fn(
-                selves["x8"](), oth(), alpha=al, out=out
-            ),
-            out,
+        yield (
+            f"{op}.out/x8/{other}/alpha={alpha}",
+            _outcome(lambda: fn(selves["x8"](), oth(), alpha=alpha, out=out), out),
         )
     for base, ex, od, shp in itertools.product(
         (1, 1.0, 1 + 0j, True, 2, 2j),
@@ -4014,44 +4187,29 @@ def _rsub_pow_alpha_lines(dev):
             if shp == "exp3"
             else torch.zeros(0, dtype=dt, device=dev)
         )
-        yield f"pow.Scalar_out {base} {ex} {od}{shp} " + _act_res(
-            lambda base=base, ex=ex, out=out: torch.pow(base, selves[ex](), out=out),
-            out,
+        yield (
+            f"pow.Scalar_out/{base}/{ex}/out={od}[{shp}]",
+            _outcome(lambda: torch.pow(base, selves[ex](), out=out), out),
         )
 
 
-def test_rsub_pow_alpha_match_stock_cuda(mojo_device):
-    _compare(list(_rsub_pow_alpha_lines(mojo_device)), _F8_ITER["rsub_pow_alpha"])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_rsub_pow_alpha_data_regenerates_on_stock_cuda():
-    assert list(_rsub_pow_alpha_lines("cuda")) == _F8_ITER["rsub_pow_alpha"]
-
-
-# ---------------------------------------------------------------------------
-# review round 5: out= validation (device, internal / partial overlap)
-# ---------------------------------------------------------------------------
-
-
-def _ov_res(fn, out, extra=()):
-    """`_act_res` plus where the out's storage lives (a host out must keep
-    host storage) and the state of any tensor the out overlaps."""
-    s = _act_res(fn, out)
+def _ov_outcome(fn, out, base=None) -> Outcome:
+    """`_outcome` plus where the out's storage lives (a host out must keep
+    host storage) and the state of the tensor the out is a view of."""
+    outcome = _outcome(fn, out)
     kind = out.untyped_storage().device.type
-    s += " storage=" + ("host" if kind == "cpu" else "dev")
-    for e in extra:
-        s += " in=" + _mx_enc(e)
-    return s
+    outcome["out"]["storage"] = "host" if kind == "cpu" else "dev"
+    if base is not None:
+        outcome["out"]["base"] = _state(base)
+    return outcome
 
 
-def _out_validation_lines(dev):
-    """Every out= path of this PR's float8 / complex work with an out on the
-    host, an expanded out (internal overlap), an out partially overlapping
-    an input and an out aliasing it, plus add / sub's alpha_check on the
-    out's dtype (stock CUDA 2.11)."""
+def _out_validation_cases(dev):
+    """Every out= path of the float8 / complex work with an out on the host,
+    an expanded out (internal overlap), an out partially overlapping an
+    input and an out aliasing it, plus add / sub's alpha_check on the out's
+    dtype. Case ids end with the out: host0 / host3 an empty / 3-element
+    host out, exp3 / exp6 a one-element device out expanded to 3 / 6."""
     f8, a = torch.float8_e4m3fn, torch.ops.aten
 
     def x8():
@@ -4065,28 +4223,28 @@ def _out_validation_lines(dev):
 
     forms = []
     for odt in (torch.float32, f8, torch.complex64):
-        on = str(odt)[6:]
+        on = _dtype_name(odt)
         for xn, xs in (("f32", f32), ("x8", x8)):
             forms += [
-                (f"rsub.Scalar_out {xn} {on}", odt,
+                (f"rsub.Scalar_out/{xn}/{on}", odt,
                  lambda o, xs=xs: a.rsub.Scalar_out(xs(), 4.5, out=o)),
-                (f"rsub.Tensor_out {xn} {on}", odt,
+                (f"rsub.Tensor_out/{xn}/{on}", odt,
                  lambda o, xs=xs: a.rsub.Tensor_out(xs(), f32(), out=o)),
             ]  # fmt: skip
             for base in (1, 2, 1 + 0j, 2j):
                 forms.append(
-                    (f"pow.Scalar_out {base} {xn} {on}", odt,
+                    (f"pow.Scalar_out/{base}/{xn}/{on}", odt,
                      lambda o, xs=xs, base=base: torch.pow(base, xs(), out=o))
                 )  # fmt: skip
         forms += [
-            (f"eq x8 {on}", odt, lambda o: torch.eq(x8(), 2, out=o)),
-            (f"add x8 {on}", odt, lambda o: torch.add(x8(), x8(), out=o)),
-            (f"pow x8 {on}", odt, lambda o: torch.pow(x8(), 2, out=o)),
-            (f"abs cx {on}", odt, lambda o: torch.abs(cx(), out=o)),
-            (f"neg x8 {on}", odt, lambda o: torch.neg(x8(), out=o)),
-            (f"relu f32 {on}", odt, lambda o: a.relu.out(f32(), out=o)),
-            (f"irfft cx {on}", odt, lambda o: torch.fft.irfft(cx(), out=o)),
-            (f"hfft cx {on}", odt, lambda o: torch.fft.hfft(cx(), out=o)),
+            (f"eq/x8/{on}", odt, lambda o: torch.eq(x8(), 2, out=o)),
+            (f"add/x8/{on}", odt, lambda o: torch.add(x8(), x8(), out=o)),
+            (f"pow/x8/{on}", odt, lambda o: torch.pow(x8(), 2, out=o)),
+            (f"abs/cx/{on}", odt, lambda o: torch.abs(cx(), out=o)),
+            (f"neg/x8/{on}", odt, lambda o: torch.neg(x8(), out=o)),
+            (f"relu/f32/{on}", odt, lambda o: a.relu.out(f32(), out=o)),
+            (f"irfft/cx/{on}", odt, lambda o: torch.fft.irfft(cx(), out=o)),
+            (f"hfft/cx/{on}", odt, lambda o: torch.fft.hfft(cx(), out=o)),
         ]  # fmt: skip
     outs = {
         "host0": lambda dt: torch.empty(0, dtype=dt),
@@ -4097,22 +4255,21 @@ def _out_validation_lines(dev):
     for name, odt, fn in forms:
         for oname, mk in outs.items():
             out = mk(odt)
-            yield f"{name} out={oname} " + _ov_res(lambda fn=fn, out=out: fn(out), out)
-    for name, fn in (
+            yield f"{name}/out={oname}", _ov_outcome(lambda: fn(out), out)
+    for name, call in (
         ("rsub.Scalar_out", lambda x, o: a.rsub.Scalar_out(x, 4.5, out=o)),
         ("rsub.Tensor_out", lambda x, o: a.rsub.Tensor_out(x, x.flip(0), out=o)),
-        ("pow.Scalar_out 1", lambda x, o: torch.pow(1, x, out=o)),
-        ("pow.Scalar_out 2", lambda x, o: torch.pow(2, x, out=o)),
+        ("pow.Scalar_out/1", lambda x, o: torch.pow(1, x, out=o)),
+        ("pow.Scalar_out/2", lambda x, o: torch.pow(2, x, out=o)),
         ("add", lambda x, o: torch.add(x, 1, out=o)),
     ):
         buf = torch.tensor([1.0, 2.0, 3.0, 4.0], device=dev)
-        yield f"{name} partial " + _ov_res(
-            lambda fn=fn, buf=buf: fn(buf[:3], buf[1:4]), buf[1:4], (buf,)
+        yield (
+            f"{name}/partial",
+            _ov_outcome(lambda: call(buf[:3], buf[1:4]), buf[1:4], buf),
         )
         buf = torch.tensor([1.0, 2.0, 3.0, 4.0], device=dev)
-        yield f"{name} alias " + _ov_res(
-            lambda fn=fn, buf=buf: fn(buf[:3], buf[:3]), buf[:3], (buf,)
-        )
+        yield f"{name}/alias", _ov_outcome(lambda: call(buf[:3], buf[:3]), buf[:3], buf)
     ins = {
         "i32": lambda: torch.ones(2, dtype=torch.int32, device=dev),
         "bool": lambda: torch.ones(2, dtype=torch.bool, device=dev),
@@ -4127,38 +4284,22 @@ def _out_validation_lines(dev):
     ):
         dt = {"f8": f8, "f32": torch.float32, "i32": torch.int32}[od]
         out = torch.empty(0, dtype=dt, device=dev)
-        yield f"{op}.out {xn} a={al} {od} " + _act_res(
-            lambda op=op, xn=xn, al=al, out=out: getattr(torch, op)(
-                ins[xn](), ins[xn](), alpha=al, out=out
+        yield (
+            f"{op}.out/{xn}/alpha={al}/out={od}",
+            _outcome(
+                lambda: getattr(torch, op)(ins[xn](), ins[xn](), alpha=al, out=out), out
             ),
-            out,
         )
 
 
-def test_out_validation_matches_stock_cuda(mojo_device):
-    _compare(list(_out_validation_lines(mojo_device)), _F8_ITER["out_validation"])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_out_validation_data_regenerates_on_stock_cuda():
-    assert list(_out_validation_lines("cuda")) == _F8_ITER["out_validation"]
-
-
-# ---------------------------------------------------------------------------
-# review round 6: alpha converted to an integral / bool computation dtype
-# ---------------------------------------------------------------------------
-
-
-def _alpha_convert_lines(dev):
+def _alpha_conversion_cases(dev):
     """add / sub of integer and bool operands into a float8 out (alpha_check
     passes on the out's floating dtype), so the kernel converts alpha to the
     integral / bool computation dtype with c10's checked_convert: an alpha
-    out of range, a negative fraction into an unsigned dtype, NaN / inf
-    (stock CUDA 2.11), sub's being -alpha (int8 takes +128, int32 +2**31).
-    Fractions within a unit of an integer bound are left out: torch 2.11
-    and 2.14 round that boundary differently."""
+    out of range, a negative fraction into an unsigned dtype, NaN / inf,
+    sub's being -alpha (int8 takes +128, int32 +2**31). Fractions within a
+    unit of an integer bound are left out: torch 2.11 and 2.14 round that
+    boundary differently. other=t is a tensor other, other=3 a Scalar."""
     f8 = torch.float8_e4m3fn
     dts = (
         torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64,
@@ -4173,24 +4314,128 @@ def _alpha_convert_lines(dev):
         ("add", "sub"), dts, alphas, ("t", "3"), ("0", "2")
     ):
 
-        def x(dt=dt):
+        def x():
             return torch.tensor([1, 2], device=dev).to(dt)
 
         out = torch.zeros(int(shp), dtype=f8, device=dev)
-        yield f"{op} {str(dt)[6:]} a={al} o={other} out{shp} " + _act_res(
-            lambda op=op, x=x, al=al, other=other, out=out: getattr(torch, op)(
-                x(), x() if other == "t" else 3, alpha=al, out=out
+        yield (
+            f"{op}/{_dtype_name(dt)}/alpha={al}/other={other}/out=f8[{shp}]",
+            _outcome(
+                lambda: getattr(torch, op)(
+                    x(), x() if other == "t" else 3, alpha=al, out=out
+                ),
+                out,
             ),
-            out,
         )
 
 
-def test_alpha_convert_matches_stock_cuda(mojo_device):
-    _compare(list(_alpha_convert_lines(mojo_device)), _F8_ITER["alpha_convert"])
+# float8_iter_cuda.json's groups, by topic: each is one test on the mojo
+# device and one regeneration check on stock CUDA.
+_ITER_GROUPS = {
+    "operand_dtype_rules": _operand_dtype_rule_cases,
+    "out_dtype_dispatch": _out_dtype_dispatch_cases,
+    "out_aliasing_input": _out_aliasing_cases,
+    "backward": _backward_cases,
+    "activations": _activation_cases,
+    "softshrink_check": _softshrink_check_cases,
+    "broadcast_errors": _broadcast_error_cases,
+    "cpu_operands": _cpu_operand_cases,
+    "ldexp": _ldexp_cases,
+    "threshold_outs": _threshold_out_cases,
+    "threshold_values": _threshold_value_cases,
+    "threshold_scalars": _threshold_scalar_cases,
+    "rsub_pow_alpha": _rsub_pow_alpha_cases,
+    "out_validation": _out_validation_cases,
+    "alpha_conversion": _alpha_conversion_cases,
+}
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
-def test_alpha_convert_data_regenerates_on_stock_cuda():
-    assert list(_alpha_convert_lines("cuda")) == _F8_ITER["alpha_convert"]
+@pytest.mark.parametrize("group", list(_ITER_GROUPS))
+def test_float8_iter_matches_stock_cuda(mojo_device, group):
+    fixture = _fixture(_ITER_JSON)
+    got = _collect(_ITER_GROUPS[group](mojo_device))
+    assert _mismatches(got, fixture["cases"][group], fixture, mojo_device) == {}
+
+
+def test_float8_cuda_fixtures_are_consistent():
+    """The fixture files hold exactly the generators' groups, none empty,
+    every case id once across a file, and every known difference / torch-2.14 override
+    names a recorded case it really changes."""
+    for path, groups in (
+        (_EW_JSON, _EW_UNARY + _EW_BINARY),
+        (_ITER_JSON, tuple(_ITER_GROUPS)),
+    ):
+        fixture = _fixture(path)
+        assert tuple(fixture["cases"]) == groups
+        recorded = {}
+        for group, cases in fixture["cases"].items():
+            assert cases, f"{group} records no case"
+            assert not recorded.keys() & cases.keys()
+            recorded.update(cases)
+        for key, known in fixture.get("known_differences", {}).items():
+            assert set(known) == {"mojo", "reason"}
+            assert _hw_free(known["mojo"]) != _hw_free(recorded[key]), key
+        for key, outcome in fixture.get("torch_2_14_overrides", {}).items():
+            assert _hw_free(outcome) != _hw_free(recorded[key]), key
+
+
+@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
+def test_float8_elementwise_data_regenerates_on_stock_cuda():
+    """float8_elementwise_cuda.json is what its generators produce on stock
+    CUDA (torch.cuda), so the comparisons above test against the real
+    thing."""
+    require_stock_cuda()
+    recorded = _fixture(_EW_JSON)["cases"]
+    bad = {}
+    for op, want in recorded.items():
+        bad.update(_regenerated_mismatches(_ew_cases(op, "cuda"), want))
+    assert bad == {}
+
+
+@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
+@pytest.mark.parametrize("group", list(_ITER_GROUPS))
+def test_float8_iter_data_regenerates_on_stock_cuda(group):
+    require_stock_cuda()
+    got = _collect(_ITER_GROUPS[group]("cuda"))
+    want = _fixture(_ITER_JSON)["cases"][group]
+    assert _regenerated_mismatches(got, want) == {}
+
+
+def _json_block(obj, levels: int, indent: str = "") -> str:
+    """`obj` as JSON with its first `levels` levels of keys one per line and
+    everything below on that line, so a diff names the cases it changes."""
+    if levels == 0 or not isinstance(obj, dict) or not obj:
+        return json.dumps(obj)
+    inner = indent + " "
+    items = [
+        f"{inner}{json.dumps(k)}: {_json_block(v, levels - 1, inner)}"
+        for k, v in obj.items()
+    ]
+    return "{\n" + ",\n".join(items) + "\n" + indent + "}"
+
+
+def write_float8_cuda_json():
+    """Rewrite the "cases" of float8_elementwise_cuda.json and
+    float8_iter_cuda.json from stock CUDA torch (see "Stock-CUDA fixtures"
+    above), keeping their known differences and torch-2.14 overrides."""
+    assert torch.cuda.is_available() and torch.version.cuda, "needs stock CUDA torch"
+    for path, groups in (
+        (
+            _EW_JSON,
+            {op: functools.partial(_ew_cases, op) for op in _EW_UNARY + _EW_BINARY},
+        ),
+        (
+            _ITER_JSON,
+            {g: lambda dev, g=g: _collect(_ITER_GROUPS[g](dev)) for g in _ITER_GROUPS},
+        ),
+    ):
+        old = json.loads(path.read_text()) if path.exists() else {}
+        fixture = {k: v for k, v in old.items() if k != "cases"}
+        fixture["cases"] = {group: gen("cuda") for group, gen in groups.items()}
+        levels = {"cases": 2}
+        body = ",\n".join(
+            f" {json.dumps(k)}: {_json_block(v, levels.get(k, 1), ' ')}"
+            for k, v in fixture.items()
+        )
+        path.write_text("{\n" + body + "\n}\n")
+        _fixture.cache_clear()
