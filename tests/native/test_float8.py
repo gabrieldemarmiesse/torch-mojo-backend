@@ -23,7 +23,7 @@ import pytest
 import torch
 from torch.nn.functional import ScalingType, SwizzleType
 
-from tests.native.conftest import is_metal
+from tests.native.conftest import is_metal, require_stock_cuda
 from torch_mojo_backend.native import device_module
 
 FP8 = [
@@ -4392,14 +4392,12 @@ def test_float8_cuda_fixtures_are_consistent():
             assert _hw_free(outcome) != _hw_free(recorded[key]), key
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
+@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
 def test_float8_elementwise_data_regenerates_on_stock_cuda():
     """float8_elementwise_cuda.json is what its generators produce on stock
     CUDA (torch.cuda), so the comparisons above test against the real
     thing."""
+    require_stock_cuda()
     recorded = _fixture(_EW_JSON)["cases"]
     bad = {}
     for op, want in recorded.items():
@@ -4407,12 +4405,10 @@ def test_float8_elementwise_data_regenerates_on_stock_cuda():
     assert bad == {}
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
-)
+@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
 @pytest.mark.parametrize("group", list(_ITER_GROUPS))
 def test_float8_iter_data_regenerates_on_stock_cuda(group):
+    require_stock_cuda()
     got = _collect(_ITER_GROUPS[group]("cuda"))
     want = _fixture(_ITER_JSON)["cases"][group]
     assert _regenerated_mismatches(got, want) == {}
@@ -4435,7 +4431,7 @@ def write_float8_cuda_json():
     """Rewrite the "cases" of float8_elementwise_cuda.json and
     float8_iter_cuda.json from stock CUDA torch (see "Stock-CUDA fixtures"
     above), keeping their known differences and torch-2.14 overrides."""
-    assert torch.cuda.is_available() and torch.version.cuda, "needs CUDA torch"
+    assert torch.cuda.is_available() and torch.version.cuda, "needs stock CUDA torch"
     for path, groups in (
         (
             _EW_JSON,
