@@ -369,6 +369,27 @@ def is_rounding[kind: StaticString]() -> Bool:
 
 
 @always_inline
+def _lift_subnormal[
+    dtype: DType, width: SIMDLength
+](a: SIMD[dtype, width]) -> Tuple[SIMD[dtype, width], SIMD[dtype, width]]:
+    """`(x, s)` with `log2(a) = log2(x) - s`, `x` never a float32 subnormal.
+
+    std.math's NVIDIA float32 log2 (and log, which is `ln2 * log2`) is
+    `lg2.approx.ftz.f32`, which flushes a subnormal input to zero and returns
+    -inf. Scaling by 2^24 is exact and lifts every subnormal into the normal
+    range; `s` is 0 for every other input, so their results do not change.
+    """
+    comptime if is_nvidia_gpu() and dtype == DType.float32:
+        var tiny = a.gt(0) & a.lt(1.17549435e-38)  # FLT_MIN = 2^-126
+        return (
+            tiny.select(a * 16777216.0, a),
+            tiny.select(SIMD[dtype, width](24), SIMD[dtype, width](0)),
+        )
+    else:
+        return (a, SIMD[dtype, width](0))
+
+
+@always_inline
 def _float_unary[
     kind: StaticString, dtype: DType, width: SIMDLength
 ](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
@@ -441,10 +462,14 @@ def _float_unary[
     comptime if kind == "erf":
         res = erf(a)
     comptime if kind == "log":
+        var x, shift = _lift_subnormal(a)
         # Preserve +inf, which the stdlib CPU approximation treats as finite.
-        res = a.eq(max_or_inf[dtype]()).select(a, log(a))
+        res = a.eq(max_or_inf[dtype]()).select(
+            a, log(x) - shift * 0.693147180559945309
+        )
     comptime if kind == "log2":
-        res = log2(a)
+        var x, shift = _lift_subnormal(a)
+        res = log2(x) - shift
         comptime if dtype == DType.float64 or is_apple_gpu():
             # The double approximation and Metal's float log2 omit +inf.
             res = a.eq(max_or_inf[dtype]()).select(a, res)

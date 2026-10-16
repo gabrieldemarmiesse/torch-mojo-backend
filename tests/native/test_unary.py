@@ -1271,6 +1271,20 @@ def test_log2_domain(mojo_gpu: str, dtype: torch.dtype):
     )
 
 
+@pytest.mark.parametrize("op", [torch.log, torch.log2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_log_subnormal_inputs(mojo_gpu: str, op: Callable, dtype: torch.dtype):
+    skip_if_metal(mojo_gpu, "Apple GPUs flush subnormal inputs to zero, as MPS does")
+    tiny = torch.finfo(torch.float32).tiny
+    data = torch.tensor(
+        [1e-40, 1.4e-45, tiny / 2, tiny * (1 - 2**-23), tiny, tiny * 2, 1e-30]
+    ).to(dtype)
+    rtol, atol = _tol(dtype)
+    torch.testing.assert_close(
+        op(data.to(mojo_gpu)).cpu(), op(data), rtol=rtol, atol=atol
+    )
+
+
 @pytest.mark.parametrize("shape", [(), (0,), (3, 5)])
 def test_log2_shapes(mojo_gpu: str, shape: tuple[int, ...]):
     data = torch.full(shape, 8.0)
