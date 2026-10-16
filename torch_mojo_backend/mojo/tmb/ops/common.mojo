@@ -1996,6 +1996,22 @@ def scalar_type_token(st: Int32) -> String:
     return "c10::complex<double>"
 
 
+def sub_check(self_is_bool: Bool, other_is_bool: Bool) raises:
+    """BinaryOps.h `sub_check`: sub refuses a bool tensor (or a bool
+    Scalar) on either side, before any dtype dispatch."""
+    if self_is_bool and other_is_bool:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if self_is_bool or other_is_bool:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+
+
 def check_real_scalar_fits(st: Int32, v: Value) raises:
     """c10::checked_convert of a Scalar record (`v`) to the REAL dtype `st`
     (c10::overflows): bool takes anything; a complex value with a nonzero
@@ -2173,6 +2189,12 @@ def real_fill_value(st: Int32, v: Value) raises -> Value:
       the 64 bits of C++'s host `static_cast<uint64_t>` (the fill kernels go
       through int64): exact below 2**64, and 0 for 2**64 itself, which
       c10::overflows lets through (it compares with double(UINT64_MAX)).
+    - Into int64, the double 2**63 (c10::overflows compares with
+      double(INT64_MAX), which is 2**63) becomes the int record INT64_MIN: a
+      chosen policy, what stock CUDA gives on an x86 host (its host
+      `static_cast<int64_t>`). On an AArch64 host (GH200, an Apple Mac)
+      that cast saturates to INT64_MAX, and so would a device conversion
+      of the double; the record keeps one answer on every machine.
     Anything else is returned unchanged."""
     if st == ST_BOOL or is_complex_stype(st):
         return v.copy()
@@ -2188,6 +2210,9 @@ def real_fill_value(st: Int32, v: Value) raises -> Value:
                     Scalar[DType.uint64](UInt64(d)).cast[DType.int64]()
                 )
             return Value(TAG_SCALAR_INT, 0, bits, 0)
+    if st == ST_INT64 and (r.tag == TAG_SCALAR_DOUBLE or r.tag == TAG_DOUBLE):
+        if v_complex(r)[0] == 9223372036854775808.0:
+            return Value(TAG_SCALAR_INT, 0, Int64.MIN, 0)
     return r^
 
 

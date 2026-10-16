@@ -35,9 +35,7 @@ from tmb.backend.abi import (
     T,
     TAG_BOOL,
     TAG_INT_LIST,
-    TAG_DOUBLE,
     TAG_NONE,
-    TAG_SCALAR_BOOL,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
     Value,
@@ -112,6 +110,8 @@ from tmb.ops.binary import (
     Res,
     Scal,
     Side,
+    _b_alpha_check,
+    _b_sub_check,
     _b_can_cast,
     _b_copy_into,
     _b_inplace_destination,
@@ -1399,45 +1399,17 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
     return True
 
 
-def _pw_is_bool_side(side: Side) -> Bool:
-    if side.is_t:
-        return side.t.value().stype == ST_BOOL
-    return side.s.value().is_bool
-
-
 def _pw_rsub_check(args: Values) raises:
     """BinaryOps.cpp's sub_check and alpha_check (rsub is sub(other, self,
     alpha)): no bool operand, no bool alpha (it would need a bool result,
     which sub_check already refused), no floating alpha for an integral
     result."""
-    var a = _pw_is_bool_side(_b_side(args[unsafe_offset=0]))
-    var b = _pw_is_bool_side(_b_side(args[unsafe_offset=1]))
-    if a and b:
-        raise Error(
-            "Subtraction, the `-` operator, with two bool tensors is not"
-            " supported. Use the `^` or `logical_xor()` operator instead."
-        )
-    if a or b:
-        raise Error(
-            "Subtraction, the `-` operator, with a bool tensor is not"
-            " supported. If you are trying to invert a mask, use the `~` or"
-            " `logical_not()` operator instead."
-        )
-    var alpha = args[unsafe_offset=2].tag
-    if alpha == TAG_SCALAR_BOOL or alpha == TAG_BOOL:
-        raise Error("Boolean alpha only supported for Boolean results.")
-    if alpha == TAG_SCALAR_DOUBLE or alpha == TAG_DOUBLE:
-        var common = _pw_result_type(
-            _b_side(args[unsafe_offset=0]),
-            _b_side(args[unsafe_offset=1]),
-            _none_side(),
-            2,
-        )
-        if not _pw_is_float(common):
-            raise Error(
-                "For integral input tensors, argument alpha must not be a"
-                " floating point number."
-            )
+    var a = _b_side(args[unsafe_offset=0])
+    var b = _b_side(args[unsafe_offset=1])
+    _b_sub_check(b, a)
+    _b_alpha_check(
+        _pw_result_type(a, b, _none_side(), 2), args[unsafe_offset=2]
+    )
 
 
 # aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor

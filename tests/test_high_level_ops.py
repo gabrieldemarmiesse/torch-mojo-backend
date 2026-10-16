@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch._dynamo import mark_dynamic
 
+from tests.native.conftest import skip_float64_on_metal
 from torch_mojo_backend import mojo_backend
 from torch_mojo_backend.testing import (
     Conf,
@@ -317,6 +318,8 @@ def test_sign(conf: Conf, tensor_shapes: tuple[int, ...]):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_sign_different_dtypes(conf: Conf, dtype):
+    skip_float64_on_metal(conf.device, dtype)
+
     def fn(x):
         return torch.sign(x)
 

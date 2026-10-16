@@ -32,6 +32,7 @@ from std.math import ceildiv
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    ST_BFLOAT16,
     ST_FLOAT16,
     ST_INT64,
     ST_COMPLEX32,
@@ -42,6 +43,7 @@ from tmb.backend.abi import (
     ST_UINT8,
     TAG_BOOL,
     TAG_DOUBLE,
+    TAG_DTYPE,
     TAG_INT,
     max_dtype,
     new_scalar,
@@ -64,6 +66,7 @@ from tmb.backend.abi import (
     new_like,
     new_tensor,
     own,
+    own_if_new,
     Owned,
     ret_ref,
     ret_tensor_list,
@@ -147,6 +150,24 @@ def _seq_vector_norm(
     args.append(Value(TAG_BOOL, 0, 0, 0))  # keepdim=False
     args.append(dtype_v.copy())
     var rets = call_op(op, "", args^, 1)
+    return rets.take_tensor(0)
+
+
+def _seq_to_dtype(t: T, stype: Int32) raises -> T:
+    """`t.to(stype)` through the dispatcher's `_to_copy`; `t` itself when its
+    dtype already is `stype`, so wrap the result in `own_if_new`. Not
+    common.mojo's `cast_to`: its CastSpec kernel has no uint16 / uint32 /
+    uint64 source, and the wide unsigned lists come through here."""
+    if t.stype == stype:
+        return t.copy()
+    var args = List[Value](capacity=7)
+    args.append(_tensor_value(t))
+    args.append(Value(TAG_DTYPE, 0, Int64(stype), 0))
+    for _ in range(3):  # layout, device, pin_memory
+        args.append(_none_value())
+    args.append(Value(TAG_BOOL, 0, 0, 0))  # non_blocking=False
+    args.append(_none_value())  # memory_format
+    var rets = call_op("aten::_to_copy", "", args^, 1)
     return rets.take_tensor(0)
 
 
@@ -791,19 +812,35 @@ def _scalar_slot(v: Value, t: T) raises -> Int:
 def _fast_route(
     e: ForeachOverload, inplace: Bool, p: _ForeachArgs
 ) raises -> Bool:
+    """The lists the multi-tensor apply runs: CUDA's fast route
+    (`_cuda_fast_route`), less what an Apple GPU has no kernel for and the
+    in-place lists whose aliasing needs the sequential order."""
+    if not _cuda_fast_route(e, inplace, p):
+        return False
+    ref first = p.lists[0][0]
+    if dev(first.device)[].api == "metal":
+        if (
+            first.dtype != DType.float32
+            or not e.apple
+            or not foreach_apple_supported(e.kind, _variant(e, inplace))
+        ):
+            return False
+    if inplace and _inplace_hazard(p):
+        return False
+    return True
+
+
+def _cuda_fast_route(
+    e: ForeachOverload, inplace: Bool, p: _ForeachArgs
+) raises -> Bool:
+    """`can_use_fast_route` as CUDA has it, with the errors its fast kernels
+    raise (a scalar tensor on another device)."""
     if not _lists_on_route(p.lists):
         return False
     ref first = p.lists[0][0]
     var dt = first.dtype
     if not _dtype_on_route(e, dt):
         return False
-    if dev(first.device)[].api == "metal":
-        if (
-            dt != DType.float32
-            or not e.apple
-            or not foreach_apple_supported(e.kind, _variant(e, inplace))
-        ):
-            return False
     var s = e.shape
     # The Scalars that must not promote: the overload's scalar(s), and add /
     # sub's alpha where the schema has one.
@@ -834,8 +871,6 @@ def _fast_route(
                 " but is on ",
                 device_str(other),
             )
-    if inplace and _inplace_hazard(p):
-        return False
     return True
 
 
@@ -1042,8 +1077,9 @@ def _foreach(
         # ForeachBinaryOpScalar{,List}.cu check before anything runs: the
         # Scalar overload the first tensor, the ScalarList one every pair.
         # The List overload checks nothing up front: a bool pair on the
-        # fast route (bool alpha) computes, any other raises in the
-        # per-tensor sub, as on CUDA.
+        # fast route (bool alpha) computes (`_bool_sub_per_tensor` where no
+        # multi-tensor apply runs it), any other raises in the per-tensor
+        # sub, as on CUDA.
         if e.shape == S_SCALAR:
             _sub_check(p.lists[0][0], p.scalar)
         elif e.shape == S_SCALARLIST:
@@ -1072,8 +1108,58 @@ def _foreach(
         p.scalar = _reciprocal(p.scalar)
     if _fast_route(e, inplace, p):
         _launch(e, inplace, p, rets)
+    elif (
+        e.kind == "sub"
+        and p.lists[0][0].dtype == DType.bool
+        and _cuda_fast_route(e, inplace, p)
+    ):
+        _bool_sub_per_tensor(inplace, p, rets)
     else:
         _per_tensor(e, inplace, p, rets)
+
+
+def _bool_sub_per_tensor(inplace: Bool, p: _ForeachArgs, rets: Values) raises:
+    """A bool list CUDA's fast route subtracts (the per-tensor sub refuses
+    bools) where the multi-tensor apply does not run it (an Apple GPU, or an
+    in-place list whose aliasing needs the sequential order): `x - alpha * y`
+    is nonzero exactly where `x != (alpha and y)`, so it is a `logical_xor`
+    with `y` for a true alpha and `x` itself for a false one. In place, the
+    result is copied back and every entry's version bumped once, as the
+    launch does (CUDA's increment_version, a false alpha and empty tensors
+    included)."""
+    var alpha = v_bool(p.alpha)
+    var results = List[Owned]()
+    for i in range(len(p.lists[0])):
+        ref x = p.lists[0][i]
+        if not alpha:
+            if not inplace:
+                var r = call_op(
+                    "aten::clone", "", [_tensor_value(x), _none_value()], 1
+                )
+                results.append(own(r.take_tensor(0)))
+            continue
+        var r = call_op(
+            "aten::logical_xor",
+            "",
+            [_tensor_value(x), _tensor_value(p.lists[1][i])],
+            1,
+        )
+        var xor = own(r.take_tensor(0))
+        if inplace:
+            # sequentially: a later entry reads this one's update
+            if x.numel > 0:
+                copy_strided_into(x, xor.t)
+            _ = xor^  # alive past the copy
+        else:
+            results.append(xor^)
+    if inplace:
+        for t in p.lists[0]:
+            t.bump_version()
+        return
+    var result = List[T]()
+    for i in range(len(results)):
+        result.append(results[i].take())
+    ret_tensor_list(rets, 0, result)
 
 
 def op_foreach[
@@ -1523,14 +1609,23 @@ def _check_norm_dtype(dtype_v: Value, self_stype: Int32, name: String) raises:
 
 
 def _reduce_on_route(tensors: List[T], floating: Bool) raises -> Bool:
+    """The list the multi-tensor reduction takes: `_reduce_qualifies`, on
+    anything but an Apple GPU (its descriptors carry raw addresses, which
+    Metal translates only as kernel arguments; see apple_kernels.mojo)."""
+    return (
+        _reduce_qualifies(tensors, floating)
+        and dev(tensors[0].device)[].api != "metal"
+    )
+
+
+def _reduce_qualifies(tensors: List[T], floating: Bool) raises -> Bool:
+    """CUDA's fast-route condition for the foreach reductions: one dense
+    list of one device and dtype, of a dtype the reduction builds."""
     var lists = List[List[T]]()
     lists.append(tensors.copy())
     if not _lists_on_route(lists):
         return False
     var dt = tensors[0].dtype
-    var api = dev(tensors[0].device)[].api
-    if api == "metal":
-        return False
     if floating:
         return (
             dt == DType.float32
@@ -1587,13 +1682,16 @@ def _foreach_lp(args: Values, rets: Values, root: Bool) raises:
         norm = FR_L2
     elif p == inf and root:
         norm = FR_LINF
-    if norm >= 0 and _reduce_on_route(self_list, True):
+    if norm >= 0 and _reduce_qualifies(self_list, True):
+        # The fast route's dtype check holds on an Apple GPU too, which
+        # cannot run the multi-tensor reduction and computes per tensor below.
         _check_norm_dtype(dtype_v, self_list[0].stype, name)
-        var out_stype = v_dtype_or(dtype_v, self_list[0].stype)
-        ret_tensor_list(
-            rets, 0, _reduce_launch(self_list, norm, root, out_stype)
-        )
-        return
+        if dev(self_list[0].device)[].api != "metal":
+            var out_stype = v_dtype_or(dtype_v, self_list[0].stype)
+            ret_tensor_list(
+                rets, 0, _reduce_launch(self_list, norm, root, out_stype)
+            )
+            return
     if (
         root
         and p == 2
@@ -1778,7 +1876,9 @@ def _lp_one(
                 + _scalar_type_name(max_dtype(out_stype))
                 + "'"
             )
-    if dev(t.device)[].api == "metal" or not _reduce_input_ok(t.dtype):
+    if dev(t.device)[].api == "metal":
+        return _lp_one_per_tensor(t, root, ord_v, out_stype)
+    if not _reduce_input_ok(t.dtype):
         var op = String(
             "aten::linalg_vector_norm" if root else "aten::linalg__powsum"
         )
@@ -1810,6 +1910,30 @@ def _lp_one(
     var r = _reduce_launch(one, norm, root, out_stype, p, one_element_abs=root)
     _ = tmp  # alive past the launch
     return r[0].copy()
+
+
+def _lp_one_per_tensor(
+    t: T, root: Bool, ord_v: Value, out_stype: Int32
+) raises -> T:
+    """`_lp_one` where the multi-tensor reduction cannot run (an Apple GPU):
+    the per-tensor `linalg_vector_norm` / `linalg__powsum`, with the
+    arithmetic of CUDA's reduction spelled out -- the elements converted to
+    the result dtype, a half result accumulated in float32 and rounded once.
+    Handing the half dtype to `linalg__powsum` itself would raise each
+    element to its power in half (its composite casts first): 1000 * 10000
+    ** -2 summed that way is 0 in float16, not 1.0014e-05."""
+    var op = String(
+        "aten::linalg_vector_norm" if root else "aten::linalg__powsum"
+    )
+    var x = own_if_new(_seq_to_dtype(t, out_stype), t)
+    if out_stype != ST_FLOAT16 and out_stype != ST_BFLOAT16:
+        return _seq_vector_norm(op, x.t, ord_v, _none_value())
+    var acc = own(
+        _seq_vector_norm(
+            op, x.t, ord_v, Value(TAG_DTYPE, 0, Int64(ST_FLOAT32), 0)
+        )
+    )
+    return _seq_to_dtype(acc.t, out_stype)
 
 
 # aten::_foreach_norm.Scalar(Tensor[] self, Scalar ord=2, ScalarType? dtype=None) -> Tensor[]

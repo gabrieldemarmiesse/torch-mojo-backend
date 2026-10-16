@@ -93,9 +93,12 @@ from tmb.ops.common import (
     resize_out,
     scalar_to_float,
     scalar_to_int,
+    sub_check,
 )
 from tmb.ops.core import cast_for_copy
 from tmb.ops.f8_iter import (
+    _alpha_check,
+    _kernel_alpha,
     f8_cx_scalar,
     f8_iter,
     MODE_CAST,
@@ -916,9 +919,15 @@ def _b_fast_route(
     var a = T(Int(av.a))
     if not a.on_mojo() or not a.contig or a.is_complex():
         return False
+    # a bool operand of sub: the checked route raises sub_check's error
+    var sub = tt == "SubSpec"
+    if sub and a.stype == ST_BOOL:
+        return False
     var bv = args[unsafe_offset=1].copy()
     if _b_is_tensor_rec(bv):
         var b = T(Int(bv.a))
+        if sub and b.stype == ST_BOOL:
+            return False
         if b.is_complex():
             # a complex operand (a wrapped complex number included): the
             # real routes would read its pairs as reals; the slow path
@@ -934,7 +943,7 @@ def _b_fast_route(
     if ts.byte_length() == 0:
         return False
     var ms = _b_rec_scalar(bv)
-    if not ms.ok:
+    if not ms.ok or (sub and ms.s.is_bool):
         return False
     return _b_fast_ts(ts, a, ms.s, negate, rets, dest_h)
 
@@ -1286,19 +1295,20 @@ def _b_scale(t: T, alpha: Float64, alpha_i: Optional[Int]) raises -> Held:
     """`t * alpha` as an owned temporary, in `t`'s own dtype (see
     `_b_alpha_as` for the rounding this implies). `alpha_i` is an integer
     alpha's exact value."""
+    if t.stype == ST_BOOL:
+        # (a bool scaled by an integer would promote to int64; add takes
+        # bools before this, a bool sub is refused)
+        unsupported("alpha != 1 with an operand of this dtype")
     var side = _b_tside(t)
     var a_side = _b_sside(
         Scal(alpha, alpha_i.value(), True, False) if alpha_i else Scal(
             alpha, Int(alpha), False, False
         )
     )
-    var scaled = _b_try_scalar("MulScalarSpec", side, a_side, False, None)
-    if not scaled.__bool__():
-        scaled = _b_try_int_scalar("MulScalarIntSpec", side, a_side, False)
-    if not scaled.__bool__():
-        unsupported("alpha != 1 with an operand of this dtype")
-        return _b_hold(t)
-    return Held(scaled.value().t.copy(), True)
+    # The mul cascade: the scalar specs where they apply, else MulSpec with
+    # alpha as a wrapped number (int8 / int16 / uint8 operands).
+    var scaled = _b_mul(side, a_side, None)
+    return Held(scaled.t.copy(), True)
 
 
 # ---------------------------------------------------------------------------
@@ -1595,20 +1605,80 @@ def _b_add_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
     return _b_binary("AddSpec", lhs, rhs, Int32(-1), dst)
 
 
+def _b_common(lhs: Side, rhs: Side) raises -> Int32:
+    """`torch.result_type` of the two operands (-1: declined, or no tensor)."""
+    if lhs.is_t and rhs.is_t:
+        return _b_promote(lhs.t.value(), rhs.t.value())
+    if lhs.is_t:
+        return _b_side_result(lhs.t.value(), rhs)
+    if rhs.is_t:
+        return _b_side_result(rhs.t.value(), lhs)
+    return -1
+
+
+def _b_alpha_check(common: Int32, alpha_v: Value) raises:
+    """BinaryOps.h `alpha_check` (f8_iter's `_alpha_check`) against the
+    result dtype `common`, skipped when the promotion was declined (-1):
+    the op then declines on its own."""
+    if common >= 0:
+        _alpha_check(common, alpha_v)
+
+
+def _b_alpha_is_one(alpha_v: Value) -> Bool:
+    """An integer alpha of 1 (the default), the one alpha the fast routes
+    take without `alpha_check`: a bool or floating 1 still has to be checked
+    against the result dtype, so it goes the checked way."""
+    return (alpha_v.tag == TAG_SCALAR_INT or alpha_v.tag == TAG_INT) and (
+        alpha_v.a == 1
+    )
+
+
+def _b_negated_alpha(alpha_v: Value) -> Value:
+    """`-alpha` for an int64 alpha record: ATen's sub is
+    `add_stub(..., -alpha)`, so `-alpha` is what its kernel converts, and
+    range-checks, into the result dtype. (A Python int past int64 never
+    gets here: this backend's shim boxes an integral Scalar with
+    `Scalar::toLong`, which refuses 2**63 and up, where stock CUDA keeps
+    an unsigned Scalar and negates it: sub(int64, alpha=2**63) computes
+    there and raises here.)"""
+    return Value(alpha_v.tag, 0, 0 - alpha_v.a, alpha_v.b)
+
+
+def _b_alpha_prologue(
+    lhs: Side, rhs: Side, alpha_v: Value, out_st: Int32, negate: Bool
+) raises -> Tuple[Int32, Value]:
+    """add / sub's meta and alpha conversion, in CUDA's order: an `out=`
+    (or in-place self) of dtype `out_st` (-1: the result dtype itself)
+    first takes the common dtype (compute_types' canCast), then
+    `alpha_check` runs against the iterator's output dtype -- so an
+    integral sum into a float32 out takes a floating alpha -- and the
+    kernel converts alpha into the integral / bool computation dtype
+    (f8_iter's `_kernel_alpha`: range-checked, -alpha for sub, a float
+    truncated, a bool from nonzero). Returns (common dtype, alpha)."""
+    var common = _b_common(lhs, rhs)
+    var checked = common
+    if out_st >= 0 and is_float8_stype(out_st):
+        # A float8 out only comes from f8_iter, which ran both checks on it
+        # and hands over alpha already converted (a bool for a bool sum).
+        checked = -1
+    elif out_st >= 0 and common >= 0:
+        if not _b_can_cast(common, out_st):
+            _b_cast_error(common, out_st)
+        checked = out_st
+    _b_alpha_check(checked, alpha_v)
+    if common >= 0 and (is_int_stype(common) or common == ST_BOOL):
+        return (common, _kernel_alpha(common, alpha_v, negate))
+    return (common, alpha_v.copy())
+
+
 def _b_alpha_int(alpha_v: Value, lhs: Side, rhs: Side) raises -> Optional[Int]:
     """An integer alpha, exact (never through a float), when the add/sub
     computes in an integral dtype -- checked against that dtype as ATen's
-    `alpha.to<scalar_t>()` checks it (int8 `sub(x, 1, alpha=300)` raises).
+    `alpha.to<scalar_t>()` checks it (int8 `add(x, 1, alpha=300)` raises).
     None for a float alpha or a floating result."""
     if not _b_scalar_is_int(alpha_v) or not (lhs.is_t or rhs.is_t):
         return None
-    var common: Int32
-    if lhs.is_t and rhs.is_t:
-        common = _b_promote(lhs.t.value(), rhs.t.value())
-    elif lhs.is_t:
-        common = _b_side_result(lhs.t.value(), rhs)
-    else:
-        common = _b_side_result(rhs.t.value(), lhs)
+    var common = _b_common(lhs, rhs)
     if not is_int_stype(common):
         return None
     return scalar_to_int(alpha_v, common)
@@ -1626,13 +1696,7 @@ def _b_scaled_scalar(s: Scal, alpha: Float64, alpha_i: Optional[Int]) -> Scal:
 
 def _b_bool_result(lhs: Side, rhs: Side) raises -> Bool:
     """Whether the operands promote to bool (`torch.result_type`)."""
-    if lhs.is_t and rhs.is_t:
-        return _b_promote(lhs.t.value(), rhs.t.value()) == ST_BOOL
-    if lhs.is_t:
-        return _b_side_result(lhs.t.value(), rhs) == ST_BOOL
-    if rhs.is_t:
-        return _b_side_result(rhs.t.value(), lhs) == ST_BOOL
-    return False
+    return _b_common(lhs, rhs) == ST_BOOL
 
 
 def _b_bool_add(
@@ -1655,16 +1719,18 @@ def _b_bool_add(
 
 
 def _b_add(
-    lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
+    lhs: Side,
+    rhs: Side,
+    alpha_in: Value,
+    dst: Optional[T],
+    out_st: Int32 = -1,
 ) raises -> Res:
-    """The `fast_aten_add` cascade."""
-    if _b_bool_result(lhs, rhs):
-        if alpha_v.tag == TAG_SCALAR_DOUBLE or alpha_v.tag == TAG_DOUBLE:
-            # BinaryOps.h alpha_check: a bool result is integral.
-            raise Error(
-                "For integral input tensors, argument alpha must not be a"
-                " floating point number."
-            )
+    """The `fast_aten_add` cascade. `out_st`: the dtype of the `out=` or
+    in-place self the result goes into (-1 for a functional result)."""
+    var pro = _b_alpha_prologue(lhs, rhs, alpha_in, out_st, False)
+    var common = pro[0]
+    var alpha_v = pro[1].copy()
+    if common == ST_BOOL:
         return _b_bool_add(lhs, rhs, v_f64(alpha_v) != 0.0, dst)
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
@@ -1714,18 +1780,28 @@ def _b_sub_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
 
 
 def _b_sub(
-    lhs: Side, rhs: Side, alpha_v: Value, dst: Optional[T]
+    lhs: Side,
+    rhs: Side,
+    alpha_in: Value,
+    dst: Optional[T],
+    out_st: Int32 = -1,
 ) raises -> Res:
-    """The `fast_aten_sub` cascade."""
+    """The `fast_aten_sub` cascade (`out_st` as `_b_add`'s)."""
     _b_sub_check(lhs, rhs)
+    var pro = _b_alpha_prologue(lhs, rhs, alpha_in, out_st, True)
+    var common = pro[0]
+    var alpha_v = pro[1].copy()
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
-    var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
     if alpha == 1.0:
         return _b_sub_routes(lhs, rhs, dst)
+    if is_int_stype(common):
+        # ATen's sub is add with -alpha: -alpha is what its kernel converts
+        # (and range-checks) into the result dtype -- int8 takes alpha=128
+        # and refuses alpha=-128 -- and the product wraps as that add's does.
+        return _b_add(lhs, rhs, _b_negated_alpha(alpha_v), dst, out_st)
+    var alpha_i = _b_alpha_int(alpha_v, lhs, rhs)
     if not rhs.is_t:
         var s = rhs.s.value().copy()
-        if s.is_bool:
-            unsupported("a bool scalar operand with alpha != 1")
         var scaled_s = _b_sside(_b_scaled_scalar(s, alpha, alpha_i))
         scaled_s.zero_st = rhs.zero_st
         return _b_sub_routes(lhs, scaled_s^, dst)
@@ -1745,19 +1821,7 @@ def _b_is_bool_side(side: Side) -> Bool:
 
 def _b_sub_check(lhs: Side, rhs: Side) raises:
     """BinaryOps.cpp's sub_check, before any dtype dispatch."""
-    var a = _b_is_bool_side(lhs)
-    var b = _b_is_bool_side(rhs)
-    if a and b:
-        raise Error(
-            "Subtraction, the `-` operator, with two bool tensors is not"
-            " supported. Use the `^` or `logical_xor()` operator instead."
-        )
-    if a or b:
-        raise Error(
-            "Subtraction, the `-` operator, with a bool tensor is not"
-            " supported. If you are trying to invert a mask, use the `~` or"
-            " `logical_not()` operator instead."
-        )
+    sub_check(_b_is_bool_side(lhs), _b_is_bool_side(rhs))
 
 
 def _b_pow_float8(lhs: Side, rhs: Side) raises -> Optional[Res]:
@@ -1799,7 +1863,7 @@ def _b_mul(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
 
 # aten::add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 def op_add_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+    if _b_alpha_is_one(args[unsafe_offset=2]) and _b_fast_route(
         "AddSpec", "AddScalarSpec", False, args, rets, 0
     ):
         return
@@ -1819,6 +1883,11 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "add_")
     var rhs = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, rhs)
+    if not _b_alpha_is_one(args[unsafe_offset=2]):
+        # the cast into self, then alpha_check (and its conversion)
+        _ = _b_alpha_prologue(
+            _b_tside(self), rhs, args[unsafe_offset=2], self.stype, False
+        )
     var alpha = v_f64(args[unsafe_offset=2])
     if alpha == 1.0 and rhs.is_t:
         # Direct in-place kernel when every layout lines up.
@@ -1846,13 +1915,15 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
-        rets, self, _b_add(_b_tside(self), rhs, args[unsafe_offset=2], None)
+        rets,
+        self,
+        _b_add(_b_tside(self), rhs, args[unsafe_offset=2], None, self.stype),
     )
 
 
 # aten::add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
 def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+    if _b_alpha_is_one(args[unsafe_offset=2]) and _b_fast_route(
         "AddSpec",
         "AddScalarSpec",
         False,
@@ -1868,13 +1939,19 @@ def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_store_out(
         rets,
         dest,
-        _b_add(lhs, rhs, args[unsafe_offset=2], Optional[T](dest.copy())),
+        _b_add(
+            lhs,
+            rhs,
+            args[unsafe_offset=2],
+            Optional[T](dest.copy()),
+            dest.stype,
+        ),
     )
 
 
 # aten::sub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 def op_sub_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+    if _b_alpha_is_one(args[unsafe_offset=2]) and _b_fast_route(
         "SubSpec", "AddScalarSpec", True, args, rets, 0
     ):
         return
@@ -1894,6 +1971,11 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "sub_")
     var rhs = _b_side(args[unsafe_offset=1])
     _b_no_overlap_side(self, rhs)
+    _b_sub_check(_b_tside(self), rhs)
+    if not _b_alpha_is_one(args[unsafe_offset=2]):
+        _ = _b_alpha_prologue(
+            _b_tside(self), rhs, args[unsafe_offset=2], self.stype, True
+        )
     var alpha = v_f64(args[unsafe_offset=2])
     if alpha == 1.0 and rhs.is_t:
         if _b_fast_inplace_t("SubSpec", self, rhs.t.value(), rets):
@@ -1905,13 +1987,15 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
-        rets, self, _b_sub(_b_tside(self), rhs, args[unsafe_offset=2], None)
+        rets,
+        self,
+        _b_sub(_b_tside(self), rhs, args[unsafe_offset=2], None, self.stype),
     )
 
 
 # aten::sub.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
 def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if v_f64(args[unsafe_offset=2]) == 1.0 and _b_fast_route(
+    if _b_alpha_is_one(args[unsafe_offset=2]) and _b_fast_route(
         "SubSpec",
         "AddScalarSpec",
         True,
@@ -1927,7 +2011,13 @@ def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_store_out(
         rets,
         dest,
-        _b_sub(lhs, rhs, args[unsafe_offset=2], Optional[T](dest.copy())),
+        _b_sub(
+            lhs,
+            rhs,
+            args[unsafe_offset=2],
+            Optional[T](dest.copy()),
+            dest.stype,
+        ),
     )
 
 

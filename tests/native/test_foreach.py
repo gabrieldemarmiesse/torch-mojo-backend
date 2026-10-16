@@ -2289,9 +2289,15 @@ def _mta_lists(
 
 
 @contextlib.contextmanager
-def _one_launch(name: str):
+def _one_launch(name: str, device: str):
     """The call ran as `aten::<name>` alone: no per-tensor op was dispatched,
-    so the multi-tensor apply took the list."""
+    so the multi-tensor apply took the list.
+
+    Apple GPUs have no multi-tensor apply (Metal translates only pointer
+    kernel arguments into GPU addresses, see
+    tmb/kernels/foreach/apple_kernels.mojo): there a foreach op runs a
+    fixed-arity float32 kernel or ATen's per-tensor decomposition, so only
+    `aten::<name>` itself is checked, and the values by the caller."""
     native.op_counting(True)
     native.op_counts_reset()
     try:
@@ -2299,6 +2305,10 @@ def _one_launch(name: str):
         counts = native.op_counts()
     finally:
         native.op_counting(False)
+    if is_metal(device):
+        foreach = {op for op in counts if op.startswith("aten::_foreach_")}
+        assert foreach == {"aten::" + name}, counts
+        return
     assert set(counts) == {"aten::" + name}, counts
 
 
@@ -2361,7 +2371,7 @@ def test_mta_core_overloads_match_cpu(mojo_gpu: str, name: str, dtype_id: str):
     cpu2, dev2 = _mta_lists(mojo_gpu, dtype, 0.5, 2, seed=63)
     scalar = torch.tensor(1.25, dtype=dtype, device=mojo_gpu)
     expected = reference(cpu, cpu1, cpu2)
-    with _one_launch(name):
+    with _one_launch(name, mojo_gpu):
         result = call(dev, dev1, dev2, scalar)
     _assert_lists(dev if result is None else result, expected, **_mta_tol(dtype))
 
@@ -2371,9 +2381,9 @@ def test_mta_core_long_lists_span_several_launches(mojo_gpu: str):
     sizes = [(i * 37) % 700 for i in range(130)]
     cpu, dev = _mta_lists(mojo_gpu, torch.float32, -2, 2, seed=41, sizes=sizes)
     cpu_o, dev_o = _mta_lists(mojo_gpu, torch.float32, -2, 2, seed=42, sizes=sizes)
-    with _one_launch("_foreach_add_.Scalar"):
+    with _one_launch("_foreach_add_.Scalar", mojo_gpu):
         torch._foreach_add_(dev, -0.5)
-    with _one_launch("_foreach_addcmul_.Scalar"):
+    with _one_launch("_foreach_addcmul_.Scalar", mojo_gpu):
         torch._foreach_addcmul_(dev, dev_o, dev_o, value=0.25)
     expected = [torch.addcmul(a - 0.5, b, b, value=0.25) for a, b in zip(cpu, cpu_o)]
     _assert_lists(dev, expected, **_mta_tol(torch.float32))
@@ -2448,7 +2458,7 @@ def test_mta_core_argument_errors(mojo_gpu: str):
 
 def test_mta_empty_tensors_only(mojo_gpu: str):
     dev = [torch.empty(0, device=mojo_gpu), torch.empty(0, 3, device=mojo_gpu)]
-    with _one_launch("_foreach_sqrt"):
+    with _one_launch("_foreach_sqrt", mojo_gpu):
         out = torch._foreach_sqrt(dev)
     assert [tuple(t.shape) for t in out] == [(0,), (0, 3)]
     versions = [t._version for t in dev]
@@ -2609,13 +2619,13 @@ def test_mta_unary_matches_cpu(mojo_gpu: str, name: str, dtype_id: str, inplace:
     if inplace:
         expected = [getattr(torch, name)(t) for t in cpu]
         before = [t._version for t in dev]
-        with _one_launch(f"_foreach_{name}_"):
+        with _one_launch(f"_foreach_{name}_", mojo_gpu):
             getattr(torch, f"_foreach_{name}_")(dev)
         actual = dev
         assert [t._version - v for t, v in zip(dev, before)] == [1] * len(dev)
     else:
         expected = [getattr(torch, name)(t) for t in cpu]
-        with _one_launch(f"_foreach_{name}"):
+        with _one_launch(f"_foreach_{name}", mojo_gpu):
             actual = getattr(torch, f"_foreach_{name}")(dev)
     _assert_lists(actual, expected, **_mta_tol(dtype))
 
@@ -2625,7 +2635,7 @@ def test_mta_unary_matches_cpu(mojo_gpu: str, name: str, dtype_id: str, inplace:
 def test_mta_unary_integers(mojo_gpu: str, name: str, dtype: torch.dtype):
     lo, hi = (0, 200) if dtype == torch.uint8 else (-100, 100)
     cpu, dev = _mta_lists(mojo_gpu, dtype, lo, hi, seed=3)
-    with _one_launch(f"_foreach_{name}"):
+    with _one_launch(f"_foreach_{name}", mojo_gpu):
         actual = getattr(torch, f"_foreach_{name}")(dev)
     _assert_lists(actual, [getattr(torch, name)(t) for t in cpu])
 
@@ -2634,10 +2644,10 @@ def test_mta_abs_and_zero_on_bool(mojo_gpu: str):
     """CUDA's abs takes bool (the CPU kernel does not), as the identity."""
     cpu = [torch.tensor([True, False, True]), torch.zeros(1025, dtype=torch.bool)]
     dev = [t.to(mojo_gpu) for t in cpu]
-    with _one_launch("_foreach_abs"):
+    with _one_launch("_foreach_abs", mojo_gpu):
         actual = torch._foreach_abs(dev)
     _assert_lists(actual, cpu)
-    with _one_launch("_foreach_zero_"):
+    with _one_launch("_foreach_zero_", mojo_gpu):
         torch._foreach_zero_(dev)
     _assert_lists(dev, [torch.zeros_like(t) for t in cpu])
 
@@ -2649,7 +2659,7 @@ def test_mta_zero_(mojo_gpu: str, dtype: torch.dtype):
     if dtype == torch.float64:
         skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     cpu, dev = _mta_lists(mojo_gpu, dtype, 1, 5, seed=1)
-    with _one_launch("_foreach_zero_"):
+    with _one_launch("_foreach_zero_", mojo_gpu):
         torch._foreach_zero_(dev)
     _assert_lists(dev, [torch.zeros_like(t) for t in cpu])
 
@@ -2753,9 +2763,26 @@ def _run_binary(mojo_gpu, op, overload, dtype, inplace, scalar, scalars, alpha):
         pytest.skip("integer division promotes: not a fast-route case")
     alpha = alpha if op in ("add", "sub") and overload in ("List", "Tensor") else None
     expected = _binary_expected(op, overload, cpu, cpu_o, scalar, scalars, alpha)
+    half = dtype in (torch.float16, torch.bfloat16)
+    if alpha is not None and half and is_metal(mojo_gpu):
+        # Apple GPUs run the per-tensor add / sub, whose documented
+        # policy (test_binary.py's ..._rounds_like_cpu) rounds alpha and
+        # alpha * other to the half type first; CUDA's multi-tensor
+        # apply rounds once, like CPU torch's vectorized loop.
+        others = (
+            cpu_o
+            if overload == "List"
+            else [torch.tensor(scalar, dtype=dtype)] * len(cpu)
+        )
+        alpha_r = torch.tensor(alpha).to(dtype).float()
+        sign = -1 if op == "sub" else 1
+        expected = [
+            (t.float() + sign * (alpha_r * o.float()).to(dtype).float()).to(dtype)
+            for t, o in zip(cpu, others, strict=True)
+        ]
     suffix = "_" if inplace else ""
     other = torch.tensor(scalar, dtype=dtype, device=mojo_gpu)
-    with _one_launch(f"_foreach_{op}{suffix}.{overload}"):
+    with _one_launch(f"_foreach_{op}{suffix}.{overload}", mojo_gpu):
         result = _binary_call(
             op, overload, inplace, dev, dev_o, scalar, scalars, other, alpha
         )
@@ -2801,10 +2828,10 @@ def test_mta_binary_bool(mojo_gpu: str, op: str):
     cpu, dev = _mta_lists(mojo_gpu, torch.bool, 0, 2, seed=5)
     cpu_o, dev_o = _mta_lists(mojo_gpu, torch.bool, 0, 2, seed=6)
     ref = getattr(torch, op)
-    with _one_launch(f"_foreach_{op}.Scalar"):
+    with _one_launch(f"_foreach_{op}.Scalar", mojo_gpu):
         actual = getattr(torch, f"_foreach_{op}")(dev, True)
     _assert_lists(actual, [ref(t, True) for t in cpu])
-    with _one_launch(f"_foreach_{op}_.ScalarList"):
+    with _one_launch(f"_foreach_{op}_.ScalarList", mojo_gpu):
         getattr(torch, f"_foreach_{op}_")(dev, [i % 2 == 0 for i in range(len(dev))])
     expected = [ref(t, i % 2 == 0) for i, t in enumerate(cpu)]
     _assert_lists(dev, expected)
@@ -2820,7 +2847,7 @@ def test_mta_pow_scalar_and_tensor(mojo_gpu: str, dtype_id: str):
     if dtype == torch.float64:
         skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     cpu, dev = _mta_lists(mojo_gpu, dtype, -2, 2, seed=9)
-    with _one_launch("_foreach_pow.ScalarAndTensor"):
+    with _one_launch("_foreach_pow.ScalarAndTensor", mojo_gpu):
         actual = torch._foreach_pow(1.75, dev)
     _assert_lists(actual, [torch.pow(1.75, t) for t in cpu], **_mta_tol(dtype))
 
@@ -2895,9 +2922,28 @@ def test_mta_sub_bool_rules(mojo_gpu: str):
     assert a.cpu().tolist() == [10.0]
     x = torch.tensor([True, False], device=mojo_gpu)
     y = torch.tensor([True, True], device=mojo_gpu)
-    # Stock CUDA: [False, True] and [True, False].
+    # Stock CUDA: [False, True] and [True, False] (an Apple GPU, which has
+    # no multi-tensor apply, computes the same per tensor).
     assert torch._foreach_sub([x], [y], alpha=True)[0].cpu().tolist() == [False, True]
     assert torch._foreach_sub([x], [y], alpha=False)[0].cpu().tolist() == [True, False]
+    xs = [x.clone(), torch.tensor([False, True, True], device=mojo_gpu)]
+    torch._foreach_sub_(
+        xs, [y, torch.ones(3, dtype=torch.bool, device=mojo_gpu)], alpha=True
+    )
+    assert [t.cpu().tolist() for t in xs] == [[False, True], [True, False, False]]
+    # every entry's version bumps once, a false alpha and an empty tensor
+    # included (stock CUDA's increment_version)
+    for alpha in (True, False):
+        xs = [x.clone(), torch.zeros(0, dtype=torch.bool, device=mojo_gpu)]
+        ys = [y, torch.zeros(0, dtype=torch.bool, device=mojo_gpu)]
+        versions = [t._version for t in xs]
+        torch._foreach_sub_(xs, ys, alpha=alpha)
+        assert [t._version - v for t, v in zip(xs, versions)] == [1, 1], alpha
+        assert xs[0].cpu().tolist() == ([False, True] if alpha else [True, False])
+    # Off the fast route (a strided list) the per-tensor sub refuses it, as
+    # on CUDA.
+    with pytest.raises((RuntimeError, NotImplementedError), match="bool"):
+        torch._foreach_sub([x.repeat(2)[::2]], [y.repeat(2)[::2]], alpha=True)
     # The per-tensor sub.Tensor declines bool operands (CUDA: "two bool
     # tensors"); either way nothing is computed.
     with pytest.raises((RuntimeError, NotImplementedError)):
@@ -2912,10 +2958,13 @@ def test_mta_dense_non_contiguous_lists(mojo_gpu: str):
     dev = [t.to(mojo_gpu) for t in cpu]
     dev_o = [t.to(mojo_gpu) for t in other]
     assert all(t.stride() == o.stride() for t, o in zip(dev, dev_o))
-    with _one_launch("_foreach_mul.List"):
+    with _one_launch("_foreach_mul.List", mojo_gpu):
         actual = torch._foreach_mul(dev, dev_o)
-    for a, t in zip(actual, dev):
-        assert a.stride() == t.stride()
+    # The multi-tensor apply keeps the layout; an Apple GPU, which has none,
+    # runs the per-tensor mul, whose result is contiguous.
+    if not is_metal(mojo_gpu):
+        for a, t in zip(actual, dev):
+            assert a.stride() == t.stride()
     _assert_lists(actual, [a * b for a, b in zip(cpu, other)])
 
 
@@ -2931,7 +2980,7 @@ def test_mta_inplace_aliasing_is_sequential(mojo_gpu: str):
     # The same tensor at the same index is elementwise and takes the launch.
     x = torch.randn(3000)
     dx = x.to(mojo_gpu)
-    with _one_launch("_foreach_mul_.List"):
+    with _one_launch("_foreach_mul_.List", mojo_gpu):
         torch._foreach_mul_([dx], [dx])
     _assert_lists([dx], [x * x])
 
@@ -2949,7 +2998,7 @@ def test_mta_scalar_tensor_overloads(mojo_gpu: str):
     with pytest.raises(RuntimeError, match="0 dim"):
         torch._foreach_add(dev, torch.ones(2, device=mojo_gpu))
     half = torch.tensor(0.5, device=mojo_gpu)
-    with _one_launch("_foreach_add_.Tensor"):
+    with _one_launch("_foreach_add_.Tensor", mojo_gpu):
         torch._foreach_add_(dev, half, alpha=-2)
     _assert_lists(dev, [t - 1.0 for t in xs])
 
@@ -3033,7 +3082,7 @@ def test_mta_pointwise_matches_cpu(
         for t, a, b, v in zip(cpu, cpu1, cpu2, per, strict=True)
     ]
     name = f"_foreach_{op}_" if inplace else f"_foreach_{op}"
-    with _one_launch(f"{name}.{overload}"):
+    with _one_launch(f"{name}.{overload}", mojo_gpu):
         result = getattr(torch, name)(dev, dev1, dev2, arg)
     _assert_lists(dev if inplace else result, expected, **_mta_tol(dtype))
 
@@ -3059,7 +3108,7 @@ def test_mta_lerp_matches_cpu(
         arg, per = weights, weights
     expected = [torch.lerp(t, e, w) for t, e, w in zip(cpu, cpu_e, per)]
     name = "_foreach_lerp_" if inplace else "_foreach_lerp"
-    with _one_launch(f"{name}.{overload}"):
+    with _one_launch(f"{name}.{overload}", mojo_gpu):
         result = getattr(torch, name)(dev, dev_e, arg)
     _assert_lists(dev if inplace else result, expected, **_mta_tol(dtype))
 
@@ -3068,10 +3117,10 @@ def test_mta_pointwise_long_lists_span_several_launches(mojo_gpu: str):
     sizes = [(i * 37) % 700 for i in range(130)]
     cpu, dev = _mta_lists(mojo_gpu, torch.float32, -2, 2, seed=41, sizes=sizes)
     cpu_o, dev_o = _mta_lists(mojo_gpu, torch.float32, -2, 2, seed=42, sizes=sizes)
-    with _one_launch("_foreach_lerp.List"):
+    with _one_launch("_foreach_lerp.List", mojo_gpu):
         actual = torch._foreach_lerp(dev, dev_o, dev_o)
     _assert_lists(actual, [torch.lerp(a, b, b) for a, b in zip(cpu, cpu_o)])
-    with _one_launch("_foreach_addcdiv_.ScalarList"):
+    with _one_launch("_foreach_addcdiv_.ScalarList", mojo_gpu):
         torch._foreach_addcdiv_(dev, dev_o, dev, [0.01 * i for i in range(130)])
     for a, b, i in zip(cpu, cpu_o, range(130)):
         a.addcdiv_(b, a.clone(), value=0.01 * i)
@@ -3133,7 +3182,7 @@ def test_mta_norm_matches_cpu(mojo_gpu: str, dtype_id: str, ord_: float):
     cpu[0][3] = 0.0
     dev[0][3] = 0.0
     kwargs = {} if out_dtype is None else {"dtype": out_dtype}
-    with _one_launch("_foreach_norm.Scalar"):
+    with _one_launch("_foreach_norm.Scalar", mojo_gpu):
         actual = torch._foreach_norm(dev, ord_, **kwargs)
     expected = [
         torch.linalg.vector_norm(t.double(), ord_).to(out_dtype or dtype) for t in cpu
@@ -3162,7 +3211,7 @@ def test_mta_powsum_matches_cpu(
         skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
     cpu, dev = _mta_lists(mojo_gpu, dtype, -2, 2, seed=52)
     kwargs = {} if out_dtype is None else {"dtype": out_dtype}
-    with _one_launch("_foreach_powsum.Scalar"):
+    with _one_launch("_foreach_powsum.Scalar", mojo_gpu):
         actual = torch._foreach_powsum(dev, ord_, **kwargs)
     result = out_dtype or dtype
     expected = [
@@ -3229,7 +3278,7 @@ def test_mta_max_matches_cpu(mojo_gpu: str, dtype: torch.dtype):
         dev[3][70_000] = float("nan")
         cpu[4][:] = float("-inf")
         dev[4][:] = float("-inf")
-    with _one_launch("_foreach_max"):
+    with _one_launch("_foreach_max", mojo_gpu):
         actual = torch._foreach_max(dev)
     _assert_lists(actual, [t.max() for t in cpu])
     with pytest.raises(RuntimeError, match="Expected reduction dim to be specified"):

@@ -13,7 +13,7 @@ import warnings
 import pytest
 import torch
 
-from tests.native.conftest import skip_if_metal
+from tests.native.conftest import is_metal, skip_if_metal
 from tests.native.test_complex import CDTYPES, _close, _put, _rand, _skip_c128
 from torch_mojo_backend import native
 
@@ -364,9 +364,10 @@ def test_promotion_with_scalars(mojo_gpu: str):
         assert (torch.ones(3, dtype=torch.float32).to(mojo_gpu) * 1j).dtype == (
             torch.complex64
         )
-        assert (
-            torch.ones(3, dtype=torch.int64).to(mojo_gpu) * 1j
-        ).dtype == torch.complex128
+        if not is_metal(mojo_gpu):  # complex128 needs float64: no Apple GPU
+            assert (
+                torch.ones(3, dtype=torch.int64).to(mojo_gpu) * 1j
+            ).dtype == torch.complex128
     finally:
         torch.set_default_dtype(old)
     b = torch.ones(3, dtype=torch.bfloat16)
@@ -380,8 +381,9 @@ def test_promotion_with_scalars(mojo_gpu: str):
 def test_reduction_out_and_dtype(mojo_gpu: str):
     x = torch.tensor([1e8, 1, -1e8], dtype=torch.complex64)
     out = torch.empty(0, dtype=torch.complex128, device=mojo_gpu)
-    torch.sum(x.to(mojo_gpu), 0, out=out)
-    assert out.item() == 1  # accumulated in the out's complex128
+    if not is_metal(mojo_gpu):  # complex128 needs float64: no Apple GPU
+        torch.sum(x.to(mojo_gpu), 0, out=out)
+        assert out.item() == 1  # accumulated in the out's complex128
     with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
         torch.sum(x.to(mojo_gpu), 0, dtype=torch.complex64, out=out)
     y = _rand(3, 4)
@@ -505,9 +507,10 @@ def test_cumsum_dtypes_and_outs(mojo_gpu: str):
     x = _rand(4)
     d = x.to(mojo_gpu)
     out = torch.empty(0, dtype=torch.complex128, device=mojo_gpu)
-    torch.cumsum(d, 0, out=out)
-    assert out.dtype == torch.complex128
-    _close(out, torch.cumsum(x.to(torch.complex128), 0))
+    if not is_metal(mojo_gpu):  # complex128 needs float64: no Apple GPU
+        torch.cumsum(d, 0, out=out)
+        assert out.dtype == torch.complex128
+        _close(out, torch.cumsum(x.to(torch.complex128), 0))
     with pytest.raises(RuntimeError, match="Expected out tensor to have dtype"):
         torch.cumsum(
             d,
@@ -686,7 +689,13 @@ def test_pow_follows_thrust_log_and_exp(mojo_gpu: str):
     got = (x.to(mojo_gpu) ** y.to(mojo_gpu)).cpu()
     assert got[0].real.item() == float("-inf") and got[0].imag.item() == float("-inf")
     assert got[1].item() == complex(0.8021237254142761, -1.223475694656372)
-    assert got[2].item() == complex(1.0, 0.5000000596046448)
+    if is_metal(mojo_gpu):
+        # Apple's exp / sin / cos are not CUDA's libdevice: 1 + 0.5j to the
+        # first power lands an ulp off in the other component there
+        # (1.0000001192092896 + 0.5j). Both are one ulp from exact.
+        torch.testing.assert_close(got[2], torch.tensor(1 + 0.5j), rtol=0, atol=2**-23)
+    else:
+        assert got[2].item() == complex(1.0, 0.5000000596046448)
 
 
 def test_scalar_conversion_overflow(mojo_gpu: str):
@@ -698,8 +707,9 @@ def test_scalar_conversion_overflow(mojo_gpu: str):
     with pytest.raises(RuntimeError, match="without overflow"):
         z**1e100
     # complex128 holds any double; a wrapped operand is not checked
-    w = z.to(torch.complex128)
-    assert torch.add(w, w, alpha=1e100).cpu().real.abs().max() > 1e99
+    if not is_metal(mojo_gpu):  # complex128 needs float64: no Apple GPU
+        w = z.to(torch.complex128)
+        assert torch.add(w, w, alpha=1e100).cpu().real.abs().max() > 1e99
     got = (torch.tensor([1 + 1j], device=mojo_gpu) + 1e100).cpu()
     assert got.real.item() == float("inf") and got.imag.isnan()
 

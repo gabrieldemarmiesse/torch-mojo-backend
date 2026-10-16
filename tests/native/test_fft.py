@@ -226,8 +226,9 @@ def test_fft_of_an_infinity_quarter_turns(mojo_gpu: str):
     """A twiddle between passes that is a quarter turn (-i, -1, +i) is a
     sign and a swap, not a multiply by a table entry with a zero part, so an
     infinity stays an infinity. n = 16 (passes of 8 then 2), inf at index 4:
-    every twiddle on its path is a quarter turn, the result is exact (CPU
-    torch agrees; stock CUDA has NaNs in 12 of the 16 bins). Inf at index 3:
+    every twiddle on its path is a quarter turn, the result is exact,
+    inf * (-i)**k (x86 CPU torch agrees; AArch64's pocketfft has NaN real
+    parts in the odd bins, stock CUDA NaNs in 12 of the 16 bins). Inf at index 3:
     the even bins match stock CUDA bin for bin (bin 4 was NaN + inf i before
     quarter turns were special-cased); the odd bins carry the inf - inf of
     two successive non-quarter rotations of an infinite complex value, which
@@ -235,7 +236,8 @@ def test_fft_of_an_infinity_quarter_turns(mojo_gpu: str):
     x = torch.zeros(16, dtype=torch.complex64)
     x[4] = _INF
     got = torch.fft.fft(x.to(mojo_gpu)).cpu()
-    assert torch.equal(got, torch.fft.fft(x))
+    quarter_turns = [(_INF, 0.0), (0.0, -_INF), (-_INF, 0.0), (0.0, _INF)] * 4
+    assert torch.equal(got, torch.tensor([complex(*v) for v in quarter_turns]))
     x = torch.zeros(16, dtype=torch.complex64)
     x[3] = _INF
     got = torch.fft.fft(x.to(mojo_gpu)).cpu()

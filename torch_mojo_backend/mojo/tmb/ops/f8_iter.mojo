@@ -233,10 +233,16 @@ def _alpha_check(dt: Int32, a: Value) raises:
         raise Error("Boolean alpha only supported for Boolean results.")
     var floating = is_float_stype(dt) or is_float8_stype(dt)
     var cplx = is_complex_stype(dt)
+    # alpha.isIntegral(true) is false for a double and for a complex alpha:
+    # on an integral result both get this message, before the complex one
     if (
         not floating
         and not cplx
-        and (a.tag == TAG_SCALAR_DOUBLE or a.tag == TAG_DOUBLE)
+        and (
+            a.tag == TAG_SCALAR_DOUBLE
+            or a.tag == TAG_DOUBLE
+            or a.tag == TAG_COMPLEX
+        )
     ):
         raise Error(
             "For integral input tensors, argument alpha must not be a"

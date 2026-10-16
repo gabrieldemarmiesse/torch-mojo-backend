@@ -8,12 +8,23 @@ public API only; `CallChecker` (or `native.op_count` for the ops with no
 """
 
 import contextlib
+import functools
+import itertools
+import json
 import math
+import pathlib
+import sys
+from typing import TypeAlias
 
 import pytest
 import torch
 
-from tests.native.conftest import flush_subnormals_on_metal, is_metal, skip_if_metal
+from tests.native.conftest import (
+    flush_subnormals_on_metal,
+    is_metal,
+    require_stock_cuda,
+    skip_if_metal,
+)
 from torch_mojo_backend import aten_functions, get_accelerators, native
 
 
@@ -138,6 +149,295 @@ def test_add_sub_alpha_reduced_precision_rounds_like_cpu(mojo_gpu, dtype):
     # would pass on the implementation it is meant to reject.
     unrounded = (a.float() + (alpha * b.float()).to(dtype).float()).to(dtype)
     assert not torch.equal(unrounded, got.cpu())
+
+
+def _outcome(fn):
+    """("ok", values, dtype) or (exception type, its message without the
+    backend's ` [aten::...]` op trail)."""
+    try:
+        t = fn()
+    except (RuntimeError, NotImplementedError) as error:
+        return (type(error), str(error).split(" [aten::")[0].split("\n")[0])
+    return ("ok", t.cpu().tolist(), t.dtype)
+
+
+_ALPHA_DTYPES = [torch.int8, torch.int16, torch.uint8, torch.int32, torch.int64]
+# Integer alphas at and past each dtype's range on both signs (sub converts
+# -alpha: int8 takes 128 and refuses -128), wrapping products, and the bool
+# and floating alphas `alpha_check` refuses for an integral result.
+_ALPHAS = [2, 3, -1, 0, 127, 128, -128, -129, 255, 256, -255, -256,
+           32767, 32768, -32768, -32769, 2**31, -(2**31), 0.5, 2.5, 1.0,
+           True, False]  # fmt: skip
+
+
+def _alpha_operands(device: str, dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+    values = [1, 3, 200, 0] if dtype == torch.uint8 else [1, -3, 100, 0]
+    a = torch.tensor(values, dtype=dtype, device=device)
+    return a, torch.tensor([2, 5, 7, 1], dtype=dtype, device=device)
+
+
+@pytest.mark.parametrize("variant", ["functional", "inplace", "out"])
+@pytest.mark.parametrize("op", ["add", "sub"])
+@pytest.mark.parametrize("dtype", _ALPHA_DTYPES, ids=str)
+def test_integer_add_sub_alpha_matches_cpu(mojo_gpu, dtype, op, variant):
+    """add / sub of integer tensors with every kind of alpha: values (a
+    wrapping product included), the range check of alpha -- of -alpha for
+    sub, which ATen computes as add with -alpha -- and `alpha_check`'s
+    errors for a bool or floating alpha, in every variant. CPU torch runs
+    the same meta and the same alpha conversion as CUDA."""
+
+    def run(device: str, alpha):
+        a, b = _alpha_operands(device, dtype)
+        if variant == "inplace":
+            return lambda: getattr(a, op + "_")(b, alpha=alpha)
+        if variant == "out":
+            return lambda: getattr(torch, op)(
+                a, b, alpha=alpha, out=torch.empty_like(a)
+            )
+        return lambda: getattr(torch, op)(a, b, alpha=alpha)
+
+    for alpha in _ALPHAS:
+        got = _outcome(run(mojo_gpu, alpha))
+        want = _outcome(run("cpu", alpha))
+        assert got == want, alpha
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int32, torch.float32], ids=str)
+def test_sub_refuses_a_bool_operand(mojo_gpu, dtype):
+    """`sub_check`: a bool tensor (or a bool scalar) on either side of sub is
+    refused before anything runs, whatever alpha, in every variant."""
+    x = torch.tensor([1, 2, 3], dtype=dtype)
+    m = torch.tensor([True, False, True])
+    calls = [
+        lambda d: torch.sub(x.to(d), m.to(d)),
+        lambda d: torch.sub(m.to(d), x.to(d), alpha=2),
+        lambda d: torch.sub(x.to(d), m.to(d), alpha=2),
+        lambda d: torch.sub(m.to(d), m.to(d)),
+        lambda d: torch.sub(m.to(d), m.to(d), alpha=True),
+        lambda d: torch.sub(x.to(d), True),
+        lambda d: x.to(d).sub_(m.to(d), alpha=3),
+        lambda d: torch.sub(x.to(d), m.to(d), out=torch.empty_like(x.to(d))),
+        lambda d: torch.rsub(x.to(d), m.to(d)),
+    ]
+    for i, call in enumerate(calls):
+        got = _outcome(lambda: call(mojo_gpu))
+        want = _outcome(lambda: call("cpu"))
+        assert want[0] is RuntimeError and got == want, i
+
+
+def test_bool_add_alpha_checks(mojo_gpu):
+    """A bool result takes a bool or integer alpha, never a floating one; a
+    non-bool result never takes a bool alpha."""
+    m = torch.tensor([True, False, False])
+    f = torch.tensor([1.5, -2.0, 0.0])
+    calls = [
+        lambda d: torch.add(m.to(d), m.to(d), alpha=True),
+        lambda d: torch.add(m.to(d), m.to(d), alpha=False),
+        lambda d: torch.add(m.to(d), m.to(d), alpha=2),
+        lambda d: torch.add(m.to(d), m.to(d), alpha=0.5),
+        lambda d: torch.add(f.to(d), f.to(d), alpha=True),
+        lambda d: f.to(d).add_(f.to(d), alpha=False),
+        lambda d: f.to(d).sub_(f.to(d), alpha=True),
+        lambda d: torch.add(f.to(d), 2, alpha=True),
+    ]
+    for i, call in enumerate(calls):
+        assert _outcome(lambda: call(mojo_gpu)) == _outcome(lambda: call("cpu")), i
+
+
+# add / sub / rsub with an alpha into an output of another dtype, against
+# stock CUDA (torch 2.11, H100; binary_alpha_cuda.json next to this file):
+# CUDA's alpha_check reads the iterator's OUTPUT dtype (the out=, or self in
+# place), after compute_types' canCast of the common dtype into it, and the
+# kernel then converts alpha into the computation dtype (a float truncated,
+# a bool from nonzero, -alpha for sub, range-checked). CPU torch shares the
+# meta, but a same-dtype out cannot show the difference.
+#
+# The JSON maps a case id, "op/variant/input-dtype[->out-dtype]/alpha=<repr>",
+# to its outcome: {"dtype", "values"} or {"error", "message"}, one case per
+# line in generation order. To rewrite it, on a machine with stock CUDA
+# torch:
+#   uv run python -c "from tests.native.test_binary import write_alpha_cuda_json; write_alpha_cuda_json()"
+_ALPHA_JSON = pathlib.Path(__file__).parent / "binary_alpha_cuda.json"
+# one case's outcome: {"dtype", "values"} or {"error", "message"}
+_Outcome: TypeAlias = dict[
+    str,
+    str
+    | list[bool]
+    | list[int]
+    | list[float | str]
+    | list[list[float | str]]
+    | list[float]
+    | list[list[float]],
+]
+_ALPHA_OPS = ("add", "sub", "rsub")
+_ALPHA_VARIANTS = ("fn", "inplace", "out")
+_ALPHA_IN = [
+    torch.int8, torch.int16, torch.uint8, torch.int32, torch.int64, torch.bool,
+    torch.float16, torch.bfloat16, torch.float32,
+]  # fmt: skip
+# out= dtypes, and the in-place selves: every category the output can be
+# (a complex one goes through the complex route, a half one is computed in
+# float32 but checked against itself)
+_ALPHA_OUT = [
+    torch.float32, torch.int64, torch.int8, torch.bool, torch.complex64,
+    torch.float16, torch.bfloat16,
+]  # fmt: skip
+_ALPHA_SELF = [
+    torch.float32, torch.int64, torch.int8, torch.bool, torch.complex64,
+    torch.float16,
+]  # fmt: skip
+_INF = float("inf")
+_ALPHA_VALUES = [1, 1.0, 2.5, True, False, -128, 128, float("nan"), _INF, -_INF]
+# complex alphas: a complex output converts one into the inputs'
+# computation dtype (sub's -alpha, a Half / BFloat16 sum's float), any
+# other output refuses it in alpha_check (an integral one with the
+# "floating point" message, in CUDA's order)
+_ALPHA_COMPLEX_VALUES = [1j, 2 + 0j, -1 + 0j, 128 + 0j, -0.5 + 0j, 65505 + 0j, 1e5 + 0j]
+
+
+def _alpha_vals(dtype: torch.dtype, device: str) -> torch.Tensor:
+    if dtype == torch.bool:
+        values = [1, 0, 1]
+    else:
+        values = [1, 3, 200] if dtype == torch.uint8 else [1, -3, 100]
+    return torch.tensor(values, device=device).to(dtype)
+
+
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _json_number(v: float) -> float | str:
+    """A value JSON holds and `==` compares: NaN and the infinities as
+    "nan", "inf", "-inf"."""
+    return v if math.isfinite(v) else str(v)
+
+
+def _alpha_outcome(fn) -> _Outcome:
+    try:
+        t = fn()
+    except (RuntimeError, NotImplementedError) as error:
+        message = str(error).split(" [aten::")[0].split("\n")[0]
+        return {"error": type(error).__name__, "message": message}
+    values = t.cpu().tolist()
+    if t.is_complex():  # JSON has no complex: [re, im]
+        values = [[_json_number(v.real), _json_number(v.imag)] for v in values]
+    elif t.dtype.is_floating_point:
+        values = [_json_number(v) for v in values]
+    return {"dtype": _dtype_name(t.dtype), "values": values}
+
+
+def _alpha_cases(device: str, op: str, variant: str) -> dict[str, _Outcome]:
+    """The outcome of every (input dtype, out dtype, alpha) case of
+    `op` / `variant` on `device`, keyed by case id."""
+    cases = {}
+    outs = {"fn": _ALPHA_OUT[:1], "inplace": _ALPHA_SELF, "out": _ALPHA_OUT}[variant]
+    combos = itertools.product(_ALPHA_IN, outs, _ALPHA_VALUES + _ALPHA_COMPLEX_VALUES)
+    for idt, odt, alpha in combos:
+        a = _alpha_vals(idt, device)
+        b = torch.tensor([2, 5, 7], device=device).to(idt)
+        fn = getattr(torch, op)
+        if variant == "fn":
+
+            def call(fn=fn, a=a, b=b, alpha=alpha):
+                return fn(a, b, alpha=alpha)
+        elif variant == "inplace":
+            s = _alpha_vals(odt, device)
+
+            def call(s=s, op=op, b=b, alpha=alpha):
+                return getattr(s, op + "_")(b, alpha=alpha)
+        else:
+            o = torch.empty(3, dtype=odt, device=device)
+            out_fn = torch.ops.aten.rsub.Tensor_out if op == "rsub" else fn
+
+            def call(out_fn=out_fn, a=a, b=b, alpha=alpha, o=o):
+                return out_fn(a, b, alpha=alpha, out=o)
+
+        dtypes = _dtype_name(idt)
+        if variant != "fn":
+            dtypes += "->" + _dtype_name(odt)
+        cases[f"{op}/{variant}/{dtypes}/alpha={alpha!r}"] = _alpha_outcome(call)
+    return cases
+
+
+# (op, variant) pairs: a functional result has no out dtype; there is no rsub_
+_ALPHA_GROUPS = [
+    (op, variant)
+    for op in _ALPHA_OPS
+    for variant in _ALPHA_VARIANTS
+    if not (op == "rsub" and variant == "inplace")
+]
+
+
+def _all_alpha_cases(device: str) -> dict[str, _Outcome]:
+    cases = {}
+    for op, variant in _ALPHA_GROUPS:
+        cases.update(_alpha_cases(device, op, variant))
+    return cases
+
+
+def write_alpha_cuda_json():
+    """Rewrite binary_alpha_cuda.json from stock CUDA torch (see above)."""
+    assert torch.version.cuda is not None and torch.cuda.is_available(), (
+        "needs stock CUDA torch"
+    )
+    cases = _all_alpha_cases("cuda")
+    # one case per line, so a diff names the cases that changed
+    lines = [f" {json.dumps(k)}: {json.dumps(v)}" for k, v in cases.items()]
+    _ALPHA_JSON.write_text("{\n" + ",\n".join(lines) + "\n}\n")
+
+
+@functools.cache
+def _alpha_cuda() -> dict[str, _Outcome]:
+    return json.loads(_ALPHA_JSON.read_text())
+
+
+# The C++ type names in CUDA's messages are the host compiler's (Linux
+# GCC); the mojo device prints the names of the host it runs on.
+_MACOS_TYPE_NAMES = [
+    ("long unsigned int", "unsigned long long"),
+    ("short unsigned int", "unsigned short"),
+    ("long int", "long long"),
+    ("short int", "short"),
+]
+
+
+def _as_on_this_host(outcome: _Outcome) -> _Outcome:
+    if sys.platform != "darwin" or "message" not in outcome:
+        return outcome
+    message = outcome["message"]
+    for linux, macos in _MACOS_TYPE_NAMES:
+        message = message.replace(linux, macos)
+    return {**outcome, "message": message}
+
+
+@pytest.mark.parametrize(
+    ("op", "variant"), _ALPHA_GROUPS, ids=[f"{o}/{v}" for o, v in _ALPHA_GROUPS]
+)
+def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(mojo_gpu, op, variant):
+    got = _alpha_cases(mojo_gpu, op, variant)
+    recorded = _alpha_cuda()
+    want = {
+        key: _as_on_this_host(recorded[key])
+        for key in recorded
+        if key.startswith(f"{op}/{variant}/")
+    }
+    assert got.keys() == want.keys()
+    mismatches = {
+        key: {"got": got[key], "want": want[key]}
+        for key in want
+        if got[key] != want[key]
+    }
+    assert mismatches == {}
+
+
+@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
+def test_add_sub_alpha_data_regenerates_on_stock_cuda():
+    require_stock_cuda()
+    got = _all_alpha_cases("cuda")
+    want = _alpha_cuda()
+    assert list(got) == list(want)
+    assert {k: v for k, v in got.items() if v != want[k]} == {}
 
 
 def test_inplace_add_rejects_partial_overlap(mojo_gpu):
