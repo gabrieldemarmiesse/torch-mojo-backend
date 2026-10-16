@@ -29,6 +29,7 @@ import torch.distributed.distributed_c10d as c10d
 import torch.distributed.tensor as dtensor
 import torch.utils._triton
 
+from torch_mojo_backend.distributed import flight_recorder
 from torch_mojo_backend.native import device_module
 
 if TYPE_CHECKING:
@@ -191,6 +192,23 @@ def fix_batch_isend_irecv_for_python_process_groups():
     batch_isend_irecv._torch_mojo_backend = True  # ty: ignore[unresolved-attribute]
     c10d.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
     torch.distributed.batch_isend_irecv = batch_isend_irecv  # ty: ignore[invalid-assignment]
+
+
+def serve_nccl_trace_dumps_from_the_mojo_backend():
+    """`torch._C._distributed_c10d._dump_nccl_trace` and
+    `_dump_nccl_trace_json` only read ProcessGroupNCCL's flight recorder.
+
+    They are what a CUDA user calls for an on-demand dump, but they read a
+    C++ singleton only ProcessGroupNCCL records into (FlightRecorderCuda.cpp)
+    and exist only in CUDA builds (init.cpp, `USE_C10D_NCCL`). The mojo
+    process group is the one recording on the mojo device, so both return its
+    recorder's dump instead (distributed/flight_recorder.py), in the same
+    format, on every build. `_dump_fr_trace*` (the generic recorder Gloo and
+    FlightRecorderHook use) is left alone.
+    """
+    c10d_c = torch._C._distributed_c10d  # ty: ignore[possibly-missing-submodule] -- loaded by torch.distributed, imported above
+    c10d_c._dump_nccl_trace = flight_recorder.dump_nccl_trace
+    c10d_c._dump_nccl_trace_json = flight_recorder.dump_nccl_trace_json
 
 
 def let_dtensor_differentiate_a_native_linear():

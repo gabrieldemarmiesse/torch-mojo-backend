@@ -48,7 +48,7 @@ from torch._C._distributed_c10d import (
 )
 
 from torch_mojo_backend import native
-from torch_mojo_backend.distributed import nccl
+from torch_mojo_backend.distributed import flight_recorder, nccl
 from torch_mojo_backend.native import device_module
 
 _PRIVATEUSE1 = 20  # c10::DeviceType::PrivateUse1
@@ -529,15 +529,23 @@ def _report_desync(
 
 
 def _desync_reporter(
-    notify_fd: int, ack_fd: int, store: Store, rank: int, world: int, wait_s: float
+    notify_fd: int,
+    ack_fd: int,
+    store: Store,
+    rank: int,
+    world: int,
+    wait_s: float,
+    fr_store: Store | None = None,
 ):
     """Thread body: report each incident line of the Mojo watchdog and
     acknowledge it with its incident's byte; a `resolved` line takes that
-    communicator's record out of this rank's index (report mode). Ends, with
-    the index emptied and its store worker closed, when the process group
-    closes the pipe."""
+    communicator's record out of this rank's index (report mode). With
+    `fr_store` (the store under every prefix), each incident also dumps the
+    flight recorder of every rank first. Ends, with the index emptied and
+    its store workers closed, when the process group closes the pipe."""
     published: dict[str, str] = {}
     worker = _StoreWorker(store)
+    fr_worker = _StoreWorker(fr_store) if fr_store is not None else None
     pending = b""
     gen = 0
     incarnation = f"{time.time_ns():x}{os.getpid():x}"
@@ -566,6 +574,8 @@ def _desync_reporter(
                         rewrite_index()
                     continue
                 try:
+                    if fr_worker is not None:
+                        _fr_incident(fields, fr_worker, rank)
                     _report_desync(
                         line,
                         worker,
@@ -576,6 +586,8 @@ def _desync_reporter(
                         next_gen(),
                         incarnation,
                     )
+                    if fr_worker is not None:
+                        _fr_wait_for_peers(fields, fr_worker, rank)
                 except Exception:
                     traceback.print_exc(file=sys.stderr)
                 finally:
@@ -588,8 +600,54 @@ def _desync_reporter(
             rewrite_index()
     finally:
         worker.close()
+        if fr_worker is not None:
+            fr_worker.close()
         _close_watchdog_fd(notify_fd)
         _close_watchdog_fd(ack_fd)
+
+
+def _fr_incident(fields: dict[str, str], worker: _StoreWorker, rank: int):
+    """This rank's watchdog fired: signal every rank to dump its flight
+    recorder (ProcessGroupNCCL's broadcastDumpSignal), dump this one's and
+    print the Python stack of the collective that timed out."""
+    grank = flight_recorder.global_rank(rank)
+    rec = flight_recorder.recorder()
+    if rec is not None:
+        rec.dumped_on_signal = True  # this process's own poller: done here
+    worker.run(lambda client: flight_recorder.signal_dump(client, grank), 2.0)
+    flight_recorder.dump_now(grank, "collective timeout")
+    worker.run(lambda client: flight_recorder.ack_dump(client, grank), 2.0)
+    frames = rec.stack(int(fields.get("fr", "0"))) if rec is not None else []
+    if frames:
+        lines = [
+            f"[rank {rank}] flight recorder: Python stack of that collective, "
+            "innermost first:\n"
+        ] + [
+            f'[rank {rank}]   File "{f["filename"]}", line {f["line"]}, in {f["name"]}\n'
+            for f in frames
+        ]
+        sys.stderr.write("".join(lines))
+        sys.stderr.flush()
+
+
+def _fr_wait_for_peers(fields: dict[str, str], worker: _StoreWorker, rank: int):
+    """Give the other ranks TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC to dump
+    before this one aborts (ProcessGroupNCCL sleeps 4x that instead)."""
+    if not dist.is_initialized():
+        return
+    world = dist.get_world_size()
+    wait = 0.5 if fields.get("exit") == "1" else flight_recorder.dump_wait_s()
+    deadline = time.monotonic() + wait
+    missing = worker.run(
+        lambda client: flight_recorder.wait_for_dumps(client, world, deadline),
+        wait + 2.0,
+    )
+    if missing:
+        sys.stderr.write(
+            f"[rank {rank}] flight recorder: no dump from ranks {_ranks(missing)} "
+            f"within {wait:.1f} s\n"
+        )
+        sys.stderr.flush()
 
 
 def _loud(method: Callable[..., object]) -> Callable[..., object]:
@@ -611,6 +669,9 @@ def _loud(method: Callable[..., object]) -> Callable[..., object]:
             traceback.print_exc(file=sys.stderr)
             self._abort_coalescing()
             raise
+        finally:
+            if self._fr is not None:
+                self._fr.clear()
 
     _LOUD.add(wrapper)
     return wrapper
@@ -733,6 +794,9 @@ class _Core:
         self.watchdog_test_fault = ctypes.CFUNCTYPE(None, vp, i32)(table[22])
         self.watchdog_test_limit = ctypes.CFUNCTYPE(None, vp, i32, i32)(table[23])
         self.watchdog_process_exiting = ctypes.CFUNCTYPE(None)(table[24])
+        self.fr_init = ctypes.CFUNCTYPE(vp, i64)(table[25])
+        self.fr_attach = ctypes.CFUNCTYPE(i32, vp, i64)(table[26])
+        self.fr_snapshot = ctypes.CFUNCTYPE(i64, vp, i64)(table[27])
 
     def check(self, rc: int, what: str):
         if rc != 0:
@@ -772,6 +836,11 @@ class MojoProcessGroup(dist.ProcessGroup):
         # alive until the operations that read and write it are submitted.
         self._coalesced_records: list[torch.Tensor] = []
         self._coalesced_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        # Flight recorder (flight_recorder.py), None when not recording; the
+        # point-to-point flags of the open coalescing block's operations.
+        self._fr: flight_recorder.Recorder | None = None
+        self._fr_block: list[bool] | None = None
+        self._fr_pg_id = -1
         # Communicator creation is collective: do it now, while every rank is
         # here, on the rank's current device (one visible GPU per torchrun rank).
         # A machine with no mojo device at all gets no communicator: only the
@@ -802,7 +871,9 @@ class MojoProcessGroup(dist.ProcessGroup):
             )
         self._handle_pid = os.getpid()
         version = self._core.version(self._handle)
-        name = "mojoccl" if nccl.uses_mojoccl() else nccl.vendor_name()
+        vendor = nccl.vendor_name()
+        name = "mojoccl" if nccl.uses_mojoccl() else vendor
+        self._fr_lib = ("rccl" if vendor == "rccl" else "nccl", version)
         if os.environ.get("TORCH_MOJO_BACKEND_TRACE", "1") != "0":
             print(
                 f"[TRACE] collectives via {self._path} ({name} version {version})",
@@ -825,6 +896,13 @@ class MojoProcessGroup(dist.ProcessGroup):
             )
             return
         wait_s = min(_DESYNC_WAIT_S, seconds)
+        fr = flight_recorder.make_recorder(
+            self._core.fr_init, self._core.fr_snapshot, self._fr_lib[0]
+        )
+        fr_dumps = fr is not None and flight_recorder.dump_on_timeout()
+        # The incident's own dump and the wait for the other ranks' come
+        # before the reporter acknowledges it.
+        fr_wait_s = flight_recorder.dump_wait_s() + 4 if fr_dumps else 0
         notify_r, notify_w = _watchdog_pipe()
         try:
             ack_r, ack_w = _watchdog_pipe()
@@ -834,20 +912,43 @@ class MojoProcessGroup(dist.ProcessGroup):
             raise
         os.set_blocking(notify_w, False)  # the watchdog's writes never block
         rc = self._core.watchdog(
-            self._handle, timeout_ms, action, notify_w, ack_r, int((wait_s + 5) * 1000)
+            self._handle,
+            timeout_ms,
+            action,
+            notify_w,
+            ack_r,
+            int((wait_s + 5 + fr_wait_s) * 1000),
         )
         if rc != 0:
             for fd in (notify_r, notify_w, ack_r, ack_w):
                 _close_watchdog_fd(fd)
             self._core.check(rc, "starting the collective watchdog")
         self._watchdog_fds = (notify_w, ack_r)
+        if fr is not None:
+            self._fr_pg_id = fr.add_group(self)
+            self._core.check(
+                self._core.fr_attach(self._handle, self._fr_pg_id),
+                "starting the flight recorder",
+            )
+            v = self._fr_lib[1]
+            fr.comm_lib_version = f"{v // 10000}.{v // 100 % 100}.{v % 100}"
+            self._fr = fr
+            flight_recorder.start_poller(self._store, self.rank())
         with _LIVE_LOCK:
             _LIVE_WATCHDOGS[id(self)] = _Live(self._core, cast(int, self._handle))
             if not _EXIT_CORE:
                 _EXIT_CORE.append(self._core)
         threading.Thread(
             target=_desync_reporter,
-            args=(notify_r, ack_w, self._store, self.rank(), self.size(), wait_s),
+            args=(
+                notify_r,
+                ack_w,
+                self._store,
+                self.rank(),
+                self.size(),
+                wait_s,
+                flight_recorder.unprefixed(self._store) if fr_dumps else None,
+            ),
             name="mojo-pg-desync-report",
             daemon=True,
         ).start()
@@ -878,6 +979,8 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._group_name = name
 
     def shutdown(self):
+        if self._fr is not None and self._handle is not None:
+            self._fr.remember(self._fr_pg_id)
         handle, self._handle = self._handle, None
         fds, self._watchdog_fds = self._watchdog_fds, None
         self._ready.clear()
@@ -1078,6 +1181,35 @@ class MojoProcessGroup(dist.ProcessGroup):
     def _op(self, dtype: torch.dtype, op: ReduceOp | ReduceOp.RedOpType) -> int:
         return _nccl_red_op(op, dtype)
 
+    def _fr_op(
+        self,
+        name: str,
+        inputs: list[torch.Tensor],
+        outputs: list[torch.Tensor],
+        p2p: bool = False,
+    ):
+        """Describe the call about to issue to the flight recorder, under
+        ProcessGroupNCCL's name for it (`_loud` clears it after the call)."""
+        fr = self._fr
+        if fr is None:
+            return
+        flags = flight_recorder.TAG_P2P if p2p else 0
+        block = self._fr_block
+        if block is not None and self._coalescing_thread == threading.get_ident():
+            flags |= flight_recorder.TAG_MEMBER
+            if not block:
+                flags |= flight_recorder.TAG_FIRST
+            block.append(p2p)
+        fr.begin(name, inputs, outputs, flags)
+
+    def _fr_block_end(self):
+        """The end entry of a coalescing block (ProcessGroupNCCL's
+        `nccl:coalesced`), committed by its group_end."""
+        block, self._fr_block = self._fr_block, None
+        if self._fr is not None and block is not None:
+            p2p = flight_recorder.TAG_P2P if any(block) else 0
+            self._fr.begin("coalesced", [], [], flight_recorder.TAG_END | p2p)
+
     def _result(self, index: int, tensors: list[torch.Tensor]) -> Work:
         if self._coalescing_open():
             self._coalesced_tensors.extend(tensors)
@@ -1113,6 +1245,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._coalesced_tensors = []
         self._coalesced_records = []
         self._coalesced_pairs = []
+        self._fr_block = []
 
     def _end_coalescing(self, device: torch.device) -> Work:
         """Submit the group, then run the work every call inside it deferred:
@@ -1130,7 +1263,12 @@ class MojoProcessGroup(dist.ProcessGroup):
         pairs, self._coalesced_pairs = self._coalesced_pairs, []
         # Taken out of the group state first: a failed group_end must leave no
         # deferred work behind for the next block to apply.
-        self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+        self._fr_block_end()
+        try:
+            self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+        finally:
+            if self._fr is not None:
+                self._fr.clear()
         self._record(index, *records)
         self._finish(index, *pairs)
         return self._work(index, tensors)
@@ -1149,6 +1287,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         records, self._coalesced_records = self._coalesced_records, []
         pairs, self._coalesced_pairs = self._coalesced_pairs, []
         try:
+            self._fr_block_end()
             self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
             self._record(index, *records)
             self._finish(index, *pairs)
@@ -1169,6 +1308,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(tensors[0]):
             return self._gloo.allreduce(tensors, opts)
+        self._fr_op("all_reduce", tensors, tensors)
         self._one_per_rank(tensors)
         tensor = tensors[0]
         index = self._same_device(tensors)
@@ -1192,6 +1332,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(tensors[0]):
             return self._gloo.allreduce_coalesced(tensors, opts)
+        self._fr_op("allreduce_coalesced", tensors, tensors)
         index = self._same_device(tensors)
         self._ensure(index)
         plan = [
@@ -1215,6 +1356,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(tensors[0]):
             return self._gloo.broadcast(tensors, opts)
+        self._fr_op("broadcast", tensors, tensors)
         self._one_per_rank(tensors)
         if opts.rootTensor != 0:
             raise ValueError("rootTensor must be 0 with one tensor per rank")
@@ -1243,6 +1385,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(tensors[0]):
             return self._gloo.reduce(tensors, opts)
+        self._fr_op("reduce", tensors, tensors)
         self._one_per_rank(tensors)
         tensor = tensors[0]
         index = self._same_device(tensors)
@@ -1299,6 +1442,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(input_tensor):
             return self._gloo._allgather_base(output_tensor, input_tensor, opts)
+        self._fr_op("_all_gather_base", [input_tensor], [output_tensor])
         index = self._same_device([input_tensor, output_tensor])
         self._ensure(index)
         staged_in, staged_out = self._allgather_flat(index, output_tensor, input_tensor)
@@ -1315,6 +1459,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(input_tensors[0]):
             return self._gloo.allgather(output_tensors, input_tensors, opts)
+        self._fr_op("all_gather", input_tensors, output_tensors[0])
         self._one_per_rank(input_tensors)
         input = input_tensors[0]
         outputs = output_tensors[0]
@@ -1356,6 +1501,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.allgather_into_tensor_coalesced(
                 output_tensors, input_tensors, opts
             )
+        self._fr_op("all_gather_into_tensor_coalesced", input_tensors, output_tensors)
         if len(output_tensors) != len(input_tensors):
             raise ValueError("coalesced all_gather needs as many outputs as inputs")
         index = self._same_device([*input_tensors, *output_tensors])
@@ -1408,6 +1554,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(input_tensor):
             return self._gloo._reduce_scatter_base(output_tensor, input_tensor, opts)
+        self._fr_op("_reduce_scatter_base", [input_tensor], [output_tensor])
         index = self._same_device([input_tensor, output_tensor])
         self._ensure(index)
         staged_in, staged_out = self._reduce_scatter_flat(
@@ -1426,6 +1573,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(output_tensors[0]):
             return self._gloo.reduce_scatter(output_tensors, input_tensors, opts)
+        self._fr_op("reduce_scatter", input_tensors[0], output_tensors)
         self._one_per_rank(output_tensors)
         output = output_tensors[0]
         inputs = input_tensors[0]
@@ -1456,6 +1604,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.reduce_scatter_tensor_coalesced(
                 output_tensors, input_tensors, opts
             )
+        self._fr_op("reduce_scatter_tensor_coalesced", input_tensors, output_tensors)
         if len(output_tensors) != len(input_tensors):
             raise ValueError("coalesced reduce_scatter needs as many outputs as inputs")
         index = self._same_device([*input_tensors, *output_tensors])
@@ -1542,6 +1691,7 @@ class MojoProcessGroup(dist.ProcessGroup):
             return self._gloo.alltoall_base(
                 output_tensor, input_tensor, output_split_sizes, input_split_sizes, opts
             )
+        self._fr_op("all_to_all", [input_tensor], [output_tensor])
         index = self._same_device([input_tensor, output_tensor])
         self._ensure(index)
         in_sizes = self._splits(input_tensor, list(input_split_sizes), "input")
@@ -1562,6 +1712,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(input_tensors[0]):
             return self._gloo.alltoall(output_tensors, input_tensors, opts)
+        self._fr_op("all_to_all", input_tensors, output_tensors)
         if len(output_tensors) != self.size() or len(input_tensors) != self.size():
             raise ValueError("all_to_all needs world_size input and output tensors")
         index = self._same_device([*input_tensors, *output_tensors])
@@ -1607,6 +1758,9 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(input_tensors[0]):
             return self._gloo.gather(output_tensors, input_tensors, opts)
+        self._fr_op(
+            "gather", input_tensors, output_tensors[0] if output_tensors else []
+        )
         self._one_per_rank(input_tensors)
         input = input_tensors[0]
         root = self.rank() == opts.rootRank
@@ -1729,6 +1883,9 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(output_tensors[0]):
             return self._gloo.scatter(output_tensors, input_tensors, opts)
+        self._fr_op(
+            "scatter", input_tensors[0] if input_tensors else [], output_tensors
+        )
         self._one_per_rank(output_tensors)
         output = output_tensors[0]
         root = self.rank() == opts.rootRank
@@ -1789,6 +1946,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     def send(self, tensors: list[torch.Tensor], dst_rank: int, tag: int) -> Work:
         if self._is_cpu(tensors[0]):
             return self._gloo.send(tensors, dst_rank, tag)
+        self._fr_op(f"send {self.rank()}->{dst_rank}", tensors, tensors, p2p=True)
         index = self._same_device(tensors)
         self._ensure(index)
         staged = [self._stage_in(index, t) for t in tensors]
@@ -1812,6 +1970,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     def recv(self, tensors: list[torch.Tensor], src_rank: int, tag: int) -> Work:
         if self._is_cpu(tensors[0]):
             return self._gloo.recv(tensors, src_rank, tag)
+        self._fr_op(f"recv {self.rank()}<-{src_rank}", tensors, tensors, p2p=True)
         index = self._same_device(tensors)
         self._ensure(index)
         staged = [self._stage_out(index, t) for t in tensors]

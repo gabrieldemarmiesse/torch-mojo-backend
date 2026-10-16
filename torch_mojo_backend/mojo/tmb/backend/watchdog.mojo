@@ -34,6 +34,7 @@ from std.time import perf_counter_ns, sleep
 from max.gpu.host import DeviceContext
 
 from tmb.backend.device import be
+from tmb.backend.flight_recorder import fr_commit, fr_done
 from tmb.backend.vendor import NOT_READY
 
 comptime SEG = 1024  # slots per queue segment
@@ -110,7 +111,8 @@ comptime S_FP = 8
 comptime S_ISSUED = 9
 comptime S_EVENT = 10  # created on the slot's first use, then fixed
 comptime S_CPOS = 11
-comptime S_WORDS = 12
+comptime S_FR = 12  # its flight recorder entry (record id + 1), 0 if none
+comptime S_WORDS = 13
 
 comptime WordsP = Pointer[Int64, MutUntrackedOrigin]
 comptime EventRecordFn = def(Int, Int) thin abi("C") -> Int32
@@ -405,6 +407,7 @@ struct Watch(Movable):
     var reported_call: Int  # watchdog's: in-call mark already reported
     var warned_full: Bool
     var warned_overflow: Bool
+    var fr: Int  # flight_recorder.mojo `fr_pg`, 0 when not recording
 
     def __init__(
         out self,
@@ -445,6 +448,7 @@ struct Watch(Movable):
         self.reported_call = 0
         self.warned_full = False
         self.warned_overflow = False
+        self.fr = 0
 
 
 comptime WatchP = Pointer[Watch, MutUntrackedOrigin]
@@ -690,6 +694,13 @@ def watch_claim(t: Int) -> Bool:
     return ok
 
 
+def watch_set_fr(w: Int, fp: Int):
+    """Record this group's collectives in the flight recorder from now on
+    (`fp`: flight_recorder.mojo `fr_pg`). Under the backend mutex."""
+    if w != 0:
+        _watch(w)[].fr = fp
+
+
 def watch_fault(t: Int, rc: Int):
     """A driver error on either side: the watchdog reports it, and a destroy
     aborts the communicator instead of trusting its queue."""
@@ -735,6 +746,17 @@ def _boundary(
     return Boundary(lo, 0)
 
 
+def _fr_retired(w: Int, tr: Tracker, lo: Int, hi: Int):
+    """Stamp the flight recorder entries of [lo, hi) completed: called
+    before the tail moves past them (their slots are reusable after)."""
+    var fp = _watch(w)[].fr
+    if fp == 0:
+        return
+    var now = perf_counter_ns()
+    for i in range(lo, hi):
+        fr_done(fp, _ld(_slot(tr, i), S_FR), now)
+
+
 def _retire_now(w: Int, t: Int):
     """Producer-side retirement, once per segment and never waiting: one
     query of the newest event (all done: everything retires), else the
@@ -754,6 +776,7 @@ def _retire_now(w: Int, t: Int):
             )
         if b.end > tail:
             var seq = _ld(_slot(tr, b.end - 1), S_SEQ)
+            _fr_retired(w, tr, tail, b.end)
             if _cas(tr.words, T_TAIL, tail, b.end):
                 _st_max(tr.words, T_DONE, seq)
     except:
@@ -816,6 +839,15 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
     in flight are commits dropped, until enough complete. A driver error
     goes to the watchdog (`watch_fault`)."""
     ref tr = _tracker(t)[]
+    var fr = fr_commit(
+        _watch(w)[].fr,
+        e.op,
+        e.nops,
+        e.count,
+        e.dtype,
+        e.root,
+        e.op >= OP_SEND and e.op <= OP_SENDRECV,
+    )
     if _ld(tr.words, T_FAULT) != 0 or _ld(tr.words, T_STATE) != 0:
         return
     var seq = _ld(tr.words, T_SEQ) + 1
@@ -868,6 +900,7 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
     _st(s, S_FP, Int(e.fp & 0x3FFFFFFFFFFFFFFF))
     _st(s, S_ISSUED, perf_counter_ns())
     _st(s, S_CPOS, e.cpos)
+    _st(s, S_FR, fr)
     _st(s, S_VER, v + 2)
     _st(tr.words, T_HEAD, head + 1)
 
@@ -943,6 +976,7 @@ def _drain(w: Int, t: Int, deadline_ns: Int) -> Bool:
             return False
         if b.end > tail:
             var seq = _ld(_slot(tr, b.end - 1), S_SEQ)
+            _fr_retired(w, tr, tail, b.end)
             if _cas(tr.words, T_TAIL, tail, b.end):
                 _st_max(tr.words, T_DONE, seq)
             continue
@@ -1426,6 +1460,7 @@ def _poll_tracker(w: Int, t: Int, now: Int) -> Bool:
         var last_seq = _ld(
             _slot(tr, b.end - 1), S_SEQ
         )  # before: reusable after
+        _fr_retired(w, tr, tail, b.end)
         if not _cas(tr.words, T_TAIL, tail, b.end):
             return True  # a drain retired entries: look again next round
         _st_max(tr.words, T_DONE, last_seq)
@@ -1494,6 +1529,7 @@ def _line(
     age_ns: Int,
     kind: StaticString,
     at_exit: Bool = False,
+    fr: Int = 0,
 ) -> String:
     """The machine-readable line for the Python desync reporter: `id` is the
     incident, `tid` the communicator (-1: a call blocked on the host)."""
@@ -1530,6 +1566,8 @@ def _line(
         + String(age_ns // 1_000_000)
         + " where="
         + String(kind)
+        + " fr="
+        + String(fr)
         + (" exit=1" if at_exit else "")
         + "\n"
     )
@@ -1575,7 +1613,15 @@ def _device_timeout(
     msg += _history(tr, pending, head - tail - len(pending), now, wa.rank)
     wa.incident += 1
     tr.published = True
-    var line = _line(wa, tr, pending[0].copy(), age, "device", at_exit)
+    var line = _line(
+        wa,
+        tr,
+        pending[0].copy(),
+        age,
+        "device",
+        at_exit,
+        _ld(_slot(tr, tail), S_FR),
+    )
     _fail(w, msg^, line, at_exit)
 
 

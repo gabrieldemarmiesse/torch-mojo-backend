@@ -18,7 +18,9 @@ inside main().
 # ruff: noqa: E402 -- use_local_rank_gpu() must run before torch/MAX initialize
 import contextlib
 import datetime
+import json
 import os
+import pickle
 import signal
 import sys
 import threading
@@ -32,6 +34,7 @@ use_local_rank_gpu()
 
 import torch
 import torch.distributed as dist
+from torch._C import _distributed_c10d as c10d_c
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torch_mojo_backend import register_mojo_devices
@@ -649,6 +652,107 @@ def run_abort(failures: list[str]):
     _check(failures, "abort.shutdown_after_abort_is_safe", True)
 
 
+def run_flight_recorder(failures: list[str]):
+    """The flight recorder seen through torch's own entry points: every
+    collective of this run in `_dump_nccl_trace` with ProcessGroupNCCL's
+    names, seq ids and shapes, completed; the JSON variant; the ring keeping
+    only the newest TORCH_FR_BUFFER_SIZE; a dump through the debug pipe."""
+    rank, world = dist.get_rank(), dist.get_world_size()
+    dev = torch.accelerator.current_accelerator()
+    assert dev is not None
+    size = int(os.environ.get("TORCH_FR_BUFFER_SIZE", "2000"))
+    t = torch.ones(4, 8, device=dev)
+    dist.all_reduce(t)
+    dist.broadcast(t, 0)
+    gathered = torch.empty(4 * world, 8, device=dev)
+    dist.all_gather_into_tensor(gathered, t)
+    scattered = torch.empty(4 // world, 8, device=dev)
+    dist.reduce_scatter_tensor(scattered, t)
+    expected = ["all_reduce", "broadcast", "_all_gather_base", "_reduce_scatter_base"]
+    if not _MOJO_CCL:
+        # One way, even ranks to the next: fr_trace pairs a coalesced
+        # block's ops starting from its first rank's and looks a recv's
+        # peer up by its own rank, so it only matches blocks where that
+        # rank sends (on NCCL's dumps too).
+        if rank % 2 == 0:
+            op = dist.P2POp(dist.isend, t, rank + 1)
+            expected += [f"send {rank}->{rank + 1}"]
+        else:
+            op = dist.P2POp(dist.irecv, torch.empty_like(t), rank - 1)
+            expected += [f"recv {rank}<-{rank - 1}"]
+        for work in dist.batch_isend_irecv([op]):
+            work.wait()
+        expected += ["coalesced"]
+    for _ in range(12):
+        dist.all_reduce(t)
+    expected += ["all_reduce"] * 12
+    torch.accelerator.synchronize()
+    time.sleep(0.5)  # the watchdog retires (stamps) them within a poll
+    dump = pickle.loads(c10d_c._dump_nccl_trace())  # ty: ignore[unresolved-attribute] -- stubbed for CUDA builds only; register_mojo_devices() installs it
+    entries = dump["entries"]
+    names = [e["profiling_name"].split(":", 1)[1] for e in entries]
+    if size == 0:
+        _check(failures, "fr.buffer_size_0_records_nothing", entries == [])
+        _check(
+            failures,
+            "fr.buffer_size_0_starts_no_monitor",
+            not any(th.name == "mojo-pg-fr-monitor" for th in threading.enumerate()),
+        )
+        return
+    _check(failures, "fr.names", names == expected[-size:])
+    ids = [e["record_id"] for e in entries]
+    _check(
+        failures,
+        "fr.ring_keeps_the_newest",
+        ids == list(range(len(expected) - len(ids), len(expected))),
+    )
+    _check(
+        failures, "fr.all_completed", all(e["state"] == "completed" for e in entries)
+    )
+    coll = [e["collective_seq_id"] for e in entries if not e["is_p2p"]]
+    _check(failures, "fr.collective_seq_ids", coll == sorted(coll))
+    _check(
+        failures,
+        "fr.frames_start_in_torch_distributed",
+        all(
+            e["frames"] and "torch/distributed" in e["frames"][0]["filename"]
+            for e in entries
+            if not e["profiling_name"].endswith("coalesced")
+        ),
+    )
+    if size >= len(expected):
+        _check(
+            failures,
+            "fr.shapes",
+            entries[2]["input_sizes"] == [[4, 8]]
+            and entries[2]["output_sizes"] == [[4 * world, 8]]
+            and entries[0]["input_dtypes"] == ["Float"],
+        )
+    as_json = json.loads(c10d_c._dump_nccl_trace_json())  # ty: ignore[unresolved-attribute] -- stubbed for CUDA builds only; register_mojo_devices() installs it
+    _check(
+        failures,
+        "fr.json",
+        len(as_json["entries"]) == len(entries)
+        and "frames" not in as_json["entries"][0],
+    )
+    _check(
+        failures,
+        "fr.pg_config",
+        dump["pg_config"]["0"]
+        == {"name": "0", "desc": "default_pg", "ranks": str(list(range(world)))},
+    )
+    stem = os.environ.get("TORCH_NCCL_DEBUG_INFO_PIPE_FILE")
+    if stem:
+        path = os.environ["TORCH_FR_DUMP_TEMP_FILE"] + str(rank)
+        with open(f"{stem}{rank}.pipe", "w") as pipe:
+            pipe.write("dump")
+        deadline = time.monotonic() + 10
+        while not os.path.exists(path) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        _check(failures, "fr.pipe_dumps", os.path.exists(path))
+        dist.barrier()  # both dumps written before torchrun reaps a rank
+
+
 # The timeout of the process group the `desync*` modes hang: what its
 # watchdog waits. The default group keeps 300 s, so rendezvous, communicator
 # creation and first-use kernel builds (a cold cache) never count against it.
@@ -943,6 +1047,8 @@ def main():
         run_stress(failures)
     elif mode == "abort":
         run_abort(failures)
+    elif mode == "flight_recorder":
+        run_flight_recorder(failures)
     else:
         raise ValueError(f"unknown mode {mode}")
     dist.destroy_process_group()

@@ -468,10 +468,11 @@ communicators and does the actual library calls.
     does no native work (the communicators and threads are the parent's).
   - *Known limitations* (reviewed, judged narrow, left as they are):
     - Not done: `ncclCommGetAsyncError` polling (mojoccl's needs a
-      device-to-host read that blocks behind the hung kernel), dumps from
-      ranks whose own watchdog did not fire (their missing record is the
-      signal, and the report says a rank that could not send one looks
-      the same), pairing a send with its recv across ranks.
+      device-to-host read that blocks behind the hung kernel), a desync
+      record from ranks whose own watchdog did not fire (their missing
+      record is the signal, and the report says a rank that could not
+      send one looks the same; their flight recorder dump has the rest),
+      pairing a send with its recv across ranks.
     - A thread blocked inside a library call holds the backend mutex, so
       an exiting thread that frees a tensor blocks behind it before the
       exit hook runs; the watchdog's timeout then reports it (in report
@@ -495,6 +496,73 @@ communicators and does the actual library calls.
       library call (an abort that may hang), so such an exit can end with
       status 1 even in report mode.
     - Groups across process groups and RCCL/HIP are untested.
+  - *Flight recorder* (`tmb/backend/flight_recorder.mojo`,
+    `distributed/flight_recorder.py`; user docs: "Flight recorder dumps").
+    PyTorch 2.14's (c10d/FlightRecorder.hpp, schema version "2.10"),
+    rebuilt because nothing of torch's reaches a Python `ProcessGroup`:
+    `FlightRecorderHook` hangs off the C++ c10d ops our methods bypass, and
+    its `c10d:` names fail the analyzer's backend whitelist
+    (fr/components/types.py), as `mojo:` would -- hence `nccl:` (`rccl:` on
+    RCCL) and ProcessGroupNCCL's op names.
+    - *Ring.* One per process, `TORCH_FR_BUFFER_SIZE` slots, seqlocked like
+      the tracker's; written under the backend mutex, read by the dump
+      without it. `watch_commit` writes an entry for every tracked commit
+      (so graph collectives are in it) and stores its id in the tracker
+      slot (`S_FR`); the three places that move `tail` stamp it completed
+      first. Seq ids are ProcessGroupNCCL's, counted per group in the
+      native core (eager and graph collectives share them). Off with the
+      watchdog.
+    - *Tag word.* Python cannot learn which ring entry a call made, so
+      before the call `_fr_op` writes a record id (plus member/first/end/
+      p2p bits and a thread hash) into the ring header; entries take it,
+      the dump joins them with the Python record (name, shapes, dtypes,
+      `gather_traceback`). A torch op issuing several library calls inside
+      `_group()` is one entry (its group commit); a coalescing block's
+      operations are member entries (no completion: they take the end
+      entry's) plus a `coalesced` end entry, ProcessGroupNCCL's layout,
+      which is what lets the analyzer pair sends with recvs. Graph
+      collectives (no tag) get names and `[[count]]` sizes from the native
+      op: the lowering knows the FakeTensor shape, but carrying it to the
+      ring needs a graph input or a per-node op parameter (a recompile per
+      node).
+    - *Dumps.* Written by Python (pickle protocol 2, renamed into place
+      under a name without the prefix, which the analyzer's loader matches
+      by substring). On an incident `_desync_reporter` sets
+      `exception_dump` on the unprefixed store, dumps, prints the timed-out
+      entry's stack (the incident line carries `fr=`), runs the desync
+      report, then waits for every rank's `mojo_fr/dumped/<rank>`
+      (`TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC`) before acking; the native ack
+      window grows by that wait plus 4 s. One `mojo-pg-fr-monitor` thread
+      per process polls the key and the debug pipe every
+      `TORCH_NCCL_COORD_CHECK_MILSEC`, dumps once per process and acks.
+      `_dump_nccl_trace[_json]` are patched (monkeypatching.py) to return
+      this dump.
+    - *Host cost* (job 321355, 2 x H100, the watchdog's
+      overhead.py legs with TORCH_FR_BUFFER_SIZE=0 vs 2000, ABBA, medians
+      of six legs): the native entry is unchanged within noise (NCCL 8.87
+      -> 8.86 us, mojoccl 4.46 -> 4.54 us: about 15 word stores, no extra
+      clock read); `dist.all_reduce` pays +2.6-3.6 us (NCCL 28.9 -> 31.9,
+      mojoccl 23.5 -> 27.1), about 1 us of it `gather_traceback` (a leg
+      with it stubbed out: +1.7 us), the rest the record and the tag
+      word. torch records a Python stack per collective too. A dict keyed
+      by tag cost 5.9 us per record (popping its oldest key scans the
+      dummies left at the front); the records are a list indexed by tag.
+    - *fr_trace quirks* (2.11 and 2.14.1 alike, on NCCL's dumps too): it
+      logs "does not have a coalesced end" for every `nccl:coalesced` (it
+      checks `endswith("_coalesced")`); it pairs a coalescing block's p2p
+      ops from its first rank's and looks a recv's peer up by the recv's
+      own rank, so a block where that rank receives is a MISMATCH; and its
+      MISMATCH table needs `tabulate` (2.14.1 raises NameError without
+      it). The worker's p2p check is one-way for that reason.
+    - Verified by hand against the 2.14.1 analyzer (CPU wheel venv,
+      `~/ddp_work/flight_recorder/torch214`) on real two-rank dumps:
+      desync (NCCL, mojoccl, compiled graph) names "Not all ranks joining
+      collective, sequence number: 2 ... missing ranks: {1}" with the
+      eager stack; the clean runs report nothing.
+    - Tests: `test_flight_recorder.py` (CPU: format, member states, the
+      installed analyzer naming a missing rank and pairing a p2p block),
+      `test_two_rank_flight_recorder*` and the compiled `flight_recorder`
+      mode in test_distributed.py.
   - *Host cost* (job 318657, 2 x H100, bare pg.mojo allreduce entry through
     ctypes, 1 element, sync every 200 calls, median of the six ABBA legs,
     legs the node slowed down for both sides left out): NCCL 7.11 ->

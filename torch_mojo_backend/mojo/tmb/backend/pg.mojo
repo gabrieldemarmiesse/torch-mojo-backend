@@ -30,6 +30,13 @@ from tmb.backend.device import (
     set_error,
     stream_ctx,
 )
+from tmb.backend.flight_recorder import (
+    fr_init,
+    fr_member,
+    fr_pg,
+    fr_ring,
+    fr_snapshot,
+)
 from tmb.backend.vendor import raw_stream_of
 from tmb.backend.watchdog import (
     ACTION_OFF,
@@ -65,6 +72,7 @@ from tmb.backend.watchdog import (
     watch_group_add,
     watch_next_cpos,
     watch_process_exiting,
+    watch_set_fr,
 )
 
 comptime UID_BYTES = 128
@@ -147,6 +155,7 @@ struct PG(Movable):
     var watch: Int  # the collective watchdog (watchdog.mojo), 0 when off
     var timeout_ns: Int  # init_process_group's timeout, 0 when unknown
     var closing: Bool  # destroyed or being destroyed: every entry fails
+    var fr: Int  # its flight recorder state (flight_recorder.mojo), 0 if off
 
     def __init__(out self, path: String, rank: Int, world: Int) raises:
         self.lib = OwnedDLHandle(path)
@@ -167,6 +176,7 @@ struct PG(Movable):
         self.watch = 0
         self.timeout_ns = 0
         self.closing = False
+        self.fr = 0
 
     def symbol(self, name: String) raises -> Int:
         return _symbol(self.lib, name)
@@ -246,6 +256,9 @@ struct PG(Movable):
             watch_next_cpos(c.tracker, op),
         )
         if group_open(self.watch, self.f_group_start):
+            fr_member(
+                self.fr, op, count, d, root, op == OP_SEND or op == OP_RECV
+            )
             watch_group_add(c.tracker, e^)
             group_note(self.f_group_start, self.watch, c.tracker, c.raw)
         else:
@@ -934,7 +947,43 @@ def tmb_pg_watchdog_process_exiting() abi("C"):
     watch_process_exiting()
 
 
-comptime PG_VTABLE_SLOTS = 25
+def tmb_pg_fr_init(size: Int64) abi("C") -> Int:
+    """The flight recorder's ring, made with `size` entries on the first
+    call: the address of its header, whose word 2 is the tag word
+    flight_recorder.py writes. 0 when `size` is 0."""
+    with Locked():
+        return fr_init(Int(size))
+
+
+def tmb_pg_fr_attach(p: Int, pg_id: Int64) abi("C") -> Int32:
+    """Record the group's collectives in the flight recorder as `pg_id`.
+    Needs the ring and the group's watchdog (the recorder follows it)."""
+    with Locked():
+        try:
+            var pg = _pg(p)
+            pg[].open_or_raise()
+            var ring = fr_ring()
+            if ring == 0 or pg[].watch == 0:
+                raise Error(
+                    "the flight recorder needs its ring and the watchdog"
+                )
+            if pg[].fr == 0:
+                pg[].fr = fr_pg(ring, Int(pg_id))
+                watch_set_fr(pg[].watch, pg[].fr)
+            return 0
+        except e:
+            set_error(String(e))
+            return 1
+
+
+def tmb_pg_fr_snapshot(buf: Int, cap: Int64) abi("C") -> Int64:
+    """Copy up to `cap` flight recorder entries, oldest first, into `buf`
+    (flight_recorder.mojo F_WORDS int64 words each). No backend mutex: a
+    dump must work while a hung thread holds it."""
+    return Int64(fr_snapshot(buf, Int(cap)))
+
+
+comptime PG_VTABLE_SLOTS = 28
 
 
 def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
@@ -944,7 +993,7 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     11 send, 12 recv, 13 group_start, 14 group_end, 15 async_error, 16 abort,
     17 synchronize_comm, 18 graph_start, 19 graph_wait, 20 watchdog,
     21 watchdog_exit, 22 watchdog_test_fault, 23 watchdog_test_limit,
-    24 watchdog_process_exiting.
+    24 watchdog_process_exiting, 25 fr_init, 26 fr_attach, 27 fr_snapshot.
     """
     var t = unsafe_alloc[Int](PG_VTABLE_SLOTS)
     var f0: def(Pointer[c_char, MutUntrackedOrigin], Int32, Int32) thin abi(
@@ -1000,6 +1049,9 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
         "C"
     ) -> None = tmb_pg_watchdog_test_limit
     var f24: def() thin abi("C") -> None = tmb_pg_watchdog_process_exiting
+    var f25: def(Int64) thin abi("C") -> Int = tmb_pg_fr_init
+    var f26: def(Int, Int64) thin abi("C") -> Int32 = tmb_pg_fr_attach
+    var f27: def(Int, Int64) thin abi("C") -> Int64 = tmb_pg_fr_snapshot
     t[unsafe_offset=0] = Pointer(to=f0).unsafe_bitcast[Int]()[]
     t[unsafe_offset=1] = Pointer(to=f1).unsafe_bitcast[Int]()[]
     t[unsafe_offset=2] = Pointer(to=f2).unsafe_bitcast[Int]()[]
@@ -1025,4 +1077,7 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=22] = Pointer(to=f22).unsafe_bitcast[Int]()[]
     t[unsafe_offset=23] = Pointer(to=f23).unsafe_bitcast[Int]()[]
     t[unsafe_offset=24] = Pointer(to=f24).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=25] = Pointer(to=f25).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=26] = Pointer(to=f26).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=27] = Pointer(to=f27).unsafe_bitcast[Int]()[]
     return t
