@@ -75,6 +75,7 @@ from tmb.backend.abi import (
     Owned,
     ST_BOOL,
     ST_INT64,
+    ST_BFLOAT16,
     ST_FLOAT16,
     ST_FLOAT32,
     ST_FLOAT64,
@@ -375,7 +376,16 @@ def _real_alpha_args(args: Values, negate: Bool) raises -> List[Value]:
                 0,
             )
         else:
-            check_real_scalar_fits(common, alpha)
+            # c10's complex -> real conversion into the kernel's scalar
+            # type: a nonzero imaginary part overflows it, and a floating
+            # one (Half / BFloat16 compute in float) range-checks the real
+            # part. The real part then converts as a double alpha does
+            # (`_kernel_alpha`: sub's -alpha, range-checked, for an integer).
+            var opmath = common
+            if common == ST_FLOAT16 or common == ST_BFLOAT16:
+                opmath = ST_FLOAT32
+            if parts[1] != 0.0 or is_float_stype(opmath):
+                check_real_scalar_fits(opmath, alpha)
             alpha = Value(TAG_SCALAR_DOUBLE, 0, alpha.a, 0)  # the real part
     var out = List[Value](capacity=4)
     out.append(args[unsafe_offset=0].copy())
