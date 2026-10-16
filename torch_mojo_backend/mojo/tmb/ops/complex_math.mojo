@@ -75,6 +75,7 @@ from tmb.backend.abi import (
     Owned,
     ST_BOOL,
     ST_INT64,
+    ST_BFLOAT16,
     ST_FLOAT16,
     ST_FLOAT32,
     ST_FLOAT64,
@@ -165,11 +166,8 @@ def _arith(
     var a = _operand(av, like)
     var b = _operand(bv, like)
     var st = _result_type(a, b)
-    if alpha.tag == TAG_COMPLEX and not is_complex_stype(st):
-        raise Error(
-            "For non-complex input tensors, argument alpha must not be a"
-            " complex number."
-        )
+    if alpha.tag != TAG_NONE:
+        _alpha_check(st, alpha)  # a complex alpha on a real result raises
     if not is_complex_stype(st):
         unsupported("a complex op whose result type is not complex")
     if alpha.tag != TAG_NONE:
@@ -328,8 +326,31 @@ def cx_add(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+def _real_inplace_checks(args: Values, sub: Bool) raises:
+    """add_ / sub_ of a real self and other that took the complex route
+    for a complex alpha: sub_check, then compute_types' cast of the common
+    dtype into self, before alpha_check (in `_arith`), as CUDA orders them
+    (bool.add_(int32, alpha=1j) is the cast error)."""
+    if v_is_complex(args[unsafe_offset=0]) or v_is_complex(
+        args[unsafe_offset=1]
+    ):
+        return
+    if sub:
+        sub_check(
+            _is_bool_value(args[unsafe_offset=0]),
+            _is_bool_value(args[unsafe_offset=1]),
+        )
+    var like = _first_tensor(args[unsafe_offset=0], args[unsafe_offset=1])
+    var common = _result_type(
+        _operand(args[unsafe_offset=0], like),
+        _operand(args[unsafe_offset=1], like),
+    )
+    _check_cast(common, v_tensor_c(args[unsafe_offset=0]).stype)
+
+
 def cx_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """add_.Tensor(self, other, *, alpha)"""
+    _real_inplace_checks(args, False)
     var self = v_tensor_c(args[unsafe_offset=0])
     _inplace(
         args,
@@ -345,9 +366,10 @@ def cx_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _real_alpha_args(args: Values, negate: Bool) raises -> List[Value]:
-    """add / sub.out's arguments for a complex `out` with no complex input,
-    alpha as CUDA's kernel reads it: `alpha_check` against the out's
-    (complex) dtype, then alpha converted into the inputs' computation
+    """add / sub.out's arguments for a real-input call on the complex route
+    (a complex out, or a complex alpha), alpha as CUDA's kernel reads it:
+    the common dtype's cast into the out, `alpha_check` against the out's
+    dtype, then alpha converted into the inputs' computation
     dtype (f8_iter's `_kernel_alpha`; a complex alpha by c10's
     complex -> real conversion, which a nonzero imaginary part overflows,
     except into bool). The real functional op then computes, and its
@@ -359,12 +381,14 @@ def _real_alpha_args(args: Values, negate: Bool) raises -> List[Value]:
             _is_bool_value(args[unsafe_offset=1]),
         )
     var alpha = args[unsafe_offset=2].copy()
-    _alpha_check(v_tensor_c(args[unsafe_offset=3]).stype, alpha)
+    var out_st = v_tensor_c(args[unsafe_offset=3]).stype
     var like = _first_tensor(args[unsafe_offset=0], args[unsafe_offset=1])
     var common = _result_type(
         _operand(args[unsafe_offset=0], like),
         _operand(args[unsafe_offset=1], like),
     )
+    _check_cast(common, out_st)  # compute_types, before alpha_check
+    _alpha_check(out_st, alpha)
     if alpha.tag == TAG_COMPLEX and not is_complex_stype(common):
         var parts = v_complex(alpha)
         if common == ST_BOOL:
@@ -375,7 +399,16 @@ def _real_alpha_args(args: Values, negate: Bool) raises -> List[Value]:
                 0,
             )
         else:
-            check_real_scalar_fits(common, alpha)
+            # c10's complex -> real conversion into the kernel's scalar
+            # type: a nonzero imaginary part overflows it, and a floating
+            # one (Half / BFloat16 compute in float) range-checks the real
+            # part. The real part then converts as a double alpha does
+            # (`_kernel_alpha`: sub's -alpha, range-checked, for an integer).
+            var opmath = common
+            if common == ST_FLOAT16 or common == ST_BFLOAT16:
+                opmath = ST_FLOAT32
+            if parts[1] != 0.0 or is_float_stype(opmath):
+                check_real_scalar_fits(opmath, alpha)
             alpha = Value(TAG_SCALAR_DOUBLE, 0, alpha.a, 0)  # the real part
     var out = List[Value](capacity=4)
     out.append(args[unsafe_offset=0].copy())
@@ -433,6 +466,7 @@ def cx_sub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def cx_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _real_inplace_checks(args, True)
     var self = v_tensor_c(args[unsafe_offset=0])
     _inplace(
         args,

@@ -260,11 +260,21 @@ def test_bool_add_alpha_checks(mojo_gpu):
 _ALPHA_JSON = pathlib.Path(__file__).parent / "binary_alpha_cuda.json"
 # one case's outcome: {"dtype", "values"} or {"error", "message"}
 _Outcome: TypeAlias = dict[
-    str, str | list[bool] | list[int] | list[float] | list[list[float]]
+    str,
+    str
+    | list[bool]
+    | list[int]
+    | list[float | str]
+    | list[list[float | str]]
+    | list[float]
+    | list[list[float]],
 ]
 _ALPHA_OPS = ("add", "sub", "rsub")
 _ALPHA_VARIANTS = ("fn", "inplace", "out")
-_ALPHA_IN = [torch.int8, torch.int16, torch.uint8, torch.int32, torch.int64, torch.bool]
+_ALPHA_IN = [
+    torch.int8, torch.int16, torch.uint8, torch.int32, torch.int64, torch.bool,
+    torch.float16, torch.bfloat16, torch.float32,
+]  # fmt: skip
 # out= dtypes, and the in-place selves: every category the output can be
 # (a complex one goes through the complex route, a half one is computed in
 # float32 but checked against itself)
@@ -276,7 +286,13 @@ _ALPHA_SELF = [
     torch.float32, torch.int64, torch.int8, torch.bool, torch.complex64,
     torch.float16,
 ]  # fmt: skip
-_ALPHA_VALUES = [1, 1.0, 2.5, True, False, -128, 128]
+_INF = float("inf")
+_ALPHA_VALUES = [1, 1.0, 2.5, True, False, -128, 128, float("nan"), _INF, -_INF]
+# complex alphas: a complex output converts one into the inputs'
+# computation dtype (sub's -alpha, a Half / BFloat16 sum's float), any
+# other output refuses it in alpha_check (an integral one with the
+# "floating point" message, in CUDA's order)
+_ALPHA_COMPLEX_VALUES = [1j, 2 + 0j, -1 + 0j, 128 + 0j, -0.5 + 0j, 65505 + 0j, 1e5 + 0j]
 
 
 def _alpha_vals(dtype: torch.dtype, device: str) -> torch.Tensor:
@@ -291,6 +307,12 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
+def _json_number(v: float) -> float | str:
+    """A value JSON holds and `==` compares: NaN and the infinities as
+    "nan", "inf", "-inf"."""
+    return v if math.isfinite(v) else str(v)
+
+
 def _alpha_outcome(fn) -> _Outcome:
     try:
         t = fn()
@@ -298,8 +320,10 @@ def _alpha_outcome(fn) -> _Outcome:
         message = str(error).split(" [aten::")[0].split("\n")[0]
         return {"error": type(error).__name__, "message": message}
     values = t.cpu().tolist()
-    if t.is_complex():
-        values = [[v.real, v.imag] for v in values]  # JSON has no complex
+    if t.is_complex():  # JSON has no complex: [re, im]
+        values = [[_json_number(v.real), _json_number(v.imag)] for v in values]
+    elif t.dtype.is_floating_point:
+        values = [_json_number(v) for v in values]
     return {"dtype": _dtype_name(t.dtype), "values": values}
 
 
@@ -308,7 +332,8 @@ def _alpha_cases(device: str, op: str, variant: str) -> dict[str, _Outcome]:
     `op` / `variant` on `device`, keyed by case id."""
     cases = {}
     outs = {"fn": _ALPHA_OUT[:1], "inplace": _ALPHA_SELF, "out": _ALPHA_OUT}[variant]
-    for idt, odt, alpha in itertools.product(_ALPHA_IN, outs, _ALPHA_VALUES):
+    combos = itertools.product(_ALPHA_IN, outs, _ALPHA_VALUES + _ALPHA_COMPLEX_VALUES)
+    for idt, odt, alpha in combos:
         a = _alpha_vals(idt, device)
         b = torch.tensor([2, 5, 7], device=device).to(idt)
         fn = getattr(torch, op)
