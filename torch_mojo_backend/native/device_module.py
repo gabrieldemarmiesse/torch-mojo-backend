@@ -210,29 +210,31 @@ def _gfx_version(arch: str) -> tuple[int | None, int | None]:
 
 
 _properties_cache: dict[int, MojoDeviceProperties] = {}
-_properties_pid = os.getpid()
 _properties_lock = threading.Lock()
+
+
+def _reset_properties_cache():
+    # A forked child starts empty, so its first read reaches the native
+    # bad-fork check, and with a fresh lock: another parent thread may have
+    # held this one at fork time.
+    global _properties_lock
+    _properties_cache.clear()
+    _properties_lock = threading.Lock()
+
+
+os.register_at_fork(after_in_child=_reset_properties_cache)
 
 
 def get_device_properties(
     device: int | str | torch.device | None = None,
 ) -> MojoDeviceProperties:
-    """Properties of the device, read once and cached for its lifetime: like
-    torch.cuda's, the same object comes back every call. They are hardware
-    constants, but a forked child skips the cache so the native bad-fork
-    check still raises there."""
-    global _properties_pid
+    """Properties of the device, read once per process: like torch.cuda's,
+    the same object comes back every call."""
     idx = _index(device)
-    pid = os.getpid()
-    if pid == _properties_pid:
-        cached = _properties_cache.get(idx)
-        if cached is not None:
-            return cached
+    cached = _properties_cache.get(idx)
+    if cached is not None:
+        return cached
     with _properties_lock:
-        if pid != _properties_pid:
-            _properties_cache.clear()
-            _read_device_properties(idx)  # raises in a bad fork
-            _properties_pid = pid
         cached = _properties_cache.get(idx)
         if cached is None:
             cached = _properties_cache[idx] = _read_device_properties(idx)

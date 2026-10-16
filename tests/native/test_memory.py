@@ -1627,6 +1627,18 @@ def test_properties_are_cached_per_device(
         device_module.get_device_properties(count)
 
 
+def test_properties_fork_while_the_cache_lock_is_held(mojo_device: str):
+    torch.empty(7, device=mojo_device)  # a context, so the child's fork is bad
+    with device_module._properties_lock:
+
+        def child() -> str:
+            with pytest.raises(RuntimeError, match="spawn"):
+                device_module.get_device_properties(mojo_device)
+            return "ok"
+
+        assert _in_forked_child(child) == "ok"
+
+
 def test_properties_and_memory_info(mojo_device: str):
     props = device_module.get_device_properties(mojo_device)
     assert props == device_module.get_device_properties(torch.device(mojo_device))
