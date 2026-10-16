@@ -90,11 +90,12 @@ def find_broadcast_shape(shape_a: list[Dim], shape_b: list[Dim]) -> list[Dim]:
     # missing dims with None, which resolve to the other shape's dims.
     result = []
     for dim_a, dim_b in itertools.zip_longest(reversed(shape_a), reversed(shape_b)):
-        if dim_a == dim_b:
+        # a missing dim first: a size-1 dim against it keeps its 1
+        if dim_b is None:
             result.append(dim_a)
-        elif dim_a in (Dim(1), None):
+        elif dim_a is None or dim_a == dim_b or dim_a == Dim(1):
             result.append(dim_b)
-        elif dim_b in (Dim(1), None):
+        elif dim_b == Dim(1):
             result.append(dim_a)
         else:
             raise ValueError(
@@ -3806,10 +3807,14 @@ def aten_index_put(
     values: MaxTensor,
     accumulate: bool = False,
 ) -> MaxTensor:
-    """``out = input.clone(); out[indices] = values`` (``+=`` when
-    ``accumulate``) — the write mirror of ``aten_index``.
+    """``out = input.clone(); out[indices] = values``, or, when
+    ``accumulate``, every update summed into its destination (repeated
+    indices included) — the write mirror of ``aten_index``.
 
-    Only a single index tensor on axis 0 is served; anything else (a boolean mask, several index tensors, an
+    Only a single index tensor on axis 0 is served, of any rank: an N-D
+    index writes ``index.shape + input.shape[1:]``, flattened here to the
+    1-D index ``scatter_nd`` takes (the embedding backward's ``[batch, seq]``
+    token ids). Anything else (a boolean mask, several index tensors, an
     index on a later axis) raises rather than silently computing the wrong
     thing. The MAX primitives are the ``_nd`` scatters and not the axis-based
     ``F.scatter``/``F.scatter_add``, because those have no GPU kernel and
@@ -3828,9 +3833,11 @@ def aten_index_put(
             "number of written elements is data dependent)"
         )
     if len(index.shape) != 1:
-        raise NotImplementedError(
-            f"aten.index_put needs a 1-D index tensor, got rank {len(index.shape)}"
-        )
+        values = _broadcast_to(values, [*index.shape, *input.shape[1:]])
+        # the index first: its length is then known, where reshape cannot
+        # infer -1 against a zero-size trailing dim
+        index = F.reshape(index, [-1])
+        values = F.reshape(values, [index.shape[0], *input.shape[1:]])
     # scatter_nd's updates carry the trailing (unindexed) axes of `input`:
     # indices [rows, 1] pairs with updates [rows, *input.shape[1:]].
     updates = _broadcast_to(values, [index.shape[0], *input.shape[1:]])

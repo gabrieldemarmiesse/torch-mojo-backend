@@ -29,7 +29,7 @@ _WORKER = Path(__file__).parent / "ddp_worker.py"
 
 
 def _gpu_count() -> int:
-    return len(list(get_accelerators())) - 1  # get_accelerators appends the CPU
+    return len(list(get_accelerators()))
 
 
 def test_backend_name_registered():
@@ -430,6 +430,19 @@ def test_two_rank_fsdp2(mode: str, ccl: str):
         pytest.skip("needs at least 2 GPUs")
     extra_env = {"TORCH_MOJO_BACKEND_CCL": ccl}
     _run_torchrun(2, mode, extra_env, Path(__file__).parent / "fsdp_worker.py")
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.parametrize(
+    "mode", ["functional", "interleaved", "tensor_parallel", "unsupported"]
+)
+def test_two_rank_compiled_collectives(mode: str, ccl: str):
+    """Collectives inside graphs compiled with `mojo_backend`
+    (torch_compile_backend/collectives.py), compared with eager mode."""
+    if _gpu_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    extra_env = {"TORCH_MOJO_BACKEND_CCL": ccl}
+    _run_torchrun(2, mode, extra_env, Path(__file__).parent / "compile_c10d_worker.py")
 
 
 def test_two_rank_reduce_scatter_chunked():

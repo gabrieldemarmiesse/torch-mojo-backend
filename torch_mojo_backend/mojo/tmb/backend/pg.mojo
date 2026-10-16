@@ -20,11 +20,13 @@ from std.memory.alloc import unsafe_alloc
 
 from tmb.backend.device import (
     _add_stream,
+    be,
     current_stream,
     dev,
     set_error,
     stream_ctx,
 )
+from tmb.backend.vendor import raw_stream_of
 
 comptime UID_BYTES = 128
 
@@ -104,6 +106,11 @@ struct PG(Movable):
     var f_recv: Int
     var f_group_start: Int
     var f_group_end: Int
+    # Collectives issued from compiled MAX graphs (tmb_pg_graph_start/_wait):
+    # idle vendor events per device, and the completion event of every
+    # collective still waiting for its graph wait, keyed by its output.
+    var graph_events: Dict[Int, List[Int]]
+    var graph_pending: Dict[Int, Int]
 
     def __init__(out self, path: String, rank: Int, world: Int) raises:
         self.lib = OwnedDLHandle(path)
@@ -119,6 +126,8 @@ struct PG(Movable):
         self.f_recv = _symbol(self.lib, "ncclRecv")
         self.f_group_start = _symbol(self.lib, "ncclGroupStart")
         self.f_group_end = _symbol(self.lib, "ncclGroupEnd")
+        self.graph_events = Dict[Int, List[Int]]()
+        self.graph_pending = Dict[Int, Int]()
 
     def symbol(self, name: String) raises -> Int:
         return _symbol(self.lib, name)
@@ -145,6 +154,21 @@ struct PG(Movable):
                 " (init_device first, or it was aborted)",
             )
         return c.value().copy()
+
+    def graph_event(mut self, device: Int) raises -> Int:
+        """An idle event of `device` (vendor driver handle, no timing)."""
+        var idle = self.graph_events.find(device)
+        if idle and len(idle.value()) > 0:
+            var ev = self.graph_events[device].pop()
+            return ev
+        return be()[].vendor.value().event_create(dev(device)[].ctx, False)
+
+    def graph_release(mut self, device: Int, ev: Int):
+        """Back to the pool. A wait enqueued on the event already captured
+        its last record, so the event may be recorded again right away."""
+        var pool = self.graph_events.pop(device, List[Int]())
+        pool.append(ev)
+        self.graph_events[device] = pool^
 
     def sync_in(self, c: Comm) raises:
         """The comm stream waits for everything the caller's current stream has
@@ -192,6 +216,12 @@ def tmb_pg_destroy(p: Int) abi("C"):
             var f = _fn[CommFn](box[].symbol("ncclCommDestroy"))
             for item in box[].comms.items():
                 _ = f(item.value.handle)
+            if be()[].vendor:
+                for item in box[].graph_events.items():
+                    for ev in item.value:
+                        be()[].vendor.value().event_destroy(ev)
+                for item in box[].graph_pending.items():
+                    be()[].vendor.value().event_destroy(item.value)
         except e:
             set_error(String(e))
         var moved = box.unsafe_take_pointee()
@@ -518,7 +548,124 @@ def tmb_pg_synchronize_comm(p: Int, device: Int32) abi("C") -> Int32:
             return 1
 
 
-comptime PG_VTABLE_SLOTS = 18
+# --- collectives in compiled graphs --------------------------------------------
+#
+# A MAX graph (torch.compile(backend=mojo_backend)) runs on a stream of MAX's
+# own, handed to its custom ops; tmb/graph/collectives.mojo calls these two
+# entries through the addresses `pg_vtable` exposes. The collective runs on
+# the communicator's comm stream -- the one eager collectives use, so eager
+# and compiled collectives of a rank reach the communicator in program order
+# -- between two event joins: the comm stream waits for the graph stream
+# before it (inputs ready), and `tmb_pg_graph_wait` makes the graph stream
+# wait for it at the graph's `wait_tensor`, so compute between the two
+# overlaps the transfer.
+
+comptime GRAPH_ALLREDUCE = 0
+comptime GRAPH_ALLGATHER = 1
+comptime GRAPH_REDUCE_SCATTER = 2
+comptime GRAPH_BROADCAST = 3
+
+
+def _need_vendor() raises:
+    if not be()[].vendor:
+        raise Error("collectives in a compiled graph need the vendor driver")
+
+
+def tmb_pg_graph_start(
+    p: Int,
+    device: Int32,
+    kind: Int32,
+    send: Int,
+    recv: Int,
+    count: Int,
+    dtype: Int32,
+    arg: Int32,
+    stream: Int,
+) abi("C") -> Int32:
+    """Enqueue one collective of a compiled graph on the comm stream after
+    the work `stream` (an AsyncRT stream handle) has enqueued so far. `arg`
+    is the reduction op, or the root of a broadcast; `count` is per rank
+    (the input of an all-gather, the output of a reduce-scatter). `recv`
+    keys the completion event `tmb_pg_graph_wait` joins on."""
+    with Locked():
+        try:
+            var pg = _pg(p)
+            var c = pg[].comm(Int(device))
+            # An entry for this address can only be stale (an execute failed
+            # between a start and its wait, and MAX's memory plan handed the
+            # address out again): a live one's buffer is still allocated.
+            # The comm stream already orders that collective before this one.
+            var stale = pg[].graph_pending.pop(recv, -1)
+            if stale != -1:
+                pg[].graph_release(c.device, stale)
+            _need_vendor()
+            var graph_raw = raw_stream_of(be()[].vendor.value(), stream)
+            var ready = pg[].graph_event(c.device)
+            try:
+                be()[].vendor.value().event_record(ready, graph_raw)
+                be()[].vendor.value().stream_wait_event(c.raw, ready)
+            except e:
+                pg[].graph_release(c.device, ready)
+                raise e^
+            pg[].graph_release(c.device, ready)
+            var rc: Int32
+            var what: StaticString
+            if kind == GRAPH_ALLREDUCE:
+                what = "ncclAllReduce"
+                rc = _fn[CollFn](pg[].f_allreduce)(
+                    send, recv, count, dtype, arg, c.handle, Int64(c.raw)
+                )
+            elif kind == GRAPH_ALLGATHER:
+                what = "ncclAllGather"
+                rc = _fn[GatherFn](pg[].f_allgather)(
+                    send, recv, count, dtype, c.handle, Int64(c.raw)
+                )
+            elif kind == GRAPH_REDUCE_SCATTER:
+                what = "ncclReduceScatter"
+                rc = _fn[CollFn](pg[].f_reduce_scatter)(
+                    send, recv, count, dtype, arg, c.handle, Int64(c.raw)
+                )
+            elif kind == GRAPH_BROADCAST:
+                what = "ncclBroadcast"
+                rc = _fn[CollFn](pg[].f_broadcast)(
+                    send, recv, count, dtype, arg, c.handle, Int64(c.raw)
+                )
+            else:
+                raise Error("unknown graph collective kind ", kind)
+            pg[].check(rc, what)
+            var done = pg[].graph_event(c.device)
+            try:
+                be()[].vendor.value().event_record(done, c.raw)
+            except e:
+                pg[].graph_release(c.device, done)
+                raise e^
+            pg[].graph_pending[recv] = done
+            return 0
+        except e:
+            set_error(String(e))
+            return 1
+
+
+def tmb_pg_graph_wait(
+    p: Int, device: Int32, recv: Int, stream: Int
+) abi("C") -> Int32:
+    """The graph stream waits for the collective that writes `recv`."""
+    with Locked():
+        try:
+            var pg = _pg(p)
+            _need_vendor()
+            var graph_raw = raw_stream_of(be()[].vendor.value(), stream)
+            var done = pg[].graph_pending[recv]
+            be()[].vendor.value().stream_wait_event(graph_raw, done)
+            _ = pg[].graph_pending.pop(recv)
+            pg[].graph_release(Int(device), done)
+            return 0
+        except e:
+            set_error(String(e))
+            return 1
+
+
+comptime PG_VTABLE_SLOTS = 20
 
 
 def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
@@ -526,7 +673,7 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     0 create, 1 destroy, 2 version, 3 unique_id, 4 init_device, 5 comm_stream,
     6 allreduce, 7 broadcast, 8 reduce, 9 allgather, 10 reduce_scatter,
     11 send, 12 recv, 13 group_start, 14 group_end, 15 async_error, 16 abort,
-    17 synchronize_comm."""
+    17 synchronize_comm, 18 graph_start, 19 graph_wait."""
     var t = unsafe_alloc[Int](PG_VTABLE_SLOTS)
     var f0: def(Pointer[c_char, MutUntrackedOrigin], Int32, Int32) thin abi(
         "C"
@@ -584,4 +731,12 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=15] = Pointer(to=f15).unsafe_bitcast[Int]()[]
     t[unsafe_offset=16] = Pointer(to=f16).unsafe_bitcast[Int]()[]
     t[unsafe_offset=17] = Pointer(to=f17).unsafe_bitcast[Int]()[]
+    var f18: def(Int, Int32, Int32, Int, Int, Int, Int32, Int32, Int) thin abi(
+        "C"
+    ) -> Int32 = tmb_pg_graph_start
+    var f19: def(Int, Int32, Int, Int) thin abi(
+        "C"
+    ) -> Int32 = tmb_pg_graph_wait
+    t[unsafe_offset=18] = Pointer(to=f18).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=19] = Pointer(to=f19).unsafe_bitcast[Int]()[]
     return t

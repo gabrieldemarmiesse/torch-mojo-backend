@@ -325,6 +325,87 @@ communicators and does the actual library calls.
   propagating (`_loud`): an exception escaping into the autograd engine on
   this backend can otherwise kill the process with no Python traceback.
 
+## Collectives in compiled graphs
+
+`torch.compile(backend=mojo_backend)` on the mojo device lowers the
+`_c10d_functional` ops dynamo traces (functional collectives, the
+`dist.all_reduce`-style calls it rewrites into them, DTensor
+redistributions) into the MAX graph itself
+(`torch_compile_backend/collectives.py`). No graph break, no Python at run
+time.
+
+- **Two custom ops per collective** (`tmb/graph/collectives.mojo`).
+  `c10d_start` enqueues the collective into its own output; `c10d_wait`,
+  emitted at the FX `wait_tensor`, makes the graph stream wait for it and
+  copies that output into the result consumers read. Both are
+  `inplace_custom` ops on a one-byte token buffer, so the device chain
+  keeps every start and wait in program order (each rank issues the same
+  sequence); pure compute between them floats freely, which is the
+  overlap. The wait reads the start's output and the collective's input, so
+  ordinary liveness keeps both allocated until the transfer is over.
+  Every started collective is waited for before the graph's outputs
+  (dynamo's dead-code pass drops an unused result's `wait_tensor`, never
+  the collective); a second wait on one start reuses the first's result.
+- **Why the copy.** A MAX op cannot return its input as its output, so
+  without the copy consumers would depend on the start, not the wait. The
+  copy-free alternative -- start and wait as in-place ops on a
+  `buffer_create`d buffer, `buffer_load` after the wait (which aliases, no
+  copy) -- is unusable in MAX 26.6: two live `buffer_create` buffers of one
+  type get the same memory, even with different `init_value`s (measured
+  with two buffers each written by an in-place op, then both loaded), so
+  two in-flight collectives
+  of one shape write the same bytes; and `mo.mutable.load` rejects a buffer
+  whose dims are not static or graph-input symbols (`s0 // 2`).
+- **A `wait_tensor` on a graph input** (an eager collective's
+  `AsyncCollectiveTensor` passed into compiled code, which stays pending
+  through views, `split` and `unbind` included) is run eagerly before
+  `execute` (`waited_inputs`): it orders the current stream after the comm
+  stream, and the DLPack import orders the graph after that. A wait the
+  graph can trace to neither a collective of its own nor an input is a
+  compile error. An ordinary op (a view) reaching a collective's result
+  before its `wait_tensor` waits for it there.
+- **Failures.** A failed `execute` host-waits the graph's comm streams
+  before re-raising, so MAX cannot reuse memory a started collective still
+  touches. That wait does not return if another rank failed before issuing
+  the same collective (the hang watchdog is what reports that). Zero-element
+  collectives issue nothing. One device per graph: MAX chains in-place ops
+  per device, so a cross-device graph would have no program order.
+- **The comm stream is the eager one.** `tmb_pg_graph_start` (`pg.mojo`)
+  records an event on the graph's stream, makes the communicator's comm
+  stream wait on it, issues the library call there and records a
+  completion event, keyed by the output pointer; `tmb_pg_graph_wait` makes
+  the graph stream wait on that event. Eager and compiled collectives of a
+  rank therefore share one stream per communicator in host program order.
+  MAX calls custom ops from one worker thread, but strictly inside
+  `model.execute()` (measured), so the host order is the program order.
+- Without the wait reading the input, a temporary consumed only by the
+  collective would be released at the start and reused while the comm
+  stream still reads it (the cross-stream free hazard of the eager path,
+  fenced there with `record_stream`).
+- **A failed execute cannot wedge the next one**: a completion event still
+  keyed by an address when a new start lands there is stale (a live
+  output's address cannot be reused), so it is released and replaced.
+  A graph refuses to run once its process group was destroyed
+  (`GroupHandles.check_alive`), instead of passing freed memory to the ops.
+- **The ops reach the process group through a host graph input**, one int64
+  `[pg, device, graph_start, graph_wait, tmb_get_error]` per group
+  (`GroupHandles`), fed at every `execute` like the RNG seed. These are
+  addresses in the backend library, which the MAX-compiled package cannot
+  link against (it has its own globals); passing them as constants would
+  make every process compile a different graph.
+- MAX gives each `execute()` its own stream (handles differ per call), which
+  is why the ops take the stream from their `ctx` rather than once.
+- Only the mojo process group is lowered; `all_to_all_single` raises at
+  compile time (MojoCCL has no all-to-all). The communicator of the graph's
+  device is created at compile time, which is collective: every rank
+  compiles the same graph at the same point of the program.
+- DTensor tensor parallelism on this device needed one more fix, eager mode
+  included: the mojo device's native `aten::linear` makes autograd emit
+  `aten::linear_backward`, which DTensor cannot shard
+  (`monkeypatching.let_dtensor_differentiate_a_native_linear`).
+- `tests/compile_c10d_worker.py` compares every pattern with eager mode on
+  two ranks, both libraries (`test_two_rank_compiled_collectives`).
+
 ## Cluster notes (SLURM, IB — NVIDIA)
 
 - ptxas needs no configuration: the package sets

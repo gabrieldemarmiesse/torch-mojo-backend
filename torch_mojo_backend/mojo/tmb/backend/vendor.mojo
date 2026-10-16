@@ -148,10 +148,20 @@ struct Vendor(Movable):
 def raw_stream(vendor: Vendor, ctx: DeviceContext) raises -> Int:
     """The CUstream / hipStream_t behind a context view's stream (an AsyncRT
     entry of MAX's own runtime library, resolved by name at run time)."""
+    return raw_stream_of(vendor, Int(ctx.stream()._handle.value()))
+
+
+def raw_stream_of(vendor: Vendor, asyncrt_stream: Int) raises -> Int:
+    """`raw_stream` for an AsyncRT stream handle (`DeviceStream._handle`)
+    handed over by code that does not share this library's contexts: a MAX
+    graph op passes the stream MAX runs it on."""
     var raw: Int = 0
     var err = vendor.asyncrt.get_function[OpaquePointer[MutUntrackedOrigin]](
         vendor.names.raw_stream
-    )(Pointer(to=raw), ctx.stream()._handle)
+    )(
+        Pointer(to=raw),
+        OpaquePointer[MutUntrackedOrigin](unsafe_from_address=asyncrt_stream),
+    )
     if Int(err) != 0:
         raise Error("raw stream handle unavailable")
     return raw
