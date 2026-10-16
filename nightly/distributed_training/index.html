@@ -1485,6 +1485,11 @@ suit the hardware the library was measured on:</p>
 <td>on</td>
 <td><code>0</code> hides the <code>[TRACE]</code> lines (library in use, build timings)</td>
 </tr>
+<tr>
+<td><code>TORCH_MOJO_BACKEND_PG_WATCHDOG</code></td>
+<td><code>abort</code></td>
+<td>what a collective that outlives the <code>init_process_group</code> timeout does: <code>abort</code> reports and exits, <code>report</code> only reports, <code>off</code> disables the check (<a href="#a-run-hangs">A run hangs</a>)</td>
+</tr>
 </tbody>
 </table>
 <p><code>register_mojo_devices()</code> warns about any <code>TORCH_MOJO_BACKEND_*</code> or
@@ -1511,15 +1516,44 @@ already been initialised. Make it the first thing the script does. If it
 raises <code>LOCAL_RANK=... but CUDA_VISIBLE_DEVICES=... lists only N devices</code>,
 you started more processes per node than there are visible GPUs.</p>
 <h3 id="a-run-hangs">A run hangs<a class="headerlink" href="#a-run-hangs" title="Permanent link">&para;</a></h3>
-<p>NCCL and RCCL collectives have no watchdog here. The <code>timeout=</code> of
-<code>init_process_group</code> applies only to the rendezvous and to CPU work
-(<code>barrier</code>, object collectives). When a worker crashes, torchrun stops the
-others. A hang with every process still alive usually means the ranks
-issued different collectives, or issued them in a different order.
-<code>NCCL_DEBUG=INFO</code> shows how the communicators were set up, and
-<code>py-spy dump --pid &lt;pid&gt;</code> shows where each rank is waiting. With Mojo
-collectives, a rank stops waiting after <code>MOJOCCL_IB_TIMEOUT_S</code> and its next
-collective raises, so the run fails instead of hanging.</p>
+<p>A GPU collective that hasn't completed within the <code>timeout=</code> of
+<code>init_process_group</code> (30 minutes by default) ends the run, as with NCCL in
+stock PyTorch. Pass a shorter timeout to fail sooner:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="n">dist</span><span class="o">.</span><span class="n">init_process_group</span><span class="p">(</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>    <span class="n">backend</span><span class="o">=</span><span class="n">dist</span><span class="o">.</span><span class="n">get_default_backend_for_device</span><span class="p">(</span><span class="n">device</span><span class="p">),</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>    <span class="n">timeout</span><span class="o">=</span><span class="n">datetime</span><span class="o">.</span><span class="n">timedelta</span><span class="p">(</span><span class="n">minutes</span><span class="o">=</span><span class="mi">5</span><span class="p">),</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="p">)</span>
+</code></pre></div>
+<p>The rank whose collective timed out prints it, with its sequence number,
+operation, arguments and the last collectives that rank issued:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>[rank 0] Watchdog caught collective operation timeout: collective #2 (allreduce 1024 x float32 sum) on device 0 has not completed 10.0 s after it was issued (timeout 10.0 s, the timeout= of init_process_group).
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a>[rank 0]   last collectives issued on device 0, oldest first:
+<a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a>[rank 0]     #1 allreduce 1024 x float32 sum  completed
+<a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>[rank 0]     #2 allreduce 1024 x float32 sum  pending for 10.0 s  &lt;-- timed out
+</code></pre></div>
+<p>It then waits up to 10 seconds for the other ranks' reports and prints a
+desync report: which ranks are waiting in the same collective, which are in
+a different one or at a different position, and which sent no report. A
+rank without a report usually never issued that collective, or is blocked
+somewhere else; that's where to look first, and
+<code>py-spy dump --pid &lt;pid&gt;</code> shows where it is. When every rank reports the
+same collective, or the ranks wait in point-to-point transfers (which
+don't compare across ranks), the report says it can't tell why. Every rank has to issue
+the same collectives, in the same order, with the same arguments. Finally
+the rank aborts its communicators and exits with status 1, and torchrun
+stops the other workers. A device error on the rank (a faulted kernel) ends
+the run the same way.</p>
+<p><code>TORCH_MOJO_BACKEND_PG_WATCHDOG=report</code> prints the same reports but leaves
+the process waiting, so you can inspect it, and <code>off</code> turns the watchdog
+off. Collectives in graphs compiled with <code>mojo_backend</code> are watched like
+the others. A collective call that blocks on the host instead of the GPU is
+caught the same way, and so is the first use of a collective that compiles its
+kernels for longer than the timeout: keep the timeout well above a cold
+compile, or warm the kernel cache first. A collective still in flight
+when the script ends (Ctrl-C included) gets two seconds to finish, then
+is reported like a timeout; <code>destroy_process_group()</code> waits for this
+rank's collectives but not for its peers. CPU work (<code>barrier</code>, object collectives) goes through gloo,
+which raises after the same timeout.</p>
 <h3 id="the-first-training-step-takes-minutes">The first training step takes minutes<a class="headerlink" href="#the-first-training-step-takes-minutes" title="Permanent link">&para;</a></h3>
 <p>Kernels compile the first time each one is used; see
 <a href="#multi-node">warm the kernel cache first</a>. Later runs reuse the cache.</p>
