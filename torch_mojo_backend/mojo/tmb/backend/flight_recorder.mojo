@@ -4,17 +4,20 @@ collectives of the process, completed ones included, for the dumps
 PyTorch's flight recorder (torch/csrc/distributed/c10d/FlightRecorder.hpp).
 
 One ring per process, like torch's. The watchdog's commit (`watch_commit`)
-writes an entry for every collective it tracks, and `PG.track` one for every
-member of a coalescing block; the watchdog stamps an entry completed when it
-retires the collective. Writers hold the backend mutex, so there is one at a
-time; the dump reads without it (a hung thread may hold it), so every slot
-is seqlocked and every field an atomic word.
+writes an entry for every collective it commits, and `PG.track` one for
+every operation of a coalescing block; the watchdog stamps an entry
+completed when it retires the collective. Writers hold the backend mutex, so
+there is one at a time; the dump reads without it (a hung thread may hold
+it), so every slot is seqlocked and every field an atomic word. The
+completion stamp is one word, written by compare-exchange outside the
+seqlock: it carries the record id it is for, so a late stamp of an entry
+whose slot was reused never marks the replacement.
 
 The Python side describes the torch-level operation in flight: before a
-collective it writes a tag word into the ring's header (`H_TAG`), which the
-entries it causes record, and the dump joins the two. The tag word carries a
-hash of the writing thread, so an entry made on another thread meanwhile
-does not take it.
+collective it writes a tag word into its thread's slot of the ring header
+(`H_TAG`), which the entries it causes record, and the dump joins the two.
+The tag word carries a hash of the writing thread, so a thread sharing the
+slot never takes another's tag.
 """
 from std.atomic import Atomic, Ordering
 from std.ffi import _get_global_or_null, external_call
@@ -23,7 +26,7 @@ from std.time import perf_counter_ns
 
 comptime FR_GLOBAL = "TMB_PG_FLIGHT_RECORDER"
 
-# Tag word (flight_recorder.py `_tag_word` builds it).
+# Tag word (flight_recorder.py `Recorder.begin` builds it).
 comptime TAG_MASK = (1 << 40) - 1  # the Python record's id, 0 if none
 comptime TAG_MEMBER = 1 << 40  # one operation of a coalescing block
 comptime TAG_FIRST = 1 << 41  # ...its first
@@ -31,17 +34,21 @@ comptime TAG_END = 1 << 42  # the block's end
 comptime TAG_P2P = 1 << 43  # point-to-point (overrides the native op)
 comptime TAG_THREAD_SHIFT = 44
 comptime TAG_THREAD_MASK = (1 << 19) - 1
+comptime TAG_SLOTS = 64  # per-thread tag words, by thread hash
+comptime HASH_MUL: UInt64 = 0x9E3779B97F4A7C15
 
 # Entry flags.
 comptime FL_P2P = 1
 comptime FL_MEMBER = 2
 comptime FL_END = 4
+comptime FL_UNTRACKED = 8  # the watchdog does not track it: no stamp comes
 
 # Header words.
 comptime H_SIZE = 0
 comptime H_NEXT = 1  # entries recorded so far: the next record id
-comptime H_TAG = 2
-comptime H_WORDS = 3
+comptime H_EPOCH = 2  # CLOCK_MONOTONIC ns at creation, the stamps' origin
+comptime H_TAG = 3  # TAG_SLOTS words
+comptime H_WORDS = H_TAG + TAG_SLOTS
 
 # Slot words; a snapshot copies them as they are (flight_recorder.py).
 comptime F_VER = 0
@@ -53,15 +60,20 @@ comptime F_OPID = 5
 comptime F_OP = 6  # watchdog.mojo OP_*
 comptime F_COUNT = 7
 comptime F_DTYPE = 8  # ncclDataType_t
-comptime F_ROOT = 9
+comptime F_ROOT = 9  # root or peer (group rank), -1 if none
 comptime F_NOPS = 10
 comptime F_FLAGS = 11
 comptime F_CREATED = 12  # CLOCK_MONOTONIC ns
 comptime F_THREAD = 13  # pthread_self
 comptime F_TAG = 14
-comptime F_DONE = 15  # record id + 1 once completed (the stamper's)
-comptime F_DONE_NS = 16
-comptime F_WORDS = 17
+comptime F_DONE = 15  # completion stamp (DONE_*), 0 while pending
+comptime F_WORDS = 16
+
+# Completion stamp: the record id + 1's low bits, then microseconds since
+# H_EPOCH.
+comptime DONE_TIME_BITS = 44
+comptime DONE_ID_MASK = (1 << 19) - 1
+comptime DONE_TIME_MASK = (1 << DONE_TIME_BITS) - 1
 
 # Per process group (`fr_pg`), producer-only.
 comptime P_RING = 0
@@ -92,6 +104,15 @@ def _st(p: FrP, i: Int, v: Int):
     )
 
 
+@always_inline
+def _cas(p: FrP, i: Int, old: Int, new: Int) -> Bool:
+    var expected = Int64(old)
+    return Atomic[Scalar[DType.int64]].compare_exchange[
+        success_ordering=Ordering.ACQUIRE_RELEASE,
+        failure_ordering=Ordering.ACQUIRE,
+    ](p.unsafe_offset(i), expected, Int64(new))
+
+
 def _zeroed(n: Int) -> FrP:
     var p = unsafe_alloc[Int64](n)
     for i in range(n):
@@ -107,6 +128,16 @@ def _slot(ring: FrP, rid: Int) -> FrP:
     )
 
 
+@always_inline
+def _pg(fp: Int) -> FrP:
+    return FrP(unsafe_from_address=fp)
+
+
+@always_inline
+def _ring_of(fp: Int) -> FrP:
+    return FrP(unsafe_from_address=_ld(_pg(fp), P_RING))
+
+
 def fr_ring() -> Int:
     """The process's ring, 0 when none was made."""
     var p = _get_global_or_null(FR_GLOBAL)
@@ -116,13 +147,14 @@ def fr_ring() -> Int:
 
 
 def fr_init(size: Int) -> Int:
-    """The ring (its header address, where the tag word is), made on the
-    first call with `size` entries; later sizes are ignored."""
+    """The ring (its header address), made on the first call with `size`
+    entries; later sizes are ignored."""
     var ring = fr_ring()
     if ring != 0 or size <= 0:
         return ring
     var words = _zeroed(H_WORDS + size * F_WORDS)
     _st(words, H_SIZE, size)
+    _st(words, H_EPOCH, perf_counter_ns())
     external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
         StringSlice(FR_GLOBAL), words.unsafe_bitcast[NoneType]()
     )
@@ -138,31 +170,44 @@ def fr_pg(ring: Int, pg_id: Int) -> Int:
 
 
 @always_inline
-def _thread_hash(t: Int) -> Int:
-    return ((t >> 12) ^ (t >> 31)) & TAG_THREAD_MASK
-
-
-@always_inline
 def _tag(ring: FrP) -> Int:
-    """This thread's tag word, its thread bits dropped; 0 if none."""
-    var t = _ld(ring, H_TAG)
-    var me = external_call["pthread_self", Int]()
-    if (t >> TAG_THREAD_SHIFT) & TAG_THREAD_MASK != _thread_hash(me):
+    """This thread's tag word, its thread bits dropped; 0 if none. The slot
+    and the thread bits are a multiplicative hash of pthread_self (threads'
+    ids sit a stack apart, so their low bits are alike), as
+    flight_recorder.py computes them from CPython's thread ident."""
+    var h = (UInt64(external_call["pthread_self", Int]()) >> 12) * HASH_MUL
+    var t = _ld(ring, H_TAG + Int(h >> 58))
+    if (t >> TAG_THREAD_SHIFT) & TAG_THREAD_MASK != Int(
+        (h >> 39) & UInt64(TAG_THREAD_MASK)
+    ):
         return 0
     return t & ((1 << TAG_THREAD_SHIFT) - 1)
 
 
 def _record(
-    fp: Int, op: Int, nops: Int, count: Int, dtype: Int, root: Int, p2p_op: Bool
+    fp: Int,
+    op: Int,
+    nops: Int,
+    count: Int,
+    dtype: Int,
+    root: Int,
+    p2p_op: Bool,
+    untracked: Bool,
 ) -> Int:
     """Seq ids as ProcessGroupNCCL counts them: `collective_seq_id` once per
     collective or coalescing block, `p2p_seq_id` once per point-to-point op
     or block, `op_id` per operation. Returns record id + 1."""
-    var pg = FrP(unsafe_from_address=fp)
-    var ring = FrP(unsafe_from_address=_ld(pg, P_RING))
+    var pg = _pg(fp)
+    var ring = _ring_of(fp)
     var tag = _tag(ring)
+    if tag & TAG_END and _ld(pg, P_GROUP_C) == 0 and _ld(pg, P_GROUP_P) == 0:
+        # Another group's block ended (this group's commit rides its
+        # group_end): an ordinary entry, which that record does not describe.
+        tag = 0
     var p2p = (tag & TAG_P2P != 0) if tag & TAG_MASK != 0 else p2p_op
     var flags = FL_P2P if p2p else 0
+    if untracked:
+        flags |= FL_UNTRACKED
     if tag & TAG_MEMBER:
         flags |= FL_MEMBER
         if tag & TAG_FIRST:
@@ -201,48 +246,77 @@ def _record(
     _st(s, F_THREAD, external_call["pthread_self", Int]())
     _st(s, F_TAG, tag & TAG_MASK)
     _st(s, F_DONE, 0)
-    _st(s, F_DONE_NS, 0)
     _st(s, F_VER, v + 2)
     _st(ring, H_NEXT, rid + 1)
     return rid + 1
 
 
 def fr_commit(
-    fp: Int, op: Int, nops: Int, count: Int, dtype: Int, root: Int, p2p_op: Bool
+    fp: Int,
+    op: Int,
+    nops: Int,
+    count: Int,
+    dtype: Int,
+    root: Int,
+    p2p_op: Bool,
+    untracked: Bool = False,
 ) -> Int:
-    """The entry of a collective the watchdog tracks (a call, or a group at
-    its end); record id + 1, 0 when not recording. Under the backend mutex.
-    """
+    """The entry of a collective the watchdog commits (a call, or a group
+    at its end); record id + 1, 0 when not recording. `untracked`: the
+    watchdog drops it, so no stamp will come. Under the backend mutex."""
     if fp == 0:
         return 0
-    return _record(fp, op, nops, count, dtype, root, p2p_op)
+    return _record(fp, op, nops, count, dtype, root, p2p_op, untracked)
+
+
+def fr_untracked(fp: Int, rid1: Int):
+    """The watchdog could not track entry `rid1` after all (its event
+    failed). Under the backend mutex."""
+    if fp == 0 or rid1 == 0:
+        return
+    var s = _slot(_ring_of(fp), rid1 - 1)
+    if _ld(s, F_ID) != rid1:
+        return
+    var v = _ld(s, F_VER)
+    _st(s, F_VER, v + 1)
+    _st(s, F_FLAGS, _ld(s, F_FLAGS) | FL_UNTRACKED)
+    _st(s, F_VER, v + 2)
 
 
 def fr_member(
     fp: Int, op: Int, count: Int, dtype: Int, root: Int, p2p_op: Bool
 ):
     """A library call inside an NCCL group: its own entry only when it is an
-    operation of a coalescing block (the block's end entry, at the group's
-    commit, carries the completion). Under the backend mutex."""
-    if fp == 0:
-        return
-    var ring = FrP(unsafe_from_address=_ld(FrP(unsafe_from_address=fp), P_RING))
-    if _tag(ring) & TAG_MEMBER:
-        _ = _record(fp, op, 1, count, dtype, root, p2p_op)
+    operation of a coalescing block. Like ProcessGroupNCCL's, these entries
+    are never stamped; the block's end entry, at the group's commit, is.
+    Under the backend mutex."""
+    if fp != 0 and _tag(_ring_of(fp)) & TAG_MEMBER:
+        _ = _record(fp, op, 1, count, dtype, root, p2p_op, False)
 
 
 def fr_done(fp: Int, rid1: Int, now: Int):
-    """Stamp entry `rid1` (record id + 1) completed at `now`, unless the ring
-    has reused its slot. Any thread; a stale stamp of a reused slot names the
-    old id, which the dump ignores."""
+    """Stamp entry `rid1` (record id + 1) completed at `now`. Any thread, no
+    lock: the stamp names its id, and replaces only an empty stamp or one of
+    an older id, so a late stamp of a slot the ring reused never marks the
+    replacement, nor undoes the replacement's own stamp."""
     if fp == 0 or rid1 == 0:
         return
-    var ring = FrP(unsafe_from_address=_ld(FrP(unsafe_from_address=fp), P_RING))
+    var ring = _ring_of(fp)
     var s = _slot(ring, rid1 - 1)
     if _ld(s, F_ID) != rid1:
         return
-    _st(s, F_DONE_NS, now)
-    _st(s, F_DONE, rid1)
+    var us = max(now - _ld(ring, H_EPOCH), 0) // 1000
+    var stamp = ((rid1 & DONE_ID_MASK) << DONE_TIME_BITS) | (
+        us & DONE_TIME_MASK
+    )
+    while True:
+        var cur = _ld(s, F_DONE)
+        if cur != 0:
+            var ahead = (rid1 - (cur >> DONE_TIME_BITS)) & DONE_ID_MASK
+            if ahead == 0 or ahead > DONE_ID_MASK // 2:
+                return  # stamped already, or a newer entry's stamp
+        if _cas(s, F_DONE, cur, stamp):
+            return
 
 
 def fr_snapshot(buf: Int, cap: Int) -> Int:
@@ -268,7 +342,9 @@ def fr_snapshot(buf: Int, cap: Int) -> Int:
             var o = out.unsafe_offset(n * F_WORDS)
             for k in range(F_WORDS):
                 o[unsafe_offset=k] = Int64(_ld(s, k))
-            if _ld(s, F_VER) == v and Int(o[unsafe_offset=F_ID]) == rid + 1:
+            if _ld(s, F_VER) != v:
+                continue
+            if Int(o[unsafe_offset=F_ID]) == rid + 1:
                 n += 1
-                break
+            break  # consistent: kept, or already a newer entry's
     return n

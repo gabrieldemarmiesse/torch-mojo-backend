@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TypeVar, cast
 
 import torch
@@ -574,8 +574,9 @@ def _desync_reporter(
                         rewrite_index()
                     continue
                 try:
+                    fr_gen = 0  # not `gen`: next_gen() owns that one
                     if fr_worker is not None:
-                        _fr_incident(fields, fr_worker, rank)
+                        fr_gen = _fr_incident(fields, fr_worker, rank)
                     _report_desync(
                         line,
                         worker,
@@ -587,7 +588,7 @@ def _desync_reporter(
                         incarnation,
                     )
                     if fr_worker is not None:
-                        _fr_wait_for_peers(fields, fr_worker, rank)
+                        _fr_wait_for_peers(fields, fr_worker, rank, fr_gen)
                 except Exception:
                     traceback.print_exc(file=sys.stderr)
                 finally:
@@ -606,17 +607,21 @@ def _desync_reporter(
         _close_watchdog_fd(ack_fd)
 
 
-def _fr_incident(fields: dict[str, str], worker: _StoreWorker, rank: int):
+def _fr_incident(fields: dict[str, str], worker: _StoreWorker, rank: int) -> int:
     """This rank's watchdog fired: signal every rank to dump its flight
-    recorder (ProcessGroupNCCL's broadcastDumpSignal), dump this one's and
-    print the Python stack of the collective that timed out."""
+    recorder (ProcessGroupNCCL's broadcastDumpSignal, plus a new generation,
+    returned; 0 when the store did not answer), dump this one's and print
+    the Python stack of the collective that timed out."""
     grank = flight_recorder.global_rank(rank)
+    gen = worker.run(lambda client: flight_recorder.signal_dump(client, grank), 2.0)
+    gens = flight_recorder.claim(gen or 0)
+    flight_recorder.dump_now(
+        grank, "collective timeout", flight_recorder.include_stack_traces()
+    )
+    if gen:
+        acked = range(gens.start if gens else gen, gen + 1)
+        worker.run(lambda client: flight_recorder.ack_dump(client, grank, acked), 2.0)
     rec = flight_recorder.recorder()
-    if rec is not None:
-        rec.dumped_on_signal = True  # this process's own poller: done here
-    worker.run(lambda client: flight_recorder.signal_dump(client, grank), 2.0)
-    flight_recorder.dump_now(grank, "collective timeout")
-    worker.run(lambda client: flight_recorder.ack_dump(client, grank), 2.0)
     frames = rec.stack(int(fields.get("fr", "0"))) if rec is not None else []
     if frames:
         lines = [
@@ -628,18 +633,22 @@ def _fr_incident(fields: dict[str, str], worker: _StoreWorker, rank: int):
         ]
         sys.stderr.write("".join(lines))
         sys.stderr.flush()
+    return gen or 0
 
 
-def _fr_wait_for_peers(fields: dict[str, str], worker: _StoreWorker, rank: int):
+def _fr_wait_for_peers(
+    fields: dict[str, str], worker: _StoreWorker, rank: int, gen: int
+):
     """Give the other ranks TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC to dump
-    before this one aborts (ProcessGroupNCCL sleeps 4x that instead)."""
-    if not dist.is_initialized():
+    generation `gen` before this one aborts (ProcessGroupNCCL sleeps 4x
+    that instead)."""
+    if not gen or not dist.is_initialized():
         return
     world = dist.get_world_size()
     wait = 0.5 if fields.get("exit") == "1" else flight_recorder.dump_wait_s()
     deadline = time.monotonic() + wait
     missing = worker.run(
-        lambda client: flight_recorder.wait_for_dumps(client, world, deadline),
+        lambda client: flight_recorder.wait_for_dumps(client, world, gen, deadline),
         wait + 2.0,
     )
     if missing:
@@ -900,9 +909,10 @@ class MojoProcessGroup(dist.ProcessGroup):
             self._core.fr_init, self._core.fr_snapshot, self._fr_lib[0]
         )
         fr_dumps = fr is not None and flight_recorder.dump_on_timeout()
-        # The incident's own dump and the wait for the other ranks' come
-        # before the reporter acknowledges it.
-        fr_wait_s = flight_recorder.dump_wait_s() + 4 if fr_dumps else 0
+        # Before the reporter acknowledges an incident: the signal and the
+        # acknowledgement (2 s each at most), this rank's dump, and the wait
+        # for the other ranks' (its own 2 s of store slack included).
+        fr_wait_s = flight_recorder.dump_wait_s() + 20 if fr_dumps else 0
         notify_r, notify_w = _watchdog_pipe()
         try:
             ack_r, ack_w = _watchdog_pipe()
@@ -925,15 +935,20 @@ class MojoProcessGroup(dist.ProcessGroup):
             self._core.check(rc, "starting the collective watchdog")
         self._watchdog_fds = (notify_w, ack_r)
         if fr is not None:
-            self._fr_pg_id = fr.add_group(self)
-            self._core.check(
-                self._core.fr_attach(self._handle, self._fr_pg_id),
-                "starting the flight recorder",
-            )
-            v = self._fr_lib[1]
-            fr.comm_lib_version = f"{v // 10000}.{v // 100 % 100}.{v % 100}"
-            self._fr = fr
-            flight_recorder.start_poller(self._store, self.rank())
+            pg_id = fr.add_group(self)
+            if self._core.fr_attach(self._handle, pg_id) == 0:
+                self._fr_pg_id = pg_id
+                v = self._fr_lib[1]
+                fr.comm_lib_version = f"{v // 10000}.{v // 100 % 100}.{v % 100}"
+                self._fr = fr
+                flight_recorder.attach_poller(
+                    id(self), self._store, flight_recorder.global_rank(self.rank())
+                )
+            else:  # the watchdog runs on; this group is just not recorded
+                fr.forget(pg_id)
+                sys.stderr.write(
+                    f"flight recorder off for this process group: {native.last_error()}\n"
+                )
         with _LIVE_LOCK:
             _LIVE_WATCHDOGS[id(self)] = _Live(self._core, cast(int, self._handle))
             if not _EXIT_CORE:
@@ -981,6 +996,7 @@ class MojoProcessGroup(dist.ProcessGroup):
     def shutdown(self):
         if self._fr is not None and self._handle is not None:
             self._fr.remember(self._fr_pg_id)
+            flight_recorder.detach_poller(id(self))
         handle, self._handle = self._handle, None
         fds, self._watchdog_fds = self._watchdog_fds, None
         self._ready.clear()
@@ -1184,8 +1200,8 @@ class MojoProcessGroup(dist.ProcessGroup):
     def _fr_op(
         self,
         name: str,
-        inputs: list[torch.Tensor],
-        outputs: list[torch.Tensor],
+        inputs: Sequence[flight_recorder.Shaped],
+        outputs: Sequence[flight_recorder.Shaped],
         p2p: bool = False,
     ):
         """Describe the call about to issue to the flight recorder, under
@@ -1459,7 +1475,10 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(input_tensors[0]):
             return self._gloo.allgather(output_tensors, input_tensors, opts)
-        self._fr_op("all_gather", input_tensors, output_tensors[0])
+        if output_tensors[0]:
+            self._fr_op(
+                "all_gather", input_tensors, [flight_recorder.flat(output_tensors[0])]
+            )
         self._one_per_rank(input_tensors)
         input = input_tensors[0]
         outputs = output_tensors[0]
@@ -1573,7 +1592,12 @@ class MojoProcessGroup(dist.ProcessGroup):
     ) -> Work:
         if self._is_cpu(output_tensors[0]):
             return self._gloo.reduce_scatter(output_tensors, input_tensors, opts)
-        self._fr_op("reduce_scatter", input_tensors[0], output_tensors)
+        if input_tensors[0]:
+            self._fr_op(
+                "reduce_scatter",
+                [flight_recorder.flat(input_tensors[0])],
+                output_tensors,
+            )
         self._one_per_rank(output_tensors)
         output = output_tensors[0]
         inputs = input_tensors[0]

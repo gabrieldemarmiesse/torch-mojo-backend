@@ -553,10 +553,12 @@ As with NCCL in stock PyTorch, every process keeps its last 2000 collectives
 in a flight recorder: process group, sequence numbers, operation, shapes,
 dtypes, the Python stack that issued it, and whether it completed. When a
 collective times out, the rank that caught it asks every rank, through the
-c10d store, to write its record to `~/.cache/torch/comm_lib_trace_rank_<rank>`.
-It waits up to 15 seconds for those dumps, then aborts. Then run PyTorch's
-analyzer over the files; it names the collective a rank never joined, or the
-ranks that disagree on one:
+c10d store, to write its record to
+`~/.cache/torch/comm_lib_trace_rank_<global rank>`. It waits up to 15
+seconds for those dumps, then aborts. A later timeout in the same job (with
+`TORCH_MOJO_BACKEND_PG_WATCHDOG=report`) dumps every rank again. Then run
+PyTorch's analyzer over the files; it names the collective a rank never
+joined, or the ranks that disagree on one:
 
 ```bash
 python -m torch.distributed.flight_recorder.fr_trace ~/.cache/torch -p comm_lib_trace_rank_
@@ -585,18 +587,22 @@ trace = pickle.loads(torch._C._distributed_c10d._dump_nccl_trace())
 ```
 
 `_dump_nccl_trace_json()` returns the same dump as JSON, without stacks.
-Both work with the CPU build of torch too. You can also set
+Both work with the CPU build of torch too. While no process group of this
+backend records (none was created, the watchdog is off, or
+`TORCH_FR_BUFFER_SIZE=0`), they are PyTorch's own, so a NCCL process group
+in the same process keeps its dumps. You can also set
 `TORCH_NCCL_DEBUG_INFO_PIPE_FILE=/tmp/fr_` and write to
-`/tmp/fr_<rank>.pipe`.
+`/tmp/fr_<global rank>.pipe`.
 
 How this differs from NCCL in stock PyTorch:
 
 - Each rank's record lives with the watchdog. With
   `TORCH_MOJO_BACKEND_PG_WATCHDOG=off`, nothing is recorded.
 - The rank that caught the timeout waits until every rank has dumped, at
-  most `TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC`; PyTorch sleeps a fixed 60
-  seconds. The other ranks dump and keep running, until torchrun or their
-  own watchdog stops them. PyTorch's monitor thread terminates them.
+  most `TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC`; PyTorch sleeps four times
+  that (60 seconds by default). The other ranks dump and keep running,
+  until torchrun or their own watchdog stops them; PyTorch's monitor thread
+  terminates them.
 - The dump is written from Python. A process whose interpreter is stuck
   holding the GIL writes no dump; the abort still happens.
 - A collective is never shown as "started", only "scheduled" or
@@ -604,10 +610,14 @@ How this differs from NCCL in stock PyTorch:
   without `TORCH_NCCL_ENABLE_TIMING`, which isn't supported here.
 - A collective from a graph compiled with `mojo_backend` is recorded with
   its element count as its shape and no Python stack.
+- `barrier()` isn't recorded: it synchronizes the devices and goes through
+  Gloo, where NCCL records an `all_reduce_barrier`.
 - A collective call that blocks on the host before it is enqueued isn't in
   the dump; the watchdog's report names it.
 - `FlightRecorderHook` (PyTorch 2.14) and `_dump_fr_trace()` don't see
-  this backend's collectives; `_dump_fr_trace()` shows Gloo's.
+  this backend's collectives; `_dump_fr_trace()` shows Gloo's. Neither
+  does `torch.distributed.debug`'s server, which reads PyTorch's recorder
+  directly.
 
 ### The first training step takes minutes
 

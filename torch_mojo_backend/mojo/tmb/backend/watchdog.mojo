@@ -34,7 +34,7 @@ from std.time import perf_counter_ns, sleep
 from max.gpu.host import DeviceContext
 
 from tmb.backend.device import be
-from tmb.backend.flight_recorder import fr_commit, fr_done
+from tmb.backend.flight_recorder import fr_commit, fr_done, fr_untracked
 from tmb.backend.vendor import NOT_READY
 
 comptime SEG = 1024  # slots per queue segment
@@ -746,15 +746,23 @@ def _boundary(
     return Boundary(lo, 0)
 
 
-def _fr_retired(w: Int, tr: Tracker, lo: Int, hi: Int):
-    """Stamp the flight recorder entries of [lo, hi) completed: called
-    before the tail moves past them (their slots are reusable after)."""
+def _fr_ids(w: Int, tr: Tracker, lo: Int, hi: Int) -> List[Int]:
+    """The flight recorder entries of [lo, hi), read before the tail moves
+    past them; stamped by `_fr_stamp` only once that move succeeded (a
+    segment can be recycled only after it, so these reads saw the right
+    slots)."""
+    var ids = List[Int]()
+    if _watch(w)[].fr != 0:
+        for i in range(lo, hi):
+            ids.append(_ld(_slot(tr, i), S_FR))
+    return ids^
+
+
+def _fr_stamp(w: Int, ids: List[Int]):
     var fp = _watch(w)[].fr
-    if fp == 0:
-        return
     var now = perf_counter_ns()
-    for i in range(lo, hi):
-        fr_done(fp, _ld(_slot(tr, i), S_FR), now)
+    for i in range(len(ids)):
+        fr_done(fp, ids[i], now)
 
 
 def _retire_now(w: Int, t: Int):
@@ -776,9 +784,10 @@ def _retire_now(w: Int, t: Int):
             )
         if b.end > tail:
             var seq = _ld(_slot(tr, b.end - 1), S_SEQ)
-            _fr_retired(w, tr, tail, b.end)
+            var ids = _fr_ids(w, tr, tail, b.end)
             if _cas(tr.words, T_TAIL, tail, b.end):
                 _st_max(tr.words, T_DONE, seq)
+                _fr_stamp(w, ids)
     except:
         return  # nothing retired: the watchdog sees the same driver state
 
@@ -849,6 +858,7 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
         e.op >= OP_SEND and e.op <= OP_SENDRECV,
     )
     if _ld(tr.words, T_FAULT) != 0 or _ld(tr.words, T_STATE) != 0:
+        fr_untracked(_watch(w)[].fr, fr)
         return
     var seq = _ld(tr.words, T_SEQ) + 1
     _st(tr.words, T_SEQ, seq)
@@ -870,6 +880,7 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
                         ),
                     ),
                 )
+            fr_untracked(_watch(w)[].fr, fr)
             return
     if tr.overflowing:
         tr.overflowing = False
@@ -882,11 +893,13 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
             event = be()[].vendor.value().event_create(tr.ctx, False)
         except:
             watch_fault(t, -1)
+            fr_untracked(_watch(w)[].fr, fr)
             return
         _st(s, S_EVENT, event)
     var rc = call_fn[EventRecordFn](_watch(w)[].f_record)(event, raw_stream)
     if rc != 0:
         watch_fault(t, Int(rc))
+        fr_untracked(_watch(w)[].fr, fr)
         return
     var v = _ld(s, S_VER)
     _st(s, S_VER, v + 1)
@@ -976,9 +989,10 @@ def _drain(w: Int, t: Int, deadline_ns: Int) -> Bool:
             return False
         if b.end > tail:
             var seq = _ld(_slot(tr, b.end - 1), S_SEQ)
-            _fr_retired(w, tr, tail, b.end)
+            var ids = _fr_ids(w, tr, tail, b.end)
             if _cas(tr.words, T_TAIL, tail, b.end):
                 _st_max(tr.words, T_DONE, seq)
+                _fr_stamp(w, ids)
             continue
         if perf_counter_ns() > deadline_ns:
             return False
@@ -1460,10 +1474,11 @@ def _poll_tracker(w: Int, t: Int, now: Int) -> Bool:
         var last_seq = _ld(
             _slot(tr, b.end - 1), S_SEQ
         )  # before: reusable after
-        _fr_retired(w, tr, tail, b.end)
+        var ids = _fr_ids(w, tr, tail, b.end)
         if not _cas(tr.words, T_TAIL, tail, b.end):
             return True  # a drain retired entries: look again next round
         _st_max(tr.words, T_DONE, last_seq)
+        _fr_stamp(w, ids)
         for k in range(len(done)):
             tr.hist[unsafe_offset=tr.hist_n % HISTORY] = done[k].copy()
             tr.hist_n += 1

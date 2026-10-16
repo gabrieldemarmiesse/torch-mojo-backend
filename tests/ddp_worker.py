@@ -17,6 +17,7 @@ inside main().
 
 # ruff: noqa: E402 -- use_local_rank_gpu() must run before torch/MAX initialize
 import contextlib
+import ctypes
 import datetime
 import json
 import os
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from typing import cast
 
 # One GPU per rank, decided before anything can initialize CUDA/MAX.
 from torch_mojo_backend.distributed import use_local_rank_gpu
@@ -652,11 +654,80 @@ def run_abort(failures: list[str]):
     _check(failures, "abort.shutdown_after_abort_is_safe", True)
 
 
+def _fr_tag_isolation(t: torch.Tensor) -> bool | None:
+    """An all_reduce whose tag word another thread writes between the call's
+    `_fr_op` and its native entry keeps its own record (the tag words are
+    per thread). None when the two threads share a tag slot (1 in 64): the
+    other thread's write then only drops this record, which is not what is
+    checked here."""
+    group = cast(MojoProcessGroup, dist.group.WORLD)
+    fr = group._fr
+    assert fr is not None
+    group._fr_op("all_reduce", [t], [t])
+    slots: list[int] = []
+
+    def other():
+        slots.append(ctypes.addressof(fr._cell()[0]))
+        fr.begin("broadcast", [t], [t], 0)
+
+    thread = threading.Thread(target=other)
+    thread.start()
+    thread.join()
+    index = t.device.index or 0
+    group._core.check(
+        group._core.allreduce(
+            group._handle,
+            index,
+            t.data_ptr(),
+            t.numel(),
+            7,
+            0,  # float32, sum
+        ),
+        "ncclAllReduce",
+    )
+    fr.clear()
+    return None if slots[0] == ctypes.addressof(fr._cell()[0]) else True
+
+
+def _fr_wrap_stress(t: torch.Tensor, size: int) -> bool:
+    """Dumps taken on another thread while 300 collectives lap a small ring:
+    each holds at most `size` entries, with consecutive record ids."""
+    stop = threading.Event()
+    bad: list[str] = []
+    dumps = [0]
+
+    def snapshot():
+        while not stop.is_set():
+            entries = pickle.loads(c10d_c._dump_nccl_trace(True, False))["entries"]  # ty: ignore[unresolved-attribute] -- stubbed for CUDA builds only; register_mojo_devices() installs it
+            ids = [e["record_id"] for e in entries]
+            first = ids[0] if ids else 0
+            if len(ids) > size or ids != list(range(first, first + len(ids))):
+                bad.append(str(ids))
+            dumps[0] += 1
+            # A Python thread that never lets go of the GIL starves the
+            # issuing one (each boxed op it runs takes the GIL back for its
+            # refcounts), whatever it does: pace it like a real dumper.
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=snapshot)
+    thread.start()
+    for _ in range(300):
+        dist.all_reduce(t)
+    torch.accelerator.synchronize()
+    stop.set()
+    thread.join()
+    print(f"[rank {dist.get_rank()}] {dumps[0]} dumps during the laps", flush=True)
+    return not bad and dumps[0] > 0
+
+
 def run_flight_recorder(failures: list[str]):
     """The flight recorder seen through torch's own entry points: every
     collective of this run in `_dump_nccl_trace` with ProcessGroupNCCL's
-    names, seq ids and shapes, completed; the JSON variant; the ring keeping
-    only the newest TORCH_FR_BUFFER_SIZE; a dump through the debug pipe."""
+    names, seq ids and shapes (list collectives as the stacked buffer),
+    completed (a coalescing block's operations stay scheduled, as
+    ProcessGroupNCCL's do); per-thread tags; the JSON variant; the ring
+    keeping only the newest TORCH_FR_BUFFER_SIZE; a dump through the debug
+    pipe."""
     rank, world = dist.get_rank(), dist.get_world_size()
     dev = torch.accelerator.current_accelerator()
     assert dev is not None
@@ -668,7 +739,17 @@ def run_flight_recorder(failures: list[str]):
     dist.all_gather_into_tensor(gathered, t)
     scattered = torch.empty(4 // world, 8, device=dev)
     dist.reduce_scatter_tensor(scattered, t)
-    expected = ["all_reduce", "broadcast", "_all_gather_base", "_reduce_scatter_base"]
+    dist.all_gather([torch.empty_like(t) for _ in range(world)], t)
+    dist.reduce_scatter(torch.empty_like(t), [t.clone() for _ in range(world)])
+    expected = [
+        "all_reduce",
+        "broadcast",
+        "_all_gather_base",
+        "_reduce_scatter_base",
+        "all_gather",
+        "reduce_scatter",
+    ]
+    members = []
     if not _MOJO_CCL:
         # One way, even ranks to the next: fr_trace pairs a coalesced
         # block's ops starting from its first rank's and looks a recv's
@@ -676,16 +757,18 @@ def run_flight_recorder(failures: list[str]):
         # rank sends (on NCCL's dumps too).
         if rank % 2 == 0:
             op = dist.P2POp(dist.isend, t, rank + 1)
-            expected += [f"send {rank}->{rank + 1}"]
+            members = [f"send {rank}->{rank + 1}"]
         else:
             op = dist.P2POp(dist.irecv, torch.empty_like(t), rank - 1)
-            expected += [f"recv {rank}<-{rank - 1}"]
+            members = [f"recv {rank}<-{rank - 1}"]
         for work in dist.batch_isend_irecv([op]):
             work.wait()
-        expected += ["coalesced"]
+        expected += [*members, "coalesced"]
     for _ in range(12):
         dist.all_reduce(t)
     expected += ["all_reduce"] * 12
+    isolated = _fr_tag_isolation(t) if size else None
+    expected += ["all_reduce"]
     torch.accelerator.synchronize()
     time.sleep(0.5)  # the watchdog retires (stamps) them within a poll
     dump = pickle.loads(c10d_c._dump_nccl_trace())  # ty: ignore[unresolved-attribute] -- stubbed for CUDA builds only; register_mojo_devices() installs it
@@ -707,7 +790,12 @@ def run_flight_recorder(failures: list[str]):
         ids == list(range(len(expected) - len(ids), len(expected))),
     )
     _check(
-        failures, "fr.all_completed", all(e["state"] == "completed" for e in entries)
+        failures,
+        "fr.states",
+        all(
+            e["state"] == ("scheduled" if n in members else "completed")
+            for e, n in zip(entries, names)
+        ),
     )
     coll = [e["collective_seq_id"] for e in entries if not e["is_p2p"]]
     _check(failures, "fr.collective_seq_ids", coll == sorted(coll))
@@ -716,16 +804,26 @@ def run_flight_recorder(failures: list[str]):
         "fr.frames_start_in_torch_distributed",
         all(
             e["frames"] and "torch/distributed" in e["frames"][0]["filename"]
-            for e in entries
+            for e in entries[:-1]
             if not e["profiling_name"].endswith("coalesced")
         ),
     )
+    if isolated is None:
+        print(f"[rank {rank}] SKIP fr.tags_per_thread (a shared slot)", flush=True)
+    else:
+        _check(
+            failures,
+            "fr.tags_per_thread",
+            any(f["name"] == "_fr_tag_isolation" for f in entries[-1]["frames"]),
+        )
     if size >= len(expected):
+        sizes = [(e["input_sizes"], e["output_sizes"]) for e in entries[:6]]
         _check(
             failures,
             "fr.shapes",
-            entries[2]["input_sizes"] == [[4, 8]]
-            and entries[2]["output_sizes"] == [[4 * world, 8]]
+            sizes[2] == ([[4, 8]], [[4 * world, 8]])
+            and sizes[4] == ([[4, 8]], [[world, 4, 8]])
+            and sizes[5] == ([[world, 4, 8]], [[4, 8]])
             and entries[0]["input_dtypes"] == ["Float"],
         )
     as_json = json.loads(c10d_c._dump_nccl_trace_json())  # ty: ignore[unresolved-attribute] -- stubbed for CUDA builds only; register_mojo_devices() installs it
@@ -744,6 +842,7 @@ def run_flight_recorder(failures: list[str]):
     stem = os.environ.get("TORCH_NCCL_DEBUG_INFO_PIPE_FILE")
     if stem:
         path = os.environ["TORCH_FR_DUMP_TEMP_FILE"] + str(rank)
+        _check(failures, "fr.pipe_exists", os.path.exists(f"{stem}{rank}.pipe"))
         with open(f"{stem}{rank}.pipe", "w") as pipe:
             pipe.write("dump")
         deadline = time.monotonic() + 10
@@ -751,6 +850,47 @@ def run_flight_recorder(failures: list[str]):
             time.sleep(0.1)
         _check(failures, "fr.pipe_dumps", os.path.exists(path))
         dist.barrier()  # both dumps written before torchrun reaps a rank
+    if size <= 16:
+        _check(failures, "fr.snapshots_while_the_ring_wraps", _fr_wrap_stress(t, size))
+
+
+def run_fr_subgroup():
+    """A gloo default group and a mojo group of global rank 1 alone (its
+    rank 0): the pipe, the dump file and the group's ranks use the global
+    rank."""
+    dist.init_process_group("gloo", timeout=datetime.timedelta(seconds=300))
+    rank = dist.get_rank()
+    group = dist.new_group([1], backend="mojo")
+    failures: list[str] = []
+    if rank == 1:
+        t = torch.ones(4, device="mojo")
+        dist.all_reduce(t, group=group)
+        torch.accelerator.synchronize()
+        stem = os.environ["TORCH_NCCL_DEBUG_INFO_PIPE_FILE"]
+        path = os.environ["TORCH_FR_DUMP_TEMP_FILE"] + "1"
+        deadline = time.monotonic() + 10
+        _check(failures, "fr.subgroup_pipe_exists", os.path.exists(f"{stem}1.pipe"))
+        with open(f"{stem}1.pipe", "w") as pipe:
+            pipe.write("dump")
+        while not os.path.exists(path) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        _check(
+            failures, "fr.subgroup_dumps_under_the_global_rank", os.path.exists(path)
+        )
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                dump = pickle.load(f)
+            _check(
+                failures,
+                "fr.subgroup_ranks",
+                [g["ranks"] for g in dump["pg_config"].values()] == ["[1]"],
+            )
+    dist.barrier()
+    dist.destroy_process_group()
+    if failures:
+        print(f"[rank {rank}] FAILURES: {failures}", flush=True)
+        raise SystemExit(1)
+    raise SystemExit(0)
 
 
 # The timeout of the process group the `desync*` modes hang: what its
@@ -1033,6 +1173,8 @@ def main():
     mode = sys.argv[1]
 
     register_mojo_devices()
+    if mode == "fr_subgroup":
+        run_fr_subgroup()
     dist.init_process_group(backend="mojo", timeout=datetime.timedelta(seconds=300))
     if mode in DESYNC_MODES:
         DESYNC_MODES[mode]()

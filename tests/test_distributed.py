@@ -719,6 +719,47 @@ def test_two_rank_flight_recorder_desync(ccl: str, tmp_path: Path):
     assert "run_desync" in analysis, analysis  # the collective's stack
 
 
+@pytest.mark.parametrize(
+    "switch", ["TORCH_NCCL_DUMP_ON_TIMEOUT=0", "TORCH_INCLUDE_ONLY_ACTIVE=1"]
+)
+@pytest.mark.gpu
+def test_two_rank_flight_recorder_desync_switches(switch: str, tmp_path: Path):
+    """The `desync` hang with a dump switch: no dumps at all, or only the
+    collectives still in flight."""
+    name, value = switch.split("=")
+    rc, output, context = _run_desync(
+        "desync",
+        "vendor",
+        {"TORCH_FR_DUMP_TEMP_FILE": str(tmp_path / "trace_"), name: value},
+    )
+    _assert_aborted(rc, output, context, 2, "allreduce 1024 x float32 sum")
+    dumps = _fr_dumps(tmp_path)
+    if value == "0":
+        assert dumps == {} and "flight recorder:" not in output, context
+        return
+    assert sorted(dumps) == [0, 1], context
+    assert [e["state"] for e in dumps[0]["entries"]] == ["scheduled"], dumps[0]
+    assert dumps[1]["entries"] == [], dumps[1]
+
+
+@pytest.mark.gpu
+def test_two_rank_flight_recorder_subgroup(tmp_path: Path):
+    """A gloo default group and a mojo group of global rank 1 alone: its
+    pipe and dump file carry the global rank, 1, not its rank in the group."""
+    if _gpu_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    _run_torchrun(
+        2,
+        "fr_subgroup",
+        {
+            "TORCH_FR_DUMP_TEMP_FILE": str(tmp_path / "trace_"),
+            "TORCH_NCCL_DEBUG_INFO_PIPE_FILE": str(tmp_path / "pipe_"),
+        },
+    )
+    assert sorted(f.name for f in tmp_path.glob("trace_*")) == ["trace_1"]
+    assert sorted(f.name for f in tmp_path.glob("pipe_*")) == ["pipe_1.pipe"]
+
+
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.gpu
 def test_two_rank_desync_watchdog_after_a_burst(ccl: str):
@@ -740,16 +781,35 @@ def test_two_rank_desync_watchdog_destroy(ccl: str):
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.gpu
-def test_two_rank_desync_watchdog_report_mode(ccl: str):
+def test_two_rank_desync_watchdog_report_mode(ccl: str, tmp_path: Path):
     """TORCH_MOJO_BACKEND_PG_WATCHDOG=report: three late collectives (#2 late
     on rank 0, #3 on rank 1, #4 on rank 0) are each reported by the rank
     left waiting, which keeps running; the run then finishes cleanly. A
     record of an earlier incident is gone from the store by the next one,
     so every report names the late rank as silent, never as behind."""
     rc, output, context = _run_desync(
-        "desync_report_twice", ccl, {"TORCH_MOJO_BACKEND_PG_WATCHDOG": "report"}
+        "desync_report_twice",
+        ccl,
+        {
+            "TORCH_MOJO_BACKEND_PG_WATCHDOG": "report",
+            "TORCH_FR_DUMP_TEMP_FILE": str(tmp_path / "trace_"),
+        },
     )
     assert rc == 0, context
+    # Every incident is a new dump generation: the waiting rank dumps for
+    # each, and so does its peer, so the files are of the last incident.
+    assert output.count("[rank 0] flight recorder: rank 1 signalled a dump") == 2
+    assert output.count("[rank 1] flight recorder: rank 0 signalled a dump") == 1
+    assert "no dump from ranks" not in output, context
+    last = {
+        r: max(
+            e["collective_seq_id"]
+            for e in d["entries"]
+            if e["process_group"][0] == "1" and e["state"] == "completed"
+        )
+        for r, d in _fr_dumps(tmp_path).items()
+    }
+    assert last == {0: 3, 1: 3}, last
     assert output.count("report_twice finished") == 2, context
     for waiting, late, seq in ((1, 0, 2), (0, 1, 3), (1, 0, 4)):
         assert (

@@ -200,15 +200,47 @@ def serve_nccl_trace_dumps_from_the_mojo_backend():
 
     They are what a CUDA user calls for an on-demand dump, but they read a
     C++ singleton only ProcessGroupNCCL records into (FlightRecorderCuda.cpp)
-    and exist only in CUDA builds (init.cpp, `USE_C10D_NCCL`). The mojo
-    process group is the one recording on the mojo device, so both return its
-    recorder's dump instead (distributed/flight_recorder.py), in the same
-    format, on every build. `_dump_fr_trace*` (the generic recorder Gloo and
-    FlightRecorderHook use) is left alone.
+    and exist only in CUDA builds (init.cpp, `USE_C10D_NCCL`). While a mojo
+    process group records, both return its recorder's dump instead
+    (distributed/flight_recorder.py), in the same format, on every build;
+    otherwise -- no mojo group, the watchdog off, TORCH_FR_BUFFER_SIZE=0 --
+    they call torch's own, so ProcessGroupNCCL users keep theirs.
+    `_dump_fr_trace*` (the generic recorder Gloo and FlightRecorderHook
+    use) is left alone.
     """
     c10d_c = torch._C._distributed_c10d  # ty: ignore[possibly-missing-submodule] -- loaded by torch.distributed, imported above
-    c10d_c._dump_nccl_trace = flight_recorder.dump_nccl_trace
-    c10d_c._dump_nccl_trace_json = flight_recorder.dump_nccl_trace_json
+    if _NCCL_TRACE_ORIGINALS:
+        return
+    trace = getattr(c10d_c, "_dump_nccl_trace", None)
+    trace_json = getattr(c10d_c, "_dump_nccl_trace_json", None)
+    _NCCL_TRACE_ORIGINALS.extend((trace, trace_json))
+
+    def _dump_nccl_trace(
+        includeCollectives: bool | None = None,  # noqa: N803 -- torch's keyword names
+        includeStackTraces: bool | None = None,  # noqa: N803
+        onlyActive: bool | None = None,  # noqa: N803
+    ) -> bytes:
+        if trace is not None and not flight_recorder.active():
+            return trace(includeCollectives, includeStackTraces, onlyActive)
+        return flight_recorder.dump_nccl_trace(
+            includeCollectives, includeStackTraces, onlyActive
+        )
+
+    def _dump_nccl_trace_json(
+        includeCollectives: bool | None = None,  # noqa: N803 -- torch's keyword names
+        onlyActive: bool | None = None,  # noqa: N803
+    ) -> bytes:
+        if trace_json is not None and not flight_recorder.active():
+            return trace_json(includeCollectives, onlyActive)
+        return flight_recorder.dump_nccl_trace_json(includeCollectives, onlyActive)
+
+    c10d_c._dump_nccl_trace = _dump_nccl_trace
+    c10d_c._dump_nccl_trace_json = _dump_nccl_trace_json
+
+
+# torch's `_dump_nccl_trace` / `_json` (None where the build has none), kept
+# by the patch above, which also uses it as its done-once flag.
+_NCCL_TRACE_ORIGINALS: list[Callable[..., bytes] | None] = []
 
 
 def let_dtensor_differentiate_a_native_linear():

@@ -506,62 +506,110 @@ communicators and does the actual library calls.
     RCCL) and ProcessGroupNCCL's op names.
     - *Ring.* One per process, `TORCH_FR_BUFFER_SIZE` slots, seqlocked like
       the tracker's; written under the backend mutex, read by the dump
-      without it. `watch_commit` writes an entry for every tracked commit
-      (so graph collectives are in it) and stores its id in the tracker
-      slot (`S_FR`); the three places that move `tail` stamp it completed
-      first. Seq ids are ProcessGroupNCCL's, counted per group in the
-      native core (eager and graph collectives share them). Off with the
-      watchdog.
-    - *Tag word.* Python cannot learn which ring entry a call made, so
+      without it. `watch_commit` writes an entry for every commit (so graph
+      collectives are in it) and stores its id in the tracker slot
+      (`S_FR`). The three places that move `tail` read those ids before
+      their compare-exchange and stamp them only once it succeeded: a
+      segment is recycled only after the tail passed it, so the reads saw
+      the right slots (stamping before the CAS could mark the collective a
+      recycled slot then held). The stamp is one word, record id + 1 (low
+      19 bits) and microseconds since the ring's epoch, written by a
+      compare-exchange that replaces only an empty stamp or an older id's:
+      a late stamp of a reused slot neither marks the replacement nor
+      undoes its stamp, and a snapshot reads it in one load. A commit the
+      tracker drops (overflow, a fault, a failed event) is flagged
+      untracked; the dump takes it as completed once a later collective of
+      its group is (one comm stream). Seq ids are ProcessGroupNCCL's,
+      counted per group in the native core (eager and graph collectives
+      share them). Off with the watchdog.
+    - *Tag words.* Python cannot learn which ring entry a call made, so
       before the call `_fr_op` writes a record id (plus member/first/end/
-      p2p bits and a thread hash) into the ring header; entries take it,
-      the dump joins them with the Python record (name, shapes, dtypes,
-      `gather_traceback`). A torch op issuing several library calls inside
-      `_group()` is one entry (its group commit); a coalescing block's
-      operations are member entries (no completion: they take the end
-      entry's) plus a `coalesced` end entry, ProcessGroupNCCL's layout,
-      which is what lets the analyzer pair sends with recvs. Graph
+      p2p bits and thread bits) into its thread's word of the ring header
+      (64 words, by a multiplicative hash of pthread_self: thread ids sit a
+      stack apart, so their low bits are alike); entries take it, the dump
+      joins them with the Python record (name, shapes, dtypes,
+      `gather_traceback`). Two threads hashing to one word drop each
+      other's records (the thread bits stop a wrong join), never swap them.
+      A torch op issuing several library calls inside `_group()` is one
+      entry (its group commit); list all_gather / reduce_scatter record the
+      stacked buffer ProcessGroupNCCL does (`newLikeFlat`, [n, *shape]),
+      which the analyzer's numel checks expect. A coalescing block's
+      operations are member entries, never stamped (ProcessGroupNCCL's
+      have no events either: inheriting the end's state made the analyzer
+      report state mismatches inside blocks), plus a `coalesced` end entry
+      -- ProcessGroupNCCL's layout, what lets the analyzer pair sends with
+      recvs. An END tag reaching a group that recorded no member (its
+      commit rides another group's `group_end`) is dropped. Graph
       collectives (no tag) get names and `[[count]]` sizes from the native
-      op: the lowering knows the FakeTensor shape, but carrying it to the
-      ring needs a graph input or a per-node op parameter (a recompile per
-      node).
-    - *Dumps.* Written by Python (pickle protocol 2, renamed into place
-      under a name without the prefix, which the analyzer's loader matches
-      by substring). On an incident `_desync_reporter` sets
-      `exception_dump` on the unprefixed store, dumps, prints the timed-out
+      op, send/recv as `send <rank>-><peer>` from the ring's peer and the
+      group's rank (a bare `nccl:send` crashes the analyzer): the lowering
+      knows the FakeTensor shape, but carrying it to the ring needs a graph
+      input or a per-node op parameter (a recompile per node).
+    - *Dumps.* Written by Python: pickle protocol 2 to a uuid-named
+      temporary file without the prefix (the loader matches files by
+      substring; a pid-named one collided across hosts), renamed into
+      place, serialized per process. Entries of a group the process never
+      knew are left out (the analyzer needs each in `pg_config`). Every
+      dump is keyed by global rank -- file, pipe, acknowledgement.
+    - *Coordination.* On an incident `_desync_reporter` takes a new
+      generation (`add` on `mojo_fr/generation` of the unprefixed store),
+      sets torch's `exception_dump`, dumps, acknowledges
+      `mojo_fr/dumped/<generation>/<global rank>`, prints the timed-out
       entry's stack (the incident line carries `fr=`), runs the desync
-      report, then waits for every rank's `mojo_fr/dumped/<rank>`
-      (`TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC`) before acking; the native ack
-      window grows by that wait plus 4 s. One `mojo-pg-fr-monitor` thread
-      per process polls the key and the debug pipe every
-      `TORCH_NCCL_COORD_CHECK_MILSEC`, dumps once per process and acks.
+      report, then waits for every rank's acknowledgement of that
+      generation (one multi-key `check` per 100 ms,
+      `TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC`) before acking; the native ack
+      window grows by that wait plus 20 s (the store calls' 2 s bounds and
+      the dump). One `mojo-pg-fr-monitor` thread per process polls the
+      generation and the debug pipe every `TORCH_NCCL_COORD_CHECK_MILSEC`;
+      a process dumps once per generation it has not served, and
+      acknowledges each, so a later incident (report mode) refreshes every
+      rank's file. The monitor follows the watched groups: each attaches
+      its store and detaches at shutdown; with none it holds no store, and
+      the first group after that takes the store's current generation as
+      served (an earlier job's signals on a reused store are not ours).
       `_dump_nccl_trace[_json]` are patched (monkeypatching.py) to return
-      this dump.
-    - *Host cost* (job 321355, 2 x H100, the watchdog's
-      overhead.py legs with TORCH_FR_BUFFER_SIZE=0 vs 2000, ABBA, medians
-      of six legs): the native entry is unchanged within noise (NCCL 8.87
-      -> 8.86 us, mojoccl 4.46 -> 4.54 us: about 15 word stores, no extra
-      clock read); `dist.all_reduce` pays +2.6-3.6 us (NCCL 28.9 -> 31.9,
-      mojoccl 23.5 -> 27.1), about 1 us of it `gather_traceback` (a leg
-      with it stubbed out: +1.7 us), the rest the record and the tag
-      word. torch records a Python stack per collective too. A dict keyed
-      by tag cost 5.9 us per record (popping its oldest key scans the
-      dummies left at the front); the records are a list indexed by tag.
+      this dump while a mojo group records, torch's own otherwise.
+    - *Host cost* (2 x H100, the watchdog's overhead.py legs with
+      TORCH_FR_BUFFER_SIZE=0 vs 2000, ABBA, medians of six legs; job
+      321912, after the review fixes): the native entry costs about
+      0.0-0.2 us (NCCL 9.15 -> 9.37 us, mojoccl 4.61 -> 4.66 us; an
+      earlier job on another node measured no difference); `dist.all_reduce`
+      pays +3.5-4.1 us (NCCL 31.0 -> 35.1, mojoccl 24.6 -> 28.0; job 321355
+      on another node: +3.0-3.6). `Recorder.begin` alone is 1.5 us on the
+      login node, 0.66 us of it without `gather_traceback` (torch records
+      a Python stack per collective too); the per-thread tag word costs
+      one `threading.local` lookup (~50 ns) where the hash was ~200 ns. A
+      dict keyed by tag cost 5.9 us per record (popping its oldest key
+      scans the dummies left at the front); the records are a list
+      indexed by tag.
     - *fr_trace quirks* (2.11 and 2.14.1 alike, on NCCL's dumps too): it
       logs "does not have a coalesced end" for every `nccl:coalesced` (it
       checks `endswith("_coalesced")`); it pairs a coalescing block's p2p
       ops from its first rank's and looks a recv's peer up by the recv's
       own rank, so a block where that rank receives is a MISMATCH; and its
       MISMATCH table needs `tabulate` (2.14.1 raises NameError without
-      it). The worker's p2p check is one-way for that reason.
+      it). The worker's p2p check is one-way for that reason. It also
+      groups a collective and a following point-to-point op as one
+      coalesced block when the collective's `collective_seq_id` equals the
+      p2p op's `p2p_seq_id` (it compares across the two counters).
     - Verified by hand against the 2.14.1 analyzer (CPU wheel venv,
-      `~/ddp_work/flight_recorder/torch214`) on real two-rank dumps:
-      desync (NCCL, mojoccl, compiled graph) names "Not all ranks joining
-      collective, sequence number: 2 ... missing ranks: {1}" with the
-      eager stack; the clean runs report nothing.
-    - Tests: `test_flight_recorder.py` (CPU: format, member states, the
-      installed analyzer naming a missing rank and pairing a p2p block),
-      `test_two_rank_flight_recorder*` and the compiled `flight_recorder`
+      `~/ddp_work/flight_recorder/torch214`, run under `env -i`: from a
+      shell that imported the project its python can load the project
+      venv's torch instead) on real two-rank dumps: desync (NCCL, mojoccl,
+      compiled graph) names "Not all ranks joining collective, sequence
+      number: 2 ... missing ranks: {1}" with the eager stack; the clean
+      runs (list collectives and a p2p block included) report nothing, and
+      the CPU tests' scenarios read the same.
+    - Tests: `test_flight_recorder.py` (CPU: format, stamps, per-thread
+      tags, member and untracked states, unknown groups, the fallback to
+      torch's `_dump_nccl_trace`, concurrent dumps, signal generations,
+      and the installed analyzer on a missing rank, untagged p2p, a p2p
+      block, a block retired on one rank, list collectives);
+      `test_two_rank_flight_recorder*` (names, seq ids, shapes, states,
+      per-thread tags, wraparound with snapshots racing it, buffer 0, the
+      pipe, a desync, the dump switches, a gloo-default subgroup), report
+      mode's fresh dumps per incident, and the compiled `flight_recorder`
       mode in test_distributed.py.
   - *Host cost* (job 318657, 2 x H100, bare pg.mojo allreduce entry through
     ctypes, 1 element, sync every 200 calls, median of the six ABBA legs,
