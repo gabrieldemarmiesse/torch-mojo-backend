@@ -555,7 +555,7 @@ dtypes, the Python stack that issued it, and whether it completed. When a
 collective times out, the rank that caught it asks every rank, through the
 c10d store, to write its record to
 `~/.cache/torch/comm_lib_trace_rank_<global rank>`. It waits up to 15
-seconds for those dumps, then aborts. A later timeout in the same job (with
+seconds for the dumps of the ranks in its process groups, then aborts. A later timeout in the same job (with
 `TORCH_MOJO_BACKEND_PG_WATCHDOG=report`) dumps every rank again. Then run
 PyTorch's analyzer over the files; it names the collective a rank never
 joined, or the ranks that disagree on one:
@@ -588,9 +588,12 @@ trace = pickle.loads(torch._C._distributed_c10d._dump_nccl_trace())
 
 `_dump_nccl_trace_json()` returns the same dump as JSON, without stacks.
 Both work with the CPU build of torch too. While no process group of this
-backend records (none was created, the watchdog is off, or
-`TORCH_FR_BUFFER_SIZE=0`), they are PyTorch's own, so a NCCL process group
-in the same process keeps its dumps. You can also set
+backend is alive (none was created, all were destroyed, the watchdog is
+off, or `TORCH_FR_BUFFER_SIZE=0`), they are PyTorch's own. While one is
+and a NCCL process group in the same process recorded too, they return both
+backends' collectives in one dump; record ids are each backend's own, so
+give the analyzer one backend's dumps. A NCCL process group's own timeout
+dump signal makes this backend's ranks dump too. You can also set
 `TORCH_NCCL_DEBUG_INFO_PIPE_FILE=/tmp/fr_` and write to
 `/tmp/fr_<global rank>.pipe`.
 
@@ -614,6 +617,9 @@ How this differs from NCCL in stock PyTorch:
   Gloo, where NCCL records an `all_reduce_barrier`.
 - A collective call that blocks on the host before it is enqueued isn't in
   the dump; the watchdog's report names it.
+- Up to 64 threads of a process describe their collectives at once; the
+  collectives of further threads are recorded with the element count as
+  their shape and no Python stack, like a compiled graph's.
 - `FlightRecorderHook` (PyTorch 2.14) and `_dump_fr_trace()` don't see
   this backend's collectives; `_dump_fr_trace()` shows Gloo's. Neither
   does `torch.distributed.debug`'s server, which reads PyTorch's recorder

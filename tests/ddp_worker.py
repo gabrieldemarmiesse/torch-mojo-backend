@@ -17,7 +17,6 @@ inside main().
 
 # ruff: noqa: E402 -- use_local_rank_gpu() must run before torch/MAX initialize
 import contextlib
-import ctypes
 import datetime
 import json
 import os
@@ -39,7 +38,8 @@ import torch.distributed as dist
 from torch._C import _distributed_c10d as c10d_c
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from torch_mojo_backend import register_mojo_devices
+from torch_mojo_backend import monkeypatching, register_mojo_devices
+from torch_mojo_backend.distributed import flight_recorder
 from torch_mojo_backend.distributed.process_group import MojoProcessGroup
 from torch_mojo_backend.native import device_module
 
@@ -654,23 +654,15 @@ def run_abort(failures: list[str]):
     _check(failures, "abort.shutdown_after_abort_is_safe", True)
 
 
-def _fr_tag_isolation(t: torch.Tensor) -> bool | None:
-    """An all_reduce whose tag word another thread writes between the call's
-    `_fr_op` and its native entry keeps its own record (the tag words are
-    per thread). None when the two threads share a tag slot (1 in 64): the
-    other thread's write then only drops this record, which is not what is
-    checked here."""
+def _fr_tag_isolation(t: torch.Tensor):
+    """An all_reduce whose tag another thread writes between the call's
+    `_fr_op` and its native entry keeps its own record: every thread tags
+    through a header slot of its own."""
     group = cast(MojoProcessGroup, dist.group.WORLD)
     fr = group._fr
     assert fr is not None
     group._fr_op("all_reduce", [t], [t])
-    slots: list[int] = []
-
-    def other():
-        slots.append(ctypes.addressof(fr._cell()[0]))
-        fr.begin("broadcast", [t], [t], 0)
-
-    thread = threading.Thread(target=other)
+    thread = threading.Thread(target=lambda: fr.begin("broadcast", [t], [t], 0))
     thread.start()
     thread.join()
     index = t.device.index or 0
@@ -686,7 +678,6 @@ def _fr_tag_isolation(t: torch.Tensor) -> bool | None:
         "ncclAllReduce",
     )
     fr.clear()
-    return None if slots[0] == ctypes.addressof(fr._cell()[0]) else True
 
 
 def _fr_wrap_stress(t: torch.Tensor, size: int) -> bool:
@@ -767,7 +758,8 @@ def run_flight_recorder(failures: list[str]):
     for _ in range(12):
         dist.all_reduce(t)
     expected += ["all_reduce"] * 12
-    isolated = _fr_tag_isolation(t) if size else None
+    if size:
+        _fr_tag_isolation(t)
     expected += ["all_reduce"]
     torch.accelerator.synchronize()
     time.sleep(0.5)  # the watchdog retires (stamps) them within a poll
@@ -808,14 +800,13 @@ def run_flight_recorder(failures: list[str]):
             if not e["profiling_name"].endswith("coalesced")
         ),
     )
-    if isolated is None:
-        print(f"[rank {rank}] SKIP fr.tags_per_thread (a shared slot)", flush=True)
-    else:
-        _check(
-            failures,
-            "fr.tags_per_thread",
-            any(f["name"] == "_fr_tag_isolation" for f in entries[-1]["frames"]),
-        )
+    _check(
+        failures,
+        "fr.tags_per_thread",
+        any(f["name"] == "_fr_tag_isolation" for f in entries[-1]["frames"]),
+    )
+    group = cast(MojoProcessGroup, dist.group.WORLD)
+    _check(failures, "fr.native_selftest", group._core.fr_selftest() == 0)
     if size >= len(expected):
         sizes = [(e["input_sizes"], e["output_sizes"]) for e in entries[:6]]
         _check(
@@ -1194,6 +1185,15 @@ def main():
     else:
         raise ValueError(f"unknown mode {mode}")
     dist.destroy_process_group()
+    if mode == "flight_recorder" and int(os.environ.get("TORCH_FR_BUFFER_SIZE", "1")):
+        # Every mojo group destroyed: torch's own `_dump_nccl_trace` again.
+        configs = pickle.loads(c10d_c._dump_nccl_trace())["pg_config"]  # ty: ignore[unresolved-attribute] -- stubbed for CUDA builds only; register_mojo_devices() installs it
+        torch_has_one = monkeypatching._NCCL_TRACE_ORIGINALS[0] is not None
+        ok = not flight_recorder.active() and not (torch_has_one and "0" in configs)
+        rank = os.environ["RANK"]  # no default group to ask any more
+        print(f"[rank {rank}] {'OK  ' if ok else 'FAIL'} fr.torch_dump_after_destroy")
+        if not ok:
+            failures.append("fr.torch_dump_after_destroy")
     if failures:
         print(f"[rank {os.environ['RANK']}] FAILURES: {failures}", flush=True)
         raise SystemExit(1)

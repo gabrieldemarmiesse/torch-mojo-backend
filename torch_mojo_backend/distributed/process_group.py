@@ -20,7 +20,6 @@ import functools
 import inspect
 import os
 import platform
-import queue
 import sys
 import threading
 import time
@@ -49,6 +48,7 @@ from torch._C._distributed_c10d import (
 
 from torch_mojo_backend import native
 from torch_mojo_backend.distributed import flight_recorder, nccl
+from torch_mojo_backend.distributed.store_worker import StoreWorker as _StoreWorker
 from torch_mojo_backend.native import device_module
 
 _PRIVATEUSE1 = 20  # c10::DeviceType::PrivateUse1
@@ -261,76 +261,6 @@ def _ranks(ranks: list[int]) -> str:
     return shown + (f" and {len(ranks) - 16} more" if len(ranks) > 16 else "")
 
 
-_T = TypeVar("_T")
-
-
-_Job = tuple[Callable[[Store], object], int | None, list[object], threading.Event]
-
-
-class _StoreWorker:
-    """Store operations on a thread of their own, each bounded by a deadline
-    the caller enforces: a store client cannot be bounded from outside (its
-    `check` blocks in a socket read that ignores `set_timeout`, and `clone`
-    connects with the original timeout), so a job that overruns is
-    abandoned -- its thread exits once that operation returns -- and the
-    next job starts a fresh thread and client. A job tagged with an index
-    generation older than `latest` is dropped unrun: the index has moved
-    on."""
-
-    def __init__(self, store: Store, clone: bool = True):
-        self._store = store
-        self._clone = clone
-        self._jobs: queue.SimpleQueue[_Job | None] | None = None
-        self.latest = 0
-
-    def _serve(self, jobs: queue.SimpleQueue[_Job | None]):
-        client = None
-        while (item := jobs.get()) is not None:
-            job, gen, box, done = item
-            try:
-                if gen is not None and gen < self.latest:
-                    box.append(None)
-                else:
-                    if client is None:
-                        client = (
-                            _reporter_store(self._store) if self._clone else self._store
-                        )
-                    box.append(job(client))
-            except Exception as error:  # reported by the caller
-                box.append(error)
-            done.set()
-
-    def run(
-        self, job: Callable[[Store], _T], timeout: float, gen: int | None = None
-    ) -> _T | None:
-        """`job(client)`'s result, or None when it raised, overran or was
-        dropped as stale."""
-        if self._jobs is None:
-            self._jobs = queue.SimpleQueue()
-            threading.Thread(
-                target=self._serve,
-                args=(self._jobs,),
-                name="mojo-pg-desync-store",
-                daemon=True,
-            ).start()
-        box: list[object] = []
-        done = threading.Event()
-        self._jobs.put((job, gen, box, done))
-        if not done.wait(max(timeout, 0.1)):
-            self.close()  # stuck: that thread exits once its op returns
-            sys.stderr.write("mojo watchdog: the c10d store did not answer in time\n")
-            return None
-        if isinstance(box[0], Exception):
-            sys.stderr.write(f"mojo watchdog: c10d store error: {box[0]!r}\n")
-            return None
-        return cast(_T, box[0])
-
-    def close(self):
-        if self._jobs is not None:
-            self._jobs.put(None)
-            self._jobs = None
-
-
 def _set_index(client: Store, rank: int, gen: int, names: list[str]) -> bool:
     """Rewrite the rank's index to `names` unless a newer generation is
     already there: a write that lands late (its worker was abandoned)
@@ -344,17 +274,6 @@ def _set_index(client: Store, rank: int, gen: int, names: list[str]) -> bool:
         if bytes(client.compare_set(key, current, new)).decode() == new:
             return True
     return False
-
-
-def _reporter_store(store: Store) -> Store:
-    """A client of its own when the store can make one (`clone()`, torch >=
-    2.6): a TCPStore client holds its lock for a whole blocking op, so
-    sharing the main thread's would stall the report behind it."""
-    clone = getattr(store, "clone", None)
-    if clone is not None:
-        with contextlib.suppress(Exception):
-            return clone()
-    return store
 
 
 def _index_key(rank: int) -> str:
@@ -613,14 +532,17 @@ def _fr_incident(fields: dict[str, str], worker: _StoreWorker, rank: int) -> int
     returned; 0 when the store did not answer), dump this one's and print
     the Python stack of the collective that timed out."""
     grank = flight_recorder.global_rank(rank)
+    epoch = flight_recorder.poller_epoch()
     gen = worker.run(lambda client: flight_recorder.signal_dump(client, grank), 2.0)
-    gens = flight_recorder.claim(gen or 0)
-    flight_recorder.dump_now(
+    gens = flight_recorder.claim(gen, epoch) if gen else range(0)
+    dumped = flight_recorder.dump_now(
         grank, "collective timeout", flight_recorder.include_stack_traces()
     )
-    if gen:
+    if gen and dumped:  # an acknowledgement means a file is there
         acked = range(gens.start if gens else gen, gen + 1)
         worker.run(lambda client: flight_recorder.ack_dump(client, grank, acked), 2.0)
+    elif gens:
+        flight_recorder.unclaim(gens, epoch)
     rec = flight_recorder.recorder()
     frames = rec.stack(int(fields.get("fr", "0"))) if rec is not None else []
     if frames:
@@ -642,13 +564,16 @@ def _fr_wait_for_peers(
     """Give the other ranks TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC to dump
     generation `gen` before this one aborts (ProcessGroupNCCL sleeps 4x
     that instead)."""
-    if not gen or not dist.is_initialized():
+    rec = flight_recorder.recorder()
+    if not gen or rec is None:
         return
-    world = dist.get_world_size()
+    # The ranks of this process's groups: in a job whose default group is
+    # gloo, ranks without a mojo group never dump.
+    ranks = sorted(rec.peer_ranks())
     wait = 0.5 if fields.get("exit") == "1" else flight_recorder.dump_wait_s()
     deadline = time.monotonic() + wait
     missing = worker.run(
-        lambda client: flight_recorder.wait_for_dumps(client, world, gen, deadline),
+        lambda client: flight_recorder.wait_for_dumps(client, ranks, gen, deadline),
         wait + 2.0,
     )
     if missing:
@@ -806,6 +731,7 @@ class _Core:
         self.fr_init = ctypes.CFUNCTYPE(vp, i64)(table[25])
         self.fr_attach = ctypes.CFUNCTYPE(i32, vp, i64)(table[26])
         self.fr_snapshot = ctypes.CFUNCTYPE(i64, vp, i64)(table[27])
+        self.fr_selftest = ctypes.CFUNCTYPE(i64)(table[28])
 
     def check(self, rc: int, what: str):
         if rc != 0:
@@ -945,7 +871,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                     id(self), self._store, flight_recorder.global_rank(self.rank())
                 )
             else:  # the watchdog runs on; this group is just not recorded
-                fr.forget(pg_id)
+                fr.retire(pg_id)
                 sys.stderr.write(
                     f"flight recorder off for this process group: {native.last_error()}\n"
                 )
@@ -995,7 +921,7 @@ class MojoProcessGroup(dist.ProcessGroup):
 
     def shutdown(self):
         if self._fr is not None and self._handle is not None:
-            self._fr.remember(self._fr_pg_id)
+            self._fr.retire(self._fr_pg_id)
             flight_recorder.detach_poller(id(self))
         handle, self._handle = self._handle, None
         fds, self._watchdog_fds = self._watchdog_fds, None

@@ -45,6 +45,8 @@ import torch.distributed as dist
 from torch._C._distributed_c10d import PrefixStore, Store
 from torch._C._profiler import CapturedTraceback, gather_traceback, symbolize_tracebacks
 
+from torch_mojo_backend.distributed.store_worker import StoreWorker
+
 if TYPE_CHECKING:
     from torch_mojo_backend.distributed.process_group import MojoProcessGroup
 
@@ -55,9 +57,8 @@ GEN_KEY = "mojo_fr/generation"  # ours: one per signal, so peers dump again
 ACK_KEY = "mojo_fr/dumped"  # ours: <generation>/<global rank>
 
 # tmb/backend/flight_recorder.mojo: the words of a snapshot entry (F_*), its
-# flags (FL_*), the tag word's bits (TAG_*), the header (H_*) and the
-# completion stamp (DONE_*).
-F_WORDS = 16
+# flags (FL_*), the tag word's bits (TAG_*) and the header's tag slots.
+F_WORDS = 17
 F_ID = 1
 F_PG = 2
 F_CSEQ = 3
@@ -71,17 +72,13 @@ F_FLAGS = 11
 F_CREATED = 12
 F_THREAD = 13
 F_TAG = 14
-F_DONE = 15
+F_COMM = 15
+F_DONE = 16
 FL_P2P, FL_MEMBER, FL_END, FL_UNTRACKED = 1, 2, 4, 8
 TAG_MASK = (1 << 40) - 1
 TAG_MEMBER, TAG_FIRST, TAG_END, TAG_P2P = 1 << 40, 1 << 41, 1 << 42, 1 << 43
-TAG_THREAD_SHIFT = 44
-TAG_THREAD_MASK = (1 << 19) - 1
-HASH_MUL = 0x9E3779B97F4A7C15
-H_EPOCH = 2
-H_TAG = 3
-DONE_TIME_BITS = 44
-DONE_ID_MASK = (1 << 19) - 1
+H_TAG = 2  # TAG_SLOTS pairs of words: owner thread, tag
+TAG_SLOTS = 64
 
 # watchdog.mojo OP_* -> the name ProcessGroupNCCL records, for entries no
 # eager call described (compiled-graph collectives).
@@ -273,7 +270,28 @@ class _Entry:
     created_ns: int
     thread: int
     tag: int
+    comm: int
     done_ns: int | None
+
+
+class _Slot:
+    """A thread's tag slot, held in the recorder's `threading.local`: freed
+    when the thread ends (CPython drops a dead thread's locals)."""
+
+    def __init__(self, recorder: Recorder):
+        self._recorder = recorder
+        self.index = recorder._take_slot(threading.get_ident())
+        self.word = (
+            None
+            if self.index is None
+            else ctypes.c_int64.from_address(
+                recorder._header + 8 * (H_TAG + 2 * self.index + 1)
+            )
+        )
+
+    def __del__(self):
+        if self.index is not None:
+            self._recorder._give_slot(self.index)
 
 
 class Recorder:
@@ -284,7 +302,6 @@ class Recorder:
     ):
         self.size = size
         self._header = header
-        self._epoch = ctypes.c_int64.from_address(header + 8 * H_EPOCH).value
         self._snapshot = snapshot
         self._prefix = lib_name + ":"
         self.comm_lib_version = ""
@@ -295,6 +312,8 @@ class Recorder:
         self._groups: dict[int, _Group] = {}
         self._live: dict[int, weakref.ref[MojoProcessGroup]] = {}
         self._thread = threading.local()
+        self._free_slots = list(range(TAG_SLOTS - 1, -1, -1))
+        self._slots_lock = threading.RLock()
 
     # ---- recording (the issuing thread) ------------------------------------
 
@@ -303,24 +322,49 @@ class Recorder:
         self._live[pg_id] = weakref.ref(group)
         return pg_id
 
-    def forget(self, pg_id: int):
+    def retire(self, pg_id: int):
+        """A group is destroyed: keep its names for the dumps (its entries
+        stay in the ring), but it no longer makes this backend's recorder
+        the one `_dump_nccl_trace` answers for."""
+        self._group(pg_id)
         self._live.pop(pg_id, None)
 
-    def remember(self, pg_id: int):
-        """Keep a group's names for the dumps made after it is destroyed."""
-        self._group(pg_id)
-
-    def _cell(self) -> tuple[ctypes.c_int64, int]:
-        """This thread's tag word and its thread bits: flight_recorder.mojo
-        `_tag`'s hash of the thread's pthread_self (CPython's ident)."""
+    def _cell(self) -> ctypes.c_int64 | None:
+        """This thread's tag word: a header slot of its own, taken on its
+        first call (its owner word is the thread's pthread_self, CPython's
+        ident, which flight_recorder.mojo `_tag` looks for) and given back
+        when the thread ends. None when all TAG_SLOTS are taken: that
+        thread's calls are recorded without a description."""
         try:
-            return self._thread.cell
+            return self._thread.slot.word
         except AttributeError:
-            h = ((threading.get_ident() >> 12) * HASH_MUL) & (2**64 - 1)
-            word = ctypes.c_int64.from_address(self._header + 8 * (H_TAG + (h >> 58)))
-            cell = (word, ((h >> 39) & TAG_THREAD_MASK) << TAG_THREAD_SHIFT)
-            self._thread.cell = cell
-            return cell
+            slot = _Slot(self)
+            self._thread.slot = slot
+            return slot.word
+
+    def _take_slot(self, ident: int) -> int | None:
+        with self._slots_lock:
+            if not self._free_slots:
+                return None
+            index = self._free_slots.pop()
+            owners = (ctypes.c_int64 * (2 * TAG_SLOTS)).from_address(
+                self._header + 8 * H_TAG
+            )
+            for i in range(TAG_SLOTS):  # a dead thread's, if its id came back
+                if owners[2 * i] == ident:
+                    owners[2 * i] = 0
+            owners[2 * index + 1] = 0
+            owners[2 * index] = ident
+            return index
+
+    def _give_slot(self, index: int):
+        with self._slots_lock:
+            owners = (ctypes.c_int64 * (2 * TAG_SLOTS)).from_address(
+                self._header + 8 * H_TAG
+            )
+            owners[2 * index] = 0
+            owners[2 * index + 1] = 0
+            self._free_slots.append(index)
 
     def begin(
         self, name: str, inputs: Sequence[Shaped], outputs: Sequence[Shaped], flags: int
@@ -345,16 +389,30 @@ class Recorder:
             out_dtypes,
             gather_traceback(True, False, False),
         )
-        word, bits = self._cell()
-        word.value = tag | flags | bits
+        word = self._cell()
+        if word is not None:
+            word.value = tag | flags
 
     def clear(self):
-        self._cell()[0].value = 0
+        word = self._cell()
+        if word is not None:
+            word.value = 0
 
     # ---- dumping (any thread) ----------------------------------------------
 
     def active(self) -> bool:
+        """A mojo group that is not destroyed records."""
         return bool(self._live)
+
+    def peer_ranks(self) -> set[int]:
+        """The global ranks of this process's live groups: the ranks that
+        dump on a signal."""
+        ranks: set[int] = set()
+        for pg_id in list(self._live):
+            group = self._group(pg_id)
+            if group is not None:
+                ranks.update(group.ranks)
+        return ranks
 
     def _group(self, pg_id: int) -> _Group | None:
         """A group's names and ranks, read from the live group (the names
@@ -382,11 +440,9 @@ class Recorder:
         out = []
         for i in range(n):
             w = buf[i * F_WORDS : (i + 1) * F_WORDS]
-            rid1, stamp = w[F_ID], w[F_DONE]
-            done = stamp != 0 and stamp >> DONE_TIME_BITS == rid1 & DONE_ID_MASK
             out.append(
                 _Entry(
-                    rid1 - 1,
+                    w[F_ID] - 1,
                     w[F_PG],
                     w[F_CSEQ],
                     w[F_PSEQ],
@@ -399,9 +455,8 @@ class Recorder:
                     w[F_CREATED],
                     w[F_THREAD],
                     w[F_TAG],
-                    self._epoch + (stamp & ((1 << DONE_TIME_BITS) - 1)) * 1000
-                    if done
-                    else None,
+                    w[F_COMM],
+                    w[F_DONE] or None,
                 )
             )
         return out
@@ -441,19 +496,20 @@ class Recorder:
         offset = time.time_ns() - time.monotonic_ns()
         threads = {t.ident: t.name for t in threading.enumerate()}
         # A collective the watchdog could not track (its queue full, its
-        # event failed) has no stamp; one of its group's later collectives
-        # completing means it did (a comm stream runs in order). A
-        # coalescing block's operations, like ProcessGroupNCCL's, have none.
+        # event failed) has no stamp; a later collective on the same
+        # communicator completing means it did (its comm stream runs in
+        # order). A coalescing block's operations, like ProcessGroupNCCL's,
+        # have none.
         done: list[int | None] = [e.done_ns for e in entries]
-        later: dict[int, int] = {}
+        later: dict[tuple[int, int], int] = {}
         for i in range(len(entries) - 1, -1, -1):
             e = entries[i]
-            if e.flags & FL_MEMBER:
+            if e.flags & FL_MEMBER or not e.comm:
                 continue
             if e.flags & FL_UNTRACKED:
-                done[i] = later.get(e.pg)
+                done[i] = later.get((e.pg, e.comm))
             elif e.done_ns is not None:
-                later[e.pg] = e.done_ns
+                later[(e.pg, e.comm)] = e.done_ns
         stacks: dict[int, list[dict[str, Any]]] = {}
         if include_collectives and include_stack_traces:
             tags = list(records)
@@ -646,15 +702,18 @@ def write_dump(rank: int, stacks: bool) -> str | None:
     return path
 
 
-def dump_now(rank: int, why: str, stacks: bool):
+def dump_now(rank: int, why: str, stacks: bool) -> bool:
+    """Write this process's dump; whether it was published."""
     try:
         path = write_dump(rank, stacks)
     except Exception as error:
         sys.stderr.write(f"[rank {rank}] flight recorder: dump failed: {error!r}\n")
-        return
-    if path is not None:
-        sys.stderr.write(f"[rank {rank}] flight recorder: {why}, dumped to {path}\n")
-        sys.stderr.flush()
+        return False
+    if path is None:
+        return False
+    sys.stderr.write(f"[rank {rank}] flight recorder: {why}, dumped to {path}\n")
+    sys.stderr.flush()
+    return True
 
 
 def unprefixed(store: Store) -> Store:
@@ -666,11 +725,6 @@ def unprefixed(store: Store) -> Store:
 
 
 # ---- the dump signal --------------------------------------------------------
-
-# The last signal generation this process dumped for (or that predates its
-# store): a generation is dumped and acknowledged once per process.
-_SERVED = [0]
-_SERVED_LOCK = threading.Lock()
 
 
 def signal_dump(client: Store, rank: int) -> int:
@@ -685,13 +739,12 @@ def current_generation(client: Store) -> int:
     return client.add(GEN_KEY, 0)
 
 
-def claim(upto: int) -> range:
-    """The generations up to `upto` this process has yet to dump for, now
-    its to serve (empty when another thread has)."""
-    with _SERVED_LOCK:
-        gens = range(_SERVED[0] + 1, upto + 1)
-        _SERVED[0] = max(_SERVED[0], upto)
-        return gens
+def signaller(client: Store) -> int:
+    """The rank in torch's dump key, -1 when absent (a signaller that died
+    between its generation and the key): `get` would wait for it."""
+    if not client.check([DUMP_KEY]):
+        return -1
+    return struct.unpack("=i", bytes(client.get(DUMP_KEY)))[0]
 
 
 def ack_dump(client: Store, rank: int, gens: range):
@@ -699,28 +752,38 @@ def ack_dump(client: Store, rank: int, gens: range):
         client.set(f"{ACK_KEY}/{gen}/{rank}", "1")
 
 
-def wait_for_dumps(client: Store, world: int, gen: int, deadline: float) -> list[int]:
-    """Wait until every rank acknowledged generation `gen` or the deadline
-    (monotonic); the ranks that did not. One request per poll."""
-    keys = [f"{ACK_KEY}/{gen}/{r}" for r in range(world)]
+def wait_for_dumps(
+    client: Store, ranks: Sequence[int], gen: int, deadline: float
+) -> list[int]:
+    """Wait until every rank of `ranks` acknowledged generation `gen` or the
+    deadline (monotonic); the ranks that did not. One request per poll."""
+    keys = [f"{ACK_KEY}/{gen}/{r}" for r in ranks]
     while time.monotonic() < deadline:
         if client.check(keys):
             return []
         time.sleep(0.1)
-    return [r for r, key in enumerate(keys) if not client.check([key])]
+    return [r for r, key in zip(ranks, keys) if not client.check([key])]
 
 
 class _Poller:
     """ProcessGroupNCCL's heartbeat monitor, for the dump only: polls the
-    store of the watched groups for a new dump generation, and the debug
-    pipe. One per process, on its own store client; it follows the groups
-    (a re-initialized job's store replaces a destroyed one's) and holds no
-    store while none is attached."""
+    store of the watched groups for a new dump generation (or torch's own
+    dump key appearing, which a ProcessGroupNCCL in the job sets without
+    one), and the debug pipe. One per process.
+
+    It follows the groups: each attaches its store and detaches at
+    shutdown, and every change of the store watched starts an epoch. The
+    generations claimed belong to the epoch; work of an earlier epoch (an
+    RPC that returned late) is dropped, and every store operation runs on a
+    worker it can abandon, so a dead store never stalls the monitor."""
 
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         # group -> its unprefixed store, this process's global rank
         self.stores: dict[int, tuple[Store, int]] = {}
+        self.epoch = 0
+        self.claimed: int | None = None  # generations served or in flight
+        self.torch_seen = False  # torch's dump key was there already
         self.pipe = -1
         self.pipe_path = ""
 
@@ -730,24 +793,45 @@ class _Poller:
         base = unprefixed(store)
         with self.lock:
             fresh = not self.stores
+        baseline: tuple[int, bool] | None = None
+        if fresh and dump_on_timeout():
+            # Generations of an earlier job on this store are not ours; read
+            # before the store is watched, published with it.
+            try:
+                baseline = (current_generation(base), base.check([DUMP_KEY]))
+            except Exception:
+                baseline = None  # the monitor takes it on its first poll
+        with self.lock:
+            if not self.stores:
+                self.epoch += 1
+                self.claimed, self.torch_seen = (
+                    baseline if baseline is not None else (None, False)
+                )
             self.stores[key] = (base, rank)
             self._pipe(rank)  # before the caller's first collective
-        if fresh and dump_on_timeout():
-            # Generations of an earlier job on this store are not ours.
-            try:
-                gen = current_generation(base)
-            except Exception:
-                return
-            with _SERVED_LOCK:
-                _SERVED[0] = gen
 
     def detach(self, key: int):
         with self.lock:
             self.stores.pop(key, None)
+            if not self.stores:
+                self.epoch += 1
+                self.claimed = None
 
-    def _current(self) -> tuple[Store, int] | None:
+    def claim(self, upto: int, epoch: int) -> range:
+        """The generations up to `upto` this process has yet to dump for,
+        now its to serve; empty when served, or `epoch` is over."""
         with self.lock:
-            return next(reversed(self.stores.values()), None)
+            if epoch != self.epoch or self.claimed is None:
+                return range(0)
+            gens = range(self.claimed + 1, upto + 1)
+            self.claimed = max(self.claimed, upto)
+            return gens
+
+    def unclaim(self, gens: range, epoch: int):
+        """The dump for `gens` failed: serve them again on the next poll."""
+        with self.lock:
+            if gens and epoch == self.epoch and self.claimed == gens.stop - 1:
+                self.claimed = gens.start - 1
 
     def _pipe(self, rank: int):
         stem = os.environ.get("TORCH_NCCL_DEBUG_INFO_PIPE_FILE", "")
@@ -771,17 +855,19 @@ class _Poller:
             )
 
     def run(self):
-        client: Store | None = None
-        bound: Store | None = None
+        worker: StoreWorker | None = None
+        bound = -1  # the epoch `worker` serves
         while True:
             time.sleep(coord_check_s())
-            current = self._current()
+            with self.lock:
+                current = next(reversed(self.stores.values()), None)
+                epoch, pipe = self.epoch, self.pipe
             if current is None:
-                client = bound = None  # nothing watched: hold no store
+                if worker is not None:
+                    worker.close()  # nothing watched: hold no store
+                    worker = None
                 continue
             store, rank = current
-            with self.lock:
-                pipe = self.pipe
             if pipe >= 0:
                 try:
                     if os.read(pipe, 4096):
@@ -790,27 +876,40 @@ class _Poller:
                     pass  # nothing written (EAGAIN), or reopened meanwhile
             if not dump_on_timeout():
                 continue
-            try:
-                if store is not bound:
-                    clone = getattr(store, "clone", None)
-                    client = clone() if clone is not None else store
-                    bound = store
-                assert client is not None
-                gen = current_generation(client)
-                if gen <= _SERVED[0]:
-                    continue
-                signaller = struct.unpack("=i", bytes(client.get(DUMP_KEY)))[0]
-            except Exception:
-                bound = client = None  # the store went away: retry
-                continue
-            gens = claim(gen)
-            if not gens:
-                continue
-            dump_now(rank, f"rank {signaller} signalled a dump", include_stack_traces())
-            try:
-                ack_dump(client, rank, gens)
-            except Exception:
-                bound = client = None
+            if bound != epoch or worker is None:
+                if worker is not None:
+                    worker.close()  # an older store's: its jobs are dropped
+                worker = StoreWorker(store, quiet=True, name="mojo-pg-fr-store")
+                bound = epoch
+            self._poll(worker, rank, epoch)
+
+    def _poll(self, worker: StoreWorker, rank: int, epoch: int):
+        bound = coord_check_s() + 2
+        seen = worker.run(lambda c: (current_generation(c), c.check([DUMP_KEY])), bound)
+        if seen is None:
+            return  # the store did not answer: the next poll retries
+        gen, has_key = seen
+        with self.lock:
+            if epoch != self.epoch:
+                return
+            if self.claimed is None:  # no baseline at attach: this is it
+                self.claimed, self.torch_seen = gen, has_key
+                return
+            torch_signal = has_key and not self.torch_seen
+            self.torch_seen = self.torch_seen or has_key
+        gens = self.claim(gen, epoch)
+        if gens:
+            who = worker.run(signaller, bound)
+            why = f"rank {who if who is not None else -1} signalled a dump"
+            if dump_now(rank, why, include_stack_traces()):
+                worker.run(lambda c: ack_dump(c, rank, gens), bound)
+            else:
+                self.unclaim(gens, epoch)
+        elif torch_signal:
+            # ProcessGroupNCCL's broadcastDumpSignal: no generation, no ack.
+            dump_now(
+                rank, "a NCCL process group signalled a dump", include_stack_traces()
+            )
 
 
 _POLLER: list[_Poller] = []
@@ -835,6 +934,46 @@ def attach_poller(key: int, store: Store, rank: int):
 def detach_poller(key: int):
     if _POLLER:
         _POLLER[0].detach(key)
+
+
+def poller_epoch() -> int:
+    return _POLLER[0].epoch if _POLLER else -1
+
+
+def claim(upto: int, epoch: int) -> range:
+    """See `_Poller.claim`; without a monitor every generation is new."""
+    if not _POLLER:
+        return range(upto, upto + 1)
+    return _POLLER[0].claim(upto, epoch)
+
+
+def unclaim(gens: range, epoch: int):
+    if _POLLER:
+        _POLLER[0].unclaim(gens, epoch)
+
+
+def merge(theirs: dict[str, Any], ours: dict[str, Any]) -> dict[str, Any]:
+    """One dump of ProcessGroupNCCL's recorder and this one: both groups'
+    configs and statuses, their entries then ours. Our pg ids are shifted
+    past theirs; record ids are each recorder's own, so the analyzer, which
+    aligns ranks by record id, should be given one backend's dumps."""
+    if not theirs.get("entries") and not theirs.get("pg_config"):
+        return ours
+    pg_ids = [int(k) for k in theirs.get("pg_status", {})]
+    pg_ids += [e["pg_id"] for e in theirs.get("entries", [])]
+    shift = max(pg_ids, default=-1) + 1
+    out = dict(theirs)
+    out["pg_config"] = {**theirs.get("pg_config", {}), **ours["pg_config"]}
+    out["pg_status"] = {
+        **theirs.get("pg_status", {}),
+        **{str(int(k) + shift): v for k, v in ours["pg_status"].items()},
+    }
+    if "entries" in ours or "entries" in theirs:
+        mine = [{**e, "pg_id": e["pg_id"] + shift} for e in ours.get("entries", [])]
+        out["entries"] = [*theirs.get("entries", []), *mine]
+    if not out.get("comm_lib_version"):
+        out["comm_lib_version"] = ours["comm_lib_version"]
+    return out
 
 
 def dump_nccl_trace(

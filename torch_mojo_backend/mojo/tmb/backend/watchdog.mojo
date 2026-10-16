@@ -856,6 +856,7 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
         e.dtype,
         e.root,
         e.op >= OP_SEND and e.op <= OP_SENDRECV,
+        t,
     )
     if _ld(tr.words, T_FAULT) != 0 or _ld(tr.words, T_STATE) != 0:
         fr_untracked(_watch(w)[].fr, fr)

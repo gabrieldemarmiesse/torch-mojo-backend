@@ -4,12 +4,15 @@ analyzer (torch.distributed.flight_recorder). The two-rank GPU runs are in
 test_distributed.py (`test_two_rank_flight_recorder*`)."""
 
 import ctypes
+import gc
 import json
 import os
 import pickle
+import struct
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,13 +22,10 @@ from torch._C import _distributed_c10d as c10d_c
 
 from torch_mojo_backend import monkeypatching
 from torch_mojo_backend.distributed import flight_recorder as fr
+from torch_mojo_backend.distributed.store_worker import StoreWorker
 
 ALLREDUCE, SEND, RECV, ALLGATHER, SENDRECV = 1, 6, 7, 4, 8
 FLOAT = 7  # ncclFloat32
-
-
-def _stamp(rid1: int, us: int) -> int:
-    return ((rid1 & fr.DONE_ID_MASK) << fr.DONE_TIME_BITS) | us
 
 
 def _word(rid: int, op: int, cseq: int, pseq: int = 0, **kw: int) -> list[int]:
@@ -38,8 +38,9 @@ def _word(rid: int, op: int, cseq: int, pseq: int = 0, **kw: int) -> list[int]:
     w[fr.F_FLAGS] = kw.get("flags", 0)
     w[fr.F_CREATED] = 1_000 + rid
     w[fr.F_TAG] = kw.get("tag", 0)
+    w[fr.F_COMM] = kw.get("comm", 1)
     if kw.get("done", True):
-        w[fr.F_DONE] = _stamp(rid + 1, 2 + rid)
+        w[fr.F_DONE] = 2_000 + rid
     return w
 
 
@@ -47,7 +48,7 @@ class _Fake:
     """A Recorder over `rows` instead of the Mojo ring."""
 
     def __init__(self, rows: list[list[int]], world: int = 2, rank: int = 0):
-        self.header = (ctypes.c_int64 * (fr.H_TAG + 64))()
+        self.header = (ctypes.c_int64 * (fr.H_TAG + 2 * fr.TAG_SLOTS))()
         self.rows = rows
         self.rec = fr.Recorder(8, ctypes.addressof(self.header), self.snapshot, "nccl")
         self.rec._groups[0] = fr._Group(
@@ -62,7 +63,9 @@ class _Fake:
 
     def tag(self) -> int:
         """The tag this thread's last `begin` wrote."""
-        return self.rec._cell()[0].value & fr.TAG_MASK
+        word = self.rec._cell()
+        assert word is not None
+        return word.value & fr.TAG_MASK
 
 
 def _analyze(tmp_path: Path, dumps: dict[int, dict[str, Any]]) -> str:
@@ -114,7 +117,7 @@ def test_eager_record_and_native_entry():
     tag = fake.tag()
     fake.rows = [_word(0, ALLREDUCE, 1, tag=tag), _word(1, ALLGATHER, 2, count=5)]
     fake.rec.clear()
-    assert fake.rec._cell()[0].value == 0
+    assert fake.tag() == 0
     e0, e1 = fake.rec.dump()["entries"]
     assert e0["profiling_name"] == "nccl:all_reduce"
     assert e0["input_sizes"] == [[2, 3]] and e0["input_dtypes"] == ["Float"]
@@ -125,37 +128,64 @@ def test_eager_record_and_native_entry():
     assert e1["frames"] == [] and e1["state"] == "completed"
 
 
-def test_stamp_of_another_id_is_pending():
-    """A stamp naming the slot's previous id (a late stamp of a reused
-    slot) leaves the entry pending."""
-    row = _word(5, ALLREDUCE, 1, done=False)
-    row[fr.F_DONE] = _stamp(5, 9)  # entry 4's stamp, the slot is entry 5's
-    (e,) = _Fake([row]).rec.dump()["entries"]
-    assert e["state"] == "scheduled" and e["time_discovered_completed_ns"] is None
-
-
 def test_tags_are_per_thread():
-    """Another thread's tag never takes this thread's slot unless their
-    hashes share it; a shared slot carries the writer's thread bits, so the
-    other thread reads no tag rather than a wrong one."""
+    """Every thread tags through a header slot of its own (owner: its
+    ident), so another thread's call never touches this thread's tag."""
     fake = _Fake([])
     x = torch.ones(1)
     fake.rec.begin("all_reduce", [x], [x], 0)
-    mine = fake.rec._cell()
-    other: list[tuple[ctypes.c_int64, int]] = []
+    mine = fake.tag()
+    owners: list[int] = []
 
     def run():
-        fake.rec.begin("broadcast", [x], [x], 0)
-        other.append(fake.rec._cell())
+        fake.rec.begin("broadcast", [x], [x], fr.TAG_P2P)
+        fake.rec.clear()
+        owners.extend(fake.header[fr.H_TAG + 2 * i] for i in range(fr.TAG_SLOTS))
 
     thread = threading.Thread(target=run)
     thread.start()
     thread.join()
-    word, bits = mine
-    if ctypes.addressof(word) == ctypes.addressof(other[0][0]):
-        assert word.value & ~((1 << fr.TAG_THREAD_SHIFT) - 1) == other[0][1]
-    else:
-        assert word.value == 1 | bits  # still this thread's first record
+    assert fake.tag() == mine
+    assert threading.get_ident() in owners and thread.ident in owners
+
+
+def test_tag_slots_run_out_and_come_back():
+    """All TAG_SLOTS taken by live threads: one more thread records without
+    a tag and touches no slot; the slots come back as their threads end."""
+    fake = _Fake([])
+    x = torch.ones(1)
+    started = threading.Barrier(fr.TAG_SLOTS + 1)
+    release = threading.Event()
+
+    def hold():
+        fake.rec.begin("all_reduce", [x], [x], 0)
+        started.wait()
+        release.wait()
+
+    holders = [threading.Thread(target=hold) for _ in range(fr.TAG_SLOTS)]
+    for thread in holders:
+        thread.start()
+    started.wait()
+    before = list(fake.header)
+    extra: list[object] = []
+
+    def overflow():
+        fake.rec.begin("broadcast", [x], [x], 0)
+        extra.append(fake.rec._cell())
+
+    thread = threading.Thread(target=overflow)
+    thread.start()
+    thread.join()
+    assert extra == [None] and list(fake.header) == before
+    release.set()
+    for thread in holders:
+        thread.join()
+    deadline = time.monotonic() + 5  # a dead thread's locals go soon after
+    while len(fake.rec._free_slots) < fr.TAG_SLOTS and time.monotonic() < deadline:
+        gc.collect()
+        time.sleep(0.01)
+    assert sorted(fake.rec._free_slots) == list(range(fr.TAG_SLOTS))
+    assert not any(fake.header[fr.H_TAG : fr.H_TAG + 2 * fr.TAG_SLOTS])
 
 
 def test_coalesced_members_stay_scheduled():
@@ -178,14 +208,18 @@ def test_coalesced_members_stay_scheduled():
 
 def test_untracked_entries_complete_with_a_later_one():
     """An entry the watchdog dropped has no stamp of its own: a later
-    collective of its group completing means it completed (one stream)."""
+    collective on its communicator completing means it completed (one
+    stream); one on another communicator of the group (another device)
+    proves nothing."""
+    untracked = fr.FL_UNTRACKED
     rows = [
-        _word(0, ALLREDUCE, 1, flags=fr.FL_UNTRACKED, done=False),
-        _word(1, ALLREDUCE, 2),
-        _word(2, ALLREDUCE, 3, flags=fr.FL_UNTRACKED, done=False),
+        _word(0, ALLREDUCE, 1, flags=untracked, done=False),
+        _word(1, ALLREDUCE, 2, flags=untracked, done=False, comm=2),
+        _word(2, ALLREDUCE, 3),
+        _word(3, ALLREDUCE, 4, flags=untracked, done=False),
     ]
     states = [e["state"] for e in _Fake(rows).rec.dump()["entries"]]
-    assert states == ["completed", "completed", "scheduled"]
+    assert states == ["completed", "scheduled", "completed", "scheduled"]
 
 
 def test_untagged_point_to_point_is_named_with_ranks(tmp_path: Path):
@@ -306,26 +340,65 @@ def test_list_collectives_record_the_stacked_buffer(tmp_path: Path):
     assert "has errors" not in output and "MISMATCH" not in output, output
 
 
-def test_dump_falls_back_to_torch_without_a_mojo_group(monkeypatch: pytest.MonkeyPatch):
-    """`_dump_nccl_trace` is torch's own until a mojo group records: a CUDA
-    user's ProcessGroupNCCL keeps its dumps."""
+def _nccl_dump() -> dict[str, Any]:
+    """What ProcessGroupNCCL's recorder holds for one all_reduce."""
+    entry = _Fake([_word(0, ALLREDUCE, 1)]).rec.dump()["entries"][0]
+    return {
+        "version": "2.10",
+        "pg_config": {"5": {"name": "5", "desc": "nccl_pg", "ranks": "[0, 1]"}},
+        "comm_lib_version": "2.27.3",
+        "pg_status": {"0": {"last_enqueued_collective": 1}},
+        "entries": [{**entry, "process_group": ("5", "nccl_pg")}],
+    }
+
+
+def test_dump_follows_the_mojo_groups(monkeypatch: pytest.MonkeyPatch):
+    """`_dump_nccl_trace` is torch's own while no mojo group is alive -- none
+    yet, or all destroyed -- and both recorders' entries, merged, while one
+    is: a ProcessGroupNCCL in the same process keeps its dumps."""
+    nccl = _nccl_dump()
     monkeypatch.setattr(
-        c10d_c, "_dump_nccl_trace", lambda *a: b"torch's", raising=False
+        c10d_c, "_dump_nccl_trace", lambda *a: pickle.dumps(nccl), raising=False
     )
     monkeypatch.setattr(
-        c10d_c, "_dump_nccl_trace_json", lambda *a: b"torch's json", raising=False
+        c10d_c,
+        "_dump_nccl_trace_json",
+        lambda *a: json.dumps(nccl).encode(),
+        raising=False,
     )
     monkeypatch.setattr(monkeypatching, "_NCCL_TRACE_ORIGINALS", [])
     monkeypatch.setattr(fr, "_RECORDER", [])
     monkeypatching.serve_nccl_trace_dumps_from_the_mojo_backend()
     trace = getattr(c10d_c, "_dump_nccl_trace")  # noqa: B009 -- CUDA builds only in the stub
     trace_json = getattr(c10d_c, "_dump_nccl_trace_json")  # noqa: B009
-    assert trace() == b"torch's" and trace_json() == b"torch's json"
+    assert pickle.loads(trace()) == nccl
     fake = _Fake([_word(0, ALLREDUCE, 1)])
-    fake.rec._live[0] = lambda: None  # ty: ignore[invalid-assignment] -- a group known to have lived
+    fake.rec._live[0] = lambda: None  # ty: ignore[invalid-assignment] -- a group known to be alive
     fr._RECORDER.append(fake.rec)
-    assert pickle.loads(trace())["entries"][0]["profiling_name"] == "nccl:all_reduce"
-    assert json.loads(trace_json())["entries"][0]["record_id"] == 0
+    merged = pickle.loads(trace())
+    assert [e["process_group"][0] for e in merged["entries"]] == ["5", "0"]
+    assert [e["pg_id"] for e in merged["entries"]] == [0, 1]  # ours shifted
+    assert sorted(merged["pg_config"]) == ["0", "5"]
+    assert sorted(merged["pg_status"]) == ["0", "1"]
+    as_json = json.loads(trace_json())
+    assert [e["process_group"][0] for e in as_json["entries"]] == ["5", "0"]
+    fake.rec.retire(0)  # destroy_process_group
+    assert not fr.active() and pickle.loads(trace()) == nccl
+
+
+def test_merge_without_nccl_entries_is_ours():
+    ours = _Fake([_word(0, ALLREDUCE, 1)]).rec.dump()
+    assert fr.merge(fr.empty_dump(), ours) == ours
+
+
+def test_peer_ranks_are_those_of_the_live_groups():
+    """The ranks a firing rank waits for: in a job whose default group is
+    gloo, ranks without a mojo group never dump."""
+    fake = _Fake([])
+    fake.rec._groups[0] = fr._Group("3", "sub", [2, 3], 0, 1)
+    fake.rec._groups[1] = fr._Group("4", "gone", [5], 0, 1)
+    fake.rec._live[0] = lambda: None  # ty: ignore[invalid-assignment] -- alive
+    assert fake.rec.peer_ranks() == {2, 3}
 
 
 def test_concurrent_dumps(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -352,17 +425,83 @@ def test_concurrent_dumps(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     assert len(pickle.loads((tmp_path / "trace_3").read_bytes())["entries"]) == 1
 
 
-def test_signal_generations(monkeypatch: pytest.MonkeyPatch):
-    """Every signal is a new generation, acknowledged per generation; a
-    process serves each generation once."""
+def _poller(store: Any) -> fr._Poller:
+    poller = fr._Poller()
+    poller.attach(1, store, 0)
+    return poller
+
+
+def test_generations_belong_to_an_epoch():
+    """Every signal is a new generation; a process claims each once, and a
+    claim of an earlier epoch (an RPC on a store since replaced) gets
+    nothing."""
+    old = c10d_c.HashStore()
+    fr.signal_dump(old, 3)  # an earlier job's signal: the baseline
+    poller = _poller(old)
+    first = fr.signal_dump(old, 0)
+    epoch = poller.epoch
+    assert poller.claim(first, epoch) == range(first, first + 1)
+    assert not poller.claim(first, epoch)
+    poller.detach(1)
+    new = c10d_c.HashStore()
+    poller.attach(2, new, 0)
+    assert not poller.claim(first + 5, epoch)  # the old store's late answer
+    assert poller.claim(fr.signal_dump(new, 1), poller.epoch) == range(1, 2)
+
+
+def test_acknowledgements_per_generation():
     store = c10d_c.HashStore()
-    monkeypatch.setattr(fr, "_SERVED", [fr.current_generation(store)])
     first = fr.signal_dump(store, 0)
-    assert fr.claim(first) == range(1, 2) and fr.claim(first) == range(2, 2)
     second = fr.signal_dump(store, 1)
-    assert second == first + 1
     fr.ack_dump(store, 0, range(first, second + 1))
-    assert fr.wait_for_dumps(store, 2, second, 0.0) == [1]
+    assert fr.wait_for_dumps(store, [0, 1], second, 0.0) == [1]
     fr.ack_dump(store, 1, range(second, second + 1))
-    assert fr.wait_for_dumps(store, 2, second, 1e18) == []
-    assert fr.wait_for_dumps(store, 2, first, 0.0) == [1]  # not acked for #1
+    assert fr.wait_for_dumps(store, [0, 1], second, 1e18) == []
+    assert fr.wait_for_dumps(store, [0, 1], first, 0.0) == [1]
+    assert fr.signaller(store) == 1
+    assert fr.signaller(c10d_c.HashStore()) == -1  # no key: no blocking get
+
+
+def test_poll_acknowledges_only_a_written_dump(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A dump that fails is not acknowledged and is retried at the next
+    poll; once written it is."""
+    store = c10d_c.HashStore()
+    fake = _Fake([_word(0, ALLREDUCE, 1)])
+    monkeypatch.setattr(fr, "_RECORDER", [fake.rec])
+    poller = _poller(store)
+    worker = StoreWorker(store, clone=False, quiet=True)
+    gen = fr.signal_dump(store, 1)
+    blocked = tmp_path / "file"
+    blocked.write_text("")  # a file where the dump directory should be
+    monkeypatch.setenv("TORCH_FR_DUMP_TEMP_FILE", str(blocked / "trace_"))
+    poller._poll(worker, 0, poller.epoch)
+    assert not store.check([f"{fr.ACK_KEY}/{gen}/0"])
+    monkeypatch.setenv("TORCH_FR_DUMP_TEMP_FILE", str(tmp_path / "trace_"))
+    poller._poll(worker, 0, poller.epoch)
+    assert store.check([f"{fr.ACK_KEY}/{gen}/0"])
+    assert (tmp_path / "trace_0").exists()
+    worker.close()
+
+
+def test_poll_answers_a_nccl_dump_signal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """ProcessGroupNCCL's broadcastDumpSignal sets torch's key and no
+    generation: its first appearance dumps once."""
+    store = c10d_c.HashStore()
+    fake = _Fake([_word(0, ALLREDUCE, 1)])
+    monkeypatch.setattr(fr, "_RECORDER", [fake.rec])
+    monkeypatch.setenv("TORCH_FR_DUMP_TEMP_FILE", str(tmp_path / "trace_"))
+    poller = _poller(store)
+    worker = StoreWorker(store, clone=False, quiet=True)
+    poller._poll(worker, 0, poller.epoch)
+    assert not (tmp_path / "trace_0").exists()
+    store.set(fr.DUMP_KEY, struct.pack("=i", 1))  # ty: ignore[invalid-argument-type] -- Store.set takes bytes; the stub says str
+    poller._poll(worker, 0, poller.epoch)
+    assert (tmp_path / "trace_0").exists()
+    (tmp_path / "trace_0").unlink()
+    poller._poll(worker, 0, poller.epoch)
+    assert not (tmp_path / "trace_0").exists()
+    worker.close()

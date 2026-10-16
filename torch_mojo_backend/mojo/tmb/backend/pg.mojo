@@ -35,6 +35,7 @@ from tmb.backend.flight_recorder import (
     fr_member,
     fr_pg,
     fr_ring,
+    fr_selftest,
     fr_snapshot,
 )
 from tmb.backend.vendor import raw_stream_of
@@ -257,7 +258,13 @@ struct PG(Movable):
         )
         if group_open(self.watch, self.f_group_start):
             fr_member(
-                self.fr, op, count, d, root, op == OP_SEND or op == OP_RECV
+                self.fr,
+                op,
+                count,
+                d,
+                root,
+                op == OP_SEND or op == OP_RECV,
+                c.tracker,
             )
             watch_group_add(c.tracker, e^)
             group_note(self.f_group_start, self.watch, c.tracker, c.raw)
@@ -983,7 +990,12 @@ def tmb_pg_fr_snapshot(buf: Int, cap: Int64) abi("C") -> Int64:
     return Int64(fr_snapshot(buf, Int(cap)))
 
 
-comptime PG_VTABLE_SLOTS = 28
+def tmb_pg_fr_selftest() abi("C") -> Int64:
+    """Test hook: flight_recorder.mojo `fr_selftest` (0 when it passes)."""
+    return Int64(fr_selftest())
+
+
+comptime PG_VTABLE_SLOTS = 29
 
 
 def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
@@ -993,7 +1005,8 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     11 send, 12 recv, 13 group_start, 14 group_end, 15 async_error, 16 abort,
     17 synchronize_comm, 18 graph_start, 19 graph_wait, 20 watchdog,
     21 watchdog_exit, 22 watchdog_test_fault, 23 watchdog_test_limit,
-    24 watchdog_process_exiting, 25 fr_init, 26 fr_attach, 27 fr_snapshot.
+    24 watchdog_process_exiting, 25 fr_init, 26 fr_attach, 27 fr_snapshot,
+    28 fr_selftest.
     """
     var t = unsafe_alloc[Int](PG_VTABLE_SLOTS)
     var f0: def(Pointer[c_char, MutUntrackedOrigin], Int32, Int32) thin abi(
@@ -1052,6 +1065,7 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     var f25: def(Int64) thin abi("C") -> Int = tmb_pg_fr_init
     var f26: def(Int, Int64) thin abi("C") -> Int32 = tmb_pg_fr_attach
     var f27: def(Int, Int64) thin abi("C") -> Int64 = tmb_pg_fr_snapshot
+    var f28: def() thin abi("C") -> Int64 = tmb_pg_fr_selftest
     t[unsafe_offset=0] = Pointer(to=f0).unsafe_bitcast[Int]()[]
     t[unsafe_offset=1] = Pointer(to=f1).unsafe_bitcast[Int]()[]
     t[unsafe_offset=2] = Pointer(to=f2).unsafe_bitcast[Int]()[]
@@ -1080,4 +1094,5 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=25] = Pointer(to=f25).unsafe_bitcast[Int]()[]
     t[unsafe_offset=26] = Pointer(to=f26).unsafe_bitcast[Int]()[]
     t[unsafe_offset=27] = Pointer(to=f27).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=28] = Pointer(to=f28).unsafe_bitcast[Int]()[]
     return t
