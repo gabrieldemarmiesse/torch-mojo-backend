@@ -1,3 +1,4 @@
+import builtins
 import datetime as dt
 import functools
 import operator
@@ -16,11 +17,12 @@ import numpy as np
 import torch
 from functorch.compile import make_boxed_func
 from max import engine
+from max.experimental.tensor import Tensor as MaxEagerTensor
 from max.experimental.torch.torch import torch_dtype_to_max
 from max.graph import DeviceRef, Graph, KernelLibrary, ops as max_ops
 from torch._dynamo.backends.common import aot_autograd
 from torch._subclasses.fake_tensor import unset_fake_temporarily
-from torch.utils._pytree import tree_leaves
+from torch.utils._pytree import tree_flatten, tree_leaves, tree_unflatten
 
 from torch_mojo_backend import native
 from torch_mojo_backend.aten_functions import (
@@ -44,7 +46,11 @@ from torch_mojo_backend.torch_compile_backend.collectives import (
     waited_inputs,
 )
 from torch_mojo_backend.torch_compile_backend.streams import (
+    ACTIVE_STREAM_CONTEXTS,
+    MaxStreamPool,
     compile_stream_graph,
+    enter_streams,
+    max_stream_id,
     uses_streams,
 )
 from torch_mojo_backend.torch_compile_backend.utils import (
@@ -219,6 +225,7 @@ class _GraphFactory:
         # The graph's collectives, whose process-group handles are host
         # inputs after the seed (set by create_graph).
         self.collectives: GraphCollectives | None = None
+        self.max_stream_id = 0
 
     def initialize_graph(self):
         if self.graph is not None:
@@ -400,6 +407,87 @@ class _GraphFactory:
                 )
         self.tensor_book[node.name] = attr_value
 
+    def handle_side_stream(
+        self, nodes: list[tuple[int, torch.fx.Node]], stream_id: int
+    ):
+        """Lower a tensor region into a MAX side stream with explicit captures."""
+        assert self.graph is not None
+        self.max_stream_id = builtins.max(self.max_stream_id, stream_id)
+        members = {node for _, node in nodes}
+        inputs = list(
+            dict.fromkeys(
+                arg
+                for _, node in nodes
+                for arg in node.all_input_nodes
+                if arg not in members
+            )
+        )
+        outputs = [
+            node for _, node in nodes if any(user not in members for user in node.users)
+        ]
+        values, input_spec = tree_flatten(
+            [self.tensor_book.tensors[node.name] for node in inputs]
+        )
+        tensor_indices = [
+            i
+            for i, value in enumerate(values)
+            if isinstance(value, max.graph.TensorValue | MaxEagerTensor)
+        ]
+        tensors = [max.graph.TensorValue(values[i]) for i in tensor_indices]
+        previous = self.tensor_book
+        results = []
+        output_spec = None
+        result_indices = []
+
+        def lower(*args: max.graph.TensorValue) -> list[max.graph.TensorValue]:
+            nonlocal results, output_spec, result_indices
+            self.tensor_book = TensorsBook()
+            self.tensor_book.tensors.update(previous.tensors)
+            try:
+                body_values = list(values)
+                for index, value in zip(tensor_indices, args, strict=True):
+                    body_values[index] = value
+                for node, value in zip(
+                    inputs, tree_unflatten(body_values, input_spec), strict=True
+                ):
+                    self.tensor_book[node.name] = value
+                for node_idx, node in nodes:
+                    self.handle_call_function(node_idx, node)
+                results, output_spec = tree_flatten(
+                    [self.tensor_book.tensors[node.name] for node in outputs]
+                )
+                result_indices = [
+                    i
+                    for i, value in enumerate(results)
+                    if isinstance(value, max.graph.TensorValue | MaxEagerTensor)
+                ]
+                return [max.graph.TensorValue(results[i]) for i in result_indices]
+            finally:
+                self.tensor_book = previous
+
+        # side_stream needs result types before building its body. Infer them
+        # with the existing lowerings in a temporary graph; this also handles
+        # symbolic shape expressions without duplicating ATen shape rules.
+        # MAX 26.6 does not permit ops.call inside mo.sequence.
+        with Graph(
+            "stream_types",
+            input_types=[value.type for value in tensors],
+            kernel_library=global_max_objects().kernel_library,
+        ) as type_graph:
+            type_results = lower(*(value.tensor for value in type_graph.inputs))
+            result_types = [value.type for value in type_results]
+            type_graph.output(*type_results)
+        side_results = max_ops.side_stream(
+            tensors, lower, result_types=result_types, stream_id=stream_id
+        )
+        for index, value in zip(result_indices, side_results, strict=True):
+            results[index] = value
+        assert output_spec is not None
+        for node, value in zip(
+            outputs, tree_unflatten(results, output_spec), strict=True
+        ):
+            self.tensor_book[node.name] = value
+
     def handle_output(
         self, node: torch.fx.Node
     ) -> list[tuple[OutputBlueprintKind, int | None]]:
@@ -480,7 +568,11 @@ class _GraphFactory:
         except CollectiveLoweringError as e:
             raise MojoCompilerError(str(e)) from e
         try:
-            for node_idx, node in enumerate(graph.nodes):
+            nodes = list(enumerate(graph.nodes))
+            position = 0
+            while position < len(nodes):
+                node_idx, node = nodes[position]
+                position += 1
                 if node.op == "placeholder":
                     self.handle_placeholder(node)
                     continue
@@ -489,7 +581,23 @@ class _GraphFactory:
                     self.initialize_graph()
 
                 if node.op in ("call_function", "call_method"):
-                    self.handle_call_function(node_idx, node)
+                    stream_id = max_stream_id(node)
+                    # Random state and collective handles belong to the parent
+                    # graph. Their existing lowerings retain that ordering.
+                    if stream_id and not self.takes_seed and self.collectives is None:
+                        group = [(node_idx, node)]
+                        while position < len(nodes):
+                            next_idx, next_node = nodes[position]
+                            if (
+                                next_node.op not in ("call_function", "call_method")
+                                or max_stream_id(next_node) != stream_id
+                            ):
+                                break
+                            group.append((next_idx, next_node))
+                            position += 1
+                        self.handle_side_stream(group, stream_id)
+                    else:
+                        self.handle_call_function(node_idx, node)
                 elif node.op == "get_attr":
                     self.handle_get_attr(node)
                 elif node.op == "output":
@@ -644,6 +752,7 @@ class BaseMaxCompiler:
         if profiling_enabled():
             graph_defined_time = time.time_ns()
         self.model = global_max_objects().session.load(graph)
+        self.side_streams = MaxStreamPool(self.model.devices, factory.max_stream_id + 1)
         if profiling_enabled():
             compiling_done_time = time.time_ns()
             defining = dt.timedelta(
@@ -679,7 +788,13 @@ class BaseMaxCompiler:
             # the wait the graph traced, done here, orders the current stream
             # (and so the graph, see fast_from_dlpack) after it.
             torch.ops._c10d_functional.wait_tensor(args[i])
-        stream_fences = [fast_from_dlpack(token) for token in self.stream_tokens]
+        stream_fences = []
+        for contexts in ACTIVE_STREAM_CONTEXTS.get():
+            with enter_streams(contexts):
+                stream_fences.extend(
+                    (token, fast_from_dlpack(token), contexts)
+                    for token in self.stream_tokens
+                )
         input_tensors = [
             _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
         ]
@@ -687,6 +802,8 @@ class BaseMaxCompiler:
             input_tensors.append(graph_seed())
         if self.collectives is not None:
             input_tensors.extend(self.collectives.runtime_inputs())
+        fences = [fence for _, fence, _ in stream_fences]
+        self.side_streams.fence(fences, entering=True)
         try:
             outputs = self.model.execute(*input_tensors)
         except BaseException as e:
@@ -702,21 +819,26 @@ class BaseMaxCompiler:
         finally:
             # Publish completion even when the graph returns no GPU tensor,
             # and before AOT's mutation epilogue or a user records an event.
-            for token, fence in zip(self.stream_tokens, stream_fences, strict=True):
-                if fence.device.label == "cpu":
-                    continue
-                if token.device.type == "mojo":
-                    if device_module.get_device_properties(token.device).api == "metal":
-                        fence.device.synchronize()
+            self.side_streams.fence(fences, entering=False)
+            for token, fence, contexts in stream_fences:
+                with enter_streams(contexts):
+                    if fence.device.label == "cpu":
                         continue
-                    handle = device_module.stream_native_handle(
-                        torch.accelerator.current_stream(token.device)
-                    )
-                else:
-                    handle = torch.cuda.current_stream(token.device).cuda_stream
-                    # DLPack reserves 1 for CUDA's legacy default stream.
-                    handle = handle or 1
-                fence.__dlpack__(stream=handle)
+                    if token.device.type == "mojo":
+                        if (
+                            device_module.get_device_properties(token.device).api
+                            == "metal"
+                        ):
+                            fence.device.synchronize()
+                            continue
+                        handle = device_module.stream_native_handle(
+                            torch.accelerator.current_stream(token.device)
+                        )
+                    else:
+                        handle = torch.cuda.current_stream(token.device).cuda_stream
+                        # DLPack reserves 1 for CUDA's legacy default stream.
+                        handle = handle or 1
+                    fence.__dlpack__(stream=handle)
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
             # buffers zero-copy as eager mojo tensors (DIM outputs become

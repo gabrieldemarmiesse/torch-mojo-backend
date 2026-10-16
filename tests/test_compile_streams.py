@@ -1,5 +1,6 @@
 """Stream orchestration must survive compilation, including repeated calls."""
 
+import max.driver
 import pytest
 import torch
 
@@ -113,6 +114,41 @@ def test_compile_event_handoff(stream_device, event_api):
         torch.testing.assert_close(compiled(x).cpu(), (x.cpu() + 3) * 2)
 
 
+def test_compile_independent_regions_launch_on_distinct_max_streams(stream_device):
+    first = torch.Stream(device=stream_device)
+    second = torch.Stream(device=stream_device)
+
+    def fn(x):
+        current = current_stream(x.device)
+        first.wait_stream(current)
+        second.wait_stream(current)
+        with stream_context(first, stream_device):
+            a = x.sin()
+        with stream_context(second, stream_device):
+            b = x.cos()
+        current.wait_stream(first)
+        current.wait_stream(second)
+        return a + b
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    x = torch.randn(1024, device=stream_device)
+    compiled(x).cpu()
+    max.driver.begin_launch_trace()
+    try:
+        result = compiled(x)
+    finally:
+        launches = max.driver.take_launch_trace()
+    torch.testing.assert_close(result.cpu(), x.cpu().sin() + x.cpu().cos())
+    sine_streams = {
+        entry.stream_index for entry in launches if "elementwise_sin" in entry.name
+    }
+    cosine_streams = {
+        entry.stream_index for entry in launches if "elementwise_cos" in entry.name
+    }
+    assert sine_streams and cosine_streams, [entry.name for entry in launches]
+    assert sine_streams.isdisjoint(cosine_streams)
+
+
 def test_compile_nested_streams_and_backward(stream_device):
     require_cuda_autograd(torch.device(stream_device).type)
     first = torch.Stream(device=stream_device)
@@ -141,6 +177,70 @@ def test_compile_nested_streams_and_backward(stream_device):
         )
         assert x.grad is not None
         torch.testing.assert_close(x.grad.cpu(), 4 * x.detach().cpu() + 1)
+
+
+def test_compile_stream_regions_backward(stream_device):
+    require_cuda_autograd(torch.device(stream_device).type)
+    first = torch.Stream(device=stream_device)
+    second = torch.Stream(device=stream_device)
+
+    def fn(x):
+        current = current_stream(x.device)
+        first.wait_stream(current)
+        second.wait_stream(current)
+        with stream_context(first, stream_device):
+            a = x.sin()
+        with stream_context(second, stream_device):
+            b = x.cos()
+        current.wait_stream(first)
+        current.wait_stream(second)
+        return a + b
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True, dynamic=True)
+    for rows in (3, 7):
+        x = torch.randn(rows, 4, device=stream_device, requires_grad=True)
+        compiled(x).sum().backward()
+        assert x.grad is not None
+        host = x.detach().cpu()
+        torch.testing.assert_close(x.grad.cpu(), host.cos() - host.sin())
+
+
+def test_compile_backward_hooks_observe_forward_streams(stream_device):
+    require_cuda_autograd(torch.device(stream_device).type)
+    first = torch.Stream(device=stream_device)
+    second = torch.Stream(device=stream_device)
+
+    def fn(x, y):
+        current = current_stream(x.device)
+        first.wait_stream(current)
+        second.wait_stream(current)
+        with stream_context(first, stream_device):
+            a = x.sin()
+        with stream_context(second, stream_device):
+            b = y.cos()
+        current.wait_stream(first)
+        current.wait_stream(second)
+        return a + b
+
+    def first_hook(grad):
+        return grad * (
+            2 if current_stream(grad.device).stream_id == first.stream_id else 3
+        )
+
+    def second_hook(grad):
+        return grad * (
+            2 if current_stream(grad.device).stream_id == second.stream_id else 3
+        )
+
+    x = torch.ones(32, device=stream_device, requires_grad=True)
+    y = torch.ones(32, device=stream_device, requires_grad=True)
+    x.register_hook(first_hook)
+    y.register_hook(second_hook)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    compiled(x, y).sum().backward()
+    assert x.grad is not None and y.grad is not None
+    torch.testing.assert_close(x.grad.cpu(), 2 * x.detach().cpu().cos())
+    torch.testing.assert_close(y.grad.cpu(), -2 * y.detach().cpu().sin())
 
 
 def test_compile_mutation_on_stream(stream_device):

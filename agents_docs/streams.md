@@ -78,27 +78,47 @@ Dynamo places stream contexts in FX node metadata, but AOTAutograd executes
 ordinary stream/event methods while tracing and omits them from its tensor
 graph. `torch_compile_backend/streams.py` therefore partitions the Dynamo
 graph before AOT. The runtime wrapper retains stream/event operations in
-program order; contiguous tensor regions are compiled to MAX and invoked
-under the requested torch stream. Stream objects are resolved from Dynamo's
+program order; adjacent tensor regions stay in one MAX graph even when their
+torch stream contexts differ. Each context is assigned a MAX stream ID and
+lowered with `ops.side_stream()`, so independent regions can execute in
+parallel during inference. Data dependencies between the regions remain
+explicit graph edges. Stream objects are resolved from Dynamo's
 runtime table on every call, rather than retaining tracing-time streams.
 `preserve_dynamo_stream_contexts()` retains the entire nested context stack
 in extra metadata: the innermost stream alone cannot describe an active
 outer context on a different device. This tracing patch is installed at
 package import so it also covers CUDA-only use without device registration.
 
-MAX still executes these regions on its own shared device queue. A tiny
-per-device DLPack handoff orders the graph after the current torch stream
-and orders that stream after the graph. The handoff is refreshed on every
+The MAX queues are distinct from the user's torch queues. A tiny per-device
+DLPack handoff imports dependencies from every participating torch context.
+Every MAX side stream waits for those entry dependencies before execution;
+the exit handoff joins the MAX streams before publishing completion to the
+torch streams. The handoff is refreshed on every
 invocation, including when tensor buffers are cached or the graph has no GPU
 inputs/outputs. CUDA/ROCm waits are device-side; Metal uses its existing host
 synchronization path. Tensor calculations remain compiled; stream/event
 orchestration runs on the host, as it does in eager mode.
 
-This preserves ordering, but does **not** preserve overlap between independent
-compiled regions: MAX's shared queue can serialize them. We do not yet use
-`ops.side_stream()` to assign compiled regions to independent MAX queues.
-That optimization must also retain the external torch-stream handoffs and
-runtime event operations; stream metadata alone is not sufficient.
+Explicit stream/event operations remain host orchestration boundaries, so
+parallel execution is within each contiguous tensor section, not across such
+boundaries. Graphs involving tensors that require gradients conservatively
+retain per-context AOT partitions: an AOT
+autograd Function has one torch stream identity, so combining contexts changes
+the streams observed by backward hooks and gradient accumulation. Training
+therefore preserves stream semantics but does not yet gain cross-context
+parallel execution. Graphs containing stateful MAX random operations or
+collectives currently keep their existing serialized lowering. Metal retains its single
+queue behavior. Distinct queues enable overlap; actual overlap depends on
+kernel duration and available GPU resources.
+
+MAX 26.6 requires side-stream IDs to exist in the model's context before
+execution. Its Python `DeviceQueue` creates a separate context rather than
+extending this indexed pool. `MaxStreamPool` uses the same AsyncRT C entry
+points as Mojo's `DeviceContext.create_stream()` and `select_stream()` to
+prepare the pool and enqueue the entry/exit dependencies. The model's context
+owns the streams; selected context views are released when their compiler
+instance is collected. This compatibility bridge can be removed once MAX's
+Python API exposes indexed stream creation and selection directly.
 
 When CUDA and mojo coexist, `fix_dynamo_current_stream_device()` in
 `monkeypatching.py` repairs PyTorch 2.11's current-stream lookup: its
