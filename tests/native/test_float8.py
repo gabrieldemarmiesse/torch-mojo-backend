@@ -1,12 +1,14 @@
 """Native backend: the float8 dtypes (float8_e4m3fn, float8_e5m2, the two
-fnuz variants and float8_e8m0fnu).
+fnuz variants and float8_e8m0fnu) and torch._scaled_mm / _scaled_mm_v2.
 
 Stock CUDA's set is the oracle: allocation, conversions (c10's bit-exact
 float8 <-> float32 functions; stock CUDA's sm_89+ e4m3fn saturation on
 copies), fills, `.item()`, the dtype-agnostic data movement CUDA dispatches
-over AT_FLOAT8_TYPES, eq / ne / where and their type promotion. Arithmetic
-CUDA has no float8 kernel for is declined. References are CPU torch, with the
-stock-CUDA saturation rule applied where it differs (`_stock_cast`).
+over AT_FLOAT8_TYPES, eq / ne / where and their type promotion, and the
+scaled GEMMs. Arithmetic CUDA has no float8 kernel for is declined.
+References are CPU torch, with the stock-CUDA saturation rule applied where
+it differs (`_stock_cast`), and, for the GEMMs, a float64 product of the
+dequantized operands.
 """
 
 import itertools
@@ -16,6 +18,7 @@ import re
 
 import pytest
 import torch
+from torch.nn.functional import ScalingType, SwizzleType
 
 from tests.native.conftest import is_metal
 from torch_mojo_backend.native import device_module
@@ -319,6 +322,425 @@ def test_float8_arithmetic_declined(mojo_device, dtype, op):
         op(_x(dtype).to(mojo_device))
 
 
+# ---------------------------------------------------------------------------
+# torch._scaled_mm / _scaled_mm_v2
+# ---------------------------------------------------------------------------
+
+F8_MAX = {
+    torch.float8_e4m3fn: 448.0,
+    torch.float8_e5m2: 57344.0,
+    torch.float8_e4m3fnuz: 240.0,
+    torch.float8_e5m2fnuz: 57344.0,
+}
+
+
+def _q(shape: tuple[int, ...], dtype: torch.dtype, seed: int) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    return (torch.randn(shape, generator=g) * 2).to(dtype)
+
+
+def _expected(a32, b32, sa, sb, bias, out_dtype):
+    p = a32.double() @ b32.double()
+    p = p * sa.double() * sb.double()
+    if bias is not None:
+        p = p + bias.double()
+    if out_dtype in F8_MAX:
+        top = F8_MAX[out_dtype]
+        p = p.clamp(-top, top)
+    return p.float().to(out_dtype)
+
+
+def _check(got, want):
+    assert got.dtype == want.dtype and got.shape == want.shape
+    g, w = got.cpu().double(), want.double()
+    tol = {
+        torch.float32: (1e-5, 1e-4),
+        torch.bfloat16: (1.6e-2, 1e-2),
+        torch.float16: (2e-3, 1e-2),
+    }.get(got.dtype, (0.13, 1e-2))
+    torch.testing.assert_close(g, w, rtol=tol[0], atol=tol[1])
+
+
+@pytest.mark.parametrize(
+    "a_dt,b_dt",
+    [
+        (torch.float8_e4m3fn, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.float8_e5m2),
+        (torch.float8_e5m2, torch.float8_e4m3fn),
+    ],
+    ids=["e4m3xe4m3", "e4m3xe5m2", "e5m2xe4m3"],
+)
+@pytest.mark.parametrize(
+    "out_dtype",
+    [torch.bfloat16, torch.float16, torch.float32, None],
+    ids=["bf16", "f16", "f32", "default"],
+)
+@pytest.mark.parametrize("m,k,n", [(16, 32, 48), (100, 96, 80), (257, 528, 112)])
+def test_scaled_mm_tensorwise(mojo_device, a_dt, b_dt, out_dtype, m, k, n):
+    a = _q((m, k), a_dt, 1)
+    b = _q((n, k), b_dt, 2).t()  # column-major, as cuBLASLt wants it
+    sa, sb = torch.tensor(0.5), torch.tensor(1.75)
+    got = torch._scaled_mm(
+        a.to(mojo_device),
+        b.to(mojo_device),
+        sa.to(mojo_device),
+        sb.to(mojo_device),
+        out_dtype=out_dtype,
+    )
+    _check(got, _expected(a.float(), b.float(), sa, sb, None, out_dtype or a_dt))
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("m,k,n", [(32, 64, 16), (130, 160, 96)])
+def test_scaled_mm_rowwise(mojo_device, out_dtype, bias, m, k, n):
+    if bias and out_dtype == torch.float32:
+        pytest.skip("CUDA refuses a bias with a float32 output")
+    a = _q((m, k), torch.float8_e4m3fn, 3)
+    b = _q((n, k), torch.float8_e4m3fn, 4).t()
+    sa = torch.rand(m, 1) + 0.25
+    sb = torch.rand(1, n) + 0.25
+    bias_t = (torch.randn(n) * 4).to(out_dtype) if bias else None
+    dev = mojo_device
+    got = torch._scaled_mm(
+        a.to(dev),
+        b.to(dev),
+        sa.to(dev),
+        sb.to(dev),
+        bias=None if bias_t is None else bias_t.to(dev),
+        out_dtype=out_dtype,
+    )
+    _check(got, _expected(a.float(), b.float(), sa, sb, bias_t, out_dtype))
+    # The out= overload, into a transposed destination.
+    out = torch.empty(n, m, dtype=out_dtype, device=dev).t()
+    r = torch._scaled_mm(
+        a.to(dev),
+        b.to(dev),
+        sa.to(dev),
+        sb.to(dev),
+        bias=None if bias_t is None else bias_t.to(dev),
+        out_dtype=out_dtype,
+        out=out,
+    )
+    assert r.data_ptr() == out.data_ptr()
+    _check(out, _expected(a.float(), b.float(), sa, sb, bias_t, out_dtype))
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_scaled_mm_float8_output_saturates(mojo_device, out_dtype):
+    m, k, n = 16, 32, 16
+    a = torch.full((m, k), 8.0).to(torch.float8_e4m3fn)
+    b = torch.full((n, k), 8.0).to(torch.float8_e4m3fn).t()
+    b = b if out_dtype == torch.float8_e4m3fn else b.to(torch.float8_e5m2)
+    one = torch.tensor(1.0, device=mojo_device)
+    scale = torch.tensor(-1.0 if out_dtype == torch.float8_e4m3fn else 100.0)
+    got = torch._scaled_mm(
+        a.to(mojo_device),
+        b.to(mojo_device),
+        scale.to(mojo_device),
+        one,
+        out_dtype=out_dtype,
+    )
+    _check(
+        got, _expected(a.float(), b.float(), scale, torch.tensor(1.0), None, out_dtype)
+    )
+    assert got.float().abs().max().item() == F8_MAX[out_dtype]
+
+
+def _blockwise_case(kind_a: str, kind_b: str, m: int, k: int, n: int):
+    """Operands and CUDA-layout scales for a DeepSeek recipe, plus the
+    dequantized float32 operands. v1 and v2 lay the scales out differently:
+    return both."""
+    kb = (k + 127) // 128
+    kb4 = (kb + 3) // 4 * 4
+    a = _q((m, k), torch.float8_e4m3fn, 5)
+    bt = _q((n, k), torch.float8_e4m3fn, 6)
+    g = torch.Generator().manual_seed(7)
+    rows = {"a": m, "b": n}
+
+    def scales(side: str, kind: str):
+        r = rows[side]
+        if kind == "1x128":
+            s = torch.rand(r, kb, generator=g) + 0.5  # (outer, kb)
+            full = s.repeat_interleave(128, 1)[:, :k]
+            v1 = s.t().contiguous().t()  # outer-dim-major: strides (1, outer)
+            v2 = v1
+        else:
+            rb = (r + 127) // 128
+            s = torch.rand(rb, kb, generator=g) + 0.5
+            full = s.repeat_interleave(128, 0)[:r].repeat_interleave(128, 1)[:, :k]
+            v1 = s.contiguous()  # (outer blocks, kb) row-major
+            pad = torch.zeros(rb, kb4)
+            pad[:, :kb] = s
+            v2 = pad.t()  # (kb4, outer blocks), strides (1, kb4)
+        return full, v1, v2
+
+    fa, a_v1, a_v2 = scales("a", kind_a)
+    fb, b_v1, b_v2 = scales("b", kind_b)
+    a32 = a.float() * fa
+    b32 = (bt.float() * fb).t()
+    # v1 checks B's scale through a transpose: hand it (kb, N)-shaped.
+    return a, bt.t(), a32, b32, (a_v1, b_v1.t()), (a_v2, b_v2)
+
+
+@pytest.mark.parametrize(
+    "kinds",
+    [("1x128", "1x128"), ("1x128", "128x128"), ("128x128", "1x128")],
+    ids=["1x128-1x128", "1x128-128x128", "128x128-1x128"],
+)
+@pytest.mark.parametrize("m,k,n", [(128, 256, 128), (200, 384, 144)])
+def test_scaled_mm_blockwise(mojo_device, kinds, m, k, n):
+    a, b, a32, b32, v1, v2 = _blockwise_case(kinds[0], kinds[1], m, k, n)
+    one = torch.tensor(1.0)
+    want = _expected(a32, b32, one, one, None, torch.bfloat16)
+    dev = mojo_device
+    got = torch._scaled_mm(
+        a.to(dev), b.to(dev), v1[0].to(dev), v1[1].to(dev), out_dtype=torch.bfloat16
+    )
+    _check(got, want)
+    rec = {"1x128": ScalingType.BlockWise1x128, "128x128": ScalingType.BlockWise128x128}
+    got = torch.nn.functional.scaled_mm(
+        a.to(dev),
+        b.to(dev),
+        v2[0].to(dev),
+        rec[kinds[0]],
+        v2[1].to(dev),
+        rec[kinds[1]],
+        output_dtype=torch.bfloat16,
+    )
+    _check(got, want)
+
+
+def _to_blocked(s: torch.Tensor) -> torch.Tensor:
+    """torch's SWIZZLE_32_4_4 (`to_blocked`) of a (rows, K/32) scale matrix."""
+    rows, cols = s.shape
+    rb, cb = (rows + 127) // 128, (cols + 3) // 4
+    padded = torch.zeros(rb * 128, cb * 4, dtype=s.dtype)
+    padded[:rows, :cols] = s
+    blocks = padded.view(rb, 128, cb, 4).permute(0, 2, 1, 3)
+    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
+
+
+@pytest.mark.parametrize("m,k,n", [(128, 128, 128), (160, 320, 48)])
+def test_scaled_mm_mxfp8(mojo_device, m, k, n):
+    a = _q((m, k), torch.float8_e4m3fn, 8)
+    bt = _q((n, k), torch.float8_e4m3fn, 9)
+    g = torch.Generator().manual_seed(10)
+    ea = torch.randint(120, 134, (m, (k + 31) // 32), generator=g, dtype=torch.uint8)
+    eb = torch.randint(120, 134, (n, (k + 31) // 32), generator=g, dtype=torch.uint8)
+    fa = ea.view(torch.float8_e8m0fnu).float().repeat_interleave(32, 1)[:, :k]
+    fb = eb.view(torch.float8_e8m0fnu).float().repeat_interleave(32, 1)[:, :k]
+    sa = _to_blocked(ea).view(torch.float8_e8m0fnu)
+    sb = _to_blocked(eb).view(torch.float8_e8m0fnu)
+    one = torch.tensor(1.0)
+    want = _expected(
+        a.float() * fa, (bt.float() * fb).t(), one, one, None, torch.bfloat16
+    )
+    dev = mojo_device
+    got = torch._scaled_mm(
+        a.to(dev), bt.t().to(dev), sa.to(dev), sb.to(dev), out_dtype=torch.bfloat16
+    )
+    _check(got, want)
+    got = torch.nn.functional.scaled_mm(
+        a.to(dev),
+        bt.t().to(dev),
+        sa.to(dev),
+        ScalingType.BlockWise1x32,
+        sb.to(dev),
+        ScalingType.BlockWise1x32,
+        swizzle_a=SwizzleType.SWIZZLE_32_4_4,
+        swizzle_b=SwizzleType.SWIZZLE_32_4_4,
+        output_dtype=torch.bfloat16,
+    )
+    _check(got, want)
+
+
+def test_scaled_mm_v2_tensorwise_rowwise(mojo_device):
+    m, k, n = 48, 64, 32
+    a = _q((m, k), torch.float8_e4m3fn, 11)
+    b = _q((n, k), torch.float8_e5m2, 12).t()
+    dev = mojo_device
+    sa, sb = torch.tensor(2.0), torch.tensor(0.25)
+    got = torch.nn.functional.scaled_mm(
+        a.to(dev),
+        b.to(dev),
+        sa.to(dev),
+        ScalingType.TensorWise,
+        sb.to(dev),
+        ScalingType.TensorWise,
+        output_dtype=torch.float32,
+    )
+    _check(got, _expected(a.float(), b.float(), sa, sb, None, torch.float32))
+    sa, sb = torch.rand(m, 1) + 0.5, torch.rand(1, n) + 0.5
+    bias = torch.randn(n).to(torch.bfloat16)
+    got = torch.nn.functional.scaled_mm(
+        a.to(dev),
+        b.to(dev),
+        sa.to(dev),
+        ScalingType.RowWise,
+        sb.to(dev),
+        ScalingType.RowWise,
+        bias=bias.to(dev),
+        output_dtype=torch.bfloat16,
+    )
+    _check(got, _expected(a.float(), b.float(), sa, sb, bias, torch.bfloat16))
+
+
+def test_scaled_mm_empty_and_errors(mojo_device):
+    dev = mojo_device
+    one = torch.tensor(1.0, device=dev)
+    a = torch.zeros(16, 0, dtype=torch.float8_e4m3fn, device=dev)
+    b = torch.zeros(16, 0, dtype=torch.float8_e4m3fn, device=dev).t()
+    out = torch._scaled_mm(a, b, one, one, out_dtype=torch.bfloat16)
+    assert out.shape == (16, 16) and torch.equal(
+        out.cpu(), torch.zeros(16, 16, dtype=torch.bfloat16)
+    )
+    a = torch.zeros(16, 32, dtype=torch.float8_e4m3fn, device=dev)
+    b = torch.zeros(16, 32, dtype=torch.float8_e4m3fn, device=dev).t()
+    err = (RuntimeError, ValueError)
+    with pytest.raises(err, match="shapes cannot be multiplied"):
+        torch._scaled_mm(a, a, one, one)
+    with pytest.raises(err, match="Multiplication of two Float8_e5m2"):
+        torch._scaled_mm(a.to(torch.float8_e5m2), b.to(torch.float8_e5m2), one, one)
+    with pytest.raises(err, match="Invalid scaling configuration"):
+        torch._scaled_mm(a, b, torch.ones(3, device=dev), one)
+    with pytest.raises(err, match="divisible by 16"):
+        a2 = torch.zeros(16, 24, dtype=torch.float8_e4m3fn, device=dev)
+        torch._scaled_mm(a2, a2.t(), one, one)
+    with pytest.raises(
+        err, match="Bias is not supported when out_dtype is set to Float32"
+    ):
+        torch._scaled_mm(
+            a,
+            b,
+            one,
+            one,
+            bias=torch.zeros(16, dtype=torch.bfloat16, device=dev),
+            out_dtype=torch.float32,
+        )
+    with pytest.raises(err, match="Bias must be BFloat16 to compute BFloat16"):
+        torch._scaled_mm(
+            a,
+            b,
+            one,
+            one,
+            bias=torch.zeros(16, dtype=torch.half, device=dev),
+            out_dtype=torch.bfloat16,
+        )
+
+
+def _grouped_ref(groups):
+    """bfloat16 result of a list of (a, b, sa, sb) rowwise groups."""
+    return [
+        _expected(a.float(), b.float(), sa[:, None], sb[None, :], None, torch.bfloat16)
+        for a, b, sa, sb in groups
+    ]
+
+
+@pytest.mark.parametrize("case", ["3d3d", "2d3d", "2d2d", "3d2d"])
+def test_scaled_grouped_mm_rowwise(mojo_device, case):
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    G, M, K, N = 3, 32, 64, 48
+    g = torch.Generator().manual_seed(13)
+
+    def rnd(*shape):
+        return torch.rand(*shape, generator=g) + 0.5
+
+    if case == "3d3d":
+        a = _q((G, M, K), f8, 14)
+        b = _q((G, N, K), f8, 15).transpose(1, 2)
+        sa, sb, offs = rnd(G, M), rnd(G, N), None
+        want = torch.stack(_grouped_ref([(a[i], b[i], sa[i], sb[i]) for i in range(G)]))
+    elif case == "2d3d":
+        ends = [16, 16, 80]  # an empty group in the middle
+        a = _q((80, K), f8, 16)
+        b = _q((G, N, K), f8, 17).transpose(1, 2)
+        sa, sb = rnd(80), rnd(G, N)
+        offs = torch.tensor(ends, dtype=torch.int32)
+        starts = [0] + ends[:-1]
+        want = torch.cat(
+            _grouped_ref(
+                [
+                    (a[s:e], b[i], sa[s:e], sb[i])
+                    for i, (s, e) in enumerate(zip(starts, ends))
+                ]
+            )
+        )
+    elif case == "2d2d":
+        ends = [16, 48, 64]
+        a = _q((M, 64), f8, 18)
+        b = _q((N, 64), f8, 19).t()
+        sa, sb = rnd(G * M), rnd(G * N)
+        offs = torch.tensor(ends, dtype=torch.int32)
+        starts = [0] + ends[:-1]
+        want = torch.stack(
+            _grouped_ref(
+                [
+                    (
+                        a[:, s:e],
+                        b[s:e],
+                        sa[i * M : (i + 1) * M],
+                        sb[i * N : (i + 1) * N],
+                    )
+                    for i, (s, e) in enumerate(zip(starts, ends))
+                ]
+            )
+        )
+    else:
+        ends = [16, 32, 48]
+        a = _q((G, M, K), f8, 20)
+        b = _q((48, K), f8, 21).t()
+        sa, sb = rnd(G, M), rnd(48)
+        offs = torch.tensor(ends, dtype=torch.int32)
+        starts = [0] + ends[:-1]
+        want = torch.cat(
+            _grouped_ref(
+                [
+                    (a[i], b[:, s:e], sa[i], sb[s:e])
+                    for i, (s, e) in enumerate(zip(starts, ends))
+                ]
+            ),
+            dim=1,
+        )
+
+    da, db, dsa, dsb = (t.to(dev) for t in (a, b, sa, sb))
+    doffs = None if offs is None else offs.to(dev)
+    got = torch._scaled_grouped_mm(
+        da, db, dsa, dsb, offs=doffs, out_dtype=torch.bfloat16
+    )
+    _check(got, want)
+    # torch.nn.functional.scaled_grouped_mm (the v2 op), looked up at run
+    # time: torch's stubs do not declare it.
+    scaled_grouped_mm = vars(torch.nn.functional)["scaled_grouped_mm"]
+    got = scaled_grouped_mm(
+        da,
+        db,
+        dsa,
+        ScalingType.RowWise,
+        dsb,
+        ScalingType.RowWise,
+        offs=doffs,
+        output_dtype=torch.bfloat16,
+    )
+    _check(got, want)
+
+
+def test_scaled_grouped_mm_errors(mojo_device):
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    a = torch.zeros(2, 16, 32, dtype=f8, device=dev)
+    b = torch.zeros(2, 16, 32, dtype=f8, device=dev).transpose(1, 2)
+    s = torch.ones(2, 16, device=dev)
+    err = (RuntimeError, ValueError)
+    with pytest.raises(err, match="Expected mat2 to be transposed"):
+        torch._scaled_grouped_mm(a, b.contiguous(), s, s)
+    with pytest.raises(err, match="Only bf16"):
+        torch._scaled_grouped_mm(a, b, s, s, out_dtype=torch.float32)
+    with pytest.raises(err, match="Have to provide offsets"):
+        torch._scaled_grouped_mm(a[0], b, s[0], s)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_nan_reads_as_true_and_unequal(mojo_device, dtype):
     """bool(nan) is True and nan != x is True, as on CUDA (the float8 paths
@@ -370,6 +792,134 @@ def test_float8_scatter_value_declined(mojo_device):
             x.clone().scatter_(0, idx, value)
         with pytest.raises(NotImplementedError, match="scatter_fill"):
             x.scatter(0, idx, value)
+
+
+def test_scaled_mm_tensorwise_scales_combine(mojo_device):
+    """scale_a * scale_b is one factor (cuBLAS's alpha): 64 * 1e37 then
+    * 1e-37 one at a time would overflow to inf. (1e-37, not 1e-38: the
+    latter is a float32 subnormal, which an Apple GPU flushes.)"""
+    a = torch.full((16, 16), 2.0).to(torch.float8_e4m3fn)
+    b = torch.full((16, 16), 2.0).to(torch.float8_e4m3fn).t()
+    sa = torch.tensor(1e37, device=mojo_device)
+    sb = torch.tensor(1e-37, device=mojo_device)
+    got = torch._scaled_mm(
+        a.to(mojo_device), b.to(mojo_device), sa, sb, out_dtype=torch.float32
+    )
+    torch.testing.assert_close(got.cpu(), torch.full((16, 16), 64.0), rtol=1e-5, atol=0)
+
+
+def test_scaled_mm_blockwise_ignores_tf32(mojo_device):
+    """The block-scaled GEMM is strict float32 even when TF32 is allowed:
+    128 * 1.0001 - 128 survives (TF32 would round 1.0001 to 1)."""
+    m = n = 128
+    k = 256
+    a = torch.ones(m, k).to(torch.float8_e4m3fn)
+    bt = torch.cat([torch.ones(n, 128), -torch.ones(n, 128)], 1)
+    bt = bt.to(torch.float8_e4m3fn)
+    sa = torch.tensor([1.0001, 1.0]).repeat(m, 1)  # (M, K/128)
+    sa = sa.t().contiguous().t()  # outer-dim-major
+    sb = torch.ones(n, 2).t().contiguous()  # v1: (K/128, N), stride (N, 1)
+    want = torch.full((m, n), 128 * (torch.tensor(1.0001).item() - 1.0))
+    previous = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("high")
+    try:
+        got = torch._scaled_mm(
+            a.to(mojo_device),
+            bt.t().to(mojo_device),
+            sa.to(mojo_device),
+            sb.to(mojo_device),
+            out_dtype=torch.float32,
+        )
+    finally:
+        torch.set_float32_matmul_precision(previous)
+    # float32 summation order costs ~1e-4 against 0.0128; TF32 gives 0.
+    torch.testing.assert_close(got.cpu(), want, rtol=0, atol=2e-4)
+
+
+def test_scaled_mm_scale_result(mojo_device):
+    """torch 2.14's test_float8_scale_result: a float8 output is multiplied
+    by scale_result (cuBLAS's D scale); a high-precision one ignores it."""
+    g = torch.Generator().manual_seed(0)
+    a = torch.randint(-1, 2, (32, 16), generator=g).float().to(torch.float8_e4m3fn)
+    b = torch.randint(-1, 2, (16, 32), generator=g).float()
+    b = b.t().contiguous().t().to(torch.float8_e4m3fn)
+    dev = mojo_device
+    one = torch.ones((), device=dev)
+    sr = torch.full((), 0.5, device=dev)
+    da, db = a.to(dev), b.to(dev)
+    got = torch._scaled_mm(
+        da, db, one, one, scale_result=sr, out_dtype=torch.float8_e4m3fn
+    )
+    want = (a.float() @ b.float()).mul(0.5).to(torch.float8_e4m3fn)
+    _assert_same(got, want)
+    hp = torch._scaled_mm(da, db, one, one, scale_result=sr, out_dtype=torch.bfloat16)
+    plain = torch._scaled_mm(da, db, one, one, out_dtype=torch.bfloat16)
+    _assert_same(hp, plain.cpu())
+
+
+def test_scaled_mm_rowwise_float8_output(mojo_device):
+    """Rowwise scaling into a float8 output (cuBLAS >= 12.9 takes it)."""
+    m, k, n = 32, 64, 48
+    a = _q((m, k), torch.float8_e4m3fn, 30)
+    b = _q((n, k), torch.float8_e4m3fn, 31).t()
+    sa = torch.rand(m, 1) + 0.25
+    sb = torch.rand(1, n) + 0.25
+    dev = mojo_device
+    got = torch._scaled_mm(
+        a.to(dev), b.to(dev), sa.to(dev), sb.to(dev), out_dtype=torch.float8_e4m3fn
+    )
+    _check(got, _expected(a.float(), b.float(), sa, sb, None, torch.float8_e4m3fn))
+
+
+def test_scaled_grouped_mm_device_and_bounds_checks(mojo_device):
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    a = torch.zeros(2, 16, 32, dtype=f8, device=dev)
+    b = torch.zeros(2, 16, 32, dtype=f8, device=dev).transpose(1, 2)
+    s = torch.ones(2, 16, device=dev)
+    with pytest.raises(RuntimeError, match="same device"):
+        torch._scaled_grouped_mm(a, b, s.cpu(), s, out_dtype=torch.bfloat16)
+    # 2d x 2d: an offset past K is refused before any device read.
+    a2 = torch.zeros(16, 32, dtype=f8, device=dev)
+    b2 = torch.zeros(16, 32, dtype=f8, device=dev).t()
+    offs = torch.tensor([16, 64], dtype=torch.int32, device=dev)
+    ones = torch.ones(32, device=dev)
+    with pytest.raises(RuntimeError, match="offsets exceed"):
+        torch._scaled_grouped_mm(
+            a2, b2, ones, ones, offs=offs, out_dtype=torch.bfloat16
+        )
+
+
+def test_scaled_grouped_mm_v2_out(mojo_device):
+    if "out" not in torch.ops.aten._scaled_grouped_mm_v2.overloads():
+        pytest.skip("this torch has no _scaled_grouped_mm_v2.out overload")
+    G, M, K, N = 2, 32, 64, 48
+    a = _q((G, M, K), torch.float8_e4m3fn, 32)
+    b = _q((G, N, K), torch.float8_e4m3fn, 33).transpose(1, 2)
+    g = torch.Generator().manual_seed(34)
+    sa = torch.rand(G, M, generator=g) + 0.5
+    sb = torch.rand(G, N, generator=g) + 0.5
+    want = torch.stack(_grouped_ref([(a[i], b[i], sa[i], sb[i]) for i in range(G)]))
+    dev = mojo_device
+    out = torch.empty(0, dtype=torch.bfloat16, device=dev)
+    r = torch.ops.aten._scaled_grouped_mm_v2.out(
+        a.to(dev),
+        b.to(dev),
+        [sa.to(dev)],
+        [1],
+        [],
+        [sb.to(dev)],
+        [1],
+        [],
+        None,
+        None,
+        torch.bfloat16,
+        [],
+        False,
+        out=out,
+    )
+    assert r.data_ptr() == out.data_ptr()
+    _check(out, want)
 
 
 def test_e4m3fn_saturation_matches_stock_cuda(mojo_device):
@@ -492,9 +1042,60 @@ def test_float8_scatter_reduce_names_cuda_kernel(mojo_device):
         x.clone().scatter_reduce_(0, idx, x[:1], "amax")
 
 
+def test_scaled_grouped_mm_scales_apply_sequentially(mojo_device):
+    """The grouped CUTLASS epilogue is ScaleB * (ScaleA * acc): 1e37 then
+    1e-37 overflows to inf, as on stock CUDA (unlike _scaled_mm's alpha)."""
+    f8 = torch.float8_e4m3fn
+    a = torch.full((2, 16, 32), 2.0).to(f8)
+    b = torch.full((2, 16, 32), 2.0).to(f8).transpose(1, 2)
+    sa = torch.full((2, 16), 1e37)
+    sb = torch.full((2, 16), 1e-37)
+    dev = mojo_device
+    got = torch._scaled_grouped_mm(
+        a.to(dev), b.to(dev), sa.to(dev), sb.to(dev), out_dtype=torch.bfloat16
+    )
+    assert torch.isinf(got.cpu().float()).all()
+
+
+def test_scaled_grouped_mm_offs_stride(mojo_device):
+    f8 = torch.float8_e4m3fn
+    dev = mojo_device
+    a = torch.zeros(32, 32, dtype=f8, device=dev)
+    b = torch.zeros(2, 16, 32, dtype=f8, device=dev).transpose(1, 2)
+    offs = torch.tensor([16, 0, 32, 0], dtype=torch.int32, device=dev)[::2]
+    with pytest.raises(RuntimeError, match=r"Offsets must have stride \(1,\)"):
+        torch._scaled_grouped_mm(
+            a,
+            b,
+            torch.ones(32, device=dev),
+            torch.ones(2, 16, device=dev),
+            offs=offs,
+            out_dtype=torch.bfloat16,
+        )
+
+
 # ---------------------------------------------------------------------------
 # review round 3
 # ---------------------------------------------------------------------------
+
+
+def test_scaled_mm_bias_any_shape_reads_flat(mojo_device):
+    """torch only checks bias.numel() == N and cuBLAS reads N consecutive
+    elements: a (2, 8) bias of a 16-column GEMM is its 16 values in order."""
+    a = _q((16, 32), torch.float8_e4m3fn, 40)
+    b = _q((16, 32), torch.float8_e4m3fn, 41).t()
+    bias = torch.arange(16, dtype=torch.float32).to(torch.bfloat16)
+    one = torch.tensor(1.0)
+    dev = mojo_device
+    got = torch._scaled_mm(
+        a.to(dev),
+        b.to(dev),
+        one.to(dev),
+        one.to(dev),
+        bias=bias.reshape(2, 8).to(dev),
+        out_dtype=torch.bfloat16,
+    )
+    _check(got, _expected(a.float(), b.float(), one, one, bias, torch.bfloat16))
 
 
 def test_compare_with_cpu_0d_tensor_promotes_like_a_tensor(mojo_device):
@@ -546,6 +1147,32 @@ def test_where_converts_like_to(mojo_device):
     assert torch.isnan(got[0]) and got[1] == 1.0
 
 
+def test_scaled_mm_v2_checks_devices_first(mojo_device):
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    for m in (0, 16):
+        a = torch.zeros(m, 32, dtype=f8, device=dev)
+        b = torch.zeros(16, 32, dtype=f8, device=dev).t()
+        out = torch.empty(3, dtype=torch.bfloat16, device=dev)
+        with pytest.raises(RuntimeError, match="same device"):
+            torch.ops.aten._scaled_mm_v2.out(
+                a,
+                b,
+                [torch.tensor(1.0)],
+                [0],
+                [],
+                [torch.tensor(1.0, device=dev)],
+                [0],
+                [],
+                None,
+                torch.bfloat16,
+                [],
+                False,
+                out=out,
+            )
+        assert out.shape == (3,)
+
+
 @pytest.mark.parametrize("non_blocking", [False, True])
 def test_float8_cross_device_casts(mojo_device, non_blocking):
     """`.to(device, dtype)` and `copy_` across host and device with a float8
@@ -593,6 +1220,50 @@ def test_float8_index_reduce_and_nonzero_declined(mojo_device):
 # ---------------------------------------------------------------------------
 # review round 4
 # ---------------------------------------------------------------------------
+
+
+def test_scaled_mm_v2_rowwise_scale_any_shape(mojo_device):
+    """A rowwise v2 scale_b only has to hold N floats with stride(1) == 1:
+    (2, 8) for 16 columns is read in its logical order, contiguous or not."""
+    a = _q((32, 32), torch.float8_e4m3fn, 50)
+    b = _q((16, 32), torch.float8_e4m3fn, 51).t()
+    sa = torch.rand(32, 1) + 0.5
+    flat = torch.rand(16) + 0.5
+    dev = mojo_device
+    want = _expected(a.float(), b.float(), sa, flat[None, :], None, torch.bfloat16)
+    base = torch.zeros(4, 8)
+    base[::2] = flat.reshape(2, 8)
+    for sb in (flat.reshape(2, 8), base[::2]):
+        got = torch.nn.functional.scaled_mm(
+            a.to(dev),
+            b.to(dev),
+            sa.to(dev),
+            ScalingType.RowWise,
+            sb.to(dev) if sb.is_contiguous() else base.to(dev)[::2],
+            ScalingType.RowWise,
+            output_dtype=torch.bfloat16,
+        )
+        _check(got, want)
+
+
+def test_scaled_mm_noncontiguous_bias_is_stride_correct(mojo_device):
+    """Deliberate divergence: cuBLAS reads N consecutive bias elements from
+    the data pointer, ignoring strides (measured, torch 2.11 / H100:
+    arange(32)[::2] adds 0, 1, ..., 15). We read the view's own elements
+    (0, 2, ..., 30), never past the view."""
+    a = torch.ones(16, 16).to(torch.float8_e4m3fn)
+    one = torch.tensor(1.0, device=mojo_device)
+    full = torch.arange(32, dtype=torch.bfloat16).to(mojo_device)
+    got = torch._scaled_mm(
+        a.to(mojo_device),
+        a.to(mojo_device).t(),
+        one,
+        one,
+        bias=full[::2],
+        out_dtype=torch.bfloat16,
+    )
+    want = 16.0 + torch.arange(32, dtype=torch.float32)[::2]
+    torch.testing.assert_close(got.cpu().float(), want.expand(16, 16))
 
 
 def test_float8_scatter_empty_index_is_a_copy(mojo_device):
@@ -994,6 +1665,257 @@ def test_float8_take_out_checks_before_refusal(mojo_device):
     with pytest.raises(NotImplementedError, match="take_cuda"):
         torch.take(x, torch.tensor([0, 1, 2], device=dev), out=out)
     assert out.shape == (3,)
+
+
+# ---------------------------------------------------------------------------
+# scaled-mm PR review
+# ---------------------------------------------------------------------------
+
+
+def test_scaled_mm_out_aliasing_an_input(mojo_device):
+    """out= sharing storage with an input (here scale_a, resized by the call)
+    is computed into a temporary first: 16 * 2 * 3 everywhere, as on CUDA."""
+    dev = mojo_device
+    a = torch.ones(1, 16).to(torch.float8_e4m3fn).to(dev)
+    b = torch.ones(16, 16).to(torch.float8_e4m3fn).to(dev).t()
+    sa = torch.tensor(2.0, device=dev)
+    sb = torch.tensor(3.0, device=dev)
+    r = torch._scaled_mm(a, b, sa, sb, out_dtype=torch.float32, out=sa)
+    assert r.data_ptr() == sa.data_ptr()
+    assert sa.shape == (1, 16) and sa.cpu().tolist() == [[96.0] * 16]
+    sa2 = torch.tensor(2.0, device=dev)
+    out = torch.ops.aten._scaled_mm_v2.out(
+        a, b, [sa2], [0], [], [sb], [0], [], None, torch.float32, [], False, out=sa2
+    )
+    assert out.cpu().tolist() == [[96.0] * 16]
+
+
+def test_scaled_mm_block_scales_apply_per_k_block(mojo_device):
+    """cuBLASLt block scaling: each K block's partial sum, times scale_a,
+    times scale_b, accumulated (measured on stock CUDA: 1e37 then 1e-37
+    overflows to inf; 1e-37 then 1e37 does not)."""
+    dev = mojo_device
+    m, k, n = 128, 256, 128
+    a = torch.ones(m, k).to(torch.float8_e4m3fn).to(dev)
+    b = torch.ones(n, k).to(torch.float8_e4m3fn).to(dev).t()
+
+    def run(va: float, vb: float) -> float:
+        sa = torch.full((k // 128, m), va, device=dev).t()
+        sb = torch.full((k // 128, n), vb, device=dev)  # v1: (kb, N)
+        out = torch._scaled_mm(a, b, sa, sb, out_dtype=torch.float32)
+        return out[0, 0].item()
+
+    assert run(1e37, 1e-37) == float("inf")
+    assert run(1e-37, 1e37) == 256.0
+    assert run(2.0, 3.0) == 1536.0
+
+
+def test_scaled_grouped_mm_empty_k_group_runs_epilogue(mojo_device):
+    """A 2d x 2d group with no K still multiplies its (zero) accumulator by
+    the scales: 0 * inf is NaN, as on CUDA."""
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    a = torch.ones(16, 32).to(f8).to(dev)
+    b = torch.ones(16, 32).to(f8).to(dev).t()
+    offs = torch.tensor([0, 32], dtype=torch.int32, device=dev)
+    sa = torch.ones(32, device=dev)
+    sa[:16] = float("inf")
+    sb = torch.ones(32, device=dev)
+    got = torch._scaled_grouped_mm(a, b, sa, sb, offs=offs, out_dtype=torch.bfloat16)
+    got = got.cpu().float()
+    assert torch.isnan(got[0]).all()
+    assert (got[1] == 32.0).all()
+
+
+def test_scaled_grouped_mm_requires_e4m3fn(mojo_device):
+    dev = mojo_device
+    a = torch.zeros(2, 16, 32).to(torch.float8_e5m2).to(dev)
+    b = torch.zeros(2, 16, 32).to(torch.float8_e4m3fn).to(dev).transpose(1, 2)
+    s = torch.ones(2, 16, device=dev)
+    with pytest.raises(
+        (RuntimeError, ValueError),
+        match="Expected mat_a to be Float8_e4m3 matrix got Float8_e5m2",
+    ):
+        torch._scaled_grouped_mm(a, b, s, s, out_dtype=torch.bfloat16)
+    with pytest.raises(
+        (RuntimeError, ValueError),
+        match="Expected mat_b to be Float8_e4m3 matrix got Float8_e5m2",
+    ):
+        torch._scaled_grouped_mm(
+            b.transpose(1, 2).contiguous(),
+            a.transpose(1, 2),
+            s,
+            s,
+            out_dtype=torch.bfloat16,
+        )
+
+
+# ---------------------------------------------------------------------------
+# scaled-mm PR review, round 2
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.bfloat16])
+def test_scaled_mm_rowwise_scale_order(mojo_device, out_dtype):
+    """Rowwise scales apply one at a time, scale_b first (measured on stock
+    CUDA: 1e-37 / 1e37 overflows, 1e37 / 1e-37 does not), in v1 and v2."""
+    dev = mojo_device
+    m, k, n = 128, 256, 128
+    a = torch.ones(m, k).to(torch.float8_e4m3fn).to(dev)
+    b = torch.ones(n, k).to(torch.float8_e4m3fn).to(dev).t()
+
+    def run(va: float, vb: float, v2: bool) -> float:
+        sa = torch.full((m, 1), va, device=dev)
+        sb = torch.full((1, n), vb, device=dev)
+        if v2:
+            out = torch.nn.functional.scaled_mm(
+                a,
+                b,
+                sa,
+                ScalingType.RowWise,
+                sb,
+                ScalingType.RowWise,
+                output_dtype=out_dtype,
+            )
+        else:
+            out = torch._scaled_mm(a, b, sa, sb, out_dtype=out_dtype)
+        return out[0, 0].float().item()
+
+    for v2 in (False, True):
+        assert run(1e-37, 1e37, v2) == float("inf")
+        assert run(1e37, 1e-37, v2) == 256.0
+        assert run(2.0, 3.0, v2) == 1536.0
+
+
+def test_scaled_mm_v2_deepseek_scale_list_length(mojo_device):
+    """Every recipe takes exactly one scale per side: an extra one selects no
+    implementation (CUDA's invalid-configuration error)."""
+    a, b, _, _, _, v2 = _blockwise_case("1x128", "1x128", 128, 256, 128)
+    dev = mojo_device
+    sa = v2[0].to(dev)
+    with pytest.raises(
+        (RuntimeError, ValueError), match="Invalid scaling configuration"
+    ):
+        torch.ops.aten._scaled_mm_v2(
+            a.to(dev),
+            b.to(dev),
+            [sa, sa],
+            [4],
+            [],
+            [v2[1].to(dev)],
+            [4],
+            [],
+            None,
+            torch.bfloat16,
+            [],
+            False,
+        )
+
+
+def test_scaled_grouped_mm_v2_out_aliasing(mojo_device):
+    if "out" not in torch.ops.aten._scaled_grouped_mm_v2.overloads():
+        pytest.skip("this torch has no _scaled_grouped_mm_v2.out overload")
+    dev = mojo_device
+    f8 = torch.float8_e4m3fn
+    a = torch.ones(2, 16, 32).to(f8).to(dev)
+    b = torch.ones(2, 16, 32).to(f8).to(dev).transpose(1, 2)
+    sa = torch.full((2, 16), 2.0, device=dev)
+    sb = torch.full((2, 16), 3.0, device=dev)
+    alias = sa.view(torch.bfloat16)  # out shares scale_a's storage
+    torch.ops.aten._scaled_grouped_mm_v2.out(
+        a,
+        b,
+        [sa],
+        [1],
+        [],
+        [sb],
+        [1],
+        [],
+        None,
+        None,
+        torch.bfloat16,
+        [],
+        False,
+        out=alias,
+    )
+    assert alias.shape == (2, 16, 16)
+    assert (alias.cpu().float() == 192.0).all()
+
+
+def test_scaled_mm_empty_with_unsupported_dtypes(mojo_device):
+    """CUDA returns an empty / zero result before its output- and
+    matrix-dtype limits apply."""
+    dev = mojo_device
+    one = torch.tensor(1.0, device=dev)
+    a = torch.zeros(0, 16).to(torch.float8_e4m3fn).to(dev)
+    b = torch.zeros(16, 16).to(torch.float8_e4m3fn).to(dev).t()
+    out = torch._scaled_mm(a, b, one, one, out_dtype=torch.float8_e8m0fnu)
+    assert out.shape == (0, 16)
+
+
+def test_scaled_mm_higher_rank_scale_b_refused(mojo_device):
+    """get_joint_scaling transposes scale_b first: a 3-D one raises t()'s
+    error, while a 3-D singleton scale_a is still a tensorwise scale."""
+    dev = mojo_device
+    a = torch.randn(16, 32).to(torch.float8_e4m3fn).to(dev)
+    b = torch.randn(16, 32).to(torch.float8_e4m3fn).to(dev).t()
+    one = torch.ones((), device=dev)
+    three = torch.ones(1, 1, 1, device=dev)
+    with pytest.raises(RuntimeError, match=r"t\(\) expects a tensor with <= 2"):
+        torch._scaled_mm(a, b, one, three, out_dtype=torch.bfloat16)
+    assert torch._scaled_mm(a, b, three, one, out_dtype=torch.bfloat16).shape == (
+        16,
+        16,
+    )
+
+
+def test_scaled_mm_v2_scale_list_lengths(mojo_device):
+    """torch 2.14's structured meta (validate_scaled_mm_v2_inputs) checks the
+    lists before any kernel: an empty or extra scale names the count."""
+    dev = mojo_device
+    a = torch.randn(16, 32).to(torch.float8_e4m3fn).to(dev)
+    b = torch.randn(16, 32).to(torch.float8_e4m3fn).to(dev).t()
+    one = torch.ones((), device=dev)
+    tw, rw = ScalingType.TensorWise.value, ScalingType.RowWise.value
+    ns = SwizzleType.NO_SWIZZLE.value
+
+    def v2(sa, ra, sb, rb):
+        return torch.ops.aten._scaled_mm_v2(
+            a, b, sa, ra, [ns] * len(sa), sb, rb, [ns] * len(sb), None,
+            torch.bfloat16, [], False,
+        )  # fmt: skip
+
+    with pytest.raises(RuntimeError, match="scale_a must have 1 Float element"):
+        v2([], [tw], [one], [tw])
+    with pytest.raises(RuntimeError, match="scale_b must have 1 Float element"):
+        v2([one], [tw], [], [tw])
+    with pytest.raises(RuntimeError, match="scale_a must have 1 Float element"):
+        v2([one, one], [tw], [one], [tw])
+    ra = torch.ones(16, 1, device=dev)
+    rb = torch.ones(1, 16, device=dev)
+    with pytest.raises(RuntimeError, match="scale_a must have 16 Float elements"):
+        v2([ra, ra], [rw], [rb], [rw])
+    with pytest.raises(RuntimeError, match="unsupported recipe"):
+        v2([one, one], [tw, tw], [one], [tw])
+
+
+def test_scaled_mm_v2_deepseek_empty_scale_list(mojo_device):
+    """The DeepSeek recipes skip the meta's list checks: an empty scale list
+    still raises instead of indexing past the end."""
+    dev = mojo_device
+    a = torch.randn(128, 128).to(torch.float8_e4m3fn).to(dev)
+    b = torch.randn(128, 128).to(torch.float8_e4m3fn).to(dev).t()
+    r = ScalingType.BlockWise1x128.value
+    ns = SwizzleType.NO_SWIZZLE.value
+    sb = torch.ones(1, 128, device=dev)
+    with pytest.raises(RuntimeError, match="Invalid scaling configuration"):
+        torch.ops.aten._scaled_mm_v2(
+            a, b, [], [r], [ns], [sb], [r], [ns], None, torch.bfloat16, [], False
+        )
+    with pytest.raises(RuntimeError, match="Invalid scaling configuration"):
+        torch.ops.aten._scaled_mm_v2(
+            a, b, [sb], [r], [ns], [], [r], [ns], None, torch.bfloat16, [], False
+        )
 
 
 _N_ROUND = 3 * 2**61 - 2**38 - 1  # rounds differently via float64
