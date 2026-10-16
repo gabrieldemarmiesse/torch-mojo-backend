@@ -19,7 +19,9 @@ inside main().
 import contextlib
 import datetime
 import os
+import signal
 import sys
+import threading
 import time
 from collections.abc import Iterator
 
@@ -647,11 +649,289 @@ def run_abort(failures: list[str]):
     _check(failures, "abort.shutdown_after_abort_is_safe", True)
 
 
+# The timeout of the process group the `desync*` modes hang: what its
+# watchdog waits. The default group keeps 300 s, so rendezvous, communicator
+# creation and first-use kernel builds (a cold cache) never count against it.
+DESYNC_TIMEOUT_S = 10
+
+
+def _desync_group() -> tuple[int, dist.ProcessGroup, torch.Tensor]:
+    """A group with the short timeout, its collective #1 done on every rank
+    (after a warm-up on the default group)."""
+    rank = dist.get_rank()
+    t = torch.ones(1024, device="mojo")
+    dist.all_reduce(t)
+    torch.accelerator.synchronize()
+    group = dist.new_group(
+        list(range(dist.get_world_size())),
+        timeout=datetime.timedelta(seconds=DESYNC_TIMEOUT_S),
+    )
+    assert group is not None
+    dist.all_reduce(t, group=group)  # #1 of the short group, on every rank
+    torch.accelerator.synchronize()
+    print(f"[rank {rank}] all_reduce #1 done", flush=True)
+    return rank, group, t
+
+
+def _outlive_the_watchdog(rank: int):
+    """Rank 0's abort releases its wait and the process exits right behind
+    it; rank 1 is stopped by torchrun. Getting past here is the failure."""
+    time.sleep(DESYNC_TIMEOUT_S if rank == 0 else 10 * DESYNC_TIMEOUT_S)
+    print(f"[rank {rank}] UNEXPECTED: still alive after the timeout", flush=True)
+    raise SystemExit(3)
+
+
+def run_desync():
+    """Rank 0 issues an all_reduce rank 1 never issues; rank 1 stops issuing.
+    The watchdog must report collective #2 on rank 0 within the timeout and
+    exit the process non-zero, which makes torchrun stop rank 1."""
+    rank, group, t = _desync_group()
+    if rank == 0:
+        dist.all_reduce(t, group=group)  # #2: nobody else issues it
+        torch.accelerator.synchronize()
+    _outlive_the_watchdog(rank)
+
+
+def run_desync_burst():
+    """More collectives in flight than the watchdog's ring holds, then the
+    unmatched one: it must still be the one reported (#BURST + 2), not a
+    dropped commit. The matmuls hold the comm stream back so the burst
+    really is in flight at once."""
+    rank, group, t = _desync_group()
+    x = torch.randn(4096, 4096, device="mojo")
+    for _ in range(100):
+        x = x @ x
+    small = torch.ones(1, device="mojo")
+    for _ in range(DESYNC_BURST):
+        dist.all_reduce(small, group=group)
+    if rank == 0:
+        dist.all_reduce(torch.ones(4, device="mojo"), group=group)  # unmatched
+    torch.accelerator.synchronize()
+    _outlive_the_watchdog(rank)
+
+
+DESYNC_BURST = 3000
+OVERFLOW_BURST = 4000
+OVERFLOW_LIMIT = 256  # in flight: well under the libraries' own ~1024
+
+
+def run_desync_overflow():
+    """The watchdog's queue full (lowered to OVERFLOW_LIMIT by a test hook):
+    the burst's newest collectives go unwatched, and once it drained
+    tracking resumes -- the unmatched collective issued afterwards is
+    reported with its exact sequence number (#OVERFLOW_BURST + 2)."""
+    rank, group, t = _desync_group()
+    assert isinstance(group, MojoProcessGroup)
+    group._test_watchdog_limit(0, OVERFLOW_LIMIT)
+    x = torch.randn(4096, 4096, device="mojo")
+    for _ in range(200):
+        x = x @ x
+    small = torch.ones(1, device="mojo")
+    for _ in range(OVERFLOW_BURST):
+        dist.all_reduce(small, group=group)
+    torch.accelerator.synchronize()
+    print(f"[rank {rank}] overflow burst done", flush=True)
+    if rank == 0:
+        dist.all_reduce(torch.ones(4, device="mojo"), group=group)  # unmatched
+        torch.accelerator.synchronize()
+    _outlive_the_watchdog(rank)
+
+
+def run_desync_at_exit():
+    """The script ends with an unmatched collective in flight and no
+    destroy_process_group: the exit hook gives it a short grace, then
+    reports it and the process exits 1 -- within seconds, not the timeout."""
+    rank, group, t = _desync_group()
+    if rank == 0:
+        dist.all_reduce(t, group=group, async_op=True)  # #2, unmatched
+        print("[rank 0] leaving with a collective in flight", flush=True)
+        raise SystemExit(0)
+    _outlive_the_watchdog(rank)
+
+
+def run_desync_ctrl_c():
+    """Ctrl-C on a job hung in a collective: same as an exit, within
+    seconds."""
+    rank, group, t = _desync_group()
+    if rank == 0:
+        dist.all_reduce(t, group=group)  # #2, unmatched
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(DESYNC_TIMEOUT_S)  # the KeyboardInterrupt lands here
+    _outlive_the_watchdog(rank)
+
+
+def run_desync_exit_host_blocked():
+    """The main thread exits while a daemon thread is blocked on the host in
+    its first point-to-point call (vendor NCCL connects the pair inside
+    ncclGroupEnd, waiting for the peer): reported at exit, not swallowed."""
+    rank, group, t = _desync_group()
+    if rank == 0:
+        threading.Thread(
+            target=lambda: dist.irecv(
+                torch.zeros(4, device="mojo"), src=1, group=group
+            ),
+            daemon=True,
+        ).start()
+        time.sleep(1)
+        print("[rank 0] leaving with a call blocked on the host", flush=True)
+        raise SystemExit(0)
+    _outlive_the_watchdog(rank)
+
+
+def run_watchdog_off_destroy():
+    """TORCH_MOJO_BACKEND_PG_WATCHDOG=off: destroying a group with async
+    collectives still in flight -- rank 1 issues its side 3 s later --
+    completes them rather than cancelling them."""
+    rank, group, t = _desync_group()
+    bufs = [torch.full((1 << 16,), float(i), device="mojo") for i in range(20)]
+    if rank == 1:
+        time.sleep(3)
+    for b in bufs:
+        dist.all_reduce(b, group=group, async_op=True)
+    dist.destroy_process_group(group)
+    ok = all(bool((b.cpu() == 2.0 * i).all()) for i, b in enumerate(bufs))
+    print(f"[rank {rank}] off destroy correct: {ok}", flush=True)
+    dist.barrier()
+    dist.destroy_process_group()
+    raise SystemExit(0)
+
+
+def run_watchdog_slow_destroy():
+    """A healthy run whose ranks reach destroy_process_group far apart (rank
+    0 still writing its checkpoint, longer than the timeout): the destroy
+    does not wait for peers, so nothing times out and the run exits 0."""
+    rank, group, t = _desync_group()
+    if rank == 0:
+        time.sleep(DESYNC_TIMEOUT_S + 5)
+    dist.destroy_process_group(group)
+    dist.barrier()
+    dist.destroy_process_group()
+    print(f"[rank {rank}] slow_destroy finished", flush=True)
+    raise SystemExit(0)
+
+
+def run_desync_report_twice():
+    """TORCH_MOJO_BACKEND_PG_WATCHDOG=report, three late collectives in turn:
+    each is reported, completes after all, and its rank's record leaves the
+    store, so the next report (rank 1 reports twice) sees only fresh ones."""
+    rank, group, t = _desync_group()
+    late = DESYNC_TIMEOUT_S + 5
+    for late_rank in (0, 1, 0):  # #2, #3, #4: this rank issues it late
+        if rank == late_rank:
+            time.sleep(late)
+        dist.all_reduce(t, group=group)
+        torch.accelerator.synchronize()
+        print(f"[rank {rank}] late all_reduce done", flush=True)
+    dist.barrier()
+    dist.destroy_process_group()
+    print(f"[rank {rank}] report_twice finished", flush=True)
+    raise SystemExit(0)
+
+
+def run_desync_destroy():
+    """Destroying a group whose collective hangs: the destroy waits for it,
+    so the watchdog reports it and exits instead of the destroy hanging."""
+    rank, group, t = _desync_group()
+    if rank == 0:
+        dist.all_reduce(t, group=group)  # #2: nobody else issues it
+        dist.destroy_process_group(group)
+    _outlive_the_watchdog(rank)
+
+
+# Under the libraries' own limit: vendor NCCL's work FIFO and mojoccl's
+# queue both block the host near 1024 launches waiting for a peer.
+ASYNC_BURST = 900
+
+
+def run_watchdog_async_burst():
+    """Rank 0 issues ASYNC_BURST async all_reduces, then tells rank 1
+    through the store to issue its matching ones: valid async work in which
+    the issuing thread must return from every call before the peer can make
+    progress. The watchdog must neither block the issuer nor report
+    anything."""
+    rank, group, _ = _desync_group()
+    store = dist.distributed_c10d._get_default_store()
+    bufs = [torch.full((4,), float(i), device="mojo") for i in range(ASYNC_BURST)]
+    if rank == 0:
+        for b in bufs:
+            dist.all_reduce(b, group=group, async_op=True)
+        store.set("watchdog_async_go", "1")
+    else:
+        store.wait(["watchdog_async_go"])
+        for b in bufs:
+            dist.all_reduce(b, group=group, async_op=True)
+    torch.accelerator.synchronize()
+    ok = all(bool((b.cpu() == 2.0 * i).all()) for i, b in enumerate(bufs))
+    print(f"[rank {rank}] async burst correct: {ok}", flush=True)
+    dist.barrier()
+    dist.destroy_process_group()
+    raise SystemExit(0)
+
+
+def run_desync_host_blocked():
+    """Rank 0's first point-to-point call to rank 1 while rank 1 stopped
+    issuing: NCCL connects the pair inside ncclGroupEnd, which blocks on
+    the host. The in-call mark must report it and the process exit."""
+    rank, group, _ = _desync_group()
+    if rank == 0:
+        dist.irecv(torch.zeros(4, device="mojo"), src=1, group=group)
+    _outlive_the_watchdog(rank)
+
+
+def run_watchdog_clean_exit():
+    """Collectives still in flight when the interpreter exits without
+    destroy_process_group: no report, exit status 0."""
+    rank, group, t = _desync_group()
+    big = torch.ones(1 << 20, device="mojo")
+    for _ in range(50):
+        dist.all_reduce(big, group=group, async_op=True)
+        dist.all_reduce(t, async_op=True)
+    print(f"[rank {rank}] exiting without destroy_process_group", flush=True)
+    raise SystemExit(0)
+
+
+def run_watchdog_fault_destroy():
+    """TORCH_MOJO_BACKEND_PG_WATCHDOG=report: a driver error on rank 0's
+    communicator is reported, and destroying the group afterwards aborts
+    that communicator instead of trusting its (now unwatched) queue."""
+    rank, group, t = _desync_group()
+    assert isinstance(group, MojoProcessGroup)
+    # On every rank: an abort facing a destroy is not something vendor NCCL
+    # promises to finish (its destroy may wait for the peer's).
+    group._test_watchdog_fault(0)
+    time.sleep(1)
+    dist.destroy_process_group(group)
+    dist.barrier()
+    dist.destroy_process_group()
+    print(f"[rank {rank}] fault_destroy finished", flush=True)
+    raise SystemExit(0)
+
+
+DESYNC_MODES = {
+    "desync": run_desync,
+    "desync_burst": run_desync_burst,
+    "desync_report_twice": run_desync_report_twice,
+    "desync_destroy": run_desync_destroy,
+    "desync_host_blocked": run_desync_host_blocked,
+    "desync_overflow": run_desync_overflow,
+    "desync_at_exit": run_desync_at_exit,
+    "desync_ctrl_c": run_desync_ctrl_c,
+    "desync_exit_host_blocked": run_desync_exit_host_blocked,
+    "watchdog_off_destroy": run_watchdog_off_destroy,
+    "watchdog_slow_destroy": run_watchdog_slow_destroy,
+    "watchdog_async_burst": run_watchdog_async_burst,
+    "watchdog_clean_exit": run_watchdog_clean_exit,
+    "watchdog_fault_destroy": run_watchdog_fault_destroy,
+}
+
+
 def main():
     mode = sys.argv[1]
 
     register_mojo_devices()
     dist.init_process_group(backend="mojo", timeout=datetime.timedelta(seconds=300))
+    if mode in DESYNC_MODES:
+        DESYNC_MODES[mode]()
     failures: list[str] = []
     if mode == "collectives":
         run_collectives(failures)
