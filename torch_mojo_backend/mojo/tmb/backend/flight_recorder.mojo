@@ -15,11 +15,11 @@ to odd by compare-exchange, checks the record id under it, writes, and
 moves it to the next even value. A stamp can therefore only land on the
 entry it is for, whatever the ring did meanwhile.
 
-The Python side describes the torch-level operation in flight: before a
-collective it writes a tag word into its thread's slot of the ring header
-(`H_TAG`: pairs of owner thread and tag; flight_recorder.py hands each
-thread a slot of its own), which the entries it causes record, and the dump
-joins the two.
+The Python side describes the torch-level operation in flight: every
+pg.mojo entry takes a tag word (`fr_set_tag`, under the backend mutex) that
+the entries it causes record -- a record id, which the dump joins with its
+Python description, and the coalescing structure (member, first, end,
+point-to-point).
 """
 from std.atomic import Atomic, Ordering
 from std.ffi import _get_global_or_null, external_call
@@ -34,7 +34,6 @@ comptime TAG_MEMBER = 1 << 40  # one operation of a coalescing block
 comptime TAG_FIRST = 1 << 41  # ...its first
 comptime TAG_END = 1 << 42  # the block's end
 comptime TAG_P2P = 1 << 43  # point-to-point (overrides the native op)
-comptime TAG_SLOTS = 64  # threads that can tag at once
 
 # Entry flags.
 comptime FL_P2P = 1
@@ -45,8 +44,7 @@ comptime FL_UNTRACKED = 8  # the watchdog does not track it: no stamp comes
 # Header words.
 comptime H_SIZE = 0
 comptime H_NEXT = 1  # entries recorded so far: the next record id
-comptime H_TAG = 2  # TAG_SLOTS pairs: owner (pthread_self, 0 if free), tag
-comptime H_WORDS = H_TAG + 2 * TAG_SLOTS
+comptime H_WORDS = 2
 
 # Slot words; a snapshot copies them as they are (flight_recorder.py).
 comptime F_VER = 0  # odd while a writer holds the slot
@@ -76,7 +74,8 @@ comptime P_PSEQ = 3
 comptime P_OPID = 4
 comptime P_GROUP_C = 5  # a coalescing block bumped the collective seq
 comptime P_GROUP_P = 6  # ...the point-to-point seq
-comptime P_WORDS = 7
+comptime P_TAG = 7  # the tag of the call in progress (`fr_set_tag`)
+comptime P_WORDS = 8
 
 comptime FrP = Pointer[Int64, MutUntrackedOrigin]
 
@@ -178,15 +177,11 @@ def fr_pg(ring: Int, pg_id: Int) -> Int:
     return Int(p)
 
 
-@always_inline
-def _tag(ring: FrP) -> Int:
-    """This thread's tag word, 0 if none: the tag of the header slot this
-    thread owns (flight_recorder.py gives each thread its own)."""
-    var me = external_call["pthread_self", Int]()
-    for i in range(TAG_SLOTS):
-        if _ld(ring, H_TAG + 2 * i) == me:
-            return _ld(ring, H_TAG + 2 * i + 1)
-    return 0
+def fr_set_tag(fp: Int, tag: Int):
+    """The tag of the pg.mojo entry in progress, for the entries it causes.
+    Under the backend mutex, like every entry."""
+    if fp != 0:
+        _st(_pg(fp), P_TAG, tag)
 
 
 def _record(
@@ -205,7 +200,7 @@ def _record(
     or block, `op_id` per operation. Returns record id + 1."""
     var pg = _pg(fp)
     var ring = _ring_of(fp)
-    var tag = _tag(ring)
+    var tag = _ld(pg, P_TAG)
     if tag & TAG_END and _ld(pg, P_GROUP_C) == 0 and _ld(pg, P_GROUP_P) == 0:
         # Another group's block ended (this group's commit rides its
         # group_end): an ordinary entry, which that record does not describe.
@@ -300,7 +295,7 @@ def fr_member(
     operation of a coalescing block. Like ProcessGroupNCCL's, these entries
     are never stamped; the block's end entry, at the group's commit, is.
     Under the backend mutex."""
-    if fp != 0 and _tag(_ring_of(fp)) & TAG_MEMBER:
+    if fp != 0 and _ld(_pg(fp), P_TAG) & TAG_MEMBER:
         _ = _record(fp, op, 1, count, dtype, root, p2p_op, False, comm)
 
 
@@ -317,6 +312,22 @@ def fr_done(fp: Int, rid1: Int, now: Int):
     if _ld(s, F_ID) == rid1 and _ld(s, F_DONE) == 0:
         _st(s, F_DONE, max(now, 1))
     _st(s, F_VER, v + 2)
+
+
+def _release_all(ring: FrP):
+    for i in range(_ld(ring, H_SIZE)):
+        var s = _slot(ring, i)
+        var v = _ld(s, F_VER)
+        if v & 1:
+            _st(s, F_VER, v + 1)
+
+
+def fr_after_fork():
+    """In a forked child: a slot whose writer was another thread of the
+    parent would stay locked forever; release every one."""
+    var r = fr_ring()
+    if r != 0:
+        _release_all(FrP(unsafe_from_address=r))
 
 
 def fr_snapshot(buf: Int, cap: Int) -> Int:
@@ -361,7 +372,6 @@ def fr_selftest() -> Int:
     the number of the first check that failed (test hook)."""
     var ring = _new_ring(4)
     var fp = fr_pg(Int(ring), 7)
-    var me = external_call["pthread_self", Int]()
     var r1 = fr_commit(fp, 1, 1, 8, 7, -1, False, 11)
     fr_done(fp, r1, 100)
     if _ld(_slot(ring, r1 - 1), F_DONE) != 100:
@@ -381,12 +391,11 @@ def fr_selftest() -> Int:
     if _ld(_slot(ring, r - 1), F_CSEQ) != 5:
         return 5
     # A coalescing block of two sends, tagged: one p2p seq, op ids per op.
-    _st(ring, H_TAG + 2 * 3, me)
-    _st(ring, H_TAG + 2 * 3 + 1, 9 | TAG_MEMBER | TAG_FIRST | TAG_P2P)
+    fr_set_tag(fp, 9 | TAG_MEMBER | TAG_FIRST | TAG_P2P)
     fr_member(fp, 6, 8, 7, 1, True, 11)
-    _st(ring, H_TAG + 2 * 3 + 1, 9 | TAG_MEMBER | TAG_P2P)
+    fr_set_tag(fp, 9 | TAG_MEMBER | TAG_P2P)
     fr_member(fp, 6, 8, 7, 1, True, 11)
-    _st(ring, H_TAG + 2 * 3 + 1, 10 | TAG_END | TAG_P2P)
+    fr_set_tag(fp, 10 | TAG_END | TAG_P2P)
     var end = fr_commit(fp, 8, 2, 16, 7, -1, True, 11)
     var e = _slot(ring, end - 1)
     if _ld(e, F_PSEQ) != 1 or _ld(e, F_FLAGS) != FL_END | FL_P2P:
@@ -397,13 +406,15 @@ def fr_selftest() -> Int:
         return 8
     # An END tag reaching a group with no open block: an ordinary entry.
     var other = fr_pg(Int(ring), 8)
+    fr_set_tag(other, 10 | TAG_END | TAG_P2P)
     var plain = fr_commit(other, 1, 1, 8, 7, -1, False, 12)
     var p = _slot(ring, plain - 1)
     if _ld(p, F_FLAGS) != 0 or _ld(p, F_TAG) != 0 or _ld(p, F_CSEQ) != 1:
         return 9
-    # Another thread's slot is never read as this one's.
-    _st(ring, H_TAG + 2 * 3, me + 1)
-    if _tag(ring) != 0:
+    # A slot left locked (a forked child's view of a parent's writer).
+    _st(p, F_VER, _ld(p, F_VER) + 1)
+    _release_all(ring)
+    if _ld(p, F_VER) & 1:
         return 10
     fr_untracked(fp, plain)
     if _ld(p, F_FLAGS) != FL_UNTRACKED or _ld(p, F_VER) & 1:

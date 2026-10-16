@@ -655,14 +655,12 @@ def run_abort(failures: list[str]):
 
 
 def _fr_tag_isolation(t: torch.Tensor):
-    """An all_reduce whose tag another thread writes between the call's
-    `_fr_op` and its native entry keeps its own record: every thread tags
-    through a header slot of its own."""
+    """An all_reduce keeps its own record while another thread describes a
+    call of its own between this call's `_fr_op` and its native entry: the
+    tag travels with the call."""
     group = cast(MojoProcessGroup, dist.group.WORLD)
-    fr = group._fr
-    assert fr is not None
     group._fr_op("all_reduce", [t], [t])
-    thread = threading.Thread(target=lambda: fr.begin("broadcast", [t], [t], 0))
+    thread = threading.Thread(target=lambda: group._fr_op("broadcast", [t], [t]))
     thread.start()
     thread.join()
     index = t.device.index or 0
@@ -672,12 +670,13 @@ def _fr_tag_isolation(t: torch.Tensor):
             index,
             t.data_ptr(),
             t.numel(),
-            7,
-            0,  # float32, sum
+            7,  # float32
+            0,  # sum
+            group._fr_tag(),
         ),
         "ncclAllReduce",
     )
-    fr.clear()
+    group._fr_tls.tag = 0
 
 
 def _fr_wrap_stress(t: torch.Tensor, size: int) -> bool:

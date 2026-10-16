@@ -589,11 +589,13 @@ trace = pickle.loads(torch._C._distributed_c10d._dump_nccl_trace())
 `_dump_nccl_trace_json()` returns the same dump as JSON, without stacks.
 Both work with the CPU build of torch too. While no process group of this
 backend is alive (none was created, all were destroyed, the watchdog is
-off, or `TORCH_FR_BUFFER_SIZE=0`), they are PyTorch's own. While one is
-and a NCCL process group in the same process recorded too, they return both
-backends' collectives in one dump; record ids are each backend's own, so
-give the analyzer one backend's dumps. A NCCL process group's own timeout
-dump signal makes this backend's ranks dump too. You can also set
+off, or `TORCH_FR_BUFFER_SIZE=0`), they are PyTorch's own. In a process
+that also runs a NCCL process group, they keep returning PyTorch's dump
+once that group recorded anything: one dump can't hold both backends (the
+analyzer aligns each rank by its first record id), so this backend's
+collectives are in its dump files, written on a timeout or through the
+debug pipe below. A NCCL process group's own timeout dump signal makes
+this backend's ranks dump too. You can also set
 `TORCH_NCCL_DEBUG_INFO_PIPE_FILE=/tmp/fr_` and write to
 `/tmp/fr_<global rank>.pipe`.
 
@@ -617,9 +619,6 @@ How this differs from NCCL in stock PyTorch:
   Gloo, where NCCL records an `all_reduce_barrier`.
 - A collective call that blocks on the host before it is enqueued isn't in
   the dump; the watchdog's report names it.
-- Up to 64 threads of a process describe their collectives at once; the
-  collectives of further threads are recorded with the element count as
-  their shape and no Python stack, like a compiled graph's.
 - `FlightRecorderHook` (PyTorch 2.14) and `_dump_fr_trace()` don't see
   this backend's collectives; `_dump_fr_trace()` shows Gloo's. Neither
   does `torch.distributed.debug`'s server, which reads PyTorch's recorder

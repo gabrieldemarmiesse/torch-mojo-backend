@@ -494,8 +494,8 @@ def _desync_reporter(
                     continue
                 try:
                     fr_gen = 0  # not `gen`: next_gen() owns that one
-                    if fr_worker is not None:
-                        fr_gen = _fr_incident(fields, fr_worker, rank)
+                    if fr_worker is not None and fr_store is not None:
+                        fr_gen = _fr_incident(fields, fr_worker, fr_store, rank)
                     _report_desync(
                         line,
                         worker,
@@ -526,23 +526,31 @@ def _desync_reporter(
         _close_watchdog_fd(ack_fd)
 
 
-def _fr_incident(fields: dict[str, str], worker: _StoreWorker, rank: int) -> int:
+def _fr_incident(
+    fields: dict[str, str], worker: _StoreWorker, store: Store, rank: int
+) -> int:
     """This rank's watchdog fired: signal every rank to dump its flight
     recorder (ProcessGroupNCCL's broadcastDumpSignal, plus a new generation,
     returned; 0 when the store did not answer), dump this one's and print
-    the Python stack of the collective that timed out."""
+    the Python stack of the collective that timed out. Its acknowledgement
+    also covers the generations this process had yet to serve."""
     grank = flight_recorder.global_rank(rank)
-    epoch = flight_recorder.poller_epoch()
     gen = worker.run(lambda client: flight_recorder.signal_dump(client, grank), 2.0)
-    gens = flight_recorder.claim(gen, epoch) if gen else range(0)
+    gens = flight_recorder.claim(store, gen) if gen else ()
     dumped = flight_recorder.dump_now(
         grank, "collective timeout", flight_recorder.include_stack_traces()
     )
+    acked = False
     if gen and dumped:  # an acknowledgement means a file is there
-        acked = range(gens.start if gens else gen, gen + 1)
-        worker.run(lambda client: flight_recorder.ack_dump(client, grank, acked), 2.0)
-    elif gens:
-        flight_recorder.unclaim(gens, epoch)
+        mine = sorted({*gens, gen})
+        acked = (
+            worker.run(
+                lambda client: flight_recorder.ack_dump(client, grank, mine) or True,
+                2.0,
+            )
+            is True
+        )
+    flight_recorder.finish(store, gens, acked)
     rec = flight_recorder.recorder()
     frames = rec.stack(int(fields.get("fr", "0"))) if rec is not None else []
     if frames:
@@ -604,8 +612,7 @@ def _loud(method: Callable[..., object]) -> Callable[..., object]:
             self._abort_coalescing()
             raise
         finally:
-            if self._fr is not None:
-                self._fr.clear()
+            self._fr_tls.tag = 0
 
     _LOUD.add(wrapper)
     return wrapper
@@ -706,17 +713,20 @@ class _Core:
         self.unique_id = ctypes.CFUNCTYPE(i32, vp, vp)(table[3])
         self.init_device = ctypes.CFUNCTYPE(i32, vp, i32, vp)(table[4])
         self.comm_stream = ctypes.CFUNCTYPE(i64, vp, i32)(table[5])
-        self.allreduce = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32)(table[6])
-        self.broadcast = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32)(table[7])
-        self.reduce = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32, i32)(table[8])
-        self.allgather = ctypes.CFUNCTYPE(i32, vp, i32, vp, vp, sz, i32)(table[9])
-        self.reduce_scatter = ctypes.CFUNCTYPE(i32, vp, i32, vp, vp, sz, i32, i32)(
+        # the collectives and group_end take the flight recorder's tag last
+        self.allreduce = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32, i64)(table[6])
+        self.broadcast = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32, i64)(table[7])
+        self.reduce = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32, i32, i64)(
+            table[8]
+        )
+        self.allgather = ctypes.CFUNCTYPE(i32, vp, i32, vp, vp, sz, i32, i64)(table[9])
+        self.reduce_scatter = ctypes.CFUNCTYPE(i32, vp, i32, vp, vp, sz, i32, i32, i64)(
             table[10]
         )
-        self.send = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32)(table[11])
-        self.recv = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32)(table[12])
+        self.send = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32, i64)(table[11])
+        self.recv = ctypes.CFUNCTYPE(i32, vp, i32, vp, sz, i32, i32, i64)(table[12])
         self.group_start = ctypes.CFUNCTYPE(i32, vp)(table[13])
-        self.group_end = ctypes.CFUNCTYPE(i32, vp)(table[14])
+        self.group_end = ctypes.CFUNCTYPE(i32, vp, i64)(table[14])
         self.async_error = ctypes.CFUNCTYPE(i32, vp, i32)(table[15])
         self.abort = ctypes.CFUNCTYPE(i32, vp, i32)(table[16])
         self.synchronize_comm = ctypes.CFUNCTYPE(i32, vp, i32)(table[17])
@@ -732,6 +742,7 @@ class _Core:
         self.fr_attach = ctypes.CFUNCTYPE(i32, vp, i64)(table[26])
         self.fr_snapshot = ctypes.CFUNCTYPE(i64, vp, i64)(table[27])
         self.fr_selftest = ctypes.CFUNCTYPE(i64)(table[28])
+        self.fr_after_fork = ctypes.CFUNCTYPE(None)(table[29])
 
     def check(self, rc: int, what: str):
         if rc != 0:
@@ -776,6 +787,9 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._fr: flight_recorder.Recorder | None = None
         self._fr_block: list[bool] | None = None
         self._fr_pg_id = -1
+        # The tag word of the call in progress on each thread, which every
+        # pg.mojo entry takes (flight_recorder.mojo `fr_set_tag`).
+        self._fr_tls = threading.local()
         # Communicator creation is collective: do it now, while every rank is
         # here, on the rank's current device (one visible GPU per torchrun rank).
         # A machine with no mojo device at all gets no communicator: only the
@@ -832,7 +846,10 @@ class MojoProcessGroup(dist.ProcessGroup):
             return
         wait_s = min(_DESYNC_WAIT_S, seconds)
         fr = flight_recorder.make_recorder(
-            self._core.fr_init, self._core.fr_snapshot, self._fr_lib[0]
+            self._core.fr_init,
+            self._core.fr_snapshot,
+            self._core.fr_after_fork,
+            self._fr_lib[0],
         )
         fr_dumps = fr is not None and flight_recorder.dump_on_timeout()
         # Before the reporter acknowledges an incident: the signal and the
@@ -920,16 +937,20 @@ class MojoProcessGroup(dist.ProcessGroup):
         self._group_name = name
 
     def shutdown(self):
+        if self._handle_pid != os.getpid():
+            # A forked child's copy: the communicators, streams, watchdog and
+            # flight recorder monitor belong to the parent (fork closed the
+            # pipe copies; flight_recorder.py's fork hook dropped the rest).
+            self._handle = None
+            self._watchdog_fds = None
+            self._ready.clear()
+            return
         if self._fr is not None and self._handle is not None:
             self._fr.retire(self._fr_pg_id)
             flight_recorder.detach_poller(id(self))
         handle, self._handle = self._handle, None
         fds, self._watchdog_fds = self._watchdog_fds, None
         self._ready.clear()
-        if self._handle_pid != os.getpid():
-            # A forked child's copy: the communicators, streams and watchdog
-            # thread belong to the parent (fork closed the pipe copies).
-            return
         with _LIVE_LOCK:
             live = _LIVE_WATCHDOGS.pop(id(self), None)
             if live is not None and threading.get_ident() in _EXIT_THREAD:
@@ -1118,7 +1139,9 @@ class MojoProcessGroup(dist.ProcessGroup):
         try:
             yield
         finally:
-            self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+            self._core.check(
+                self._core.group_end(self._handle, self._fr_tag()), "ncclGroupEnd"
+            )
 
     def _op(self, dtype: torch.dtype, op: ReduceOp | ReduceOp.RedOpType) -> int:
         return _nccl_red_op(op, dtype)
@@ -1142,7 +1165,10 @@ class MojoProcessGroup(dist.ProcessGroup):
             if not block:
                 flags |= flight_recorder.TAG_FIRST
             block.append(p2p)
-        fr.begin(name, inputs, outputs, flags)
+        self._fr_tls.tag = fr.begin(name, inputs, outputs, flags)
+
+    def _fr_tag(self) -> int:
+        return getattr(self._fr_tls, "tag", 0)
 
     def _fr_block_end(self):
         """The end entry of a coalescing block (ProcessGroupNCCL's
@@ -1150,7 +1176,8 @@ class MojoProcessGroup(dist.ProcessGroup):
         block, self._fr_block = self._fr_block, None
         if self._fr is not None and block is not None:
             p2p = flight_recorder.TAG_P2P if any(block) else 0
-            self._fr.begin("coalesced", [], [], flight_recorder.TAG_END | p2p)
+            end = flight_recorder.TAG_END | p2p
+            self._fr_tls.tag = self._fr.begin("coalesced", [], [], end)
 
     def _result(self, index: int, tensors: list[torch.Tensor]) -> Work:
         if self._coalescing_open():
@@ -1207,10 +1234,11 @@ class MojoProcessGroup(dist.ProcessGroup):
         # deferred work behind for the next block to apply.
         self._fr_block_end()
         try:
-            self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+            self._core.check(
+                self._core.group_end(self._handle, self._fr_tag()), "ncclGroupEnd"
+            )
         finally:
-            if self._fr is not None:
-                self._fr.clear()
+            self._fr_tls.tag = 0
         self._record(index, *records)
         self._finish(index, *pairs)
         return self._work(index, tensors)
@@ -1230,7 +1258,9 @@ class MojoProcessGroup(dist.ProcessGroup):
         pairs, self._coalesced_pairs = self._coalesced_pairs, []
         try:
             self._fr_block_end()
-            self._core.check(self._core.group_end(self._handle), "ncclGroupEnd")
+            self._core.check(
+                self._core.group_end(self._handle, self._fr_tag()), "ncclGroupEnd"
+            )
             self._record(index, *records)
             self._finish(index, *pairs)
         except Exception:  # the original failure is the one being propagated
@@ -1259,7 +1289,13 @@ class MojoProcessGroup(dist.ProcessGroup):
         staged = self._stage_in(index, tensor)
         self._core.check(
             self._core.allreduce(
-                self._handle, index, staged.data_ptr(), staged.numel(), dtype, op
+                self._handle,
+                index,
+                staged.data_ptr(),
+                staged.numel(),
+                dtype,
+                op,
+                self._fr_tag(),
             ),
             "ncclAllReduce",
         )
@@ -1285,7 +1321,13 @@ class MojoProcessGroup(dist.ProcessGroup):
             for (t, dtype, op), s in zip(plan, staged):
                 self._core.check(
                     self._core.allreduce(
-                        self._handle, index, s.data_ptr(), s.numel(), dtype, op
+                        self._handle,
+                        index,
+                        s.data_ptr(),
+                        s.numel(),
+                        dtype,
+                        op,
+                        self._fr_tag(),
                     ),
                     "ncclAllReduce",
                 )
@@ -1315,6 +1357,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                 staged.numel(),
                 dtype,
                 opts.rootRank,
+                self._fr_tag(),
             ),
             "ncclBroadcast",
         )
@@ -1343,6 +1386,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                 dtype,
                 op,
                 opts.rootRank,
+                self._fr_tag(),
             ),
             "ncclReduce",
         )
@@ -1370,6 +1414,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                 staged_out.data_ptr(),
                 staged_in.numel(),
                 dtype,
+                self._fr_tag(),
             ),
             "ncclAllGather",
         )
@@ -1485,6 +1530,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                 staged_out.numel(),
                 dtype,
                 nccl_op,
+                self._fr_tag(),
             ),
             "ncclReduceScatter",
         )
@@ -1610,6 +1656,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                             n_in,
                             dtype,
                             peer,
+                            self._fr_tag(),
                         ),
                         "ncclSend",
                     )
@@ -1622,6 +1669,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                             n_out,
                             dtype,
                             peer,
+                            self._fr_tag(),
                         ),
                         "ncclRecv",
                     )
@@ -1680,6 +1728,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                             i.numel(),
                             _nccl_dtype(i.dtype),
                             peer,
+                            self._fr_tag(),
                         ),
                         "ncclSend",
                     )
@@ -1692,6 +1741,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                             o.numel(),
                             _nccl_dtype(o.dtype),
                             peer,
+                            self._fr_tag(),
                         ),
                         "ncclRecv",
                     )
@@ -1745,6 +1795,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                                 o.numel(),
                                 dtype,
                                 peer,
+                                self._fr_tag(),
                             ),
                             "ncclRecv",
                         )
@@ -1757,6 +1808,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                         staged_in.numel(),
                         dtype,
                         opts.rootRank,
+                        self._fr_tag(),
                     ),
                     "ncclSend",
                 )
@@ -1787,6 +1839,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                 gathered.data_ptr(),
                 input.numel(),
                 _nccl_dtype(input.dtype),
+                self._fr_tag(),
             ),
             "ncclAllGather",
         )
@@ -1818,6 +1871,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                 full.numel(),
                 _nccl_dtype(output.dtype),
                 root_rank,
+                self._fr_tag(),
             ),
             "ncclBroadcast",
         )
@@ -1870,6 +1924,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                                 i.numel(),
                                 dtype,
                                 peer,
+                                self._fr_tag(),
                             ),
                             "ncclSend",
                         )
@@ -1882,6 +1937,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                         staged_out.numel(),
                         dtype,
                         opts.rootRank,
+                        self._fr_tag(),
                     ),
                     "ncclRecv",
                 )
@@ -1910,6 +1966,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                         s.numel(),
                         _nccl_dtype(s.dtype),
                         dst_rank,
+                        self._fr_tag(),
                     ),
                     "ncclSend",
                 )
@@ -1934,6 +1991,7 @@ class MojoProcessGroup(dist.ProcessGroup):
                         s.numel(),
                         _nccl_dtype(s.dtype),
                         src_rank,
+                        self._fr_tag(),
                     ),
                     "ncclRecv",
                 )

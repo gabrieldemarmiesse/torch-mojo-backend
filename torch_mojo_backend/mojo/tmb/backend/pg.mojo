@@ -16,6 +16,8 @@ holds the backend mutex over its whole body itself (`with Locked():`).
 
 Every entry that enqueues collective work calls `PG.track` after it, which
 is what the collective watchdog (watchdog.mojo) watches; a new one must too.
+Each takes the flight recorder's tag word of the Python call (`tag`, 0 if
+none) and sets it first (`fr_set_tag`): the entries it causes record it.
 """
 from std.collections import Dict
 from std.ffi import OwnedDLHandle, c_char, external_call
@@ -31,11 +33,13 @@ from tmb.backend.device import (
     stream_ctx,
 )
 from tmb.backend.flight_recorder import (
+    fr_after_fork,
     fr_init,
     fr_member,
     fr_pg,
     fr_ring,
     fr_selftest,
+    fr_set_tag,
     fr_snapshot,
 )
 from tmb.backend.vendor import raw_stream_of
@@ -495,12 +499,19 @@ def tmb_pg_comm_stream(p: Int, device: Int32) abi("C") -> Int64:
 
 
 def tmb_pg_allreduce(
-    p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, op: Int32
+    p: Int,
+    device: Int32,
+    ptr: Int,
+    count: Int,
+    dtype: Int32,
+    op: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
+            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_ALLREDUCE, c.device):
@@ -516,12 +527,19 @@ def tmb_pg_allreduce(
 
 
 def tmb_pg_broadcast(
-    p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, root: Int32
+    p: Int,
+    device: Int32,
+    ptr: Int,
+    count: Int,
+    dtype: Int32,
+    root: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
+            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_BROADCAST, c.device):
@@ -544,11 +562,13 @@ def tmb_pg_reduce(
     dtype: Int32,
     op: Int32,
     root: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
+            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_REDUCE, c.device):
@@ -566,13 +586,20 @@ def tmb_pg_reduce(
 
 
 def tmb_pg_allgather(
-    p: Int, device: Int32, send: Int, recv: Int, count: Int, dtype: Int32
+    p: Int,
+    device: Int32,
+    send: Int,
+    recv: Int,
+    count: Int,
+    dtype: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     """recv[world * count] <- every rank's send[count]."""
     with Locked():
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
+            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_ALLGATHER, c.device):
@@ -595,12 +622,14 @@ def tmb_pg_reduce_scatter(
     count: Int,
     dtype: Int32,
     op: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     """recv[count] <- reduce of send[world * count] chunk `rank`."""
     with Locked():
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
+            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_REDUCE_SCATTER, c.device):
@@ -616,12 +645,19 @@ def tmb_pg_reduce_scatter(
 
 
 def tmb_pg_send(
-    p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, peer: Int32
+    p: Int,
+    device: Int32,
+    ptr: Int,
+    count: Int,
+    dtype: Int32,
+    peer: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
+            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_SEND, c.device):
@@ -637,12 +673,19 @@ def tmb_pg_send(
 
 
 def tmb_pg_recv(
-    p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, peer: Int32
+    p: Int,
+    device: Int32,
+    ptr: Int,
+    count: Int,
+    dtype: Int32,
+    peer: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
+            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_RECV, c.device):
@@ -671,11 +714,12 @@ def tmb_pg_group_start(p: Int) abi("C") -> Int32:
             return 1
 
 
-def tmb_pg_group_end(p: Int) abi("C") -> Int32:
+def tmb_pg_group_end(p: Int, tag: Int64) abi("C") -> Int32:
     with Locked():
         try:
             var pg = _pg(p)
             pg[].open_or_raise()
+            fr_set_tag(pg[].fr, Int(tag))  # the group's commit is here
             var rc: Int32
             with InCall(pg[].watch, OP_GROUP_END, -1):
                 rc = call_fn[GroupFn](pg[].f_group_end)()
@@ -792,6 +836,7 @@ def tmb_pg_graph_start(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
+            fr_set_tag(pg[].fr, 0)  # no Python call describes it
             # An entry for this address can only be stale (an execute failed
             # between a start and its wait, and MAX's memory plan handed the
             # address out again): a live one's buffer is still allocated.
@@ -995,7 +1040,12 @@ def tmb_pg_fr_selftest() abi("C") -> Int64:
     return Int64(fr_selftest())
 
 
-comptime PG_VTABLE_SLOTS = 29
+def tmb_pg_fr_after_fork() abi("C"):
+    """A forked child: flight_recorder.mojo `fr_after_fork`."""
+    fr_after_fork()
+
+
+comptime PG_VTABLE_SLOTS = 30
 
 
 def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
@@ -1006,7 +1056,7 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     17 synchronize_comm, 18 graph_start, 19 graph_wait, 20 watchdog,
     21 watchdog_exit, 22 watchdog_test_fault, 23 watchdog_test_limit,
     24 watchdog_process_exiting, 25 fr_init, 26 fr_attach, 27 fr_snapshot,
-    28 fr_selftest.
+    28 fr_selftest, 29 fr_after_fork.
     """
     var t = unsafe_alloc[Int](PG_VTABLE_SLOTS)
     var f0: def(Pointer[c_char, MutUntrackedOrigin], Int32, Int32) thin abi(
@@ -1021,29 +1071,29 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
         "C"
     ) -> Int32 = tmb_pg_init_device
     var f5: def(Int, Int32) thin abi("C") -> Int64 = tmb_pg_comm_stream
-    var f6: def(Int, Int32, Int, Int, Int32, Int32) thin abi(
+    var f6: def(Int, Int32, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_allreduce
-    var f7: def(Int, Int32, Int, Int, Int32, Int32) thin abi(
+    var f7: def(Int, Int32, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_broadcast
-    var f8: def(Int, Int32, Int, Int, Int32, Int32, Int32) thin abi(
+    var f8: def(Int, Int32, Int, Int, Int32, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_reduce
-    var f9: def(Int, Int32, Int, Int, Int, Int32) thin abi(
+    var f9: def(Int, Int32, Int, Int, Int, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_allgather
-    var f10: def(Int, Int32, Int, Int, Int, Int32, Int32) thin abi(
+    var f10: def(Int, Int32, Int, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_reduce_scatter
-    var f11: def(Int, Int32, Int, Int, Int32, Int32) thin abi(
+    var f11: def(Int, Int32, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_send
-    var f12: def(Int, Int32, Int, Int, Int32, Int32) thin abi(
+    var f12: def(Int, Int32, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_recv
     var f13: def(Int) thin abi("C") -> Int32 = tmb_pg_group_start
-    var f14: def(Int) thin abi("C") -> Int32 = tmb_pg_group_end
+    var f14: def(Int, Int64) thin abi("C") -> Int32 = tmb_pg_group_end
     var f15: def(Int, Int32) thin abi("C") -> Int32 = tmb_pg_async_error
     var f16: def(Int, Int32) thin abi("C") -> Int32 = tmb_pg_abort
     var f17: def(Int, Int32) thin abi("C") -> Int32 = tmb_pg_synchronize_comm
@@ -1066,6 +1116,7 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     var f26: def(Int, Int64) thin abi("C") -> Int32 = tmb_pg_fr_attach
     var f27: def(Int, Int64) thin abi("C") -> Int64 = tmb_pg_fr_snapshot
     var f28: def() thin abi("C") -> Int64 = tmb_pg_fr_selftest
+    var f29: def() thin abi("C") -> None = tmb_pg_fr_after_fork
     t[unsafe_offset=0] = Pointer(to=f0).unsafe_bitcast[Int]()[]
     t[unsafe_offset=1] = Pointer(to=f1).unsafe_bitcast[Int]()[]
     t[unsafe_offset=2] = Pointer(to=f2).unsafe_bitcast[Int]()[]
@@ -1095,4 +1146,5 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=26] = Pointer(to=f26).unsafe_bitcast[Int]()[]
     t[unsafe_offset=27] = Pointer(to=f27).unsafe_bitcast[Int]()[]
     t[unsafe_offset=28] = Pointer(to=f28).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=29] = Pointer(to=f29).unsafe_bitcast[Int]()[]
     return t

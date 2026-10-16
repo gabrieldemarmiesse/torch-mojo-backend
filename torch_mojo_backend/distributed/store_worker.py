@@ -27,7 +27,11 @@ class StoreWorker:
     abandoned -- its thread exits once that operation returns -- and the
     next job starts a fresh thread and client. A job tagged with an index
     generation older than `latest` is dropped unrun: the index has moved
-    on. `quiet`: no line on stderr when a job overruns or raises."""
+    on. `quiet`: no line on stderr when a job overruns or raises.
+    `max_abandoned`: while that many abandoned jobs are still blocked, a
+    new job is not started (returns None): a store that accepts connections
+    and never answers would otherwise collect a thread and a client per
+    call."""
 
     def __init__(
         self,
@@ -35,15 +39,20 @@ class StoreWorker:
         clone: bool = True,
         quiet: bool = False,
         name: str = "mojo-pg-desync-store",
+        max_abandoned: int | None = None,
     ):
         self._store = store
         self._clone = clone
         self._quiet = quiet
         self._name = name
+        self._max_abandoned = max_abandoned
         self._jobs: queue.SimpleQueue[_Job | None] | None = None
+        self._abandoned = threading.Event()
+        self._stuck = 0  # abandoned jobs whose operation has not returned
+        self._lock = threading.Lock()
         self.latest = 0
 
-    def _serve(self, jobs: queue.SimpleQueue[_Job | None]):
+    def _serve(self, jobs: queue.SimpleQueue[_Job | None], abandoned: threading.Event):
         client = None
         while (item := jobs.get()) is not None:
             job, gen, box, done = item
@@ -58,28 +67,48 @@ class StoreWorker:
                     box.append(job(client))
             except Exception as error:  # reported by the caller
                 box.append(error)
-            done.set()
+            with self._lock:
+                done.set()
+                if abandoned.is_set():  # its caller gave up on it: this thread too
+                    self._stuck -= 1
+                    return
+
+    @property
+    def stuck(self) -> int:
+        return self._stuck
 
     def run(
         self, job: Callable[[Store], _T], timeout: float, gen: int | None = None
     ) -> _T | None:
-        """`job(client)`'s result, or None when it raised, overran or was
-        dropped as stale."""
+        """`job(client)`'s result, or None when it raised, overran, was
+        dropped as stale, or was not started (`max_abandoned`)."""
+        if self._max_abandoned is not None and self._stuck >= self._max_abandoned:
+            return None
         if self._jobs is None:
             self._jobs = queue.SimpleQueue()
+            self._abandoned = threading.Event()
             threading.Thread(
-                target=self._serve, args=(self._jobs,), name=self._name, daemon=True
+                target=self._serve,
+                args=(self._jobs, self._abandoned),
+                name=self._name,
+                daemon=True,
             ).start()
         box: list[object] = []
         done = threading.Event()
         self._jobs.put((job, gen, box, done))
         if not done.wait(max(timeout, 0.1)):
-            self.close()  # stuck: that thread exits once its op returns
-            if not self._quiet:
-                sys.stderr.write(
-                    "mojo watchdog: the c10d store did not answer in time\n"
-                )
-            return None
+            with self._lock:
+                overran = not done.is_set()
+                if overran:
+                    self._stuck += 1
+                    self._abandoned.set()
+            if overran:
+                self.close()  # stuck: that thread exits once its op returns
+                if not self._quiet:
+                    sys.stderr.write(
+                        "mojo watchdog: the c10d store did not answer in time\n"
+                    )
+                return None
         if isinstance(box[0], Exception):
             if not self._quiet:
                 sys.stderr.write(f"mojo watchdog: c10d store error: {box[0]!r}\n")

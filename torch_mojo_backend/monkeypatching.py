@@ -204,11 +204,13 @@ def serve_nccl_trace_dumps_from_the_mojo_backend():
     C++ singleton only ProcessGroupNCCL records into (FlightRecorderCuda.cpp)
     and exist only in CUDA builds (init.cpp, `USE_C10D_NCCL`). While a mojo
     process group is alive, both return its recorder's dump
-    (distributed/flight_recorder.py), in the same format, on every build,
-    merged with torch's own when ProcessGroupNCCL recorded too; otherwise
-    -- no mojo group, all destroyed, the watchdog off, TORCH_FR_BUFFER_SIZE=0
-    -- they are torch's own. `_dump_fr_trace*` (the generic recorder Gloo
-    and FlightRecorderHook use) is left alone.
+    (distributed/flight_recorder.py), in the same format, on every build --
+    unless ProcessGroupNCCL recorded too: then torch's dump comes back
+    untouched (one dump cannot hold both, the analyzer aligns a rank by its
+    first record id), and ours is the dump files (timeout, debug pipe). With
+    no mojo group alive -- none yet, all destroyed, the watchdog off,
+    TORCH_FR_BUFFER_SIZE=0 -- they are torch's own. `_dump_fr_trace*` (the
+    generic recorder Gloo and FlightRecorderHook use) is left alone.
     """
     c10d_c = torch._C._distributed_c10d  # ty: ignore[possibly-missing-submodule] -- loaded by torch.distributed, imported above
     if _NCCL_TRACE_ORIGINALS:
@@ -222,33 +224,31 @@ def serve_nccl_trace_dumps_from_the_mojo_backend():
         includeStackTraces: bool | None = None,  # noqa: N803
         onlyActive: bool | None = None,  # noqa: N803
     ) -> bytes:
-        if trace is not None and not flight_recorder.active():
-            return trace(includeCollectives, includeStackTraces, onlyActive)
-        ours = flight_recorder.dump_nccl_trace(
+        if trace is not None:
+            theirs = trace(includeCollectives, includeStackTraces, onlyActive)
+            if not flight_recorder.active() or _recorded(pickle.loads(theirs)):
+                return theirs
+        return flight_recorder.dump_nccl_trace(
             includeCollectives, includeStackTraces, onlyActive
-        )
-        if trace is None:
-            return ours
-        theirs = pickle.loads(trace(includeCollectives, includeStackTraces, onlyActive))
-        return pickle.dumps(
-            flight_recorder.merge(theirs, pickle.loads(ours)), protocol=2
         )
 
     def _dump_nccl_trace_json(
         includeCollectives: bool | None = None,  # noqa: N803 -- torch's keyword names
         onlyActive: bool | None = None,  # noqa: N803
     ) -> bytes:
-        if trace_json is not None and not flight_recorder.active():
-            return trace_json(includeCollectives, onlyActive)
-        ours = flight_recorder.dump_nccl_trace_json(includeCollectives, onlyActive)
-        if trace_json is None:
-            return ours
-        theirs = json.loads(trace_json(includeCollectives, onlyActive))
-        merged = flight_recorder.merge(theirs, json.loads(ours))
-        return json.dumps(merged, sort_keys=True, separators=(",", ":")).encode()
+        if trace_json is not None:
+            theirs = trace_json(includeCollectives, onlyActive)
+            if not flight_recorder.active() or _recorded(json.loads(theirs)):
+                return theirs
+        return flight_recorder.dump_nccl_trace_json(includeCollectives, onlyActive)
 
     c10d_c._dump_nccl_trace = _dump_nccl_trace
     c10d_c._dump_nccl_trace_json = _dump_nccl_trace_json
+
+
+def _recorded(dump: dict[str, object]) -> bool:
+    """ProcessGroupNCCL's recorder holds something."""
+    return bool(dump.get("entries") or dump.get("pg_config"))
 
 
 # torch's `_dump_nccl_trace` / `_json` (None where the build has none), kept
