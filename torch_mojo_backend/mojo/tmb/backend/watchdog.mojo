@@ -308,6 +308,10 @@ struct Tracker(Movable):
     var handle: Int64
     var ctx: DeviceContext
     var g_entry: Entry
+    # Flight recorder: the calls folded since their process group's last
+    # group_end, and the entry recorded for the pending group's latest.
+    var fr_fold: Entry
+    var fr_last: Int
     var reported: Int
     var fault_reported: Bool
     var published: Bool  # watchdog's: an incident line went out for it
@@ -335,6 +339,8 @@ struct Tracker(Movable):
         self.handle = handle
         self.ctx = ctx
         self.g_entry = _empty_entry()
+        self.fr_fold = _empty_entry()
+        self.fr_last = 0
         self.reported = 0
         self.fault_reported = False
         self.published = False
@@ -841,23 +847,16 @@ def _full(tr: Tracker, head: Int) -> Bool:
     )
 
 
-def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
+def watch_commit(
+    w: Int, t: Int, raw_stream: Int, var e: Entry, tag: Int = 0, fr_rid: Int = 0
+):
     """Record the completion point of what was just enqueued on the comm
     stream as the tracker's next collective. Never waits for the GPU: the
     queue grows by a segment instead; only with a whole table of segments
     in flight are commits dropped, until enough complete. A driver error
     goes to the watchdog (`watch_fault`)."""
     ref tr = _tracker(t)[]
-    var fr = fr_commit(
-        _watch(w)[].fr,
-        e.op,
-        e.nops,
-        e.count,
-        e.dtype,
-        e.root,
-        e.op >= OP_SEND and e.op <= OP_SENDRECV,
-        t,
-    )
+    var fr = fr_rid if fr_rid != 0 else _fr_record(w, t, e, tag)
     if _ld(tr.words, T_FAULT) != 0 or _ld(tr.words, T_STATE) != 0:
         fr_untracked(_watch(w)[].fr, fr)
         return
@@ -939,10 +938,46 @@ def watch_test_limit(t: Int, entries: Int):
         _tracker(t)[].inflight_limit = max(min(entries, (NSEG - 1) * SEG), 1)
 
 
+def _fr_record(w: Int, t: Int, e: Entry, tag: Int) -> Int:
+    return fr_commit(
+        _watch(w)[].fr,
+        e.op,
+        e.nops,
+        e.count,
+        e.dtype,
+        e.root,
+        e.op >= OP_SEND and e.op <= OP_SENDRECV,
+        t,
+        tag,
+    )
+
+
 def watch_group_add(t: Int, var e: Entry):
     """A library call inside an NCCL group: nothing is enqueued before the
     outermost ncclGroupEnd, so it is folded into one entry committed there."""
-    ref g = _tracker(t)[].g_entry
+    ref tr = _tracker(t)[]
+    _fold(tr.fr_fold, e)
+    _fold(tr.g_entry, e)
+
+
+def watch_fr_mark(w: Int, t: Int, tag: Int):
+    """A process group's group_end, at any depth: its calls folded since
+    its last one are a torch-level operation, recorded now with `tag` (a
+    deferred commit must not take whatever the group issues next). The
+    group's commit stamps the latest; the earlier ones complete with it."""
+    if t == 0 or _watch(w)[].fr == 0:
+        return
+    ref tr = _tracker(t)[]
+    if tr.fr_fold.nops == 0:
+        return
+    var rid = _fr_record(w, t, tr.fr_fold, tag)
+    tr.fr_fold = _empty_entry()
+    if tr.fr_last != 0:
+        fr_untracked(_watch(w)[].fr, tr.fr_last)
+    tr.fr_last = rid
+
+
+def _fold(mut g: Entry, e: Entry):
     if g.nops == 0:
         g = e.copy()  # a group of one hashes like the call itself
         return
@@ -966,8 +1001,14 @@ def _group_commit(w: Int, t: Int, raw_stream: Int, submitted: Bool):
     ref tr = _tracker(t)[]
     var g = tr.g_entry.copy()
     tr.g_entry = _empty_entry()
+    if submitted:
+        watch_fr_mark(w, t, 0)  # calls no group_end of their group covered
+    tr.fr_fold = _empty_entry()
+    var fr = tr.fr_last
+    tr.fr_last = 0
     if g.nops != 0 and submitted:
-        watch_commit(w, t, raw_stream, g^)  # a claimed tracker skips it
+        # a claimed tracker skips it
+        watch_commit(w, t, raw_stream, g^, fr_rid=fr)
 
 
 def _drain(w: Int, t: Int, deadline_ns: Int) -> Bool:

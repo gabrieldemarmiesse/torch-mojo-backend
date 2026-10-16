@@ -400,24 +400,38 @@ def _poller(store: Any) -> fr._Poller:
     return poller
 
 
-def test_generations_are_done_pending_or_to_serve(monkeypatch: pytest.MonkeyPatch):
-    """Overlapping dumps that both fail leave both generations to serve (a
-    single high-water mark lost one); a failure backs retries off."""
+def _poll(poller: fr._Poller, worker: StoreWorker, key: tuple[object, ...]):
+    state = poller.state(key)
+    assert state is not None
+    poller.poll(worker, key, state, 0)
+
+
+def test_generations_are_done_pending_failed_or_to_serve():
+    """Overlapping dumps that both fail leave both generations to retry (a
+    single high-water mark lost one); retries back off, but a generation
+    never seen before is served at once."""
     state = fr._StoreState(0, False)
     assert state.claim(1) == (1,)
     assert state.claim(2) == (2,)  # a concurrent claim: only the new one
     state.finish((1,), False)
     state.finish((2,), False)
-    assert state.claim(2) == ()  # backing off
-    state.dump_retry_at = 0.0
-    assert state.claim(2) == (1, 2)
-    state.finish((1, 2), True)
-    assert state.base == 2 and not state.pending and state.claim(2) == ()
-    assert state.claim(4) == (3, 4)
-    state.finish((4,), True)
-    assert state.base == 2 and state.done == {4}  # 3 still pending
+    assert state.claim(2) == ()  # retries back off
+    assert state.claim(3) == (3,)  # a fresh incident does not wait
     state.finish((3,), True)
-    assert state.base == 4 and not state.done
+    state.dump_retry_at = 0.0
+    assert state.claim(3) == (1, 2)
+    state.finish((1, 2), True, acked=False)  # written, acknowledgement lost
+    assert state.base == 3 and not state.pending and state.unacked == {1, 2}
+    assert state.claim(5) == (4, 5)
+    state.finish((5,), True)
+    assert state.base == 3 and state.done == {5}  # 4 still pending
+    state.finish((4,), True)
+    assert state.base == 5 and not state.done
+
+
+def test_poll_backoff_stays_below_the_dump_wait(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC", "8000")
+    assert fr._poll_backoff_cap() == 2.0
 
 
 def test_store_state_follows_the_watched_stores():
@@ -466,15 +480,15 @@ def test_poll_acknowledges_only_a_written_dump(
     blocked = tmp_path / "file"
     blocked.write_text("")  # a file where the dump directory should be
     monkeypatch.setenv("TORCH_FR_DUMP_TEMP_FILE", str(blocked / "trace_"))
-    poller.poll(worker, key, 0)
+    _poll(poller, worker, key)
     assert not store.check([f"{fr.ACK_KEY}/{gen}/0"])
     monkeypatch.setenv("TORCH_FR_DUMP_TEMP_FILE", str(tmp_path / "trace_"))
-    poller.poll(worker, key, 0)
+    _poll(poller, worker, key)
     assert not (tmp_path / "trace_0").exists()  # backing off
     state = poller.state(key)
     assert state is not None
     state.dump_retry_at = 0.0
-    poller.poll(worker, key, 0)
+    _poll(poller, worker, key)
     assert store.check([f"{fr.ACK_KEY}/{gen}/0"])
     assert (tmp_path / "trace_0").exists()
     worker.close()
@@ -494,19 +508,154 @@ def test_poll_answers_a_nccl_dump_signal(
     poller = _poller(store)
     key = fr.store_key(store)
     worker = StoreWorker(store, clone=False, quiet=True)
-    poller.poll(worker, key, 0)
+    _poll(poller, worker, key)
     store.set(fr.DUMP_KEY, struct.pack("=i", 1))  # ty: ignore[invalid-argument-type] -- Store.set takes bytes; the stub says str
-    poller.poll(worker, key, 0)  # fails
+    _poll(poller, worker, key)  # fails
     monkeypatch.setenv("TORCH_FR_DUMP_TEMP_FILE", str(tmp_path / "trace_"))
     state = poller.state(key)
     assert state is not None and state.torch == "unseen"
     state.dump_retry_at = 0.0
-    poller.poll(worker, key, 0)
+    _poll(poller, worker, key)
     assert (tmp_path / "trace_0").exists() and state.torch == "seen"
     (tmp_path / "trace_0").unlink()
-    poller.poll(worker, key, 0)
+    _poll(poller, worker, key)
     assert not (tmp_path / "trace_0").exists()
     worker.close()
+
+
+def test_a_fresh_incident_is_dumped_during_a_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """Generation 1's dumps failed and back off for a minute; generation 2
+    arrives: this rank dumps at once (the firing rank waits only
+    TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC)."""
+    store = c10d_c.HashStore()
+    fake = _Fake([_word(0, ALLREDUCE, 1)])
+    monkeypatch.setattr(fr, "_RECORDER", [fake.rec])
+    monkeypatch.setenv("TORCH_FR_DUMP_TEMP_FILE", str(tmp_path / "trace_"))
+    poller = _poller(store)
+    key = fr.store_key(store)
+    worker = StoreWorker(store, clone=False, quiet=True)
+    state = poller.state(key)
+    assert state is not None
+    fr.signal_dump(store, 1)
+    assert state.claim(1) == (1,)
+    state.finish((1,), False)
+    state.dump_backoff, state.dump_retry_at = 60.0, time.monotonic() + 60
+    second = fr.signal_dump(store, 1)
+    _poll(poller, worker, key)
+    assert (tmp_path / "trace_0").exists()
+    assert store.check([f"{fr.ACK_KEY}/{second}/0"])
+    assert state.failed == {1}  # its retry still waits
+    worker.close()
+
+
+def test_an_acknowledgement_is_retried_without_a_new_dump(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    store = c10d_c.HashStore()
+    monkeypatch.setattr(fr, "_RECORDER", [_Fake([_word(0, ALLREDUCE, 1)]).rec])
+    monkeypatch.setenv("TORCH_FR_DUMP_TEMP_FILE", str(tmp_path / "trace_"))
+    poller = _poller(store)
+    key = fr.store_key(store)
+    state = poller.state(key)
+    assert state is not None
+    gen = fr.signal_dump(store, 1)
+    assert state.claim(gen) == (gen,)
+    state.finish((gen,), True, acked=False)
+    worker = StoreWorker(store, clone=False, quiet=True)
+    _poll(poller, worker, key)
+    assert store.check([f"{fr.ACK_KEY}/{gen}/0"]) and not state.unacked
+    assert not (tmp_path / "trace_0").exists()
+    worker.close()
+
+
+def test_a_blocked_poll_does_not_back_off():
+    """While the one abandoned job is still blocked the poll is skipped,
+    not backed off: it runs again as soon as that job returns."""
+    store = c10d_c.HashStore()
+    poller = _poller(store)
+    key = fr.store_key(store)
+    worker = StoreWorker(store, clone=False, quiet=True, max_abandoned=1)
+    release = threading.Event()
+    assert worker.run(lambda _: release.wait(), 0.1) is None
+    _poll(poller, worker, key)
+    state = poller.state(key)
+    assert state is not None and state.poll_at == 0.0 and state.poll_backoff == 0.0
+    release.set()
+    worker.close()
+
+
+def test_attach_survives_the_store_state_going_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Group B attaches a store group A watched; A detaches while B reads the
+    baseline: B still gets a state (it was dropped with A's detach)."""
+    store = c10d_c.HashStore()
+    poller = _poller(store)
+    read = fr.current_generation
+
+    def detach_meanwhile(client: Any) -> int:
+        poller.detach(1)
+        return read(client)
+
+    monkeypatch.setattr(fr, "current_generation", detach_meanwhile)
+    poller.attach(2, store, 0)
+    assert poller.state(fr.store_key(store)) is not None
+
+
+def test_a_restarted_store_is_a_new_incarnation(tmp_path: Path):
+    """A server restarted at the same address counts from 0 again: below
+    what this process served, so its state (and worker) start over rather
+    than ignore its first generations."""
+    store = c10d_c.HashStore()
+    for _ in range(5):
+        fr.signal_dump(store, 0)
+    poller = _poller(store)
+    key = fr.store_key(store)
+    old = poller.state(key)
+    assert old is not None and old.base == 5
+    worker = StoreWorker(store, clone=False, quiet=True)
+    store.set(fr.GEN_KEY, "0")  # what a new server's counter reads
+    _poll(poller, worker, key)
+    new = poller.state(key)
+    assert new is not None and new is not old and new.base == 0
+    assert new.claim(fr.signal_dump(store, 1)) == (1,)
+    poller.attach(3, store, 0)  # an attach reading below the base: same
+    worker.close()
+
+
+def test_workers_follow_the_store_state(monkeypatch: pytest.MonkeyPatch):
+    """The monitor's worker for a store lives as long as that store's state:
+    a new incarnation gets a new one, and the old one is closed."""
+    monkeypatch.setenv("TORCH_NCCL_COORD_CHECK_MILSEC", "10")
+    made: list[Any] = []
+
+    class Recording(StoreWorker):
+        closed = False
+
+        def __init__(self, *a: Any, **kw: Any):
+            super().__init__(*a, **kw)
+            made.append(self)
+
+        def close(self):
+            self.closed = True
+            super().close()
+
+    monkeypatch.setattr(fr, "StoreWorker", Recording)
+    store = c10d_c.HashStore()
+    poller = _poller(store)
+    threading.Thread(target=poller.run, daemon=True).start()
+    deadline = time.monotonic() + 5
+    while not made and time.monotonic() < deadline:
+        time.sleep(0.01)
+    key = fr.store_key(store)
+    with poller.lock:
+        poller.states[key] = fr._StoreState(0, False)  # a new incarnation
+    while len(made) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(made) >= 2 and made[0].closed
+    poller.detach(1)
 
 
 def test_store_worker_keeps_one_abandoned_job():

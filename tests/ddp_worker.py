@@ -710,6 +710,48 @@ def _fr_wrap_stress(t: torch.Tensor, size: int) -> bool:
     return not bad and dumps[0] > 0
 
 
+def _fr_nested_blocks(failures: list[str], t: torch.Tensor):
+    """One thread, two groups: B's coalescing block closes inside A's, then
+    an ordinary B broadcast, then A's block closes -- B's NCCL commit waits
+    for A's group_end. B's block keeps its `coalesced` end and the
+    broadcast its own entry and seq id (a commit reading B's latest tag at
+    A's group_end lost the end), both completed; the members stay
+    scheduled."""
+    world = dist.get_world_size()
+    a = cast(MojoProcessGroup, dist.group.WORLD)
+    b = cast(MojoProcessGroup, dist.new_group(list(range(world))))
+    x, y, z = (torch.ones_like(t) for _ in range(3))
+    a._start_coalescing(t.device)
+    b._start_coalescing(t.device)
+    dist.all_reduce(x, group=b)
+    b._end_coalescing(t.device)
+    dist.broadcast(y, 0, group=b)
+    dist.all_reduce(z, group=a)
+    a._end_coalescing(t.device)
+    torch.accelerator.synchronize()
+    time.sleep(0.5)
+    entries = pickle.loads(c10d_c._dump_nccl_trace(True, False))["entries"]  # ty: ignore[unresolved-attribute] -- stubbed for CUDA builds only; register_mojo_devices() installs it
+    by_group: dict[str, list[tuple[str, int, str]]] = {}
+    for e in entries:
+        by_group.setdefault(e["process_group"][0], []).append(
+            (e["profiling_name"][5:], e["collective_seq_id"], e["state"])
+        )
+    got_b = by_group[b.getGroupName()]
+    got_a = by_group["0"][-2:]
+    ok = got_b == [
+        ("all_reduce", 1, "scheduled"),
+        ("coalesced", 1, "completed"),
+        ("broadcast", 2, "completed"),
+    ] and [(n, st) for n, _, st in got_a] == [
+        ("all_reduce", "scheduled"),
+        ("coalesced", "completed"),
+    ]
+    if not ok:
+        print(f"[rank {dist.get_rank()}] fr.nested_blocks: {got_b} {got_a}", flush=True)
+    _check(failures, "fr.nested_blocks", ok)
+    dist.destroy_process_group(b)
+
+
 def run_flight_recorder(failures: list[str]):
     """The flight recorder seen through torch's own entry points: every
     collective of this run in `_dump_nccl_trace` with ProcessGroupNCCL's
@@ -842,6 +884,8 @@ def run_flight_recorder(failures: list[str]):
         dist.barrier()  # both dumps written before torchrun reaps a rank
     if size <= 16:
         _check(failures, "fr.snapshots_while_the_ring_wraps", _fr_wrap_stress(t, size))
+    if size >= 2000:
+        _fr_nested_blocks(failures, t)
 
 
 def run_fr_subgroup():

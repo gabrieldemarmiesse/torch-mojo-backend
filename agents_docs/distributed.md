@@ -525,16 +525,23 @@ communicators and does the actual library calls.
       share them). Off with the watchdog. `tmb_pg_fr_selftest` checks the
       stamping, lapping, block and tag rules on a private ring.
     - *Tag words.* Python cannot learn which ring entry a call made, so
-      every pg.mojo entry (and `group_end`) takes a tag word, which it sets
-      on the group's recording state under the backend mutex
-      (`fr_set_tag`) before the library call; the entries it causes take
-      it. `_fr_op` builds it per call -- a record id plus member/first/end/
-      p2p bits -- and keeps it in a `threading.local` the call sites read.
-      Two earlier designs, a process-wide header word and then hashed or
-      owned per-thread header slots, each lost tags or flags under some
-      interleaving, slot exhaustion, a dead owner or a fork; an argument
-      under the mutex has none of that, and the coalescing structure no
-      longer depends on anything optional. The dump joins entries with the
+      every pg.mojo collective entry (and `group_end`) takes a tag word and
+      passes it down to the entries it causes (`PG.track`, `fr_member`,
+      `watch_commit`). A group's calls are recorded at their process
+      group's own `group_end` (`watch_fr_mark`), with that call's tag, even
+      when the NCCL group they were folded into commits later (an
+      enclosing group of another process group, on the same thread): the
+      commit links the latest of them and the earlier ones complete with
+      it (flagged untracked). Reading a group-wide "latest tag" at the
+      enclosing commit took whatever that group issued in between -- a
+      closed coalescing block lost its end. `_fr_op` builds the tag per
+      call -- a record id plus member/first/end/p2p bits -- and keeps it in
+      a `threading.local` the call sites read. Earlier designs (a
+      process-wide header word, then hashed or owned per-thread header
+      slots, then a per-group "current tag") each lost tags or flags under
+      some interleaving, slot exhaustion, a dead owner or a fork; an
+      argument has none of that, and the coalescing structure depends on
+      nothing optional. The dump joins entries with the
       Python record (name, shapes, dtypes, `gather_traceback`). A torch op
       issuing several library calls inside `_group()` is one entry (its
       group commit); list all_gather / reduce_scatter record the stacked
@@ -570,24 +577,36 @@ communicators and does the actual library calls.
       `mojo-pg-fr-monitor` thread per process polls torch's
       `exception_dump`, then the generation (the reverse of
       `signal_dump`'s order, so a key it sees comes with its generation),
-      and the debug pipe, every `TORCH_NCCL_COORD_CHECK_MILSEC`. State is
-      per store (TCPStore host/port, FileStore path): a generation is
-      done, pending (a dump in progress) or to serve, and a failed dump
-      makes its generations servable again after a backoff doubling up to
-      a minute; a ProcessGroupNCCL's `broadcastDumpSignal` -- the key
-      appearing while the generation never moved -- dumps once, retried
-      the same way. Groups attach their store (baseline: its current
-      generation, an earlier job's, read before it is watched) and detach
-      at shutdown; the newest attached store is polled, a store whose
-      groups are gone loses its state and worker, and an answer for one
-      is never applied to another. Store operations run on a
-      `StoreWorker` (store_worker.py, shared with the desync reporter);
-      the monitor's starts no new job while an abandoned one is still
-      blocked, and an unanswering store is polled less and less often.
-      The signaller is read with `check` before `get`.
-    - *Fork.* A child gets fresh recorder and monitor locks, no monitor
-      (its own first group starts one), none of the parent's groups, and
-      the ring's slots a parent thread was writing released
+      and the debug pipe, every `TORCH_NCCL_COORD_CHECK_MILSEC`.
+    - *Signal state* is per store (TCPStore host/port, FileStore path) and
+      incarnation: a generation read below the state's base means a server
+      restarted at that address, and starts a new state. A generation is
+      done, pending (a dump in progress), failed or to serve. A generation
+      never seen before is dumped at once; only retries of failed ones
+      back off (doubling up to a minute) -- a backoff that gated new
+      generations kept a recovered rank from dumping a fresh incident
+      within the firing rank's wait. A dump that was written but whose
+      acknowledgement did not get through is acknowledged again at the
+      next poll, without a new dump. A ProcessGroupNCCL's
+      `broadcastDumpSignal` -- the key appearing while the generation never
+      moved -- dumps once, its retries backed off the same way. Groups
+      attach their store (the baseline, the store's current generation, is
+      read before it is watched; an attach that finds the state gone
+      meanwhile makes a new one) and detach at shutdown; the newest
+      attached store is polled. Store operations run on a `StoreWorker`
+      (store_worker.py, shared with the desync reporter; it drops a client
+      that raised) owned by the store's state: a new incarnation, or the
+      state going with its last group, closes it, and an answer is applied
+      only to the state it was asked for. While its one abandoned job is
+      still blocked the poll is skipped and retried as soon as it returns;
+      a store that answers with errors is polled less often, never more
+      than a quarter of the dump wait apart. The signaller is read with
+      `check` before `get`.
+    - *Fork.* The native backend refuses device use in a forked child, so a
+      child never records; the hook only keeps one that touches the
+      recorder (a dump, a group's `__del__`) from deadlocking: fresh
+      recorder and monitor locks, no monitor, none of the parent's groups,
+      and the ring's slots a parent thread was writing released
       (`fr_after_fork`). A group's `shutdown()` in the child returns before
       touching any of it.
     - *`_dump_nccl_trace[_json]`* (monkeypatching.py): torch's own while no
@@ -600,15 +619,16 @@ communicators and does the actual library calls.
       destroy); an older one's entries are left out.
     - *Host cost* (2 x H100, the watchdog's overhead.py legs with
       TORCH_FR_BUFFER_SIZE=0 vs 2000, ABBA, medians of six legs; job
-      322563, after the round-3 review fixes): the native entry costs
-      0.1 us or less (NCCL 7.32 -> 7.44 us, mojoccl 3.91 -> 3.99 us: a tag
-      store, a slot lock, about 17 stores); `dist.all_reduce` pays +2.2 us
-      (NCCL 23.3 -> 25.5, mojoccl 19.2 -> 21.4; earlier revisions on other
-      nodes measured +2.3-4.1). `Recorder.begin` alone is 1.5 us on the
-      login node, 0.66 us of it without `gather_traceback` (torch records
-      a Python stack per collective too). A dict keyed by tag cost 5.9 us
-      per record (popping its oldest key scans the dummies left at the
-      front); the records are a list indexed by tag.
+      322681, after the round-4 review fixes): the native entry costs
+      about 0.1 us (NCCL 7.39 -> 7.46 us, mojoccl 3.91 -> 4.05 us: the tag
+      argument, a slot lock, about 17 stores); `dist.all_reduce` pays
+      +1.8-2.3 us (NCCL 23.4 -> 25.7, mojoccl 19.2 -> 21.0; earlier
+      revisions on other nodes measured +2.2-4.1). `Recorder.begin` alone
+      is 1.5 us on the login node, 0.66 us of it without
+      `gather_traceback` (torch records a Python stack per collective
+      too). A dict keyed by tag cost 5.9 us per record (popping its oldest
+      key scans the dummies left at the front); the records are a list
+      indexed by tag.
     - *fr_trace quirks* (2.11 and 2.14.1 alike, on NCCL's dumps too): it
       logs "does not have a coalesced end" for every `nccl:coalesced` (it
       checks `endswith("_coalesced")`); it pairs a coalescing block's p2p

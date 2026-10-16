@@ -16,10 +16,11 @@ moves it to the next even value. A stamp can therefore only land on the
 entry it is for, whatever the ring did meanwhile.
 
 The Python side describes the torch-level operation in flight: every
-pg.mojo entry takes a tag word (`fr_set_tag`, under the backend mutex) that
-the entries it causes record -- a record id, which the dump joins with its
-Python description, and the coalescing structure (member, first, end,
-point-to-point).
+pg.mojo entry takes a tag word, passed down to the entries it causes -- a
+record id, which the dump joins with its Python description, and the
+coalescing structure (member, first, end, point-to-point). A group's entry
+is recorded at its process group's group_end, with that call's tag, even
+when the commit it completes with comes later (an enclosing group).
 """
 from std.atomic import Atomic, Ordering
 from std.ffi import _get_global_or_null, external_call
@@ -74,8 +75,7 @@ comptime P_PSEQ = 3
 comptime P_OPID = 4
 comptime P_GROUP_C = 5  # a coalescing block bumped the collective seq
 comptime P_GROUP_P = 6  # ...the point-to-point seq
-comptime P_TAG = 7  # the tag of the call in progress (`fr_set_tag`)
-comptime P_WORDS = 8
+comptime P_WORDS = 7
 
 comptime FrP = Pointer[Int64, MutUntrackedOrigin]
 
@@ -177,13 +177,6 @@ def fr_pg(ring: Int, pg_id: Int) -> Int:
     return Int(p)
 
 
-def fr_set_tag(fp: Int, tag: Int):
-    """The tag of the pg.mojo entry in progress, for the entries it causes.
-    Under the backend mutex, like every entry."""
-    if fp != 0:
-        _st(_pg(fp), P_TAG, tag)
-
-
 def _record(
     fp: Int,
     op: Int,
@@ -194,13 +187,14 @@ def _record(
     p2p_op: Bool,
     untracked: Bool,
     comm: Int,
+    tag_word: Int,
 ) -> Int:
     """Seq ids as ProcessGroupNCCL counts them: `collective_seq_id` once per
     collective or coalescing block, `p2p_seq_id` once per point-to-point op
     or block, `op_id` per operation. Returns record id + 1."""
     var pg = _pg(fp)
     var ring = _ring_of(fp)
-    var tag = _ld(pg, P_TAG)
+    var tag = tag_word
     if tag & TAG_END and _ld(pg, P_GROUP_C) == 0 and _ld(pg, P_GROUP_P) == 0:
         # Another group's block ended (this group's commit rides its
         # group_end): an ordinary entry, which that record does not describe.
@@ -261,13 +255,14 @@ def fr_commit(
     root: Int,
     p2p_op: Bool,
     comm: Int,
+    tag: Int,
 ) -> Int:
     """The entry of a collective the watchdog commits on tracker `comm` (a
-    call, or a group at its end); record id + 1, 0 when not recording.
-    Under the backend mutex."""
+    call, or a group's calls at its group_end), described by `tag`; record
+    id + 1, 0 when not recording. Under the backend mutex."""
     if fp == 0:
         return 0
-    return _record(fp, op, nops, count, dtype, root, p2p_op, False, comm)
+    return _record(fp, op, nops, count, dtype, root, p2p_op, False, comm, tag)
 
 
 def fr_untracked(fp: Int, rid1: Int):
@@ -290,13 +285,14 @@ def fr_member(
     root: Int,
     p2p_op: Bool,
     comm: Int,
+    tag: Int,
 ):
     """A library call inside an NCCL group: its own entry only when it is an
-    operation of a coalescing block. Like ProcessGroupNCCL's, these entries
-    are never stamped; the block's end entry, at the group's commit, is.
-    Under the backend mutex."""
-    if fp != 0 and _ld(_pg(fp), P_TAG) & TAG_MEMBER:
-        _ = _record(fp, op, 1, count, dtype, root, p2p_op, False, comm)
+    operation of a coalescing block (`tag`). Like ProcessGroupNCCL's, these
+    entries are never stamped; the block's end entry is. Under the backend
+    mutex."""
+    if fp != 0 and tag & TAG_MEMBER:
+        _ = _record(fp, op, 1, count, dtype, root, p2p_op, False, comm, tag)
 
 
 def fr_done(fp: Int, rid1: Int, now: Int):
@@ -372,7 +368,7 @@ def fr_selftest() -> Int:
     the number of the first check that failed (test hook)."""
     var ring = _new_ring(4)
     var fp = fr_pg(Int(ring), 7)
-    var r1 = fr_commit(fp, 1, 1, 8, 7, -1, False, 11)
+    var r1 = fr_commit(fp, 1, 1, 8, 7, -1, False, 11, 0)
     fr_done(fp, r1, 100)
     if _ld(_slot(ring, r1 - 1), F_DONE) != 100:
         return 1
@@ -381,7 +377,7 @@ def fr_selftest() -> Int:
         return 2
     var r = r1
     for _ in range(4):  # lap the ring: r1's slot is the newest entry's
-        r = fr_commit(fp, 1, 1, 8, 7, -1, False, 11)
+        r = fr_commit(fp, 1, 1, 8, 7, -1, False, 11, 0)
     fr_done(fp, r1, 300)  # a late stamp of the slot's previous entry
     if _ld(_slot(ring, r - 1), F_DONE) != 0:
         return 3
@@ -391,12 +387,9 @@ def fr_selftest() -> Int:
     if _ld(_slot(ring, r - 1), F_CSEQ) != 5:
         return 5
     # A coalescing block of two sends, tagged: one p2p seq, op ids per op.
-    fr_set_tag(fp, 9 | TAG_MEMBER | TAG_FIRST | TAG_P2P)
-    fr_member(fp, 6, 8, 7, 1, True, 11)
-    fr_set_tag(fp, 9 | TAG_MEMBER | TAG_P2P)
-    fr_member(fp, 6, 8, 7, 1, True, 11)
-    fr_set_tag(fp, 10 | TAG_END | TAG_P2P)
-    var end = fr_commit(fp, 8, 2, 16, 7, -1, True, 11)
+    fr_member(fp, 6, 8, 7, 1, True, 11, 9 | TAG_MEMBER | TAG_FIRST | TAG_P2P)
+    fr_member(fp, 6, 8, 7, 1, True, 11, 9 | TAG_MEMBER | TAG_P2P)
+    var end = fr_commit(fp, 8, 2, 16, 7, -1, True, 11, 10 | TAG_END | TAG_P2P)
     var e = _slot(ring, end - 1)
     if _ld(e, F_PSEQ) != 1 or _ld(e, F_FLAGS) != FL_END | FL_P2P:
         return 6
@@ -406,8 +399,9 @@ def fr_selftest() -> Int:
         return 8
     # An END tag reaching a group with no open block: an ordinary entry.
     var other = fr_pg(Int(ring), 8)
-    fr_set_tag(other, 10 | TAG_END | TAG_P2P)
-    var plain = fr_commit(other, 1, 1, 8, 7, -1, False, 12)
+    var plain = fr_commit(
+        other, 1, 1, 8, 7, -1, False, 12, 10 | TAG_END | TAG_P2P
+    )
     var p = _slot(ring, plain - 1)
     if _ld(p, F_FLAGS) != 0 or _ld(p, F_TAG) != 0 or _ld(p, F_CSEQ) != 1:
         return 9

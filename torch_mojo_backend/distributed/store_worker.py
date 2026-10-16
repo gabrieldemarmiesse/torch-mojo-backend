@@ -67,6 +67,7 @@ class StoreWorker:
                     box.append(job(client))
             except Exception as error:  # reported by the caller
                 box.append(error)
+                client = None  # a broken connection: the next job makes a new one
             with self._lock:
                 done.set()
                 if abandoned.is_set():  # its caller gave up on it: this thread too

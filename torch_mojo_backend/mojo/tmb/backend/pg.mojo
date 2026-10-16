@@ -17,7 +17,8 @@ holds the backend mutex over its whole body itself (`with Locked():`).
 Every entry that enqueues collective work calls `PG.track` after it, which
 is what the collective watchdog (watchdog.mojo) watches; a new one must too.
 Each takes the flight recorder's tag word of the Python call (`tag`, 0 if
-none) and sets it first (`fr_set_tag`): the entries it causes record it.
+none) and hands it to `track` (`group_end` to `watch_fr_mark`): the entries
+it causes record it.
 """
 from std.collections import Dict
 from std.ffi import OwnedDLHandle, c_char, external_call
@@ -39,7 +40,6 @@ from tmb.backend.flight_recorder import (
     fr_pg,
     fr_ring,
     fr_selftest,
-    fr_set_tag,
     fr_snapshot,
 )
 from tmb.backend.vendor import raw_stream_of
@@ -77,6 +77,7 @@ from tmb.backend.watchdog import (
     watch_group_add,
     watch_next_cpos,
     watch_process_exiting,
+    watch_fr_mark,
     watch_set_fr,
 )
 
@@ -237,9 +238,11 @@ struct PG(Movable):
         dtype: Int32,
         root: Int = -1,
         redop: Int = -1,
+        tag: Int = 0,
     ):
         """Hand what a library call just enqueued on `c`'s comm stream to the
-        watchdog. Call it right after every successful call that enqueues
+        watchdog (and the flight recorder: `tag` is the Python call's tag
+        word, 0 if none). Call it right after every successful call that enqueues
         collective work there (`root` is the root or peer, `redop` the
         reduction). Inside an NCCL group -- this thread's, on this library,
         whichever process group opened it -- the calls are folded into one
@@ -269,11 +272,12 @@ struct PG(Movable):
                 root,
                 op == OP_SEND or op == OP_RECV,
                 c.tracker,
+                tag,
             )
             watch_group_add(c.tracker, e^)
             group_note(self.f_group_start, self.watch, c.tracker, c.raw)
         else:
-            watch_commit(self.watch, c.tracker, c.raw, e^)
+            watch_commit(self.watch, c.tracker, c.raw, e^, tag)
 
     def sync_in(self, c: Comm) raises:
         """The comm stream waits for everything the caller's current stream has
@@ -511,7 +515,6 @@ def tmb_pg_allreduce(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
-            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_ALLREDUCE, c.device):
@@ -519,7 +522,9 @@ def tmb_pg_allreduce(
                     ptr, ptr, count, dtype, op, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclAllReduce")
-            pg[].track(c, OP_ALLREDUCE, count, dtype, redop=Int(op))
+            pg[].track(
+                c, OP_ALLREDUCE, count, dtype, redop=Int(op), tag=Int(tag)
+            )
             return 0
         except e:
             set_error(String(e))
@@ -539,7 +544,6 @@ def tmb_pg_broadcast(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
-            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_BROADCAST, c.device):
@@ -547,7 +551,9 @@ def tmb_pg_broadcast(
                     ptr, ptr, count, dtype, root, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclBroadcast")
-            pg[].track(c, OP_BROADCAST, count, dtype, root=Int(root))
+            pg[].track(
+                c, OP_BROADCAST, count, dtype, root=Int(root), tag=Int(tag)
+            )
             return 0
         except e:
             set_error(String(e))
@@ -568,7 +574,6 @@ def tmb_pg_reduce(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
-            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_REDUCE, c.device):
@@ -577,7 +582,13 @@ def tmb_pg_reduce(
                 )
             pg[].check(rc, "ncclReduce")
             pg[].track(
-                c, OP_REDUCE, count, dtype, root=Int(root), redop=Int(op)
+                c,
+                OP_REDUCE,
+                count,
+                dtype,
+                root=Int(root),
+                redop=Int(op),
+                tag=Int(tag),
             )
             return 0
         except e:
@@ -599,7 +610,6 @@ def tmb_pg_allgather(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
-            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_ALLGATHER, c.device):
@@ -607,7 +617,7 @@ def tmb_pg_allgather(
                     send, recv, count, dtype, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclAllGather")
-            pg[].track(c, OP_ALLGATHER, count, dtype)
+            pg[].track(c, OP_ALLGATHER, count, dtype, tag=Int(tag))
             return 0
         except e:
             set_error(String(e))
@@ -629,7 +639,6 @@ def tmb_pg_reduce_scatter(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
-            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_REDUCE_SCATTER, c.device):
@@ -637,7 +646,9 @@ def tmb_pg_reduce_scatter(
                     send, recv, count, dtype, op, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclReduceScatter")
-            pg[].track(c, OP_REDUCE_SCATTER, count, dtype, redop=Int(op))
+            pg[].track(
+                c, OP_REDUCE_SCATTER, count, dtype, redop=Int(op), tag=Int(tag)
+            )
             return 0
         except e:
             set_error(String(e))
@@ -657,7 +668,6 @@ def tmb_pg_send(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
-            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_SEND, c.device):
@@ -665,7 +675,7 @@ def tmb_pg_send(
                     ptr, count, dtype, peer, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclSend")
-            pg[].track(c, OP_SEND, count, dtype, root=Int(peer))
+            pg[].track(c, OP_SEND, count, dtype, root=Int(peer), tag=Int(tag))
             return 0
         except e:
             set_error(String(e))
@@ -685,7 +695,6 @@ def tmb_pg_recv(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
-            fr_set_tag(pg[].fr, Int(tag))
             pg[].sync_in(c)
             var rc: Int32
             with InCall(pg[].watch, OP_RECV, c.device):
@@ -693,7 +702,7 @@ def tmb_pg_recv(
                     ptr, count, dtype, peer, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclRecv")
-            pg[].track(c, OP_RECV, count, dtype, root=Int(peer))
+            pg[].track(c, OP_RECV, count, dtype, root=Int(peer), tag=Int(tag))
             return 0
         except e:
             set_error(String(e))
@@ -719,7 +728,8 @@ def tmb_pg_group_end(p: Int, tag: Int64) abi("C") -> Int32:
         try:
             var pg = _pg(p)
             pg[].open_or_raise()
-            fr_set_tag(pg[].fr, Int(tag))  # the group's commit is here
+            for c in pg[].comms.values():  # its calls since its last one
+                watch_fr_mark(pg[].watch, c.tracker, Int(tag))
             var rc: Int32
             with InCall(pg[].watch, OP_GROUP_END, -1):
                 rc = call_fn[GroupFn](pg[].f_group_end)()
@@ -836,7 +846,6 @@ def tmb_pg_graph_start(
         try:
             var pg = _pg(p)
             var c = pg[].comm(Int(device))
-            fr_set_tag(pg[].fr, 0)  # no Python call describes it
             # An entry for this address can only be stale (an execute failed
             # between a start and its wait, and MAX's memory plan handed the
             # address out again): a live one's buffer is still allocated.

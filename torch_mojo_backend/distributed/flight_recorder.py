@@ -725,48 +725,69 @@ def wait_for_dumps(
 _MAX_BACKOFF_S = 60.0
 
 
+def _poll_backoff_cap() -> float:
+    """Polls of an unanswering store back off, but never past a quarter of
+    the dump wait: the firing rank waits that long for this rank's dump."""
+    return max(min(_MAX_BACKOFF_S, dump_wait_s() / 4), coord_check_s())
+
+
 class _StoreState:
-    """The dump signals of one store, for this process: every generation
-    is done (dumped and acknowledged), pending (a dump in progress) or
-    neither (to serve); a failed dump makes its generations servable again,
-    after a backoff."""
+    """The dump signals of one store incarnation, for this process: every
+    generation is done (dumped), pending (a dump in progress), failed
+    (dumped in vain: retried after a backoff) or to serve. A generation not
+    seen before is served at once, whatever the backoff of failed ones. A
+    dump written whose acknowledgement did not get through is acknowledged
+    again at the next poll, without a new dump."""
 
     def __init__(self, base: int | None, torch_seen: bool):
         self.base = base  # every generation <= base is done; None: unread
         self.first = base  # the store's generation when first watched
+        self.high = base  # the highest generation ever claimed
         self.done: set[int] = set()
         self.pending: set[int] = set()
+        self.failed: set[int] = set()
+        self.unacked: set[int] = set()
         # torch's own key (ProcessGroupNCCL's signal): "seen" when it was
         # there before, or dumped for; "unseen" until then
         self.torch = "seen" if torch_seen else "unseen"
+        self.torch_tried = False
         self.dump_backoff = 0.0
         self.dump_retry_at = 0.0
         self.poll_backoff = 0.0
         self.poll_at = 0.0
 
     def claim(self, upto: int) -> tuple[int, ...]:
-        if self.base is None or time.monotonic() < self.dump_retry_at:
+        if self.base is None:
             return ()
-        gens = tuple(
-            g
-            for g in range(self.base + 1, upto + 1)
-            if g not in self.done and g not in self.pending
-        )
-        self.pending.update(gens)
-        return gens
+        top = max(self.high if self.high is not None else self.base, self.base)
+        gens = set(range(top + 1, upto + 1))
+        if self.failed and time.monotonic() >= self.dump_retry_at:
+            gens |= self.failed
+            self.failed = set()
+        gens -= self.done | self.pending
+        self.high = max(top, upto)
+        self.pending |= gens
+        return tuple(sorted(gens))
 
-    def finish(self, gens: Iterable[int], ok: bool):
-        self.pending.difference_update(gens)
-        if ok:
-            self.done.update(gens)
-            assert self.base is not None
-            while self.base + 1 in self.done:
-                self.base += 1
-                self.done.discard(self.base)
-        self.failed(ok)
+    def finish(self, gens: Iterable[int], dumped: bool, acked: bool = True):
+        gens = set(gens)
+        self.pending -= gens
+        if not dumped:
+            self.failed |= gens
+            self.backoff(False)
+            return
+        self.backoff(True)
+        self.failed -= gens
+        self.done |= gens
+        assert self.base is not None
+        while self.base + 1 in self.done:
+            self.base += 1
+            self.done.discard(self.base)
+        if not acked:
+            self.unacked |= gens
 
-    def failed(self, ok: bool):
-        """Back a failing dump off, doubling up to a minute."""
+    def backoff(self, ok: bool):
+        """Back retries of a failing dump off, doubling up to a minute."""
         if ok:
             self.dump_backoff = 0.0
             return
@@ -783,12 +804,14 @@ class _Poller:
     one), and the debug pipe. One per process.
 
     It follows the groups: each attaches its store and detaches at
-    shutdown; the store polled is the newest attached one, and the signal
-    state is kept per store, so a store switch, or a late answer from a
-    store no longer polled, never touches another store's. Store operations
-    run on a worker the monitor abandons on overrun, at most one abandoned
-    at a time per store, and an unanswering store is polled less and less
-    often."""
+    shutdown; the store polled is the newest attached one. The signal state
+    is kept per store (address) and incarnation: a generation below the
+    state's base means the server was restarted, and starts a new state. A
+    store's worker lives as long as its state, and an answer is only ever
+    applied to the state it was asked for. Store operations run on a worker
+    the monitor abandons on overrun, at most one abandoned at a time; an
+    unanswering store is polled less often, up to a quarter of the dump
+    wait."""
 
     def __init__(self):
         self.lock = threading.RLock()
@@ -804,23 +827,26 @@ class _Poller:
         registered is the default group, whose ranks are the global ones."""
         base = unprefixed(store)
         key = store_key(base)
+        # Generations of an earlier job on this store are not ours: the
+        # baseline is read before the store is watched, published with it
+        # (the first poll takes it when this read fails).
+        read: tuple[int, bool] | None = None
+        if dump_on_timeout():
+            try:
+                seen = base.check([DUMP_KEY])
+                read = (current_generation(base), seen)
+            except Exception:
+                read = None
         with self.lock:
-            known = key in self.states
-        state = None
-        if not known:
-            # Generations of an earlier job on this store are not ours: the
-            # baseline is read before the store is watched, published with
-            # it (the first poll takes it when this read fails).
-            state = _StoreState(None, False)
-            if dump_on_timeout():
-                try:
-                    seen = base.check([DUMP_KEY])
-                    state = _StoreState(current_generation(base), seen)
-                except Exception:
-                    pass
-        with self.lock:
-            if state is not None and key not in self.states:
-                self.states[key] = state
+            state = self.states.get(key)
+            # A state that went (its last group detached meanwhile), or one
+            # of a server since restarted at this address: a new one.
+            if state is None or (
+                read is not None and state.base is not None and read[0] < state.base
+            ):
+                self.states[key] = (
+                    _StoreState(*read) if read else _StoreState(None, False)
+                )
             self.groups[group] = (key, base, rank)
             self._pipe(rank)  # before the caller's first collective
 
@@ -864,55 +890,68 @@ class _Poller:
         self.states.clear()
 
     def run(self):
-        workers: dict[tuple[object, ...], StoreWorker] = {}
+        # one worker per store state, closed when the state goes
+        workers: dict[int, tuple[_StoreState, StoreWorker]] = {}
         while True:
             time.sleep(coord_check_s())
             with self.lock:
                 current = next(reversed(self.groups.values()), None)
                 pipe = self.pipe
-                live = {k for k, _, _ in self.groups.values()}
-            for key in [k for k in workers if k not in live]:
-                workers.pop(key).close()  # its groups are gone: hold no store
+                live = {id(st): st for st in self.states.values()}
+                state = self.states.get(current[0]) if current else None
+            for sid in [i for i, (st, _) in workers.items() if live.get(i) is not st]:
+                workers.pop(sid)[1].close()
             if current is None:
                 continue
-            key, store, rank = current
+            _, store, rank = current
             if pipe >= 0:
                 try:
                     if os.read(pipe, 4096):
                         dump_now(rank, "dump requested through the debug pipe", True)
                 except OSError:
                     pass  # nothing written (EAGAIN), or reopened meanwhile
-            if not dump_on_timeout():
+            if not dump_on_timeout() or state is None:
                 continue
-            worker = workers.get(key)
-            if worker is None:
-                worker = workers[key] = StoreWorker(
-                    store, quiet=True, name="mojo-pg-fr-store", max_abandoned=1
+            if id(state) not in workers:
+                workers[id(state)] = (
+                    state,
+                    StoreWorker(
+                        store, quiet=True, name="mojo-pg-fr-store", max_abandoned=1
+                    ),
                 )
-            self.poll(worker, key, rank)
+            self.poll(workers[id(state)][1], current[0], state, rank)
 
-    def poll(self, worker: StoreWorker, key: tuple[object, ...], rank: int):
-        state = self.state(key)
-        if state is None or time.monotonic() < state.poll_at:
-            return
+    def poll(
+        self,
+        worker: StoreWorker,
+        key: tuple[object, ...],
+        state: _StoreState,
+        rank: int,
+    ):
+        if worker.stuck or time.monotonic() < state.poll_at:
+            return  # an abandoned job still blocks: try again once it returns
         bound = coord_check_s() + 2
         # The key first: `signal_dump` takes the generation before it sets
         # the key, so a key seen here comes with its generation.
         seen = worker.run(lambda c: (c.check([DUMP_KEY]), current_generation(c)), bound)
         with self.lock:
             if self.states.get(key) is not state:
-                return  # detached meanwhile: the answer is moot
-            if seen is None:  # no answer: poll it less often
-                state.poll_backoff = min(
-                    max(2 * state.poll_backoff, coord_check_s()), _MAX_BACKOFF_S
-                )
-                state.poll_at = time.monotonic() + state.poll_backoff
+                return  # its groups went, or it was replaced: the answer is moot
+            if seen is None:
+                if not worker.stuck:  # an error, not an overrun: back off
+                    state.poll_backoff = min(
+                        max(2 * state.poll_backoff, coord_check_s()),
+                        _poll_backoff_cap(),
+                    )
+                    state.poll_at = time.monotonic() + state.poll_backoff
                 return
             state.poll_backoff = 0.0
             has_key, gen = seen
-            if state.base is None:  # no baseline at attach: this is it
-                state.base = state.first = gen
-                state.torch = "seen" if has_key else "unseen"
+            if state.base is None or gen < state.base:
+                # No baseline at attach, or a server restarted at this
+                # address (its counter is below what was served): a new
+                # state from this read, and a new worker with it.
+                self.states[key] = _StoreState(gen, has_key)
                 return
             if gen != state.first:
                 state.torch = "seen"  # the key is (also) ours: generations serve it
@@ -921,27 +960,31 @@ class _Poller:
                 not gens
                 and has_key
                 and state.torch == "unseen"
-                and time.monotonic() >= state.dump_retry_at
+                and (not state.torch_tried or time.monotonic() >= state.dump_retry_at)
             )
+            unacked = tuple(sorted(state.unacked))
+        if unacked and worker.run(lambda c: ack_dump(c, rank, unacked) or True, bound):
+            with self.lock:
+                state.unacked -= set(unacked)
         if gens:
             who = worker.run(signaller, bound)
             why = f"rank {who if who is not None else -1} signalled a dump"
-            ok = dump_now(rank, why, include_stack_traces())
-            if ok:
-                ok = (
-                    worker.run(lambda c: ack_dump(c, rank, gens) or True, bound) is True
-                )
+            dumped = dump_now(rank, why, include_stack_traces())
+            acked = dumped and (
+                worker.run(lambda c: ack_dump(c, rank, gens) or True, bound) is True
+            )
             with self.lock:
-                state.finish(gens, ok)
+                state.finish(gens, dumped, acked)
         elif torch_signal:
             # ProcessGroupNCCL's broadcastDumpSignal: no generation, no ack.
-            ok = dump_now(
+            dumped = dump_now(
                 rank, "a NCCL process group signalled a dump", include_stack_traces()
             )
             with self.lock:
-                if ok:
+                state.torch_tried = True
+                if dumped:
                     state.torch = "seen"
-                state.failed(ok)
+                state.backoff(dumped)
 
 
 _POLLER: list[_Poller] = []
@@ -974,19 +1017,18 @@ def claim(store: Store, upto: int) -> tuple[int, ...]:
     if not _POLLER:
         return (upto,)
     poller = _POLLER[0]
-    key = store_key(store)
     with poller.lock:
-        state = poller.states.get(key)
+        state = poller.states.get(store_key(store))
         return state.claim(upto) if state is not None else (upto,)
 
 
-def finish(store: Store, gens: Iterable[int], ok: bool):
+def finish(store: Store, gens: Iterable[int], dumped: bool, acked: bool):
     if _POLLER:
         poller = _POLLER[0]
         with poller.lock:
             state = poller.states.get(store_key(store))
             if state is not None:
-                state.finish(gens, ok)
+                state.finish(gens, dumped, acked)
 
 
 def _after_fork_in_child():

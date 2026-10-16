@@ -550,7 +550,7 @@ def _fr_incident(
             )
             is True
         )
-    flight_recorder.finish(store, gens, acked)
+    flight_recorder.finish(store, gens, dumped, acked)
     rec = flight_recorder.recorder()
     frames = rec.stack(int(fields.get("fr", "0"))) if rec is not None else []
     if frames:
