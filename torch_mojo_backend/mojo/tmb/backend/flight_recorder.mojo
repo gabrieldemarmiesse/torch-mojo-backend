@@ -18,9 +18,13 @@ entry it is for, whatever the ring did meanwhile.
 The Python side describes the torch-level operation in flight: every
 pg.mojo entry takes a tag word, passed down to the entries it causes -- a
 record id, which the dump joins with its Python description, and the
-coalescing structure (member, first, end, point-to-point). A group's entry
-is recorded at its process group's group_end, with that call's tag, even
-when the commit it completes with comes later (an enclosing group).
+coalescing structure (member, first, end, point-to-point).
+
+Calls inside an NCCL group are submitted only by the thread's outermost
+group_end, but recorded when their torch-level operation ends (its own
+group_end, or the next operation folded on that communicator), each with
+its own tag: deferred (`FL_FOLDED`). The submitting commit links them to
+the one entry it stamps (`F_LINK`); one never submitted stays unlinked.
 """
 from std.atomic import Atomic, Ordering
 from std.ffi import _get_global_or_null, external_call
@@ -41,6 +45,7 @@ comptime FL_P2P = 1
 comptime FL_MEMBER = 2
 comptime FL_END = 4
 comptime FL_UNTRACKED = 8  # the watchdog does not track it: no stamp comes
+comptime FL_FOLDED = 16  # deferred to its NCCL group's commit (`F_LINK`)
 
 # Header words.
 comptime H_SIZE = 0
@@ -65,7 +70,10 @@ comptime F_THREAD = 13  # pthread_self
 comptime F_TAG = 14
 comptime F_COMM = 15  # the communicator's tracker (watchdog.mojo), 0 if none
 comptime F_DONE = 16  # CLOCK_MONOTONIC ns of completion, 0 while pending
-comptime F_WORDS = 17
+# A folded entry's commit: the entry it completes with (itself when it is
+# the one stamped); 0 until its group is submitted.
+comptime F_LINK = 17
+comptime F_WORDS = 18
 
 # Per process group (`fr_pg`), producer-only.
 comptime P_RING = 0
@@ -188,6 +196,7 @@ def _record(
     untracked: Bool,
     comm: Int,
     tag_word: Int,
+    deferred: Bool = False,
 ) -> Int:
     """Seq ids as ProcessGroupNCCL counts them: `collective_seq_id` once per
     collective or coalescing block, `p2p_seq_id` once per point-to-point op
@@ -203,6 +212,8 @@ def _record(
     var flags = FL_P2P if p2p else 0
     if untracked:
         flags |= FL_UNTRACKED
+    if deferred:
+        flags |= FL_FOLDED
     if tag & TAG_MEMBER:
         flags |= FL_MEMBER
         if tag & TAG_FIRST:
@@ -241,6 +252,7 @@ def _record(
     _st(s, F_TAG, tag & TAG_MASK)
     _st(s, F_COMM, comm)
     _st(s, F_DONE, 0)
+    _st(s, F_LINK, 0)
     _st(s, F_VER, v + 2)
     _st(ring, H_NEXT, rid + 1)
     return rid + 1
@@ -263,6 +275,39 @@ def fr_commit(
     if fp == 0:
         return 0
     return _record(fp, op, nops, count, dtype, root, p2p_op, False, comm, tag)
+
+
+def fr_deferred(
+    fp: Int,
+    op: Int,
+    nops: Int,
+    count: Int,
+    dtype: Int,
+    root: Int,
+    p2p_op: Bool,
+    comm: Int,
+    tag: Int,
+) -> Int:
+    """A torch-level operation's calls folded into an NCCL group not yet
+    submitted (`FL_FOLDED`); `fr_link` ties it to its commit. Under the
+    backend mutex."""
+    if fp == 0:
+        return 0
+    return _record(
+        fp, op, nops, count, dtype, root, p2p_op, False, comm, tag, True
+    )
+
+
+def fr_link(fp: Int, rid1: Int, link: Int):
+    """Folded entry `rid1` was submitted by the commit that stamps `link`
+    (itself, or the group's last folded entry). Under the backend mutex."""
+    if fp == 0 or rid1 == 0:
+        return
+    var s = _slot(_ring_of(fp), rid1 - 1)
+    var v = _lock(s)
+    if _ld(s, F_ID) == rid1:
+        _st(s, F_LINK, link)
+    _st(s, F_VER, v + 2)
 
 
 def fr_untracked(fp: Int, rid1: Int):
@@ -422,4 +467,21 @@ def fr_selftest() -> Int:
     ring.unsafe_free()
     if n != 4 or first != plain - 3:
         return 12
-    return 0
+    var lone = fr_pg(Int(_new_ring(4)), 9)
+    var f1 = fr_deferred(lone, 2, 1, 6, 7, 0, False, 13, 21)
+    var f2 = fr_deferred(lone, 1, 1, 6, 7, -1, False, 13, 22)
+    fr_link(lone, f1, f2)
+    fr_link(lone, f2, f2)
+    var lring = _ring_of(lone)
+    var s1 = _slot(lring, f1 - 1)
+    var s2 = _slot(lring, f2 - 1)
+    var ok = (
+        _ld(s1, F_FLAGS) == FL_FOLDED
+        and _ld(s1, F_LINK) == f2
+        and _ld(s2, F_LINK) == f2
+        and _ld(s1, F_TAG) == 21
+        and _ld(s2, F_CSEQ) == 2
+    )
+    lring.unsafe_free()
+    _pg(lone).unsafe_free()
+    return 0 if ok else 13

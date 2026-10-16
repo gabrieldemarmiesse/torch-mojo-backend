@@ -527,14 +527,21 @@ communicators and does the actual library calls.
     - *Tag words.* Python cannot learn which ring entry a call made, so
       every pg.mojo collective entry (and `group_end`) takes a tag word and
       passes it down to the entries it causes (`PG.track`, `fr_member`,
-      `watch_commit`). A group's calls are recorded at their process
-      group's own `group_end` (`watch_fr_mark`), with that call's tag, even
-      when the NCCL group they were folded into commits later (an
-      enclosing group of another process group, on the same thread): the
-      commit links the latest of them and the earlier ones complete with
-      it (flagged untracked). Reading a group-wide "latest tag" at the
-      enclosing commit took whatever that group issued in between -- a
-      closed coalescing block lost its end. `_fr_op` builds the tag per
+      `watch_commit`). Inside an NCCL group nothing is submitted before the
+      thread's outermost `group_end`, so the flight recorder keeps, per
+      (thread's group level, communicator), the calls of the torch-level
+      operation in progress (`FrFold` in watchdog.mojo): when it ends --
+      its process group's own `group_end` (`group_fr_mark`), or the next
+      operation folded on that communicator -- its entry is made with its
+      own tag, deferred (`FL_FOLDED`). The commit that submits the group
+      links them to the one entry it stamps (`F_LINK`; `fr_link`); the
+      dump completes a folded entry with its link and never otherwise, so
+      a group not submitted (a failed `group_end`, or one still open while
+      another thread's later collective completes) stays scheduled. A
+      group-wide "latest tag" read at the enclosing commit took whatever
+      that group issued in between (a closed coalescing block lost its
+      end), and order-based inference completed blocks not yet submitted.
+      `_fr_op` builds the tag per
       call -- a record id plus member/first/end/p2p bits -- and keeps it in
       a `threading.local` the call sites read. Earlier designs (a
       process-wide header word, then hashed or owned per-thread header
@@ -579,8 +586,14 @@ communicators and does the actual library calls.
       `signal_dump`'s order, so a key it sees comes with its generation),
       and the debug pipe, every `TORCH_NCCL_COORD_CHECK_MILSEC`.
     - *Signal state* is per store (TCPStore host/port, FileStore path) and
-      incarnation: a generation read below the state's base means a server
-      restarted at that address, and starts a new state. A generation is
+      incarnation: `mojo_fr/incarnation` holds a nonce the server's first
+      client sets (`compare_set`), read at attach and every poll; a
+      different nonce means a server restarted at that address, and a new
+      state that serves its generations from the first (inferring a
+      restart from the generation going down missed one already past the
+      old base, and a delayed read faked one). Claims hand back the state
+      they were made on (`Claim`), and `finish` changes that state only. A
+      generation is
       done, pending (a dump in progress), failed or to serve. A generation
       never seen before is dumped at once; only retries of failed ones
       back off (doubling up to a minute) -- a backoff that gated new
@@ -600,7 +613,8 @@ communicators and does the actual library calls.
       only to the state it was asked for. While its one abandoned job is
       still blocked the poll is skipped and retried as soon as it returns;
       a store that answers with errors is polled less often, never more
-      than a quarter of the dump wait apart. The signaller is read with
+      than a quarter of the dump wait apart (even when that is below the
+      poll interval). The signaller is read with
       `check` before `get`.
     - *Fork.* The native backend refuses device use in a forked child, so a
       child never records; the hook only keeps one that touches the
@@ -618,17 +632,17 @@ communicators and does the actual library calls.
       name belongs to the newest group of that name (re-created after a
       destroy); an older one's entries are left out.
     - *Host cost* (2 x H100, the watchdog's overhead.py legs with
-      TORCH_FR_BUFFER_SIZE=0 vs 2000, ABBA, medians of six legs; job
-      322681, after the round-4 review fixes): the native entry costs
-      about 0.1 us (NCCL 7.39 -> 7.46 us, mojoccl 3.91 -> 4.05 us: the tag
-      argument, a slot lock, about 17 stores); `dist.all_reduce` pays
-      +1.8-2.3 us (NCCL 23.4 -> 25.7, mojoccl 19.2 -> 21.0; earlier
-      revisions on other nodes measured +2.2-4.1). `Recorder.begin` alone
-      is 1.5 us on the login node, 0.66 us of it without
-      `gather_traceback` (torch records a Python stack per collective
-      too). A dict keyed by tag cost 5.9 us per record (popping its oldest
-      key scans the dummies left at the front); the records are a list
-      indexed by tag.
+      TORCH_FR_BUFFER_SIZE=0 vs 2000, ABBA, medians of six legs): the
+      native entry costs 0.1 us or less (job 322681: NCCL 7.39 -> 7.46 us,
+      mojoccl 3.91 -> 4.05 us; job 322848, another node: 8.91 -> 8.99,
+      4.54 -> 4.56); `dist.all_reduce` pays +1.8-2.3 us on one node (job
+      322681: NCCL 23.4 -> 25.7, mojoccl 19.2 -> 21.0) and +3.0-4.7 us on
+      another (job 322848: 28.9 -> 31.9, 21.6 -> 26.3), the per-call
+      Python path unchanged between them. `Recorder.begin` alone is 1.5 us
+      on the login node, 0.66 us of it without `gather_traceback` (torch
+      records a Python stack per collective too). A dict keyed by tag cost
+      5.9 us per record (popping its oldest key scans the dummies left at
+      the front); the records are a list indexed by tag.
     - *fr_trace quirks* (2.11 and 2.14.1 alike, on NCCL's dumps too): it
       logs "does not have a coalesced end" for every `nccl:coalesced` (it
       checks `endswith("_coalesced")`); it pairs a coalescing block's p2p

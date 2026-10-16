@@ -17,7 +17,7 @@ holds the backend mutex over its whole body itself (`with Locked():`).
 Every entry that enqueues collective work calls `PG.track` after it, which
 is what the collective watchdog (watchdog.mojo) watches; a new one must too.
 Each takes the flight recorder's tag word of the Python call (`tag`, 0 if
-none) and hands it to `track` (`group_end` to `watch_fr_mark`): the entries
+none) and hands it to `track` (`group_end` to `group_fr_mark`): the entries
 it causes record it.
 """
 from std.collections import Dict
@@ -61,6 +61,8 @@ from tmb.backend.watchdog import (
     call_fp,
     group_enter,
     group_exit,
+    group_fr_fold,
+    group_fr_mark,
     group_note,
     group_open,
     watch_add,
@@ -77,7 +79,6 @@ from tmb.backend.watchdog import (
     watch_group_add,
     watch_next_cpos,
     watch_process_exiting,
-    watch_fr_mark,
     watch_set_fr,
 )
 
@@ -274,6 +275,7 @@ struct PG(Movable):
                 c.tracker,
                 tag,
             )
+            group_fr_fold(self.f_group_start, self.watch, c.tracker, e, tag)
             watch_group_add(c.tracker, e^)
             group_note(self.f_group_start, self.watch, c.tracker, c.raw)
         else:
@@ -728,8 +730,10 @@ def tmb_pg_group_end(p: Int, tag: Int64) abi("C") -> Int32:
         try:
             var pg = _pg(p)
             pg[].open_or_raise()
-            for c in pg[].comms.values():  # its calls since its last one
-                watch_fr_mark(pg[].watch, c.tracker, Int(tag))
+            for c in pg[].comms.values():  # its operation (`tag`) ends
+                group_fr_mark(
+                    pg[].f_group_start, pg[].watch, c.tracker, Int(tag)
+                )
             var rc: Int32
             with InCall(pg[].watch, OP_GROUP_END, -1):
                 rc = call_fn[GroupFn](pg[].f_group_end)()

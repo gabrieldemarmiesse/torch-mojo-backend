@@ -58,7 +58,7 @@ ACK_KEY = "mojo_fr/dumped"  # ours: <generation>/<global rank>
 
 # tmb/backend/flight_recorder.mojo: the words of a snapshot entry (F_*), its
 # flags (FL_*) and the tag word's bits (TAG_*).
-F_WORDS = 17
+F_WORDS = 18
 F_ID = 1
 F_PG = 2
 F_CSEQ = 3
@@ -74,7 +74,8 @@ F_THREAD = 13
 F_TAG = 14
 F_COMM = 15
 F_DONE = 16
-FL_P2P, FL_MEMBER, FL_END, FL_UNTRACKED = 1, 2, 4, 8
+F_LINK = 17
+FL_P2P, FL_MEMBER, FL_END, FL_UNTRACKED, FL_FOLDED = 1, 2, 4, 8, 16
 TAG_MASK = (1 << 40) - 1
 TAG_MEMBER, TAG_FIRST, TAG_END, TAG_P2P = 1 << 40, 1 << 41, 1 << 42, 1 << 43
 
@@ -270,6 +271,7 @@ class _Entry:
     tag: int
     comm: int
     done_ns: int | None
+    link: int  # FL_FOLDED: record id + 1 of the entry it completes with
 
 
 class Recorder:
@@ -390,6 +392,7 @@ class Recorder:
                     w[F_TAG],
                     w[F_COMM],
                     w[F_DONE] or None,
+                    w[F_LINK],
                 )
             )
         return out
@@ -440,8 +443,11 @@ class Recorder:
         # A collective the watchdog could not track (its queue full, its
         # event failed) has no stamp; a later collective on the same
         # communicator completing means it did (its comm stream runs in
-        # order). A coalescing block's operations, like ProcessGroupNCCL's,
-        # have none.
+        # order) -- unless it was folded into an NCCL group, whose
+        # submission comes after its record. A folded entry completes with
+        # the entry its group's commit stamped (`link`), and never if that
+        # group was not submitted. A coalescing block's operations, like
+        # ProcessGroupNCCL's, have no completion.
         done: list[int | None] = [e.done_ns for e in entries]
         later: dict[tuple[int, int], int] = {}
         for i in range(len(entries) - 1, -1, -1):
@@ -449,9 +455,15 @@ class Recorder:
             if e.flags & FL_MEMBER or not e.comm:
                 continue
             if e.flags & FL_UNTRACKED:
-                done[i] = later.get((e.pg, e.comm))
+                if not e.flags & FL_FOLDED:
+                    done[i] = later.get((e.pg, e.comm))
             elif e.done_ns is not None:
                 later[(e.pg, e.comm)] = e.done_ns
+        index = {e.rid + 1: i for i, e in enumerate(entries)}
+        for i, e in enumerate(entries):
+            if e.flags & FL_FOLDED and e.link != e.rid + 1:
+                target = index.get(e.link) if e.link else None
+                done[i] = done[target] if target is not None else None
         stacks: dict[int, list[dict[str, Any]]] = {}
         if include_collectives and include_stack_traces:
             tags = list(records)
@@ -723,12 +735,19 @@ def wait_for_dumps(
 
 
 _MAX_BACKOFF_S = 60.0
+INCARNATION_KEY = "mojo_fr/incarnation"  # ours: which store server this is
 
 
 def _poll_backoff_cap() -> float:
     """Polls of an unanswering store back off, but never past a quarter of
     the dump wait: the firing rank waits that long for this rank's dump."""
-    return max(min(_MAX_BACKOFF_S, dump_wait_s() / 4), coord_check_s())
+    return min(_MAX_BACKOFF_S, dump_wait_s() / 4)
+
+
+def incarnation(client: Store) -> str:
+    """The store server's incarnation: a nonce its first client sets (a
+    restarted server has none, so its first client sets a new one)."""
+    return bytes(client.compare_set(INCARNATION_KEY, "", uuid.uuid4().hex)).decode()
 
 
 class _StoreState:
@@ -737,9 +756,11 @@ class _StoreState:
     (dumped in vain: retried after a backoff) or to serve. A generation not
     seen before is served at once, whatever the backoff of failed ones. A
     dump written whose acknowledgement did not get through is acknowledged
-    again at the next poll, without a new dump."""
+    again at the next poll, without a new dump. Claims hand the state back
+    with them, so a late finish only ever touches the state it claimed."""
 
-    def __init__(self, base: int | None, torch_seen: bool):
+    def __init__(self, nonce: str | None, base: int | None, torch_seen: bool):
+        self.nonce = nonce  # the incarnation, None until read
         self.base = base  # every generation <= base is done; None: unread
         self.first = base  # the store's generation when first watched
         self.high = base  # the highest generation ever claimed
@@ -771,6 +792,8 @@ class _StoreState:
 
     def finish(self, gens: Iterable[int], dumped: bool, acked: bool = True):
         gens = set(gens)
+        if not gens:
+            return
         self.pending -= gens
         if not dumped:
             self.failed |= gens
@@ -779,8 +802,7 @@ class _StoreState:
         self.backoff(True)
         self.failed -= gens
         self.done |= gens
-        assert self.base is not None
-        while self.base + 1 in self.done:
+        while self.base is not None and self.base + 1 in self.done:
             self.base += 1
             self.done.discard(self.base)
         if not acked:
@@ -805,13 +827,13 @@ class _Poller:
 
     It follows the groups: each attaches its store and detaches at
     shutdown; the store polled is the newest attached one. The signal state
-    is kept per store (address) and incarnation: a generation below the
-    state's base means the server was restarted, and starts a new state. A
-    store's worker lives as long as its state, and an answer is only ever
-    applied to the state it was asked for. Store operations run on a worker
-    the monitor abandons on overrun, at most one abandoned at a time; an
-    unanswering store is polled less often, up to a quarter of the dump
-    wait."""
+    is kept per store address and incarnation (`incarnation`): a server
+    restarted at that address gets a new nonce, hence a new state, which
+    serves its generations from the first. A store's worker lives as long
+    as its state, and an answer is only ever applied to the state it was
+    asked for. Store operations run on a worker the monitor abandons on
+    overrun, at most one abandoned at a time; an unanswering store is
+    polled less often, at most a quarter of the dump wait apart."""
 
     def __init__(self):
         self.lock = threading.RLock()
@@ -830,22 +852,23 @@ class _Poller:
         # Generations of an earlier job on this store are not ours: the
         # baseline is read before the store is watched, published with it
         # (the first poll takes it when this read fails).
-        read: tuple[int, bool] | None = None
+        read: tuple[str, int, bool] | None = None
         if dump_on_timeout():
             try:
-                seen = base.check([DUMP_KEY])
-                read = (current_generation(base), seen)
+                read = (
+                    incarnation(base),
+                    current_generation(base),
+                    base.check([DUMP_KEY]),
+                )
             except Exception:
                 read = None
         with self.lock:
             state = self.states.get(key)
             # A state that went (its last group detached meanwhile), or one
-            # of a server since restarted at this address: a new one.
-            if state is None or (
-                read is not None and state.base is not None and read[0] < state.base
-            ):
+            # of another incarnation of the server at this address.
+            if state is None or (read is not None and state.nonce != read[0]):
                 self.states[key] = (
-                    _StoreState(*read) if read else _StoreState(None, False)
+                    _StoreState(*read) if read else _StoreState(None, None, False)
                 )
             self.groups[group] = (key, base, rank)
             self._pipe(rank)  # before the caller's first collective
@@ -903,7 +926,7 @@ class _Poller:
                 workers.pop(sid)[1].close()
             if current is None:
                 continue
-            _, store, rank = current
+            key, store, rank = current
             if pipe >= 0:
                 try:
                     if os.read(pipe, 4096):
@@ -919,7 +942,7 @@ class _Poller:
                         store, quiet=True, name="mojo-pg-fr-store", max_abandoned=1
                     ),
                 )
-            self.poll(workers[id(state)][1], current[0], state, rank)
+            self.poll(workers[id(state)][1], key, state, rank)
 
     def poll(
         self,
@@ -933,7 +956,10 @@ class _Poller:
         bound = coord_check_s() + 2
         # The key first: `signal_dump` takes the generation before it sets
         # the key, so a key seen here comes with its generation.
-        seen = worker.run(lambda c: (c.check([DUMP_KEY]), current_generation(c)), bound)
+        seen = worker.run(
+            lambda c: (incarnation(c), c.check([DUMP_KEY]), current_generation(c)),
+            bound,
+        )
         with self.lock:
             if self.states.get(key) is not state:
                 return  # its groups went, or it was replaced: the answer is moot
@@ -946,13 +972,15 @@ class _Poller:
                     state.poll_at = time.monotonic() + state.poll_backoff
                 return
             state.poll_backoff = 0.0
-            has_key, gen = seen
-            if state.base is None or gen < state.base:
-                # No baseline at attach, or a server restarted at this
-                # address (its counter is below what was served): a new
-                # state from this read, and a new worker with it.
-                self.states[key] = _StoreState(gen, has_key)
+            nonce, has_key, gen = seen
+            if state.nonce is None:  # no baseline at attach: this is it
+                self.states[key] = _StoreState(nonce, gen, has_key)
                 return
+            if nonce != state.nonce:
+                # The server restarted: everything it signalled is this
+                # job's, from its first generation (a new state, and a new
+                # worker with it; this poll's answer serves it).
+                state = self.states[key] = _StoreState(nonce, 0, False)
             if gen != state.first:
                 state.torch = "seen"  # the key is (also) ours: generations serve it
             gens = state.claim(gen)
@@ -1011,24 +1039,31 @@ def detach_poller(group: int):
         _POLLER[0].detach(group)
 
 
-def claim(store: Store, upto: int) -> tuple[int, ...]:
+class Claim(NamedTuple):
+    """Generations a caller now serves, with the state they belong to."""
+
+    state: _StoreState | None
+    gens: tuple[int, ...]
+
+
+def claim(store: Store, upto: int) -> Claim:
     """This process's claim on the generations up to `upto` of `store` (see
     `_StoreState`); without a monitor every generation is new."""
     if not _POLLER:
-        return (upto,)
+        return Claim(None, (upto,))
     poller = _POLLER[0]
     with poller.lock:
         state = poller.states.get(store_key(store))
-        return state.claim(upto) if state is not None else (upto,)
+        if state is None:
+            return Claim(None, (upto,))
+        return Claim(state, state.claim(upto))
 
 
-def finish(store: Store, gens: Iterable[int], dumped: bool, acked: bool):
-    if _POLLER:
-        poller = _POLLER[0]
-        with poller.lock:
-            state = poller.states.get(store_key(store))
-            if state is not None:
-                state.finish(gens, dumped, acked)
+def finish(claimed: Claim, dumped: bool, acked: bool):
+    """The outcome of `claimed`, on the state it was claimed from."""
+    if claimed.state is not None and _POLLER:
+        with _POLLER[0].lock:
+            claimed.state.finish(claimed.gens, dumped, acked)
 
 
 def _after_fork_in_child():

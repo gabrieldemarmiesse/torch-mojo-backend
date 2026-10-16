@@ -536,13 +536,14 @@ def _fr_incident(
     also covers the generations this process had yet to serve."""
     grank = flight_recorder.global_rank(rank)
     gen = worker.run(lambda client: flight_recorder.signal_dump(client, grank), 2.0)
-    gens = flight_recorder.claim(store, gen) if gen else ()
+    claimed = flight_recorder.claim(store, gen) if gen else None
     dumped = flight_recorder.dump_now(
         grank, "collective timeout", flight_recorder.include_stack_traces()
     )
     acked = False
     if gen and dumped:  # an acknowledgement means a file is there
-        mine = sorted({*gens, gen})
+        assert claimed is not None
+        mine = sorted({*claimed.gens, gen})
         acked = (
             worker.run(
                 lambda client: flight_recorder.ack_dump(client, grank, mine) or True,
@@ -550,7 +551,8 @@ def _fr_incident(
             )
             is True
         )
-    flight_recorder.finish(store, gens, dumped, acked)
+    if claimed is not None:
+        flight_recorder.finish(claimed, dumped, acked)
     rec = flight_recorder.recorder()
     frames = rec.stack(int(fields.get("fr", "0"))) if rec is not None else []
     if frames:
