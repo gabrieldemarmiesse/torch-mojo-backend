@@ -8,16 +8,23 @@ public API only; `CallChecker` (or `native.op_count` for the ops with no
 """
 
 import contextlib
+import functools
 import itertools
 import json
 import math
 import pathlib
 import sys
+from typing import TypeAlias
 
 import pytest
 import torch
 
-from tests.native.conftest import flush_subnormals_on_metal, is_metal, skip_if_metal
+from tests.native.conftest import (
+    flush_subnormals_on_metal,
+    is_metal,
+    require_stock_cuda,
+    skip_if_metal,
+)
 from torch_mojo_backend import aten_functions, get_accelerators, native
 
 
@@ -238,18 +245,38 @@ def test_bool_add_alpha_checks(mojo_gpu):
 
 
 # add / sub / rsub with an alpha into an output of another dtype, against
-# stock CUDA (torch 2.11, H100; the JSON next to this file): CUDA's
-# alpha_check reads the iterator's OUTPUT dtype (the out=, or self in
+# stock CUDA (torch 2.11, H100; binary_alpha_cuda.json next to this file):
+# CUDA's alpha_check reads the iterator's OUTPUT dtype (the out=, or self in
 # place), after compute_types' canCast of the common dtype into it, and the
 # kernel then converts alpha into the computation dtype (a float truncated,
 # a bool from nonzero, -alpha for sub, range-checked). CPU torch shares the
 # meta, but a same-dtype out cannot show the difference.
+#
+# The JSON maps a case id, "op/variant/input-dtype[->out-dtype]/alpha=<repr>",
+# to its outcome: {"dtype", "values"} or {"error", "message"}, one case per
+# line in generation order. To rewrite it, on a machine with stock CUDA
+# torch:
+#   uv run python -c "from tests.native.test_binary import write_alpha_cuda_json; write_alpha_cuda_json()"
+_ALPHA_JSON = pathlib.Path(__file__).parent / "binary_alpha_cuda.json"
+# one case's outcome: {"dtype", "values"} or {"error", "message"}
+_Outcome: TypeAlias = dict[
+    str, str | list[bool] | list[int] | list[float] | list[list[float]]
+]
+_ALPHA_OPS = ("add", "sub", "rsub")
+_ALPHA_VARIANTS = ("fn", "inplace", "out")
 _ALPHA_IN = [torch.int8, torch.int16, torch.uint8, torch.int32, torch.int64, torch.bool]
-_ALPHA_OUT = [torch.float32, torch.int64, torch.int8, torch.bool]
+# out= dtypes, and the in-place selves: every category the output can be
+# (a complex one goes through the complex route, a half one is computed in
+# float32 but checked against itself)
+_ALPHA_OUT = [
+    torch.float32, torch.int64, torch.int8, torch.bool, torch.complex64,
+    torch.float16, torch.bfloat16,
+]  # fmt: skip
+_ALPHA_SELF = [
+    torch.float32, torch.int64, torch.int8, torch.bool, torch.complex64,
+    torch.float16,
+]  # fmt: skip
 _ALPHA_VALUES = [1, 1.0, 2.5, True, False, -128, 128]
-_ALPHA_CUDA = json.loads(
-    (pathlib.Path(__file__).parent / "binary_alpha_cuda.json").read_text()
-)
 
 
 def _alpha_vals(dtype: torch.dtype, device: str) -> torch.Tensor:
@@ -260,27 +287,28 @@ def _alpha_vals(dtype: torch.dtype, device: str) -> torch.Tensor:
     return torch.tensor(values, device=device).to(dtype)
 
 
-def _alpha_res(fn) -> str:
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).removeprefix("torch.")
+
+
+def _alpha_outcome(fn) -> _Outcome:
     try:
         t = fn()
     except (RuntimeError, NotImplementedError) as error:
         message = str(error).split(" [aten::")[0].split("\n")[0]
-        return f"{type(error).__name__} {message}"
-    return f"OK {str(t.dtype)[6:]}{t.cpu().tolist()}"
+        return {"error": type(error).__name__, "message": message}
+    values = t.cpu().tolist()
+    if t.is_complex():
+        values = [[v.real, v.imag] for v in values]  # JSON has no complex
+    return {"dtype": _dtype_name(t.dtype), "values": values}
 
 
-def _alpha_out_lines(device: str):
-    for op, variant, idt, odt, alpha in itertools.product(
-        ("add", "sub", "rsub"),
-        ("fn", "inplace", "out"),
-        _ALPHA_IN,
-        _ALPHA_OUT,
-        _ALPHA_VALUES,
-    ):
-        if (variant == "fn" and odt != _ALPHA_OUT[0]) or (
-            variant == "inplace" and op == "rsub"
-        ):
-            continue  # a functional result has no out dtype; no rsub_
+def _alpha_cases(device: str, op: str, variant: str) -> dict[str, _Outcome]:
+    """The outcome of every (input dtype, out dtype, alpha) case of
+    `op` / `variant` on `device`, keyed by case id."""
+    cases = {}
+    outs = {"fn": _ALPHA_OUT[:1], "inplace": _ALPHA_SELF, "out": _ALPHA_OUT}[variant]
+    for idt, odt, alpha in itertools.product(_ALPHA_IN, outs, _ALPHA_VALUES):
         a = _alpha_vals(idt, device)
         b = torch.tensor([2, 5, 7], device=device).to(idt)
         fn = getattr(torch, op)
@@ -300,8 +328,43 @@ def _alpha_out_lines(device: str):
             def call(out_fn=out_fn, a=a, b=b, alpha=alpha, o=o):
                 return out_fn(a, b, alpha=alpha, out=o)
 
-        o_name = "" if variant == "fn" else f" {str(odt)[6:]}"
-        yield f"{op} {variant} {str(idt)[6:]}{o_name} a={alpha!r} {_alpha_res(call)}"
+        dtypes = _dtype_name(idt)
+        if variant != "fn":
+            dtypes += "->" + _dtype_name(odt)
+        cases[f"{op}/{variant}/{dtypes}/alpha={alpha!r}"] = _alpha_outcome(call)
+    return cases
+
+
+# (op, variant) pairs: a functional result has no out dtype; there is no rsub_
+_ALPHA_GROUPS = [
+    (op, variant)
+    for op in _ALPHA_OPS
+    for variant in _ALPHA_VARIANTS
+    if not (op == "rsub" and variant == "inplace")
+]
+
+
+def _all_alpha_cases(device: str) -> dict[str, _Outcome]:
+    cases = {}
+    for op, variant in _ALPHA_GROUPS:
+        cases.update(_alpha_cases(device, op, variant))
+    return cases
+
+
+def write_alpha_cuda_json():
+    """Rewrite binary_alpha_cuda.json from stock CUDA torch (see above)."""
+    assert torch.version.cuda is not None and torch.cuda.is_available(), (
+        "needs stock CUDA torch"
+    )
+    cases = _all_alpha_cases("cuda")
+    # one case per line, so a diff names the cases that changed
+    lines = [f" {json.dumps(k)}: {json.dumps(v)}" for k, v in cases.items()]
+    _ALPHA_JSON.write_text("{\n" + ",\n".join(lines) + "\n}\n")
+
+
+@functools.cache
+def _alpha_cuda() -> dict[str, _Outcome]:
+    return json.loads(_ALPHA_JSON.read_text())
 
 
 # The C++ type names in CUDA's messages are the host compiler's (Linux
@@ -314,27 +377,42 @@ _MACOS_TYPE_NAMES = [
 ]
 
 
-def _as_on_this_host(line: str) -> str:
-    if sys.platform == "darwin":
-        for linux, macos in _MACOS_TYPE_NAMES:
-            line = line.replace(linux, macos)
-    return line
+def _as_on_this_host(outcome: _Outcome) -> _Outcome:
+    if sys.platform != "darwin" or "message" not in outcome:
+        return outcome
+    message = outcome["message"]
+    for linux, macos in _MACOS_TYPE_NAMES:
+        message = message.replace(linux, macos)
+    return {**outcome, "message": message}
 
 
-def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(mojo_gpu):
-    got = list(_alpha_out_lines(mojo_gpu))
-    want = [_as_on_this_host(w) for w in _ALPHA_CUDA]
-    assert len(got) == len(want)
-    assert [g for g, w in zip(got, want) if g != w] == [], [
-        w for g, w in zip(got, want) if g != w
-    ]
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="regenerating needs stock CUDA torch"
+@pytest.mark.parametrize(
+    ("op", "variant"), _ALPHA_GROUPS, ids=[f"{o}/{v}" for o, v in _ALPHA_GROUPS]
 )
+def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(mojo_gpu, op, variant):
+    got = _alpha_cases(mojo_gpu, op, variant)
+    recorded = _alpha_cuda()
+    want = {
+        key: _as_on_this_host(recorded[key])
+        for key in recorded
+        if key.startswith(f"{op}/{variant}/")
+    }
+    assert got.keys() == want.keys()
+    mismatches = {
+        key: {"got": got[key], "want": want[key]}
+        for key in want
+        if got[key] != want[key]
+    }
+    assert mismatches == {}
+
+
+@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
 def test_add_sub_alpha_data_regenerates_on_stock_cuda():
-    assert list(_alpha_out_lines("cuda")) == _ALPHA_CUDA
+    require_stock_cuda()
+    got = _all_alpha_cases("cuda")
+    want = _alpha_cuda()
+    assert list(got) == list(want)
+    assert {k: v for k, v in got.items() if v != want[k]} == {}
 
 
 def test_inplace_add_rejects_partial_overlap(mojo_gpu):

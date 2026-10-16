@@ -1,4 +1,5 @@
 import contextlib
+import os
 
 import pytest
 import torch
@@ -77,6 +78,24 @@ def skip_if_metal(device: str, reason: str):
     """
     if is_metal(device):
         pytest.skip(reason)
+
+
+def require_stock_cuda():
+    """For a test that runs or regenerates data recorded on stock CUDA
+    torch: return when stock NVIDIA CUDA torch is importable here
+    (`torch.version.cuda` set; a ROCm wheel's cuda.is_available() does not
+    count, the data is CUDA's), else skip -- except on a CI runner with an
+    NVIDIA GPU (`CI` set, a mojo accelerator whose api is "cuda"), where a
+    skip would leave the recorded data unchecked, so it fails instead."""
+    if torch.cuda.is_available() and torch.version.cuda is not None:
+        return
+    nvidia = any(a.api == "cuda" for a in get_accelerators())
+    if os.environ.get("CI") and nvidia:
+        pytest.fail(
+            "stock CUDA torch expected on this runner: the recorded CUDA data"
+            " would go unchecked"
+        )
+    pytest.skip("needs stock CUDA torch")
 
 
 def skip_float64_on_metal(device: str, dtype: torch.dtype):
