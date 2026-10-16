@@ -79,6 +79,14 @@ def skip_if_metal(device: str, reason: str):
         pytest.skip(reason)
 
 
+def skip_float64_on_metal(device: str, dtype: torch.dtype):
+    """Skip a float64 case on an Apple GPU, which has no float64. `device`
+    is any device string (a `Conf.device` too): only a mojo device on Metal
+    skips."""
+    if dtype == torch.float64 and device.startswith("mojo:"):
+        skip_if_metal(device, "Apple GPUs have no float64")
+
+
 @contextlib.contextmanager
 def ran(*op_names: str):
     """Assert that at least one of `op_names` ran as a native boxed kernel.

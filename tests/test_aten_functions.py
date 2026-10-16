@@ -17,6 +17,7 @@ from torch.ops import aten  # ty: ignore[unresolved-import]
 
 from tests.conftest import Tolerance, matmul_tolerance, require_cuda_autograd
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
+from tests.native.conftest import skip_float64_on_metal
 from torch_mojo_backend import (
     aten_functions,
     custom_mojo_ops,
@@ -1639,6 +1640,7 @@ def test_aten_conv1d_dtypes(conf: Conf, call_checker: CallChecker, dtype: torch.
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_add_scalar(conf: Conf, dtype: torch.dtype):
     """Test _foreach_add.Scalar - adds scalar to each tensor in list"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1654,6 +1656,7 @@ def test_foreach_add_scalar(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_add_list(conf: Conf, dtype: torch.dtype):
     """Test _foreach_add.List - adds corresponding tensors with alpha scaling"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x1, y1, z1, x2, y2, z2):
         self_tensors = [x1, y1, z1]
@@ -1690,6 +1693,7 @@ def test_foreach_add_list_alpha(conf: Conf, alpha: float):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_add_scalarlist(conf: Conf, dtype: torch.dtype):
     """Test _foreach_add.ScalarList - adds corresponding scalar to each tensor"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1706,6 +1710,7 @@ def test_foreach_add_scalarlist(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_add_tensor(conf: Conf, dtype: torch.dtype):
     """Test _foreach_add.Tensor - broadcasts single 0-d tensor to all tensors in list"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z, other):
         tensors = [x, y, z]
@@ -1737,6 +1742,7 @@ def test_foreach_add_tensor_alpha(conf: Conf, alpha: float):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_sub_scalar(conf: Conf, dtype: torch.dtype):
     """Test _foreach_sub.Scalar - subtracts scalar from each tensor in list"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1752,6 +1758,7 @@ def test_foreach_sub_scalar(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_sub_list(conf: Conf, dtype: torch.dtype):
     """Test _foreach_sub.List - subtracts corresponding tensors with alpha scaling"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x1, y1, z1, x2, y2, z2):
         self_tensors = [x1, y1, z1]
@@ -1788,6 +1795,7 @@ def test_foreach_sub_list_alpha(conf: Conf, alpha: float):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_sub_scalarlist(conf: Conf, dtype: torch.dtype):
     """Test _foreach_sub.ScalarList - subtracts corresponding scalar from each tensor"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1804,6 +1812,7 @@ def test_foreach_sub_scalarlist(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_mul_scalar(conf: Conf, dtype: torch.dtype):
     """Test _foreach_mul.Scalar - multiplies each tensor in list by scalar"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1819,6 +1828,7 @@ def test_foreach_mul_scalar(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_mul_list(conf: Conf, dtype: torch.dtype):
     """Test _foreach_mul.List - multiplies corresponding tensors"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x1, y1, z1, x2, y2, z2):
         self_tensors = [x1, y1, z1]
@@ -1838,6 +1848,7 @@ def test_foreach_mul_list(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_mul_scalarlist(conf: Conf, dtype: torch.dtype):
     """Test _foreach_mul.ScalarList - multiplies each tensor by corresponding scalar"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1854,6 +1865,7 @@ def test_foreach_mul_scalarlist(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_mul_tensor(conf: Conf, dtype: torch.dtype):
     """Test _foreach_mul.Tensor - broadcasts single 0-d tensor to all tensors in list"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z, other):
         tensors = [x, y, z]
@@ -1870,6 +1882,7 @@ def test_foreach_mul_tensor(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_pow_scalar(conf: Conf, dtype: torch.dtype):
     """Test _foreach_pow.Scalar - raises each tensor in list to scalar power"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1885,6 +1898,7 @@ def test_foreach_pow_scalar(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_pow_list(conf: Conf, dtype: torch.dtype):
     """Test _foreach_pow.List - raises corresponding tensors to powers"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x1, y1, z1, x2, y2, z2):
         self_tensors = [x1, y1, z1]
@@ -1904,6 +1918,7 @@ def test_foreach_pow_list(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_pow_scalarlist(conf: Conf, dtype: torch.dtype):
     """Test _foreach_pow.ScalarList - raises each tensor to corresponding scalar power"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1935,6 +1950,7 @@ def test_foreach_pow_scalarandtensor(device: str, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_div_scalar(conf: Conf, dtype: torch.dtype):
     """Test _foreach_div.Scalar - divides each tensor in list by scalar"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1950,6 +1966,7 @@ def test_foreach_div_scalar(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_div_list(conf: Conf, dtype: torch.dtype):
     """Test _foreach_div.List - divides corresponding tensors"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x1, y1, z1, x2, y2, z2):
         self_tensors = [x1, y1, z1]
@@ -1969,6 +1986,7 @@ def test_foreach_div_list(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_div_scalarlist(conf: Conf, dtype: torch.dtype):
     """Test _foreach_div.ScalarList - divides each tensor by corresponding scalar"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -1985,6 +2003,7 @@ def test_foreach_div_scalarlist(conf: Conf, dtype: torch.dtype):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_div_tensor(conf: Conf, dtype: torch.dtype):
     """Test _foreach_div.Tensor - broadcasts single 0-d tensor to all tensors in list"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z, other):
         tensors = [x, y, z]
@@ -2015,6 +2034,7 @@ def test_foreach_sqrt(conf: Conf):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_foreach_neg(conf: Conf, dtype: torch.dtype):
     """Test _foreach_neg - computes negation of each tensor in list"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y, z):
         tensors = [x, y, z]
@@ -2475,11 +2495,15 @@ def test_aten_ceil_scalar_tensor(conf: Conf):
     "dtype", [torch.float32, torch.float64, torch.int32, torch.int64]
 )
 def test_aten_div_rounding_mode_tensor(
-    conf: Conf, call_checker: CallChecker, dtype: torch.dtype, rounding_mode: str
+    conf: Conf, request: pytest.FixtureRequest, dtype: torch.dtype, rounding_mode: str
 ):
     """aten::div.Tensor_mode: floor/trunc rounding, incl. the sign
     combinations where the two modes disagree (only when the true quotient
     is negative and inexact)."""
+    skip_float64_on_metal(conf.device, dtype)
+    # requested after the skip: a skipped test never registers, and the
+    # fixture's teardown would fail on that
+    call_checker = request.getfixturevalue("call_checker")
     call_checker.register(aten_functions.aten_div)
 
     def fn(x, y):
@@ -2877,6 +2901,7 @@ def test_aten_convolution_trains_end_to_end_compiled(device: str):
 @pytest.mark.parametrize("approximate", ["none", "tanh"])
 def test_aten_gelu_backward_basic(conf: Conf, dtype: torch.dtype, approximate: str):
     """Test aten.gelu_backward with different approximations"""
+    skip_float64_on_metal(conf.device, dtype)
     # Skip float16 on CPU as MAX doesn't support f16 on CPU
     if conf.device == "cpu" and dtype == torch.float16:
         pytest.skip("float16 not supported on CPU in MAX")
@@ -4433,6 +4458,7 @@ def test_aten_repeat_interleave_large_repeats(device: str):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.bfloat16])
 def test_aten_pow_tensor_tensor_basic(conf: Conf, dtype: torch.dtype):
     """Test pow.Tensor_Tensor basic functionality with floating point numbers"""
+    skip_float64_on_metal(conf.device, dtype)
     # Skip float16 on CPU as MAX doesn't support f16 on CPU
     if conf.device == "cpu" and dtype == torch.float16:
         pytest.skip("float16 not supported on CPU in MAX")
@@ -6691,6 +6717,7 @@ def test_aten_logical_and_numeric_tensors(conf: Conf):
 )
 def test_aten_logical_and_different_dtypes(conf: Conf, dtype: torch.dtype):
     """Test aten.logical_and with different numeric data types"""
+    skip_float64_on_metal(conf.device, dtype)
 
     def fn(x, y):
         return aten.logical_and(x, y)

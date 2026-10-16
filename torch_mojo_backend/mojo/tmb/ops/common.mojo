@@ -1572,6 +1572,10 @@ def real_fill_value(st: Int32, v: Value) raises -> Value:
       the 64 bits of C++'s host `static_cast<uint64_t>` (the fill kernels go
       through int64): exact below 2**64, and 0 for 2**64 itself, which
       c10::overflows lets through (it compares with double(UINT64_MAX)).
+    - Into int64, the double 2**63 (c10::overflows compares with
+      double(INT64_MAX), which is 2**63) becomes the int record INT64_MIN,
+      what x86's host `static_cast<int64_t>` gives on CUDA. Left a double, a
+      kernel or an AArch64 host would convert it saturating, to INT64_MAX.
     Anything else is returned unchanged."""
     if st == ST_BOOL or is_complex_stype(st):
         return v.copy()
@@ -1587,6 +1591,9 @@ def real_fill_value(st: Int32, v: Value) raises -> Value:
                     Scalar[DType.uint64](UInt64(d)).cast[DType.int64]()
                 )
             return Value(TAG_SCALAR_INT, 0, bits, 0)
+    if st == ST_INT64 and (r.tag == TAG_SCALAR_DOUBLE or r.tag == TAG_DOUBLE):
+        if v_complex(r)[0] == 9223372036854775808.0:
+            return Value(TAG_SCALAR_INT, 0, Int64.MIN, 0)
     return r^
 
 

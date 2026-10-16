@@ -1057,7 +1057,8 @@ def test_where_and_index_put_messages(mojo_gpu: str):
     ):
         torch.zeros(3, dtype=torch.complex64, device=mojo_gpu).index_put_(
             (torch.tensor([0], device=mojo_gpu),),
-            torch.ones(1, dtype=torch.complex128, device=mojo_gpu),
+            # a host copy: an Apple GPU holds complex128 but cannot fill it
+            torch.ones(1, dtype=torch.complex128).to(mojo_gpu),
             accumulate=True,
         )
 
@@ -1206,12 +1207,20 @@ def test_masked_fill_outs_take_a_complex_value_on_a_real_tensor(mojo_gpu: str):
         assert out.cpu().tolist() == [5.0, 5.0]
 
 
+def _through_float(v: float, dtype: torch.dtype) -> torch.Tensor:
+    """`v` as c10's Half / BFloat16 make it from a double: rounded to float,
+    then to `dtype`. Spelled out because CPU torch's own double -> float16
+    tensor cast rounds once on an AArch64 host (a hardware conversion), so
+    `tensor(v, dtype=float64).to(float16)` is not this chain there."""
+    return torch.tensor(v, dtype=torch.float64).float().to(dtype)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_half_fills_round_through_float(mojo_gpu: str, dtype: torch.dtype):
     # c10's Half / BFloat16 from double go through float: two roundings
     m = torch.ones(1, dtype=torch.bool, device=mojo_gpu)
     for v in (1 + 2**-11 + 2**-30, 1 + 2**-8 + 2**-30, -(1 + 2**-11 + 2**-30)):
-        want = torch.tensor(v, dtype=torch.float64).to(dtype)  # CPU torch: same chain
+        want = _through_float(v, dtype)
         for got in (
             torch.zeros(1, dtype=dtype, device=mojo_gpu).fill_(v),
             torch.zeros(1, dtype=dtype, device=mojo_gpu).fill_(complex(v, 0)),
@@ -1307,7 +1316,7 @@ def test_masked_fill_out_resizes_before_its_dtype_check(
 def test_real_masked_fill_rounds_half_through_float(
     mojo_gpu: str, dtype: torch.dtype, value: float
 ):
-    want = torch.tensor(value, dtype=torch.float64).to(dtype).item()
+    want = _through_float(value, dtype).item()
     m = torch.ones(3, dtype=torch.bool, device=mojo_gpu)
     got = torch.zeros(3, dtype=dtype, device=mojo_gpu).masked_fill_(m, value)
     assert got.cpu().tolist() == [want] * 3
@@ -1558,6 +1567,29 @@ def _outcome(fn):
         return ("raised", type(e))
 
 
+# What an out-of-range double -> int64 / uint64 `static_cast` (2**63 and
+# 2**64, which c10::overflows lets through) gives on an x86 host, as stock
+# CUDA's fills do there, and what an AArch64 host gives instead: its
+# conversion saturates.
+_X86_CAST = {torch.int64: (2**63 - 1, -(2**63)), torch.uint64: (2**64 - 1, 0)}
+_HOST_CAST_SATURATES = (
+    torch.tensor(2.0**63, dtype=torch.float64).to(torch.int64).item() == 2**63 - 1
+)
+
+
+def _as_on_x86(outcome):
+    """A CPU-oracle outcome with the AArch64 host's saturated conversions
+    replaced by x86's values, which the mojo device reproduces anywhere."""
+    if not _HOST_CAST_SATURATES or outcome[0] != "ok":
+        return outcome
+    t = outcome[1]
+    if t.dtype not in _X86_CAST:
+        return outcome
+    saturated, x86 = _X86_CAST[t.dtype]
+    values = [x86 if e == saturated else e for e in t.flatten().tolist()]
+    return ("ok", torch.tensor(values, dtype=t.dtype).reshape(t.shape))
+
+
 @pytest.mark.parametrize(
     "v", [1e19 + 0j, 2**63 + 0j, -1 + 0j, 300 + 0j, 2.5 + 0j, 2.0**64 + 0j, 2.0**64]
 )
@@ -1592,7 +1624,7 @@ def test_complex_scalar_into_a_real_dtype_matches_the_host(mojo_gpu: str, v, dty
     want_all = entries("cpu")
     for name, fn in entries(mojo_gpu).items():
         got = _outcome(fn)
-        want = _outcome(want_all[name])
+        want = _as_on_x86(_outcome(want_all[name]))
         assert got[0] == want[0], (name, got, want)
         if got[0] == "ok":
             assert torch.equal(got[1], want[1]), (name, got, want)

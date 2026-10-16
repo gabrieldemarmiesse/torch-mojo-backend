@@ -359,6 +359,12 @@ def _bool_unary_out(op: String, t: T, mut dst: T) raises:
 # aten::abs(Tensor self) -> Tensor
 def op_abs(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
+    if t.dtype == DType.bool:
+        # CUDA's abs takes bool, as the identity (AbsKernel.cu dispatches
+        # Bool; the CPU kernel refuses it).
+        var copy = own(_int_identity(t))
+        ret_owned(rets, 0, copy)
+        return
     var out = own(_direct_unary("AbsSpec", t))
     ret_owned(rets, 0, out)
 
@@ -367,7 +373,10 @@ def op_abs(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_abs_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _direct_unary_out("AbsSpec", t, dst)
+    if t.dtype == DType.bool:
+        _identity_into(t, dst)  # see op_abs
+    else:
+        _direct_unary_out("AbsSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 

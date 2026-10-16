@@ -1151,19 +1151,20 @@ def _b_scale(t: T, alpha: Float64, alpha_i: Optional[Int]) raises -> Held:
     """`t * alpha` as an owned temporary, in `t`'s own dtype (see
     `_b_alpha_as` for the rounding this implies). `alpha_i` is an integer
     alpha's exact value."""
+    if t.stype == ST_BOOL:
+        # (a bool scaled by an integer would promote to int64; add takes
+        # bools before this, a bool sub is refused)
+        unsupported("alpha != 1 with an operand of this dtype")
     var side = _b_tside(t)
     var a_side = _b_sside(
         Scal(alpha, alpha_i.value(), True, False) if alpha_i else Scal(
             alpha, Int(alpha), False, False
         )
     )
-    var scaled = _b_try_scalar("MulScalarSpec", side, a_side, False, None)
-    if not scaled.__bool__():
-        scaled = _b_try_int_scalar("MulScalarIntSpec", side, a_side, False)
-    if not scaled.__bool__():
-        unsupported("alpha != 1 with an operand of this dtype")
-        return _b_hold(t)
-    return Held(scaled.value().t.copy(), True)
+    # The mul cascade: the scalar specs where they apply, else MulSpec with
+    # alpha as a wrapped number (int8 / int16 / uint8 operands).
+    var scaled = _b_mul(side, a_side, None)
+    return Held(scaled.t.copy(), True)
 
 
 # ---------------------------------------------------------------------------
