@@ -62,12 +62,53 @@ the class level to hand back objects of its own.
 `native/csrc/shim_runtime.cpp` registers a real C++
 `PrivateUse1HooksInterface` (device guard, streams, events) with torch's own
 dispatcher instead, so `torch.Stream`/`torch.Event` work for the `mojo`
-device through the ordinary generic path, exactly like CUDA, and
-`monkeypatching.py` holds one unrelated patch.
+device through the ordinary generic path, exactly like CUDA. The Dynamo
+compatibility patch below changes tracing, not these native classes.
 
 ## Execution semantics
 
-Kernels launch on the device's **current stream** (`ctx_for(t.device)` in
+### torch.compile
+
+With PyTorch 2.11's generic stream tracing, `mojo_backend` preserves stream
+contexts, stream/event waits and event recording on CUDA and mojo tensors.
+This also works with `fullgraph=True`, streams constructed inside the
+function, nested contexts, mutation, and backward.
+
+Dynamo places stream contexts in FX node metadata, but AOTAutograd executes
+ordinary stream/event methods while tracing and omits them from its tensor
+graph. `torch_compile_backend/streams.py` therefore partitions the Dynamo
+graph before AOT. The runtime wrapper retains stream/event operations in
+program order; contiguous tensor regions are compiled to MAX and invoked
+under the requested torch stream. Stream objects are resolved from Dynamo's
+runtime table on every call, rather than retaining tracing-time streams.
+`preserve_dynamo_stream_contexts()` retains the entire nested context stack
+in extra metadata: the innermost stream alone cannot describe an active
+outer context on a different device. This tracing patch is installed at
+package import so it also covers CUDA-only use without device registration.
+
+MAX still executes these regions on its own shared device queue. A tiny
+per-device DLPack handoff orders the graph after the current torch stream
+and orders that stream after the graph. The handoff is refreshed on every
+invocation, including when tensor buffers are cached or the graph has no GPU
+inputs/outputs. CUDA/ROCm waits are device-side; Metal uses its existing host
+synchronization path. Tensor calculations remain compiled; stream/event
+orchestration runs on the host, as it does in eager mode.
+
+This preserves ordering, but does **not** preserve overlap between independent
+compiled regions: MAX's shared queue can serialize them. We do not yet use
+`ops.side_stream()` to assign compiled regions to independent MAX queues.
+That optimization must also retain the external torch-stream handoffs and
+runtime event operations; stream metadata alone is not sufficient.
+
+When CUDA and mojo coexist, `fix_dynamo_current_stream_device()` in
+`monkeypatching.py` repairs PyTorch 2.11's current-stream lookup: its
+symbolic stack, CUDA query handler, and runtime/guard reconstruction must
+respect the requested device type instead of defaulting to mojo. The patch
+is installed by `register_mojo_devices()`.
+
+### Native eager execution
+
+Native eager kernels launch on the device's **current stream** (`ctx_for(t.device)` in
 `tmb/backend/abi.mojo`/`device.mojo`). On CUDA/ROCm a new stream selects an
 independent queue; on Metal it selects the same default queue.
 

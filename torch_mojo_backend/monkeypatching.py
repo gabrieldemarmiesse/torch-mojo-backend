@@ -9,8 +9,9 @@ module; keep new patches in this file
 (``tests/test_monkeypatching_is_centralized.py`` enforces that for
 ``torch``-rooted assignments).
 
-Every patch installer is called by ``register.register_mojo_devices``, never
-at import time. Official registration APIs (``torch.library.impl``, the
+Device patch installers are called by ``register.register_mojo_devices``.
+The Dynamo stream-metadata patch is installed at package import, before
+tracing can begin, including for CUDA-only users. Official registration APIs (``torch.library.impl``, the
 PrivateUse1 backend module, ``torch.__future__`` toggles) are not
 monkeypatches and stay in ``mojo_device/register.py``.
 """
@@ -21,19 +22,145 @@ import os
 import sys
 from collections.abc import Callable
 from functools import wraps
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import torch
+import torch._dynamo.guards as dynamo_guards
+import torch._dynamo.utils as dynamo_utils
 import torch._tensor_str
 import torch.distributed.distributed_c10d as c10d
 import torch.distributed.tensor as dtensor
+import torch.fx.traceback
 import torch.utils._triton
+from torch._dynamo import source as dynamo_source
+from torch._dynamo.symbolic_convert import InstructionTranslator
+from torch._dynamo.variables.base import VariableTracker
+from torch._dynamo.variables.constant import ConstantVariable
+from torch._dynamo.variables.lazy import LazyVariableTracker
+from torch._dynamo.variables.torch import TorchInGraphFunctionVariable
 
 from torch_mojo_backend.native import device_module
 
+try:
+    from torch._dynamo.variables import streams as dynamo_streams
+except ImportError:  # Older torch releases predate generic stream tracing.
+    dynamo_streams = None
+
 if TYPE_CHECKING:
+    from torch._dynamo.variables.streams import (
+        StreamContextVariable,
+        StreamVariable,
+        SymbolicStreamState,
+    )
+
     # Optional Triton dependency: its wheels are unavailable on macOS.
     from triton.backends.driver import DriverBase
+
+
+def preserve_dynamo_stream_contexts():
+    """Dynamo's single stream annotation loses outer contexts on other devices.
+
+    Retain the full context stack in extra metadata for our backend. Install
+    before tracing, including when CUDA users do not register the mojo device.
+    The upstream stream annotation stays intact for other backends.
+    """
+    if dynamo_streams is None:
+        return
+    context = dynamo_streams.StreamContextVariable
+    original_enter = context.enter
+    if getattr(original_enter, "_torch_mojo_backend", False):
+        return
+
+    def enter(
+        self: "StreamContextVariable", tx: InstructionTranslator, *args: VariableTracker
+    ) -> VariableTracker:
+        custom = torch.fx.traceback.get_current_meta().get("custom", {})
+        indices = custom.get("torch_mojo_streams", ())
+        # Newer Dynamo renamed this field; writing target_values there is
+        # silently ignored by the annotation context's enter implementation.
+        attribute = "annotation" if hasattr(self, "annotation") else "target_values"
+        annotation = dict(getattr(self, attribute))
+        annotation["torch_mojo_streams"] = (
+            *indices,
+            self.get_stream().user_object_index,
+        )
+        setattr(self, attribute, annotation)
+        return original_enter(self, tx, *args)
+
+    enter._torch_mojo_backend = True  # ty: ignore[unresolved-attribute] -- idempotent patch marker
+    context.enter = enter
+
+
+def fix_dynamo_current_stream_device():
+    """Dynamo 2.11 falls back to the default accelerator's stream when an
+    explicitly requested device has no entry in its symbolic stream stack.
+    After PrivateUse1 registration that turns CUDA stream queries into mojo
+    streams. Its runtime CurrentStreamSource helper also ignores the device
+    type, and its CUDA handler treats no device argument as the default
+    accelerator. Preserve the requested CUDA device in all three places.
+    """
+    state = getattr(dynamo_streams, "SymbolicStreamState", None)
+    if (
+        dynamo_streams is None
+        or state is None
+        or getattr(dynamo_utils.get_current_stream, "_torch_mojo_backend", False)
+    ):
+        return
+    original_get = dynamo_utils.get_current_stream
+    original_current = state.cur_stream
+    handlers = TorchInGraphFunctionVariable._get_handlers()
+    original_cuda = handlers[torch.cuda.current_stream]
+
+    @wraps(original_get)
+    def get_current_stream(device: torch.device) -> torch.Stream:
+        if device.type == "cuda":
+            stream = torch.cuda.current_stream(device)
+            # Match accelerator.current_stream's generic object. Letting
+            # Dynamo guard these temporary CUDA subclass wrappers triggers
+            # weakref_dealloc crashes in torch 2.11 (also with backend=eager).
+            return torch.Stream(
+                stream_id=stream.stream_id,
+                device_index=stream.device_index,
+                device_type=stream.device_type,
+            )
+        return original_get(device)
+
+    def cur_stream(
+        self: "SymbolicStreamState", device: torch.device | None = None
+    ) -> "StreamVariable":
+        if device is None:
+            return original_current(self, device)
+        actual = get_current_stream(device)
+        for stream in reversed(self.cur_stream_stack):
+            if stream.device == actual.device:
+                return stream
+        return cast(
+            "StreamVariable",
+            LazyVariableTracker.create(
+                actual, source=dynamo_source.CurrentStreamSource(actual.device)
+            ),
+        )
+
+    def cuda_current_stream(
+        self: TorchInGraphFunctionVariable,
+        tx: InstructionTranslator,
+        *args: VariableTracker,
+        **kwargs: VariableTracker,
+    ) -> VariableTracker:
+        if len(args) + len(kwargs) > 1 or (kwargs and "device" not in kwargs):
+            return original_cuda(self, tx, *args, **kwargs)
+        value = args[0] if args else kwargs.get("device")
+        requested = value.as_python_constant() if value is not None else None
+        actual = torch.cuda.current_stream(requested)
+        return original_cuda(self, tx, ConstantVariable.create(actual.device))
+
+    get_current_stream._torch_mojo_backend = True  # ty: ignore[unresolved-attribute] -- idempotent patch marker
+    dynamo_utils.get_current_stream = get_current_stream  # ty: ignore[invalid-assignment] -- torch's internal/public Stream return aliases differ in its stubs
+    dynamo_guards.get_current_stream = get_current_stream  # ty: ignore[invalid-assignment] -- same Stream alias gap as utils above
+    if dynamo_guards._CLOSURE_VARS is not None:
+        dynamo_guards._CLOSURE_VARS["___get_current_stream"] = get_current_stream
+    state.cur_stream = cur_stream
+    handlers[torch.cuda.current_stream] = cuda_current_stream
 
 
 def fix_privateuse1_dlpack_device_type():

@@ -20,6 +20,7 @@ from max.experimental.torch.torch import torch_dtype_to_max
 from max.graph import DeviceRef, Graph, KernelLibrary, ops as max_ops
 from torch._dynamo.backends.common import aot_autograd
 from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.utils._pytree import tree_leaves
 
 from torch_mojo_backend import native
 from torch_mojo_backend.aten_functions import (
@@ -41,6 +42,10 @@ from torch_mojo_backend.torch_compile_backend.collectives import (
     GraphCollectives,
     wait,
     waited_inputs,
+)
+from torch_mojo_backend.torch_compile_backend.streams import (
+    compile_stream_graph,
+    uses_streams,
 )
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,
@@ -270,12 +275,9 @@ class _GraphFactory:
             # in the graph.
             return
 
-        if "example_value" in node.meta:
-            example_value = node.meta["example_value"]
-        elif "val" in node.meta:
-            example_value = node.meta["val"]
+        example_value = node.meta.get("example_value", node.meta.get("val"))
         if isinstance(example_value, torch.SymInt):
-            self.expression_to_node_name[example_value.node.expr.name] = node.name
+            self.expression_to_node_name[str(example_value.node.expr)] = node.name
         if isinstance(example_value, torch.Tensor | torch.nn.Parameter):
             shape = []
             for dim_idx, dim in enumerate(example_value.shape):
@@ -463,6 +465,12 @@ class _GraphFactory:
         self, graph: torch.fx.Graph
     ) -> tuple[Graph, list[tuple[OutputBlueprintKind, int | None]]]:
         output_blueprint = None
+        # Partitioned FX graphs may put tensor inputs before their symbolic
+        # dimensions. Register dimension names before inspecting tensor shapes.
+        for node in graph.nodes:
+            example = node.meta.get("example_value", node.meta.get("val"))
+            if node.op == "placeholder" and isinstance(example, torch.SymInt):
+                self.expression_to_node_name[str(example.node.expr)] = node.name
         self.takes_seed = any(
             node.op == "call_function" and node.target in GRAPH_SEEDED_OPS
             for node in graph.nodes
@@ -600,6 +608,22 @@ class BaseMaxCompiler:
     ):
         self.gm = gm
         self.mojo_outputs = _graph_uses_mojo_device(gm, example_inputs)
+        devices = {
+            value.device
+            for node in gm.graph.nodes
+            for value in tree_leaves(
+                node.meta.get("val", node.meta.get("example_value"))
+            )
+            if isinstance(value, torch.Tensor) and value.device.type in ("cuda", "mojo")
+        }
+        # A per-device handoff also orders input-free factories and graphs
+        # whose outputs are all CPU values. Re-import it on *every* call:
+        # cached tensor aliases do not refresh DLPack's stream dependency.
+        with unset_fake_temporarily():
+            self.stream_tokens = [
+                torch.empty(1, dtype=torch.uint8, device=device)
+                for device in sorted(devices, key=str)
+            ]
         if profiling_enabled():
             compiler_start = time.time_ns()
         if verbose_enabled():
@@ -655,6 +679,7 @@ class BaseMaxCompiler:
             # the wait the graph traced, done here, orders the current stream
             # (and so the graph, see fast_from_dlpack) after it.
             torch.ops._c10d_functional.wait_tensor(args[i])
+        stream_fences = [fast_from_dlpack(token) for token in self.stream_tokens]
         input_tensors = [
             _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
         ]
@@ -674,6 +699,24 @@ class BaseMaxCompiler:
                         "the process group. " + "; ".join(failed)
                     )
             raise
+        finally:
+            # Publish completion even when the graph returns no GPU tensor,
+            # and before AOT's mutation epilogue or a user records an event.
+            for token, fence in zip(self.stream_tokens, stream_fences, strict=True):
+                if fence.device.label == "cpu":
+                    continue
+                if token.device.type == "mojo":
+                    if device_module.get_device_properties(token.device).api == "metal":
+                        fence.device.synchronize()
+                        continue
+                    handle = device_module.stream_native_handle(
+                        torch.accelerator.current_stream(token.device)
+                    )
+                else:
+                    handle = torch.cuda.current_stream(token.device).cuda_stream
+                    # DLPack reserves 1 for CUDA's legacy default stream.
+                    handle = handle or 1
+                fence.__dlpack__(stream=handle)
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
             # buffers zero-copy as eager mojo tensors (DIM outputs become
@@ -760,15 +803,24 @@ def boxed_func(
 
 class mojo_backend:
     def __init__(self, gm: torch.fx.GraphModule, example_inputs: list[object]):
-        self.func_to_execute = aot_autograd(
-            fw_compiler=boxed_func, decompositions=DECOMPOSITION_TABLE
-        )(gm, example_inputs)
+        if uses_streams(gm.graph):
+            self.func_to_execute = compile_stream_graph(gm, _compile_region)
+        else:
+            self.func_to_execute = _compile_region(gm, example_inputs)
 
     def __call__(self, *args: object) -> list[torch.Tensor | int | float | None]:
         result = self.func_to_execute(*args)
         if isinstance(result, tuple):
             return list(result)
         return result
+
+
+def _compile_region(
+    gm: torch.fx.GraphModule, example_inputs: list[object]
+) -> Callable[..., Any]:
+    return aot_autograd(fw_compiler=boxed_func, decompositions=DECOMPOSITION_TABLE)(
+        gm, example_inputs
+    )
 
 
 def dummy_compiler(
