@@ -698,6 +698,33 @@ def test_pow_follows_thrust_log_and_exp(mojo_gpu: str):
         assert got[2].item() == complex(1.0, 0.5000000596046448)
 
 
+@pytest.mark.parametrize("op", ["exp", "polar"])
+def test_complex_phase_argument_reduction(mojo_gpu: str, op: str):
+    skip_if_metal(
+        mojo_gpu, "tests the libdevice trig route; Metal uses its own sin/cos"
+    )
+    # The AMD hardware trig instructions alone lose the residual near pi/2
+    # and all phase information for large inputs. Exercise both sides of
+    # libdevice's 105615-radian range-reduction boundary and finite extremes.
+    theta = torch.tensor(
+        [1.5707963705062866, 100.0, 105614.0, 105615.0, 1e6, 1e30, 3e38, -3e38],
+        dtype=torch.float32,
+    )
+    if op == "exp":
+        z = torch.complex(torch.zeros_like(theta), theta)
+        got = torch.exp(z.to(mojo_gpu)).cpu()
+        want = torch.exp(z)
+    else:
+        rho = torch.ones_like(theta)
+        got = torch.polar(rho.to(mojo_gpu), theta.to(mojo_gpu)).cpu()
+        want = torch.polar(rho, theta)
+    # Compare components separately: a complex-relative tolerance would
+    # conceal an incorrect zero for cos(float32(pi/2)).
+    torch.testing.assert_close(
+        torch.view_as_real(got), torch.view_as_real(want), rtol=2e-6, atol=1e-12
+    )
+
+
 def test_scalar_conversion_overflow(mojo_gpu: str):
     z = _rand(3).to(mojo_gpu)
     with pytest.raises(RuntimeError, match="without overflow"):

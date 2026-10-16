@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from tests.native.conftest import ran, skip_if_metal
+from torch_mojo_backend import get_accelerators
 
 # ---------------------------------------------------------------------------
 # mode
@@ -79,12 +80,27 @@ def test_mode_long_rows(mojo_gpu):
         assert i[r].item() == hits.min().item()
 
 
+def _mode_fused_max_row(device: str) -> int:
+    """The longest row TensorModeKernel.cpp sends to the fused kernel:
+    `2 * MAX_BLOCK_SIZE`, with MAX_BLOCK_SIZE 1024 on CUDA and 256 on ROCm
+    (`AT_ROCM_ENABLED() ? 256 : 1024`), so 2048 elements on NVIDIA, 512 on
+    AMD."""
+    idx = int(device.rsplit(":", 1)[-1])
+    return 512 if get_accelerators()[idx].api == "hip" else 2048
+
+
 def test_mode_row_length_picks_cudas_tie_rule(mojo_gpu):
-    """Up to 2048 elements CUDA's fused kernel reports the largest index of
-    the mode, beyond it the thrust fallback the smallest."""
-    short = torch.zeros(2048, dtype=torch.bool)
+    """Up to 2 * MAX_BLOCK_SIZE elements (2048 on CUDA, 512 on ROCm) the
+    fused kernel reports the largest index of the mode, beyond it the thrust
+    fallback the smallest: a 2048-element row is fused on an NVIDIA GPU and
+    takes the fallback on an AMD one, as stock ROCm torch does."""
+    fused_max = _mode_fused_max_row(mojo_gpu)
+    short = torch.zeros(fused_max, dtype=torch.bool)
     _, i = torch.mode(short.to(mojo_gpu), 0)
-    assert i.item() == 2047
+    assert i.item() == fused_max - 1
+    past = torch.zeros(fused_max + 1, dtype=torch.bool)
+    _, i = torch.mode(past.to(mojo_gpu), 0)
+    assert i.item() == 0
     long = torch.zeros(5000, dtype=torch.bool)
     v, i = torch.mode(long.to(mojo_gpu), 0)
     assert v.item() is False and i.item() == 0

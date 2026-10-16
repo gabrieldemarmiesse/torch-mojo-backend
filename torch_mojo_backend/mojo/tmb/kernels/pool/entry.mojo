@@ -41,6 +41,7 @@ from std.utils.numerics import min_or_neg_inf
 
 from max.gpu import block_idx, grid_dim, thread_idx
 
+from tmb.kernels.common.dtype_arithmetic import cast_rounded
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
@@ -754,9 +755,11 @@ def _avg_pool_backward[
                 var div = g[G_DIV] if g[G_DIV] != 0 else (
                     g[G_K] * g[G_K + 1] * g[G_K + 2]
                 )
-                result = (wide * (Scalar[acc_t](1) / Scalar[acc_t](div))).cast[
-                    dtype
-                ]()
+                # `static_cast<scalar_t>(sum * normFactor)`: the float
+                # product rounds first (see `cast_rounded`).
+                result = cast_rounded[dtype, acc_t, 1](
+                    wide * (Scalar[acc_t](1) / Scalar[acc_t](div))
+                )
             else:
                 result = narrow
         gin_ptr[unsafe_offset=i] = result

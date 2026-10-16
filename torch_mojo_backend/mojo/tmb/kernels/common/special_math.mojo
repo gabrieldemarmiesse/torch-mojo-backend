@@ -105,6 +105,14 @@ def _air[name: StaticString](x: Float32) -> Float32:
 def _expf(x: Float32) -> Float32:
     comptime if is_apple_gpu():
         return _air["llvm.air.exp"](x)
+    comptime if is_amd_gpu():
+        # ROCm's torch calls ocml's expf here, as `_libm_expf` does.
+        # `nv_expf` off NVIDIA is std.math.exp, v_exp_f32(x * log2(e)) with
+        # the product rounded to float: up to |x| 2^-24 relative error,
+        # measured on gfx942 29 ulp at i1(30) and 116 at erfcx(-8.7)'s
+        # exp(x^2) (CPU torch: 1 and 60), outside torch's float32 rtol.
+        # ocml's hi/lo argument reduction lands within an ulp of CPU torch.
+        return oc_expf(x)
     return nv_expf(x)
 
 

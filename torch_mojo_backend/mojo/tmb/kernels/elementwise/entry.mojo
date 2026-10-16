@@ -83,6 +83,7 @@ from tmb.kernels.common.variant_gates import (
     _tmb_entry_error,
 )
 from tmb.kernels.common.div_math import floor_div, trunc_div
+from tmb.kernels.common.dtype_arithmetic import cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pow_math import powf_c99, torch_pow
 from std.sys.info import _has_sm_9x
@@ -1240,8 +1241,10 @@ def _scalar_elementwise[
                     i, (a + s).cast[dtype]()
                 )
             comptime if op_code == SOP_MUL:
+                # The float product rounds before the half conversion
+                # (mul_kernel_cuda's opmath): see `cast_rounded`.
                 out_ptr.unsafe_store[width=width, alignment=al](
-                    i, (a * s).cast[dtype]()
+                    i, cast_rounded[dtype](a * s)
                 )
             comptime if op_code == SOP_FLOORDIV:
                 out_ptr.unsafe_store[width=width, alignment=al](

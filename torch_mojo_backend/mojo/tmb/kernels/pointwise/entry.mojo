@@ -23,6 +23,7 @@ from max.gpu.host import DeviceContext
 from std.memory import bitcast
 from std.sys.info import (
     has_accelerator,
+    has_amd_gpu_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,
     size_of,
@@ -255,7 +256,14 @@ def _lanes[kind: StaticString, dt: DType]() -> Int:
     coherent (sorted) inputs igamma 898 -> 848 us (torch 762), igammac 922
     -> 863 (744); random inputs 2.20 ms (2.27), 2.71 (2.57); 281673 sorted
     elements igammac 23 us (55)."""
-    comptime if _ua_ok and (kind == "igamma" or kind == "igammac"):
+    # Mojo 1.1's AMDGPU long-branch relaxation clobbers the return-address
+    # registers in the outlined eight-element Half body after the float64
+    # log expansion (gfx942, igamma(full, scalar)). Keep the Half callable
+    # within short-branch range by processing one element per thread.
+    comptime if (
+        (_ua_ok or (has_amd_gpu_accelerator() and dt == DType.float16))
+        and (kind == "igamma" or kind == "igammac")
+    ):
         return 1
     else:
         return 16 // size_of[dt]()

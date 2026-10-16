@@ -2397,7 +2397,7 @@ def test_non_blocking_download_falls_back_after_pinned_allocation_failure(
 
 @pytest.fixture(scope="module")
 def pinned_host_failure_preload(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Subprocess-only faults at MAX's C ABI, with no production test switch."""
+    """Subprocess-only faults and ownership accounting at MAX's C ABI."""
     if not sys.platform.startswith("linux"):
         pytest.skip("MAX allocation fault injection requires Linux LD_PRELOAD")
     directory = tmp_path_factory.mktemp("host-buffer-failure")
@@ -2407,6 +2407,37 @@ def pinned_host_failure_preload(tmp_path_factory: pytest.TempPathFactory) -> Pat
         #include <stddef.h>
         #include <stdlib.h>
         #include <string.h>
+        #include <mutex>
+        #include <unordered_map>
+        static std::mutex host_mutex;
+        static std::unordered_map<const void*, size_t> host_buffers;
+        extern "C" size_t tmb_test_live_host_buffers() {
+            std::lock_guard<std::mutex> lock(host_mutex);
+            return host_buffers.size();
+        }
+        extern "C" void AsyncRT_DeviceBuffer_retain(const void* buffer) {
+            using Retain = void (*)(const void*);
+            auto retain = reinterpret_cast<Retain>(dlsym(
+                RTLD_NEXT, "AsyncRT_DeviceBuffer_retain"));
+            {
+                std::lock_guard<std::mutex> lock(host_mutex);
+                auto it = host_buffers.find(buffer);
+                if (it != host_buffers.end()) ++it->second;
+            }
+            retain(buffer);
+        }
+        extern "C" void AsyncRT_DeviceBuffer_release(const void* buffer) {
+            using Release = void (*)(const void*);
+            auto release = reinterpret_cast<Release>(dlsym(
+                RTLD_NEXT, "AsyncRT_DeviceBuffer_release"));
+            {
+                std::lock_guard<std::mutex> lock(host_mutex);
+                auto it = host_buffers.find(buffer);
+                if (it != host_buffers.end() && --it->second == 0)
+                    host_buffers.erase(it);
+            }
+            release(buffer);
+        }
         static int failures = 0;
         extern "C" int tmb_test_host_buffer_failures() { return failures; }
         extern "C" const char* AsyncRT_DeviceContext_createHostBuffer(
@@ -2423,7 +2454,12 @@ def pinned_host_failure_preload(tmp_path_factory: pytest.TempPathFactory) -> Pat
             auto create = reinterpret_cast<Create>(dlsym(
                 RTLD_NEXT, "AsyncRT_DeviceContext_createHostBuffer"));
             if (!create) return strdup("test interposer could not find MAX host allocator");
-            return create(result, pointer, context, count, itemsize);
+            const char* error = create(result, pointer, context, count, itemsize);
+            if (!error) {
+                std::lock_guard<std::mutex> lock(host_mutex);
+                host_buffers.emplace(*result, 1);
+            }
+            return error;
         }
         extern "C" const char* AsyncRT_DeviceContext_DtoH_async(
             const void* context, void* destination, const void* source) {
@@ -2515,13 +2551,10 @@ def _current_rss_bytes() -> int | None:
     return None
 
 
-@pytest.mark.parametrize("async_use", [False, True])
-def test_pinned_allocations_are_released(mojo_device: str, async_use: bool):
-    """Catch leaked HostBuffers that were not destroyed after their tensors died.
-
-    Current RSS bounds retained memory after churn regardless of earlier peaks.
-    Without procfs, the churn and fresh-allocation checks still run.
-    """
+def _check_pinned_allocations_are_released(
+    mojo_device: str, async_use: bool, probe: ctypes.CDLL | None = None
+):
+    """Churn allocations and check that their MAX ownership is released."""
     with device_module.device(mojo_device):
         # Tensor.pin_memory() uses our allocator even with a CUDA torch wheel.
         source = torch.zeros(4 * 1024 * 1024, dtype=torch.uint8)
@@ -2531,10 +2564,13 @@ def test_pinned_allocations_are_released(mojo_device: str, async_use: bool):
             uploaded.copy_(warm, non_blocking=True)
         del warm
         torch.accelerator.synchronize(mojo_device)
-        before = _current_rss_bytes()
+        before = probe.tmb_test_live_host_buffers() if probe else _current_rss_bytes()
         # Churn 256 MiB in total with only 32 MiB of live pinned blocks.
         for _ in range(8):
             blocks = [source.pin_memory() for _ in range(8)]
+            if probe:
+                assert before is not None
+                assert probe.tmb_test_live_host_buffers() >= before + len(blocks)
             while blocks:
                 block = blocks.pop(len(blocks) // 2)
                 if async_use:
@@ -2542,11 +2578,59 @@ def test_pinned_allocations_are_released(mojo_device: str, async_use: bool):
                 del block
                 assert all(live.is_pinned() for live in blocks)
         torch.accelerator.synchronize(mojo_device)
-        after = _current_rss_bytes()
-        if before is not None and after is not None:
-            assert after - before < 128 * 1024 * 1024
+        if probe:
+            assert probe.tmb_test_live_host_buffers() == before
+        else:
+            after = _current_rss_bytes()
+            if before is not None and after is not None:
+                assert after - before < 128 * 1024 * 1024
         fresh = torch.empty(8).pin_memory()
         assert fresh.is_pinned()
+
+
+@pytest.mark.parametrize("async_use", [False, True])
+def test_pinned_allocations_are_released(
+    mojo_device: str, async_use: bool, request: pytest.FixtureRequest
+):
+    """Check actual HostBuffer releases, excluding lazy driver allocations.
+
+    ROCm 6.4 can create additional ~134 MiB HSA allocations during async
+    churn, even after repeated warmups. Process RSS cannot distinguish them
+    from leaked pinned buffers. Interpose MAX's ownership ABI on Linux;
+    other platforms retain the churn and available RSS checks.
+    """
+    if not sys.platform.startswith("linux"):
+        _check_pinned_allocations_are_released(mojo_device, async_use)
+        return
+    preload = request.getfixturevalue("pinned_host_failure_preload")
+    script = textwrap.dedent("""
+        import ctypes
+        import sys
+        from tests.test_mojo_device import _check_pinned_allocations_are_released
+        from torch_mojo_backend import register_mojo_devices
+        register_mojo_devices()
+        probe = ctypes.CDLL(sys.argv[3])
+        probe.tmb_test_live_host_buffers.restype = ctypes.c_size_t
+        _check_pinned_allocations_are_released(sys.argv[1], sys.argv[2] == '1', probe)
+        print('pinned allocations released', flush=True)
+    """)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
+    }
+    env["LD_PRELOAD"] = str(preload) + (
+        ":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else ""
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, mojo_device, str(int(async_use)), str(preload)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "pinned allocations released" in proc.stdout
 
 
 @pytest.mark.filterwarnings("ignore:pin_memory_device is deprecated:UserWarning")

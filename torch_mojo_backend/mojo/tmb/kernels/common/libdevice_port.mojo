@@ -15,10 +15,17 @@
 #
 # Portability: the routines whose libdevice body is pure IEEE arithmetic
 # (nv_logf, nv_exp, nv_log1pf, nv_sincospi, nv_sincos) run the ported body on every target
-# and are bit-exact everywhere.  The routines that depend on an NVIDIA hardware
-# approximation instruction (nv_expf, nv_log, nv_log1p, nv_tanf, nv_tan,
-# nv_fast_sincosf) fall back to std.math off NVIDIA and are NOT bit-exact
-# there.
+# and are bit-exact everywhere.  The float64 nv_log / nv_log1p / nv_tan run
+# the ported body on every GPU too (std.math on the host): their one
+# approximation instruction, rcp.approx.ftz.f64, only seeds a reciprocal that
+# libdevice refines cubically, so an IEEE `1 / x` seed off NVIDIA gives the
+# same reciprocal (see `_rcp_approx_ftz_d`).  nv_log / nv_log1p must not fall
+# back to std.math on a GPU: its float64 `log` is the Cephes
+# *single-precision* polynomial evaluated in double (3e-9 relative off on
+# MI300A; log1p, which calls it, 1e-6), where this port is within an ulp.
+# The routines that depend on an NVIDIA hardware approximation for their
+# result (nv_expf, nv_tanf, nv_fast_sincosf) fall back to std.math off NVIDIA
+# and are NOT bit-exact there.
 # ===----------------------------------------------------------------------=== #
 
 from std.bit import count_leading_zeros
@@ -32,7 +39,7 @@ from std.math import sin as _std_sin
 from std.math import tan as _std_tan
 from std.sys import llvm_intrinsic
 from std.sys._assembly import inlined_assembly
-from std.sys.info import is_gpu, is_nvidia_gpu
+from std.sys.info import is_amd_gpu, is_gpu, is_nvidia_gpu
 
 
 # --------------------------------------------------------------------------- #
@@ -102,12 +109,20 @@ comptime _F64_INF = Float64(from_bits=UInt64(0x7FF0000000000000))
 
 @always_inline
 def _rcp_approx_ftz_d(x: Float64) -> Float64:
-    return inlined_assembly[
-        "rcp.approx.ftz.f64 $0, $1;",
-        Float64,
-        constraints="=d,d",
-        has_side_effect=False,
-    ](x)
+    """rcp.approx.ftz.f64 on NVIDIA; an IEEE `1 / x` elsewhere. Each caller
+    (`_log_core`, `nv_tan`) only seeds a refinement r = r0 + r0 (e + e^2),
+    e = 1 - x r0, that takes the seed's error e to e^3: from the hardware
+    approximation or from the rounded quotient, the refined value is the
+    correctly rounded reciprocal either way."""
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "rcp.approx.ftz.f64 $0, $1;",
+            Float64,
+            constraints="=d,d",
+            has_side_effect=False,
+        ](x)
+    else:
+        return Float64(1.0) / x
 
 
 @always_inline
@@ -216,12 +231,20 @@ def _add_rz_f(a: Float32, b: Float32) -> Float32:
 @always_inline
 def _add_rn_d(a: Float64, b: Float64) -> Float64:
     """add.rn.f64 spelled out. Mojo contracts `x*y + z` into an fma; libdevice
-    rounds the product first, so the fusion must be blocked here."""
+    rounds the product first, so the fusion must be blocked here (v_add_f64
+    on AMD, as pow_math's `_add_rn`)."""
     comptime if is_nvidia_gpu():
         return inlined_assembly[
             "add.rn.f64 $0, $1, $2;",
             Float64,
             constraints="=d,d,d",
+            has_side_effect=False,
+        ](a, b)
+    elif is_amd_gpu():
+        return inlined_assembly[
+            "v_add_f64 $0, $1, $2",
+            Float64,
+            constraints="=v,v,v",
             has_side_effect=False,
         ](a, b)
     else:
@@ -460,18 +483,18 @@ def _log_core(a: Float64) -> Float64:
 
 @always_inline
 def nv_log(a: Float64) -> Float64:
-    """`__nv_log` (libdevice_ir/__nv_log.ll). NVIDIA only: rcp.approx.ftz.f64.
-    """
-    comptime if not is_nvidia_gpu():
+    """`__nv_log` (libdevice_ir/__nv_log.ll) on every GPU (see the header:
+    std.math's float64 log is float32-accurate); std.math on the host."""
+    comptime if not is_gpu():
         return _std_log(a)
     return _log_core(a)
 
 
 @always_inline
 def nv_log1p(a: Float64) -> Float64:
-    """`__nv_log1p` (libdevice_ir/__nv_log1p.ll). NVIDIA only (uses _log_core).
-    """
-    comptime if not is_nvidia_gpu():
+    """`__nv_log1p` (libdevice_ir/__nv_log1p.ll) on every GPU; std.math on
+    the host."""
+    comptime if not is_gpu():
         return _std_log1p(a)
 
     var ahi = _fr(_hi(a))
@@ -885,11 +908,7 @@ def nv_tan(a: Float64) -> Float64:
 
     if (i & Int32(1)) != Int32(0):
         var d = fma(u, z, -(r - z))
-        var r0: Float64
-        comptime if is_nvidia_gpu():
-            r0 = _rcp_approx_ftz_d(r)
-        else:
-            r0 = Float64(1.0) / r
+        var r0 = _rcp_approx_ftz_d(r)
         var nr = fma(-r, r0, Float64(1.0))
         nr = fma(nr, nr, nr)
         var rr = -fma(nr, r0, r0)
