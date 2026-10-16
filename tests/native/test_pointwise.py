@@ -1380,7 +1380,9 @@ _ACT = [
     ("hardsigmoid", lambda x: F.hardsigmoid(x), "aten::hardsigmoid"),
     ("hardswish", lambda x: F.hardswish(x), "aten::hardswish"),
     ("mish", lambda x: F.mish(x), "aten::mish"),
-    ("threshold", lambda x: F.threshold(x, _in(x, 0.3), -2.0), "aten::threshold"),
+    # value -5: half's and bfloat16's bits differ (-2.0 has the same bits in
+    # both, which hid Metal narrowing bfloat16's value as half)
+    ("threshold", lambda x: F.threshold(x, _in(x, 0.3), -5.0), "aten::threshold"),
     ("logsigmoid", lambda x: F.logsigmoid(x), "aten::log_sigmoid_forward"),
     (
         "rrelu_eval",

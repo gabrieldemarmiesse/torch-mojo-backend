@@ -1824,7 +1824,18 @@ def _wide[
         # p = (threshold, value), both rounded to the input dtype by the
         # host (ActivationThresholdKernel.cu computes in scalar_t).
         var r = a.le(p[0]).select(SIMD[w, n](p[1]), a)
-        return isnan(a).select(a, r)
+        r = isnan(a).select(a, r)
+        comptime if is_apple_gpu() and w == DType.float32:
+            # Apple's shader compiler sinks the caller's float32 -> bfloat16
+            # narrowing into this select and narrows `value` there as if to
+            # half: bfloat16 threshold(x, 0.5, -5) gave -2048 (half -5's
+            # bits) on an M4. An XOR with a runtime zero (p[2] is always 0)
+            # keeps the select opaque, as `_st_round`'s fence does.
+            var bits = bitcast[DType.uint32, n](r) ^ SIMD[DType.uint32, n](
+                UInt32(1 if p[2] != 0 else 0)
+            )
+            r = bitcast[w, n](bits)
+        return r
     elif kind == "log_sigmoid":
         # ActivationLogSigmoidKernel.cu: min(0, x) - log1p(exp(-|x|)).
         var r = min(zero, a) - _log1p(_exp(-abs(a)))

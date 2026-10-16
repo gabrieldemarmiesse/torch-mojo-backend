@@ -1324,12 +1324,15 @@ def test_compare_out_alias_checked_on_original_operands(mojo_device):
 def test_float8_download_to_int_converts_where_cuda_does(mojo_device, non_blocking):
     """Measured on stock CUDA: a blocking download with a dtype change
     converts on the CPU (e5m2 inf / nan -> int32 is INT_MIN), a
-    non-blocking one on the GPU (INT_MAX / 0)."""
+    non-blocking one on the GPU (INT_MAX / 0). The CPU conversion is the
+    host's own: [INT_MIN, INT_MIN, 512, -3] on x86 (CUDA's measured host),
+    saturating on an AArch64 host such as an Apple Mac, so the blocking
+    case is checked against CPU torch's cast."""
     x = torch.tensor([float("inf"), float("nan"), 512.0, -3.0]).to(torch.float8_e5m2)
     got = x.to(mojo_device).to("cpu", dtype=torch.int32, non_blocking=non_blocking)
     torch.accelerator.synchronize()
-    imin, imax = -(2**31), 2**31 - 1
-    want = [imax, 0, 512, -3] if non_blocking else [imin, imin, 512, -3]
+    imax = 2**31 - 1
+    want = [imax, 0, 512, -3] if non_blocking else x.to(torch.int32).tolist()
     assert got.tolist() == want
 
 
@@ -2574,11 +2577,28 @@ def _hw_free(line):
     return _FLOAT_LIT.sub(lambda m: format(float(m.group()) + 0.0, ".5g"), line)
 
 
-def _compare(got, want):
+_NO_F64 = "float64 is not supported on Apple GPU"
+
+
+def _metal_lacks_f64(device: str | None, got: str, want: str) -> bool:
+    """A line whose stock CUDA outcome is a float64 tensor, declined on an
+    Apple GPU for want of float64 (an explicit capability decline, not a
+    difference)."""
+    return (
+        device is not None
+        and is_metal(device)
+        and _NO_F64 in got
+        and "float64" in want.split(" | ")[0]
+    )
+
+
+def _compare(got, want, device: str | None = None):
+    """`got` against stock CUDA's `want` line for line. With `device`, a
+    float64 result an Apple GPU declines (`_metal_lacks_f64`) is left out."""
     pairs = [
         (_hw_free(g), _hw_free(_V214.get(w, w)))
         for g, w in zip(got, want, strict=True)
-        if w not in _KNOWN
+        if w not in _KNOWN and not _metal_lacks_f64(device, g, w)
     ]
     assert [g for g, _ in pairs] == [w for _, w in pairs]
 
@@ -2586,7 +2606,7 @@ def _compare(got, want):
 @pytest.mark.parametrize("op", list(_F8_MATRIX))
 def test_float8_elementwise_matches_stock_cuda(mojo_device, op):
     gen = _mx_unary if op in _MATRIX_UNARY else _mx_binary
-    _compare(list(gen(op, mojo_device)), _F8_MATRIX[op])
+    _compare(list(gen(op, mojo_device)), _F8_MATRIX[op], mojo_device)
 
 
 _R9_CUDA = [
@@ -3502,7 +3522,11 @@ def _threshold_scalar_lines(dev):
 
 
 def test_threshold_scalar_overflow_matches_stock_cuda(mojo_device):
-    _compare(list(_threshold_scalar_lines(mojo_device)), _F8_ITER["threshold_scalars"])
+    _compare(
+        list(_threshold_scalar_lines(mojo_device)),
+        _F8_ITER["threshold_scalars"],
+        mojo_device,
+    )
 
 
 @pytest.mark.skipif(
