@@ -757,7 +757,8 @@ def test_nan_reads_as_true_and_unequal(mojo_device, dtype):
 
 
 # ---------------------------------------------------------------------------
-# review regressions
+# compares with scalars, complex and CPU 0-d tensors; scatter / fill
+# declines; scaled-mm scales, bounds and outputs
 # ---------------------------------------------------------------------------
 
 
@@ -1078,7 +1079,7 @@ def test_scaled_grouped_mm_offs_stride(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# review round 3
+# promotion, cross-device casts, scaled-mm bias and device checks
 # ---------------------------------------------------------------------------
 
 
@@ -1221,7 +1222,8 @@ def test_float8_index_reduce_and_nonzero_declined(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# review round 4
+# CPU 0-d conversion order, empty-index scatter, scaled-mm scale shapes
+# and bias strides
 # ---------------------------------------------------------------------------
 
 
@@ -1308,7 +1310,8 @@ def test_float8_promotion_error_names_dimensioned_first(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# PR review
+# refusals naming CUDA's kernels and what is checked before them; masked
+# assignment; float8 to integer conversions
 # ---------------------------------------------------------------------------
 
 
@@ -1674,7 +1677,7 @@ def test_float8_take_out_checks_before_refusal(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# scaled-mm PR review
+# scaled-mm out aliasing and block scales; grouped-mm edge cases
 # ---------------------------------------------------------------------------
 
 
@@ -1757,7 +1760,8 @@ def test_scaled_grouped_mm_requires_e4m3fn(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# scaled-mm PR review, round 2
+# scaled-mm scale lists and refusals; foreach copy; scalar ops, clamp and
+# the out= check order
 # ---------------------------------------------------------------------------
 
 
@@ -2614,7 +2618,9 @@ def _mismatches(
 ) -> dict[str, dict[str, Outcome]]:
     """{case id: {"got", "want"}} for every case of `got` (the mojo device)
     that differs from `want` (stock CUDA), with the fixture's known
-    differences and torch-2.14 overrides applied."""
+    differences and torch-2.14 overrides applied. Neither may be empty: a
+    generator that yields nothing must not pass."""
+    assert want, "an empty group compares nothing"
     assert list(got) == list(want)
     known = fixture.get("known_differences", {})
     v214 = fixture.get("torch_2_14_overrides", {})
@@ -2630,7 +2636,9 @@ def _mismatches(
 def _regenerated_mismatches(got: Cases, want: Cases) -> dict[str, dict[str, Outcome]]:
     """{case id: {"got", "want"}} for every case stock CUDA (`got`) no longer
     produces as recorded (`want`), up to the last-ulp rounding of
-    `_hw_free` (the recording is an H100's; CI's GPUs are L4s)."""
+    `_hw_free` (the recording is an H100's; CI's GPUs are L4s). Neither may
+    be empty."""
+    assert got, "the generator yields no case"
     assert list(got) == list(want)
     return {
         key: {"got": got[key], "want": w}
@@ -2715,94 +2723,71 @@ def test_float8_elementwise_matches_stock_cuda(mojo_device, op):
     assert _mismatches(_ew_cases(op, mojo_device), want, fixture, mojo_device) == {}
 
 
-def _mx_enc(t):
-    if not isinstance(t, torch.Tensor):
-        return repr(t)[:40]
-    v = t.view(torch.uint8) if t.dtype in FP8 else t
-    return f"{str(t.dtype)[6:]}{tuple(t.shape)}{v.cpu().tolist()}"
-
-
-_R9_CUDA = [
-    'pow_0d8_f32 OK float32(2,)[8.0, 8.0]',
-    'pow_tt_out_torch.float8_e4m3fn NotImplementedError "pow_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'pow_tt_out_torch.float32 NotImplementedError "pow_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    "pow_tt_out_torch.int32 RuntimeError result type Float8_e4m3fn can't be cast to the desired output type Int | out=(0,)",
-    'gt_out_torch.float32 NotImplementedError "compare_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'gt_out_torch.bool NotImplementedError "compare_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_and_out_torch.float32 NotImplementedError "logical_and_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_and_out_torch.bool NotImplementedError "logical_and_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_or_out_torch.float32 NotImplementedError "logical_or_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_or_out_torch.bool NotImplementedError "logical_or_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_xor_out_torch.float32 NotImplementedError "logical_xor_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'logical_xor_out_torch.bool NotImplementedError "logical_xor_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'neg_overlap RuntimeError unsupported operation: some elements of the input tensor and the written-to tensor refer to a single | out=(3,)',
-    'exp_overlap RuntimeError unsupported operation: some elements of the input tensor and the written-to tensor refer to a single | out=(3,)',
-    'nan_to_num_overlap RuntimeError unsupported operation: some elements of the input tensor and the written-to tensor refer to a single | out=(3,)',
-    'lt_cpu0d_out NotImplementedError "compare_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-    'maximum_e5out NotImplementedError "max_elementwise_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
-    'bitand_e5out NotImplementedError "bitwise_and_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
-    'clamp_tmin_e5out NotImplementedError "max_elementwise_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
-    'minimum_e5out NotImplementedError "min_elementwise_cuda" not implemented for \'Float8_e5m2\' | out=(2,)',
-    'pow_int_f8 RuntimeError Promotion for Float8 Types is not supported, attempted to promote Int and Float8_e4m3fn',
-    'pow_bool_f8 RuntimeError Promotion for Float8 Types is not supported, attempted to promote Bool and Float8_e4m3fn',
-    'isclose_tol NotImplementedError "mul_cuda" not implemented for \'Float8_e4m3fn\'',
-    'isclose_tol_cpu0d NotImplementedError "mul_cpu_reduced_float" not implemented for \'Float8_e4m3fn\'',
-    'div_floor NotImplementedError "div_floor_cuda" not implemented for \'Float8_e4m3fn\'',
-    'div_trunc NotImplementedError "div_trunc_cuda" not implemented for \'Float8_e4m3fn\'',
-    'div_floor_out NotImplementedError "div_floor_cuda" not implemented for \'Float8_e4m3fn\' | out=(2,)',
-]  # fmt: skip
-
-
-def _r9_lines(dev):
+def _out_dtype_dispatch_cases(dev):
+    """Which kernel a float8 refusal names, and what comes before it: pow /
+    comparison / logical outs of other dtypes, a float8_e5m2 out of e4m3fn
+    operands, an out partially overlapping the input, a CPU 0-d operand,
+    integral and bool bases, isclose's tolerance arithmetic, div's rounding
+    modes."""
     f8, e5 = torch.float8_e4m3fn, torch.float8_e5m2
-
-    def run(name, fn, out=None):
-        try:
-            s = "OK " + _mx_enc(fn())
-        except Exception as e:  # noqa: BLE001 -- the outcome itself is compared
-            s = type(e).__name__ + " " + str(e).split("\n")[0].split(" [aten")[0][:100]
-        if out is not None:
-            s += f" | out={tuple(out.shape)}"
-        return f"{name} {s}"
-
     x = torch.tensor([1.0, 2.0]).to(f8).to(dev)
     base = torch.tensor(2.0).to(f8).to(dev)
-    yield run("pow_0d8_f32", lambda: torch.pow(base, torch.full((2,), 3.0, device=dev)))
+    yield (
+        "pow/f8_0d,f32",
+        _outcome(lambda: torch.pow(base, torch.full((2,), 3.0, device=dev))),
+    )
     for odt in (f8, torch.float32, torch.int32):
         o = torch.empty(0, dtype=odt, device=dev)
-        yield run(f"pow_tt_out_{odt}", lambda: torch.pow(x, x, out=o), o)
+        yield (
+            f"pow/f8,f8/out={_dtype_name(odt)}",
+            _outcome(lambda: torch.pow(x, x, out=o), o),
+        )
     for fn in ("gt", "logical_and", "logical_or", "logical_xor"):
         for odt in (torch.float32, torch.bool):
             o = torch.empty(0, dtype=odt, device=dev)
-            yield run(f"{fn}_out_{odt}", lambda: getattr(torch, fn)(x, x, out=o), o)
+            yield (
+                f"{fn}/f8,f8/out={_dtype_name(odt)}",
+                _outcome(lambda: getattr(torch, fn)(x, x, out=o), o),
+            )
     a = torch.ones(4).to(f8).to(dev)
     for fn in ("neg", "exp", "nan_to_num"):
         o = a[1:]
-        yield run(f"{fn}_overlap", lambda: getattr(torch, fn)(a[:2], out=o), o)
+        yield (
+            f"{fn}/f8/out=partial_overlap",
+            _outcome(lambda: getattr(torch, fn)(a[:2], out=o), o),
+        )
     o = torch.empty(0, dtype=torch.bool, device=dev)
-    yield run("lt_cpu0d_out", lambda: torch.lt(x, torch.tensor(1.5), out=o), o)
+    yield (
+        "lt/f8,cpu0d_f32/out=bool",
+        _outcome(lambda: torch.lt(x, torch.tensor(1.5), out=o), o),
+    )
     for name, f in [
-        ("maximum", lambda o: torch.maximum(x, x, out=o)),
-        ("bitand", lambda o: torch.bitwise_and(x, x, out=o)),
-        ("clamp_tmin", lambda o: torch.clamp(x, min=x, out=o)),
-        ("minimum", lambda o: torch.minimum(x, x, out=o)),
+        ("maximum/f8,f8", lambda o: torch.maximum(x, x, out=o)),
+        ("bitwise_and/f8,f8", lambda o: torch.bitwise_and(x, x, out=o)),
+        ("clamp/f8,min=f8", lambda o: torch.clamp(x, min=x, out=o)),
+        ("minimum/f8,f8", lambda o: torch.minimum(x, x, out=o)),
     ]:
         o = torch.empty(0, dtype=e5, device=dev)
-        yield run(f"{name}_e5out", lambda: f(o), o)
+        yield f"{name}/out=float8_e5m2", _outcome(lambda: f(o), o)
     ones_i = torch.ones(2, dtype=torch.int32, device=dev)
-    yield run("pow_int_f8", lambda: torch.pow(ones_i, x))
+    yield "pow/i32,f8", _outcome(lambda: torch.pow(ones_i, x))
     ones_b = torch.ones(2, dtype=torch.bool, device=dev)
-    yield run("pow_bool_f8", lambda: torch.pow(ones_b, x))
-    yield run("isclose_tol", lambda: torch.isclose(x, x))
-    yield run("isclose_tol_cpu0d", lambda: torch.isclose(x, torch.tensor(1.0).to(f8)))
-    yield run("div_floor", lambda: torch.div(x, x, rounding_mode="floor"))
-    yield run("div_trunc", lambda: torch.div(x, x, rounding_mode="trunc"))
+    yield "pow/bool,f8", _outcome(lambda: torch.pow(ones_b, x))
+    yield "isclose/f8,f8", _outcome(lambda: torch.isclose(x, x))
+    yield (
+        "isclose/f8,cpu0d_f8",
+        _outcome(lambda: torch.isclose(x, torch.tensor(1.0).to(f8))),
+    )
+    for mode in ("floor", "trunc"):
+        yield (
+            f"div/f8,f8/rounding_mode={mode}",
+            _outcome(lambda: torch.div(x, x, rounding_mode=mode)),
+        )
     o = torch.empty(0, dtype=f8, device=dev)
-    yield run("div_floor_out", lambda: torch.div(x, x, rounding_mode="floor", out=o), o)
-
-
-def test_float8_review_items_match_stock_cuda(mojo_device):
-    assert list(_r9_lines(mojo_device)) == _R9_CUDA
+    yield (
+        "div/f8,f8/rounding_mode=floor/out=float8_e4m3fn",
+        _outcome(lambda: torch.div(x, x, rounding_mode="floor", out=o), o),
+    )
 
 
 def _operands(dev):
@@ -3361,7 +3346,7 @@ def _threshold_out_cases(dev):
     b = torch.ones(4).to(f8).to(dev)
     yield (
         "threshold.out/f8=1/2,-2/out=partial_overlap",
-        _outcome(lambda: a.threshold.out(b[:2], 2, -2, out=b[1:3])),
+        _outcome(lambda: a.threshold.out(b[:2], 2, -2, out=b[1:3]), watch=(b,)),
     )
     o = torch.empty(1, device=dev).expand(4)
     yield (
@@ -3395,7 +3380,7 @@ def _threshold_out_cases(dev):
     b = torch.arange(4.0, device=dev)
     yield (
         "threshold.out/f32=arange/1.5,-1/out=partial_overlap",
-        _outcome(lambda: a.threshold.out(b[:3], 1.5, -1, out=b[1:])),
+        _outcome(lambda: a.threshold.out(b[:3], 1.5, -1, out=b[1:]), watch=(b,)),
     )
     e = torch.zeros(1, device=dev).expand(4)
     yield "threshold_/f32=0[1->4]/1.5,-1", _outcome(lambda: a.threshold_(e, 1.5, -1))
@@ -3717,7 +3702,7 @@ def _threshold_scalar_cases(dev):
 
 
 # ---------------------------------------------------------------------------
-# float8 meets complex (review of the complex-tensor merge)
+# float8 meets complex
 # ---------------------------------------------------------------------------
 
 
@@ -4348,6 +4333,7 @@ def _alpha_conversion_cases(dev):
 # device and one regeneration check on stock CUDA.
 _ITER_GROUPS = {
     "operand_dtype_rules": _operand_dtype_rule_cases,
+    "out_dtype_dispatch": _out_dtype_dispatch_cases,
     "out_aliasing_input": _out_aliasing_cases,
     "backward": _backward_cases,
     "activations": _activation_cases,
@@ -4372,8 +4358,8 @@ def test_float8_iter_matches_stock_cuda(mojo_device, group):
 
 
 def test_float8_cuda_fixtures_are_consistent():
-    """The fixture files hold exactly the generators' groups, every case id
-    once across a file, and every known difference / torch-2.14 override
+    """The fixture files hold exactly the generators' groups, none empty,
+    every case id once across a file, and every known difference / torch-2.14 override
     names a recorded case it really changes."""
     for path, groups in (
         (_EW_JSON, _EW_UNARY + _EW_BINARY),
@@ -4382,7 +4368,8 @@ def test_float8_cuda_fixtures_are_consistent():
         fixture = _fixture(path)
         assert tuple(fixture["cases"]) == groups
         recorded = {}
-        for cases in fixture["cases"].values():
+        for group, cases in fixture["cases"].items():
+            assert cases, f"{group} records no case"
             assert not recorded.keys() & cases.keys()
             recorded.update(cases)
         for key, known in fixture.get("known_differences", {}).items():
