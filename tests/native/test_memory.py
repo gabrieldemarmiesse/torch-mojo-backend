@@ -493,27 +493,35 @@ _DEVICE_DTYPES = {
     torch.bfloat16,
     torch.float32,
     torch.float64,
-    torch.complex64,
-    torch.complex128,
-}
-# Declined on every backend: no mojo tensor of these dtypes can exist.
-_NEVER_ON_DEVICE = (
-    torch.complex32,
     torch.float8_e4m3fn,
     torch.float8_e5m2,
     torch.float8_e4m3fnuz,
     torch.float8_e5m2fnuz,
-    torch.qint8,
-    torch.quint8,
-    torch.qint32,
-)
+    torch.float8_e8m0fnu,
+    torch.complex64,
+    torch.complex128,
+}
+# Declined on every backend: no mojo tensor of these dtypes can exist.
+_NEVER_ON_DEVICE = (torch.complex32, torch.qint8, torch.quint8, torch.qint32)
 
 
 def _values_exact_in(a: torch.dtype, b: torch.dtype) -> torch.Tensor:
     """0/1 when either side is bool, else small non-negative integers: exact
-    in every supported dtype (bfloat16 up to 256, int8 up to 127)."""
+    in every supported dtype (bfloat16 up to 256, int8 up to 127); powers of
+    two when float8_e8m0fnu (a bare exponent: no zero) is one side."""
+    if torch.float8_e8m0fnu in (a, b):
+        if torch.bool in (a, b):
+            return torch.tensor([1, 1])
+        return torch.tensor([1, 2, 4, 8, 16, 32, 64])
     if torch.bool in (a, b):
         return torch.tensor([0, 1, 1, 0, 1])
+    if (
+        a.is_floating_point
+        and a.itemsize == 1
+        or b.is_floating_point
+        and b.itemsize == 1
+    ):
+        return torch.tensor([0, 1, 2, 3, 5, 8, 12, 16, 24, 32, 56, 96])  # float8
     return torch.tensor([0, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 127])
 
 

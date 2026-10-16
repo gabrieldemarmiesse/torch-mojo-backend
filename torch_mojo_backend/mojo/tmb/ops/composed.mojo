@@ -9,6 +9,10 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    v_tensor_c,
+    no_complex,
+    new_scalar,
+    ST_BOOL,
     ST_BFLOAT16,
     ST_FLOAT16,
     ST_FLOAT32,
@@ -64,12 +68,18 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.matmul import _sm90_cuda
 from tmb.ops.common import (
+    scalar_type_name,
+    threshold_into_overlapping,
+    threshold_scalar_check,
+    threshold_scalar_overflows,
+    threshold_scalar_value,
     assert_no_internal_overlap,
     assert_no_overlap,
     assert_no_partial_overlap,
     call_op,
     check_out,
     cast_to,
+    result_type,
     contiguous,
     copy_strided_into,
     device_str,
@@ -79,6 +89,13 @@ from tmb.ops.common import (
     same_view,
 )
 from tmb.ops.data_movement import _scalar_type_name
+from tmb.ops.f8_iter import (
+    f8_iter,
+    MODE_FN,
+    MODE_OUTDT,
+    PRE_NONE,
+    PRE_SELF_FIRST,
+)
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
     where_out_overlaps,
@@ -125,46 +142,104 @@ def _one_minus(x: T) raises -> T:
 
 
 # aten::threshold_backward(Tensor grad_output, Tensor self, Scalar threshold) -> Tensor
-def _threshold_backward_mask(args: Values) raises -> T:
-    return _dispatch(
-        "aten::gt",
-        "Scalar",
-        [
-            _tensor_value(v_tensor(args[unsafe_offset=1])),
-            args[unsafe_offset=2].copy(),
-        ],
-    )
-
-
 def op_threshold_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    """`self <= threshold ? 0 : grad` (Activation.cpp: threshold's kernel
+    with value 0 and other = grad), a SELECTION in the promoted dtype of
+    (self, grad): an inf / nan grad where self is at or below the
+    threshold is 0, not a product's nan."""
+    _thrb_same_device(args, -1, "wrapper_CUDA_threshold_backward")
     var grad = v_tensor(args[unsafe_offset=0])
-    var mask = _threshold_backward_mask(args)
-    var g = own(
+    var self = v_tensor(args[unsafe_offset=1])
+    var common = result_type(self, grad)
+    var g = own_if_new(cast_to(grad, common, False), grad)
+    var s = own_if_new(cast_to(self, common, False), self)
+    # The kernel compares in the common dtype against `threshold.to<
+    # scalar_t>()`: that exact value as a 0-d operand of the common dtype
+    # (an int64 past 2**53 kept whole, never declined). An overflowing or
+    # bool case still runs the iterator's shape checks, then raises.
+    var bad = common == ST_BOOL or threshold_scalar_overflows(
+        args, 2, 2, common
+    )
+    var thr = own(new_scalar(common, s.t.device))
+    if not bad:
+        fill_value(thr.t, threshold_scalar_value(args[unsafe_offset=2], common))
+    else:
+        fill_value(thr.t, 0.0)
+    var cond = own(
         _dispatch(
-            "aten::mul", "Tensor", [_tensor_value(grad), _tensor_value(mask)]
+            "aten::le",
+            "Tensor",
+            [_tensor_value(s.t), _tensor_value(thr.t)],
         )
     )
-    release(mask.h)
-    ret_owned(rets, 0, g)
+    var r = own(
+        _dispatch(
+            "aten::where",
+            "ScalarSelf",
+            [
+                _tensor_value(cond.t),
+                Value(TAG_SCALAR_INT, 0, 0, 0),
+                _tensor_value(g.t),
+            ],
+        )
+    )
+    # The kernel's dispatch (no bool), then its `threshold.to<scalar_t>()`,
+    # after the iterator's checks.
+    if common == ST_BOOL:
+        unsupported("\"threshold_cuda\" not implemented for 'Bool'")
+    threshold_scalar_check(args, 2, 2, common)
+    _ = thr^
+    _ = cond^
+    _ = g^
+    _ = s^
+    ret_owned(rets, 0, r)
+
+
+def _thrb_same_device(args: Values, out_idx: Int, method: StaticString) raises:
+    """The CUDA dispatcher wrapper's `check_and_update_common_device` over
+    (grad_input, grad_output, self): every tensor on the first one's device,
+    a CPU 0-d one included (it runs before TensorIterator)."""
+    var idx = List[Int]()
+    if out_idx >= 0:
+        idx.append(out_idx)
+    idx.append(0)
+    idx.append(1)
+    var first = v_tensor(args[unsafe_offset=idx[0]])
+    for j in range(1, len(idx)):
+        var t = v_tensor(args[unsafe_offset=idx[j]])
+        if t.device_type != first.device_type or t.device != first.device:
+            raise Error(
+                "Expected all tensors to be on the same device, but got ",
+                "grad_output" if idx[j] == 0 else "self",
+                " is on ",
+                device_str(t),
+                ", different from other tensors on ",
+                device_str(first),
+                " (when checking argument in method ",
+                method,
+                ")",
+            )
 
 
 # aten::threshold_backward.grad_input(Tensor grad_output, Tensor self, Scalar threshold, *, Tensor(a!) grad_input)
 def op_threshold_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var grad = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=3])
-    var mask = _threshold_backward_mask(args)
-    _dispatch_into(
-        "aten::mul",
-        "out",
-        [_tensor_value(grad), _tensor_value(mask), _tensor_value(out)],
-        out,
-    )
-    release(mask.h)
-    ret_ref(rets, 0, out)
+    _thrb_same_device(args, 3, "wrapper_CUDA_threshold_backward_out_grad_input")
+    # Always the iterator sequence of threshold's config (out dtype
+    # dispatch, safe casting, no overlap check), then the selection.
+    if threshold_into_overlapping(
+        "aten::threshold_backward",
+        args,
+        3,
+        args[unsafe_offset=3].copy(),
+        rets,
+        True,
+    ):
+        return
+    unsupported("threshold_backward.grad_input with an out off the mojo device")
 
 
 # aten::sigmoid_backward(Tensor grad_output, Tensor output) -> Tensor: grad * out * (1 - out)
@@ -514,9 +589,9 @@ def op_where_self_out(
     if r.t.stype != out.stype:
         raise Error(
             "Expected out type to be ",
-            String(r.t.dtype),
+            _scalar_type_name(r.t.dtype),
             " but got ",
-            String(out.dtype),
+            _scalar_type_name(out.dtype),
         )
     # TensorIterator's memory-overlap checks on the out as given, against
     # the operands it reads unconverted
@@ -1149,8 +1224,10 @@ def op_trace(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _dot(args: Values, rets: Values) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
+    # complex operands are read for dot's own checks (a mixed-dtype pair is
+    # its RuntimeError), then declined
+    var a = v_tensor_c(args[unsafe_offset=0])
+    var b = v_tensor_c(args[unsafe_offset=1])
     if a.rank != 1 or b.rank != 1:
         raise Error(
             "1D tensors expected, but got ",
@@ -1162,10 +1239,11 @@ def _dot(args: Values, rets: Values) raises:
     if a.stype != b.stype:
         raise Error(
             "dot : expected both vectors to have same dtype, but found ",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.stype),
             " and ",
-            _scalar_type_name(b.dtype),
+            scalar_type_name(b.stype),
         )
+    no_complex(a)
     if a.numel != b.numel:
         raise Error(
             "inconsistent tensor size, expected tensor [",
@@ -1576,14 +1654,82 @@ def op_test_functorch_fallback_out(
 
 
 def register_composed(site: Site) raises:
-    impl[op_threshold_backward, "threshold_backward"](site)
-    impl[op_threshold_backward_grad_input, "threshold_backward.grad_input"](
-        site
-    )
-    impl[op_sigmoid_backward, "sigmoid_backward"](site)
-    impl[op_sigmoid_backward_grad_input, "sigmoid_backward.grad_input"](site)
-    impl[op_tanh_backward, "tanh_backward"](site)
-    impl[op_tanh_backward_grad_input, "tanh_backward.grad_input"](site)
+    impl[
+        f8_iter[
+            op_threshold_backward,
+            "threshold_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_SELF_FIRST,
+            "",
+            False,
+        ],
+        "threshold_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_threshold_backward_grad_input,
+            "threshold_cuda",
+            3,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_SELF_FIRST,
+            "",
+            False,
+        ],
+        "threshold_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_sigmoid_backward,
+            "sigmoid_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "sigmoid_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_sigmoid_backward_grad_input,
+            "sigmoid_backward_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "sigmoid_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_tanh_backward,
+            "tanh_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "tanh_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_tanh_backward_grad_input,
+            "tanh_backward_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "tanh_backward.grad_input",
+    ](site)
     impl[routed[op_where_self_out, cx_where_out, 3], "where.self_out"](site)
     impl[op_native_batch_norm_backward, "native_batch_norm_backward"](site)
     impl[op_native_group_norm_backward, "native_group_norm_backward"](site)

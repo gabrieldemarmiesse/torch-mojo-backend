@@ -8,6 +8,13 @@ from std.ffi import external_call
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    complex_of,
+    is_float8_stype,
+    ST_FLOAT8_E4M3FN,
+    ST_FLOAT8_E5M2,
+    ST_FLOAT8_E4M3FNUZ,
+    ST_FLOAT8_E5M2FNUZ,
+    ST_FLOAT8_E8M0FNU,
     ST_BFLOAT16,
     TAG_BOOL,
     TAG_COMPLEX,
@@ -32,7 +39,9 @@ from tmb.backend.abi import (
     ST_COMPLEX64,
     Owned,
     T,
+    TAG_INT_LIST,
     Value,
+    none_arg,
     Values,
     _channels_last_strides,
     check,
@@ -64,6 +73,14 @@ from tmb.backend.abi import (
     unsupported,
     v_f64,
     v_scalar_is_integral,
+    v_scalar_is_bool,
+    v_tensor,
+    ret_ref,
+    tensor_arg,
+    TAG_TENSOR,
+    TAG_TENSOR_REF,
+    TAG_SCALAR_DOUBLE,
+    TAG_SCALAR_INT,
     v_int,
     v_complex,
 )
@@ -78,6 +95,7 @@ from tmb.backend.device import (
 )
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
+from tmb.kernels.common.float8 import f64_to_fp8_bits, is_float8
 
 # `call_op` / `call_op_raw` live in abi.mojo (one implementation, shared with
 # the ops that import them from there); they are re-exported here because most
@@ -89,6 +107,15 @@ def _padded(shape: IndexList[MAX_RANK]) -> List[Int]:
     for i in range(MAX_RANK):
         out.append(shape[i])
     return out^
+
+
+def _shape_list_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
+    var s = String("[")
+    for i in range(rank):
+        if i > 0:
+            s += ", "
+        s += String(shape[MAX_RANK - rank + i])
+    return s + "]"
 
 
 def shape_str(t: T) raises -> String:
@@ -113,6 +140,9 @@ def copy_strided_into(dst: T, src: T) raises:
     """
     if src.stype != dst.stype:
         raise Error("copy_strided_into: dtype mismatch")
+    if not dst.on_mojo() or not src.on_mojo() or dst.device != src.device:
+        # Never hand a host buffer (or another device's) to the kernel.
+        raise Error("copy_strided_into: tensors on different devices")
     if not dst.same_shape(src):
         raise Error(
             "copy_strided_into: shape mismatch, destination ",
@@ -212,6 +242,22 @@ def device_str(t: T) -> String:
     if t.on_cpu():
         return String("cpu")
     return String("device type ") + String(t.device_type)
+
+
+def out_device_error(device: Int, dest: T) raises:
+    """TensorIterator's compute_types device error for an `out=` that is
+    not on the operands' mojo device `device` (CUDA's message, operands'
+    device first)."""
+    raise Error(
+        (
+            "Expected all tensors to be on the same device, but found at"
+            " least two devices, "
+        ),
+        String("mojo:") + String(device),
+        " and ",
+        device_str(dest),
+        "!",
+    )
 
 
 def _repeats_elements(t: T) -> Bool:
@@ -557,7 +603,49 @@ def fill_value(t: T, value: Float64) raises:
 
 def fill_value(t: T, value: Value) raises:
     """Constant fill from an ATen `Scalar` argument record, tag kept."""
-    _fill(t, FillScalar(value))
+    var s = FillScalar(value)
+    if is_float8(t.dtype):
+        check_float8_scalar(s, t.dtype, t.stype)
+    _fill(t, s)
+
+
+def _float8_max(dt: DType) -> Float64:
+    """`std::numeric_limits<c10::Float8_*>::max()`."""
+    if dt == DType.float8_e4m3fn:
+        return 448.0
+    if dt == DType.float8_e4m3fnuz:
+        return 240.0
+    if dt == DType.float8_e8m0fnu:
+        return 1.7014118346046923e38  # 2**127
+    return 57344.0  # e5m2, e5m2fnuz
+
+
+def check_float8_scalar(s: FillScalar, dt: DType, stype: Int32) raises:
+    """`Scalar::to<c10::Float8_*>()`'s overflow check (c10::overflows): an
+    integer outside [lowest, max] -- never for e8m0fnu, an unsigned type
+    that lets a negative integer wrap -- and a float outside [lowest, max]
+    raise, except an infinity for e5m2 (the one float8 with inf) and NaN
+    (every float8 has one). e8m0fnu's lowest is 2**-127, so a float zero or
+    negative overflows it while an integer zero does not."""
+    var top = _float8_max(dt)
+    var low = -top
+    if dt == DType.float8_e8m0fnu:
+        low = 5.877471754111438e-39  # 2**-127
+    var bad: Bool
+    if s.integral:
+        bad = dt != DType.float8_e8m0fnu and (
+            Float64(s.i) < low or Float64(s.i) > top
+        )
+    else:
+        var f = s.f
+        var is_inf = f == f and f - f != 0.0  # inf - inf is NaN
+        bad = (f < low or f > top) and not (is_inf and dt == DType.float8_e5m2)
+    if bad:
+        raise Error(
+            "value cannot be converted to type ",
+            dtype_name(stype),
+            " without overflow",
+        )
 
 
 def _fill(t: T, s_in: FillScalar) raises:
@@ -578,6 +666,31 @@ def _fill(t: T, s_in: FillScalar) raises:
         s.f = Float64(Int64(s.i).cast[DType.float32]())
     elif t.dtype == DType.float16 or t.dtype == DType.bfloat16:
         s.f = Float64(Float32(s.f))
+    if is_float8(t.dtype):
+        # One byte, computed here the way c10 converts (through float32):
+        # a byte memset, or the strided fill of that byte as uint8. An
+        # integer rounds to float32 once, as `static_cast<float>(int64_t)`
+        # does (through Float64 it would round twice).
+        var f = Float64(
+            Scalar[DType.int64](s.i).cast[DType.float32]()
+        ) if s.integral else s.f
+        var bits = f64_to_fp8_bits(t.dtype, f)
+        if t.contig:
+            var ctx = ctx_for(t.device)
+            memset_bytes(ctx, t.ptr, bits, t.numel)
+            _ = ctx
+            return
+        var fctx = ctx_for(t.device)
+        var fcall = KernelCall("memory", "StridedFill")
+        fcall.int(t.ptr)
+        fcall.f64(Float64(bits))
+        fcall.tuple(_padded(t.shape))
+        fcall.tuple(_padded(t.strides))
+        fcall.int(dtype_code(DType.uint8))
+        fcall.int(ctx_ptr(fctx))
+        fcall.run()
+        _ = fctx
+        return
     if t.contig:
         _fill_contiguous(t, s)
         return
@@ -659,6 +772,7 @@ def is_cast_dtype(dt: DType) -> Bool:
         or dt == DType.int8
         or dt == DType.uint8
         or dt == DType.bool
+        or is_float8(dt)
     )
 
 
@@ -676,8 +790,30 @@ def is_cast_dtype_on(dt: DType, t: T) raises -> Bool:
     return is_cast_dtype(dt)
 
 
-def cast_into(dst: T, src: T) raises:
-    """dst = src.to(dst.dtype) for a contiguous dst (data_movement CastSpec)."""
+def is_cast_pair_on(a: DType, b: DType, t: T) raises -> Bool:
+    """Whether the device cast kernel converts between `a` and `b` on `t`'s
+    device: two `is_cast_dtype_on` dtypes, or a float8 with uint16 / 32 /
+    64 (which CUDA converts on the device; the kernel takes those unsigned
+    types only against a float8 end)."""
+    if is_cast_dtype_on(a, t) and is_cast_dtype_on(b, t):
+        return True
+
+    @__parameter
+    def wide_unsigned(d: DType) -> Bool:
+        return d == DType.uint16 or d == DType.uint32 or d == DType.uint64
+
+    return (is_float8(a) and wide_unsigned(b)) or (
+        is_float8(b) and wide_unsigned(a)
+    )
+
+
+def cast_into(dst: T, src: T, saturate: Bool = True) raises:
+    """dst = src.to(dst.dtype) for a contiguous dst (data_movement CastSpec).
+
+    `saturate` is copy_ / to()'s float -> e4m3fn rule on an sm_89+ NVIDIA
+    GPU (stock torch's SATFINITE intrinsic, see the kernel); a type
+    promotion (a comparison's operand, ...) converts like c10 instead and
+    passes False."""
     if src.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -685,6 +821,8 @@ def cast_into(dst: T, src: T) raises:
     var call = KernelCall("data_movement", "CastSpec")
     call.arg_dtype(0, src.dtype)
     call.out_dtype(dst.dtype)
+    if not saturate and dst.dtype == DType.float8_e4m3fn:
+        call.flag("FP8_NOSAT", 1)
     call.spec(src.spec(cp))
     call.int(dtype_code(dst.dtype))
     call.spec(dst.spec(cp))
@@ -692,14 +830,14 @@ def cast_into(dst: T, src: T) raises:
     _ = ctx
 
 
-def cast_to(t: T, stype: Int32) raises -> T:
+def cast_to(t: T, stype: Int32, saturate: Bool = True) raises -> T:
     """A contiguous copy of `t` in dtype `stype` (t itself when unchanged).
     Both the output and the intermediate are released if the cast raises."""
     if t.stype == stype:
         return t.copy()
     var out = own(new_like_dtype(t, stype))
     var src = own_if_new(contiguous(t), t)
-    cast_into(out.t, src.t)
+    cast_into(out.t, src.t, saturate)
     _ = src^  # alive past the launch (its last use above is the pointer read)
     return out.take()
 
@@ -949,11 +1087,26 @@ def _pw_float_rank(st: Int32) -> Int:
 
 
 def promote_types(a: Int32, b: Int32) raises -> Int32:
-    """c10::promoteTypes over the dtypes the mojo device computes on."""
+    """c10::promoteTypes over the dtypes the mojo device computes on,
+    complex included."""
     if a == ST_UNDEFINED:
         return b
     if b == ST_UNDEFINED or a == b:
         return a
+    if is_float8_stype(a) or is_float8_stype(b):
+        raise Error(
+            (
+                "Promotion for Float8 Types is not supported, attempted to"
+                " promote "
+            ),
+            scalar_type_name(a),
+            " and ",
+            scalar_type_name(b),
+        )
+    if is_complex_stype(a) or is_complex_stype(b):
+        # the complex type of the promoted value types (complex64 + float64
+        # is complex128)
+        return complex_of(promote_types(real_of(a), real_of(b)))
     if not known_stype(a) or not known_stype(b):
         unsupported(
             "type promotion of dtypes " + String(a) + " and " + String(b)
@@ -982,23 +1135,63 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
 
 
 def combine_categories(higher: Int32, lower: Int32) raises -> Int32:
-    """c10's combine_categories (the ResultTypeState fold)."""
-    if is_float_stype(higher):
+    """c10's combine_categories (TypeProperties.cpp, the ResultTypeState
+    fold), complex included; float8 is a floating category there. A float8
+    `higher` meeting a complex `lower` needs toComplexType(float8), which
+    c10 does not have: its "Unknown Complex ScalarType" RuntimeError."""
+    if is_complex_stype(higher):
         return higher
-    if higher == ST_BOOL or is_float_stype(lower):
+    if is_complex_stype(lower):
+        if is_float8_stype(higher):
+            raise Error(
+                "Unknown Complex ScalarType for ", scalar_type_name(higher)
+            )
+        if is_float_stype(higher):
+            return complex_of(higher)
+        return lower
+    if is_float_stype(higher) or is_float8_stype(higher):
+        return higher
+    if higher == ST_BOOL or is_float_stype(lower) or is_float8_stype(lower):
         return promote_types(higher, lower)
     if higher != ST_UNDEFINED:
         return higher
     return lower
 
 
+def dtype_category(st: Int32) -> Int:
+    """bool < integral < floating < complex: c10's canCast order (float8 is
+    floating)."""
+    if st == ST_BOOL:
+        return 0
+    if is_complex_stype(st):
+        return 3
+    if is_float_stype(st) or is_float8_stype(st):
+        return 2
+    return 1
+
+
 def can_cast(src: Int32, dst: Int32) -> Bool:
-    """`c10::canCast` over real dtypes: a cast that does not lower the
-    category (bool < integral < floating). What TensorIterator's
+    """`c10::canCast`: a cast that does not lower the category (bool <
+    integral < floating < complex). What TensorIterator's
     `enforce_safe_casting_to_output` asks of an `out=` / in-place output."""
-    var s = 2 if is_float_stype(src) else (0 if src == ST_BOOL else 1)
-    var d = 2 if is_float_stype(dst) else (0 if dst == ST_BOOL else 1)
-    return s <= d
+    return dtype_category(src) <= dtype_category(dst)
+
+
+def has_masked_fill_kernel(st: Int32) -> Bool:
+    """Whether CUDA's masked_fill_ kernel is instantiated for `st`
+    (Indexing.cu's AT_DISPATCH: neither uint16 / uint32 / uint64 nor float8,
+    which where.self has). Its dtype dispatch refuses before the value is
+    converted, so a caller checks this before the value."""
+    return not is_wide_unsigned(st) and not is_float8_stype(st)
+
+
+def refuse_masked_fill_dtype(st: Int32) raises:
+    """masked_fill_'s dtype dispatch error (NotImplementedError) for a
+    dtype `has_masked_fill_kernel` rejects."""
+    if not has_masked_fill_kernel(st):
+        unsupported(
+            '"masked_fill_" not implemented for \'' + scalar_type_name(st) + "'"
+        )
 
 
 def result_type(a: T, b: T) raises -> Int32:
@@ -1018,6 +1211,60 @@ def result_type(a: T, b: T) raises -> Int32:
     else:
         dim = promote_types(dim, b.stype)
     return combine_categories(dim, zero)
+
+
+def scalar_type_name(dt: DType) -> String:
+    """How torch names a ScalarType in an error message (`c10::toString`)."""
+    if dt == DType.float64:
+        return "Double"
+    if dt == DType.float32:
+        return "Float"
+    if dt == DType.float16:
+        return "Half"
+    if dt == DType.bfloat16:
+        return "BFloat16"
+    if dt == DType.int64:
+        return "Long"
+    if dt == DType.int32:
+        return "Int"
+    if dt == DType.int16:
+        return "Short"
+    if dt == DType.int8:
+        return "Char"
+    if dt == DType.uint8:
+        return "Byte"
+    if dt == DType.bool:
+        return "Bool"
+    if dt == DType.uint16:
+        return "UInt16"
+    if dt == DType.uint32:
+        return "UInt32"
+    if dt == DType.uint64:
+        return "UInt64"
+    if dt == DType.float8_e4m3fn:
+        return "Float8_e4m3fn"
+    if dt == DType.float8_e5m2:
+        return "Float8_e5m2"
+    if dt == DType.float8_e4m3fnuz:
+        return "Float8_e4m3fnuz"
+    if dt == DType.float8_e5m2fnuz:
+        return "Float8_e5m2fnuz"
+    if dt == DType.float8_e8m0fnu:
+        return "Float8_e8m0fnu"
+    return String(dt)
+
+
+def decline_float8(dt: DType, kernel: String) raises:
+    """Refuse a float8 operand the way stock CUDA does, naming the CUDA
+    kernel whose AT_DISPATCH has no float8 case (NotImplementedError)."""
+    if is_float8(dt):
+        unsupported(
+            '"'
+            + String(kernel)
+            + "\" not implemented for '"
+            + scalar_type_name(dt)
+            + "'"
+        )
 
 
 def binary_promotion(a: T, b: T) raises -> DType:
@@ -1043,6 +1290,18 @@ def binary_promotion(a: T, b: T) raises -> DType:
     var b_dtype = b.dtype
     if a_dtype == b_dtype:
         return a_dtype
+    if is_float8(a_dtype) or is_float8(b_dtype):
+        # c10::promoteTypes: float8 promotes with no other dtype (bool
+        # included, which the castable-bool branch below would allow).
+        raise Error(
+            (
+                "Promotion for Float8 Types is not supported, attempted to"
+                " promote "
+            ),
+            scalar_type_name(a_dtype),
+            " and ",
+            scalar_type_name(b_dtype),
+        )
     if a_dtype == DType.bool and is_cast_dtype_on(b_dtype, b):
         return b_dtype
     if b_dtype == DType.bool and is_cast_dtype_on(a_dtype, a):
@@ -1125,6 +1384,48 @@ def forward_args(args: Values, n: Int) -> List[Value]:
     return out^
 
 
+def resize_any(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
+    """`resize_output` on an out of any device: a mojo out in place
+    (`resize_out`), a host out by torch's own resize_ on its device (its
+    storage stays where it is). A host out's cached view fields are stale
+    afterwards: the caller reads it again."""
+    if t.on_mojo():
+        resize_out(t, shape, rank)
+        return
+    var sizes = List[Int64](capacity=max(rank, 1))
+    for i in range(rank):
+        sizes.append(Int64(shape[MAX_RANK - rank + i]))
+    var r = call_op(
+        "aten::resize_",
+        "",
+        [
+            tensor_arg(t),
+            Value(TAG_INT_LIST, Int32(rank), Int64(Int(sizes.unsafe_ptr())), 0),
+            none_arg(),
+        ],
+        1,
+    )
+    _ = r^
+    _ = sizes^  # the list is read by the call
+
+
+def store_generated_out(out_v: Value, var src: T) raises -> T:
+    """The tail of torch's generated `out=` wrapper, after the functional
+    result `src` (owned, released here) was computed with all its checks:
+    `resize_out_helper` (resize_output on the out's own device), copy_arg's
+    dtype then device checks, then `copy_` (no internal overlap in the out,
+    then the copy). Returns the out, read again after its resize."""
+    var held = own(src^)
+    var dst = T(Int(out_v.a))
+    if not dst.same_shape(held.t):
+        resize_any(dst, held.t.shape, held.t.rank)
+        dst = T(Int(out_v.a))
+    check_out_as(dst, held.t.stype, held.t)
+    assert_no_internal_overlap(dst)
+    copy_strided_into(dst, held.t)
+    return dst^
+
+
 def store_out(mut dst: T, var src: T) raises:
     """Copy a FRESH functional result (owned, released here) into a caller's
     `out=` tensor: torch's `resize_output` then a strided copy.
@@ -1179,6 +1480,288 @@ def like_layout(var r: Owned, like: T, any_dense: Bool = False) raises -> Owned:
     copy_strided_into(out.t, r.t)
     _ = r^
     return out^
+
+
+def _scalar_to_name(st: Int32) -> String:
+    """The C++ type `Scalar::to<scalar_t>()` names in its overflow error
+    (c10/core/Scalar.h's accessor `#type`), "" for a dtype threshold's
+    kernel does not dispatch on."""
+    if st == ST_UINT8:
+        return "uint8_t"
+    if st == ST_INT8:
+        return "int8_t"
+    if st == ST_INT16:
+        return "int16_t"
+    if st == ST_INT32:
+        return "int"
+    if st == ST_INT64:
+        return "int64_t"
+    if st == ST_FLOAT16:
+        return "c10::Half"
+    if st == ST_BFLOAT16:
+        return "c10::BFloat16"
+    if st == ST_FLOAT32:
+        return "float"
+    return ""
+
+
+def threshold_scalar_overflows(
+    args: Values, first: Int, last: Int, st: Int32
+) raises -> Bool:
+    """Whether `Scalar::to<scalar_t>()` of a threshold Scalar arg in the
+    kernel's dtype `st` trips c10::overflows (c10/util/overflows.h): a bool
+    never; an int against the dtype's range (a negative one wraps into an
+    unsigned dtype while |v| <= its max); a double -- inf and nan convert
+    to a float dtype, never to an integer one, whose range is
+    [lowest, 2^digits)."""
+    if _scalar_to_name(st) == "":
+        return False
+    var is_int = (
+        st == ST_UINT8
+        or st == ST_INT8
+        or st == ST_INT16
+        or st == ST_INT32
+        or st == ST_INT64
+    )
+    var lo: Float64
+    var hi: Float64  # exclusive bound for an integer dtype, inclusive else
+    if st == ST_UINT8:
+        lo, hi = 0.0, 256.0
+    elif st == ST_INT8:
+        lo, hi = -128.0, 128.0
+    elif st == ST_INT16:
+        lo, hi = -32768.0, 32768.0
+    elif st == ST_INT32:
+        lo, hi = -2147483648.0, 2147483648.0
+    elif st == ST_INT64:
+        lo, hi = -9223372036854775808.0, 9223372036854775808.0
+    elif st == ST_FLOAT16:
+        lo, hi = -65504.0, 65504.0
+    elif st == ST_BFLOAT16:
+        lo, hi = -3.3895313892515355e38, 3.3895313892515355e38
+    else:
+        lo, hi = -3.4028234663852886e38, 3.4028234663852886e38
+    for i in range(first, last + 1):
+        var v = args[unsafe_offset=i].copy()
+        if v_scalar_is_bool(v):
+            continue
+        if v_scalar_is_integral(v):
+            var n = v_int(v)
+            if is_int:
+                if st == ST_INT64:
+                    continue
+                var top = Int(hi) - 1
+                if n > top:
+                    return True
+                if st == ST_UINT8:
+                    # A negative wraps while its magnitude fits (compared
+                    # without negating: -(-2**63) overflows).
+                    if n < -top:
+                        return True
+                elif n < Int(lo):
+                    return True
+            elif Float64(n) < lo or Float64(n) > hi:
+                return True
+            continue
+        if v.tag != TAG_SCALAR_DOUBLE:
+            continue
+        var f = v_f64(v)
+        if f != f:
+            if is_int:
+                return True
+            continue
+        if is_int:
+            if f < lo or f >= hi:
+                return True
+        elif abs(f) <= 1.7976931348623157e308 and (f < lo or f > hi):
+            return True
+    return False
+
+
+def threshold_scalar_value(v: Value, st: Int32) raises -> Value:
+    """`Scalar::to<scalar_t>()` of a threshold Scalar (already checked for
+    overflow) as a Scalar record exact in `st`: an integer dtype keeps the
+    int64 (no float on the way), a floating one takes the value C++ makes --
+    an int64 rounded once to float32 (c10::Half / BFloat16 are built from a
+    float; a double only from an int64 directly), a double through float32
+    for Half / BFloat16."""
+    if is_int_stype(st):
+        return Value(TAG_SCALAR_INT, 0, Int64(scalar_to_int(v, st)), 0)
+    var f: Float64
+    if v_scalar_is_integral(v):
+        var i = Int64(v_int(v))
+        if st == ST_FLOAT64:
+            f = i.cast[DType.float64]()
+        else:
+            f = i.cast[DType.float32]().cast[DType.float64]()
+    else:
+        f = v_f64(v)
+        if st == ST_FLOAT32 or st == ST_FLOAT16 or st == ST_BFLOAT16:
+            f = f.cast[DType.float32]().cast[DType.float64]()
+    if st == ST_FLOAT16:
+        f = f.cast[DType.float32]().cast[DType.float16]().cast[DType.float64]()
+    elif st == ST_BFLOAT16:
+        f = f.cast[DType.float32]().cast[DType.bfloat16]().cast[DType.float64]()
+    return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(f), 0)
+
+
+def threshold_scalar_check(
+    args: Values, first: Int, last: Int, st: Int32
+) raises:
+    """Raises c10's `checked_convert` error when a threshold Scalar arg
+    overflows the kernel's dtype `st` (`threshold_scalar_overflows`)."""
+    if threshold_scalar_overflows(args, first, last, st):
+        raise Error(
+            "value cannot be converted to type ",
+            _scalar_to_name(st),
+            " without overflow",
+        )
+
+
+def threshold_into_overlapping(
+    op: StaticString,
+    args: Values,
+    n_in: Int,
+    out_v: Value,
+    rets: Values,
+    force: Bool = False,
+) raises -> Bool:
+    """threshold / threshold_backward build their iterator without the
+    memory-overlap check (threshold is idempotent): an internally
+    overlapping out= (an expanded one) takes the functional result, copied
+    in. False when out is an ordinary tensor."""
+    var dst = v_tensor(out_v)
+    if not dst.on_mojo():
+        return False
+    var self0 = v_tensor(args[unsafe_offset=0])
+    if op == "aten::threshold" and self0.on_cpu() and self0.rank == 0:
+        # threshold's iterator adds self twice (self, other).
+        raise Error("Trying to pass too many CPU scalars to non-CPU kernel!")
+    # Taken when out differs from the plain case: aliasing itself or an
+    # input (no overlap check here), or of another dtype than an input
+    # (the kernel dispatches on out's dtype).
+    var special = force or (dst.numel > 0 and _repeats_elements(dst))
+    for i in range(n_in):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            var t = v_tensor(v)
+            # The same tensor (an in-place self) is the plain path's case.
+            if t.impl() == dst.impl():
+                continue
+            if t.stype != dst.stype or (
+                t.on_mojo() and overlap_status(dst, t) != OVERLAP_NO
+            ):
+                special = True
+    if not special:
+        return False
+    # TensorIterator's sequence for this out= (threshold's config: inputs
+    # promoted to their common dtype, the kernel dispatched on the out
+    # dtype, safe casting enforced): every operand on out's device, the
+    # common dtype castable to out's, the broadcast shape out's own.
+    var common = ST_UNDEFINED
+    var n_t = 0
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    var first = v_tensor(args[unsafe_offset=0])
+    # compute_shape (resizable out skipped) before the device and dtype
+    # checks: infer_size's error, the trailing dims first, in the
+    # iterator's operand order (threshold_backward's is (self, grad)).
+    var bwd = op == "aten::threshold_backward"
+    for j0 in range(n_in):
+        var i = (1 - j0 if j0 < 2 else j0) if bwd else j0
+        var v = args[unsafe_offset=i].copy()
+        if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
+            continue
+        var t = v_tensor(v)
+        rank = max(rank, t.rank)
+        for j in range(MAX_RANK):
+            var k = MAX_RANK - 1 - j
+            if shape[k] == 1:
+                shape[k] = t.shape[k]
+            elif t.shape[k] != 1 and t.shape[k] != shape[k]:
+                raise Error(
+                    "The size of tensor a (",
+                    shape[k],
+                    ") must match the size of tensor b (",
+                    t.shape[k],
+                    ") at non-singleton dimension ",
+                    k - (MAX_RANK - rank),
+                )
+    for i in range(n_in):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
+            continue
+        var t = v_tensor(v)
+        if not t.on_mojo() or t.device != dst.device:
+            raise Error(
+                "Expected all tensors to be on the same device, but found at",
+                " least two devices, ",
+                device_str(dst),
+                " and ",
+                device_str(t),
+                "!",
+            )
+        common = t.stype if n_t == 0 else result_type(first, t)
+        if n_t == 0:
+            first = t.copy()
+        n_t += 1
+    if n_t == 0:
+        return False
+    if not can_cast(common, dst.stype):
+        raise Error(
+            "result type ",
+            scalar_type_name(max_dtype(common)),
+            " can't be cast to the desired output type ",
+            scalar_type_name(dst.dtype),
+        )
+    var aliased = False
+    for i in range(n_in):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            if v_tensor(v).impl() == dst.impl():
+                aliased = True
+    var fits = dst.rank == rank
+    for k in range(MAX_RANK):
+        if dst.shape[k] != shape[k]:
+            fits = False
+    if not fits:
+        if aliased:
+            raise Error(
+                "output with shape ",
+                _shape_list_str(dst.shape, dst.rank),
+                " doesn't match the broadcast shape ",
+                _shape_list_str(shape, rank),
+            )
+        resize_out(dst, shape, rank)
+    # The kernel's dispatch on out's dtype (no bool), then its Scalar
+    # conversion.
+    if dst.stype == ST_BOOL:
+        unsupported("\"threshold_cuda\" not implemented for 'Bool'")
+    if op == "aten::threshold":
+        threshold_scalar_check(args, 1, 2, dst.stype)
+    else:
+        threshold_scalar_check(args, 2, 2, dst.stype)
+    # Computed in out's dtype: every operand converted to it first.
+    var held = List[Owned]()
+    var call_args = List[Value]()
+    for i in range(n_in):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            var t = v_tensor(v)
+            if t.stype != dst.stype:
+                held.append(own(cast_to(t, dst.stype, False)))
+                call_args.append(tensor_arg(held[len(held) - 1].t))
+                continue
+        call_args.append(v^)
+    var r = call_op(String(op), "", call_args^, 1)
+    var res = own(r.take_tensor(0))
+    _ = held^
+    if res.t.stype != dst.stype or not res.t.same_shape(dst):
+        raise Error("internal: threshold result does not match out")
+    copy_strided_into(dst, res.t)
+    _ = res^
+    ret_ref(rets, 0, dst)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1361,7 +1944,11 @@ def cast_complex(t: T, stype: Int32) raises -> T:
     _ = src^
     if stype == re.t.stype:
         return re.take()
-    var out = own(cast_to(re.t, stype))
+    # Never saturating: stock CUDA's SATFINITE e4m3fn conversion is keyed on
+    # a float / half / bfloat16 SOURCE (Copy.cu's float8_copy_kernel_cuda);
+    # a complex source takes its default branch, c10's conversion of the
+    # real part (1000+2j -> NaN).
+    var out = own(cast_to(re.t, stype, saturate=False))
     _ = re^
     return out.take()
 
@@ -1432,6 +2019,20 @@ def check_real_scalar_fits(st: Int32, v: Value) raises:
         or st == ST_INT32
         or st == ST_INT64
     )
+    if is_float8_stype(st) and v.tag == TAG_COMPLEX:
+        # c10::overflows<Float8_*, complex<double>>: a nonzero imaginary part
+        # overflows, else each part is checked as a double (e8m0fnu's lowest
+        # is 2**-127, so even a zero imaginary part overflows it).
+        var c = v_complex(v)
+        if c[1] != 0.0:
+            raise Error(
+                "value cannot be converted to type ",
+                dtype_name(st),
+                " without overflow",
+            )
+        check_float8_scalar(FillScalar(c[0]), max_dtype(st), st)
+        check_float8_scalar(FillScalar(c[1]), max_dtype(st), st)
+        return
     if not known:
         return  # (float8 and the rest: the fill kernels decide)
     var bad = False
@@ -1632,6 +2233,16 @@ def scalar_type_name(st: Int32) -> String:
         return "ComplexFloat"
     if st == ST_COMPLEX128:
         return "ComplexDouble"
+    if st == ST_FLOAT8_E4M3FN:
+        return "Float8_e4m3fn"
+    if st == ST_FLOAT8_E5M2:
+        return "Float8_e5m2"
+    if st == ST_FLOAT8_E4M3FNUZ:
+        return "Float8_e4m3fnuz"
+    if st == ST_FLOAT8_E5M2FNUZ:
+        return "Float8_e5m2fnuz"
+    if st == ST_FLOAT8_E8M0FNU:
+        return "Float8_e8m0fnu"
     return String(st)
 
 

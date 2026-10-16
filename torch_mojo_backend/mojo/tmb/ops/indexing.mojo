@@ -36,6 +36,7 @@ handed to kernels, never to the dispatcher.
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    v_bool_or,
     TAG_COMPLEX,
     IntList,
     Owned,
@@ -78,6 +79,7 @@ from tmb.backend.device import (
     ctx_for,
 )
 from tmb.backend.registry import Site, impl
+from tmb.kernels.common.float8 import is_float8
 from tmb.ops.complex import (
     cx_fill_tensor_,
     cx_flip,
@@ -90,6 +92,7 @@ from tmb.ops.complex import (
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    decline_float8,
     uint64_cross_item,
     check_real_scalar_fits,
     real_fill_value,
@@ -353,6 +356,8 @@ def _roll_into(dst: T, src: T, starts: List[Int]) raises:
 # aten::roll(Tensor self, SymInt[1] shifts, int[1] dims=[]) -> Tensor
 def op_roll(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
+    if a.numel > 0:  # CUDA returns an empty roll before its dispatch
+        decline_float8(a.dtype, "roll_cuda")
     var shifts = IntList(args[unsafe_offset=1])
     var dims = IntList(args[unsafe_offset=2])
     if len(shifts) == 0:
@@ -618,6 +623,9 @@ def _take_into(dst: T, a: T, index: T) raises:
     """dst (contiguous, index's shape) = a.flatten()[index]."""
     if index.numel == 0:
         return
+    # CUDA's take_cuda dispatch runs past the checks, the overlap checks and
+    # out's resize; an empty take never dispatches.
+    decline_float8(a.dtype, "take_cuda")
     var idx = _wrapped_index(index, a.numel)
     var src = own_if_new(contiguous(a), a)
     _gather_dim_launch(
@@ -1155,6 +1163,8 @@ def op_masked_scatter_(
     if a.numel == 0:
         ret_ref(rets, 0, a)
         return
+    # CUDA's float8 refusal comes after its checks and empty early return.
+    decline_float8(a.dtype, "masked_scatter_")
     var n = a.numel
     # The broadcast mask, dense in self's logical order.
     var m = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
@@ -1355,6 +1365,16 @@ def _reduction(reduce: String, new_options: Bool) raises -> Int:
 
 
 def _reduce_dtype_check(a: T, red: Int, what: String) raises:
+    if is_float8(a.dtype):
+        # The message CUDA's reducing scatter gives for float8 (index_reduce
+        # names its own kernels, in `_index_reduce_op`).
+        if what == "index_reduce":
+            return
+        unsupported(
+            '"cuda_scatter_gather_base_kernel_func" not implemented for \''
+            + _scalar_type_name(a.dtype)
+            + "'"
+        )
     if not _is_scatter_add_dtype(a.dtype):
         unsupported(
             "aten::"
@@ -1614,7 +1634,9 @@ def _scatter_reduce_op(
     if include_self_pos >= 0:
         include_self = v_bool(args[unsafe_offset=include_self_pos])
     var dim = _scatter_validate(a, dim_in, index, src, False)
-    if red != 0:
+    if red != 0 and not (is_float8(a.dtype) and index.numel == 0):
+        # (A float8 reduce over an empty index never reaches CUDA's dtype
+        # dispatch: an unchanged copy of self.)
         _reduce_dtype_check(a, red, what)
         # CUDA's alerts: prod always; the legacy add / multiply kernel
         # unless a floating add takes the deterministic index_put route
@@ -1942,6 +1964,18 @@ def _index_reduce_op(
         source,
         v_string(args[unsafe_offset=4]),
     )
+    if is_float8(a.dtype):
+        # CUDA's two index_reduce kernels, neither with a float8 case.
+        var kernel = String("index_reduce") if v_bool_or(
+            args[unsafe_offset=5], True
+        ) else String("index_reduce_func_cuda_exclude_input_init")
+        unsupported(
+            '"'
+            + kernel
+            + "\" not implemented for '"
+            + _scalar_type_name(a.dtype)
+            + "'"
+        )
     var dim = checked[0]
     var red = checked[1]
     var include_self = v_bool(args[unsafe_offset=5])
@@ -2159,6 +2193,28 @@ def op_fill__tensor(
             value.rank,
             " dimensions.",
         )
+    if is_float8(t.dtype) and value.on_mojo() and value.device == t.device:
+        # A same-device value is a `copy_` (no range check): for a float8
+        # self that is copy_'s conversion, saturation included, so cast it
+        # on the device and copy that one element everywhere.
+        assert_no_internal_overlap(t)
+        var cv = own_if_new(cast_to(value, t.stype), value)
+        var expanded = own(
+            view_strided(
+                cv.t, t.shape, IndexList[MAX_RANK](0), t.rank, cv.t.offset
+            )
+        )
+        if t.numel > 0:
+            _ = call_op(
+                "aten::copy_",
+                "",
+                [tensor_arg(t), tensor_arg(expanded.t), bool_arg(False)],
+                1,
+            )
+        _ = expanded^
+        _ = cv^
+        ret_ref(rets, 0, t)
+        return
     # The value is read once, on the host (a device value costs one sync,
     # where CUDA copies on the stream), then filled with fill_.Scalar's
     # conversion rules. Reading it first also covers a value aliasing self.

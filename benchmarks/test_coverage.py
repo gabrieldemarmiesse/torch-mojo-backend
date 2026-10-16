@@ -41,11 +41,14 @@ OPS_DIR = BENCH_DIR.parent / "torch_mojo_backend" / "mojo" / "tmb" / "ops"
 # registration (see agents_docs/native_backend.md): the backend registers its ops
 # from Mojo, so the list is read from the source rather than imported.
 # `impl[op_x, "name.overload"](site)` in each register_<group> (registry.mojo),
-# the op possibly a parametric instance (`op_pad[True, 1, False]`, one level
-# of nesting: `routed[op_any, cx_via_bool["any", "", 1], 1]`); the formatter
-# may break the call over several lines
+# the op possibly a parametric instance (`op_pad[True, 1, False]`, up to two
+# levels of nesting: `routed[op_any, cx_via_bool["any", "", 1], 1]`, and that
+# inside the float8 funnel, `f8_iter[routed[...], "kernel", ...]`); the
+# formatter may break the call over several lines
 _IMPL_RE = re.compile(
-    r'impl\[\s*\w+(?:\[(?:[^\[\]]|\[[^\]]*\])*\])?\s*,\s*"([^"]+)"\s*,?\s*\]\s*\(', re.S
+    r"impl\[\s*\w+(?:\[(?:[^\[\]]|\[(?:[^\[\]]|\[[^\]]*\])*\])*\])?"
+    r'\s*,\s*"([^"]+)"\s*,?\s*\]\s*\(',
+    re.S,
 )
 
 

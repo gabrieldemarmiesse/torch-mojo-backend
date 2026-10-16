@@ -20,12 +20,10 @@ from tmb.ops.complex import (
     _TO_RE,
     _bshape,
     _broadcast_into,
-    _category,
     _dims_of,
     _first_tensor,
     _flatten,
     _host_value,
-    _is_float,
     _one_device,
     _part,
     _require_same_device,
@@ -34,7 +32,6 @@ from tmb.ops.complex import (
     _result_type,
     _ret,
     _same_device,
-    _st_name,
     _store,
     _store_ew,
     _store_ew_n,
@@ -48,6 +45,10 @@ from tmb.ops.complex import (
     cx_unary_out,
 )
 from tmb.ops.common import (
+    assert_no_internal_overlap,
+    can_cast,
+    is_float_stype,
+    scalar_type_name,
     scalar_parts,
     scalar_type_token,
     device_str,
@@ -90,6 +91,7 @@ from tmb.backend.abi import (
     dtype_name,
     f64_bits,
     is_complex_stype,
+    is_float8_stype,
     new_tensor,
     own,
     own_if_new,
@@ -276,9 +278,9 @@ def cx_unary_same_out[
     if dest.stype != x.stype:
         raise Error(
             "Found dtype ",
-            _st_name(dest.stype),
+            scalar_type_name(dest.stype),
             " but expected ",
-            _st_name(x.stype),
+            scalar_type_name(x.stype),
         )
     _store_ew[1](args, dest, _unary(kind, _TO_CX, x), rets)
 
@@ -674,18 +676,18 @@ def cx_to_real_out[
                 return
         raise Error(
             "Found dtype ",
-            _st_name(dest.stype),
+            scalar_type_name(dest.stype),
             " but expected ",
-            _st_name(x.stype),
+            scalar_type_name(x.stype),
         )
     if is_complex_stype(dest.stype):
         # (the dtype check first, then the device check, as CUDA orders them)
         if kind == "abs" and dest.stype != x.stype:
             raise Error(
                 "Found dtype ",
-                _st_name(dest.stype),
+                scalar_type_name(dest.stype),
                 " but expected ",
-                _st_name(x.stype),
+                scalar_type_name(x.stype),
             )
         if not x.on_mojo():
             raise Error(
@@ -718,6 +720,9 @@ def cx_to_real_out[
     rz.none()
     _ = rz.run(1)
     var dest2 = v_tensor_c(args[unsafe_offset=1])
+    # copy_'s own first check, raised here without the nested call's
+    # "aten::copy_:" prefix
+    assert_no_internal_overlap(dest2)
     var cp = _Call("aten::copy_")
     cp.t(dest2)
     cp.t(res.t)
@@ -830,16 +835,16 @@ def _make_dtype(name: StaticString, re: T, im: T) raises -> Int32:
     if not _make_float(re.stype) or not _make_float(im.stype):
         raise Error(
             "Expected both inputs to be Half, Float or Double tensors but got ",
-            _st_name(re.stype),
+            scalar_type_name(re.stype),
             " and ",
-            _st_name(im.stype),
+            scalar_type_name(im.stype),
         )
     if re.stype != im.stype:
         raise Error(
             "Expected object of scalar type ",
-            _st_name(re.stype),
+            scalar_type_name(re.stype),
             " but got scalar type ",
-            _st_name(im.stype),
+            scalar_type_name(im.stype),
             " for second argument",
         )
     if re.stype == ST_FLOAT16:
@@ -875,9 +880,9 @@ def _make_op(
     if dest.stype != st:
         raise Error(
             "Expected object of scalar type ",
-            _st_name(st),
+            scalar_type_name(st),
             " but got scalar type ",
-            _st_name(dest.stype),
+            scalar_type_name(dest.stype),
             " for argument 'out'",
         )
     _store_ew[2](args, dest, _make(kind, re, im, st), rets)
@@ -929,10 +934,12 @@ def _reduce(
     column reduction rounded 7x worse on a 1M-element sum), viewed back as
     complex. A real one: x converted to it first (keeping the real part,
     with torch's warning), then the real reduction."""
+    # float8 is a floating dtype for these checks (c10's isFloatingType)
     if (
         name == "mean"
         and dtype_v.tag == TAG_NONE
-        and not _is_float(x.stype)
+        and not is_float_stype(x.stype)
+        and not is_float8_stype(x.stype)
         and not x.is_complex()
     ):
         # mean_dtype_out / meta: no dtype= to compute an integer mean in
@@ -941,17 +948,21 @@ def _reduce(
                 "mean(): could not infer output dtype. Input dtype must be"
                 " either a floating point or complex dtype. Got: "
             ),
-            _st_name(x.stype),
+            scalar_type_name(x.stype),
         )
     if name == "mean" and dtype_v.tag != TAG_NONE:
         var asked = v_dtype_or(dtype_v, x.stype)
-        if not _is_float(asked) and not is_complex_stype(asked):
+        if (
+            not is_float_stype(asked)
+            and not is_float8_stype(asked)
+            and not is_complex_stype(asked)
+        ):
             raise Error(
                 (
                     "mean(): could not infer output dtype. Optional dtype must"
                     " be either a floating point or complex dtype. Got: "
                 ),
-                _st_name(asked),
+                scalar_type_name(asked),
             )
     var dims = _dims_of(dim_v, x.rank)  # validated on the complex rank
     for i in range(len(dims)):
@@ -979,7 +990,16 @@ def _reduce(
         return r^
     var overload = String("dim_IntList") if name == "sum" else String("dim")
     if not is_complex_stype(want):
-        if not _is_float(want):
+        if is_float8_stype(want):
+            # the reduction kernel's dtype dispatch (sum_cuda, mean_cuda)
+            unsupported(
+                '"'
+                + name
+                + "_cuda\" not implemented for '"
+                + scalar_type_name(want)
+                + "'"
+            )
+        if not is_float_stype(want):
             # a complex reduction into a bool / integer dtype or out: not
             # emulated (declined after CUDA's own checks, before the out is
             # touched)
@@ -1143,13 +1163,13 @@ def cx_mean_dtype_out(
     """mean.dtype_out(self, *, dtype, out)"""
     var dest = v_tensor_c(args[unsafe_offset=2])
     var x = v_tensor_c(args[unsafe_offset=0])
-    if _category(x.stype) > _category(dest.stype):
+    if not can_cast(x.stype, dest.stype):
         raise Error(
             (
                 "mean.dtype_out(): input types can't be cast to the desired"
                 " output type "
             ),
-            _st_name(dest.stype),
+            scalar_type_name(dest.stype),
         )
     _store_red(
         dest,
@@ -1179,30 +1199,6 @@ def cx_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
-def cx_rsub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    """rsub.Tensor_out / rsub.Scalar_out(self, other, *, alpha, out)"""
-    if _real_out(
-        "aten::rsub",
-        _tensor_or_scalar(args[unsafe_offset=1], "Tensor", "Scalar"),
-        args,
-        3,
-        3,
-        rets,
-    ):
-        return
-    # rsub.*_out is a generated wrapper: the functional result, the out's
-    # exact dtype, then resize and copy (no overlap check with the inputs)
-    var dest = v_tensor_c(args[unsafe_offset=3])
-    var res = _arith(
-        "sub",
-        args[unsafe_offset=1],
-        args[unsafe_offset=0],
-        args[unsafe_offset=2].copy(),
-    )
-    _exact_dtype(dest, res.t.stype)
-    _store(dest, res^, rets)
-
-
 def _cumsum(args: Values, out_st: Int32 = -1) raises -> Owned:
     """cumsum(self, dim, *, dtype) with a complex self, dtype= or out=. The
     accumulation dtype is dtype=, else the out='s dtype, else self's
@@ -1221,7 +1217,13 @@ def _cumsum(args: Values, out_st: Int32 = -1) raises -> Owned:
             dtype_name(out_st),
             " instead",
         )
-    if not is_complex_stype(want) and not _is_float(want):
+    if is_float8_stype(want):
+        unsupported(
+            '"cumsum_cuda" not implemented for \''
+            + scalar_type_name(want)
+            + "'"
+        )
+    if not is_complex_stype(want) and not is_float_stype(want):
         # a complex scan into a bool / integer dtype or out: not emulated
         # (declined before the out is touched)
         unsupported(

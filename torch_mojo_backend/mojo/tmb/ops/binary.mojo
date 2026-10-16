@@ -22,8 +22,9 @@ from std.utils import IndexList
 from std.utils.numerics import nan
 
 from tmb.backend.abi import (
+    is_float8_stype,
+    max_dtype,
     DEVICE_TYPE_CPU,
-    is_complex_stype,
     ST_BFLOAT16,
     ST_BOOL,
     ST_FLOAT16,
@@ -70,9 +71,14 @@ from tmb.backend.abi import (
 )
 from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
+from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    out_device_error,
+    is_cast_pair_on,
+    decline_float8,
     ST_UNDEFINED,
+    scalar_type_name,
     assert_no_internal_overlap,
     combine_categories,
     known_stype,
@@ -83,13 +89,31 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     is_cast_dtype_on,
-    is_float_stype,
     is_int_stype,
     resize_out,
     scalar_to_float,
     scalar_to_int,
 )
 from tmb.ops.core import cast_for_copy
+from tmb.ops.f8_iter import (
+    _alpha_check,
+    f8_cx_scalar,
+    f8_iter,
+    MODE_CAST,
+    MODE_FN,
+    MODE_INPLACE,
+    MODE_NOCHECK,
+    MODE_OUTDT,
+    MODE_SAME,
+    PRE_BOOL_OUT,
+    PRE_DIV_MODE,
+    PRE_HEAVISIDE,
+    PRE_LDEXP,
+    PRE_NAN_TO_NUM,
+    PRE_NO_COMPLEX,
+    PRE_NONE,
+    PRE_SUB,
+)
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
     cx_via_bool,
@@ -178,7 +202,7 @@ def _b_category(st: Int32) -> Int:
     """torch's promotion category: bool < integral < floating."""
     if st == ST_BOOL:
         return 0
-    if _b_float3(st) or st == ST_FLOAT64:
+    if _b_float3(st) or st == ST_FLOAT64 or is_float8_stype(st):
         return 2
     return 1
 
@@ -198,6 +222,14 @@ def _b_promote(a: T, b: T) raises -> Int32:
     """
     if a.stype == b.stype:
         return a.stype
+    if is_float8_stype(a.stype) or is_float8_stype(b.stype):
+        # c10's rules: raises for a float8 meeting another dimensioned
+        # dtype, a 0-dim one of a lower category yields to it.
+        var f8 = result_type(a, b)
+        var other = b.copy() if is_float8_stype(a.stype) else a.copy()
+        if f8 != other.stype and not _b_castable_on(other.stype, other):
+            return Int32(-1)
+        return f8
     if not known_stype(a.stype) or not known_stype(b.stype):
         return Int32(-1)
     var r = result_type(a, b)
@@ -248,6 +280,12 @@ def _b_host_scalar(t: T) raises -> Scal:
     if t.dtype == DType.float16:
         var vh = Float64(p.unsafe_bitcast[Float16]()[])
         return Scal(vh, Int(vh), False, False)
+    if is_float8(t.dtype):
+        # A CPU 0-d float8 (a promotion operand): its exact value.
+        var v8 = fp8_bits_to_f64(t.dtype, p[])
+        return Scal(
+            v8, Int(v8) if v8 == v8 and abs(v8) < 1e18 else 0, False, False
+        )
     var k: Int = 0
     if t.dtype == DType.int64:
         k = Int(p.unsafe_bitcast[Int64]()[])
@@ -314,6 +352,62 @@ def _b_side_result(t: T, side: Side) raises -> Int32:
             ST_INT64 if s.is_int else default_dtype()
         )
     return combine_categories(dim, combine_categories(zero, wrapped))
+
+
+def _b_sides_result(a: Side, b: Side, c: Side) raises -> Int32:
+    """`torch.result_type` over up to three operand sides (tensor, 0-d CPU
+    tensor or Python Scalar), as TensorIterator's ResultTypeState folds."""
+    var dim = ST_UNDEFINED
+    var zero = ST_UNDEFINED
+    var wrapped = ST_UNDEFINED
+    for k in range(3):
+        var side = a.copy() if k == 0 else (b.copy() if k == 1 else c.copy())
+        if side.is_t:
+            var t = side.t.value().copy()
+            if t.rank == 0:
+                zero = promote_types(zero, t.stype)
+            else:
+                dim = promote_types(dim, t.stype)
+        elif side.zero_st >= 0:
+            zero = promote_types(zero, side.zero_st)
+        else:
+            var s = side.s.value().copy()
+            wrapped = promote_types(
+                wrapped,
+                ST_BOOL if s.is_bool else (
+                    ST_INT64 if s.is_int else default_dtype()
+                ),
+            )
+    return combine_categories(dim, combine_categories(zero, wrapped))
+
+
+def _b_any_float8(a: Side, b: Side, c: Side) -> Bool:
+    return _b_side_float8(a) or _b_side_float8(b) or _b_side_float8(c)
+
+
+def _b_side_float8(side: Side) -> Bool:
+    if side.is_t:
+        return is_float8_stype(side.t.value().stype)
+    return is_float8_stype(side.zero_st)
+
+
+def _b_shape_is(t: T, shape: IndexList[MAX_RANK], rank: Int) -> Bool:
+    if t.rank != rank:
+        return False
+    for i in range(MAX_RANK):
+        if t.shape[i] != shape[i]:
+            return False
+    return True
+
+
+def _b_f8_refuse(kernel: StaticString, a: Side, b: Side) raises:
+    """CUDA's `<kernel>` dispatch has no float8 case: refuse when the
+    operands' result type is float8."""
+    if not _b_any_float8(a, b, b):
+        return
+    var common = _b_sides_result(a, b, b)
+    if is_float8_stype(common):
+        decline_float8(max_dtype(common), String(kernel))
 
 
 def _b_side(v: Value) raises -> Side:
@@ -406,7 +500,9 @@ def _b_hold(t: T) -> Held:
 def _b_cast(t: T, st: Int32) raises -> Held:
     if t.stype == st:
         return Held(t.copy(), False)
-    if not (_b_castable_on(t.stype, t) and _b_castable_on(st, t)):
+    if not (
+        _b_castable_on(t.stype, t) and _b_castable_on(st, t)
+    ) and not is_cast_pair_on(t.dtype, max_dtype(st), t):
         unsupported(
             "a cast from dtype "
             + String(t.stype)
@@ -414,7 +510,8 @@ def _b_cast(t: T, st: Int32) raises -> Held:
             + String(st)
             + " on the mojo device"
         )
-    return Held(cast_to(t, st), True)
+    # A promotion, not a copy_: no e4m3fn saturation.
+    return Held(cast_to(t, st, False), True)
 
 
 def _b_ready(t: T, st: Int32, need_contig: Bool) raises -> Held:
@@ -898,6 +995,32 @@ struct Res(Copyable, Movable):
     var owned: Bool
 
 
+def _b_cuda_kernel(op: StaticString) -> String:
+    """The CUDA kernel name a float8 refusal of `op` quotes."""
+    var kernel = String(op)
+    if op == "AddSpec" or op == "SubSpec":
+        kernel = "ufunc_add_CUDA"
+    elif op == "MulSpec":
+        kernel = "mul_cuda"
+    elif op == "DivSpec":
+        kernel = "div_true_cuda"
+    elif op == "PowSpec":
+        kernel = "pow_cuda"
+    elif op == "RemainderSpec":
+        kernel = "remainder_cuda"
+    elif op == "MaximumSpec":
+        kernel = "max_elementwise_cuda"
+    elif op == "MinimumSpec":
+        kernel = "min_elementwise_cuda"
+    elif op == "BitwiseAndSpec":
+        kernel = "bitwise_and_cuda"
+    elif op == "BitwiseOrSpec":
+        kernel = "bitwise_or_cuda"
+    elif op == "BitwiseXorSpec":
+        kernel = "bitwise_xor_cuda"
+    return kernel
+
+
 def _b_op_dtype_ok(op: StaticString, st: Int32, is_cmp: Bool) raises:
     """The dtype checks `_binary_spec_into_go` makes, made here instead so a
     declined pair never triggers a kernel build."""
@@ -912,6 +1035,17 @@ def _b_op_dtype_ok(op: StaticString, st: Int32, is_cmp: Bool) raises:
             unsupported("bool operands for " + String(op))
         return
     if not _b_bcast_dtype(st):
+        if st == 23 or st == 24 or st == 25 or st == 26 or st == 44:
+            # (torch's five float8 ScalarTypes)
+            # CUDA's own refusal for the common float8 arithmetic.
+            var kernel = _b_cuda_kernel(op)
+            unsupported(
+                '"'
+                + kernel
+                + "\" not implemented for '"
+                + scalar_type_name(max_dtype(st))
+                + "'"
+            )
         unsupported("dtype " + String(st) + " for " + String(op))
     if op == "DivSpec" or op == "PowSpec":
         if not (_b_float3(st) or st == ST_FLOAT64):
@@ -1204,19 +1338,13 @@ def _b_store_out(
         return
     var held = own(res.t.copy())
     if exact_dtype and held.t.stype != dest.stype:
-        raise Error(
-            "Expected out tensor to have dtype ",
-            dtype_name(held.t.stype),
-            ", but got ",
-            dtype_name(dest.stype),
-            " instead",
-        )
+        _b_found_dtype_error(dest.stype, held.t.stype)
     if not _b_can_cast(held.t.stype, dest.stype):
         raise Error(
             "result type ",
-            dtype_name(held.t.stype),
+            _b_tname(held.t.stype),
             " can't be cast to the desired output type ",
-            dtype_name(dest.stype),
+            _b_tname(dest.stype),
         )
     var dst = dest.copy()
     if not dst.same_shape(held.t):
@@ -1230,7 +1358,7 @@ def _b_store_out(
         # cast_for_copy, not cast_to: `_b_can_cast` admits every pair torch's
         # own out= does (int32 into a float64 `out`), CastSpec only its
         # CAST_DTYPES; the rest round-trip through the host like `copy_`.
-        var casted = own(cast_for_copy(held.t, dst.stype))
+        var casted = own(cast_for_copy(held.t, dst.stype, False))
         _b_copy_into(dst, casted.t)
         _ = casted^  # alive past the launch
     _ = held^
@@ -1258,13 +1386,8 @@ def _b_store_inplace(rets: Values, self: T, var res: Res) raises:
         # the cast is category-safe: float16.add_(float32) is float16,
         # int64.add_(float32) raises.
         if not _b_can_cast(held.t.stype, self.stype):
-            raise Error(
-                "result type ",
-                dtype_name(held.t.stype),
-                " can't be cast to the desired output type ",
-                dtype_name(self.stype),
-            )
-        var casted = own(cast_for_copy(held.t, self.stype))
+            _b_cast_error(held.t.stype, self.stype)
+        var casted = own(cast_for_copy(held.t, self.stype, False))
         _b_copy_into(self, casted.t)
         _ = casted^  # alive past the launch
     _ = held^  # alive past the launch
@@ -1276,11 +1399,9 @@ def _b_out_tensor(v: Value, device: Int) raises -> T:
     elements at one address (`at::assert_no_internal_overlap`, which every
     TensorIterator op with `check_mem_overlap` runs)."""
     var out = v_tensor(v)
-    if not out.on_mojo():
-        raise Error("expected `out` to be a mojo tensor")
-    if out.device != device:
-        raise Error("expected `out` and the inputs on the same mojo device")
-    assert_no_internal_overlap(out)
+    assert_no_internal_overlap(out)  # compute_mem_overlaps, then the device
+    if not out.on_mojo() or out.device != device:
+        out_device_error(device, out)
     return out^
 
 
@@ -1362,12 +1483,36 @@ def _b_shape_list(shape: IndexList[MAX_RANK], rank: Int) -> String:
     return s + "]"
 
 
-def _b_out_guard(dest: T, a: Side, b: Side) raises:
+def _b_tname(st: Int32) raises -> String:
+    return scalar_type_name(max_dtype(st))
+
+
+def _b_cast_error(result: Int32, out_st: Int32) raises:
+    """TensorIterator's compute_types check (stock CUDA wording)."""
+    raise Error(
+        "result type ",
+        _b_tname(result),
+        " can't be cast to the desired output type ",
+        _b_tname(out_st),
+    )
+
+
+def _b_found_dtype_error(out_st: Int32, expected: Int32) raises:
+    """TensorIterator's check_dtype for an out= that must hold the result's
+    own dtype (stock CUDA wording)."""
+    raise Error(
+        "Found dtype ", _b_tname(out_st), " but expected ", _b_tname(expected)
+    )
+
+
+def _b_out_guard(dest: T, a: Side, b: Side, common_out: Bool = True) raises:
     """`_b_out_guard3` of a binary op."""
-    _b_out_guard3(dest, a, b, b)
+    _b_out_guard3(dest, a, b, b, common_out)
 
 
-def _b_out_guard3(dest: T, a: Side, b: Side, c: Side) raises:
+def _b_out_guard3(
+    dest: T, a: Side, b: Side, c: Side, common_out: Bool = True
+) raises:
     """TensorIterator's `out=` meta against the inputs, before anything is
     written or resized:
 
@@ -1404,6 +1549,21 @@ def _b_out_guard3(dest: T, a: Side, b: Side, c: Side) raises:
                     i - (MAX_RANK - rank),
                 )
     if not read_write:
+        # A float8 computation is refused by the kernel dispatch, after
+        # TensorIterator resized `out` (compute_types' checks first).
+        # `common_out`: the output holds the common dtype (not a
+        # comparison's / logical op's bool), so compute_types' canCast
+        # check applies -- before any resize.
+        if not common_out or not _b_any_float8(a, b, c):
+            return
+        var common = _b_sides_result(a, b, c)
+        if not is_float8_stype(common):
+            return
+        if not _b_can_cast(common, dest.stype):
+            _b_cast_error(common, dest.stype)
+        if not _b_shape_is(dest, shape, rank):
+            var d = dest.copy()
+            resize_out(d, shape, rank)
         return
     var fits = dest.rank == rank
     for i in range(MAX_RANK):
@@ -1454,48 +1614,12 @@ def _b_common(lhs: Side, rhs: Side) raises -> Int32:
     return -1
 
 
-def _b_is_bool_side(side: Side) -> Bool:
-    if side.is_t:
-        return side.t.value().stype == ST_BOOL
-    return side.s.value().is_bool
-
-
-def _b_sub_check(lhs: Side, rhs: Side) raises:
-    """BinaryOps.h `sub_check`: no bool operand (a bool Scalar included)."""
-    var a = _b_is_bool_side(lhs)
-    var b = _b_is_bool_side(rhs)
-    if a and b:
-        raise Error(
-            "Subtraction, the `-` operator, with two bool tensors is not"
-            " supported. Use the `^` or `logical_xor()` operator instead."
-        )
-    if a or b:
-        raise Error(
-            "Subtraction, the `-` operator, with a bool tensor is not"
-            " supported. If you are trying to invert a mask, use the `~` or"
-            " `logical_not()` operator instead."
-        )
-
-
 def _b_alpha_check(common: Int32, alpha_v: Value) raises:
-    """BinaryOps.h `alpha_check` against the result dtype `common` (skipped
-    when the promotion was declined: the op declines later)."""
-    if common < 0:
-        return
-    var tag = alpha_v.tag
-    if (tag == TAG_SCALAR_BOOL or tag == TAG_BOOL) and common != ST_BOOL:
-        raise Error("Boolean alpha only supported for Boolean results.")
-    var floating = is_float_stype(common) or is_complex_stype(common)
-    if (tag == TAG_SCALAR_DOUBLE or tag == TAG_DOUBLE) and not floating:
-        raise Error(
-            "For integral input tensors, argument alpha must not be a"
-            " floating point number."
-        )
-    if tag == TAG_COMPLEX and not is_complex_stype(common):
-        raise Error(
-            "For non-complex input tensors, argument alpha must not be a"
-            " complex number."
-        )
+    """BinaryOps.h `alpha_check` (f8_iter's `_alpha_check`) against the
+    result dtype `common`, skipped when the promotion was declined (-1):
+    the op then declines on its own."""
+    if common >= 0:
+        _alpha_check(common, alpha_v)
 
 
 def _b_alpha_is_one(alpha_v: Value) -> Bool:
@@ -1641,6 +1765,58 @@ def _b_sub(
     var res = _b_sub_routes(lhs, _b_tside(scaled.t), dst)
     _ = scaled
     return res^
+
+
+def _b_is_bool_side(side: Side) -> Bool:
+    if side.is_t:
+        return side.t.value().stype == ST_BOOL
+    if side.zero_st >= 0:
+        return side.zero_st == ST_BOOL
+    return side.s.value().is_bool
+
+
+def _b_sub_check(lhs: Side, rhs: Side) raises:
+    """BinaryOps.cpp's sub_check, before any dtype dispatch."""
+    var a = _b_is_bool_side(lhs)
+    var b = _b_is_bool_side(rhs)
+    if a and b:
+        raise Error(
+            "Subtraction, the `-` operator, with two bool tensors is not"
+            " supported. Use the `^` or `logical_xor()` operator instead."
+        )
+    if a or b:
+        raise Error(
+            "Subtraction, the `-` operator, with a bool tensor is not"
+            " supported. If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+
+
+def _b_pow_float8(lhs: Side, rhs: Side) raises -> Optional[Res]:
+    """pow.Tensor_Scalar of a float8 base (Pow.cpp's pow_out): an exponent
+    of 0 / False fills ones and 1 / True copies, with no kernel; any other
+    reaches pow_cuda, which has no float8 case. None when not float8."""
+    if not lhs.is_t or rhs.is_t:
+        return None
+    var t = lhs.t.value().copy()
+    if not is_float8(t.dtype):
+        return None
+    var s = rhs.s.value().copy()
+    var e = Float64(
+        1.0 if s.is_bool
+        and s.f
+        != 0 else (0.0 if s.is_bool else (Float64(s.i) if s.is_int else s.f))
+    )
+    if e == 0.0:
+        var ones = own(new_like(t))
+        fill_value(ones.t, 1.0)
+        return Res(ones.take(), True)
+    if e == 1.0:
+        var c = own(new_like(t))
+        copy_strided_into(c.t, t)
+        return Res(c.take(), True)
+    decline_float8(t.dtype, "pow_cuda")
+    return None
 
 
 def _b_mul(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
@@ -1830,34 +2006,6 @@ def _rsub_promote(lhs: Side, rhs: Side) raises -> Optional[T]:
     return casted^
 
 
-# aten::rsub.Tensor_out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
-# aten::rsub.Scalar_out(Tensor self, Scalar other, Scalar alpha=1, *, Tensor(a!) out) -> Tensor(a!)
-def op_rsub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var lhs = _b_side(args[unsafe_offset=1])
-    var rhs = _b_side(args[unsafe_offset=0])
-    var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
-    _b_out_guard(dest, lhs, rhs)
-    # rsub's out dtype is the result's own (sub's structured meta with
-    # `out` built from self): no cast into another dtype.
-    if v_f64(args[unsafe_offset=2]) == 1.0:
-        # The functional op's one launch, so `out=` rounds the same way
-        # (`other` stays in opmath instead of being embedded in self's
-        # dtype first: float16 self with other=1.0001).
-        var fast = _b_try_scalar(
-            "RsubScalarSpec", rhs, lhs, False, Optional[T](dest.copy())
-        )
-        if fast.__bool__():
-            _b_store_out(rets, dest, fast.value().copy(), exact_dtype=True)
-            return
-    var promoted = _rsub_promote(lhs, rhs)
-    if promoted:
-        rhs = _b_tside(promoted.value())
-    var r = _b_sub(lhs, rhs, args[unsafe_offset=2], Optional[T](dest.copy()))
-    if promoted:
-        release(promoted.value().h)
-    _b_store_out(rets, dest, r^, exact_dtype=True)
-
-
 # aten::mul.Tensor(Tensor self, Tensor other) -> Tensor
 def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if _b_fast_route("MulSpec", "MulScalarSpec", False, args, rets, 0):
@@ -2016,6 +2164,7 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
         unsupported("div rounding_mode " + name)
     if not lhs.is_t:
         unsupported("div with a scalar numerator")
+    _b_f8_refuse("div_true_cuda", lhs, rhs)
     var a = lhs.t.value().copy()
     var common = _b_true_div_dtype(a, rhs)
     # float64 included: DivSpec dispatches on logic SPEC_BCAST_DTYPES,
@@ -2204,13 +2353,31 @@ def _b_simple_out(
         args[unsafe_offset=out_index], _b_device_of(lhs, rhs)
     )
     _b_out_guard(dest, lhs, rhs)
+    if (
+        op == "BitwiseAndSpec"
+        or op == "BitwiseOrSpec"
+        or op == "BitwiseXorSpec"
+    ):
+        var w = _b_f8_into_out(lhs, rhs, Optional[T](dest.copy()))
+        if w:
+            # Dispatched on the out dtype, which is floating here.
+            unsupported(
+                '"'
+                + _b_cuda_kernel(op)
+                + "\" not implemented for '"
+                + _b_tname(w.value())
+                + "'"
+            )
     _b_store_out(
         rets, dest, _b_binary(op, lhs, rhs, Int32(-1), Optional[T](dest.copy()))
     )
 
 
-def _b_pow_float_base(lhs: Side) raises:
+def _b_pow_float_base(lhs: Side, rhs: Side) raises:
     # The kernel raises on integers, which would leave the output unwritten.
+    if lhs.is_t and is_float8(lhs.t.value().dtype):
+        _ = _b_sides_result(lhs, rhs, rhs)  # c10's float8 promotion error
+        decline_float8(lhs.t.value().dtype, "pow_cuda")
     if not lhs.is_t or not _b_is_floating(lhs.t.value().stype):
         unsupported("pow.Tensor_Tensor on a tensor that is not float")
 
@@ -2221,6 +2388,10 @@ def op_pow_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         return
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
+    var f8 = _b_pow_float8(lhs, rhs)
+    if f8:
+        _b_ret(rets, f8.value().copy())
+        return
     var r = _b_try_scalar("PowScalarSpec", lhs, rhs, False, None)
     if r.__bool__():
         _b_ret(rets, r.value().copy())
@@ -2249,6 +2420,10 @@ def op_pow_scalar_out(
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
+    var f8 = _b_pow_float8(lhs, rhs)
+    if f8:
+        _b_store_out(rets, dest, f8.value().copy())
+        return
     var r = _b_try_scalar(
         "PowScalarSpec", lhs, rhs, False, Optional[T](dest.copy())
     )
@@ -2264,7 +2439,9 @@ def op_pow_scalar_out(
 
 # aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
 def op_pow_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_pow_float_base(_b_side(args[unsafe_offset=0]))
+    _b_pow_float_base(
+        _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+    )
     _b_simple("PowSpec", args, rets)
 
 
@@ -2272,7 +2449,9 @@ def op_pow_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_pow_tensor_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _b_pow_float_base(_b_side(args[unsafe_offset=0]))
+    _b_pow_float_base(
+        _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+    )
     _b_simple_out("PowSpec", args, rets, 2)
 
 
@@ -2292,7 +2471,46 @@ def _b_maxmin_res(
         and rhs.t.value().stype == ST_BOOL
     ):
         return _b_binary(bool_op, lhs, rhs, ST_BOOL, dst)
+    var f8 = _b_f8_into_out(lhs, rhs, dst)
+    if f8:
+        # max/min_elementwise dispatch on the OUTPUT dtype: a float8 pair
+        # computes in a wider out's dtype (TensorIterator casts the inputs).
+        var w = f8.value()
+        var a = _b_cast_side(lhs, w)
+        var b = _b_cast_side(rhs, w)
+        var r = _b_binary(op, a.side.copy(), b.side.copy(), Int32(-1), dst)
+        _ = a^
+        _ = b^
+        return r^
     return _b_binary(op, lhs, rhs, Int32(-1), dst)
+
+
+def _b_f8_into_out(
+    lhs: Side, rhs: Side, dst: Optional[T]
+) raises -> Optional[Int32]:
+    """The out dtype, when a float8 computation writes a non-float8 out=
+    (ops whose kernel dispatches on the output dtype compute in it)."""
+    if not dst or not _b_any_float8(lhs, rhs, rhs):
+        return None
+    var common = _b_sides_result(lhs, rhs, rhs)
+    var d = dst.value().stype
+    if is_float8_stype(common) and not is_float8_stype(d):
+        return d
+    return None
+
+
+@fieldwise_init
+struct _CastSide(Movable):
+    var side: Side
+    var held: Optional[Held]
+
+
+def _b_cast_side(side: Side, st: Int32) raises -> _CastSide:
+    if not side.is_t or side.t.value().stype == st:
+        return _CastSide(side.copy(), None)
+    var h = _b_cast(side.t.value(), st)
+    var s2 = _b_tside(h.t)
+    return _CastSide(s2^, h^)
 
 
 def _b_maxmin(
@@ -2496,7 +2714,7 @@ def _b_logical_out(op: StaticString, args: Values, rets: Values) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
-    _b_out_guard(dest, lhs, rhs)
+    _b_out_guard(dest, lhs, rhs, False)
     _b_store_out(
         rets, dest, _b_logical_res(op, lhs, rhs, Optional[T](dest.copy()))
     )
@@ -2552,8 +2770,8 @@ def _b_clamp_dtype(self_stype: Int32, lo: Value, hi: Value) -> Int32:
     var float_bound = (not v_is_none(lo) and not _b_scalar_is_int(lo)) or (
         not v_is_none(hi) and not _b_scalar_is_int(hi)
     )
-    if _b_is_floating(self_stype):
-        return self_stype
+    if _b_is_floating(self_stype) or is_float8_stype(self_stype):
+        return self_stype  # a wrapped Scalar never promotes a float tensor
     if float_bound:
         return default_dtype()
     if self_stype == ST_BOOL and (_b_int_bound(lo) or _b_int_bound(hi)):
@@ -2594,6 +2812,8 @@ def _b_clamp(
             "torch.clamp: At least one of 'min' or 'max' must not be None"
         )
     var result_stype = _b_clamp_dtype(self.stype, lo, hi)
+    if is_float8_stype(result_stype):
+        return _b_clamp_float8(self, lo, hi, result_stype, single_bound_op)
     if not _b_bcast_dtype(result_stype) or (
         result_stype == ST_FLOAT64 and dev(self.device)[].api == "metal"
     ):
@@ -2639,6 +2859,24 @@ def _b_clamp(
     _b_clamp_launch(out.t, src.t, lo_v, hi_v, has_min, has_max)
     _ = src
     return Res(out.take(), True)
+
+
+def _b_clamp_float8(
+    self: T, lo: Value, hi: Value, result_stype: Int32, single_bound_op: Bool
+) raises -> Res:
+    """A float8 clamp with Scalar bounds: ATen's clamp_out fills a NaN
+    bound's result with NaN without any kernel (float8 too); every other
+    bound reaches clamp_scalar_cuda, which has no float8 case."""
+    var both = not v_is_none(lo) and not v_is_none(hi)
+    var any_nan = _b_is_nan_bound(lo) or _b_is_nan_bound(hi)
+    if any_nan and (both or single_bound_op):
+        var filled = own(
+            new_tensor(self.shape, self.rank, result_stype, self.device)
+        )
+        fill_value(filled.t, nan[DType.float64]())
+        return Res(filled.take(), True)
+    decline_float8(max_dtype(result_stype), "clamp_scalar_cuda")
+    return Res(self.copy(), False)  # unreachable: float8 always declines
 
 
 def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:
@@ -2687,6 +2925,11 @@ def _b_clamp_out(
 ) raises:
     var self = _b_self(args[unsafe_offset=0], "clamp")
     var dest = _b_out_tensor(args[unsafe_offset=out_index], self.device)
+    var result_stype = _b_clamp_dtype(self.stype, lo, hi)
+    if is_float8_stype(result_stype) and dest.stype != result_stype:
+        # A unary iterator: out must hold the result dtype, checked before
+        # out is touched.
+        _b_found_dtype_error(dest.stype, result_stype)
     _b_out_guard(dest, _b_tside(self), _b_tside(self))
     # TORCH_META_FUNC(clamp) and clamp_min / clamp_max build a unary
     # iterator: the out dtype is the result's own.
@@ -2816,6 +3059,10 @@ def _b_addc(
         raise Error("expected every operand on the same mojo device")
     if a.stype != b.stype or a.stype != c.stype:
         unsupported("addc* operands of different dtypes")
+    # CUDA's addcmul_cuda / addcdiv_cuda dispatch no float8.
+    decline_float8(
+        a.dtype, "addcmul_cuda" if op == "AddcmulBcast" else "addcdiv_cuda"
+    )
     if not _b_float3(a.stype) and not (allow_int and _b_int_dtype(a.stype)):
         unsupported("addc* of dtype " + String(a.stype))
     if a.rank > 4 or b.rank > 4 or c.rank > 4:
@@ -3055,81 +3302,482 @@ def op_lerp_scalar_(
 
 
 def register_binary(site: Site) raises:
-    impl[routed[op_add_tensor, cx_add, 3], "add.Tensor"](site)
-    impl[routed[op_add_, cx_add_, 3], "add_.Tensor"](site)
-    impl[routed[op_add_out, cx_add_out, 4], "add.out"](site)
-    impl[op_addcdiv, "addcdiv"](site)
-    impl[op_addcdiv_, "addcdiv_"](site)
-    impl[op_addcdiv_out, "addcdiv.out"](site)
-    impl[op_addcmul, "addcmul"](site)
-    impl[op_addcmul_, "addcmul_"](site)
-    impl[op_addcmul_out, "addcmul.out"](site)
-    impl[op_bitwise_and, "bitwise_and.Scalar"](site)
-    impl[op_bitwise_and, "bitwise_and.Tensor"](site)
-    impl[op_bitwise_and_out, "bitwise_and.Tensor_out"](site)
-    impl[op_bitwise_and_out, "bitwise_and.Scalar_out"](site)
-    impl[op_bitwise_or, "bitwise_or.Scalar"](site)
-    impl[op_bitwise_or, "bitwise_or.Tensor"](site)
-    impl[op_bitwise_or_out, "bitwise_or.Tensor_out"](site)
-    impl[op_bitwise_or_out, "bitwise_or.Scalar_out"](site)
-    impl[op_bitwise_xor, "bitwise_xor.Scalar"](site)
-    impl[op_bitwise_xor, "bitwise_xor.Tensor"](site)
-    impl[op_bitwise_xor_out, "bitwise_xor.Tensor_out"](site)
-    impl[op_bitwise_xor_out, "bitwise_xor.Scalar_out"](site)
+    impl[
+        f8_iter[
+            routed[op_add_tensor, cx_add, 3],
+            "ufunc_add_CUDA",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+            alpha_idx=2,
+        ],
+        "add.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_add_, cx_add_, 3],
+            "ufunc_add_CUDA",
+            3,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+            alpha_idx=2,
+        ],
+        "add_.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_add_out, cx_add_out, 4],
+            "ufunc_add_CUDA",
+            3,
+            3,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+            alpha_idx=2,
+        ],
+        "add.out",
+    ](site)
+    impl[
+        f8_iter[op_addcdiv, "addcdiv_cuda", 7, -1, MODE_FN, False, PRE_NONE],
+        "addcdiv",
+    ](site)
+    impl[
+        f8_iter[
+            op_addcdiv_, "addcdiv_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
+        ],
+        "addcdiv_",
+    ](site)
+    impl[
+        f8_iter[
+            op_addcdiv_out, "addcdiv_cuda", 7, 4, MODE_CAST, False, PRE_NONE
+        ],
+        "addcdiv.out",
+    ](site)
+    impl[
+        f8_iter[op_addcmul, "addcmul_cuda", 7, -1, MODE_FN, False, PRE_NONE],
+        "addcmul",
+    ](site)
+    impl[
+        f8_iter[
+            op_addcmul_, "addcmul_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
+        ],
+        "addcmul_",
+    ](site)
+    impl[
+        f8_iter[
+            op_addcmul_out, "addcmul_cuda", 7, 4, MODE_CAST, False, PRE_NONE
+        ],
+        "addcmul.out",
+    ](site)
+    impl[f8_cx_scalar[op_bitwise_and], "bitwise_and.Scalar"](site)
+    impl[
+        f8_iter[
+            op_bitwise_and, "bitwise_and_cuda", 3, -1, MODE_FN, True, PRE_NONE
+        ],
+        "bitwise_and.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_bitwise_and_out,
+            "bitwise_and_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            True,
+            PRE_NONE,
+        ],
+        "bitwise_and.Tensor_out",
+    ](site)
+    impl[f8_cx_scalar[op_bitwise_and_out], "bitwise_and.Scalar_out"](site)
+    impl[f8_cx_scalar[op_bitwise_or], "bitwise_or.Scalar"](site)
+    impl[
+        f8_iter[
+            op_bitwise_or, "bitwise_or_cuda", 3, -1, MODE_FN, True, PRE_NONE
+        ],
+        "bitwise_or.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_bitwise_or_out,
+            "bitwise_or_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            True,
+            PRE_NONE,
+        ],
+        "bitwise_or.Tensor_out",
+    ](site)
+    impl[f8_cx_scalar[op_bitwise_or_out], "bitwise_or.Scalar_out"](site)
+    impl[f8_cx_scalar[op_bitwise_xor], "bitwise_xor.Scalar"](site)
+    impl[
+        f8_iter[
+            op_bitwise_xor, "bitwise_xor_cuda", 3, -1, MODE_FN, True, PRE_NONE
+        ],
+        "bitwise_xor.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_bitwise_xor_out,
+            "bitwise_xor_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            True,
+            PRE_NONE,
+        ],
+        "bitwise_xor.Tensor_out",
+    ](site)
+    impl[f8_cx_scalar[op_bitwise_xor_out], "bitwise_xor.Scalar_out"](site)
     impl[op_clamp, "clamp"](site)
     impl[op_clamp_out, "clamp.out"](site)
     impl[op_clamp_max, "clamp_max"](site)
     impl[op_clamp_max_out, "clamp_max.out"](site)
-    impl[op_clamp_max_tensor, "clamp_max.Tensor"](site)
-    impl[op_clamp_max_tensor_out, "clamp_max.Tensor_out"](site)
+    impl[
+        f8_iter[
+            op_clamp_max_tensor,
+            "min_elementwise_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "clamp_max.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_clamp_max_tensor_out,
+            "min_elementwise_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "clamp_max.Tensor_out",
+    ](site)
     impl[op_clamp_min, "clamp_min"](site)
     impl[op_clamp_min_out, "clamp_min.out"](site)
-    impl[op_clamp_min_tensor, "clamp_min.Tensor"](site)
-    impl[op_clamp_min_tensor_out, "clamp_min.Tensor_out"](site)
-    impl[routed[op_div_tensor, cx_div, 2], "div.Tensor"](site)
-    impl[routed[op_div_mode, cx_div_mode, 2], "div.Tensor_mode"](site)
-    impl[routed[op_div_out, cx_div_out, 3], "div.out"](site)
-    impl[routed[op_div_out_mode, cx_div_out_mode, 4], "div.out_mode"](site)
-    impl[op_floor_divide, "floor_divide"](site)
-    impl[op_floor_divide, "floor_divide.Scalar"](site)
-    impl[op_floor_divide_out, "floor_divide.out"](site)
-    impl[op_floor_divide_, "floor_divide_.Tensor"](site)
     impl[
-        routed[op_logical_and, cx_via_bool["logical_and", "", 2], 2],
+        f8_iter[
+            op_clamp_min_tensor,
+            "max_elementwise_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "clamp_min.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_clamp_min_tensor_out,
+            "max_elementwise_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "clamp_min.Tensor_out",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_div_tensor, cx_div, 2],
+            "div_true_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "div.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_div_mode, cx_div_mode, 2],
+            "div_true_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_DIV_MODE,
+        ],
+        "div.Tensor_mode",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_div_out, cx_div_out, 3],
+            "div_true_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "div.out",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_div_out_mode, cx_div_out_mode, 4],
+            "div_true_cuda",
+            3,
+            3,
+            MODE_CAST,
+            False,
+            PRE_DIV_MODE,
+        ],
+        "div.out_mode",
+    ](site)
+    impl[
+        f8_iter[
+            op_floor_divide, "div_floor_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        ],
+        "floor_divide",
+    ](site)
+    impl[op_floor_divide, "floor_divide.Scalar"](site)
+    impl[
+        f8_iter[
+            op_floor_divide_out,
+            "div_floor_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "floor_divide.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_floor_divide_,
+            "div_floor_cuda",
+            3,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
+        "floor_divide_.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_logical_and, cx_via_bool["logical_and", "", 2], 2],
+            "logical_and_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "logical_and",
     ](site)
     impl[
-        routed[op_logical_and_out, cx_via_bool["logical_and", "out", 2], 3],
+        f8_iter[
+            routed[op_logical_and_out, cx_via_bool["logical_and", "out", 2], 3],
+            "logical_and_cuda",
+            3,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
         "logical_and.out",
     ](site)
     impl[
-        routed[op_logical_or, cx_via_bool["logical_or", "", 2], 2], "logical_or"
+        f8_iter[
+            routed[op_logical_or, cx_via_bool["logical_or", "", 2], 2],
+            "logical_or_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "logical_or",
     ](site)
     impl[
-        routed[op_logical_or_out, cx_via_bool["logical_or", "out", 2], 3],
+        f8_iter[
+            routed[op_logical_or_out, cx_via_bool["logical_or", "out", 2], 3],
+            "logical_or_cuda",
+            3,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
         "logical_or.out",
     ](site)
     impl[
-        routed[op_logical_xor, cx_via_bool["logical_xor", "", 2], 2],
+        f8_iter[
+            routed[op_logical_xor, cx_via_bool["logical_xor", "", 2], 2],
+            "logical_xor_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "logical_xor",
     ](site)
     impl[
-        routed[op_logical_xor_out, cx_via_bool["logical_xor", "out", 2], 3],
+        f8_iter[
+            routed[op_logical_xor_out, cx_via_bool["logical_xor", "out", 2], 3],
+            "logical_xor_cuda",
+            3,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
         "logical_xor.out",
     ](site)
-    impl[op_maximum, "maximum"](site)
-    impl[op_maximum_out, "maximum.out"](site)
-    impl[op_minimum, "minimum"](site)
-    impl[op_minimum_out, "minimum.out"](site)
-    impl[routed[op_mul_tensor, cx_mul, 2], "mul.Tensor"](site)
-    impl[routed[op_mul_, cx_mul_, 2], "mul_.Tensor"](site)
+    impl[
+        f8_iter[
+            op_maximum,
+            "max_elementwise_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NO_COMPLEX,
+            "maximum",
+        ],
+        "maximum",
+    ](site)
+    impl[
+        f8_iter[
+            op_maximum_out,
+            "max_elementwise_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NO_COMPLEX,
+            "maximum",
+        ],
+        "maximum.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_minimum,
+            "min_elementwise_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NO_COMPLEX,
+            "minimum",
+        ],
+        "minimum",
+    ](site)
+    impl[
+        f8_iter[
+            op_minimum_out,
+            "min_elementwise_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NO_COMPLEX,
+            "minimum",
+        ],
+        "minimum.out",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_mul_tensor, cx_mul, 2],
+            "mul_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "mul.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_mul_, cx_mul_, 2],
+            "mul_cuda",
+            3,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
+        "mul_.Tensor",
+    ](site)
     impl[routed[op_mul_, cx_mul_, 2], "mul_.Scalar"](site)
-    impl[routed[op_mul_out, cx_mul_out, 3], "mul.out"](site)
-    impl[op_remainder, "remainder.Scalar"](site)
-    impl[op_remainder, "remainder.Scalar_Tensor"](site)
-    impl[op_remainder, "remainder.Tensor"](site)
-    impl[op_remainder_out, "remainder.Scalar_out"](site)
-    impl[op_remainder_out, "remainder.Tensor_out"](site)
-    impl[routed[op_sub_tensor, cx_sub, 3], "sub.Tensor"](site)
-    impl[routed[op_sub_, cx_sub_, 3], "sub_.Tensor"](site)
-    impl[routed[op_sub_out, cx_sub_out, 4], "sub.out"](site)
+    impl[
+        f8_iter[
+            routed[op_mul_out, cx_mul_out, 3],
+            "mul_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "mul.out",
+    ](site)
+    impl[f8_cx_scalar[op_remainder], "remainder.Scalar"](site)
+    impl[f8_cx_scalar[op_remainder], "remainder.Scalar_Tensor"](site)
+    impl[
+        f8_iter[
+            op_remainder, "remainder_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        ],
+        "remainder.Tensor",
+    ](site)
+    impl[f8_cx_scalar[op_remainder_out], "remainder.Scalar_out"](site)
+    impl[
+        f8_iter[
+            op_remainder_out, "remainder_cuda", 3, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "remainder.Tensor_out",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_sub_tensor, cx_sub, 3],
+            "ufunc_add_CUDA",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_SUB,
+            alpha_idx=2,
+        ],
+        "sub.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_sub_, cx_sub_, 3],
+            "ufunc_add_CUDA",
+            3,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_SUB,
+            alpha_idx=2,
+        ],
+        "sub_.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_sub_out, cx_sub_out, 4],
+            "ufunc_add_CUDA",
+            3,
+            3,
+            MODE_CAST,
+            False,
+            PRE_SUB,
+            alpha_idx=2,
+        ],
+        "sub.out",
+    ](site)

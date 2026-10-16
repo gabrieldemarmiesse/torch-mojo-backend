@@ -56,6 +56,7 @@ from tmb.backend.abi import (
     new_strided,
     v_scalar_is_integral,
     T,
+    bool_arg,
     is_dense,
     Value,
     Values,
@@ -85,6 +86,7 @@ from tmb.backend.abi import (
 from tmb.backend.device import ctx_for, ctx_ptr, dev, copy_d2d
 from tmb.kernels.optimizer.foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
 from tmb.backend.kernel_call import KernelCall
+from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
 from tmb.kernels.foreach.contract import (
@@ -104,6 +106,8 @@ from tmb.kernels.foreach.contract import (
     foreach_apple_supported,
 )
 from tmb.ops.common import (
+    cast_into,
+    cast_to,
     copy_strided_into,
     fill_value,
     device_str,
@@ -1390,6 +1394,76 @@ def _copy_adjacent_views(dsts: List[T], srcs: List[T]) raises -> Bool:
     return True
 
 
+def _foreach_copy_dtype_check(dt: DType) raises:
+    if (
+        dt == DType.float8_e8m0fnu
+        or dt == DType.uint16
+        or dt == DType.uint32
+        or dt == DType.uint64
+    ):
+        unsupported(
+            '"foreach_tensor_copy" not implemented for \''
+            + _scalar_type_name(dt)
+            + "'"
+        )
+
+
+def _cuda_copy_fast_route(dsts: List[T], srcs: List[T]) -> Bool:
+    """The condition of CUDA's `_foreach_copy_` multi_tensor_apply route
+    (ForeachBinaryOpList.cu): one device, dense strided tensors, one dtype
+    per list, index-aligned sizes and strides."""
+    var first = dsts[0].copy()
+    if not first.on_mojo():
+        return False
+    var src_dtype = srcs[0].dtype
+    for i in range(len(dsts)):
+        ref d = dsts[i]
+        ref s = srcs[i]
+        if (
+            not d.on_mojo()
+            or d.device != first.device
+            or d.dtype != first.dtype
+        ):
+            return False
+        if not s.on_mojo() or s.device != first.device or s.dtype != src_dtype:
+            return False
+        # An empty tensor is contiguous, hence non-overlapping and dense.
+        if (d.numel > 0 and not is_dense(d.shape, d.strides, d.rank)) or (
+            s.numel > 0 and not is_dense(s.shape, s.strides, s.rank)
+        ):
+            return False
+        if not d.same_shape(s):
+            return False
+        var pad = MAX_RANK - d.rank
+        for k in range(d.rank):
+            if (
+                d.shape[pad + k] != 1
+                and d.strides[pad + k] != s.strides[pad + k]
+            ):
+                return False
+    return True
+
+
+def _copy_e4m3fn_unsaturated(dsts: List[T], srcs: List[T]) raises:
+    """CUDA's fast route converts with c10's static_cast: an out-of-range
+    value becomes NaN, not copy_'s saturated 448 (sm_89+ SATFINITE)."""
+    for i in range(len(dsts)):
+        if dsts[i].numel == 0:
+            dsts[i].bump_version()  # CUDA's increment_version, empty too
+            continue
+        if dsts[i].contig:
+            cast_into(dsts[i], srcs[i], False)
+            dsts[i].bump_version()
+            continue
+        var tmp = own(cast_to(srcs[i], dsts[i].stype, False))
+        var copy_args = List[Value]()
+        copy_args.append(_tensor_value(dsts[i]))
+        copy_args.append(_tensor_value(tmp.t))
+        copy_args.append(bool_arg(False))
+        _ = call_op("aten::copy_", "", copy_args^, 1)
+        _ = tmp^
+
+
 # aten::_foreach_copy_(Tensor(a!)[] self, Tensor[] src, bool non_blocking=False) -> ()
 def op_foreach_copy_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -1400,10 +1474,24 @@ def op_foreach_copy_(
         raise Error("Tensor list must have at least one tensor.")
     if len(srcs) != len(dsts):
         raise Error("Tensor lists must have the same number of tensors.")
+    var f8 = is_float8(dsts[0].dtype) or is_float8(srcs[0].dtype)
+    if f8 and _cuda_copy_fast_route(dsts, srcs):
+        # CUDA's multi_tensor_apply route dispatches the destination, then
+        # the source, over the standard dtypes and four float8s: e8m0fnu and
+        # uint16/32/64 refuse there, empty lists included, before writing.
+        _foreach_copy_dtype_check(dsts[0].dtype)
+        _foreach_copy_dtype_check(srcs[0].dtype)
     if _copy_adjacent_views(dsts, srcs):
         return
     if _copy_batch_qualifies(dsts, srcs):
         _copy_batch_launch(dsts, srcs)
+        return
+    if (
+        dsts[0].dtype == DType.float8_e4m3fn
+        and srcs[0].dtype != DType.float8_e4m3fn
+        and _cuda_copy_fast_route(dsts, srcs)
+    ):
+        _copy_e4m3fn_unsaturated(dsts, srcs)
         return
     for i in range(len(dsts)):
         var copy_args = List[Value]()

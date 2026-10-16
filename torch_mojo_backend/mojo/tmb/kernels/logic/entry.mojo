@@ -271,6 +271,28 @@ def _nonzero[
 
 
 @always_inline
+def _is_nan_bits[
+    dtype: DType, width: Int
+](a: SIMD[dtype, width]) -> SIMD[DType.bool, width]:
+    """isnan from the bits: magnitude above the infinity pattern. Safe under
+    the fast-math flags that let LLVM fold a float NaN test away."""
+    comptime bits = DType.uint64 if size_of[dtype]() == 8 else (
+        DType.uint32 if size_of[dtype]() == 4 else DType.uint16
+    )
+    comptime nbits = size_of[dtype]() * 8
+    comptime magnitude = ~(Scalar[bits](1) << Scalar[bits](nbits - 1))
+    var m = bitcast[bits, width](a) & magnitude
+    comptime if dtype == DType.float64:
+        return m.gt(Scalar[bits](0x7FF0000000000000))
+    elif dtype == DType.float32:
+        return m.gt(Scalar[bits](0x7F800000))
+    elif dtype == DType.bfloat16:
+        return m.gt(Scalar[bits](0x7F80))
+    else:
+        return m.gt(Scalar[bits](0x7C00))  # float16
+
+
+@always_inline
 def _bin_vec_op[
     dtype: DType,
     out_dtype: DType,
@@ -299,9 +321,23 @@ def _bin_vec_op[
         # `<` and friends are Scalar-only in mojo 1.0; the elementwise forms
         # are the named methods, and they are what yields the mask.
         comptime if op_code == COP_EQ:
-            return a.eq(b).cast[out_dtype]()
+            comptime if dtype.is_floating_point():
+                # The fast-math build may assume no NaN: test it on the bits
+                # (NaN == anything is False, as on CUDA).
+                return (a.eq(b) & ~_is_nan_bits(a) & ~_is_nan_bits(b)).cast[
+                    out_dtype
+                ]()
+            else:
+                return a.eq(b).cast[out_dtype]()
         comptime if op_code == COP_NE:
-            return a.ne(b).cast[out_dtype]()
+            comptime if dtype.is_floating_point():
+                # NaN != anything is True (measured: the plain compare folded
+                # `nan != x` to False).
+                return (~a.eq(b) | _is_nan_bits(a) | _is_nan_bits(b)).cast[
+                    out_dtype
+                ]()
+            else:
+                return a.ne(b).cast[out_dtype]()
         comptime if op_code == COP_LT:
             return a.lt(b).cast[out_dtype]()
         comptime if op_code == COP_LE:

@@ -205,7 +205,6 @@ _MATCHES_CPU: dict[str, tuple[str, ...]] = {
     "mm": ("complex64",),
     "mode": ("bfloat16", "int64", "bool"),
     "mv": ("complex64",),
-    "nanmean": ("float32", "bfloat16", "float16"),
     "nanquantile": ("float32",),
     # CUDA's dropout_backward dispatches on floating grads only ("masked_scale"
     # not implemented for 'Long'); CPU computes grad * mask * scale for any.

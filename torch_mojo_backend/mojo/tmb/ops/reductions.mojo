@@ -76,8 +76,10 @@ from tmb.backend.abi import (
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
+from tmb.kernels.common.float8 import is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    decline_float8,
     assert_no_internal_overlap,
     assert_no_overlap,
     cast_into,
@@ -920,6 +922,17 @@ def op_sum_intlist_out(
     var target = _out_reduce_dtype(
         args[unsafe_offset=3], out, "aten::sum.IntList_out"
     )
+    if is_float8(target):
+        # The reduction's out= is resized before sum_cuda's dispatch, which
+        # has no float8 case.
+        var fdims = _reduce_dims(args[unsafe_offset=1], src.t.rank, True)
+        var fshape = IndexList[MAX_RANK](1)
+        var frank = 0
+        _reduced_shape(
+            src.t, fdims, v_bool_or(args[unsafe_offset=2], False), fshape, frank
+        )
+        resize_out(out, fshape, frank)
+        decline_float8(target, "sum_cuda")
     if not _is_sum_dtype(target):
         unsupported("sum with dtype=" + String(target))
     _promote_for_out_reduction(src, target, "aten::sum.IntList_out")

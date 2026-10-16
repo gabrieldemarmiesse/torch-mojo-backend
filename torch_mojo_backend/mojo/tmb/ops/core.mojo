@@ -113,6 +113,7 @@ from tmb.backend.device import (
     record_stream,
 )
 from tmb.kernels.common.op_utils import MAX_RANK
+from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.ops.common import (
     real_fill_value,
     is_float_stype,
@@ -130,6 +131,7 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     is_cast_dtype_on,
+    is_cast_pair_on,
 )
 from tmb.backend.registry import Site, impl
 
@@ -352,8 +354,7 @@ def _device_copy(dst: T, src: T) raises:
             and dst.contig
             and not src.is_complex()
             and not dst.is_complex()
-            and is_cast_dtype_on(src.dtype, src)
-            and is_cast_dtype_on(dst.dtype, dst)
+            and is_cast_pair_on(src.dtype, dst.dtype, src)
             and (
                 src.ptr + src.numel * src.itemsize <= dst.ptr
                 or dst.ptr + dst.numel * dst.itemsize <= src.ptr
@@ -426,13 +427,17 @@ def _copy_broadcast_source(src: T, dst: T) raises -> T:
     return view_strided(src, dst.shape, strides, dst.rank, src.offset)
 
 
-def cast_for_copy(src: T, stype: Int32) raises -> T:
+def cast_for_copy(src: T, stype: Int32, saturate: Bool = True) raises -> T:
+    """`src` converted to `stype`. `saturate` is copy_'s float -> e4m3fn
+    rule; an out= / in-place store of a TensorIterator op converts in its
+    kernel (c10's static_cast) and passes False."""
     if src.is_complex() or is_complex_stype(stype):
+        # `saturate` cannot apply: a complex source never saturates (stock
+        # CUDA's SATFINITE path is keyed on a float / half / bfloat16 source)
+        # and no complex dtype is float8.
         return cast_complex(src, stype)
-    if is_cast_dtype_on(src.dtype, src) and is_cast_dtype_on(
-        max_dtype(stype), src
-    ):
-        return cast_to(src, stype)
+    if is_cast_pair_on(src.dtype, max_dtype(stype), src):
+        return cast_to(src, stype, saturate)
     # CPU torch preserves integer precision for pairs outside CastSpec.
     var host_src = own(cpu_empty(src.shape, src.rank, src.stype))
     copy_to_host(
@@ -811,6 +816,32 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
                 + String(src.device_type)
                 + " tensor to the mojo device"
             )
+        if (
+            non_blocking
+            and src.stype != dst.stype
+            and is_cast_pair_on(src.dtype, dst.dtype, dst)
+        ):
+            # Copy.cu: a non-blocking transfer converts on the GPU (where
+            # float -> e4m3fn saturates on sm_89+), a blocking one on the CPU.
+            var packed = own(cpu_empty(src.shape, src.rank, src.stype))
+            wait_for_host_read(ctx_for(dst.device), src.ptr)
+            _host_copy(packed.t, src)
+            var raw = own(
+                new_tensor(src.shape, src.rank, src.stype, dst.device)
+            )
+            copy_from_host(
+                dst.device,
+                ctx_for(dst.device),
+                raw.t.ptr,
+                packed.t.ptr,
+                src.numel * src.itemsize,
+            )
+            _ = packed^
+            _device_copy(dst, raw.t)
+            _ = raw^  # alive past the launch
+            _ = expanded^
+            ret_ref(rets, 0, dst)
+            return
         # host -> device: a dense host copy in dst's dtype (torch's CPU copy_
         # does the layout / dtype work), one H2D, then a device relayout if needed
         var host = own_if_new(
@@ -858,6 +889,27 @@ def op_copy_from(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # device -> host: one D2H of a dense copy in src's dtype, then torch's
         # CPU copy_ for the host layout / dtype when dst is not that already
         var dense = own_if_new(contiguous(src), src)
+        if (
+            non_blocking
+            and src.stype != dst.stype
+            and is_cast_pair_on(src.dtype, dst.dtype, src)
+        ):
+            # A non-blocking download converts on the GPU (Copy.cu).
+            var conv = own(cast_to(dense.t, dst.stype))
+            _ = dense^
+            var landed = own(cpu_empty(src.shape, src.rank, dst.stype))
+            copy_to_host(
+                ctx_for(src.device),
+                conv.t.ptr,
+                landed.t.ptr,
+                conv.t.numel * conv.t.itemsize,
+            )
+            _ = conv^
+            _host_copy(dst, landed.t)
+            _ = landed^
+            _ = expanded^
+            ret_ref(rets, 0, dst)
+            return
         var nbytes = src.numel * src.itemsize
         # Both dense in the same dtype: the bytes land in the right order
         # whatever the two logical shapes are.
@@ -1024,6 +1076,8 @@ def op_local_scalar_dense(
         return
     if t.dtype == DType.bool:
         ret_scalar_bool(rets, 0, p[] != 0)
+    elif is_float8(t.dtype):
+        ret_scalar_f64(rets, 0, fp8_bits_to_f64(t.dtype, p[]))
     elif t.dtype.is_floating_point():
         var v: Float64
         if t.dtype == DType.float32:

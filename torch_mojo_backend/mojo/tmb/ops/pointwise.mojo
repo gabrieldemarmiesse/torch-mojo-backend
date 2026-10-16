@@ -54,6 +54,7 @@ from tmb.backend.abi import (
     ret_owned,
     ret_tensor,
     tensor_arg,
+    v_tensor_c,
     unsupported,
     v_bool,
     v_f64,
@@ -66,17 +67,43 @@ from tmb.backend.abi import (
 )
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
+from tmb.ops.f8_iter import (
+    f8_cx_scalar,
+    f8_iter,
+    generated_out,
+    MODE_CAST,
+    MODE_FN,
+    MODE_INPLACE,
+    MODE_OUTDT,
+    MODE_SAME,
+    PRE_BOOL_OUT,
+    PRE_ALL_SAME,
+    PRE_DISPATCH_SELF,
+    PRE_DIV_MODE,
+    PRE_LERP,
+    PRE_HEAVISIDE,
+    PRE_LDEXP,
+    PRE_NAN_TO_NUM,
+    PRE_NO_COMPLEX,
+    PRE_NONE,
+    PRE_SELF_FIRST,
+    PRE_SOFTSHRINK,
+    PRE_RSUB,
+    PRE_THRESHOLD,
+    softshrink_check,
+)
 from tmb.backend.registry import Site, impl
+from tmb.kernels.common.float8 import is_float8
 from tmb.ops.complex import (
     routed,
 )
 from tmb.ops.complex_math import (
+    _base_is_one,
     cx_pow_tensor,
     cx_pow_tensor_out,
     cx_pow_tensor_scalar,
     cx_pow_tensor_scalar_out,
     cx_rsub,
-    cx_rsub_out,
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.binary import (
@@ -106,12 +133,24 @@ from tmb.ops.binary import (
     op_pow_tensor,
     op_pow_tensor_out,
     op_rsub,
-    op_rsub_out,
 )
 from tmb.ops.common import (
+    threshold_into_overlapping,
+    threshold_scalar_check,
+    threshold_scalar_overflows,
+    threshold_scalar_value,
+    _repeats_elements,
+    can_cast,
+    decline_float8,
+    fill_value,
+    scalar_type_name,
     ST_UNDEFINED,
     assert_no_internal_overlap,
-    combine_categories as _pw_combine,
+    assert_no_partial_overlap,
+    check_out_as,
+    out_device_error,
+    resize_any,
+    combine_categories as _pw_combine_known,
     contiguous,
     copy_strided_into,
     is_float_stype as _pw_is_float,
@@ -142,6 +181,39 @@ struct _TypeState(Copyable, Movable):
     var wrapped: Int32
 
 
+def _pw_is_f8(st: Int32) raises -> Bool:
+    return st != ST_UNDEFINED and is_float8(max_dtype(st))
+
+
+def _pw_promote(a: Int32, b: Int32) raises -> Int32:
+    """c10::promoteTypes with its float8 rule: a float8 dtype promotes with
+    no other dtype."""
+    if a != ST_UNDEFINED and b != ST_UNDEFINED and a != b:
+        if _pw_is_f8(a) or _pw_is_f8(b):
+            raise Error(
+                (
+                    "Promotion for Float8 Types is not supported, attempted to"
+                    " promote "
+                ),
+                scalar_type_name(a),
+                " and ",
+                scalar_type_name(b),
+            )
+    return promote_types(a, b)
+
+
+def _pw_combine(higher: Int32, lower: Int32) raises -> Int32:
+    """c10's combine_categories, float8 counting as floating."""
+    if _pw_is_f8(higher):
+        return higher
+    if _pw_is_f8(lower) and (higher == ST_BOOL or higher == ST_UNDEFINED):
+        return _pw_promote(higher, lower)
+    if _pw_is_f8(lower) and not _pw_is_float(higher):
+        # An integral dimensioned result meets a float8 0-d / wrapped one.
+        return _pw_promote(higher, lower)
+    return _pw_combine_known(higher, lower)
+
+
 def _pw_update(mut state: _TypeState, side: Side) raises:
     """at::native::update_result_type_state for one operand. A Scalar (or
     torch's 0-d CPU wrapped number) is a wrapped number: bool, int64, or the
@@ -149,19 +221,19 @@ def _pw_update(mut state: _TypeState, side: Side) raises:
     if side.is_t:
         var t = side.t.value().copy()
         if t.rank == 0:
-            state.zero = promote_types(state.zero, t.stype)
+            state.zero = _pw_promote(state.zero, t.stype)
         else:
-            state.dim = promote_types(state.dim, t.stype)
+            state.dim = _pw_promote(state.dim, t.stype)
         return
     if side.zero_st >= 0:
         # An explicit 0-d CPU tensor (not a wrapped Python number).
-        state.zero = promote_types(state.zero, side.zero_st)
+        state.zero = _pw_promote(state.zero, side.zero_st)
         return
     var s = side.s.value().copy()
     var st = ST_BOOL if s.is_bool else (
         ST_INT64 if s.is_int else default_dtype()
     )
-    state.wrapped = promote_types(state.wrapped, st)
+    state.wrapped = _pw_promote(state.wrapped, st)
 
 
 def _pw_result_type(a: Side, b: Side, c: Side, arity: Int) raises -> Int32:
@@ -185,6 +257,7 @@ comptime P_NUMERIC = 4  # every dtype but bool
 def _pw_compute_dtype(
     kind: StaticString, common: Int32, policy: Int, f64_ok: Bool
 ) raises -> Int32:
+    _pw_no_float8(kind, common)
     var st = common
     if policy == P_FLOAT and not _pw_is_float(st):
         st = default_dtype()
@@ -375,6 +448,7 @@ def _pw_run(
     """One launch of `kind` over (a, b, c) computed in `compute`, stored as
     `out_stype`: into `dst` when it already has the result's dtype, shape
     and a dense layout, else into a fresh tensor."""
+    _pw_no_float8(kind, compute)
     var device = _pw_device(a, b, c)
     var bs = _pw_broadcast(a, b, c, arity)
     var shape = bs[0]
@@ -460,19 +534,35 @@ def _pw_finish(
         _b_ret(rets, res^)
 
 
-def _pw_out_of(v: Value, a: Side, b: Side, c: Side) raises -> T:
+def _pw_f8_side_tensor(side: Side, st: Int32, device: Int) raises -> Owned:
+    """A float8 operand as a device tensor: the tensor itself (not owned),
+    or a CPU 0-d one rebuilt on `device`."""
+    if side.is_t:
+        var o = own(side.t.value().copy())
+        _ = o.take()  # borrowed: never released here
+        return o^
+    var t = own(new_tensor(IndexList[MAX_RANK](1), 0, st, device))
+    fill_value(t.t, side.s.value().f)
+    return t^
+
+
+def _pw_out_of(
+    v: Value, a: Side, b: Side, c: Side, common_out: Bool = True
+) raises -> T:
     """The caller's `out=`, checked like TensorIterator's meta: no internal
     overlap, no partial overlap with an input, and never resized when it is
     one of the inputs (see `_b_out_guard`)."""
     var dest = v_tensor(v)
-    if not dest.on_mojo():
-        raise Error("expected `out` to be a mojo tensor")
+    assert_no_internal_overlap(dest)  # compute_mem_overlaps, then the device
     for k in range(3):
         var side = a.copy() if k == 0 else (b.copy() if k == 1 else c.copy())
-        if side.is_t and side.t.value().device != dest.device:
-            raise Error("expected `out` and the inputs on the same mojo device")
-    assert_no_internal_overlap(dest)
-    _b_out_guard3(dest, a, b, c)
+        if side.is_t and (
+            not dest.on_mojo() or side.t.value().device != dest.device
+        ):
+            out_device_error(side.t.value().device, dest)
+    if not dest.on_mojo():
+        raise Error("expected `out` to be a mojo tensor")
+    _b_out_guard3(dest, a, b, c, common_out)
     return dest^
 
 
@@ -490,6 +580,25 @@ def _pw_inplace_self(
         if side.is_t:
             _b_inplace_operand(self, side.t.value())
     return self^
+
+
+def _pw_no_float8(kind: StaticString, compute: Int32) raises:
+    """CUDA's pointwise math kernels dispatch no float8 computation (empty
+    operands included): refuse with the `<op>_cuda` name its error uses. A
+    float8 0-d operand of a wider computation converts like any other."""
+    if _pw_is_f8(compute):
+        unsupported(
+            '"'
+            + (
+                "lerp" if kind
+                == "lerp_scalar" else (
+                    "pow" if kind == "pow_scalar_base" else String(kind)
+                )
+            )
+            + "_cuda\" not implemented for '"
+            + scalar_type_name(max_dtype(compute))
+            + "'"
+        )
 
 
 def _pw_math(
@@ -510,10 +619,12 @@ def _pw_math(
     var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
     var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
     var common = _pw_result_type(a, b, c, arity)
-    var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     var dest = Optional[T]()
     if out_index >= 0:
+        # TensorIterator's out= checks and resize precede the kernel
+        # dispatch (a float8 computation is refused after the resize).
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
+    var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     _pw_finish(
         rets,
         dest,
@@ -989,10 +1100,22 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
     # One bound: ATen's maximum_stub / minimum_stub over the promoted pair.
     var bound = _b_side(args[unsafe_offset=1 if has_min else 2])
     var common = _pw_result_type(a, bound, _none_side(), 2)
-    var compute = _pw_compute_dtype("clamp", common, P_ALL, True)
     var dest = Optional[T]()
     if out_index >= 0:
+        # The out= checks and resize come before the kernel dispatch.
         dest = _pw_out_of(args[unsafe_offset=out_index], a, bound, _none_side())
+    if dest and (_pw_is_f8(common) or _pw_is_f8(dest.value().stype)):
+        # max/min_elementwise dispatch on the OUTPUT dtype: a float8 pair
+        # computes in a wider out's dtype, and a float8 out refuses as
+        # itself.
+        common = dest.value().stype
+    # CUDA's one-bound clamp is maximum / minimum: its float8 refusal names
+    # max_elementwise_cuda / min_elementwise_cuda.
+    if has_min:
+        _pw_no_float8("max_elementwise", common)
+    else:
+        _pw_no_float8("min_elementwise", common)
+    var compute = _pw_compute_dtype("clamp", common, P_ALL, True)
     if has_min:
         _pw_finish(
             rets,
@@ -1054,14 +1177,47 @@ def _pw_pow_scalar_base(args: Values, rets: Values, out_index: Int) raises:
         _pw_ipow(args, rets, out_index, False)
         return
     var common = _pw_result_type(base, expo, _none_side(), 2)
-    var compute = _pw_compute_dtype(
-        "pow_scalar_base", common, P_FLOAT_ONLY, True
-    )
+    if _pw_is_f8(common) and expo.is_t:
+        # Pow.cpp's pow(Scalar, Tensor).out: out is resized first; a base of
+        # 1 fills it with ones whatever its dtype (no cast check, no
+        # kernel); any other base meets the out cast check, then pow_cuda.
+        var e = expo.t.value().copy()
+        var b = base.s.value().copy()
+        var one = not b.is_bool and (Float64(b.i) if b.is_int else b.f) == 1.0
+        if out_index >= 0:
+            var d = _pw_out_of(
+                args[unsafe_offset=out_index],
+                expo,
+                _none_side(),
+                _none_side(),
+                False,
+            )
+            if not d.same_shape(e):
+                resize_out(d, e.shape, e.rank)
+            if one:
+                fill_value(d, 1.0)
+                ret_ref(rets, 0, d)
+                return
+            if not can_cast(common, d.stype):
+                raise Error(
+                    "result type ",
+                    scalar_type_name(max_dtype(common)),
+                    " can't be cast to the desired output type ",
+                    scalar_type_name(d.dtype),
+                )
+        elif one:
+            var ones = own(new_tensor(e.shape, e.rank, common, e.device))
+            fill_value(ones.t, 1.0)
+            ret_owned(rets, 0, ones)
+            return
     var dest = Optional[T]()
     if out_index >= 0:
         dest = _pw_out_of(
             args[unsafe_offset=out_index], expo, _none_side(), _none_side()
         )
+    var compute = _pw_compute_dtype(
+        "pow_scalar_base", common, P_FLOAT_ONLY, True
+    )
     _pw_finish(
         rets,
         dest,
@@ -1262,16 +1418,6 @@ def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_rsub_check(args)
     if not _pw_rsub_alpha(args, rets, -1):
         op_rsub(args, n_args, rets, n_rets)
-
-
-# aten::rsub.Tensor_out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)
-# aten::rsub.Scalar_out(Tensor self, Scalar other, Scalar alpha=1, *, Tensor(a!) out) -> Tensor(a!)
-def op_rsub_out_any(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_rsub_check(args)
-    if not _pw_rsub_alpha(args, rets, 3):
-        op_rsub_out(args, n_args, rets, n_rets)
 
 
 # aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
@@ -1540,19 +1686,10 @@ def _float_max(st: Int32) -> Float64:
 
 
 def _softshrink_check(args: Values) raises:
-    """softshrink's meta: 0 <= lambd <= max of self's dtype (NaN fails)."""
-    var lambd = v_f64(args[unsafe_offset=1])
-    var st = _self_stype(args, 0)
-    var top = _float_max(st)
-    if not (lambd >= 0.0 and lambd <= top):
-        raise Error(
-            "lambda must be in range [0, ",
-            top,
-            "] for input dtype ",
-            dtype_name(st),
-            ", but found ",
-            lambd,
-        )
+    """softshrink's meta (Activation.cpp's softshrink_check)."""
+    softshrink_check(
+        v_tensor(args[unsafe_offset=0]), v_f64(args[unsafe_offset=1])
+    )
 
 
 # aten::hardshrink(Tensor self, Scalar lambd=0.5) -> Tensor
@@ -1976,10 +2113,21 @@ def _glu(args: Values, rets: Values, out_index: Int) raises:
     var b = own(_glu_half(self, d, True))
     var sa = _b_tside(a.t)
     var sb = _b_tside(b.t)
-    var compute = _pw_compute_dtype("glu", self.stype, P_FLOAT_ONLY, True)
     var dest = Optional[T]()
+    var common = self.stype
     if out_index >= 0:
+        # The out= checks and resize precede the kernel dispatch.
         dest = _pw_out_of(args[unsafe_offset=out_index], sa, sb, _none_side())
+        var o = dest.value().stype
+        if _pw_is_f8(common) or _pw_is_f8(o):
+            # glu_cuda dispatches on the OUTPUT dtype: a float8 input into a
+            # wider out computes there, a float8 out refuses as itself (out
+            # resized first).
+            common = o
+            var d = dest.value().copy()
+            if not d.same_shape(a.t):
+                resize_out(d, a.t.shape, a.t.rank)
+    var compute = _pw_compute_dtype("glu", common, P_FLOAT_ONLY, True)
     _pw_finish(
         rets,
         dest,
@@ -2413,14 +2561,24 @@ def op_gelu_backward_any(
 
 def _threshold_p(args: Values) raises -> SIMD[DType.float64, 4]:
     var st = _self_stype(args, 0)
+    if _pw_is_int(st):
+        return _p(
+            _int_exact_param(args[unsafe_offset=1], st),
+            _int_exact_param(args[unsafe_offset=2], st),
+        )
+    # An int64 Scalar past 2**53 rounds once, to float32, as C++ does.
     return _p(
-        _round_to(_int_exact_param(args[unsafe_offset=1], st), st),
-        _round_to(_int_exact_param(args[unsafe_offset=2], st), st),
+        v_f64(threshold_scalar_value(args[unsafe_offset=1], st)),
+        v_f64(threshold_scalar_value(args[unsafe_offset=2], st)),
     )
 
 
 # aten::threshold(Tensor self, Scalar threshold, Scalar value) -> Tensor
 def op_threshold(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var st = v_tensor(args[unsafe_offset=0]).stype
+    if st == ST_BOOL:
+        unsupported("\"threshold_cuda\" not implemented for 'Bool'")
+    threshold_scalar_check(args, 1, 2, st)
     _pw_act(
         "threshold", args, rets, 0, -1, -1, _threshold_p(args), True, P_NUMERIC
     )
@@ -2430,6 +2588,20 @@ def op_threshold(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_threshold_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    # An overflowing Scalar (or bool, no kernel) raises in the kernel,
+    # after the iterator's checks and resize: the helper runs that sequence.
+    var out = v_tensor(args[unsafe_offset=3])
+    if threshold_into_overlapping(
+        "aten::threshold",
+        args,
+        3,
+        args[unsafe_offset=3].copy(),
+        rets,
+        out.stype == ST_BOOL
+        or threshold_scalar_overflows(args, 1, 2, out.stype),
+    ):
+        return
+    threshold_scalar_check(args, 1, 2, out.stype)
     _pw_act(
         "threshold", args, rets, 0, -1, 3, _threshold_p(args), True, P_NUMERIC
     )
@@ -2437,6 +2609,20 @@ def op_threshold_out(
 
 # aten::threshold_(Tensor(a!) self, Scalar threshold, Scalar value) -> Tensor(a!)
 def op_threshold_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    # An overflowing Scalar (or bool, no kernel) raises in the kernel,
+    # after the iterator's checks and resize: the helper runs that sequence.
+    var out = v_tensor(args[unsafe_offset=0])
+    if threshold_into_overlapping(
+        "aten::threshold",
+        args,
+        3,
+        args[unsafe_offset=0].copy(),
+        rets,
+        out.stype == ST_BOOL
+        or threshold_scalar_overflows(args, 1, 2, out.stype),
+    ):
+        return
+    threshold_scalar_check(args, 1, 2, out.stype)
     _pw_act_inplace("threshold", args, rets, _threshold_p(args), P_NUMERIC)
 
 
@@ -2714,9 +2900,10 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     if out_index >= 0:
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
         var d = dest.value().copy()
-        if not _pw_is_float(d.stype):
+        if not (_pw_is_float(d.stype) or _pw_is_f8(d.stype)):
             raise Error(
-                "ldexp can't be cast to the desired output type ", d.stype
+                "ldexp can't be cast to the desired output type ",
+                scalar_type_name(d.dtype),
             )
     var e_integral = _pw_is_int(e_st) or e_st == ST_BOOL
     if (
@@ -2937,7 +3124,7 @@ def _loss_reduce(
     if out_st >= 0 and out_st != loss.t.stype:
         # sum_out / mean_out(result, loss) reduce in result's dtype: the
         # loss is cast to it first (the reduction kernels keep one dtype).
-        var casted = own(cast_for_copy(loss.t, out_st))
+        var casted = own(cast_for_copy(loss.t, out_st, False))
         _ = loss^
         loss = casted^
     var reduced_st = loss.t.stype
@@ -3884,6 +4071,49 @@ def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         raise Error(
             "atol must be greater than or equal to zero, but got ", atol
         )
+    if _pw_is_f8(st) and (a.is_t or b.is_t):
+        # isclose.cpp: `close = self == other` (eq has a float8 kernel), the
+        # equal_nan term, then -- unless both tolerances are zero --
+        # `rtol * other`, whose mul_cuda has no float8 case. A CPU 0-d
+        # operand joins as a device 0-d tensor (its value is a float8 one,
+        # exact in the float64 it was read as).
+        if rtol != 0 or atol != 0:
+            # `rtol * other` runs where other lives: a CPU 0-d other meets
+            # the CPU kernel's name.
+            decline_float8(
+                max_dtype(st), "mul_cuda" if b.is_t else "mul_cpu_reduced_float"
+            )
+        var device = _pw_device(a, b, _none_side())
+        var ha = _pw_f8_side_tensor(a, st, device)
+        var hb = _pw_f8_side_tensor(b, st, device)
+        var ta = ha.t.copy()
+        var tb = hb.t.copy()
+        var close = call_op(
+            "aten::eq", "Tensor", [tensor_arg(ta), tensor_arg(tb)], 1
+        )
+        if not equal_nan:
+            var only = own(close.take_tensor(0))
+            ret_owned(rets, 0, only)
+            _ = ha^
+            _ = hb^
+            return
+        var na = call_op("aten::isnan", "", [tensor_arg(ta)], 1)
+        var nb = call_op("aten::isnan", "", [tensor_arg(tb)], 1)
+        var both = call_op(
+            "aten::logical_and", "", [na[0].copy(), nb[0].copy()], 1
+        )
+        var r = call_op(
+            "aten::logical_or", "", [close[0].copy(), both[0].copy()], 1
+        )
+        var res = own(r.take_tensor(0))
+        ret_owned(rets, 0, res)
+        _ = ha^
+        _ = hb^
+        _ = na^
+        _ = nb^
+        _ = both^
+        _ = close^
+        return
     if not (_pw_is_float(st) or _pw_is_int(st) or st == ST_BOOL):
         unsupported("isclose on dtype " + dtype_name(st))
     var tol_on = 0.0 if (rtol == 0 and atol == 0) else 1.0
@@ -4030,10 +4260,76 @@ def op_sample_dirichlet(
     ret_owned(rets, 0, g)
 
 
+# aten::pow.Scalar_out(Scalar self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
+def op_pow_scalar_out_meta(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """pow.Scalar_out (Pow.cpp): its meta takes the dtype from the out (no
+    result type), checks the out's device and resizes it to the exponent's
+    shape; then a base
+    EQUAL to 1 (Scalar::equal: not a bool) is `out.fill_(1)` with no other
+    check, and any other base is pow.Tensor_Tensor's out= (the real or
+    complex route)."""
+    var ex = v_tensor_c(args[unsafe_offset=1])
+    var dest = v_tensor_c(args[unsafe_offset=2])
+    # the structured out's set_output: the out's device (its dtype is the
+    # out's own here), before the resize
+    check_out_as(dest, dest.stype, ex)
+    if not dest.same_shape(ex):
+        resize_any(dest, ex.shape, ex.rank)
+        dest = v_tensor_c(args[unsafe_offset=2])
+    if _base_is_one(args[unsafe_offset=0]):
+        var f = call_op(
+            "aten::fill_",
+            "Scalar",
+            [tensor_arg(dest), Value(TAG_SCALAR_INT, 0, 1, 0)],
+            1,
+        )
+        _ = f^
+        ret_ref(rets, 0, dest)
+        return
+    # at::pow_out(out, wrapped_scalar_tensor(base), exponent): its
+    # TensorIterator checks the out's memory overlaps before the result type
+    assert_no_internal_overlap(dest)
+    assert_no_partial_overlap(dest, ex)
+    routed[op_pow_scalar_base_out, cx_pow_tensor_out, 3](
+        args, n_args, rets, n_rets
+    )
+
+
+# rsub.Tensor / rsub.Scalar(self, other, alpha): sub(other, self) -- its
+# bool check, the result type of both operands (a Scalar other as a wrapped
+# number), alpha_check, then the kernel's dtype dispatch
+comptime _rsub_fn = f8_iter[
+    routed[op_rsub_any, cx_rsub, 3],
+    "ufunc_add_CUDA",
+    3,
+    -1,
+    MODE_FN,
+    False,
+    PRE_RSUB,
+    alpha_idx=2,
+]
+
+
 def register_pointwise(site: Site) raises:
     impl[op_sample_dirichlet, "_sample_dirichlet"](site)
-    impl[op_prelu_kernel, "_prelu_kernel"](site)
-    impl[op_prelu_kernel_backward, "_prelu_kernel_backward"](site)
+    impl[
+        f8_iter[op_prelu_kernel, "prelu_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "_prelu_kernel",
+    ](site)
+    impl[
+        f8_iter[
+            op_prelu_kernel_backward,
+            "prelu_backward_cuda",
+            7,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "_prelu_kernel_backward",
+    ](site)
     impl[op_add_relu, "_add_relu.Tensor"](site)
     impl[op_add_relu, "_add_relu.Scalar"](site)
     impl[op_add_relu_out, "_add_relu.out"](site)
@@ -4041,44 +4337,181 @@ def register_pointwise(site: Site) raises:
     impl[op_add_relu_, "_add_relu_.Scalar"](site)
     impl[op_isclose, "isclose"](site)
     impl[op_masked_scale, "_masked_scale"](site)
-    impl[op_standard_gamma_grad, "_standard_gamma_grad"](site)
+    impl[
+        f8_iter[
+            op_standard_gamma_grad,
+            "_standard_gamma_grad_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "_standard_gamma_grad",
+    ](site)
     impl[op_dirichlet_grad, "_dirichlet_grad"](site)
     impl[op_ilshift, "__ilshift__.Scalar"](site)
-    impl[op_ilshift, "__ilshift__.Tensor"](site)
+    impl[
+        f8_iter[op_ilshift, "lshift_cuda", 3, 0, MODE_INPLACE, True, PRE_NONE],
+        "__ilshift__.Tensor",
+    ](site)
     impl[op_irshift, "__irshift__.Scalar"](site)
-    impl[op_irshift, "__irshift__.Tensor"](site)
+    impl[
+        f8_iter[op_irshift, "rshift_cuda", 3, 0, MODE_INPLACE, True, PRE_NONE],
+        "__irshift__.Tensor",
+    ](site)
     impl[op_lshift, "__lshift__.Scalar"](site)
-    impl[op_lshift, "__lshift__.Tensor"](site)
+    impl[
+        f8_iter[op_lshift, "lshift_cuda", 3, -1, MODE_FN, True, PRE_NONE],
+        "__lshift__.Tensor",
+    ](site)
     impl[op_rshift, "__rshift__.Scalar"](site)
-    impl[op_rshift, "__rshift__.Tensor"](site)
-    impl[op_atan2, "atan2"](site)
-    impl[op_atan2_out, "atan2.out"](site)
-    impl[op_lshift, "bitwise_left_shift.Tensor"](site)
-    impl[op_lshift_out, "bitwise_left_shift.Tensor_out"](site)
-    impl[op_rshift, "bitwise_right_shift.Tensor"](site)
-    impl[op_rshift_out, "bitwise_right_shift.Tensor_out"](site)
+    impl[
+        f8_iter[op_rshift, "rshift_cuda", 3, -1, MODE_FN, True, PRE_NONE],
+        "__rshift__.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_atan2, "atan2_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "atan2",
+    ](site)
+    impl[
+        f8_iter[op_atan2_out, "atan2_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        "atan2.out",
+    ](site)
+    impl[
+        f8_iter[op_lshift, "lshift_cuda", 3, -1, MODE_FN, True, PRE_NONE],
+        "bitwise_left_shift.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_lshift_out, "lshift_cuda", 3, 2, MODE_OUTDT, True, PRE_NONE],
+        "bitwise_left_shift.Tensor_out",
+    ](site)
+    impl[
+        f8_iter[op_rshift, "rshift_cuda", 3, -1, MODE_FN, True, PRE_NONE],
+        "bitwise_right_shift.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_rshift_out, "rshift_cuda", 3, 2, MODE_OUTDT, True, PRE_NONE],
+        "bitwise_right_shift.Tensor_out",
+    ](site)
     impl[op_clamp_tensor, "clamp.Tensor"](site)
     impl[op_clamp_tensor_out, "clamp.Tensor_out"](site)
-    impl[op_copysign, "copysign.Scalar"](site)
-    impl[op_copysign, "copysign.Tensor"](site)
-    impl[op_copysign_out, "copysign.Scalar_out"](site)
-    impl[op_copysign_out, "copysign.out"](site)
-    impl[op_elu, "elu"](site)
-    impl[op_elu_out, "elu.out"](site)
-    impl[op_elu_backward, "elu_backward"](site)
-    impl[op_elu_backward_grad_input, "elu_backward.grad_input"](site)
-    impl[op_fmax, "fmax"](site)
-    impl[op_fmax_out, "fmax.out"](site)
-    impl[op_fmin, "fmin"](site)
-    impl[op_fmin_out, "fmin.out"](site)
-    impl[op_fmod, "fmod.Scalar"](site)
-    impl[op_fmod, "fmod.Tensor"](site)
-    impl[op_fmod_out, "fmod.Scalar_out"](site)
-    impl[op_fmod_out, "fmod.Tensor_out"](site)
+    impl[f8_cx_scalar[op_copysign], "copysign.Scalar"](site)
+    impl[
+        f8_iter[op_copysign, "copysign_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "copysign.Tensor",
+    ](site)
+    impl[f8_cx_scalar[op_copysign_out], "copysign.Scalar_out"](site)
+    impl[
+        f8_iter[
+            op_copysign_out, "copysign_cuda", 3, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "copysign.out",
+    ](site)
+    impl[
+        f8_iter[op_elu, "elu_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "elu",
+    ](site)
+    impl[
+        f8_iter[op_elu_out, "elu_cuda", 1, 4, MODE_SAME, False, PRE_NONE],
+        "elu.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_elu_backward,
+            "elu_backward_cuda",
+            33,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "elu_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_elu_backward_grad_input,
+            "elu_backward_cuda",
+            33,
+            6,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "elu_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_fmax,
+            "fmax_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NO_COMPLEX,
+            "fmax",
+        ],
+        "fmax",
+    ](site)
+    impl[
+        f8_iter[
+            op_fmax_out,
+            "fmax_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NO_COMPLEX,
+            "fmax",
+        ],
+        "fmax.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_fmin,
+            "fmin_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NO_COMPLEX,
+            "fmin",
+        ],
+        "fmin",
+    ](site)
+    impl[
+        f8_iter[
+            op_fmin_out,
+            "fmin_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NO_COMPLEX,
+            "fmin",
+        ],
+        "fmin.out",
+    ](site)
+    impl[f8_cx_scalar[op_fmod], "fmod.Scalar"](site)
+    impl[
+        f8_iter[op_fmod, "fmod_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "fmod.Tensor",
+    ](site)
+    impl[f8_cx_scalar[op_fmod_out], "fmod.Scalar_out"](site)
+    impl[
+        f8_iter[op_fmod_out, "fmod_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        "fmod.Tensor_out",
+    ](site)
     impl[op_frexp, "frexp.Tensor"](site)
     impl[op_frexp_out, "frexp.Tensor_out"](site)
-    impl[op_gcd, "gcd"](site)
-    impl[op_gcd_out, "gcd.out"](site)
+    impl[
+        f8_iter[op_gcd, "gcd_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "gcd",
+    ](site)
+    impl[
+        f8_iter[op_gcd_out, "gcd_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        "gcd.out",
+    ](site)
     impl[op_binary_cross_entropy, "binary_cross_entropy"](site)
     impl[op_binary_cross_entropy_out, "binary_cross_entropy.out"](site)
     impl[op_binary_cross_entropy_backward, "binary_cross_entropy_backward"](
@@ -4096,24 +4529,62 @@ def register_pointwise(site: Site) raises:
         op_binary_cross_entropy_with_logits_out,
         "binary_cross_entropy_with_logits.out",
     ](site)
-    impl[op_deg2rad, "deg2rad"](site)
-    impl[op_deg2rad_out, "deg2rad.out"](site)
-    impl[op_deg2rad_, "deg2rad_"](site)
-    impl[op_gelu_backward_any, "gelu_backward"](site)
+    impl[
+        f8_iter[op_deg2rad, "mul_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "deg2rad",
+    ](site)
+    impl[
+        f8_iter[op_deg2rad_out, "mul_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "deg2rad.out",
+    ](site)
+    impl[
+        f8_iter[op_deg2rad_, "mul_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE],
+        "deg2rad_",
+    ](site)
+    impl[
+        f8_iter[
+            op_gelu_backward_any,
+            "GeluBackwardCUDAKernelImpl",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "gelu_backward",
+    ](site)
     impl[op_huber_loss, "huber_loss"](site)
     impl[op_huber_loss_out, "huber_loss.out"](site)
     impl[op_huber_loss_backward, "huber_loss_backward"](site)
     impl[op_huber_loss_backward_out, "huber_loss_backward.out"](site)
-    impl[op_ldexp, "ldexp.Tensor"](site)
-    impl[op_ldexp_out, "ldexp.out"](site)
-    impl[op_ldexp_, "ldexp_"](site)
+    impl[
+        f8_iter[op_ldexp, "pow_cuda", 3, -1, MODE_FN, False, PRE_LDEXP],
+        "ldexp.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_ldexp_out, "pow_cuda", 3, 2, MODE_CAST, False, PRE_LDEXP],
+        "ldexp.out",
+    ](site)
+    impl[
+        f8_iter[op_ldexp_, "pow_cuda", 3, 0, MODE_INPLACE, False, PRE_LDEXP],
+        "ldexp_",
+    ](site)
     impl[op_mse_loss, "mse_loss"](site)
     impl[op_mse_loss_out, "mse_loss.out"](site)
     impl[op_mse_loss_backward, "mse_loss_backward"](site)
     impl[op_mse_loss_backward_grad_input, "mse_loss_backward.grad_input"](site)
-    impl[op_rad2deg, "rad2deg"](site)
-    impl[op_rad2deg_out, "rad2deg.out"](site)
-    impl[op_rad2deg_, "rad2deg_"](site)
+    impl[
+        f8_iter[op_rad2deg, "mul_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "rad2deg",
+    ](site)
+    impl[
+        f8_iter[op_rad2deg_out, "mul_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        "rad2deg.out",
+    ](site)
+    impl[
+        f8_iter[op_rad2deg_, "mul_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE],
+        "rad2deg_",
+    ](site)
     impl[op_smooth_l1_loss, "smooth_l1_loss"](site)
     impl[op_smooth_l1_loss_out, "smooth_l1_loss.out"](site)
     impl[op_smooth_l1_loss_backward, "smooth_l1_loss_backward"](site)
@@ -4121,84 +4592,524 @@ def register_pointwise(site: Site) raises:
         op_smooth_l1_loss_backward_grad_input,
         "smooth_l1_loss_backward.grad_input",
     ](site)
-    impl[op_gelu_backward_grad_input, "gelu_backward.grad_input"](site)
-    impl[op_hardshrink, "hardshrink"](site)
-    impl[op_hardshrink_out, "hardshrink.out"](site)
-    impl[op_shrink_backward, "hardshrink_backward"](site)
-    impl[op_shrink_backward_grad_input, "hardshrink_backward.grad_input"](site)
-    impl[op_hardsigmoid, "hardsigmoid"](site)
-    impl[op_hardsigmoid_out, "hardsigmoid.out"](site)
-    impl[op_hardsigmoid_, "hardsigmoid_"](site)
-    impl[op_hardsigmoid_backward, "hardsigmoid_backward"](site)
-    impl[op_hardsigmoid_backward_grad_input, "hardsigmoid_backward.grad_input"](
-        site
-    )
-    impl[op_hardswish, "hardswish"](site)
-    impl[op_hardswish_out, "hardswish.out"](site)
-    impl[op_hardswish_, "hardswish_"](site)
-    impl[op_hardswish_backward, "hardswish_backward"](site)
-    impl[op_hardtanh, "hardtanh"](site)
-    impl[op_hardtanh_out, "hardtanh.out"](site)
-    impl[op_hardtanh_, "hardtanh_"](site)
-    impl[op_hardtanh_backward, "hardtanh_backward"](site)
-    impl[op_hardtanh_backward_grad_input, "hardtanh_backward.grad_input"](site)
-    impl[op_heaviside, "heaviside"](site)
-    impl[op_heaviside_out, "heaviside.out"](site)
-    impl[op_hypot, "hypot"](site)
-    impl[op_hypot_out, "hypot.out"](site)
-    impl[op_igamma, "igamma"](site)
-    impl[op_igamma_out, "igamma.out"](site)
-    impl[op_igammac, "igammac"](site)
-    impl[op_igammac_out, "igammac.out"](site)
-    impl[op_lcm, "lcm"](site)
-    impl[op_lcm_out, "lcm.out"](site)
-    impl[op_leaky_relu, "leaky_relu"](site)
-    impl[op_leaky_relu_out, "leaky_relu.out"](site)
-    impl[op_leaky_relu_, "leaky_relu_"](site)
-    impl[op_leaky_relu_backward, "leaky_relu_backward"](site)
-    impl[op_leaky_relu_backward_grad_input, "leaky_relu_backward.grad_input"](
-        site
-    )
-    impl[op_lerp_scalar_any, "lerp.Scalar"](site)
-    impl[op_lerp_scalar_out_any, "lerp.Scalar_out"](site)
-    impl[op_lerp_scalar__any, "lerp_.Scalar"](site)
-    impl[op_lerp_tensor, "lerp.Tensor"](site)
-    impl[op_lerp_tensor_out, "lerp.Tensor_out"](site)
-    impl[op_log_sigmoid_backward, "log_sigmoid_backward"](site)
-    impl[op_log_sigmoid_backward_grad_input, "log_sigmoid_backward.grad_input"](
-        site
-    )
-    impl[op_log_sigmoid_forward, "log_sigmoid_forward"](site)
-    impl[op_log_sigmoid_forward_output, "log_sigmoid_forward.output"](site)
-    impl[op_logaddexp, "logaddexp"](site)
-    impl[op_logaddexp_out, "logaddexp.out"](site)
-    impl[op_logaddexp2, "logaddexp2"](site)
-    impl[op_logaddexp2_out, "logaddexp2.out"](site)
-    impl[op_logit_backward, "logit_backward"](site)
-    impl[op_logit_backward_grad_input, "logit_backward.grad_input"](site)
-    impl[op_mish, "mish"](site)
-    impl[op_mish_out, "mish.out"](site)
-    impl[op_mish_backward, "mish_backward"](site)
-    impl[op_nextafter, "nextafter"](site)
-    impl[op_nextafter_out, "nextafter.out"](site)
-    impl[routed[op_rsub_any, cx_rsub, 3], "rsub.Tensor"](site)
-    impl[routed[op_rsub_any, cx_rsub, 3], "rsub.Scalar"](site)
-    impl[routed[op_rsub_out_any, cx_rsub_out, 4], "rsub.Tensor_out"](site)
-    impl[routed[op_rsub_out_any, cx_rsub_out, 4], "rsub.Scalar_out"](site)
-    impl[routed[op_pow_scalar_base, cx_pow_tensor, 2], "pow.Scalar"](site)
     impl[
-        routed[op_pow_scalar_base_out, cx_pow_tensor_out, 3], "pow.Scalar_out"
+        f8_iter[
+            op_gelu_backward_grad_input,
+            "GeluBackwardCUDAKernelImpl",
+            3,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "gelu_backward.grad_input",
     ](site)
     impl[
-        routed[op_pow_scalar_any, cx_pow_tensor_scalar, 2], "pow.Tensor_Scalar"
+        f8_iter[
+            op_hardshrink, "hardshrink_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "hardshrink",
     ](site)
     impl[
-        routed[op_pow_scalar_out_any, cx_pow_tensor_scalar_out, 3],
+        f8_iter[
+            op_hardshrink_out,
+            "hardshrink_cuda",
+            1,
+            2,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "hardshrink.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_shrink_backward,
+            "shrink_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "hardshrink_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_shrink_backward_grad_input,
+            "shrink_backward_cuda",
+            3,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "hardshrink_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid, "hardsigmoid_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "hardsigmoid",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid_out,
+            "hardsigmoid_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "hardsigmoid.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid_,
+            "hardsigmoid_cuda",
+            1,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
+        "hardsigmoid_",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid_backward,
+            "hardsigmoid_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "hardsigmoid_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardsigmoid_backward_grad_input,
+            "hardsigmoid_backward_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "hardsigmoid_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardswish, "hardswish_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "hardswish",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardswish_out, "hardswish_cuda", 1, 1, MODE_SAME, False, PRE_NONE
+        ],
+        "hardswish.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardswish_, "hardswish_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE
+        ],
+        "hardswish_",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardswish_backward,
+            "hardswish_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "hardswish_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardtanh, "clamp_scalar_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "hardtanh",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardtanh_out,
+            "clamp_scalar_cuda",
+            1,
+            3,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "hardtanh.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardtanh_,
+            "clamp_scalar_cuda",
+            1,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
+        "hardtanh_",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardtanh_backward,
+            "hardtanh_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "hardtanh_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_hardtanh_backward_grad_input,
+            "hardtanh_backward_cuda",
+            3,
+            4,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "hardtanh_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_heaviside, "heaviside_cuda", 3, -1, MODE_FN, False, PRE_HEAVISIDE
+        ],
+        "heaviside",
+    ](site)
+    impl[
+        f8_iter[
+            op_heaviside_out,
+            "heaviside_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_HEAVISIDE,
+        ],
+        "heaviside.out",
+    ](site)
+    impl[
+        f8_iter[op_hypot, "hypot_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "hypot",
+    ](site)
+    impl[
+        f8_iter[op_hypot_out, "hypot_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        "hypot.out",
+    ](site)
+    impl[
+        f8_iter[op_igamma, "igamma_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "igamma",
+    ](site)
+    impl[
+        f8_iter[op_igamma_out, "igamma_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        "igamma.out",
+    ](site)
+    impl[
+        f8_iter[op_igammac, "igammac_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "igammac",
+    ](site)
+    impl[
+        f8_iter[
+            op_igammac_out, "igammac_cuda", 3, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "igammac.out",
+    ](site)
+    impl[
+        f8_iter[op_lcm, "lcm_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "lcm",
+    ](site)
+    impl[
+        f8_iter[op_lcm_out, "lcm_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        "lcm.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_leaky_relu, "leaky_relu_cuda", 1, -1, MODE_FN, False, PRE_NONE
+        ],
+        "leaky_relu",
+    ](site)
+    impl[
+        f8_iter[
+            op_leaky_relu_out,
+            "leaky_relu_cuda",
+            1,
+            2,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "leaky_relu.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_leaky_relu_,
+            "leaky_relu_cuda",
+            1,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_NONE,
+        ],
+        "leaky_relu_",
+    ](site)
+    impl[
+        f8_iter[
+            op_leaky_relu_backward,
+            "leaky_relu_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_SELF_FIRST,
+        ],
+        "leaky_relu_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_leaky_relu_backward_grad_input,
+            "leaky_relu_backward_cuda",
+            3,
+            4,
+            MODE_OUTDT,
+            False,
+            PRE_SELF_FIRST,
+        ],
+        "leaky_relu_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_lerp_scalar_any, "lerp_cuda", 3, -1, MODE_FN, False, PRE_LERP
+        ],
+        "lerp.Scalar",
+    ](site)
+    impl[
+        f8_iter[
+            op_lerp_scalar_out_any,
+            "lerp_cuda",
+            3,
+            3,
+            MODE_CAST,
+            False,
+            PRE_LERP,
+        ],
+        "lerp.Scalar_out",
+    ](site)
+    impl[
+        f8_iter[
+            op_lerp_scalar__any,
+            "lerp_cuda",
+            3,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_LERP,
+        ],
+        "lerp_.Scalar",
+    ](site)
+    impl[
+        f8_iter[op_lerp_tensor, "lerp_cuda", 7, -1, MODE_FN, False, PRE_LERP],
+        "lerp.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_lerp_tensor_out, "lerp_cuda", 7, 3, MODE_SAME, False, PRE_LERP
+        ],
+        "lerp.Tensor_out",
+    ](site)
+    impl[
+        f8_iter[
+            op_log_sigmoid_backward,
+            "log_sigmoid_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_ALL_SAME,
+        ],
+        "log_sigmoid_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_log_sigmoid_backward_grad_input,
+            "log_sigmoid_backward_cuda",
+            3,
+            3,
+            MODE_SAME,
+            False,
+            PRE_ALL_SAME,
+        ],
+        "log_sigmoid_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_log_sigmoid_forward,
+            "log_sigmoid_forward_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "log_sigmoid_forward",
+    ](site)
+    impl[
+        f8_iter[
+            op_log_sigmoid_forward_output,
+            "log_sigmoid_forward_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
+        "log_sigmoid_forward.output",
+    ](site)
+    impl[
+        f8_iter[
+            op_logaddexp, "logaddexp_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logaddexp",
+    ](site)
+    impl[
+        f8_iter[
+            op_logaddexp_out,
+            "logaddexp_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "logaddexp.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_logaddexp2, "logaddexp2_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logaddexp2",
+    ](site)
+    impl[
+        f8_iter[
+            op_logaddexp2_out,
+            "logaddexp2_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "logaddexp2.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_logit_backward, "logit_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        ],
+        "logit_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_logit_backward_grad_input,
+            "logit_cuda",
+            3,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "logit_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[op_mish, "mish_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "mish",
+    ](site)
+    impl[
+        f8_iter[op_mish_out, "mish_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        "mish.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_mish_backward,
+            "mish_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_DISPATCH_SELF,
+        ],
+        "mish_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_nextafter, "nextafter_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        ],
+        "nextafter",
+    ](site)
+    impl[
+        f8_iter[
+            op_nextafter_out, "nextafter_cuda", 3, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "nextafter.out",
+    ](site)
+    impl[_rsub_fn, "rsub.Tensor"](site)
+    impl[_rsub_fn, "rsub.Scalar"](site)
+    # rsub's out= overloads are generated wrappers: the functional result
+    # (its checks and float8 refusal leave out untouched), then resize,
+    # copy_arg's exact dtype check, the copy
+    impl[generated_out[_rsub_fn, 3, 3], "rsub.Tensor_out"](site)
+    impl[generated_out[_rsub_fn, 3, 3], "rsub.Scalar_out"](site)
+    impl[
+        f8_cx_scalar[routed[op_pow_scalar_base, cx_pow_tensor, 2]], "pow.Scalar"
+    ](site)
+    # pow.Scalar_out takes its dtype from the out (no result type): the out
+    # is resized, a base equal to 1 fills ones, any other complex base
+    # meets the float8 exponent in pow.Tensor_Tensor (cx_pow_tensor_out)
+    impl[op_pow_scalar_out_meta, "pow.Scalar_out"](site)
+    impl[
+        f8_cx_scalar[routed[op_pow_scalar_any, cx_pow_tensor_scalar, 2]],
+        "pow.Tensor_Scalar",
+    ](site)
+    impl[
+        f8_cx_scalar[
+            routed[op_pow_scalar_out_any, cx_pow_tensor_scalar_out, 3]
+        ],
         "pow.Tensor_Scalar_out",
     ](site)
-    impl[routed[op_pow_tensor_any, cx_pow_tensor, 2], "pow.Tensor_Tensor"](site)
     impl[
-        routed[op_pow_tensor_out_any, cx_pow_tensor_out, 3],
+        f8_iter[
+            routed[op_pow_tensor_any, cx_pow_tensor, 2],
+            "pow_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "pow.Tensor_Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            routed[op_pow_tensor_out_any, cx_pow_tensor_out, 3],
+            "pow_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "pow.Tensor_Tensor_out",
     ](site)
     impl[op_rrelu_with_noise, "rrelu_with_noise"](site)
@@ -4212,22 +5123,163 @@ def register_pointwise(site: Site) raises:
     impl[op_glu_jvp_out, "glu_jvp.out"](site)
     impl[op_glu_backward_jvp, "glu_backward_jvp"](site)
     impl[op_glu_backward_jvp_out, "glu_backward_jvp.out"](site)
-    impl[op_silu_backward, "silu_backward"](site)
-    impl[op_silu_backward_grad_input, "silu_backward.grad_input"](site)
-    impl[op_softplus, "softplus"](site)
-    impl[op_softplus_out, "softplus.out"](site)
-    impl[op_softplus_backward, "softplus_backward"](site)
-    impl[op_softplus_backward_grad_input, "softplus_backward.grad_input"](site)
-    impl[op_softshrink, "softshrink"](site)
-    impl[op_softshrink_out, "softshrink.out"](site)
-    impl[op_shrink_backward, "softshrink_backward"](site)
-    impl[op_shrink_backward_grad_input, "softshrink_backward.grad_input"](site)
+    impl[
+        f8_iter[
+            op_silu_backward,
+            "silu_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "silu_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_silu_backward_grad_input,
+            "silu_backward_cuda",
+            3,
+            2,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "silu_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[op_softplus, "softplus_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        "softplus",
+    ](site)
+    impl[
+        f8_iter[
+            op_softplus_out, "softplus_cuda", 1, 3, MODE_SAME, False, PRE_NONE
+        ],
+        "softplus.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_softplus_backward,
+            "softplus_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "softplus_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_softplus_backward_grad_input,
+            "softplus_backward_cuda",
+            3,
+            4,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "softplus_backward.grad_input",
+    ](site)
+    impl[
+        f8_iter[
+            op_softshrink,
+            "softshrink_check",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_SOFTSHRINK,
+        ],
+        "softshrink",
+    ](site)
+    impl[
+        f8_iter[
+            op_softshrink_out,
+            "softshrink_check",
+            1,
+            2,
+            MODE_SAME,
+            False,
+            PRE_SOFTSHRINK,
+        ],
+        "softshrink.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_shrink_backward,
+            "shrink_backward_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "softshrink_backward",
+    ](site)
+    impl[
+        f8_iter[
+            op_shrink_backward_grad_input,
+            "shrink_backward_cuda",
+            3,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_NONE,
+        ],
+        "softshrink_backward.grad_input",
+    ](site)
     _register_special(site)
-    impl[op_threshold, "threshold"](site)
-    impl[op_threshold_out, "threshold.out"](site)
-    impl[op_threshold_, "threshold_"](site)
-    impl[op_xlogy, "xlogy.Tensor"](site)
-    impl[op_xlogy_out, "xlogy.OutTensor"](site)
+    impl[
+        f8_iter[
+            op_threshold,
+            "threshold_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_THRESHOLD,
+            "",
+            False,
+        ],
+        "threshold",
+    ](site)
+    impl[
+        f8_iter[
+            op_threshold_out,
+            "threshold_cuda",
+            1,
+            3,
+            MODE_OUTDT,
+            False,
+            PRE_THRESHOLD,
+            "",
+            False,
+        ],
+        "threshold.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_threshold_,
+            "threshold_cuda",
+            1,
+            0,
+            MODE_INPLACE,
+            False,
+            PRE_THRESHOLD,
+            "",
+            False,
+        ],
+        "threshold_",
+    ](site)
+    impl[
+        f8_iter[op_xlogy, "xlogy_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "xlogy.Tensor",
+    ](site)
+    impl[
+        f8_iter[op_xlogy_out, "xlogy_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        "xlogy.OutTensor",
+    ](site)
 
 
 comptime op_special_chebyshev_polynomial_t = op_poly[
@@ -4297,92 +5349,319 @@ comptime op_special_shifted_chebyshev_polynomial_w_out = op_poly[
 
 
 def _register_special(site: Site) raises:
-    impl[op_special_chebyshev_polynomial_t, "special_chebyshev_polynomial_t"](
-        site
-    )
     impl[
-        op_special_chebyshev_polynomial_t_out,
+        f8_iter[
+            op_special_chebyshev_polynomial_t,
+            "chebyshev_polynomial_t_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_chebyshev_polynomial_t",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_chebyshev_polynomial_t_out,
+            "chebyshev_polynomial_t_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_chebyshev_polynomial_t.out",
     ](site)
-    impl[op_special_chebyshev_polynomial_u, "special_chebyshev_polynomial_u"](
-        site
-    )
     impl[
-        op_special_chebyshev_polynomial_u_out,
+        f8_iter[
+            op_special_chebyshev_polynomial_u,
+            "chebyshev_polynomial_u_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_chebyshev_polynomial_u",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_chebyshev_polynomial_u_out,
+            "chebyshev_polynomial_u_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_chebyshev_polynomial_u.out",
     ](site)
-    impl[op_special_chebyshev_polynomial_v, "special_chebyshev_polynomial_v"](
-        site
-    )
     impl[
-        op_special_chebyshev_polynomial_v_out,
+        f8_iter[
+            op_special_chebyshev_polynomial_v,
+            "chebyshev_polynomial_v_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_chebyshev_polynomial_v",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_chebyshev_polynomial_v_out,
+            "chebyshev_polynomial_v_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_chebyshev_polynomial_v.out",
     ](site)
-    impl[op_special_chebyshev_polynomial_w, "special_chebyshev_polynomial_w"](
-        site
-    )
     impl[
-        op_special_chebyshev_polynomial_w_out,
+        f8_iter[
+            op_special_chebyshev_polynomial_w,
+            "chebyshev_polynomial_w_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_chebyshev_polynomial_w",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_chebyshev_polynomial_w_out,
+            "chebyshev_polynomial_w_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_chebyshev_polynomial_w.out",
     ](site)
-    impl[op_special_hermite_polynomial_h, "special_hermite_polynomial_h"](site)
     impl[
-        op_special_hermite_polynomial_h_out, "special_hermite_polynomial_h.out"
+        f8_iter[
+            op_special_hermite_polynomial_h,
+            "hermite_polynomial_h_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_hermite_polynomial_h",
     ](site)
-    impl[op_special_hermite_polynomial_he, "special_hermite_polynomial_he"](
-        site
-    )
     impl[
-        op_special_hermite_polynomial_he_out,
+        f8_iter[
+            op_special_hermite_polynomial_h_out,
+            "hermite_polynomial_h_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_hermite_polynomial_h.out",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_hermite_polynomial_he,
+            "hermite_polynomial_he_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_hermite_polynomial_he",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_hermite_polynomial_he_out,
+            "hermite_polynomial_he_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_hermite_polynomial_he.out",
     ](site)
-    impl[op_special_laguerre_polynomial_l, "special_laguerre_polynomial_l"](
-        site
-    )
     impl[
-        op_special_laguerre_polynomial_l_out,
+        f8_iter[
+            op_special_laguerre_polynomial_l,
+            "laguerre_polynomial_l_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_laguerre_polynomial_l",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_laguerre_polynomial_l_out,
+            "laguerre_polynomial_l_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_laguerre_polynomial_l.out",
     ](site)
-    impl[op_special_legendre_polynomial_p, "special_legendre_polynomial_p"](
-        site
-    )
     impl[
-        op_special_legendre_polynomial_p_out,
+        f8_iter[
+            op_special_legendre_polynomial_p,
+            "legendre_polynomial_p_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
+        "special_legendre_polynomial_p",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_legendre_polynomial_p_out,
+            "legendre_polynomial_p_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_legendre_polynomial_p.out",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_t,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_t,
+            "shifted_chebyshev_polynomial_t_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_t",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_t_out,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_t_out,
+            "shifted_chebyshev_polynomial_t_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_t.out",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_u,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_u,
+            "shifted_chebyshev_polynomial_u_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_u",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_u_out,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_u_out,
+            "shifted_chebyshev_polynomial_u_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_u.out",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_v,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_v,
+            "shifted_chebyshev_polynomial_v_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_v",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_v_out,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_v_out,
+            "shifted_chebyshev_polynomial_v_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_v.out",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_w,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_w,
+            "shifted_chebyshev_polynomial_w_cuda",
+            3,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_w",
     ](site)
     impl[
-        op_special_shifted_chebyshev_polynomial_w_out,
+        f8_iter[
+            op_special_shifted_chebyshev_polynomial_w_out,
+            "shifted_chebyshev_polynomial_w_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "special_shifted_chebyshev_polynomial_w.out",
     ](site)
-    impl[op_special_xlog1py, "special_xlog1py"](site)
-    impl[op_special_xlog1py_out, "special_xlog1py.out"](site)
-    impl[op_special_zeta, "special_zeta"](site)
-    impl[op_special_zeta_out, "special_zeta.out"](site)
+    impl[
+        f8_iter[
+            op_special_xlog1py, "xlog1py_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        ],
+        "special_xlog1py",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_xlog1py_out,
+            "xlog1py_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
+        "special_xlog1py.out",
+    ](site)
+    impl[
+        f8_iter[op_special_zeta, "zeta_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "special_zeta",
+    ](site)
+    impl[
+        f8_iter[
+            op_special_zeta_out, "zeta_cuda", 3, 2, MODE_CAST, False, PRE_NONE
+        ],
+        "special_zeta.out",
+    ](site)

@@ -36,10 +36,12 @@ from tmb.backend.abi import (
     dtype_name,
     max_dtype,
     new_like,
+    cpu_empty,
     new_scalar,
     new_tensor,
     none_arg,
     own,
+    ST_FLOAT32,
     own_if_new,
     release,
     ret_bool,
@@ -58,18 +60,20 @@ from tmb.backend.abi import (
     v_string,
     v_tensor,
 )
-from tmb.backend.device import ctx_for, ctx_ptr
+from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
+from tmb.kernels.common.float8 import is_float8
+from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.common import (
+    out_device_error,
     device_str,
     fill_item,
     assert_no_partial_overlap,
     check_expands_to,
     check_real_scalar_fits,
-    is_wide_unsigned,
     real_fill_value,
-    scalar_type_name,
+    refuse_masked_fill_dtype,
     assert_no_internal_overlap,
     binary_promotion,
     broadcast_shape,
@@ -78,12 +82,31 @@ from tmb.ops.common import (
     contiguous,
     copy_strided_into,
     fill_value,
+    is_cast_dtype_on,
+    known_stype,
     promote_types,
     promoted_pair,
     resize_out,
+    result_type,
     scalar_embed,
     scalar_to_float,
     scalar_to_int,
+)
+from tmb.ops.f8_iter import (
+    f8_iter,
+    MODE_CAST,
+    MODE_FN,
+    MODE_INPLACE,
+    MODE_NOCHECK,
+    MODE_OUTDT,
+    MODE_SAME,
+    PRE_BOOL_OUT,
+    PRE_DIV_MODE,
+    PRE_HEAVISIDE,
+    PRE_LDEXP,
+    PRE_NAN_TO_NUM,
+    PRE_NONE,
+    PRE_SUB,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
@@ -99,7 +122,7 @@ from tmb.ops.complex import (
     cx_where,
     routed,
 )
-from tmb.ops.core import cast_for_copy
+from tmb.ops.core import _host_copy, cast_for_copy
 from tmb.ops.binary import _b_out_guard, _b_tside
 
 
@@ -143,7 +166,7 @@ def _prepare_out(
     but a non-contiguous layout, since a resize always leaves it contiguous.
     """
     if not out_arg.on_mojo() or out_arg.device != device:
-        raise Error("expected the out= tensor on the operands' mojo device")
+        out_device_error(device, out_arg)
     if out_arg.stype != stype:
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
@@ -165,7 +188,7 @@ def _ensure_out_shape(
     temporary and copy (searchsorted/bucketize): only the dtype/shape
     checks matter, not contiguity."""
     if not out_arg.on_mojo() or out_arg.device != device:
-        raise Error("expected the out= tensor on the operands' mojo device")
+        out_device_error(device, out_arg)
     if out_arg.stype != stype:
         raise Error(
             "expected an out= tensor of dtype ", stype, ", got ", out_arg.stype
@@ -197,6 +220,23 @@ def _one_device(a: T, b: T) raises:
 
 
 def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
+    if is_float8(a.dtype) or is_float8(b.dtype):
+        # CUDA's compare_eq_ne_kernel takes AT_FLOAT8_TYPES (it compares the
+        # float values: NaN != NaN, +0 == -0); the ordered comparisons
+        # (compare_cuda) do not. A float8's float32 copy is exact.
+        var f8 = a.dtype if is_float8(a.dtype) else b.dtype
+        if op != "EqSpec" and op != "NeSpec":
+            unsupported(
+                '"compare_cuda" not implemented for \''
+                + _scalar_type_name(f8)
+                + "'"
+            )
+        var fa = own_if_new(cast_to(a, ST_FLOAT32), a)
+        var fb = own_if_new(cast_to(b, ST_FLOAT32), b)
+        _compare_spec(op, fa.t, fb.t, dst)
+        _ = fa^
+        _ = fb^
+        return
     _one_device(a, dst)
     _one_device(b, dst)
     var ctx = ctx_for(dst.device)
@@ -217,10 +257,11 @@ def _compare_out_guard(out_arg: T, a: T, b: T) raises:
     path runs): no internal overlap in `out`, no partial overlap with an
     input, and an `out` that IS an input (the in-place `x.eq_(y)`) never
     resized -- a broadcast shape larger than it raises."""
-    if not out_arg.on_mojo():
-        raise Error("expected the out= tensor on the operands' mojo device")
-    assert_no_internal_overlap(out_arg)
-    _b_out_guard(out_arg, _b_tside(a), _b_tside(b))
+    assert_no_internal_overlap(out_arg)  # compute_mem_overlaps first
+    var device = a.device if a.on_mojo() else b.device
+    if not out_arg.on_mojo() or out_arg.device != device:
+        out_device_error(device, out_arg)  # then compute_types
+    _b_out_guard(out_arg, _b_tside(a), _b_tside(b), False)
 
 
 def _cast_into_out(
@@ -237,61 +278,161 @@ def _cast_into_out(
     is the bool result, computed apart so an `out` aliasing an operand is
     only written once every element has been read."""
     if not out_arg.on_mojo() or out_arg.device != device:
-        raise Error("expected the out= tensor on the operands' mojo device")
+        out_device_error(device, out_arg)
     if not _shape_eq(out_arg, shape, rank):
         resize_out(out_arg, shape, rank)
-    var casted = own(cast_for_copy(res, out_arg.stype))
+    var casted = own(cast_for_copy(res, out_arg.stype, False))
     copy_strided_into(out_arg, casted.t)
     _ = casted^  # alive past the launch
 
 
-def _compare_functional(op: StaticString, args: Values, rets: Values) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
+def _float8_common(a: T, b: T) raises -> DType:
+    """torch's result_type when a float8 tensor is involved: a 0-d operand
+    (or a wrapped scalar) of a lower or equal category takes the other side's
+    float8 dtype, a 0-d float8 meets a dimensioned float in that float's
+    dtype, and every other pair of distinct dtypes is c10's
+    promoteTypes error (float8 promotes with nothing)."""
+    if a.dtype == b.dtype:
+        return a.dtype
+    if is_float8(a.dtype) and b.rank == 0 and a.rank > 0:
+        return a.dtype
+    if is_float8(b.dtype) and a.rank == 0 and b.rank > 0:
+        return b.dtype
+    if (
+        is_float8(a.dtype)
+        and a.rank == 0
+        and b.rank > 0
+        and b.dtype.is_floating_point()
+    ):
+        return b.dtype
+    if (
+        is_float8(b.dtype)
+        and b.rank == 0
+        and a.rank > 0
+        and a.dtype.is_floating_point()
+    ):
+        return a.dtype
+    # c10 folds the dimensioned operands before the 0-d ones
+    # (combine_categories(dimResult, zeroResult)): name them in that order.
+    var first = b.dtype if a.rank == 0 and b.rank > 0 else a.dtype
+    var second = a.dtype if a.rank == 0 and b.rank > 0 else b.dtype
+    raise Error(
+        "Promotion for Float8 Types is not supported, attempted to promote ",
+        _scalar_type_name(first),
+        " and ",
+        _scalar_type_name(second),
+    )
+
+
+def _compare_dtype(a: T, b: T) raises -> DType:
+    """The common dtype a comparison computes in: torch's result_type, so a
+    0-d operand of the same category never widens the dimensioned one
+    (`half[2] == float[]` compares in half, as CUDA does)."""
+    if is_float8(a.dtype) or is_float8(b.dtype):
+        return _float8_common(a, b)
+    if (
+        a.dtype != b.dtype
+        and (a.rank == 0) != (b.rank == 0)
+        and known_stype(a.stype)
+        and known_stype(b.stype)
+    ):
+        var dt = max_dtype(result_type(a, b))
+        if is_cast_dtype_on(dt, a):
+            return dt
+    return binary_promotion(a, b)
+
+
+def _cpu_scalar_operand(t: T, other: T) -> Bool:
+    """A 0-d CPU tensor against a mojo operand: TensorIterator takes it on
+    either side as a scalar-like 0-d tensor (its dtype still promotes)."""
+    return t.on_cpu() and t.rank == 0 and other.on_mojo()
+
+
+def _operand_as(t: T, other: T, stype: Int32, saturate: Bool) raises -> Owned:
+    """`t` in dtype `stype` on `other`'s device. A 0-d CPU operand converts
+    on the CPU -- CPU torch's copy_, as stock torch's `.to(result_type)` does
+    there (never saturating, and no float64 kernel for Metal to lack) -- and
+    then uploads; a device operand casts on the device (`saturate`: a
+    `.to()`, as where.self does; a comparison's TensorIterator cast does
+    not). Costs nothing for a device operand already in `stype`."""
+    if _cpu_scalar_operand(t, other):
+        var host = own(cpu_empty(IndexList[MAX_RANK](1), 0, stype))
+        _host_copy(host.t, t)
+        var up = own(new_scalar(stype, other.device))
+        copy_from_host(
+            other.device,
+            ctx_for(other.device),
+            up.t.ptr,
+            host.t.ptr,
+            host.t.itemsize,
+        )
+        _ = host^
+        return up^
+    return own_if_new(cast_to(t, stype, saturate), t)
+
+
+def _check_pair_devices(a: T, b: T) raises:
+    if a.on_cpu() and b.on_cpu() and a.rank == 0 and b.rank == 0:
+        # Two CPU scalars reach the mojo kernel only through a device out=
+        # (TensorIterator allows one).
+        raise Error("Trying to pass too many CPU scalars to non-CPU kernel!")
+    var a_ok = a.on_mojo() or _cpu_scalar_operand(a, b)
+    var b_ok = b.on_mojo() or _cpu_scalar_operand(b, a)
+    if (
+        not a_ok
+        or not b_ok
+        or (a.on_mojo() and b.on_mojo() and a.device != b.device)
+    ):
         raise Error("expected both operands on the same mojo device")
-    var dtype = binary_promotion(a, b)
-    var stype = torch_dtype(dtype)
-    var pa = cast_to(a, stype)
-    var pb = cast_to(b, stype)
-    var shape = broadcast_shape(pa, pb)
-    var rank = max(pa.rank, pb.rank)
-    var out = own(new_tensor(shape, rank, ST_BOOL, a.device))
-    _compare_spec(op, pa, pb, out.t)
-    _release_if_new(pa, a)
-    _release_if_new(pb, b)
+
+
+def _compare_functional(op: StaticString, args: Values, rets: Values) raises:
+    var a0 = v_tensor(args[unsafe_offset=0])
+    var b0 = v_tensor(args[unsafe_offset=1])
+    _check_pair_devices(a0, b0)
+    var stype = torch_dtype(_compare_dtype(a0, b0))
+    var ha = _operand_as(a0, b0, stype, False)
+    var hb = _operand_as(b0, a0, stype, False)
+    var shape = broadcast_shape(ha.t, hb.t)
+    var rank = max(ha.t.rank, hb.t.rank)
+    var out = own(new_tensor(shape, rank, ST_BOOL, ha.t.device))
+    _compare_spec(op, ha.t, hb.t, out.t)
+    _ = ha^
+    _ = hb^
     ret_owned(rets, 0, out)
 
 
 def _compare_functional_out(
     op: StaticString, args: Values, rets: Values
 ) raises:
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
+    var a0 = v_tensor(args[unsafe_offset=0])
+    var b0 = v_tensor(args[unsafe_offset=1])
     var out_arg = v_tensor(args[unsafe_offset=2])
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
-        raise Error("expected both operands on the same mojo device")
-    _compare_out_guard(out_arg, a, b)
-    var dtype = binary_promotion(a, b)
-    var stype = torch_dtype(dtype)
-    var pa = cast_to(a, stype)
-    var pb = cast_to(b, stype)
+    _check_pair_devices(a0, b0)
+    # Overlap / alias checks see the caller's operands, before any cast
+    # temporary exists (`eq(a, b, out=a)` with a cast `a` is still `out=a`).
+    _compare_out_guard(out_arg, a0, b0)
+    var stype = torch_dtype(_compare_dtype(a0, b0))
+    var ha = _operand_as(a0, b0, stype, False)
+    var hb = _operand_as(b0, a0, stype, False)
+    var pa = ha.t.copy()
+    var pb = hb.t.copy()
     var shape = broadcast_shape(pa, pb)
     var rank = max(pa.rank, pb.rank)
     if out_arg.stype != ST_BOOL:
-        var res = own(new_tensor(shape, rank, ST_BOOL, a.device))
+        var res = own(new_tensor(shape, rank, ST_BOOL, pa.device))
         _compare_spec(op, pa, pb, res.t)
-        _cast_into_out(out_arg, res.t, shape, rank, a.device)
+        _cast_into_out(out_arg, res.t, shape, rank, pa.device)
         _ = res^  # alive past the launch
-    elif _prepare_out(out_arg, shape, rank, ST_BOOL, a.device):
+    elif _prepare_out(out_arg, shape, rank, ST_BOOL, pa.device):
         _compare_spec(op, pa, pb, out_arg)
     else:
-        var tmp = own(new_tensor(shape, rank, ST_BOOL, a.device))
+        var tmp = own(new_tensor(shape, rank, ST_BOOL, pa.device))
         _compare_spec(op, pa, pb, tmp.t)
         copy_strided_into(out_arg, tmp.t)
         _ = tmp^  # alive past the launch
-    _release_if_new(pa, a)
-    _release_if_new(pb, b)
+    _ = ha^
+    _ = hb^
     ret_ref(rets, 0, out_arg)
 
 
@@ -301,7 +442,23 @@ def _scalar_fill(a: T, v: Value) raises -> Owned:
     integer-Scalar path, exact past 2**53); everything else goes through
     `scalar_embed`'s Float64."""
     var fill = own(new_scalar(a.stype, a.device))
-    if (
+    if is_float8(a.dtype):
+        # The scalar rounds into a's float8 dtype unchecked (CUDA: `x == 1000.`
+        # against e4m3fn compares with NaN, it does not raise).
+        if v.tag == TAG_COMPLEX:
+            # c10's promoteTypes (Float8, ComplexDouble).
+            raise Error(
+                "Unknown Complex ScalarType for ", _scalar_type_name(a.dtype)
+            )
+        # An integer rounds to float32 once (c10's int64 -> float ->
+        # float8); through Float64 it would round twice.
+        fill_value(
+            fill.t,
+            Float64(
+                Scalar[DType.int64](v_int(v)).cast[DType.float32]()
+            ) if v_scalar_is_integral(v) else v_f64(v),
+        )
+    elif (
         v_scalar_is_integral(v)
         and not a.dtype.is_floating_point()
         and a.dtype != DType.bool
@@ -867,25 +1024,32 @@ def _where_select(
 # aten::where.self(Tensor condition, Tensor self, Tensor other) -> Tensor
 def op_where_self(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var cond = v_tensor(args[unsafe_offset=0])
-    var a = v_tensor(args[unsafe_offset=1])
-    var b = v_tensor(args[unsafe_offset=2])
+    var a0 = v_tensor(args[unsafe_offset=1])
+    var b0 = v_tensor(args[unsafe_offset=2])
     if cond.dtype != DType.bool:
         unsupported("where: condition must be a bool tensor")
-    if (
-        not cond.on_mojo()
-        or not a.on_mojo()
-        or not b.on_mojo()
-        or cond.device != a.device
-        or a.device != b.device
-    ):
+    # A 0-d CPU self / other is allowed ("allow CPU scalars on non-cpu
+    # device", where_self_out); anything else must share cond's device.
+    var a_ok = (a0.on_mojo() and a0.device == cond.device) or (
+        _cpu_scalar_operand(a0, cond)
+    )
+    var b_ok = (b0.on_mojo() and b0.device == cond.device) or (
+        _cpu_scalar_operand(b0, cond)
+    )
+    if not cond.on_mojo() or not a_ok or not b_ok:
         raise Error("expected all operands on the same mojo device")
-    if cond.rank > 4 or a.rank > 4 or b.rank > 4:
+    if cond.rank > 4 or a0.rank > 4 or b0.rank > 4:
         unsupported(
             "where: operand rank exceeds the fast broadcast kernel's limit of 4"
         )
-    var pair = promoted_pair(a, b)
-    var pa = pair[0].copy()
-    var pb = pair[1].copy()
+    # where_self_out: result_type(self, other), then `x.to(result_type)` --
+    # a real .to(), which saturates float -> e4m3fn on the device like any
+    # other copy (a CPU 0-d operand converts on the CPU, see _operand_as).
+    var st = torch_dtype(_compare_dtype(a0, b0))
+    var ha = _operand_as(a0, cond, st, True)
+    var hb = _operand_as(b0, cond, st, True)
+    var pa = ha.t.copy()
+    var pb = hb.t.copy()
     var shape = _where_broadcast_shape(cond, pa, pb)
     var rank = max(cond.rank, max(pa.rank, pb.rank))
     var cond_s = _bcast_strides(cond, shape)
@@ -893,8 +1057,8 @@ def op_where_self(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var b_s = _bcast_strides(pb, shape)
     var out = own(new_tensor(shape, rank, pa.stype, pa.device))
     _where_select(cond, cond_s, pa, a_s, pb, b_s, out.t)
-    _release_if_new(pa, a)
-    _release_if_new(pb, b)
+    _ = ha^
+    _ = hb^
     ret_owned(rets, 0, out)
 
 
@@ -908,14 +1072,6 @@ def _masked_fill_validate(a: T, mask: T, in_place: Bool = False) raises:
         # would change under the write
         assert_no_partial_overlap(a, mask)
         check_expands_to(mask, a)  # expand_inplace(self, mask)
-    if is_wide_unsigned(a.stype):
-        # CUDA's (and the CPU's) kernel is not instantiated for them: the
-        # dtype dispatch refuses before the value converts
-        unsupported(
-            '"masked_fill_" not implemented for \''
-            + scalar_type_name(a.stype)
-            + "'"
-        )
 
 
 def _is_int_fill(st: Int32) -> Bool:
@@ -1150,6 +1306,7 @@ def op_masked_fill_scalar(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     _masked_fill_validate(a, mask)
+    refuse_masked_fill_dtype(a.stype)
     var ae = _masked_fill_expanded(a, mask)
     var out = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
     _masked_fill_scalar_dispatch(mask, ae, args[unsafe_offset=2], out.t)
@@ -1164,6 +1321,7 @@ def op_masked_fill_scalar_out(
     var mask = v_tensor(args[unsafe_offset=1])
     var out_arg = v_tensor(args[unsafe_offset=3])
     _masked_fill_validate(a, mask)
+    refuse_masked_fill_dtype(a.stype)
     var ae = _masked_fill_expanded(a, mask)
     _ = _masked_fill_value(args[unsafe_offset=2], a)  # the value first
     _masked_fill_out_dtype(out_arg, ae, a)
@@ -1195,6 +1353,7 @@ def op_masked_fill__scalar(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     _masked_fill_validate(a, mask, in_place=True)
+    refuse_masked_fill_dtype(a.stype)
     if a.contig:
         # Writing dst == a is safe: each element reads and writes the same
         # flat index (a's own strides are the output layout).
@@ -1208,6 +1367,8 @@ def op_masked_fill__scalar(
 
 
 def _masked_fill_check_value(value_arg: Value) raises -> T:
+    """The Tensor overloads' first check (masked_fill__cuda): a 0-d value,
+    before the mask checks and the dtype dispatch."""
     var val = v_tensor(value_arg)
     if val.rank != 0:
         raise Error(
@@ -1241,8 +1402,9 @@ def op_masked_fill_tensor(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
-    _masked_fill_validate(a, mask)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
+    _masked_fill_validate(a, mask)
+    refuse_masked_fill_dtype(a.stype)
     var ae = _masked_fill_expanded(a, mask)
     var out = own(new_tensor(ae.shape, ae.rank, a.stype, a.device))
     if _value_is_direct(a, val):
@@ -1266,8 +1428,9 @@ def op_masked_fill_tensor_out(
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
     var out_arg = v_tensor(args[unsafe_offset=3])
-    _masked_fill_validate(a, mask)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
+    _masked_fill_validate(a, mask)
+    refuse_masked_fill_dtype(a.stype)
     var ae = _masked_fill_expanded(a, mask)
     if not _value_is_direct(a, val):
         _ = _masked_fill_value(_value_item(val, a), a)  # the value first
@@ -1300,8 +1463,9 @@ def op_masked_fill__tensor(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var mask = v_tensor(args[unsafe_offset=1])
-    _masked_fill_validate(a, mask, in_place=True)
     var val = _masked_fill_check_value(args[unsafe_offset=2])
+    _masked_fill_validate(a, mask, in_place=True)
+    refuse_masked_fill_dtype(a.stype)
     if a.contig:
         _masked_fill_value_into(mask, a, val, a)
     else:
@@ -1906,20 +2070,76 @@ def register_compare(site: Site) raises:
     impl[routed[op_ne_tensor_out, cx_ne_out, 3], "ne.Tensor_out"](site)
     impl[routed[op_ne_scalar, cx_ne, 2], "ne.Scalar"](site)
     impl[routed[op_ne_scalar_out, cx_ne_out, 3], "ne.Scalar_out"](site)
-    impl[op_lt_tensor, "lt.Tensor"](site)
-    impl[op_lt_tensor_out, "lt.Tensor_out"](site)
+    impl[
+        f8_iter[op_lt_tensor, "compare_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "lt.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_lt_tensor_out,
+            "compare_cuda",
+            3,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "lt.Tensor_out",
+    ](site)
     impl[op_lt_scalar, "lt.Scalar"](site)
     impl[op_lt_scalar_out, "lt.Scalar_out"](site)
-    impl[op_le_tensor, "le.Tensor"](site)
-    impl[op_le_tensor_out, "le.Tensor_out"](site)
+    impl[
+        f8_iter[op_le_tensor, "compare_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "le.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_le_tensor_out,
+            "compare_cuda",
+            3,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "le.Tensor_out",
+    ](site)
     impl[op_le_scalar, "le.Scalar"](site)
     impl[op_le_scalar_out, "le.Scalar_out"](site)
-    impl[op_gt_tensor, "gt.Tensor"](site)
-    impl[op_gt_tensor_out, "gt.Tensor_out"](site)
+    impl[
+        f8_iter[op_gt_tensor, "compare_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "gt.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_gt_tensor_out,
+            "compare_cuda",
+            3,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "gt.Tensor_out",
+    ](site)
     impl[op_gt_scalar, "gt.Scalar"](site)
     impl[op_gt_scalar_out, "gt.Scalar_out"](site)
-    impl[op_ge_tensor, "ge.Tensor"](site)
-    impl[op_ge_tensor_out, "ge.Tensor_out"](site)
+    impl[
+        f8_iter[op_ge_tensor, "compare_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        "ge.Tensor",
+    ](site)
+    impl[
+        f8_iter[
+            op_ge_tensor_out,
+            "compare_cuda",
+            3,
+            2,
+            MODE_NOCHECK,
+            False,
+            PRE_NONE,
+        ],
+        "ge.Tensor_out",
+    ](site)
     impl[op_ge_scalar, "ge.Scalar"](site)
     impl[op_ge_scalar_out, "ge.Scalar_out"](site)
     impl[op_isin_scalar_tensor, "isin.Scalar_Tensor"](site)

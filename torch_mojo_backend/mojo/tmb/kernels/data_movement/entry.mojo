@@ -23,12 +23,14 @@ from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from std.sys import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
+from std.sys.defines import get_defined_int
 from std.sys.info import (
     has_accelerator,
     has_amd_gpu_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,
     size_of,
+    _is_sm_9x_or_newer,
 )
 from std.utils.coord import Coord
 
@@ -71,6 +73,7 @@ from tmb.kernels.common.op_utils import (
 )
 
 from tmb.kernels.common.dtype_convert import f32_to_bf16
+from tmb.kernels.common.float8 import f32_to_fp8, fp8_to_f32, is_float8
 from tmb.kernels.data_movement.batched_copy import copy_batched
 from tmb.kernels.data_movement.masked_select import (
     masked_select_compact_dispatcher,
@@ -2059,7 +2062,12 @@ def _dtype_size(dtype: DType) raises -> Int:
         return 2
     if dtype == DType.float64 or dtype == DType.int64 or dtype == DType.uint64:
         return 8
-    if dtype == DType.int8 or dtype == DType.uint8 or dtype == DType.bool:
+    if (
+        dtype == DType.int8
+        or dtype == DType.uint8
+        or dtype == DType.bool
+        or is_float8(dtype)
+    ):
         return 1
     raise Error("unsupported dtype for fast where: " + String(dtype))
 
@@ -2232,7 +2240,7 @@ comptime CAST_THREADS = GS_THREADS
 
 @always_inline
 def _cast_elem[
-    src: DType, dst: DType, width: Int
+    src: DType, dst: DType, width: Int, sat: Bool = False
 ](v: SIMD[src, width]) -> SIMD[dst, width]:
     """`v.cast[dst]()`, except:
 
@@ -2263,7 +2271,9 @@ def _cast_elem[
     one direct conversion -- a provably different result -- across a type
     it has no float-specific folding rules for.
     """
-    comptime if src == DType.float64 and (
+    comptime if is_float8(src) or is_float8(dst):
+        return _cast_float8[src, dst, width, sat](v)
+    elif src == DType.float64 and (
         dst == DType.float16 or dst == DType.bfloat16
     ):
         var mid = v.cast[DType.float32]()
@@ -2284,8 +2294,144 @@ def _cast_elem[
         return v.cast[dst]()
 
 
+@always_inline
+def _cuda_satfinite_e4m3() -> Bool:
+    """Whether stock CUDA torch saturates float/half/bfloat16 -> e4m3fn on
+    the target being compiled for: its intrinsic path is sm_89 and newer.
+    A function, not a module constant, so it reads the device target."""
+    return is_nvidia_gpu["sm_89"]() or _is_sm_9x_or_newer()
+
+
+# `-D FP8_NOSAT=1`: a type promotion, not a copy -- c10's conversion even
+# where copy_ saturates.
+comptime _CAST_SAT = get_defined_int["FP8_NOSAT", 0]() == 0
+
+
+@always_inline
+def _nonzero[src: DType, w: Int](v: SIMD[src, w]) -> SIMD[DType.bool, w]:
+    """`v != 0` as torch's bool conversion reads it: NaN is true, both zeros
+    false, and e8m0's 2**-127 (it has no zero) true."""
+    comptime if is_float8(src):
+        # On the bits (the fast-math build may fold a float NaN test): both
+        # zeros of the IEEE-like formats are 0x00 / 0x80; fnuz has only 0x00
+        # (0x80 is its NaN); e8m0 has no zero at all.
+        var u = bitcast[DType.uint8, w](v)
+        comptime if src == DType.float8_e8m0fnu:
+            return SIMD[DType.bool, w](fill=True)
+        elif src == DType.float8_e4m3fnuz or src == DType.float8_e5m2fnuz:
+            return u.ne(0)
+        else:
+            return (u & 0x7F).ne(0)
+    elif src.is_floating_point():
+        # Magnitude bits, not a float compare: NaN is true (torch's
+        # `bool(nan)`), which the fast-math compare folded to false.
+        comptime bits = DType.uint64 if size_of[src]() == 8 else (
+            DType.uint32 if size_of[src]() == 4 else DType.uint16
+        )
+        comptime magnitude = ~(
+            Scalar[bits](1) << Scalar[bits](size_of[src]() * 8 - 1)
+        )
+        return (bitcast[bits, w](v) & magnitude).ne(0)
+    else:
+        return v.ne(SIMD[src, w](0))
+
+
+@always_inline
+def _cast_float8[
+    src: DType, dst: DType, width: Int, sat: Bool
+](v: SIMD[src, width]) -> SIMD[dst, width]:
+    """A cast with a float8 end, the way CUDA's copy_ does it: every float8
+    value goes through float32 (c10's `Float8_*(float)` / `operator float()`,
+    tmb/kernels/common/float8.mojo), and so does every source on its way into
+    a float8 (int and float64 round to float32 first, as `static_cast<float>`
+    does). From float32 on, an integer destination takes CUDA's cvt rules
+    (`_f32_to_int_cuda`), any other the float32 path of `_cast_elem`."""
+    var f: SIMD[DType.float32, width]
+    comptime if is_float8(src):
+        f = fp8_to_f32[src](bitcast[DType.uint8, width](v))
+    elif src == DType.bool:
+        f = v.cast[DType.uint8]().cast[DType.float32]()
+    else:
+        f = v.cast[DType.float32]()
+    comptime if is_float8(dst):
+        comptime if dst == DType.float8_e4m3fn and sat and (
+            src == DType.float32
+            or src == DType.float16
+            or src == DType.bfloat16
+        ):
+            # torch >= 2.12 (Copy.cu, ConvertToFloat8E4M3fnOp, #177870) on
+            # CUDA 13 and sm_89+ converts float / half / bfloat16 into
+            # e4m3fn with `__nv_cvt_*_to_fp8(..., __NV_SATFINITE, E4M3)`:
+            # an overflow (inf included) clamps to +-448 where c10's software
+            # conversion (CPU, ROCm, older torch, every other source dtype)
+            # gives NaN. Stock CUDA on this hardware class is the oracle, so
+            # these targets clamp first; NaN stays NaN (both compares false).
+            f = f.lt(-448.0).select(SIMD[DType.float32, width](-448.0), f)
+            f = f.gt(448.0).select(SIMD[DType.float32, width](448.0), f)
+        return bitcast[dst, width](f32_to_fp8[dst](f))
+    elif dst == DType.float32:
+        return rebind[SIMD[dst, width]](f)
+    elif dst.is_integral():
+        return _f32_to_int_cuda[dst, width](f)
+    else:
+        return _cast_elem[DType.float32, dst, width](f)
+
+
+@always_inline
+def _f32_to_int_cuda[
+    dst: DType, w: Int
+](f: SIMD[DType.float32, w]) -> SIMD[dst, w]:
+    """float32 -> integer as CUDA's `static_cast` compiles (cvt.rzi.sat),
+    measured on stock torch for every float8 bit pattern: a NaN is 0 for
+    int32 / uint32, INT64_MIN for int64, 2**63 for uint64; out-of-range
+    values saturate; int8 / int16 are the saturated int32 result
+    truncated, uint16 the uint32 one, uint8 the int64 one. Spelled out on the bits: the float8 NaNs are
+    signalling (0x7F800001), which the plain cast does not map like PTX."""
+    var bits = bitcast[DType.uint32, w](f)
+    var nan = (bits & 0x7FFFFFFF).gt(0x7F800000)
+    var g = nan.select(SIMD[DType.float32, w](0), f)
+    comptime if dst == DType.int32 or dst == DType.int8 or dst == DType.int16:
+        var c = g.lt(-2147483648.0).select(
+            SIMD[DType.float32, w](-2147483648.0), g
+        )
+        var hi = c.ge(2147483648.0)
+        var r = hi.select(SIMD[DType.float32, w](0), c).cast[DType.int32]()
+        r = hi.select(SIMD[DType.int32, w](Int32.MAX), r)
+        comptime if dst == DType.int32:
+            return rebind[SIMD[dst, w]](r)
+        else:
+            return bitcast[DType.uint32, w](r).cast[dst]()
+    elif dst == DType.uint32 or dst == DType.uint16:
+        var c = g.lt(0.0).select(SIMD[DType.float32, w](0), g)
+        var hi = c.ge(4294967296.0)
+        var r = hi.select(SIMD[DType.float32, w](0), c).cast[DType.uint32]()
+        r = hi.select(SIMD[DType.uint32, w](UInt32.MAX), r)
+        return r.cast[dst]()
+    elif dst == DType.uint64:
+        var c = g.lt(0.0).select(SIMD[DType.float32, w](0), g)
+        var hi = c.ge(18446744073709551616.0)
+        var r = hi.select(SIMD[DType.float32, w](0), c).cast[DType.uint64]()
+        r = hi.select(SIMD[DType.uint64, w](UInt64.MAX), r)
+        return rebind[SIMD[dst, w]](
+            nan.select(SIMD[DType.uint64, w](UInt64(1) << 63), r)
+        )
+    else:
+        # int64, and the narrow types through it.
+        var lo = g.lt(-9223372036854775808.0)
+        var hi = g.ge(9223372036854775808.0)
+        var c = (lo | hi).select(SIMD[DType.float32, w](0), g)
+        var r = c.cast[DType.int64]()
+        r = lo.select(SIMD[DType.int64, w](Int64.MIN), r)
+        r = hi.select(SIMD[DType.int64, w](Int64.MAX), r)
+        r = nan.select(SIMD[DType.int64, w](Int64.MIN), r)
+        comptime if dst == DType.int64:
+            return rebind[SIMD[dst, w]](r)
+        else:
+            return bitcast[DType.uint64, w](r).cast[dst]()
+
+
 def _cast_vec_kernel[
-    src: DType, dst: DType, VEC: Int
+    src: DType, dst: DType, VEC: Int, SAT: Bool
 ](
     out_ptr: Pointer[Scalar[dst], MutAnyOrigin],
     in_ptr: Pointer[Scalar[src], ImmutAnyOrigin],
@@ -2311,13 +2457,14 @@ def _cast_vec_kernel[
                 width=VEC, alignment=OALIGN
             ](
                 j * VEC,
-                v.ne(SIMD[src, VEC](0)).select(
+                _nonzero[src, VEC](v).select(
                     SIMD[DType.uint8, VEC](1), SIMD[DType.uint8, VEC](0)
                 ),
             )
         else:
             out_ptr.unsafe_store[width=VEC, alignment=OALIGN](
-                j * VEC, _cast_elem[src, dst, VEC](v)
+                j * VEC,
+                _cast_elem[src, dst, VEC, SAT and _cuda_satfinite_e4m3()](v),
             )
         j += gstride
     # The tail is at most VEC-1 elements and the grid is never narrower than
@@ -2329,10 +2476,12 @@ def _cast_vec_kernel[
             # rc1: Scalar[dst](Bool) requires an integral dtype; build the
             # concrete bool scalar first (cast is the identity here).
             out_ptr[unsafe_offset=t] = Scalar[DType.bool](
-                a != Scalar[src](0)
+                _nonzero[src, 1](a)[0]
             ).cast[dst]()
         else:
-            out_ptr[unsafe_offset=t] = _cast_elem[src, dst, 1](a)
+            out_ptr[unsafe_offset=t] = _cast_elem[
+                src, dst, 1, SAT and _cuda_satfinite_e4m3()
+            ](a)
 
 
 @always_inline
@@ -2369,7 +2518,10 @@ def _cast[
             comptime SLOTS = max(
                 1, 16 // (VEC * max(size_of[src](), size_of[dst]()))
             )
-            _enqueue_cached[_cast_vec_kernel[src, dst, VEC]](
+            # SAT is a kernel parameter, not just a define: the compiled
+            # function cache is keyed by the kernel's symbol, so two builds
+            # differing only in -D FP8_NOSAT must not share one name.
+            _enqueue_cached[_cast_vec_kernel[src, dst, VEC, _CAST_SAT]](
                 ctx,
                 _bw_blocks(
                     nvec,
@@ -2422,6 +2574,16 @@ comptime CAST_DTYPES = [
     DType.int8,
     DType.uint8,
     DType.bool,
+    DType.float8_e4m3fn,
+    DType.float8_e5m2,
+    DType.float8_e4m3fnuz,
+    DType.float8_e5m2fnuz,
+    DType.float8_e8m0fnu,
+    # Only ever paired with a float8 end (the op side gates it): CUDA
+    # converts float8 <-> uint16/32/64 on the device too.
+    DType.uint16,
+    DType.uint32,
+    DType.uint64,
 ]
 
 

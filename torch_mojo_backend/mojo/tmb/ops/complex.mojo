@@ -33,6 +33,7 @@ from std.ffi import external_call
 from std.utils import IndexList
 
 from tmb.backend.abi import (
+    is_float8_stype,
     ST_BFLOAT16,
     ST_BOOL,
     ST_COMPLEX128,
@@ -71,6 +72,7 @@ from tmb.backend.abi import (
     call_op,
     complex_of,
     contiguous_strides,
+    default_complex_dtype,
     default_dtype,
     dtype_name,
     f64_bits,
@@ -101,8 +103,12 @@ from tmb.backend.device import current_device
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    resize_any,
+    can_cast,
+    combine_categories,
     int_to_component,
-    is_wide_unsigned,
+    is_float_stype,
+    refuse_masked_fill_dtype,
     scalar_type_name,
     scalar_parts,
     uint_to_component,
@@ -253,59 +259,14 @@ def as_complex(t: T) raises -> Owned:
     return c.one()
 
 
-def _st_name(st: Int32) -> String:
-    """`c10::toString(ScalarType)`, as TensorIterator's cast errors spell it."""
-    if st == ST_FLOAT32:
-        return "Float"
-    if st == ST_FLOAT64:
-        return "Double"
-    if st == ST_FLOAT16:
-        return "Half"
-    if st == ST_BFLOAT16:
-        return "BFloat16"
-    if st == ST_COMPLEX64:
-        return "ComplexFloat"
-    if st == ST_COMPLEX128:
-        return "ComplexDouble"
-    if st == ST_INT64:
-        return "Long"
-    if st == ST_INT32:
-        return "Int"
-    if st == ST_INT16:
-        return "Short"
-    if st == ST_INT8:
-        return "Char"
-    if st == ST_UINT8:
-        return "Byte"
-    if st == ST_BOOL:
-        return "Bool"
-    return String("ScalarType ") + String(st)
-
-
-def _category(st: Int32) -> Int:
-    """bool < integral < floating < complex (c10's canCast order)."""
-    if st == ST_BOOL:
-        return 0
-    if is_complex_stype(st):
-        return 3
-    if (
-        st == ST_FLOAT32
-        or st == ST_FLOAT64
-        or st == ST_FLOAT16
-        or st == ST_BFLOAT16
-    ):
-        return 2
-    return 1
-
-
 def _check_cast(result: Int32, dest: Int32) raises:
     """TensorIterator's `can't be cast to the desired output type`."""
-    if _category(result) > _category(dest):
+    if not can_cast(result, dest):
         raise Error(
             "result type ",
-            _st_name(result),
+            scalar_type_name(result),
             " can't be cast to the desired output type ",
-            _st_name(dest),
+            scalar_type_name(dest),
         )
 
 
@@ -327,7 +288,11 @@ def _store(
         copy_strided_into(dest, res.t)
         _ = res^
     else:
-        _check_cast(res.t.stype, dest.stype)
+        # (cast checked above) copy_'s own first check, the internal
+        # overlap, raised here without the nested call's "aten::copy_:"
+        # prefix when the caller did not already make it
+        if not internal:
+            assert_no_internal_overlap(dest)
         var c = _Call("aten::copy_")
         c.t(dest)
         c.t(res.t)
@@ -386,9 +351,33 @@ def _real_out(
     dtype and casts into the out, so run the real functional op and store
     its result (real -> complex is a valid cast). False when an input is
     complex (the caller's complex route applies)."""
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    var f8 = False
+    var first = -1
     for i in range(n_in):
-        if v_is_complex(args[unsafe_offset=i]):
+        var v = args[unsafe_offset=i].copy()
+        if v_is_complex(v):
             return False
+        if v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF:
+            var t = v_tensor_c(v)
+            _broadcast_into(shape, rank, t)
+            f8 = f8 or is_float8_stype(t.stype)
+            if first < 0 and t.on_mojo():
+                first = i
+    if f8:
+        # A structured op's TensorIterator checks the out's memory overlaps,
+        # then its device, then resizes it, before the kernel's dtype dispatch refuses a
+        # float8 computation (the functional call below would refuse with
+        # the out untouched). The complex out cannot be one of these real
+        # inputs, so there is no read-write out to keep from resizing.
+        # (Every caller is a structured op; rsub's generated out= wrapper
+        # is f8_iter's `generated_out`.)
+        var dest0 = v_tensor_c(args[unsafe_offset=out_idx])
+        _ew_overlaps(args, n_in, dest0)
+        if first >= 0:  # compute_types' device check, before the resize
+            _same_device(dest0, v_tensor_c(args[unsafe_offset=first]))
+        resize_any(dest0, shape, rank)
     var c = _Call(op, overload)
     for i in range(n_in):
         c.v(args[unsafe_offset=i])
@@ -497,53 +486,6 @@ def _store_ew_n(
 # ---------------------------------------------------------------------------
 # type promotion with the complex category
 # ---------------------------------------------------------------------------
-
-
-def _default_complex() -> Int32:
-    """`get_default_complex_dtype()`: complex128 under a float64 default."""
-    return ST_COMPLEX128 if default_dtype() == ST_FLOAT64 else ST_COMPLEX64
-
-
-def cx_promote(a: Int32, b: Int32) raises -> Int32:
-    """`c10::promoteTypes` where either may be complex: the complex type of
-    the promoted value types (complex64 + float64 is complex128)."""
-    if a == ST_UNDEFINED:
-        return b
-    if b == ST_UNDEFINED or a == b:
-        return a
-    if not is_complex_stype(a) and not is_complex_stype(b):
-        return promote_types(a, b)
-    return complex_of(promote_types(real_of(a), real_of(b)))
-
-
-def _is_float(st: Int32) -> Bool:
-    return (
-        st == ST_FLOAT32
-        or st == ST_FLOAT64
-        or st == ST_FLOAT16
-        or st == ST_BFLOAT16
-    )
-
-
-def cx_combine(higher: Int32, lower: Int32) raises -> Int32:
-    """ATen's `combine_categories` (TypeProperties.cpp), complex included."""
-    if is_complex_stype(higher):
-        return higher
-    if is_complex_stype(lower):
-        if _is_float(higher):
-            return complex_of(higher)
-        return lower
-    if _is_float(higher):
-        return higher
-    if higher == ST_BOOL or _is_float(lower):
-        if higher == ST_UNDEFINED:
-            return lower
-        if lower == ST_UNDEFINED:
-            return higher
-        return promote_types(higher, lower)
-    if higher != ST_UNDEFINED:
-        return higher
-    return lower
 
 
 # ---------------------------------------------------------------------------
@@ -759,8 +701,8 @@ def _operand(v: Value, like: T) raises -> _Operand:
             if t.is_wrapped_number():
                 rk = _RANK_WRAPPED
                 if is_complex_stype(st):
-                    st = _default_complex()
-                elif _is_float(st):
+                    st = default_complex_dtype()
+                elif is_float_stype(st):
                     st = default_dtype()
             var o = _Operand(like, hv[0], hv[1], st, rk)
             var kind = _host_int_kind(t)
@@ -783,7 +725,7 @@ def _operand(v: Value, like: T) raises -> _Operand:
             like,
             bits_f64(v.a),
             bits_f64(v.b),
-            _default_complex(),
+            default_complex_dtype(),
             _RANK_WRAPPED,
         )
     if v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL:
@@ -838,12 +780,12 @@ def _result_type(a: _Operand, b: _Operand) raises -> Int32:
         var st = a.stype if k == 0 else b.stype
         var rk = a.rank_kind if k == 0 else b.rank_kind
         if rk == _RANK_DIM:
-            dim = cx_promote(dim, st)
+            dim = promote_types(dim, st)
         elif rk == _RANK_ZERO:
-            zero = cx_promote(zero, st)
+            zero = promote_types(zero, st)
         else:
-            wrapped = cx_promote(wrapped, st)
-    return cx_combine(dim, cx_combine(zero, wrapped))
+            wrapped = promote_types(wrapped, st)
+    return combine_categories(dim, combine_categories(zero, wrapped))
 
 
 def _broadcast_into(mut shape: IndexList[MAX_RANK], mut rank: Int, t: T) raises:
@@ -1102,9 +1044,9 @@ def cx_conj_physical_out(
     if dest.stype != x.stype:
         raise Error(
             "Found dtype ",
-            _st_name(dest.stype),
+            scalar_type_name(dest.stype),
             " but expected ",
-            _st_name(x.stype),
+            scalar_type_name(x.stype),
         )
     _store_ew[1](args, dest, _unary("conj", _TO_CX, x), rets)
 
@@ -1154,7 +1096,7 @@ def _wrap_dim(d: Int, rank: Int) raises -> Int:
 def _common_complex(ts: List[T]) raises -> Int32:
     var st = ST_UNDEFINED
     for t in ts:
-        st = cx_promote(st, t.stype)
+        st = promote_types(st, t.stype)
     return st
 
 
@@ -1204,14 +1146,14 @@ def _cat(args: Values, stack: Bool, out_st: Int32 = -1) raises -> Owned:
                 ") cannot be concatenated",
             )
     var st = _common_complex(all_ts)
-    if out_st >= 0 and _category(st) > _category(out_st):
+    if out_st >= 0 and not can_cast(st, out_st):
         # (a TypeError on CUDA; this device raises RuntimeError)
         raise Error(
             (
                 "torch.cat(): input types can't be cast to the desired output"
                 " type "
             ),
-            _st_name(out_st),
+            scalar_type_name(out_st),
         )
     if out_st >= 0 and is_complex_stype(out_st):
         _check_cast(st, out_st)
@@ -1474,9 +1416,9 @@ def cx_index_select_out(
     if dest.stype != x.stype:
         raise Error(
             "expected scalar type ",
-            _st_name(dest.stype),
+            scalar_type_name(dest.stype),
             " but found ",
-            _st_name(x.stype),
+            scalar_type_name(x.stype),
         )
     _same_device(dest, x)
     assert_no_internal_overlap(dest)
@@ -1685,18 +1627,18 @@ def cx_index_put_impl_(
         # own terms
         raise Error(
             "expected scalar type ",
-            _st_name(values.stype),
+            scalar_type_name(values.stype),
             " but found ",
-            _st_name(self.stype),
+            scalar_type_name(self.stype),
         )
     if self.stype != values.stype:
         # CUDA's index_put_ converts nothing (Indexing.cu's index_put_with_sort
         # and TensorAdvancedIndexing's index_put_ both check the dtypes)
         raise Error(
             "Index put requires the source and destination dtypes match, got ",
-            _st_name(self.stype),
+            scalar_type_name(self.stype),
             " for the destination and ",
-            _st_name(values.stype),
+            scalar_type_name(values.stype),
             " for the source.",
         )
     if self.rank == 0:
@@ -2090,7 +2032,7 @@ def cx_via_bool[
             raise Error(
                 op,
                 " only supports bool tensor for result, got: ",
-                _st_name(v_tensor_c(args[unsafe_offset=out_idx]).stype),
+                scalar_type_name(v_tensor_c(args[unsafe_offset=out_idx]).stype),
             )
     for i in range(n_args):
         var v = args[unsafe_offset=i].copy()
@@ -2264,9 +2206,9 @@ def cx_where_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if dest.stype != res.t.stype:  # where_self_out: no cast into the out
         raise Error(
             "Expected out type to be ",
-            _st_name(res.t.stype),
+            scalar_type_name(res.t.stype),
             " but got ",
-            _st_name(dest.stype),
+            scalar_type_name(dest.stype),
         )
     _same_device(dest, res.t)
     where_out_overlaps(args, dest)
@@ -2335,11 +2277,29 @@ def _check_bool_mask(args: Values) raises:
     if mask.stype != ST_BOOL:
         raise Error(
             "masked_fill only supports boolean masks, but got dtype ",
-            _st_name(mask.stype),
+            scalar_type_name(mask.stype),
         )
 
 
+def _check_value_rank(args: Values) raises:
+    """masked_fill__cuda's Tensor overload checks a 0-d value first, before
+    the mask and the dtype dispatch."""
+    var val = args[unsafe_offset=2].copy()
+    if val.tag == TAG_TENSOR or val.tag == TAG_TENSOR_REF:
+        var vt = v_tensor_c(val)
+        if vt.rank != 0:
+            raise Error(
+                (
+                    "masked_fill_ only supports a 0-dimensional value"
+                    " tensor, but got tensor with "
+                ),
+                vt.rank,
+                " dimension(s).",
+            )
+
+
 def _masked_fill(args: Values) raises -> Owned:
+    _check_value_rank(args)
     _check_bool_mask(args)
     var x = v_tensor_c(args[unsafe_offset=0])
     # the result has the broadcast shape of self and mask
@@ -2370,22 +2330,6 @@ def cx_masked_fill(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _ret(rets, _masked_fill(args))
 
 
-def resize_any(mut t: T, shape: IndexList[MAX_RANK], rank: Int) raises:
-    """`resize_output` on an out of any device (a host out is resized by
-    torch's own resize_)."""
-    if t.on_mojo():
-        resize_out(t, shape, rank)
-        return
-    var sizes = List[Int]()
-    for i in range(rank):
-        sizes.append(shape[MAX_RANK - rank + i])
-    var c = _Call("aten::resize_")
-    c.t(t)
-    c.ints(sizes)
-    c.none()
-    _ = c.run(1)
-
-
 def cx_masked_fill_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
@@ -2406,6 +2350,7 @@ def cx_masked_fill_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     """masked_fill_.Scalar / .Tensor(self, mask, value)"""
+    _check_value_rank(args)
     _check_bool_mask(args)
     var self = v_tensor_c(args[unsafe_offset=0])
     # masked_fill_'s own check: a mask sharing part of self's memory would
@@ -2426,30 +2371,20 @@ def _masked_fill_real_(self: T, args: Values) raises:
     """masked_fill_ of a REAL self with a complex value: value.item()
     converted checked (a zero imaginary part fits), then the real op. A
     uint16 / uint32 / uint64 self is declined first, as CUDA's dtype
-    dispatch is (its kernel is not instantiated for them)."""
-    if is_wide_unsigned(self.stype):
-        unsupported(
-            '"masked_fill_" not implemented for \''
-            + scalar_type_name(self.stype)
-            + "'"
-        )
+    dispatch is (its kernel is not instantiated for them), after a value
+    tensor's rank check."""
     var val = args[unsafe_offset=2].copy()
     if val.tag == TAG_TENSOR or val.tag == TAG_TENSOR_REF:
         var vt = v_tensor_c(val)
-        if vt.rank != 0:
-            raise Error(
-                (
-                    "masked_fill_ only supports a 0-dimensional value"
-                    " tensor, but got tensor with "
-                ),
-                vt.rank,
-                " dimension(s).",
-            )
+        _check_value_rank(args)
+        refuse_masked_fill_dtype(self.stype)
         val = fill_item(
             vt,
             self.stype,
             vt.on_mojo() and self.on_mojo() and vt.device == self.device,
         )
+    else:
+        refuse_masked_fill_dtype(self.stype)
     check_real_scalar_fits(self.stype, val)
     var c = scalar_parts(val, self.stype)  # an integer: one rounding
     var m = _Call("aten::masked_fill_", "Scalar")
@@ -2699,15 +2634,15 @@ def _index_func(op: StaticString, args: Values, n_args: Int) raises -> Owned:
                     "index_copy_(): self and source expected to have the same"
                     " dtype, but got (self) "
                 ),
-                _st_name(x.stype),
+                scalar_type_name(x.stype),
                 " and (source) ",
-                _st_name(source_st),
+                scalar_type_name(source_st),
             )
         raise Error(
             "index_add_(): self (",
-            _st_name(x.stype),
+            scalar_type_name(x.stype),
             ") and source (",
-            _st_name(source_st),
+            scalar_type_name(source_st),
             ") must have the same scalar type",
         )
     var out = own(new_tensor(x.shape, x.rank, x.stype, x.device))

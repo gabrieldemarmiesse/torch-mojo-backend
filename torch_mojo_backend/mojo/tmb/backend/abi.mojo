@@ -56,6 +56,11 @@ comptime ST_BFLOAT16 = Int32(15)
 comptime ST_UINT16 = Int32(27)
 comptime ST_UINT32 = Int32(28)
 comptime ST_UINT64 = Int32(29)
+comptime ST_FLOAT8_E5M2 = Int32(23)
+comptime ST_FLOAT8_E4M3FN = Int32(24)
+comptime ST_FLOAT8_E5M2FNUZ = Int32(25)
+comptime ST_FLOAT8_E4M3FNUZ = Int32(26)
+comptime ST_FLOAT8_E8M0FNU = Int32(44)
 
 comptime DEVICE_TYPE_CPU = 0
 comptime DEVICE_TYPE_PRIVATEUSE1 = 20
@@ -109,6 +114,16 @@ def max_dtype(stype: Int32) raises -> DType:
         return DType.uint32
     if stype == ST_UINT64:
         return DType.uint64
+    if stype == ST_FLOAT8_E4M3FN:
+        return DType.float8_e4m3fn
+    if stype == ST_FLOAT8_E5M2:
+        return DType.float8_e5m2
+    if stype == ST_FLOAT8_E4M3FNUZ:
+        return DType.float8_e4m3fnuz
+    if stype == ST_FLOAT8_E5M2FNUZ:
+        return DType.float8_e5m2fnuz
+    if stype == ST_FLOAT8_E8M0FNU:
+        return DType.float8_e8m0fnu
     unsupported(
         "dtype (torch ScalarType "
         + String(stype)
@@ -123,14 +138,14 @@ def supported_stypes(api: String) -> Int64:
     `torch.accelerator.get_device_capability()["supported_dtypes"]`.
 
     That is `max_dtype`'s domain, read off it rather than listed again: a
-    tensor of any other ScalarType (complex32, float8, quantized,
-    bit-packed) is declined before it is allocated -- plus complex64 and
-    complex128, held as pairs of their component dtype (`elem_dtype`).
-    Between two of these, `_copy_from` and `_to_copy` convert on the device
-    (CastSpec, `cast_complex`) or, for the pairs those kernels lack, through
-    CPU torch (`cast_for_copy`, `host_convert`), so every pair converts.
-    float64 and complex128 are left out on Metal: the Metal shading language
-    has no double, so no kernel (fill, arithmetic) can compute in it there.
+    tensor of any other ScalarType (complex32, quantized, bit-packed) is
+    declined before it is allocated -- complex64 and complex128 are held as
+    pairs of their component dtype (`elem_dtype`). Between two of these,
+    `_copy_from` and `_to_copy` convert on the device (CastSpec,
+    `cast_complex`) or, for the pairs those kernels lack, through CPU torch
+    (`cast_for_copy`, `host_convert`), so every pair converts. float64 and
+    complex128 are left out on Metal: the Metal shading language has no
+    double, so no kernel (fill, arithmetic) can compute in it there.
     """
     var mask = Int64(0)
     for s in range(64):
@@ -225,6 +240,16 @@ def torch_dtype(dt: DType) raises -> Int32:
         return ST_UINT32
     if dt == DType.uint64:
         return ST_UINT64
+    if dt == DType.float8_e4m3fn:
+        return ST_FLOAT8_E4M3FN
+    if dt == DType.float8_e5m2:
+        return ST_FLOAT8_E5M2
+    if dt == DType.float8_e4m3fnuz:
+        return ST_FLOAT8_E4M3FNUZ
+    if dt == DType.float8_e5m2fnuz:
+        return ST_FLOAT8_E5M2FNUZ
+    if dt == DType.float8_e8m0fnu:
+        return ST_FLOAT8_E8M0FNU
     raise Error("no torch dtype for ", dt)
 
 
@@ -255,6 +280,16 @@ def dtype_code(dt: DType) -> Int:
         return 139
     if dt == DType.uint64:
         return 140
+    if dt == DType.float8_e8m0fnu:
+        return 73
+    if dt == DType.float8_e4m3fn:
+        return 75
+    if dt == DType.float8_e4m3fnuz:
+        return 76
+    if dt == DType.float8_e5m2:
+        return 77
+    if dt == DType.float8_e5m2fnuz:
+        return 78
     return 141  # int64
 
 
@@ -277,6 +312,17 @@ def dtype_itemsize(dt: DType) -> Int:
 def itemsize_of(stype: Int32) raises -> Int:
     var n = dtype_itemsize(elem_dtype(stype))
     return 2 * n if is_complex_stype(stype) else n
+
+
+def is_float8_stype(stype: Int32) -> Bool:
+    """torch's five float8 ScalarTypes."""
+    return (
+        stype == ST_FLOAT8_E5M2
+        or stype == ST_FLOAT8_E4M3FN
+        or stype == ST_FLOAT8_E5M2FNUZ
+        or stype == ST_FLOAT8_E4M3FNUZ
+        or stype == ST_FLOAT8_E8M0FNU
+    )
 
 
 def is_floating(stype: Int32) -> Bool:
@@ -337,6 +383,16 @@ def dtype_name(stype: Int32) -> String:
             return String("unsigned long long")
         else:
             return String("long unsigned int")
+    if stype == ST_FLOAT8_E4M3FN:
+        return String("c10::Float8_e4m3fn")
+    if stype == ST_FLOAT8_E5M2:
+        return String("c10::Float8_e5m2")
+    if stype == ST_FLOAT8_E4M3FNUZ:
+        return String("c10::Float8_e4m3fnuz")
+    if stype == ST_FLOAT8_E5M2FNUZ:
+        return String("c10::Float8_e5m2fnuz")
+    if stype == ST_FLOAT8_E8M0FNU:
+        return String("c10::Float8_e8m0fnu")
     if stype == ST_COMPLEX64:
         return String("c10::complex<float>")
     if stype == ST_COMPLEX128:
@@ -1363,6 +1419,11 @@ def cpu_empty(
 
 def default_dtype() -> Int32:
     return external_call["tmb_default_dtype", Int32]()
+
+
+def default_complex_dtype() -> Int32:
+    """`get_default_complex_dtype()`: complex128 under a float64 default."""
+    return ST_COMPLEX128 if default_dtype() == ST_FLOAT64 else ST_COMPLEX64
 
 
 # --- op entry -----------------------------------------------------------------

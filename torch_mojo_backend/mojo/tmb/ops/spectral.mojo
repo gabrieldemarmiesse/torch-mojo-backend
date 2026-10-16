@@ -47,6 +47,7 @@ from tmb.backend.abi import (
     cpu_empty,
     dtype_name,
     is_complex_stype,
+    is_float8_stype,
     new_tensor,
     own,
     own_if_new,
@@ -67,12 +68,14 @@ from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     assert_no_internal_overlap,
+    can_cast,
+    cast_to,
+    copy_strided_into,
     contiguous,
     device_str,
-    is_float_stype,
     resize_out,
+    scalar_type_name,
 )
-from tmb.ops.complex import _st_name
 
 comptime _REAL_IN = 1
 comptime _HERM_IN = 2
@@ -691,6 +694,11 @@ def _check_fft_input(t: T, want_complex: Bool, name: StaticString) raises:
                 " expects a complex input tensor, but got ",
                 dtype_name(t.stype),
             )
+    elif is_float8_stype(t.stype):
+        # the r2c output dtype is toComplexType(input), which float8 lacks
+        raise Error(
+            "Unknown Complex ScalarType for ", scalar_type_name(t.stype)
+        )
     elif t.stype != ST_FLOAT32 and t.stype != ST_FLOAT64:
         unsupported(
             String(name)
@@ -848,19 +856,23 @@ def _store_any(
     if resize_first:
         resize_out(dest, res.t.shape, res.t.rank)
     assert_no_internal_overlap(dest)
-    var cplx = is_complex_stype(res.t.stype)
-    if (cplx and not is_complex_stype(dest.stype)) or (
-        not cplx
-        and not is_float_stype(dest.stype)
-        and not is_complex_stype(dest.stype)
-    ):
+    if not can_cast(res.t.stype, dest.stype):
         raise Error(
             "result type ",
-            _st_name(res.t.stype),
+            scalar_type_name(res.t.stype),
             " can't be cast to the desired output type ",
-            _st_name(dest.stype),
+            scalar_type_name(dest.stype),
         )
     resize_out(dest, res.t.shape, res.t.rank)
+    if is_float8_stype(dest.stype):
+        # mul_out's TensorIterator stores with c10's conversion: never the
+        # saturating copy_ (a float8 out of a real transform)
+        var cv = own(cast_to(res.t, dest.stype, saturate=False))
+        copy_strided_into(dest, cv.t)
+        _ = cv^
+        _ = res^
+        ret_ref(rets, 0, dest)
+        return
     var c = call_op(
         "aten::copy_",
         "",

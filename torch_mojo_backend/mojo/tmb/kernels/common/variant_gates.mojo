@@ -82,6 +82,11 @@ def _dtype_arg_width_on[index: Int, bits: Int]() -> Bool:
             _dtype_arg_on[index, DType.bool]()
             or _dtype_arg_on[index, DType.uint8]()
             or _dtype_arg_on[index, DType.int8]()
+            or _dtype_arg_on[index, DType.float8_e4m3fn]()
+            or _dtype_arg_on[index, DType.float8_e5m2]()
+            or _dtype_arg_on[index, DType.float8_e4m3fnuz]()
+            or _dtype_arg_on[index, DType.float8_e5m2fnuz]()
+            or _dtype_arg_on[index, DType.float8_e8m0fnu]()
         )
     elif bits == 16:
         return (
