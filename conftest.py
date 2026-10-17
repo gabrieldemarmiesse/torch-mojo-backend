@@ -56,6 +56,18 @@ _GPU_FIXTURES = frozenset(
 )
 
 
+def _needs_gpu(item: pytest.Function) -> bool:
+    """A GPU fixture anywhere in the test's fixture closure, or a `conf`
+    parameter (tests/conftest.py) for a device other than the CPU: `conf`
+    itself depends on no device fixture, so its `Conf("cpu", True)` cases --
+    torch.compile on CPU tensors -- stay in the CPU selection."""
+    if _GPU_FIXTURES.intersection(item.fixturenames):
+        return True
+    callspec = getattr(item, "callspec", None)
+    conf = callspec.params.get("conf") if callspec is not None else None
+    return conf is not None and getattr(conf, "device", "cpu") != "cpu"
+
+
 def _sharding(config: pytest.Config) -> bool:
     """Is this run one shard of a pytest-split run?"""
     return getattr(config.option, "splits", None) is not None
@@ -69,9 +81,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     the dealt order. Un-sharded runs keep their original order.
     """
     for item in items:
-        if isinstance(item, pytest.Function) and _GPU_FIXTURES.intersection(
-            item.fixturenames
-        ):
+        if isinstance(item, pytest.Function) and _needs_gpu(item):
             item.add_marker(pytest.mark.gpu)
         # CUDA graph tests need a process without PrivateUse1 registration;
         # CPU-torch integration tests need a different torch wheel, but still

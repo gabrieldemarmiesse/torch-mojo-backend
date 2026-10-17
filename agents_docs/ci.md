@@ -23,7 +23,9 @@ an H100 still skip when that hardware is absent.
 
 The root `conftest.py` marks GPU tests from their fixture dependencies, including
 indirect dependencies such as `mojo_inductor` → `mojo_gpu`. The shared `device`
-fixture marks only its CUDA parameter, keeping the CPU cases on hosted runners.
+fixture marks only its CUDA parameter, keeping the CPU cases on hosted runners,
+and a `conf` parameter is marked by its device: `Conf("cpu", True)` (torch.compile
+on CPU tensors) stays in the CPU selection.
 Tests that manage devices themselves must use `@pytest.mark.gpu`; CUDA compiler
 tests use `@pytest.mark.cuda`, which also implies `gpu`. For mixed parameter
 sets, put the marker on the GPU `pytest.param` only. Pure validation tests in
