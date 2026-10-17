@@ -406,6 +406,39 @@ def test_compile_mutation_in_multi_context_region(stream_device):
         torch.testing.assert_close(b.cpu(), w.cpu().cos())
 
 
+@pytest.mark.parametrize("contexts", [1, 2])
+def test_compile_stream_contexts_with_a_staged_input(mojo_gpu, contexts):
+    # Runs on every GPU, Metal included, where each stream is the default
+    # one: staging a non-contiguous input, and publishing a region with
+    # several contexts, must not make a stream wait for itself (an event,
+    # which Metal does not support). Host barriers stand in for the waits.
+    first = torch.Stream(device=mojo_gpu)
+    second = torch.Stream(device=mojo_gpu)
+
+    def fn(x, w):
+        with first:
+            a = x * 2
+            x.add_(1)
+        if contexts == 1:
+            return a, w
+        with second:
+            b = w.cos()
+        return a, b
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for _ in range(2):
+        x = torch.randn(16, 8, device=mojo_gpu).t()
+        w = torch.randn(64, device=mojo_gpu)
+        expected_x = x.cpu() + 1
+        torch.accelerator.synchronize()
+        a, b = compiled(x, w)
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(a.cpu(), (expected_x - 1) * 2)
+        torch.testing.assert_close(x.cpu(), expected_x)
+        expected_b = w.cpu() if contexts == 1 else w.cpu().cos()
+        torch.testing.assert_close(b.cpu(), expected_b)
+
+
 @pytest.mark.parametrize("explicit_device", [False, True])
 def test_cuda_current_stream_after_mojo_registration(mojo_gpu, explicit_device):
     if not torch.cuda.is_available():

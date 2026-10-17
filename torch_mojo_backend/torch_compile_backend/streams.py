@@ -183,16 +183,24 @@ def _streams_of(contexts: Iterable[tuple[torch.Stream, ...]]) -> list[torch.Stre
     return list(dict.fromkeys(stream for streams in contexts for stream in streams))
 
 
+# A stream never waits for itself: the wait would still record an event,
+# which Metal (every stream is the default one) does not support.
+
+
 def wait_for_contexts(contexts: Iterable[tuple[torch.Stream, ...]]):
     """Order each device's current stream after every stream of `contexts`."""
     for stream in _streams_of(contexts):
-        current_stream(stream.device).wait_stream(stream)
+        current = current_stream(stream.device)
+        if current != stream:
+            current.wait_stream(stream)
 
 
 def publish_to_contexts(contexts: Iterable[tuple[torch.Stream, ...]]):
     """Order every stream of `contexts` after its device's current stream."""
     for stream in _streams_of(contexts):
-        stream.wait_stream(current_stream(stream.device))
+        current = current_stream(stream.device)
+        if current != stream:
+            stream.wait_stream(current)
 
 
 def max_stream_id(node: torch.fx.Node) -> int:
