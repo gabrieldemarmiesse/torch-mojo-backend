@@ -18,7 +18,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import DTensor
 
-from torch_mojo_backend import register_mojo_devices
+from torch_mojo_backend import mojo_backend, register_mojo_devices
 from torch_mojo_backend.native import device_module
 
 
@@ -333,7 +333,6 @@ def check_fsdp_collectives_stress():
 def main():
     register_mojo_devices()
     dist.init_process_group("mojo", timeout=datetime.timedelta(minutes=5))
-    rank, world = dist.get_rank(), dist.get_world_size()
     if len(sys.argv) > 1 and sys.argv[1] == "reduce_scatter":
         check_reduce_scatter()
         dist.destroy_process_group()
@@ -342,45 +341,89 @@ def main():
         check_fsdp_collectives_stress()
         dist.destroy_process_group()
         return
+    run_parity(compiled=len(sys.argv) > 1 and sys.argv[1] == "compiled")
+    dist.destroy_process_group()
+
+
+class Block(torch.nn.Module):
+    """Defined outside torch, so dynamo compiles its forward (it does not
+    start a frame in torch.nn's own modules). LayerNorm's backward reads the
+    weight itself; Linear's reads a transposed copy."""
+
+    def __init__(self, fan_in: int, fan_out: int):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(fan_in)
+        self.linear = torch.nn.Linear(fan_in, fan_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.gelu(self.linear(self.norm(x)))
+
+
+def run_parity(compiled: bool):
+    """Gradients and updates against an unsharded CPU model, three steps.
+
+    `compiled` runs the forward through `mojo_backend`, with the default
+    `reshard_after_forward=True`: the backward graphs read weights whose
+    storage FSDP2 freed after forward and regrew for backward.
+    """
+    rank, world = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(123)
-    reference = torch.nn.Sequential(
-        torch.nn.Linear(7, 13), torch.nn.GELU(), torch.nn.Linear(13, 5)
-    )
+    n_in, n_out = (64, 64) if compiled else (7, 5)
+    if compiled:
+        # One shape: a second one would recompile Block.forward with dynamic
+        # shapes, which handle_placeholder does not take yet.
+        reference = torch.nn.Sequential(*(Block(64, 64) for _ in range(3)))
+    else:
+        reference = torch.nn.Sequential(
+            torch.nn.Linear(7, 13), torch.nn.GELU(), torch.nn.Linear(13, 5)
+        )
     model = copy.deepcopy(reference).to("mojo")
     mesh = init_device_mesh("mojo", (world,))
     for layer in model:
-        if isinstance(layer, torch.nn.Linear):
+        if not isinstance(layer, torch.nn.GELU):
             fully_shard(layer, mesh=mesh)
     fully_shard(model, mesh=mesh)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, foreach=False)
     ref_optimizer = torch.optim.AdamW(reference.parameters(), lr=0.001, foreach=False)
     assert all(isinstance(p, DTensor) for p in model.parameters())
+    forward = torch.compile(model, backend=mojo_backend) if compiled else model
+    # MAX's GPU matmuls round like tf32.
+    rtol, atol = (1e-2, 1e-3) if compiled else (2e-4, 2e-5)
     for step in range(3):
-        x = torch.randn(world * 3, 7)
-        y = torch.randn(world * 3, 5)
+        x = torch.randn(world * 3, n_in)
+        y = torch.randn(world * 3, n_out)
         start, end = rank * 3, (rank + 1) * 3
         loss = (
-            (model(x[start:end].to("mojo")) - y[start:end].to("mojo")).square().mean()
+            (forward(x[start:end].to("mojo")) - y[start:end].to("mojo")).square().mean()
         )
+        # Take over the blocks the resharded weights freed, so the regathered
+        # ones land elsewhere and a stale alias reads these.
+        taken = [
+            torch.full((p.numel(),), 1e6, device="mojo") for p in reference.parameters()
+        ]
         loss.backward()
+        del taken
         ref_loss = (reference(x) - y).square().mean()
         ref_loss.backward()
         for p, ref in zip(model.parameters(), reference.parameters()):
             assert isinstance(p.grad, DTensor)
             torch.testing.assert_close(
-                p.grad.full_tensor().cpu(), ref.grad, atol=2e-5, rtol=2e-4
+                p.grad.full_tensor().cpu(), ref.grad, atol=atol, rtol=rtol
             )
         optimizer.step()
         ref_optimizer.step()
         for p, ref in zip(model.parameters(), reference.parameters()):
             assert isinstance(p, DTensor)
-            torch.testing.assert_close(p.full_tensor().cpu(), ref, atol=2e-5, rtol=2e-4)
+            torch.testing.assert_close(p.full_tensor().cpu(), ref, atol=atol, rtol=rtol)
         optimizer.zero_grad(set_to_none=True)
         ref_optimizer.zero_grad(set_to_none=True)
-        print(f"rank={rank} step={step} FSDP2 gradient/update parity OK", flush=True)
-        if step == 1:
+        print(
+            f"rank={rank} step={step} compiled={compiled} FSDP2 gradient/update "
+            "parity OK",
+            flush=True,
+        )
+        if step == 1 and not compiled:
             check_checkpoint(model, optimizer)
-    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import io
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
@@ -689,6 +690,55 @@ def test_compiled_input_buffer_cache(device: str):
     torch.testing.assert_close(
         compiled(x, w).cpu(), x.cpu() @ w.cpu(), rtol=1e-2, atol=1e-3
     )
+
+
+def _regrow_between_forward_and_backward(
+    fn: Callable[[torch.nn.Module, torch.Tensor], torch.Tensor],
+    lin: torch.nn.Linear,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """FSDP2's reshard-after-forward: between forward and backward the
+    weight's storage is freed (`resize_(0)`), regrown, and refilled -- here
+    with new values, which eager's backward then reads."""
+    x = x.clone().requires_grad_()
+    loss = fn(lin, x)
+    w = lin.weight
+    refill = w.detach() * -2 + 0.5
+    storage = w.untyped_storage()
+    nbytes = storage.nbytes()
+    with torch.no_grad(), torch.autograd._unsafe_preserve_version_counter(w):
+        storage.resize_(0)
+        # Same size as the freed block, so the allocator can hand it over.
+        taker = torch.full_like(refill, 1e6)
+        storage.resize_(nbytes)
+        w.copy_(refill)
+    loss.backward()
+    del taker
+    assert x.grad is not None
+    return x.grad
+
+
+def check_saved_input_survives_storage_regrow(device: str):
+    """The forward returns the weight it saves for backward. It must be the
+    input itself, as in eager, not a second tensor over its address."""
+    torch.manual_seed(0)
+    ref = torch.nn.Linear(16, 8)
+    lin = torch.nn.Linear(16, 8).to(device)
+    lin.load_state_dict(ref.state_dict())
+    x = torch.randn(4, 16)
+
+    def fn(m: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        return m(x).square().sum()
+
+    compiled = torch.compile(fn, backend=mojo_backend)
+    grad = _regrow_between_forward_and_backward(compiled, lin, x.to(device))
+    expected = _regrow_between_forward_and_backward(fn, ref, x)
+    torch.testing.assert_close(grad.cpu(), expected, rtol=1e-2, atol=1e-3)
+
+
+def test_compiled_saved_input_survives_storage_regrow(device: str):
+    require_cuda_autograd(device)
+    check_saved_input_survives_storage_regrow(device)
 
 
 def test_bitwise_and_0d_operand(device: str):

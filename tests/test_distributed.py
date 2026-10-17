@@ -813,7 +813,7 @@ def test_two_rank_watchdog_fault_then_destroy_report_mode(ccl: str):
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.parametrize(
-    "mode", ["parity", "reduce_scatter", "fsdp_collectives_stress"]
+    "mode", ["parity", "compiled", "reduce_scatter", "fsdp_collectives_stress"]
 )
 def test_two_rank_fsdp2(mode: str, ccl: str):
     if _gpu_count() < 2:
