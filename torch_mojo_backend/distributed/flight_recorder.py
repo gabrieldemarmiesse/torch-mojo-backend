@@ -750,7 +750,10 @@ def incarnation(client: Store) -> str:
     restarted server has none, so its first client sets a new one)."""
     try:
         value = client.compare_set(INCARNATION_KEY, "", uuid.uuid4().hex)
-    except Exception:  # a store without compare_set: no restart detection
+    except (NotImplementedError, AttributeError):
+        # A store without compare_set (c10d's default raises
+        # NotImplementedError): no restart detection. Any other error
+        # propagates, so a transient failure never fakes a restart.
         return "fixed"
     return bytes(value).decode()
 

@@ -688,9 +688,16 @@ def test_a_store_without_compare_set_has_a_constant_incarnation():
 
     class NoCompareSet:
         def compare_set(self, *_: Any) -> bytes:
-            raise RuntimeError("not supported")
+            raise NotImplementedError("Not implemented.")
+
+    class Flaky:
+        def compare_set(self, *_: Any) -> bytes:
+            raise RuntimeError("connection reset")
 
     assert fr.incarnation(cast(Any, NoCompareSet())) == "fixed"
+    # A transient error must not read as a new incarnation.
+    with pytest.raises(RuntimeError):
+        fr.incarnation(cast(Any, Flaky()))
 
 
 def test_a_delayed_read_never_resets_the_state():
