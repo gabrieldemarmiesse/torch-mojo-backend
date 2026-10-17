@@ -20,6 +20,7 @@ from max.experimental.torch.torch import torch_dtype_to_max
 from max.graph import DeviceRef, Graph, KernelLibrary, ops as max_ops
 from torch._dynamo.backends.common import aot_autograd
 from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from torch_mojo_backend import native
 from torch_mojo_backend.aten_functions import (
@@ -611,6 +612,10 @@ class BaseMaxCompiler:
         graph, self.output_blueprint = factory.create_graph(gm.graph)
         self.takes_seed = factory.takes_seed
         self.collectives = factory.collectives
+        # Returned as torch tensors over the inputs, as in eager: AOTAutograd
+        # saves these (parameters, typically) for backward, and FSDP2 frees
+        # and regrows a parameter's storage in between (`resize_(0)`).
+        self.input_aliases = _outputs_aliasing_inputs(gm.graph, self.output_blueprint)
         try:
             self.waited_inputs = waited_inputs(gm.graph)
         except CollectiveLoweringError as e:
@@ -674,6 +679,11 @@ class BaseMaxCompiler:
                         "the process group. " + "; ".join(failed)
                     )
             raise
+        views = {
+            i: view
+            for i, alias in self.input_aliases.items()
+            if (view := alias.of(args, outputs[i])) is not None
+        }
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
             # buffers zero-copy as eager mojo tensors (DIM outputs become
@@ -684,13 +694,18 @@ class BaseMaxCompiler:
                 if kind is OutputBlueprintKind.DIM
             }
             tensor_outputs = [
-                _dim_buffer_to_cpu_tensor(x)
+                views[i]
+                if i in views
+                else _dim_buffer_to_cpu_tensor(x)
                 if i in dim_indices
                 else _mojo_tensor_from_buffer(x)
                 for i, x in enumerate(outputs)
             ]
         else:
-            tensor_outputs = [torch.from_dlpack(x) for x in outputs]
+            tensor_outputs = [
+                views[i] if i in views else torch.from_dlpack(x)
+                for i, x in enumerate(outputs)
+            ]
 
         debug.debug_graph_if_required(self.gm, args)
 
@@ -703,6 +718,102 @@ class BaseMaxCompiler:
             )
             print(f"Running the Max graph in {inference_duration}")
         return result
+
+
+@dataclass(frozen=True)
+class _InputAlias:
+    """A tensor output torch traced as argument `position` itself, or as
+    `as_strided(size, stride, offset)` of it (`offset` relative to the
+    argument's own; `size` None when symbolic)."""
+
+    position: int
+    identity: bool
+    size: tuple[int, ...] | None = None
+    stride: tuple[int, ...] = ()
+    offset: int = 0
+
+    def of(
+        self, args: tuple[object, ...], buffer: max.driver.Buffer
+    ) -> torch.Tensor | None:
+        arg = args[self.position]
+        assert isinstance(arg, torch.Tensor)
+        if self.identity:
+            return arg
+        if self.size is not None:
+            return arg.as_strided(
+                self.size, self.stride, arg.storage_offset() + self.offset
+            )
+        return _view_of_input(arg, buffer)
+
+
+def _static(values: tuple[object, ...]) -> tuple[int, ...] | None:
+    if all(isinstance(v, int) for v in values):
+        return cast("tuple[int, ...]", values)
+    return None
+
+
+def _outputs_aliasing_inputs(
+    graph: torch.fx.Graph, blueprint: list[tuple[OutputBlueprintKind, int | None]]
+) -> dict[int, _InputAlias]:
+    """MAX output index -> the input it is, or is a view of (sharing its
+    storage, same dtype), as torch traced it."""
+    inputs: dict[StorageWeakRef, tuple[int, torch.Tensor]] = {}
+    positions: dict[torch.fx.Node, int] = {}
+    output_args: list[object] = []
+    for node in graph.nodes:
+        if node.op == "placeholder":
+            positions[node] = len(positions)
+            val = node.meta.get("val")
+            if isinstance(val, torch.Tensor):
+                inputs.setdefault(
+                    StorageWeakRef(val.untyped_storage()), (positions[node], val)
+                )
+        elif node.op == "output":
+            output_args = list(node.args[0])
+    aliases: dict[int, _InputAlias] = {}
+    for x, (kind, index) in zip(output_args, blueprint, strict=True):
+        if kind is not OutputBlueprintKind.TENSOR or not isinstance(x, torch.fx.Node):
+            continue
+        assert index is not None
+        val = x.meta.get("val")
+        if not isinstance(val, torch.Tensor):
+            continue
+        if x.op == "placeholder":
+            aliases[index] = _InputAlias(positions[x], identity=True)
+            continue
+        found = inputs.get(StorageWeakRef(val.untyped_storage()))
+        if found is None or found[1].dtype != val.dtype:
+            continue
+        position, base = found
+        size, stride = _static(tuple(val.size())), _static(tuple(val.stride()))
+        offsets = _static((val.storage_offset(), base.storage_offset()))
+        if size is None or stride is None or offsets is None:
+            aliases[index] = _InputAlias(position, identity=False)
+        else:
+            aliases[index] = _InputAlias(
+                position, False, size, stride, offsets[0] - offsets[1]
+            )
+    return aliases
+
+
+def _view_of_input(arg: torch.Tensor, buffer: max.driver.Buffer) -> torch.Tensor | None:
+    """`buffer` as a torch view of `arg` when MAX returned `arg`'s own memory
+    (a tensor over the same address alone would not share `arg`'s storage)."""
+    if not arg.is_contiguous():
+        return None
+    offset = buffer._data_ptr() - arg.data_ptr()
+    itemsize = arg.element_size()
+    numel = buffer.num_elements
+    if (
+        buffer.element_size != itemsize
+        or offset < 0
+        or offset % itemsize
+        or offset // itemsize + numel > arg.numel()
+    ):
+        return None
+    shape = tuple(buffer.shape)
+    start = offset // itemsize
+    return arg.view(-1)[start : start + numel].view(shape)
 
 
 def graph_seed() -> max.driver.Buffer:

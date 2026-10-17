@@ -13,6 +13,7 @@ import max.driver
 import pytest
 import torch
 
+from tests.test_compiler import check_saved_input_survives_storage_regrow
 from torch_mojo_backend import mojo_backend, register_mojo_devices
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.torch_compile_backend import compiler
@@ -314,6 +315,10 @@ def test_compile_backward(mojo_device):
     fn(x_cpu, w_cpu).backward()
     assert w_cpu.grad is not None
     torch.testing.assert_close(w.grad.cpu(), w_cpu.grad, rtol=2e-2, atol=2e-3)
+
+
+def test_compile_saved_input_survives_storage_regrow(mojo_device):
+    check_saved_input_survives_storage_regrow(mojo_device)
 
 
 def test_compile_softmax_backward_produces_a_gradient(mojo_device):
