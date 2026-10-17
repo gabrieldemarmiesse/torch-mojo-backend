@@ -162,5 +162,5 @@ print(train_step(a, b).cpu().detach().numpy())
 
 ### Contributing
 
-We do not currently accept contributions, because we're very early early in the development of this project. 
+We do not currently accept contributions, because we're very early in the development of this project. 
 Feel free to read the code though and steal some good kernels :) 
