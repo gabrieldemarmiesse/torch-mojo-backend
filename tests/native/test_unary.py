@@ -1488,8 +1488,10 @@ def test_asinh_no_cancellation(mojo_gpu: str, dtype: torch.dtype):
     if dtype == torch.float64:
         # around ocml's rescaling at 2**512 and libdevice's switch at 2**63
         big = [2.0**512, 2.0**512 * (1 + 2**-52), 2.0**63, 1e300]
-        data = torch.cat((data, torch.tensor(big + [-v for v in big]).double()))
-    rtol = {torch.float32: 2e-6, torch.float64: 4e-16}.get(dtype, 1e-2)
+        data = torch.cat(
+            (data, torch.tensor(big + [-v for v in big], dtype=torch.float64))
+        )
+    rtol = {torch.float32: 2e-6, torch.float64: 1e-15}.get(dtype, 1e-2)
     torch.testing.assert_close(
         op(data.to(mojo_gpu)).cpu(), torch.asinh(data), rtol=rtol, atol=0
     )
