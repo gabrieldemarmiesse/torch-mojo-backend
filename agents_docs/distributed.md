@@ -441,6 +441,43 @@ communicators and does the actual library calls.
     closed when the reporter ends. Then `ncclCommAbort` on every communicator it can
     claim, and `_exit(1)`. Driver errors (event record or query) take the
     same path.
+  - *Asynchronous library errors.* Every poll also asks the library, as
+    ProcessGroupNCCL's watchdog does. Vendor NCCL: `ncclCommGetAsyncError`,
+    atomic loads of `comm->asyncResult` and the proxy's; its GIN branch
+    (a shared mutex and a GIN plugin callback) runs only for communicators
+    with device-API GIN connected (`ncclDevCommCreate`), which this backend
+    never creates, and its `groupJob` branch only for non-blocking
+    communicators, which these are not. mojoccl: `mojocclCommPeekAsyncError`
+    (abort flag, inter-node engine error, latched fault records: host
+    memory, no lock, no output) and `mojocclCommAsyncErrorText` for the
+    fault's description; the full `ncclCommGetAsyncError` may take the
+    submission lock and copy the arena words off the device, which would
+    stall a concurrent submitter. Neither blocks, writes or takes the backend
+    mutex. A non-success, non-`ncclInProgress` result, or a failure of the
+    query itself, is reported like a timeout (code and `ncclGetErrorString`
+    text, mojoccl's fault line, pending collectives, desync report) once T_STATE is
+    LIVE again, through the bounded writer. Abort mode aborts and exits.
+    Report mode makes it terminal, like a driver fault: reported once,
+    the communicator unwatched, its incident resolved only when it is
+    aborted or destroyed (never by a collective completing later), and a
+    destroy aborts instead of draining, also when the error arrives during
+    the drain. An interpreter exit without a destroy aborts it too, under
+    the reaper and without a second report (vendor NCCL's proxy error does
+    not release the kernel; driver faults get the same treatment).
+    Lifetime: the poll moves the tracker's state LIVE -> POLLING by
+    compare-exchange and back after the calls; `watch_claim` (which every
+    abort/destroy goes through before freeing the communicator) retries
+    until it moves LIVE -> CLAIMED itself, so the calls never run on a
+    communicator being freed.
+    How soon the library records an error depends on the transport, and
+    the watchdog adds at most one poll: vendor NCCL over sockets sees a
+    dead peer's connection close at once; over IB, when the QP retries run
+    out (tens of seconds at the default `NCCL_IB_TIMEOUT`/`NCCL_IB_RETRY_CNT`);
+    over NVLink/P2P or SHM never -- the peer's flags just stop moving, and
+    the collective timeout reports it. mojoccl's kernels latch a deadline
+    after `MOJOCCL_IB_TIMEOUT_S` (60 s by default). The tests
+    (`test_two_rank_watchdog_async_error*`) force NCCL's socket transport
+    and set `MOJOCCL_IB_TIMEOUT_S=5`.
   - *Comparisons.* Only the five collectives every rank issues with the
     same arguments compare across ranks, by the span of collective
     positions an entry covers and its fingerprint (a send before them
@@ -456,7 +493,24 @@ communicators and does the actual library calls.
     never deleted, so a concurrent read never waits on a vanished key).
   - *Ownership and teardown.* Explicit `abort()`, destroy and the
     watchdog's abort each `watch_claim` a communicator first
-    (compare-exchange); only the winner calls the library. Destroy waits
+    (compare-exchange); only the winner calls the library, then
+    `watch_release`s it. Between the two the claim reads as a teardown in
+    progress: the exit path counts it as pending and never cancels its
+    reaper over it, so another thread's abort that claimed but stalls (even
+    before it reaches the library) cannot outlive the reaper's 10 s
+    (`test_two_rank_watchdog_exit_with_an_abort_in_progress`, a test hook
+    stalls the abort). The release of the last such claim cancels the
+    reaper the exit path left armed (`_cancel_reaper` publishes the cell
+    then looks, `watch_release` stores then looks for it, both
+    sequentially consistent: one of the two cancels), so an exit handler
+    still running past the deadline keeps the status
+    (`test_two_rank_watchdog_exit_abort_finishes_after_the_grace`). The
+    exit path arms its reaper before looking at any communicator and
+    decides only at the cancel, so a claim landing between two of its
+    looks is covered too; only one landing after the exit hook returned is
+    not. Report mode therefore exits with status 1 only when an exit-time
+    abort, its own or another thread's, is still running at the reaper's
+    deadline. Destroy waits
     (bounded: timeout + ack window + 10 s; with the watchdog off, the comm
     stream going idle within the timeout,
     `test_two_rank_watchdog_off_destroy_completes_collectives`) for this
@@ -471,12 +525,10 @@ communicators and does the actual library calls.
     fork handlers take, and closed in the child; a child's `shutdown()`
     does no native work (the communicators and threads are the parent's).
   - *Known limitations* (reviewed, judged narrow, left as they are):
-    - Not done: `ncclCommGetAsyncError` polling (mojoccl's needs a
-      device-to-host read that blocks behind the hung kernel), a desync
-      record from ranks whose own watchdog did not fire (their missing
-      record is the signal, and the report says a rank that could not
-      send one looks the same; their flight recorder dump has the rest),
-      pairing a send with its recv across ranks.
+    - Not done: a desync record from ranks whose own watchdog did not
+      fire (their missing record is the signal, and the report says a
+      rank that could not send one looks the same; their flight recorder
+      dump has the rest), pairing a send with its recv across ranks.
     - A thread blocked inside a library call holds the backend mutex, so
       an exiting thread that frees a tensor blocks behind it before the
       exit hook runs; the watchdog's timeout then reports it (in report
@@ -576,7 +628,9 @@ communicators and does the actual library calls.
       place, serialized per process. Entries of a group the process never
       knew are left out (the analyzer needs each in `pg_config`). Every
       dump is keyed by global rank -- file, pipe, acknowledgement.
-    - *Coordination.* On an incident `_desync_reporter` takes a new
+    - *Coordination.* On an incident (a timeout, a driver fault or an
+      asynchronous library error, `where=async`, whose dump says so)
+      `_desync_reporter` takes a new
       generation (`add` on `mojo_fr/generation` of the unprefixed store),
       sets torch's `exception_dump`, dumps, acknowledges
       `mojo_fr/dumped/<generation>/<global rank>` only if the file was
@@ -1116,10 +1170,11 @@ NCCL-class collectives, not a general library:
   that gave up records it twice: in its arena's error word, as it always
   did, and in the communicator's pinned *status page* — host memory the
   kernel stores into, so the host reads it with one load, no copy and no
-  stream synchronize (`ncclCommGetAsyncError`'s read of the arena word needs
-  a device-to-host copy, which blocks behind the very kernels it is asking
-  about, so no collective could afford to call it — which is why a timed-out
-  barrier used to leave no trace anybody read). That latch is what keeps a
+  stream synchronize (`ncclCommGetAsyncError` reads the arena word with a
+  device-to-host copy, under the submission lock and only once an
+  `order_event` query says the communicator's work completed, so it cannot
+  answer while a kernel is stuck; the process group's watchdog polls the
+  host-only `mojocclCommPeekAsyncError` instead). That latch is what keeps a
   timed-out collective from turning into wrong data:
   - `ncclAllReduce` / `ncclBroadcast` / `ncclAllGather` return
     `ncclRemoteError` from the next call on; `pg.mojo`'s `check()` turns that
