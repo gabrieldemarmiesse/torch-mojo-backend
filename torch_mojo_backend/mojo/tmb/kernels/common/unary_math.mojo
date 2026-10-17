@@ -2,6 +2,7 @@
 
 from std.math import (
     acos,
+    asinh,
     atanh,
     ceil,
     cos,
@@ -21,7 +22,13 @@ from std.math import (
 from std.collections import Array
 from std.memory import bitcast
 from std.sys import llvm_intrinsic
-from std.sys.info import bit_width_of, is_amd_gpu, is_apple_gpu, is_nvidia_gpu
+from std.sys.info import (
+    bit_width_of,
+    is_amd_gpu,
+    is_apple_gpu,
+    is_gpu,
+    is_nvidia_gpu,
+)
 from std.utils.numerics import isnan, max_or_inf, nan
 from tmb.kernels.common.cuda_math import (
     nv_asinf,
@@ -33,10 +40,17 @@ from tmb.kernels.common.cuda_math import (
     nv_lgammaf,
     nv_log10f,
 )
-from tmb.kernels.common.libdevice_port import nv_log2f, nv_logf
+from tmb.kernels.common.libdevice_port import (
+    nv_asinh,
+    nv_asinhf,
+    nv_log2f,
+    nv_logf,
+)
 from tmb.kernels.common.math_utils import custom_tan, ieee_sqrt
 from tmb.kernels.common.ocml_math import (
     oc_asinf,
+    oc_asinh,
+    oc_asinhf,
     oc_atanf,
     oc_erfinvf,
     oc_exp2f,
@@ -47,6 +61,7 @@ from tmb.kernels.common.ocml_math import (
 )
 from tmb.kernels.common.mps_math import (
     air_asin,
+    air_asinh,
     air_atan,
     air_log10,
     mps_digamma,
@@ -395,6 +410,38 @@ def _gpu_log_f32[
 
 
 @always_inline
+def _asinh[
+    dtype: DType, width: SIMDLength
+](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
+    """asinh with the libm stock torch calls: libdevice's `__nv_asinhf` /
+    `__nv_asinh` on NVIDIA, ocml's on AMD, Metal's on Apple, libm on the
+    host. (`log(x + sqrt(x^2 + 1))` cancels for negative x.)
+    """
+    comptime if not is_gpu():
+        return asinh(a)
+    var r = SIMD[dtype, width]()
+    comptime for i in range(width):
+        comptime if dtype == DType.float32:
+            var x = rebind[Float32](a[i])
+            comptime if is_nvidia_gpu():
+                r[i] = rebind[Scalar[dtype]](nv_asinhf(x))
+            elif is_amd_gpu():
+                r[i] = rebind[Scalar[dtype]](oc_asinhf(x))
+            else:
+                r[i] = rebind[Scalar[dtype]](air_asinh(x))
+        else:
+            comptime assert dtype == DType.float64, "float32 or float64 only"
+            var x = rebind[Float64](a[i])
+            comptime if is_nvidia_gpu():
+                r[i] = rebind[Scalar[dtype]](nv_asinh(x))
+            elif is_amd_gpu():
+                r[i] = rebind[Scalar[dtype]](oc_asinh(x))
+            else:  # Apple GPUs have no float64
+                r[i] = air_asinh(x.cast[DType.float32]()).cast[dtype]()
+    return r
+
+
+@always_inline
 def _float_unary[
     kind: StaticString, dtype: DType, width: SIMDLength
 ](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
@@ -455,9 +502,7 @@ def _float_unary[
     comptime if kind == "acosh":
         res = _acosh[exact_sqrt=True](a)
     comptime if kind == "asinh":
-        # asinh(x) = log(x + sqrt(x^2 + 1)); std.math.asinh is libm/CPU-only.
-        res = log(a + ieee_sqrt(a * a + 1))
-        res = (abs(a).eq(max_or_inf[dtype]()) | a.eq(0)).select(a, res)
+        res = _asinh(a)
     comptime if kind == "atanh":
         res = atanh(a)
     comptime if kind == "cos":
@@ -540,8 +585,11 @@ def _float_unary[
         res = 0.5 * a * (1 + tanh(inner))
     # CPU stdlib approximations omit NaNs for exp/tanh/cosh. NVIDIA's float32
     # math preserves them already, so avoid an extra select on every lane.
-    # Retain the existing correction on other backends and float64.
-    comptime if not (is_nvidia_gpu() and dtype == DType.float32):
+    # Retain the existing correction on other backends and float64, except
+    # for the vendor asinh ports, which quiet a signaling NaN as CUDA does.
+    comptime if not (is_nvidia_gpu() and dtype == DType.float32) and not (
+        kind == "asinh" and (is_nvidia_gpu() or is_amd_gpu())
+    ):
         return isnan(a).select(a, res)
     else:
         return res
