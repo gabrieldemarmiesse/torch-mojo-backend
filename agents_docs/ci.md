@@ -29,13 +29,17 @@ tests use `@pytest.mark.cuda`, which also implies `gpu`. For mixed parameter
 sets, put the marker on the GPU `pytest.param` only. Pure validation tests in
 GPU-related modules still belong to the CPU selection.
 
-The GPU suites run on whichever `L4` runners are free. A runner takes one job
-at a time, so there is no need to flock the GPU against another job on it. The
+The GPU suites run on whichever `L4` runners are free. Each runner is one
+container with one CPU core; the eight containers of a host share its L4 (as of
+2026-10). The
 jobs preserve the runner's
 uv, Mojo, and native build caches, using
 `UV_CACHE_DIR`, `MODULAR_HOME`, `MODULAR_CACHE_DIR`, and
 `TORCH_MOJO_BACKEND_CACHE_DIR` if configured,
-otherwise persistent directories under the user's cache directory. No cache
+otherwise persistent directories under the user's cache directory. Only
+`~/.cache/torch-mojo-backend` is mounted into every container of a host, so the
+native builds and `MODULAR_CACHE_DIR` (MAX's graph cache and Mojo's compile
+cache) live there; the uv and `MODULAR_HOME` directories are per-container. No cache
 cleanup or pruning runs between jobs. The dependency environment is synced
 against `uv.lock` each job; cached downloads and builds remain available.
 

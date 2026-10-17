@@ -16,10 +16,15 @@ runs:
     - name: Preserve local caches between jobs
       shell: bash
       run: |
+        native="${TORCH_MOJO_BACKEND_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torch-mojo-backend/native}"
         echo "UV_CACHE_DIR=${UV_CACHE_DIR:-$HOME/.cache/uv}" >> "$GITHUB_ENV"
         echo "MODULAR_HOME=${MODULAR_HOME:-$HOME/.cache/modular}" >> "$GITHUB_ENV"
-        echo "MODULAR_CACHE_DIR=${MODULAR_CACHE_DIR:-$HOME/.cache/modular-cache}" >> "$GITHUB_ENV"
-        echo "TORCH_MOJO_BACKEND_CACHE_DIR=${TORCH_MOJO_BACKEND_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torch-mojo-backend/native}" >> "$GITHUB_ENV"
+        # MAX's graph cache and Mojo's compile cache. Next to the native
+        # builds because the runner mounts that directory into every container
+        # on the host; the rest of $HOME is per-container, so each container
+        # recompiled the graphs and custom-op kernels the others had already compiled.
+        echo "MODULAR_CACHE_DIR=${MODULAR_CACHE_DIR:-$(dirname "$native")/modular-cache}" >> "$GITHUB_ENV"
+        echo "TORCH_MOJO_BACKEND_CACHE_DIR=$native" >> "$GITHUB_ENV"
 
     - name: Install uv
       uses: astral-sh/setup-uv@v7
