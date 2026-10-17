@@ -1,3 +1,4 @@
+import builtins
 import datetime as dt
 import functools
 import itertools
@@ -27,6 +28,7 @@ from torch._guards import TracingContext
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch.multiprocessing.reductions import StorageWeakRef
+from torch.utils._pytree import tree_flatten, tree_leaves, tree_unflatten
 from torch.utils._sympy.functions import FloorDiv, Mod, PythonMod
 
 from torch_mojo_backend import native
@@ -52,6 +54,15 @@ from torch_mojo_backend.torch_compile_backend.collectives import (
     GraphCollectives,
     wait,
     waited_inputs,
+)
+from torch_mojo_backend.torch_compile_backend.streams import (
+    ACTIVE_STREAM_CONTEXTS,
+    MaxStreamPool,
+    compile_stream_graph,
+    enter_streams,
+    max_stream_id,
+    uses_streams,
+    wait_for_contexts,
 )
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,
@@ -338,6 +349,7 @@ class _GraphFactory:
         # The graph's collectives, whose process-group handles are host
         # inputs after the seed (set by create_graph).
         self.collectives: GraphCollectives | None = None
+        self.max_stream_id = 0
 
     def initialize_graph(self):
         if self.graph is not None:
@@ -695,6 +707,90 @@ class _GraphFactory:
                 )
         self.tensor_book[node.name] = attr_value
 
+    def handle_side_stream(
+        self, nodes: list[tuple[int, torch.fx.Node]], stream_id: int
+    ):
+        """Lower a tensor region into a MAX side stream with explicit captures."""
+        assert self.graph is not None
+        self.max_stream_id = builtins.max(self.max_stream_id, stream_id)
+        members = {node for _, node in nodes}
+        inputs = list(
+            dict.fromkeys(
+                arg
+                for _, node in nodes
+                for arg in node.all_input_nodes
+                if arg not in members
+            )
+        )
+        outputs = [
+            node for _, node in nodes if any(user not in members for user in node.users)
+        ]
+        values, input_spec = tree_flatten(
+            [self.tensor_book.tensors[node.name] for node in inputs]
+        )
+        tensor_indices = [
+            i
+            for i, value in enumerate(values)
+            if isinstance(value, max.graph.TensorValue | MaxEagerTensor)
+        ]
+        tensors = [max.graph.TensorValue(values[i]) for i in tensor_indices]
+        previous = self.tensor_book
+        results = []
+        output_spec = None
+        result_indices = []
+
+        def lower(*args: max.graph.TensorValue) -> list[max.graph.TensorValue]:
+            nonlocal results, output_spec, result_indices
+            self.tensor_book = TensorsBook()
+            self.tensor_book.tensors.update(previous.tensors)
+            try:
+                body_values = list(values)
+                for index, value in zip(tensor_indices, args, strict=True):
+                    body_values[index] = value
+                for node, value in zip(
+                    inputs, tree_unflatten(body_values, input_spec), strict=True
+                ):
+                    self.tensor_book[node.name] = value
+                for node_idx, node in nodes:
+                    self.handle_call_function(node_idx, node)
+                results, output_spec = tree_flatten(
+                    [self.tensor_book.tensors[node.name] for node in outputs]
+                )
+                result_indices = [
+                    i
+                    for i, value in enumerate(results)
+                    if isinstance(value, max.graph.TensorValue | MaxEagerTensor)
+                ]
+                return [max.graph.TensorValue(results[i]) for i in result_indices]
+            finally:
+                self.tensor_book = previous
+
+        # side_stream needs result types before building its body. Infer them
+        # with the existing lowerings in a temporary graph; this also handles
+        # symbolic shape expressions without duplicating ATen shape rules.
+        # MAX 26.6 does not permit ops.call inside mo.sequence. The parent's
+        # inputs come along unused: they declare every symbol the lowerings
+        # may name, a SymInt carrier's included.
+        with Graph(
+            "stream_types",
+            input_types=[value.type for value in tensors] + self.graph_inputs,
+            kernel_library=global_max_objects().kernel_library,
+        ) as type_graph:
+            captured = type_graph.inputs[: len(tensors)]
+            type_results = lower(*(value.tensor for value in captured))
+            result_types = [value.type for value in type_results]
+            type_graph.output(*type_results)
+        side_results = max_ops.side_stream(
+            tensors, lower, result_types=result_types, stream_id=stream_id
+        )
+        for index, value in zip(result_indices, side_results, strict=True):
+            results[index] = value
+        assert output_spec is not None
+        for node, value in zip(
+            outputs, tree_unflatten(results, output_spec), strict=True
+        ):
+            self.tensor_book[node.name] = value
+
     def handle_output(
         self, node: torch.fx.Node
     ) -> list[tuple[OutputBlueprintKind, int | None]]:
@@ -779,7 +875,11 @@ class _GraphFactory:
         except CollectiveLoweringError as e:
             raise MojoCompilerError(str(e)) from e
         try:
-            for node_idx, node in enumerate(graph.nodes):
+            nodes = list(enumerate(graph.nodes))
+            position = 0
+            while position < len(nodes):
+                node_idx, node = nodes[position]
+                position += 1
                 if node.op == "placeholder":
                     self.handle_placeholder(node)
                     continue
@@ -788,7 +888,23 @@ class _GraphFactory:
                     self.initialize_graph()
 
                 if node.op in ("call_function", "call_method"):
-                    self.handle_call_function(node_idx, node)
+                    stream_id = max_stream_id(node)
+                    # Random state and collective handles belong to the parent
+                    # graph. Their existing lowerings retain that ordering.
+                    if stream_id and not self.takes_seed and self.collectives is None:
+                        group = [(node_idx, node)]
+                        while position < len(nodes):
+                            next_idx, next_node = nodes[position]
+                            if (
+                                next_node.op not in ("call_function", "call_method")
+                                or max_stream_id(next_node) != stream_id
+                            ):
+                                break
+                            group.append((next_idx, next_node))
+                            position += 1
+                        self.handle_side_stream(group, stream_id)
+                    else:
+                        self.handle_call_function(node_idx, node)
                 elif node.op == "get_attr":
                     self.handle_get_attr(node)
                 elif node.op == "output":
@@ -938,6 +1054,22 @@ class BaseMaxCompiler:
     ):
         self.gm = gm
         self.mojo_outputs = _graph_uses_mojo_device(gm, example_inputs)
+        devices = {
+            value.device
+            for node in gm.graph.nodes
+            for value in tree_leaves(
+                node.meta.get("val", node.meta.get("example_value"))
+            )
+            if isinstance(value, torch.Tensor) and value.device.type in ("cuda", "mojo")
+        }
+        # A per-device handoff also orders input-free factories and graphs
+        # whose outputs are all CPU values. Re-import it on *every* call:
+        # cached tensor aliases do not refresh DLPack's stream dependency.
+        with unset_fake_temporarily():
+            self.stream_tokens = [
+                torch.empty(1, dtype=torch.uint8, device=device)
+                for device in sorted(devices, key=str)
+            ]
         if profiling_enabled():
             compiler_start = time.time_ns()
         if verbose_enabled():
@@ -974,6 +1106,7 @@ class BaseMaxCompiler:
         if profiling_enabled():
             graph_defined_time = time.time_ns()
         self.model = global_max_objects().session.load(graph)
+        self.side_streams = MaxStreamPool(self.model.devices, factory.max_stream_id + 1)
         if profiling_enabled():
             compiling_done_time = time.time_ns()
             defining = dt.timedelta(
@@ -1046,16 +1179,37 @@ class BaseMaxCompiler:
             # the wait the graph traced, done here, orders the current stream
             # (and so the graph, see fast_from_dlpack) after it.
             torch.ops._c10d_functional.wait_tensor(args[i])
+        stream_fences = []
+        for contexts in ACTIVE_STREAM_CONTEXTS.get():
+            with enter_streams(contexts):
+                stream_fences.extend(
+                    (token, fast_from_dlpack(token), contexts)
+                    for token in self.stream_tokens
+                )
+        # A staged input copy runs on the current stream, which in a region
+        # with several contexts is the ambient one: order it after them first.
+        active = ACTIVE_STREAM_CONTEXTS.get()
+        before_copy = (
+            functools.cache(functools.partial(wait_for_contexts, active))
+            if any(active)
+            else None
+        )
         if self.tensor_inputs_only:
             input_tensors = [
-                _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
+                _cached_buffer_for(x, before_copy)
+                for x in args
+                if isinstance(x, torch.Tensor)
             ]
         else:
-            input_tensors = [_graph_input(kind, args[i]) for kind, i in self.input_plan]
+            input_tensors = [
+                _graph_input(kind, args[i], before_copy) for kind, i in self.input_plan
+            ]
         if self.takes_seed:
             input_tensors.append(graph_seed())
         if self.collectives is not None:
             input_tensors.extend(self.collectives.runtime_inputs())
+        fences = [fence for _, fence, _ in stream_fences]
+        self.side_streams.fence(fences, entering=True)
         try:
             outputs = self.model.execute(*input_tensors)
         except BaseException as e:
@@ -1068,6 +1222,29 @@ class BaseMaxCompiler:
                         "the process group. " + "; ".join(failed)
                     )
             raise
+        finally:
+            # Publish completion even when the graph returns no GPU tensor,
+            # and before AOT's mutation epilogue or a user records an event.
+            self.side_streams.fence(fences, entering=False)
+            for token, fence, contexts in stream_fences:
+                with enter_streams(contexts):
+                    if fence.device.label == "cpu":
+                        continue
+                    if token.device.type == "mojo":
+                        if (
+                            device_module.get_device_properties(token.device).api
+                            == "metal"
+                        ):
+                            fence.device.synchronize()
+                            continue
+                        handle = device_module.stream_native_handle(
+                            torch.accelerator.current_stream(token.device)
+                        )
+                    else:
+                        handle = torch.cuda.current_stream(token.device).cuda_stream
+                        # DLPack reserves 1 for CUDA's legacy default stream.
+                        handle = handle or 1
+                    fence.__dlpack__(stream=handle)
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
             # buffers zero-copy as eager mojo tensors (DIM outputs become
@@ -1128,8 +1305,12 @@ def _evict_buffer(tensor_id: int, /):
 _MAX_INPUT_ALIGNMENT = 16
 
 
-def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
+def _cached_buffer_for(
+    t: torch.Tensor, before_copy: Callable[[], None] | None = None
+) -> max.driver.Buffer:
     if not t.is_contiguous() or t.data_ptr() % _MAX_INPUT_ALIGNMENT:
+        if before_copy is not None:
+            before_copy()
         # A MAX Buffer is dense row-major and aligned, and the graph input
         # type only carries a shape, so such an input has to be materialized.
         # The copy is a fresh allocation on every call and is deliberately NOT
@@ -1152,10 +1333,12 @@ def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
 GraphValue = torch.Tensor | int | float | None
 
 
-def _graph_input(kind: GraphInputKind, arg: GraphValue) -> max.driver.Buffer:
+def _graph_input(
+    kind: GraphInputKind, arg: GraphValue, before_copy: Callable[[], None] | None = None
+) -> max.driver.Buffer:
     if kind is GraphInputKind.TENSOR:
         assert isinstance(arg, torch.Tensor)
-        return _cached_buffer_for(arg)
+        return _cached_buffer_for(arg, before_copy)
     assert isinstance(arg, int)
     if kind is GraphInputKind.SIZE:
         return _symint_carrier((arg, 0))
@@ -1201,17 +1384,26 @@ def _aot_forward_outputs() -> tuple[dict[int, int], range | None]:
 
 class mojo_backend:
     def __init__(self, gm: torch.fx.GraphModule, example_inputs: list[object]):
-        self.func_to_execute = aot_autograd(
-            fw_compiler=boxed_func,
-            bw_compiler=boxed_backward_func,
-            decompositions=DECOMPOSITION_TABLE,
-        )(gm, example_inputs)
+        if uses_streams(gm.graph):
+            self.func_to_execute = compile_stream_graph(gm, _compile_region)
+        else:
+            self.func_to_execute = _compile_region(gm, example_inputs)
 
     def __call__(self, *args: object) -> list[torch.Tensor | int | float | None]:
         result = self.func_to_execute(*args)
         if isinstance(result, tuple):
             return list(result)
         return result
+
+
+def _compile_region(
+    gm: torch.fx.GraphModule, example_inputs: list[object]
+) -> Callable[..., Any]:
+    return aot_autograd(
+        fw_compiler=boxed_func,
+        bw_compiler=boxed_backward_func,
+        decompositions=DECOMPOSITION_TABLE,
+    )(gm, example_inputs)
 
 
 def dummy_compiler(
