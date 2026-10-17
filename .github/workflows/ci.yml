@@ -146,9 +146,16 @@ jobs:
 
       - uses: ./.github/actions/gpu-runner-setup
 
+      - name: Cache report (start)
+        run: .github/scripts/gpu_cache_report.sh start
+
       - name: Run GPU unit tests
         run: |
-          uv run --no-sync pytest tests/ -m "${{ matrix.selection }}" -x -v -ra --splits 8 --group ${{ matrix.test-index }}
+          uv run --no-sync pytest tests/ -m "${{ matrix.selection }}" -x -v -ra --durations=60 --splits 8 --group ${{ matrix.test-index }}
+
+      - name: Cache report (end)
+        if: always()
+        run: .github/scripts/gpu_cache_report.sh end
 
   # 19 tests, and the only suite that swaps the torch wheel: not worth sharding.
   test-gpu-cpu-torch:
@@ -163,6 +170,13 @@ jobs:
         with:
           torch-wheel: cpu
 
+      - name: Cache report (start)
+        run: .github/scripts/gpu_cache_report.sh start
+
       - name: Run GPU unit tests
         run: |
-          uv run --no-sync pytest tests/ -m "gpu and cpu_torch" -x -v -ra
+          uv run --no-sync pytest tests/ -m "gpu and cpu_torch" -x -v -ra --durations=60
+
+      - name: Cache report (end)
+        if: always()
+        run: .github/scripts/gpu_cache_report.sh end
