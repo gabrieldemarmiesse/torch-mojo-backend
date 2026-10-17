@@ -14,9 +14,10 @@
 # * MATH_FAST_RCP / MATH_FAST_SQRT as `llvm.amdgcn.rcp` / `llvm.amdgcn.sqrt`
 #   (v_rcp_f32 / v_sqrt_f32, ~1 ulp), and the IEEE operation elsewhere, so
 #   the host (a unit test of the port) runs the same algorithm;
-# * BUILTIN_LOG_F32 / BUILTIN_EXP2_F32 / BUILTIN_LOG10_F32 (what ocml's
-#   log / exp2 / log10 are) as the `llvm.log` / `llvm.exp2` / `llvm.log10`
-#   intrinsics, which the AMDGPU backend expands exactly as for ocml;
+# * BUILTIN_LOG_F32 / BUILTIN_LOG2_F32 / BUILTIN_EXP2_F32 / BUILTIN_LOG10_F32
+#   (what ocml's log / log2 / exp2 / log10 are) as the `llvm.log` /
+#   `llvm.log2` / `llvm.exp2` / `llvm.log10` intrinsics, which the AMDGPU
+#   backend expands exactly as for ocml;
 # * torch's ROCm build not finite-only, so every `!FINITE_ONLY_OPT()` branch
 #   is kept.
 # ===----------------------------------------------------------------------=== #
@@ -98,6 +99,12 @@ def oc_sqrtf(x: Float32) -> Float32:
 def oc_logf(x: Float32) -> Float32:
     """`__ocml_log_f32`: BUILTIN_LOG_F32."""
     return llvm_intrinsic["llvm.log", Float32, has_side_effect=False](x)
+
+
+@always_inline
+def oc_log2f(x: Float32) -> Float32:
+    """`__ocml_log2_f32`: BUILTIN_LOG2_F32."""
+    return llvm_intrinsic["llvm.log2", Float32, has_side_effect=False](x)
 
 
 @always_inline

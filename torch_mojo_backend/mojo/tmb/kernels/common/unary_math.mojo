@@ -33,6 +33,7 @@ from tmb.kernels.common.cuda_math import (
     nv_lgammaf,
     nv_log10f,
 )
+from tmb.kernels.common.libdevice_port import nv_log2f, nv_logf
 from tmb.kernels.common.math_utils import custom_tan, ieee_sqrt
 from tmb.kernels.common.ocml_math import (
     oc_asinf,
@@ -41,6 +42,8 @@ from tmb.kernels.common.ocml_math import (
     oc_exp2f,
     oc_expm1f,
     oc_log10f,
+    oc_log2f,
+    oc_logf,
 )
 from tmb.kernels.common.mps_math import (
     air_asin,
@@ -369,6 +372,29 @@ def is_rounding[kind: StaticString]() -> Bool:
 
 
 @always_inline
+def _gpu_log_f32[
+    kind: StaticString, width: SIMDLength
+](a: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    """float32 log/log2 with the libm stock torch calls: libdevice's
+    `__nv_logf` / `__nv_log2f` on NVIDIA, ocml's on AMD. std.math's GPU
+    versions are approximations that mishandle subnormal inputs.
+    """
+    var r = SIMD[DType.float32, width]()
+    comptime for i in range(width):
+        comptime if is_amd_gpu():
+            comptime if kind == "log":
+                r[i] = oc_logf(a[i])
+            else:
+                r[i] = oc_log2f(a[i])
+        else:
+            comptime if kind == "log":
+                r[i] = nv_logf(a[i])
+            else:
+                r[i] = nv_log2f(a[i])
+    return r
+
+
+@always_inline
 def _float_unary[
     kind: StaticString, dtype: DType, width: SIMDLength
 ](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
@@ -440,10 +466,14 @@ def _float_unary[
         res = cosh(a)
     comptime if kind == "erf":
         res = erf(a)
-    comptime if kind == "log":
+    comptime if (
+        kind == "log" or kind == "log2"
+    ) and dtype == DType.float32 and (is_nvidia_gpu() or is_amd_gpu()):
+        res = _gpu_log_f32[kind](a.cast[DType.float32]()).cast[dtype]()
+    elif kind == "log":
         # Preserve +inf, which the stdlib CPU approximation treats as finite.
         res = a.eq(max_or_inf[dtype]()).select(a, log(a))
-    comptime if kind == "log2":
+    elif kind == "log2":
         res = log2(a)
         comptime if dtype == DType.float64 or is_apple_gpu():
             # The double approximation and Metal's float log2 omit +inf.
