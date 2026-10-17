@@ -1340,15 +1340,18 @@ def _hashed_bits(count: int, mask: int) -> list[int]:
 def _bits_input_bits(dtype: str) -> list[int]:
     """The non-negative bit patterns (each is also run negated): zero,
     infinity, NaNs, every power of two (subnormal ones too; every third
-    exponent in float64) with its neighbours, the normal/subnormal boundary, the neighbourhoods of 1 and of
-    the routines' range switches, the values of issue #674, and
-    pseudo-random patterns; a half dtype takes every fifth pattern plus all
-    bfloat16 subnormals and its own boundaries."""
+    exponent in float64) with its neighbours, the normal/subnormal
+    boundary, the neighbourhoods of 1 and of the routines' range switches,
+    the values of issue #674, and pseudo-random patterns; a half dtype
+    takes every fifth pattern plus all bfloat16 subnormals and its own
+    boundaries."""
     if dtype == "float64":
         bits = {0x7FF0000000000001, 0x7FF8000000000000, 0x7FFFFFFFFFFFFFFF}
         for e in range(0, 2048, 3):
             bits.update(b for b in range((e << 52) - 1, (e << 52) + 2) if b >= 0)
-        bits.add(0x7FF0000000000000)
+        # inf, the largest finite, the normal/subnormal boundary
+        bits.update((0x7FF0000000000000, 0x7FEFFFFFFFFFFFFF))
+        bits.update((0x0010000000000000, 0x0010000000000001, 0x000FFFFFFFFFFFFF))
         for k in range(52):
             bits.update((1 << k, (2 << k) - 1))
         # __nv_asinh's log(2|x|) switch at 2**63
@@ -1463,10 +1466,17 @@ def test_unary_cuda_bits_regenerate_on_stock_cuda():
     assert _unary_cases("cuda") == _unary_cuda()
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.float64]
+)
 def test_asinh_no_cancellation(mojo_gpu: str, dtype: torch.dtype):
     """Issue #674: log(x + sqrt(x^2 + 1)) gave -inf at -5000 and lost
-    digits at -100. Every backend, against CPU torch."""
+    digits at -100. Every backend, against CPU torch; float64 through
+    torch.compile, as the eager op declines it."""
+    op = torch.asinh
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+        op = torch.compile(torch.asinh, backend=mojo_backend, fullgraph=True)
     finfo = torch.finfo(dtype)
     data = torch.tensor(
         [-1e5, -5000.0, -100.0, -1.5, -1e-3, 1e-3, 1.5, 100.0, 5000.0, 1e5]
@@ -1475,16 +1485,32 @@ def test_asinh_no_cancellation(mojo_gpu: str, dtype: torch.dtype):
     ).to(dtype)
     if dtype == torch.float32:
         data = torch.cat((data, torch.tensor([1e30, -1e30, 3e38, -3e38])))
+    if dtype == torch.float64:
+        # around ocml's rescaling at 2**512 and libdevice's switch at 2**63
+        big = [2.0**512, 2.0**512 * (1 + 2**-52), 2.0**63, 1e300]
+        data = torch.cat((data, torch.tensor(big + [-v for v in big]).double()))
+    rtol = {torch.float32: 2e-6, torch.float64: 4e-16}.get(dtype, 1e-2)
     torch.testing.assert_close(
-        torch.asinh(data.to(mojo_gpu)).cpu(),
-        torch.asinh(data),
-        rtol=2e-6 if dtype == torch.float32 else 1e-2,
-        atol=0,
+        op(data.to(mojo_gpu)).cpu(), torch.asinh(data), rtol=rtol, atol=0
     )
     specials = torch.tensor([0.0, -0.0, math.inf, -math.inf, math.nan], dtype=dtype)
-    got = torch.asinh(specials.to(mojo_gpu)).cpu()
+    got = op(specials.to(mojo_gpu)).cpu()
     torch.testing.assert_close(got, torch.asinh(specials), equal_nan=True)
     assert torch.signbit(got[:4]).tolist() == [False, True, False, True]
+
+
+def test_asinh_wide_matches_cuda_bits(mojo_gpu: str):
+    """float32 asinh past 2**21 elements takes the 8-lane route."""
+    accelerator = list(get_accelerators())[int(mojo_gpu.rsplit(":", 1)[-1])]
+    if accelerator.api != "cuda":
+        pytest.skip("the recorded bits are CUDA's libdevice results")
+    x = _bits_inputs("float32")
+    reps = (1 << 21) // len(x) + 1
+    got = torch.asinh(x.repeat(reps).to(mojo_gpu)).cpu().view(torch.int32)
+    want = torch.frombuffer(
+        bytearray(base64.b64decode(_unary_cuda()["asinh/float32"])), dtype=torch.int32
+    )
+    assert torch.equal(got, want.repeat(reps))
 
 
 @pytest.mark.parametrize("shape", [(), (0,), (3, 5)])

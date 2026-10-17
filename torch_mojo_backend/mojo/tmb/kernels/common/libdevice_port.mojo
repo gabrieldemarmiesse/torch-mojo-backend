@@ -24,8 +24,8 @@
 # Cephes *single-precision* polynomial evaluated in double (3e-9 relative off
 # on MI300A; log1p, which calls it, 1e-6), where this port is within an ulp.
 # The routines that depend on an NVIDIA hardware approximation for their result
-# (nv_expf, nv_tanf, nv_fast_sincosf, nv_asinhf, nv_asinh) fall back to std.math
-# off NVIDIA and are NOT bit-exact there.
+# (nv_expf, nv_tanf, nv_fast_sincosf) fall back to std.math off NVIDIA and
+# are NOT bit-exact there; nv_asinhf / nv_asinh are NVIDIA or host (libm) only.
 # ===----------------------------------------------------------------------=== #
 
 from std.bit import count_leading_zeros
@@ -1160,8 +1160,9 @@ def _rsqrt_approx_ftz_d(x: Float64) -> Float64:
 
 @always_inline
 def nv_asinhf(a: Float32) -> Float32:
-    """`__nv_asinhf` (libdevice_ir/__nv_asinhf.ll). NVIDIA only: lg2.approx
-    and rcp.approx.ftz; std.math elsewhere."""
+    """`__nv_asinhf` (libdevice_ir/__nv_asinhf.ll). NVIDIA (lg2.approx,
+    rcp.approx.ftz) or host (libm) only."""
+    comptime assert is_nvidia_gpu() or not is_gpu(), "NVIDIA or host only"
     comptime if not is_nvidia_gpu():
         return _std_asinh(a)
     var x = _fabs_f(a)
@@ -1185,7 +1186,8 @@ def nv_asinhf(a: Float32) -> Float32:
 @always_inline
 def nv_asinh(a: Float64) -> Float64:
     """`__nv_asinh` (libdevice_ir/__nv_asinh.ll), with its inlined __nv_log
-    and __nv_log1p. NVIDIA only: rsqrt.approx.ftz; std.math elsewhere."""
+    and __nv_log1p. NVIDIA (rsqrt.approx.ftz) or host (libm) only."""
+    comptime assert is_nvidia_gpu() or not is_gpu(), "NVIDIA or host only"
     comptime if not is_nvidia_gpu():
         return _std_asinh(a)
     var ahi = _hi(a) & Int32(0x7FFFFFFF)

@@ -319,7 +319,26 @@ def _o_add[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def _o_sub[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
-    return _o_add(a, -b)
+    comptime if is_amd_gpu() and dt == DType.float32:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "v_sub_f32 $0, $1, $2",
+                Float32,
+                constraints="=v,v,v",
+                has_side_effect=False,
+            ](rebind[Float32](a), rebind[Float32](b))
+        )
+    elif is_amd_gpu():
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "v_add_f64 $0, $1, -$2",
+                Float64,
+                constraints="=v,v,v",
+                has_side_effect=False,
+            ](rebind[Float64](a), rebind[Float64](b))
+        )
+    else:
+        return a - b
 
 
 @always_inline
@@ -349,15 +368,15 @@ def _o_mul[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def _ep_rcp[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """MATH_FAST_RCP: v_rcp_f32; v_rcp_f64 and two Newton steps."""
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](_fast_rcp(rebind[Float32](x)))
     comptime if not is_amd_gpu():
         return Scalar[dt](1.0) / x
     var r = llvm_intrinsic[
         "llvm.amdgcn.rcp", Scalar[dt], has_side_effect=False
     ](x)
-    comptime if dt == DType.float64:
-        r = fma(fma(-x, r, Scalar[dt](1.0)), r, r)
-        r = fma(fma(-x, r, Scalar[dt](1.0)), r, r)
-    return r
+    r = fma(fma(-x, r, Scalar[dt](1.0)), r, r)
+    return fma(fma(-x, r, Scalar[dt](1.0)), r, r)
 
 
 @always_inline
@@ -373,12 +392,10 @@ def _ep_div[dt: DType](x: Scalar[dt], y: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def _ep_sqrt[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """MATH_FAST_SQRT: v_sqrt_f32; in double, v_rsq_f64 refined."""
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](_fast_sqrt(rebind[Float32](x)))
     comptime if not is_amd_gpu():
         return llvm_intrinsic["llvm.sqrt", Scalar[dt], has_side_effect=False](x)
-    comptime if dt == DType.float32:
-        return llvm_intrinsic[
-            "llvm.amdgcn.sqrt", Scalar[dt], has_side_effect=False
-        ](x)
     var y = llvm_intrinsic[
         "llvm.amdgcn.rsq", Scalar[dt], has_side_effect=False
     ](x)
