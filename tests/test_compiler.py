@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 from torch._dynamo import mark_dynamic
 from torch._dynamo.exc import BackendCompilerFailed
+from torch._dynamo.source import ConstantSource
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 # torch.ops is a `_Ops` instance registered into sys.modules at runtime
 # (torch/_ops.py), not a real package on disk, so no static resolver can
@@ -24,6 +26,10 @@ from torch_mojo_backend import (
     mojo_backend,
 )
 from torch_mojo_backend.testing import check_functions_are_equivalent
+from torch_mojo_backend.torch_compile_backend.compiler import (
+    BaseMaxCompiler,
+    MojoCompilerError,
+)
 
 
 def test_basic_training(device: str):
@@ -613,6 +619,63 @@ def test_symint_scalar_arithmetic(device: str):
         check_functions_are_equivalent(fn, device, [x], fn_compiled=fn_compiled)
 
 
+@pytest.mark.parametrize(
+    ("fn", "scalars"),
+    [
+        pytest.param(lambda x, s: x * s, [2, 3, -5], id="int"),
+        pytest.param(lambda x, s: x * s, [0.5, 0.25, -1.5], id="float"),
+        pytest.param(lambda x, s: x.view(s, -1), [2, 3, 4], id="view"),
+        pytest.param(lambda x, s: x[s:], [1, 2, 3], id="slice_start"),
+        pytest.param(lambda x, s: (x > 5) * s, [2, 3, -4], id="bool_tensor"),
+    ],
+)
+def test_scalar_arg_changes_between_calls(device: str, fn, scalars):
+    """#664: from the second value on, the scalar is a graph input (a SymInt,
+    or a 0-d CPU tensor for a float), and later values reuse that graph."""
+    counter = mojo_backendCallCount(mojo_backend)
+    fn_compiled = torch.compile(backend=counter)(fn)
+    x = torch.arange(12.0).to(device)
+    for s in scalars:
+        torch.testing.assert_close(fn_compiled(x, s), fn(x, s))
+    assert counter.call_count == 2
+
+
+def _graph_scaling_by(value: object) -> torch.fx.GraphModule:
+    """`x * s` for a placeholder `s` whose traced value is `value`."""
+    graph = torch.fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["val"] = torch.arange(4.0)
+    s = graph.placeholder("s")
+    s.meta["val"] = value
+    out = graph.call_function(aten.mul.Tensor, (x, s))
+    out.meta["val"] = torch.arange(4.0)
+    graph.output((out,))
+    return torch.fx.GraphModule(torch.nn.Module(), graph)
+
+
+def test_specialized_symint_input_is_a_constant():
+    """A SymInt input a guard pinned to one value becomes a graph constant."""
+    env = ShapeEnv()
+    s = env.create_symintnode(env.create_symbol(3, ConstantSource("s")), hint=3)
+    assert bool(s == 3)  # guards the symbol to 3
+    assert s.node.expr.is_number
+    compiled = BaseMaxCompiler(_graph_scaling_by(s), [])
+    (out,) = compiled(torch.arange(4.0), 3)
+    torch.testing.assert_close(out, torch.arange(4.0) * 3)
+
+
+@pytest.mark.parametrize("kind", ["SymFloat", "SymBool"])
+def test_symfloat_symbool_inputs_are_rejected(kind: str):
+    env = ShapeEnv()
+    value = (
+        env.create_unbacked_symfloat()
+        if kind == "SymFloat"
+        else env.create_unbacked_symbool()
+    )
+    with pytest.raises(MojoCompilerError, match=f"is a {kind}"):
+        BaseMaxCompiler(_graph_scaling_by(value), [])
+
+
 def test_sdpa_with_attention_mask(device: str):
     """An explicit float mask makes cuda pick the mem-efficient sdpa overload."""
 
@@ -718,7 +781,7 @@ def _regrow_between_forward_and_backward(
     return x.grad
 
 
-def check_saved_input_survives_storage_regrow(device: str):
+def check_saved_input_survives_storage_regrow(device: str, dynamic: bool):
     """The forward returns the weight it saves for backward. It must be the
     input itself, as in eager, not a second tensor over its address."""
     torch.manual_seed(0)
@@ -730,15 +793,16 @@ def check_saved_input_survives_storage_regrow(device: str):
     def fn(m: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
         return m(x).square().sum()
 
-    compiled = torch.compile(fn, backend=mojo_backend)
+    compiled = torch.compile(fn, backend=mojo_backend, dynamic=dynamic)
     grad = _regrow_between_forward_and_backward(compiled, lin, x.to(device))
     expected = _regrow_between_forward_and_backward(fn, ref, x)
     torch.testing.assert_close(grad.cpu(), expected, rtol=1e-2, atol=1e-3)
 
 
-def test_compiled_saved_input_survives_storage_regrow(device: str):
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_compiled_saved_input_survives_storage_regrow(device: str, dynamic: bool):
     require_cuda_autograd(device)
-    check_saved_input_survives_storage_regrow(device)
+    check_saved_input_survives_storage_regrow(device, dynamic)
 
 
 def test_bitwise_and_0d_operand(device: str):

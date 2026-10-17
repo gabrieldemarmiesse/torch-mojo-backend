@@ -1,34 +1,44 @@
 import datetime as dt
 import functools
+import itertools
 import operator
 import time
 import traceback
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import max.driver
 import max.graph.value
 import numpy as np
+import sympy
 import torch
 from functorch.compile import make_boxed_func
 from max import engine
+from max.dtype import DType
+from max.experimental.tensor import Tensor as MaxEagerTensor
 from max.experimental.torch.torch import torch_dtype_to_max
-from max.graph import DeviceRef, Graph, KernelLibrary, ops as max_ops
+from max.graph import DeviceRef, Dim, Graph, KernelLibrary, TensorValue, ops as max_ops
 from torch._dynamo.backends.common import aot_autograd
+from torch._guards import TracingContext
 from torch._subclasses.fake_tensor import unset_fake_temporarily
+from torch.fx.experimental.symbolic_shapes import statically_known_true, sym_eq
 from torch.multiprocessing.reductions import StorageWeakRef
+from torch.utils._sympy.functions import FloorDiv, Mod, PythonMod
 
 from torch_mojo_backend import native
 from torch_mojo_backend.aten_functions import (
     CURRENT_ARG_RESOLVER,
+    CURRENT_CPU_SCALARS,
     CURRENT_FX_NODE,
+    CURRENT_SYMINT_RESOLVER,
     DECOMPOSITION_TABLE,
     GRAPH_SEEDED_OPS,
     MAPPING_TORCH_ATEN_TO_MOJO,
+    _transfer_to,
     torch_device_to_max_device,
 )
 from torch_mojo_backend.flags import profiling_enabled, verbose_enabled
@@ -174,6 +184,79 @@ class OutputBlueprintKind(Enum):
     NONE = 1
     TENSOR = 2
     DIM = 3
+    # A view of a graph input, rebuilt from that input (see _InputView).
+    INPUT_VIEW = 4
+
+
+class GraphInputKind(Enum):
+    """How a runtime argument becomes a MAX graph input.
+
+    MAX graph inputs are tensors only, and a symbolic dimension only exists
+    as part of one, so a SymInt argument (dynamo's automatic-dynamic int) is
+    fed as an empty uint8 "carrier" tensor whose shape holds it. SIZE is a
+    SymInt the traced guards keep non-negative: carrier `[s, 0]`, Dim `s`.
+    SIGNED may be negative: carrier `[pos, neg_a, neg_b, 0]`, Dim
+    `pos - neg_a - neg_b` (two halves, so -2**63 fits), a value but never a
+    size.
+    """
+
+    TENSOR = 1
+    SIZE = 2
+    SIGNED = 3
+
+
+SymExpr = sympy.Expr | int
+
+
+@dataclass(frozen=True)
+class _InputView:
+    """A graph output that is the graph input `arg_index` (`identity`) or a
+    view of it, returned as such, as in eager.
+
+    MAX returns fresh buffers. AOT autograd rebuilds an output aliasing an
+    input from that input with `as_strided` at the output's own storage
+    offset when the view has symbolic inputs, and saves the outputs a backward
+    reads (parameters, typically), which FSDP2 frees and regrows in between
+    (`resize_(0)`): both need the real input. A view's size, stride and offset
+    (relative to the input's) are the traced ones.
+    """
+
+    arg_index: int
+    size: tuple[SymExpr, ...] = ()
+    stride: tuple[SymExpr, ...] = ()
+    offset: SymExpr = 0
+    identity: bool = False
+
+
+def _sym_expr(value: torch.SymInt | int) -> SymExpr:
+    return value.node.expr if isinstance(value, torch.SymInt) else value
+
+
+def _sympy_to_dim(
+    expr: sympy.Basic | int, symbols: dict[sympy.Symbol, Dim]
+) -> Dim | int:
+    """A SymInt's sympy expression as a MAX Dim over the graph's symbols."""
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    if isinstance(expr, sympy.Symbol):
+        if expr not in symbols:
+            raise NotImplementedError(f"symbol {expr} is not bound to a graph input")
+        return symbols[expr]
+    if isinstance(expr, sympy.Pow) and expr.exp.is_Integer and int(expr.exp) > 0:
+        base = _sympy_to_dim(expr.base, symbols)
+        return functools.reduce(operator.mul, [base] * int(expr.exp))
+    args = [_sympy_to_dim(a, symbols) for a in expr.args]
+    if isinstance(expr, sympy.Add):
+        return functools.reduce(operator.add, args)
+    if isinstance(expr, sympy.Mul):
+        return functools.reduce(operator.mul, args)
+    if isinstance(expr, FloorDiv):  # CleanDiv included
+        return args[0] // args[1]
+    if isinstance(expr, PythonMod | Mod):
+        return args[0] - args[0] // args[1] * args[1]
+    raise NotImplementedError(f"{expr} has no MAX Dim equivalent")
 
 
 class _GraphFactory:
@@ -181,6 +264,9 @@ class _GraphFactory:
         self,
         replace_inputs: dict[str, torch.Tensor] = {},
         force_device: DeviceRef | None = None,
+        input_views: bool = False,
+        mutated_inputs: dict[int, int] | None = None,
+        user_outputs: range | None = None,
     ):
         """Creates the MAX graph according to the input fx graph.
 
@@ -193,9 +279,48 @@ class _GraphFactory:
                 also a nicer UX for inference.
             force_device (DeviceRef | None): If provided, forces all graph inputs and constants
                 to be on this device.
+            input_views (bool): Leave the outputs that are a graph input or a view
+                of one out of the graph, as INPUT_VIEW blueprint entries the
+                caller rebuilds from its arguments (BaseMaxCompiler does).
+            mutated_inputs (dict): Output position -> argument index of the
+                input whose new value that output is (AOT autograd copies it
+                back): a view of that value is a view of the input.
+            user_outputs (range | None): The positions of the outputs AOT
+                autograd hands the user (None: all); only those may alias an
+                input whose data the graph mutates, since the copy-back would
+                bump a saved tensor's version under backward.
         """
         self.names_to_input_idx: dict[str, int] = {}
-        self.shape_names_to_input_dim: dict[str, tuple[str, int]] = {}
+        # (kind, argument index) of each runtime-fed graph input, in order;
+        # the seed and collective handles come after them.
+        self.input_plan: list[tuple[GraphInputKind, int]] = []
+        self._n_placeholders = 0
+        # (node name, argument index, value) of each symbolic SymInt input.
+        self._symint_placeholders: list[tuple[str, int, torch.SymInt]] = []
+        # The tensor input (node name, dim) a symbol is a dimension of.
+        self._dim_sources: dict[sympy.Symbol, tuple[str, int]] = {}
+        # The carrier (kind, graph input index) of a symbol no tensor holds.
+        self._carriers: dict[sympy.Symbol, tuple[GraphInputKind, int]] = {}
+        # Each symbol as a MAX Dim of the graph (set by initialize_graph).
+        self.symbol_dims: dict[sympy.Symbol, Dim] = {}
+        # Where a symbol's value is at runtime: (argument index, dim of that
+        # tensor argument, or None for an int argument).
+        self.symbol_args: dict[sympy.Symbol, tuple[int, int | None]] = {}
+        # The tensor inputs by (fake) storage: an output on one is a view.
+        self._input_storages: dict[StorageWeakRef, tuple[int, torch.Tensor]] = {}
+        self.rebuild_input_views = input_views
+        self.mutated_inputs = mutated_inputs or {}
+        self.user_outputs = user_outputs
+        # The inputs whose data the graph mutates (a new value is an output).
+        self._data_mutated: set[int] = set()
+        # The tensor inputs' traced values, by argument index and by name.
+        self._input_vals: dict[int, torch.Tensor] = {}
+        self._input_args: dict[str, int] = {}
+        # The outputs holding a mutated input's new value.
+        self._new_values: set[torch.fx.Node] = set()
+        # Tensor input name -> {dim: expression} for dims traced as expressions.
+        self._expression_dims: dict[str, dict[int, sympy.Expr]] = {}
+        self.input_views: list[_InputView] = []
         self.graph_inputs: list[max.graph.value.TensorType] = []
         self.graph: Graph | None = None
         # Whether the graph context manager is currently entered. MAX ties the
@@ -205,8 +330,6 @@ class _GraphFactory:
         # context". We track this to guarantee the graph is always exited.
         self._graph_open = False
         self.tensor_book = TensorsBook()
-        # Link the shape expressions (names) to the node names
-        self.expression_to_node_name: dict[str, str] = {}
         self.replace_inputs = replace_inputs
         self.force_device = force_device
         # Whether the graph takes one trailing uint64 seed input (a random op
@@ -220,6 +343,7 @@ class _GraphFactory:
         if self.graph is not None:
             raise RuntimeError("Graph has already been initialized.")
 
+        self._add_symint_carriers()
         if self.takes_seed:
             self.graph_inputs.append(max_ops.random.SeedType(DeviceRef.CPU()))
         n_handles = 0
@@ -244,10 +368,33 @@ class _GraphFactory:
         # Let's fill the tensor book
         for tensor_name, idx in self.names_to_input_idx.items():
             self.tensor_book[tensor_name] = self.graph.inputs[idx]
-        for shape_name, (tensor_name, dim_idx) in self.shape_names_to_input_dim.items():
-            self.tensor_book[shape_name] = self.tensor_book.tensors[tensor_name].shape[
-                dim_idx
-            ]
+        for symbol, (tensor_name, dim_idx) in self._dim_sources.items():
+            tensor = self.graph.inputs[self.names_to_input_idx[tensor_name]].tensor
+            self.symbol_dims[symbol] = tensor.shape[dim_idx]
+        for symbol, (kind, idx) in self._carriers.items():
+            shape = self.graph.inputs[idx].tensor.shape
+            self.symbol_dims[symbol] = (
+                shape[0]
+                if kind is GraphInputKind.SIZE
+                else shape[0] - shape[1] - shape[2]
+            )
+        for name, _, value in self._symint_placeholders:
+            try:
+                self.tensor_book[name] = self.symint_to_dim(value)
+            except NotImplementedError as e:
+                raise MojoCompilerError(f"Graph input {name} ({value}): {e}") from e
+        for name, dims in self._expression_dims.items():
+            tensor = self.graph.inputs[self.names_to_input_idx[name]].tensor
+            try:
+                shape = [
+                    _sympy_to_dim(dims[i], self.symbol_dims) if i in dims else d
+                    for i, d in enumerate(tensor.shape)
+                ]
+            except NotImplementedError:
+                continue  # its symbols reach the graph no other way: opaque
+            self.tensor_book[name] = max_ops.rebind(
+                tensor, shape, message=f"input {name} of shape {shape}"
+            )
         for input_name, tensor in self.replace_inputs.items():
             self.tensor_book[input_name] = max_ops.constant(
                 tensor,
@@ -261,7 +408,36 @@ class _GraphFactory:
         # torch_device_to_max_device also handles the eager "mojo" device.
         return torch_device_to_max_device(tensor.device)
 
+    def symint_to_dim(self, value: torch.SymInt | int) -> Dim | int:
+        """A SymInt of the traced graph as a MAX Dim (NotImplementedError when
+        its expression has no Dim equivalent)."""
+        return _sympy_to_dim(_sym_expr(value), self.symbol_dims)
+
+    def _add_symint_carriers(self):
+        """A carrier input for each SymInt input symbol no tensor input has as
+        a dimension. An input that guards made an expression of other
+        symbols (`b == 2 * a`) needs none."""
+        for _, arg_index, value in self._symint_placeholders:
+            expr = value.node.expr
+            if not isinstance(expr, sympy.Symbol) or (
+                expr in self._dim_sources or expr in self._carriers
+            ):
+                continue
+            if value.node.shape_env.bound_sympy(expr).lower >= 0:
+                kind = GraphInputKind.SIZE
+                shape: list[str | int] = [str(expr), 0]
+            else:
+                kind = GraphInputKind.SIGNED
+                shape = [f"{expr}_pos", f"{expr}_neg_a", f"{expr}_neg_b", 0]
+            self.graph_inputs.append(
+                max.graph.value.TensorType(DType.uint8, shape, DeviceRef.CPU())
+            )
+            self.input_plan.append((kind, arg_index))
+            self._carriers[expr] = (kind, len(self.graph_inputs) - 1)
+
     def handle_placeholder(self, node: torch.fx.Node):
+        arg_index = self._n_placeholders
+        self._n_placeholders += 1
         if node.name in self.replace_inputs:
             # We short-circuit this input and use a constant instead.
             # We still have to place it in the graph inputs list because
@@ -271,20 +447,37 @@ class _GraphFactory:
             # in the graph.
             return
 
-        if "example_value" in node.meta:
-            example_value = node.meta["example_value"]
-        elif "val" in node.meta:
-            example_value = node.meta["val"]
+        example_value = node.meta.get("example_value", node.meta.get("val"))
         if isinstance(example_value, torch.SymInt):
-            self.expression_to_node_name[example_value.node.expr.name] = node.name
+            expr = example_value.node.expr
+            if expr.is_number:
+                # A guard specialized it: the graph is only valid for this value.
+                self.tensor_book[node.name] = int(expr)
+                return
+            if isinstance(expr, sympy.Symbol):
+                self.symbol_args.setdefault(expr, (arg_index, None))
+            self._symint_placeholders.append((node.name, arg_index, example_value))
+            return
+        if isinstance(example_value, torch.SymFloat | torch.SymBool):
+            # dynamo passes floats as 0-d tensors and specializes bools
+            raise MojoCompilerError(
+                f"Graph input {node.name} is a {type(example_value).__name__}, "
+                "which the MAX graph backend does not support."
+            )
         if isinstance(example_value, torch.Tensor | torch.nn.Parameter):
             shape = []
             for dim_idx, dim in enumerate(example_value.shape):
                 if isinstance(dim, torch.SymInt):
-                    shape.append(str(dim))
-                    self.shape_names_to_input_dim[
-                        self.expression_to_node_name[str(dim)]
-                    ] = (node.name, dim_idx)
+                    expr = dim.node.expr
+                    if isinstance(expr, sympy.Symbol):
+                        shape.append(str(expr))
+                        self._dim_sources.setdefault(expr, (node.name, dim_idx))
+                        self.symbol_args.setdefault(expr, (arg_index, dim_idx))
+                    else:
+                        # `2*s0 + 1` is no valid MAX dim name: a fresh one,
+                        # rebound to the expression once the graph is open.
+                        shape.append(f"{node.name}_dim{dim_idx}")
+                        self._expression_dims.setdefault(node.name, {})[dim_idx] = expr
                 elif isinstance(dim, int):
                     shape.append(dim)
                 else:
@@ -299,8 +492,91 @@ class _GraphFactory:
                 )
             )
             self.names_to_input_idx[node.name] = len(self.graph_inputs) - 1
+            self.input_plan.append((GraphInputKind.TENSOR, arg_index))
+            self._input_vals[arg_index] = example_value
+            self._input_args[node.name] = arg_index
+            if example_value.layout == torch.strided:
+                self._input_storages.setdefault(
+                    StorageWeakRef(example_value.untyped_storage()),
+                    (arg_index, example_value),
+                )
+
+    def _register_new_values(self, output_args: list[torch.fx.Node]):
+        """A mutated input's new value stands for the input: AOT autograd
+        copies it in, then rebuilds the outputs aliasing the input from it."""
+        for position, arg_index in self.mutated_inputs.items():
+            node = output_args[position]
+            new = node.meta.get("val") if isinstance(node, torch.fx.Node) else None
+            old = self._input_vals.get(arg_index)
+            if (
+                not isinstance(new, torch.Tensor)
+                or old is None
+                or new.layout != torch.strided
+                or new.dtype != old.dtype
+                or not statically_known_true(sym_eq(new.shape, old.shape))
+                or not statically_known_true(sym_eq(new.stride(), old.stride()))
+            ):
+                continue
+            storage = StorageWeakRef(new.untyped_storage())
+            if storage not in self._input_storages:  # else a metadata mutation
+                self._input_storages[storage] = (arg_index, new)
+                self._new_values.add(node)
+                self._data_mutated.add(arg_index)
+
+    def _input_view(self, node: torch.fx.Node, position: int) -> _InputView | None:
+        """The output at `position` as a graph input or a view of one, when it
+        is and may be returned as such."""
+        if not self.rebuild_input_views or node in self._new_values:
+            return None
+        user = self.user_outputs is None or position in self.user_outputs
+
+        def allowed(arg_index: int) -> bool:
+            return user or arg_index not in self._data_mutated
+
+        if node.op == "placeholder":
+            arg_index = self._input_args.get(node.name)
+            if arg_index is None or not allowed(arg_index):
+                return None
+            return _InputView(arg_index, identity=True)
+        val = node.meta.get("val")
+        if not isinstance(val, torch.Tensor) or val.layout != torch.strided:
+            return None
+        base = self._input_storages.get(StorageWeakRef(val.untyped_storage()))
+        if base is None or base[1].dtype != val.dtype or not allowed(base[0]):
+            return None
+        arg_index, base_val = base
+        view = _InputView(
+            arg_index,
+            tuple(_sym_expr(d) for d in val.shape),
+            tuple(_sym_expr(d) for d in val.stride()),
+            _sym_expr(val.storage_offset() - base_val.storage_offset()),
+        )
+        free: set[sympy.Basic] = set()
+        for e in (*view.size, *view.stride, view.offset):
+            if isinstance(e, sympy.Expr):
+                free |= e.free_symbols
+        return view if free <= self.symbol_args.keys() else None
+
+    def _accelerator_of(self, node: torch.fx.Node) -> DeviceRef | None:
+        """The accelerator `node`'s op computes on, if it computes on one."""
+        out = node.meta.get("val")
+        if isinstance(out, list | tuple):
+            out = next((v for v in out if isinstance(v, torch.Tensor)), None)
+        if not isinstance(out, torch.Tensor) or out.device.type == "cpu":
+            return None
+        device = self.get_max_device(out)
+        return None if device == DeviceRef.CPU() else device
 
     def handle_call_function(self, node_idx: int, node: torch.fx.Node):
+        val = node.meta.get("val")
+        if isinstance(val, torch.SymInt):
+            # Integer arithmetic on SymInts (`s % 3`, `s + 2`): the traced
+            # expression over the graph's symbols says what it computes.
+            try:
+                self.tensor_book[node.name] = self.symint_to_dim(val)
+                return
+            except NotImplementedError:
+                pass  # e.g. an unbacked `item()`: lower the op itself
         func_args = [self.tensor_book.convert_to_max(x) for x in node.args]
         func_kwargs = {
             k: self.tensor_book.convert_to_max(v) for k, v in node.kwargs.items()
@@ -333,6 +609,22 @@ class _GraphFactory:
         if key is not operator.getitem:
             func_args = [wait(a) for a in func_args]
             func_kwargs = {k: wait(v) for k, v in func_kwargs.items()}
+            device = self._accelerator_of(node)
+            if device is not None:
+                func_args = [_cpu_scalar_to(a, device) for a in func_args]
+                func_kwargs = {
+                    k: _cpu_scalar_to(v, device) for k, v in func_kwargs.items()
+                }
+        cpu_scalars = frozenset(
+            itertools.chain(
+                _cpu_scalar_ids(node.args, func_args),
+                *(
+                    _cpu_scalar_ids(node.kwargs[k], v)
+                    for k, v in func_kwargs.items()
+                    if k in node.kwargs
+                ),
+            )
+        )
         if key in START_OPS:
             # scan() found this node, so the graph has its collectives
             assert self.collectives is not None
@@ -364,9 +656,13 @@ class _GraphFactory:
             mapping_func = MAPPING_TORCH_ATEN_TO_MOJO[key]
             token = CURRENT_FX_NODE.set(node)
             resolver_token = CURRENT_ARG_RESOLVER.set(self.tensor_book.convert_to_max)
+            symint_token = CURRENT_SYMINT_RESOLVER.set(self.symint_to_dim)
+            scalars_token = CURRENT_CPU_SCALARS.set(cpu_scalars)
             try:
                 func_output = mapping_func(*func_args, **func_kwargs)
             finally:
+                CURRENT_CPU_SCALARS.reset(scalars_token)
+                CURRENT_SYMINT_RESOLVER.reset(symint_token)
                 CURRENT_ARG_RESOLVER.reset(resolver_token)
                 CURRENT_FX_NODE.reset(token)
         except Exception as e:
@@ -435,7 +731,17 @@ class _GraphFactory:
         # (aot_autograd graphs always produce a flat tuple).
         output_args = node.args[0]
         assert isinstance(output_args, list | tuple)
-        for x in output_args:
+        self._register_new_values(list(output_args))
+        for position, x in enumerate(output_args):
+            view = (
+                self._input_view(x, position) if isinstance(x, torch.fx.Node) else None
+            )
+            if view is not None:
+                output_blueprint.append(
+                    (OutputBlueprintKind.INPUT_VIEW, len(self.input_views))
+                )
+                self.input_views.append(view)
+                continue
             # A collective nothing waited for still completes inside the graph.
             converted = wait(self.tensor_book.convert_to_max(x))
             if converted is None:
@@ -504,6 +810,36 @@ class _GraphFactory:
         # self.graph is set.
         assert self.graph is not None
         return self.graph, output_blueprint
+
+
+_T = TypeVar("_T")
+
+
+def _cpu_scalar_ids(arg: object, value: object) -> Iterator[int]:
+    """The ids of the converted operands (`value`, lists walked alongside the
+    fx argument `arg`) traced as 0-d CPU tensors."""
+    if isinstance(arg, list | tuple) and isinstance(value, list | tuple):
+        for a, v in zip(arg, value, strict=False):
+            yield from _cpu_scalar_ids(a, v)
+        return
+    val = arg.meta.get("val") if isinstance(arg, torch.fx.Node) else None
+    if isinstance(val, torch.Tensor) and val.ndim == 0 and val.device.type == "cpu":
+        yield id(value)
+
+
+def _cpu_scalar_to(value: _T, device: DeviceRef) -> _T:
+    """A 0-d CPU tensor operand moved to the accelerator its op computes on,
+    as torch allows; MAX ops take operands on one device. Dynamo passes a
+    float argument as one (torch/fx/passes/_tensorify_python_scalars.py)."""
+    if isinstance(value, list | tuple):
+        return type(value)(_cpu_scalar_to(v, device) for v in value)
+    if (
+        isinstance(value, TensorValue | MaxEagerTensor)
+        and value.rank == 0
+        and value.type.device == DeviceRef.CPU()
+    ):
+        return _transfer_to(value, device)
+    return value
 
 
 def _graph_uses_mojo_device(
@@ -598,6 +934,7 @@ class BaseMaxCompiler:
         gm: torch.fx.GraphModule,
         example_inputs: list[object],
         mode: str | None = None,
+        backward: bool = False,
     ):
         self.gm = gm
         self.mojo_outputs = _graph_uses_mojo_device(gm, example_inputs)
@@ -608,14 +945,26 @@ class BaseMaxCompiler:
             gather_stats_on_graph(gm)
             gm.graph.print_tabular()
 
-        factory = _GraphFactory()
+        mutated_inputs, user_outputs = (
+            ({}, None) if backward else _aot_forward_outputs()
+        )
+        factory = _GraphFactory(
+            input_views=True, mutated_inputs=mutated_inputs, user_outputs=user_outputs
+        )
         graph, self.output_blueprint = factory.create_graph(gm.graph)
         self.takes_seed = factory.takes_seed
+        self.input_plan = factory.input_plan
+        self.tensor_inputs_only = all(
+            kind is GraphInputKind.TENSOR for kind, _ in self.input_plan
+        )
+        self.input_views = factory.input_views
+        self.symbolic_views = any(
+            isinstance(e, sympy.Expr)
+            for v in self.input_views
+            for e in (*v.size, *v.stride, v.offset)
+        )
+        self.symbol_args = factory.symbol_args
         self.collectives = factory.collectives
-        # Returned as torch tensors over the inputs, as in eager: AOTAutograd
-        # saves these (parameters, typically) for backward, and FSDP2 frees
-        # and regrows a parameter's storage in between (`resize_(0)`).
-        self.input_aliases = _outputs_aliasing_inputs(gm.graph, self.output_blueprint)
         try:
             self.waited_inputs = waited_inputs(gm.graph)
         except CollectiveLoweringError as e:
@@ -636,10 +985,44 @@ class BaseMaxCompiler:
             )
             print(f"Compiling the Max graph in {compiling}")
 
+    def _symbol_values(
+        self, args: tuple["GraphValue", ...]
+    ) -> dict[sympy.Symbol, sympy.Integer]:
+        env: dict[sympy.Symbol, sympy.Integer] = {}
+        for symbol, (i, dim) in self.symbol_args.items():
+            arg = args[i]
+            if dim is not None:
+                assert isinstance(arg, torch.Tensor)
+                env[symbol] = sympy.Integer(arg.shape[dim])
+            else:
+                assert isinstance(arg, int)
+                env[symbol] = sympy.Integer(arg)
+        return env
+
+    def _input_view(
+        self,
+        view: _InputView,
+        args: tuple["GraphValue", ...],
+        env: dict[sympy.Symbol, sympy.Integer],
+    ) -> torch.Tensor:
+        base = args[view.arg_index]
+        assert isinstance(base, torch.Tensor)
+        if view.identity:
+            return base
+        values = [
+            int(e.xreplace(env)) if isinstance(e, sympy.Expr) else e
+            for e in (*view.size, *view.stride, view.offset)
+        ]
+        rank = len(view.size)
+        return base.as_strided(
+            values[:rank], values[rank : 2 * rank], base.storage_offset() + values[-1]
+        )
+
     def reconstruct_from_blueprint(
-        self, max_ouptputs: list[torch.Tensor]
+        self, max_ouptputs: list[torch.Tensor], args: tuple["GraphValue", ...]
     ) -> list[torch.Tensor | int | float | None]:
         result: list[torch.Tensor | int | float | None] = []
+        env = self._symbol_values(args) if self.symbolic_views else {}
         for kind, index in self.output_blueprint:
             if kind is OutputBlueprintKind.NONE:
                 result.append(None)
@@ -649,9 +1032,12 @@ class BaseMaxCompiler:
             elif kind is OutputBlueprintKind.DIM:
                 assert index is not None
                 result.append(max_ouptputs[index].item())
+            elif kind is OutputBlueprintKind.INPUT_VIEW:
+                assert index is not None
+                result.append(self._input_view(self.input_views[index], args, env))
         return result
 
-    def __call__(self, *args: object) -> list[torch.Tensor | int | float | None]:
+    def __call__(self, *args: "GraphValue") -> list[torch.Tensor | int | float | None]:
         # Detach tensors to avoid gradient tracking issues with DLpack
         if profiling_enabled():
             start_inference_time = time.time_ns()
@@ -660,9 +1046,12 @@ class BaseMaxCompiler:
             # the wait the graph traced, done here, orders the current stream
             # (and so the graph, see fast_from_dlpack) after it.
             torch.ops._c10d_functional.wait_tensor(args[i])
-        input_tensors = [
-            _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
-        ]
+        if self.tensor_inputs_only:
+            input_tensors = [
+                _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
+            ]
+        else:
+            input_tensors = [_graph_input(kind, args[i]) for kind, i in self.input_plan]
         if self.takes_seed:
             input_tensors.append(graph_seed())
         if self.collectives is not None:
@@ -679,11 +1068,6 @@ class BaseMaxCompiler:
                         "the process group. " + "; ".join(failed)
                     )
             raise
-        views = {
-            i: view
-            for i, alias in self.input_aliases.items()
-            if (view := alias.of(args, outputs[i])) is not None
-        }
         if self.mojo_outputs:
             # The graph computes on the mojo device: adopt the MAX output
             # buffers zero-copy as eager mojo tensors (DIM outputs become
@@ -694,22 +1078,17 @@ class BaseMaxCompiler:
                 if kind is OutputBlueprintKind.DIM
             }
             tensor_outputs = [
-                views[i]
-                if i in views
-                else _dim_buffer_to_cpu_tensor(x)
+                _dim_buffer_to_cpu_tensor(x)
                 if i in dim_indices
                 else _mojo_tensor_from_buffer(x)
                 for i, x in enumerate(outputs)
             ]
         else:
-            tensor_outputs = [
-                views[i] if i in views else torch.from_dlpack(x)
-                for i, x in enumerate(outputs)
-            ]
+            tensor_outputs = [torch.from_dlpack(x) for x in outputs]
 
         debug.debug_graph_if_required(self.gm, args)
 
-        result = self.reconstruct_from_blueprint(tensor_outputs)
+        result = self.reconstruct_from_blueprint(tensor_outputs, args)
 
         if profiling_enabled():
             end_inference_time = time.time_ns()
@@ -718,102 +1097,6 @@ class BaseMaxCompiler:
             )
             print(f"Running the Max graph in {inference_duration}")
         return result
-
-
-@dataclass(frozen=True)
-class _InputAlias:
-    """A tensor output torch traced as argument `position` itself, or as
-    `as_strided(size, stride, offset)` of it (`offset` relative to the
-    argument's own; `size` None when symbolic)."""
-
-    position: int
-    identity: bool
-    size: tuple[int, ...] | None = None
-    stride: tuple[int, ...] = ()
-    offset: int = 0
-
-    def of(
-        self, args: tuple[object, ...], buffer: max.driver.Buffer
-    ) -> torch.Tensor | None:
-        arg = args[self.position]
-        assert isinstance(arg, torch.Tensor)
-        if self.identity:
-            return arg
-        if self.size is not None:
-            return arg.as_strided(
-                self.size, self.stride, arg.storage_offset() + self.offset
-            )
-        return _view_of_input(arg, buffer)
-
-
-def _static(values: tuple[object, ...]) -> tuple[int, ...] | None:
-    if all(isinstance(v, int) for v in values):
-        return cast("tuple[int, ...]", values)
-    return None
-
-
-def _outputs_aliasing_inputs(
-    graph: torch.fx.Graph, blueprint: list[tuple[OutputBlueprintKind, int | None]]
-) -> dict[int, _InputAlias]:
-    """MAX output index -> the input it is, or is a view of (sharing its
-    storage, same dtype), as torch traced it."""
-    inputs: dict[StorageWeakRef, tuple[int, torch.Tensor]] = {}
-    positions: dict[torch.fx.Node, int] = {}
-    output_args: list[object] = []
-    for node in graph.nodes:
-        if node.op == "placeholder":
-            positions[node] = len(positions)
-            val = node.meta.get("val")
-            if isinstance(val, torch.Tensor):
-                inputs.setdefault(
-                    StorageWeakRef(val.untyped_storage()), (positions[node], val)
-                )
-        elif node.op == "output":
-            output_args = list(node.args[0])
-    aliases: dict[int, _InputAlias] = {}
-    for x, (kind, index) in zip(output_args, blueprint, strict=True):
-        if kind is not OutputBlueprintKind.TENSOR or not isinstance(x, torch.fx.Node):
-            continue
-        assert index is not None
-        val = x.meta.get("val")
-        if not isinstance(val, torch.Tensor):
-            continue
-        if x.op == "placeholder":
-            aliases[index] = _InputAlias(positions[x], identity=True)
-            continue
-        found = inputs.get(StorageWeakRef(val.untyped_storage()))
-        if found is None or found[1].dtype != val.dtype:
-            continue
-        position, base = found
-        size, stride = _static(tuple(val.size())), _static(tuple(val.stride()))
-        offsets = _static((val.storage_offset(), base.storage_offset()))
-        if size is None or stride is None or offsets is None:
-            aliases[index] = _InputAlias(position, identity=False)
-        else:
-            aliases[index] = _InputAlias(
-                position, False, size, stride, offsets[0] - offsets[1]
-            )
-    return aliases
-
-
-def _view_of_input(arg: torch.Tensor, buffer: max.driver.Buffer) -> torch.Tensor | None:
-    """`buffer` as a torch view of `arg` when MAX returned `arg`'s own memory
-    (a tensor over the same address alone would not share `arg`'s storage)."""
-    if not arg.is_contiguous():
-        return None
-    offset = buffer._data_ptr() - arg.data_ptr()
-    itemsize = arg.element_size()
-    numel = buffer.num_elements
-    if (
-        buffer.element_size != itemsize
-        or offset < 0
-        or offset % itemsize
-        or offset // itemsize + numel > arg.numel()
-    ):
-        return None
-    shape = tuple(buffer.shape)
-    start = offset // itemsize
-    return arg.view(-1)[start : start + numel].view(shape)
 
 
 def graph_seed() -> max.driver.Buffer:
@@ -839,14 +1122,20 @@ def _evict_buffer(tensor_id: int, /):
     _buffer_cache.pop(tensor_id, None)
 
 
+# MAX's kernels load a buffer with vector accesses of up to 16 bytes from
+# its start: a view at an odd offset (`x[1:]`, or a MAX output that is a
+# slice of another, saved for backward) faults with a misaligned address.
+_MAX_INPUT_ALIGNMENT = 16
+
+
 def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
-    if not t.is_contiguous():
-        # A MAX Buffer is dense row-major, and the graph input type only
-        # carries a shape, so a strided input has to be materialized. The
-        # copy is a fresh allocation on every call and is deliberately NOT
+    if not t.is_contiguous() or t.data_ptr() % _MAX_INPUT_ALIGNMENT:
+        # A MAX Buffer is dense row-major and aligned, and the graph input
+        # type only carries a shape, so such an input has to be materialized.
+        # The copy is a fresh allocation on every call and is deliberately NOT
         # cached: the cache exists to alias input memory so that in-place
         # updates stay visible, which a frozen copy could not honor.
-        return fast_from_dlpack(t.detach().contiguous())
+        return fast_from_dlpack(t.detach().clone(memory_format=torch.contiguous_format))
 
     key = id(t)
     entry = _buffer_cache.get(key)
@@ -863,16 +1152,59 @@ def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
 GraphValue = torch.Tensor | int | float | None
 
 
+def _graph_input(kind: GraphInputKind, arg: GraphValue) -> max.driver.Buffer:
+    if kind is GraphInputKind.TENSOR:
+        assert isinstance(arg, torch.Tensor)
+        return _cached_buffer_for(arg)
+    assert isinstance(arg, int)
+    if kind is GraphInputKind.SIZE:
+        return _symint_carrier((arg, 0))
+    if arg >= 0:
+        return _symint_carrier((arg, 0, 0, 0))
+    neg = -arg
+    return _symint_carrier((0, neg - neg // 2, neg // 2, 0))
+
+
+@functools.lru_cache(maxsize=1024)
+def _symint_carrier(shape: tuple[int, ...]) -> max.driver.Buffer:
+    """An empty buffer whose shape feeds a SymInt to the graph
+    (GraphInputKind)."""
+    return max.driver.Buffer(shape=shape, dtype=DType.uint8)
+
+
 def boxed_func(
     gm: torch.fx.GraphModule, example_inputs: list[object], mode: str | None = None
 ) -> Callable[[list[GraphValue]], list[GraphValue]]:
     return make_boxed_func(BaseMaxCompiler(gm, example_inputs, mode).__call__)
 
 
+def boxed_backward_func(
+    gm: torch.fx.GraphModule, example_inputs: list[object]
+) -> Callable[[list[GraphValue]], list[GraphValue]]:
+    return make_boxed_func(BaseMaxCompiler(gm, example_inputs, backward=True).__call__)
+
+
+def _aot_forward_outputs() -> tuple[dict[int, int], range | None]:
+    """For the forward graph AOT autograd is compiling, which outputs are the
+    mutated inputs' new values (output position -> argument index; AOT's
+    forward returns them first) and which the user's (next)."""
+    context = TracingContext.try_get()
+    meta = context.fw_metadata if context is not None else None
+    if meta is None or meta.tokens:
+        return {}, None
+    n_mutated = meta.num_mutated_inp_runtime_indices
+    return (
+        dict(enumerate(meta.mutated_inp_runtime_indices)),
+        range(n_mutated, n_mutated + len(meta.output_info)),
+    )
+
+
 class mojo_backend:
     def __init__(self, gm: torch.fx.GraphModule, example_inputs: list[object]):
         self.func_to_execute = aot_autograd(
-            fw_compiler=boxed_func, decompositions=DECOMPOSITION_TABLE
+            fw_compiler=boxed_func,
+            bw_compiler=boxed_backward_func,
+            decompositions=DECOMPOSITION_TABLE,
         )(gm, example_inputs)
 
     def __call__(self, *args: object) -> list[torch.Tensor | int | float | None]:

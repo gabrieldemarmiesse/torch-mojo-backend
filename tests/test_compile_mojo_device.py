@@ -8,13 +8,14 @@ eager mojo kernels instead.
 
 import ctypes
 import gc
+from collections.abc import Callable
 
 import max.driver
 import pytest
 import torch
 
 from tests.test_compiler import check_saved_input_survives_storage_regrow
-from torch_mojo_backend import mojo_backend, register_mojo_devices
+from torch_mojo_backend import aten_functions, mojo_backend, register_mojo_devices
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.torch_compile_backend import compiler
 
@@ -277,6 +278,499 @@ def test_compile_symint_arithmetic(mojo_device):
         assert_close_cpu(compiled(x), fn(x.cpu()))
 
 
+def _ar(n: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    return torch.arange(n, dtype=dtype)
+
+
+# name: (fn, per-call args with CPU tensors, mark dim 0 of the first tensor
+# dynamic, compiles: the first value's static graph, then one for the rest)
+SCALAR_ARG_CASES: dict[
+    str, tuple[Callable[..., torch.Tensor], list[tuple[object, ...]], bool, int]
+] = {
+    "int": (lambda x, s: x * s, [(_ar(4), 2), (_ar(4), 3), (_ar(4), -5)], False, 2),
+    "int_int32_tensor": (
+        lambda x, s: x * s + s,
+        [(_ar(4, torch.int32), 2), (_ar(4, torch.int32), 3), (_ar(4, torch.int32), -7)],
+        False,
+        2,
+    ),
+    "float": (
+        lambda x, s: x * s,
+        [(_ar(4), 0.5), (_ar(4), 0.25), (_ar(4), -1.5)],
+        False,
+        2,
+    ),
+    "several": (
+        lambda x, a, b, c: x * a + b - c,
+        [(_ar(4), 2, 3, 0.5), (_ar(4), 4, 5, 0.25), (_ar(4), -1, 7, 2.0)],
+        False,
+        2,
+    ),
+    # dynamo specializes the bool: one more graph for False
+    "int_and_bool": (
+        lambda x, s, b: x * s if b else x - s,
+        [(_ar(4), 2, True), (_ar(4), 3, True), (_ar(4), 4, False), (_ar(4), 5, False)],
+        False,
+        3,
+    ),
+    "symint_expression": (
+        lambda x, s: x * (s * 2 + 1),
+        [(_ar(4), 2), (_ar(4), 3), (_ar(4), -3)],
+        False,
+        2,
+    ),
+    "symint_mod": (
+        lambda x, s: x * (s % 3),
+        [(_ar(4), 2), (_ar(4), 4), (_ar(4), -5), (_ar(4), -7)],
+        False,
+        2,
+    ),
+    # the guard `b == 2 * a` makes b an expression of a's symbol
+    "guard_replaced_symint": (
+        lambda x, a, b: x * a + b if b == 2 * a else x - a,
+        [(_ar(4), 1, 2), (_ar(4), 2, 4), (_ar(4), 3, 6)],
+        False,
+        2,
+    ),
+    "int64_extremes": (
+        lambda x, s: x + s,
+        [
+            (_ar(3, torch.int64) * 0, 2),
+            (_ar(3, torch.int64) * 0, 3),
+            (_ar(3, torch.int64) * 0, -(2**63)),
+            (_ar(3, torch.int64) * 0, 2**63 - 1),
+        ],
+        False,
+        2,
+    ),
+    # a SymInt promotes like a Python int: bool -> int64, int8/uint8/fp16 stay
+    "bool_tensor": (
+        lambda x, s: x * s,
+        [(_ar(4) % 2 == 0, 2), (_ar(4) % 2 == 0, 3), (_ar(4) % 2 == 0, -4)],
+        False,
+        2,
+    ),
+    "int8_tensor": (
+        lambda x, s: x * s,
+        [(_ar(4, torch.int8), 2), (_ar(4, torch.int8), 3), (_ar(4, torch.int8), -4)],
+        False,
+        2,
+    ),
+    "uint8_tensor": (
+        lambda x, s: x * s,
+        [(_ar(4, torch.uint8), 2), (_ar(4, torch.uint8), 3), (_ar(4, torch.uint8), 5)],
+        False,
+        2,
+    ),
+    "fp16_tensor": (
+        lambda x, s: x * s,
+        [
+            (_ar(4, torch.float16), 2),
+            (_ar(4, torch.float16), 3),
+            (_ar(4, torch.float16), -4),
+        ],
+        False,
+        2,
+    ),
+    "view": (
+        lambda x, s: x.view(s, -1),
+        [(_ar(12), 2), (_ar(12), 3), (_ar(12), 4)],
+        False,
+        2,
+    ),
+    "view_mul": (
+        lambda x, s: x.view(s, -1) * 2,
+        [(_ar(12), 2), (_ar(12), 3), (_ar(12), 4)],
+        False,
+        2,
+    ),
+    "ones": (
+        lambda x, s: x.sum() + torch.ones(s, device=x.device),
+        [(_ar(4), 2), (_ar(4), 3), (_ar(4), 5)],
+        False,
+        2,
+    ),
+    "slice_end": (
+        lambda x, s: x[:s],
+        [(_ar(4), 2), (_ar(4), 3), (_ar(4), 4)],
+        False,
+        2,
+    ),
+    "slice_end_negative": (
+        lambda x, s: x[:s],
+        [(_ar(5), -1), (_ar(5), -2), (_ar(5), -3)],
+        False,
+        2,
+    ),
+    "slice_end_past_size": (
+        lambda x, s: x[:s] * 1,
+        [(_ar(4), 10), (_ar(4), 11), (_ar(4), 12)],
+        False,
+        2,
+    ),
+    "slice_start_past_size": (
+        lambda x, s: x[s:] * 1,
+        [(_ar(4), -10), (_ar(4), -11), (_ar(4), -12)],
+        False,
+        2,
+    ),
+    # a returned view of an input: AOT autograd rebuilds it from the input
+    # with the output's own offset, so the output must be the real view
+    "slice_start": (
+        lambda x, s: x[s:],
+        [(_ar(5), 1), (_ar(5), 2), (_ar(5), 3)],
+        False,
+        2,
+    ),
+    "slice_start_negative": (
+        lambda x, s: x[s:],
+        [(_ar(5), -1), (_ar(5), -2), (_ar(5), -3)],
+        False,
+        2,
+    ),
+    "slice_start_mul": (
+        lambda x, s: x[s:] * 1,
+        [(_ar(5), 1), (_ar(5), 2), (_ar(5), 3)],
+        False,
+        2,
+    ),
+    "slice_start_negative_mul": (
+        lambda x, s: x[s:] * 1,
+        [(_ar(5), -1), (_ar(5), -2), (_ar(5), -3)],
+        False,
+        2,
+    ),
+    "slice_columns": (
+        lambda x, s: x[:, s:],
+        [(_ar(18).view(3, 6), 1), (_ar(18).view(3, 6), 2), (_ar(18).view(3, 6), 3)],
+        False,
+        2,
+    ),
+    "narrow": (
+        lambda x, s: x.narrow(0, s, 2),
+        [(_ar(5), 1), (_ar(5), 2), (_ar(5), 3)],
+        False,
+        2,
+    ),
+    "narrow_mul": (
+        lambda x, s: x.narrow(0, s, 2) * 1,
+        [(_ar(5), 1), (_ar(5), 2), (_ar(5), 3)],
+        False,
+        2,
+    ),
+    "mark_dynamic": (
+        lambda x, s: x * s + x.shape[0],
+        [(_ar(5), 2), (_ar(6), 3), (_ar(7), -4)],
+        True,
+        2,
+    ),
+    "mark_dynamic_slice": (
+        lambda x, s: x[:s] * s,
+        [(_ar(5), 2), (_ar(6), 3), (_ar(7), 4)],
+        True,
+        2,
+    ),
+    "mark_dynamic_slice_start": (
+        lambda x, s: x[s:],
+        [(_ar(5), 1), (_ar(6), 2), (_ar(7), 3)],
+        True,
+        2,
+    ),
+    "mark_dynamic_half": (
+        lambda x: x[x.shape[0] // 2 :],
+        [(_ar(5),), (_ar(6),), (_ar(7),)],
+        True,
+        1,
+    ),
+    "mark_dynamic_half_mul": (
+        lambda x: x[x.shape[0] // 2 :] * 1,
+        [(_ar(5),), (_ar(6),), (_ar(7),)],
+        True,
+        1,
+    ),
+    "mark_dynamic_narrow": (
+        lambda x: x.narrow(0, x.shape[0] - 2, 2),
+        [(_ar(5),), (_ar(6),), (_ar(7),)],
+        True,
+        1,
+    ),
+}
+
+
+@pytest.mark.parametrize("case", SCALAR_ARG_CASES)
+def test_compile_scalar_args_change_between_calls(mojo_device, case):
+    """#664: once a python scalar argument changes, dynamo passes an int as a
+    SymInt graph input and a float as a 0-d CPU tensor. Each must give the
+    right result, and later values must reuse that graph."""
+    fn, calls, dynamic, expected_compiles = SCALAR_ARG_CASES[case]
+    compiles = []
+
+    def counting_backend(gm, example_inputs):
+        compiles.append(gm)
+        return mojo_backend(gm, example_inputs)
+
+    compiled = torch.compile(fn, backend=counting_backend, fullgraph=True)
+    for args in calls:
+        device_args = [
+            a.to(mojo_device) if isinstance(a, torch.Tensor) else a for a in args
+        ]
+        if dynamic:
+            torch._dynamo.mark_dynamic(device_args[0], 0)
+        out = compiled(*device_args)
+        ref = fn(*args)
+        assert out.dtype == ref.dtype
+        torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+    assert len(compiles) == expected_compiles
+
+
+@pytest.mark.parametrize("op", ["mul", "add"])
+def test_compile_cpu_0d_tensor_does_not_promote(mojo_device, op):
+    """A 0-d CPU tensor joins a mojo tensor's op as torch allows, and only
+    promotes across categories: fp32 times a float64 0-d tensor is fp32."""
+
+    def fn(x, t):
+        return getattr(torch, op)(x, t)
+
+    x = torch.arange(4.0)
+    t = torch.tensor(0.5, dtype=torch.float64)
+    out = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x.to(mojo_device), t)
+    assert_close_cpu(out, fn(x, t))
+
+
+def _add_then_view(x: torch.Tensor, s: int) -> torch.Tensor:
+    x.add_(1)
+    return x[s:]
+
+
+def _view_then_mul(x: torch.Tensor, s: int) -> torch.Tensor:
+    y = x[s:]
+    x.mul_(2)
+    return y
+
+
+@pytest.mark.parametrize("fn", [_add_then_view, _view_then_mul])
+def test_compile_view_of_mutated_input(mojo_device, fn):
+    """A returned view of an input the graph mutates: AOT autograd copies the
+    new value into the input, then rebuilds the view from the input with the
+    output's own metadata, so the output must be the real view of it."""
+    compiles = []
+
+    def counting_backend(gm, example_inputs):
+        compiles.append(gm)
+        return mojo_backend(gm, example_inputs)
+
+    compiled = torch.compile(fn, backend=counting_backend, fullgraph=True)
+    for s in (1, 2, 3):
+        x = torch.arange(5.0)
+        x_dev = x.to(mojo_device)
+        out = compiled(x_dev, s)
+        expected = fn(x, s)
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(x_dev.cpu(), x, rtol=0, atol=0)
+        assert out.untyped_storage().data_ptr() == x_dev.untyped_storage().data_ptr()
+    assert len(compiles) == 2
+
+
+def test_compile_half_times_wide_cpu_scalar_uses_opmath(mojo_device):
+    """fp16 times a 0-d fp32 CPU tensor is fp16, computed in fp32 as CUDA's
+    opmath kernels do: 2**-10 * 2**16 is 64, not 2**-10 * fp16(inf)."""
+    x = torch.full((4,), 2**-10, dtype=torch.float16)
+    t = torch.tensor(2.0**16)
+    out = torch.compile(lambda x, t: x * t, backend=mojo_backend, fullgraph=True)(
+        x.to(mojo_device), t
+    )
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out.cpu(), torch.full((4,), 64.0, dtype=torch.float16))
+
+
+@pytest.mark.parametrize("op", ["mul", "add", "sub"])
+def test_compile_bf16_with_changing_float_rounds_once(mojo_device, op):
+    """A changing float reaches the graph as a 0-d fp32 tensor; the bf16
+    result is computed in fp32 and rounded once, as CUDA's opmath kernels
+    do (stock CUDA matches bit-exactly; CPU eager, which rounds the scalar
+    to bf16 first for add and sub, does not)."""
+    fn = getattr(torch, op)
+    x = torch.linspace(-3, 3, 64).to(torch.bfloat16)
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    for s in (0.5, 0.3, 0.7, 1.1):
+        expected = fn(x.float(), torch.tensor(s, dtype=torch.float32)).bfloat16()
+        out = compiled(x.to(mojo_device), s)
+        assert out.dtype == torch.bfloat16
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+_HALF = [torch.float16, torch.bfloat16]
+
+
+@pytest.mark.parametrize("dtype", _HALF, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("scalar_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("op", ["mul", "add"])
+def test_compile_half_with_0d_device_tensor_rounds_it_first(
+    mojo_device, dtype, scalar_dtype, op
+):
+    """A 0-d *device* tensor is an ordinary operand on CUDA: rounded to the
+    result dtype first, unlike a CPU scalar (stock CUDA matches bit-exactly)."""
+    fn = getattr(torch, op)
+    a = (torch.arange(1, 257, dtype=torch.float64) * 0.0137 + 0.3).to(dtype)
+    t = torch.tensor(0.3, dtype=scalar_dtype)
+    out = torch.compile(fn, backend=mojo_backend, fullgraph=True)(
+        a.to(mojo_device), t.to(mojo_device)
+    )
+    expected = fn(a.float(), t.to(dtype).float()).to(dtype)
+    assert out.dtype == dtype
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_compile_foreach_half_times_cpu_scalar_uses_opmath(mojo_device):
+    """A CPU scalar inside a foreach list computes in opmath too: 64, not inf."""
+
+    def fn(x, s):
+        return torch._foreach_mul([x], [s])[0]
+
+    x = torch.full((4,), 2**-10, dtype=torch.float16)
+    s = torch.tensor(2.0**16)
+    out = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x.to(mojo_device), s)
+    assert out.dtype == torch.float16
+    torch.testing.assert_close(out.cpu(), torch.full((4,), 64.0, dtype=torch.float16))
+
+
+def test_compile_cpu_scalar_kwarg_uses_opmath(mojo_device):
+    """A CPU scalar passed by keyword (`mul.Tensor(x, other=t)`) computes in
+    opmath too. Core-ATen traces pass it positionally, so the node is built
+    by hand."""
+    x = torch.full((4,), 2**-10, dtype=torch.float16).to(mojo_device)
+    t = torch.tensor(2.0**16)
+    graph = torch.fx.Graph()
+    x_node = graph.placeholder("x")
+    x_node.meta["val"] = x
+    t_node = graph.placeholder("t")
+    t_node.meta["val"] = t
+    out = graph.call_function(torch.ops.aten.mul.Tensor, (x_node,), {"other": t_node})
+    out.meta["val"] = torch.empty_like(x)
+    graph.output((out,))
+    gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+    (result,) = compiler.BaseMaxCompiler(gm, [x, t])(x, t)
+    assert isinstance(result, torch.Tensor)
+    assert result.dtype == torch.float16
+    torch.testing.assert_close(
+        result.cpu(), torch.full((4,), 64.0, dtype=torch.float16)
+    )
+
+
+@pytest.mark.parametrize("dtype", _HALF, ids=["fp16", "bf16"])
+@pytest.mark.parametrize("op", ["add", "sub"])
+@pytest.mark.parametrize("alpha", [0.3, -0.01])
+def test_compile_half_add_alpha_rounds_once(mojo_device, dtype, op, alpha):
+    """`a + alpha * b` on half tensors (SGD's `p.add_(g, alpha=-lr)`) is
+    computed in float32 and rounded once, as CUDA's add kernel (stock CUDA
+    matches bit-exactly)."""
+    fn = getattr(torch, op)
+    a = (torch.arange(1, 257, dtype=torch.float64) * 0.0137 + 0.3).to(dtype)
+    b = (torch.arange(256, dtype=torch.float64) * 0.071 - 4.1).to(dtype)
+    out = torch.compile(
+        lambda a, b: fn(a, b, alpha=alpha), backend=mojo_backend, fullgraph=True
+    )(a.to(mojo_device), b.to(mojo_device))
+    # one float32 rounding of `a + alpha * b` (a fused multiply-add), then one
+    # to the half dtype
+    alpha32 = torch.tensor(alpha if op == "add" else -alpha).double()
+    expected = (a.double() + alpha32 * b.double()).float().to(dtype)
+    assert out.dtype == dtype
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def _mutate_then_slice(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    x.add_(1)
+    return (x[1:] * w).sum()
+
+
+def _mutate_then_transpose(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    x.add_(1)
+    return (x.t() * w).sum()
+
+
+def _mutate_then_flatten(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    x.mul_(2)
+    return (x.view(-1) * w).sum()
+
+
+@pytest.mark.parametrize(
+    ("fn", "x_shape", "w_shape"),
+    [
+        (_mutate_then_slice, (5,), (4,)),
+        (_mutate_then_transpose, (2, 3), (3, 2)),
+        (_mutate_then_flatten, (2, 3), (6,)),
+    ],
+    ids=["slice", "transpose", "flatten"],
+)
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_compile_training_saves_view_of_mutated_input(
+    mojo_device, fn, x_shape, w_shape, dynamic
+):
+    """A training graph that mutates a buffer and saves a view of its new
+    value for backward: the saved tensor stays the graph's own result, which
+    AOT autograd's copy into the buffer must not touch (eager saves the view
+    after the in-place op)."""
+    torch.manual_seed(0)
+    x = torch.randn(x_shape)
+    w = torch.randn(w_shape)
+    x_dev = x.to(mojo_device)
+    w_dev = w.to(mojo_device).requires_grad_()
+    w.requires_grad_()
+    compiled = torch.compile(fn, backend=mojo_backend, dynamic=dynamic)
+    compiled(x_dev, w_dev).backward()
+    fn(x, w).backward()
+    assert w_dev.grad is not None and w.grad is not None
+    torch.testing.assert_close(w_dev.grad.cpu(), w.grad)
+    torch.testing.assert_close(x_dev.cpu(), x)
+
+
+def test_compile_misaligned_input(mojo_device):
+    """An input viewed at an odd offset (here 4 bytes in) is copied to an
+    aligned buffer: MAX's vector loads fault on it otherwise."""
+
+    def fn(x, y):
+        return x * 2 + y
+
+    base = torch.arange(9.0)
+    y = torch.arange(8.0)
+    out = torch.compile(fn, backend=mojo_backend, fullgraph=True)(
+        base.to(mojo_device)[1:], y.to(mojo_device)
+    )
+    assert_close_cpu(out, fn(base[1:], y))
+
+
+def test_compile_backward_of_expression_sized_input(mojo_device):
+    """The backward of `cat([a, b])` gets a tangent sized `2*s0 + 1`: no
+    valid MAX dim name, so a fresh one rebound to the expression."""
+
+    def fn(a, b):
+        return (torch.cat([a, b]).unsqueeze(0) * 2).square().sum()
+
+    compiled = torch.compile(fn, backend=mojo_backend)
+    for n in (3, 4, 5):
+        a, b = torch.randn(n), torch.randn(n + 1)
+        a_dev = a.to(mojo_device).requires_grad_()
+        b_dev = b.to(mojo_device).requires_grad_()
+        compiled(a_dev, b_dev).backward()
+        a.requires_grad_()
+        b.requires_grad_()
+        fn(a, b).backward()
+        assert a_dev.grad is not None and b_dev.grad is not None
+        torch.testing.assert_close(a_dev.grad.cpu(), a.grad)
+        torch.testing.assert_close(b_dev.grad.cpu(), b.grad)
+
+
+def test_compile_prims_convert_element_type(mojo_device, call_checker):
+    call_checker.register(aten_functions.prims_convert_element_type)
+
+    def fn(x):
+        return torch.ops.prims.convert_element_type(x, torch.float16)
+
+    x = torch.randn(3, 4)
+    out = torch.compile(fn, backend=mojo_backend, fullgraph=True)(x.to(mojo_device))
+    assert_close_cpu(out, fn(x))
+
+
 def test_compile_factory_function(mojo_device):
     def fn(x, device):
         return x + torch.ones(4, 8, device=device)
@@ -317,8 +811,9 @@ def test_compile_backward(mojo_device):
     torch.testing.assert_close(w.grad.cpu(), w_cpu.grad, rtol=2e-2, atol=2e-3)
 
 
-def test_compile_saved_input_survives_storage_regrow(mojo_device):
-    check_saved_input_survives_storage_regrow(mojo_device)
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_compile_saved_input_survives_storage_regrow(mojo_device, dynamic):
+    check_saved_input_survives_storage_regrow(mojo_device, dynamic)
 
 
 def test_compile_softmax_backward_produces_a_gradient(mojo_device):
