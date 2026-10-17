@@ -344,7 +344,11 @@ communicators and does the actual library calls.
     too (a process-wide table, `group_enter`/`group_exit`): a collective of
     group B issued inside group A's `ncclGroupStart` is folded with the
     rest and committed by the outermost `ncclGroupEnd`, never before it is
-    submitted.
+    submitted. The folded entry is per (thread's group level,
+    communicator) (`GroupFold` in watchdog.mojo): one accumulator per
+    communicator let another thread's group commit this thread's calls,
+    leaving its own commit nothing to stamp. A destroyed group's folds
+    leave every open level (`groups_forget`).
   - *The issuer never waits for the GPU.* A thread whose next call is what
     lets the peer progress would deadlock on a full queue
     (`test_two_rank_watchdog_never_blocks_the_issuer`: 900 async
@@ -520,7 +524,8 @@ communicators and does the actual library calls.
       each). A commit the tracker drops (overflow, a fault, a failed
       event) is flagged untracked; the dump takes it as completed once a
       later collective of the same communicator is (one comm stream; a
-      group's other devices prove nothing). Seq ids are ProcessGroupNCCL's,
+      group's other devices prove nothing) -- a folded entry only when it
+      is its own link, i.e. its group was submitted. Seq ids are ProcessGroupNCCL's,
       counted per group in the native core (eager and graph collectives
       share them). Off with the watchdog. `tmb_pg_fr_selftest` checks the
       stamping, lapping, block and tag rules on a private ring.
@@ -530,10 +535,10 @@ communicators and does the actual library calls.
       `watch_commit`). Inside an NCCL group nothing is submitted before the
       thread's outermost `group_end`, so the flight recorder keeps, per
       (thread's group level, communicator), the calls of the torch-level
-      operation in progress (`FrFold` in watchdog.mojo): when it ends --
-      its process group's own `group_end` (`group_fr_mark`), or the next
-      operation folded on that communicator -- its entry is made with its
-      own tag, deferred (`FL_FOLDED`). The commit that submits the group
+      operation in progress (`GroupFold`): when it ends -- its process
+      group's own `group_end` (`group_fr_mark`), the next operation folded
+      on that communicator, or a coalescing block's first member -- its
+      entry is made with its own tag, deferred (`FL_FOLDED`). The commit that submits the group
       links them to the one entry it stamps (`F_LINK`; `fr_link`); the
       dump completes a folded entry with its link and never otherwise, so
       a group not submitted (a failed `group_end`, or one still open while
@@ -587,9 +592,10 @@ communicators and does the actual library calls.
       and the debug pipe, every `TORCH_NCCL_COORD_CHECK_MILSEC`.
     - *Signal state* is per store (TCPStore host/port, FileStore path) and
       incarnation: `mojo_fr/incarnation` holds a nonce the server's first
-      client sets (`compare_set`), read at attach and every poll; a
-      different nonce means a server restarted at that address, and a new
-      state that serves its generations from the first (inferring a
+      client sets (`compare_set`; a store without it gets a constant,
+      losing only restart detection), read at attach and every poll; a
+      different nonce, at either, means a server restarted at that
+      address, and a new state that serves its generations from the first (inferring a
       restart from the generation going down missed one already past the
       old base, and a delayed read faked one). Claims hand back the state
       they were made on (`Claim`), and `finish` changes that state only. A

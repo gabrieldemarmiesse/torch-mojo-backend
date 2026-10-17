@@ -61,9 +61,8 @@ from tmb.backend.watchdog import (
     call_fp,
     group_enter,
     group_exit,
-    group_fr_fold,
+    group_add,
     group_fr_mark,
-    group_note,
     group_open,
     watch_add,
     watch_claim,
@@ -76,7 +75,6 @@ from tmb.backend.watchdog import (
     watch_note,
     watch_exit,
     watch_test_limit,
-    watch_group_add,
     watch_next_cpos,
     watch_process_exiting,
     watch_set_fr,
@@ -265,6 +263,9 @@ struct PG(Movable):
             watch_next_cpos(c.tracker, op),
         )
         if group_open(self.watch, self.f_group_start):
+            # first: an operation before a block's first member is recorded
+            # before the member, as it was issued
+            group_add(self.f_group_start, self.watch, c.tracker, c.raw, e, tag)
             fr_member(
                 self.fr,
                 op,
@@ -275,9 +276,6 @@ struct PG(Movable):
                 c.tracker,
                 tag,
             )
-            group_fr_fold(self.f_group_start, self.watch, c.tracker, e, tag)
-            watch_group_add(c.tracker, e^)
-            group_note(self.f_group_start, self.watch, c.tracker, c.raw)
         else:
             watch_commit(self.watch, c.tracker, c.raw, e^, tag)
 

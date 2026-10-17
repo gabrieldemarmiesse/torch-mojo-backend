@@ -303,7 +303,7 @@ def _empty_entry() -> Entry:
 
 
 struct Tracker(Movable):
-    """One communicator's queue. `g_entry` is the producer's; `hist`,
+    """One communicator's queue. `hist`,
     `reported`, `fault_reported` and `push_failures` the watchdog's."""
 
     var words: WordsP
@@ -314,7 +314,6 @@ struct Tracker(Movable):
     var device: Int
     var handle: Int64
     var ctx: DeviceContext
-    var g_entry: Entry
     var reported: Int
     var fault_reported: Bool
     var published: Bool  # watchdog's: an incident line went out for it
@@ -341,7 +340,6 @@ struct Tracker(Movable):
         self.device = device
         self.handle = handle
         self.ctx = ctx
-        self.g_entry = _empty_entry()
         self.reported = 0
         self.fault_reported = False
         self.published = False
@@ -475,15 +473,22 @@ def _tracker(t: Int) -> TrackerP:
 
 
 @fieldwise_init
-struct FrFold(Copyable, Movable):
-    """The flight recorder's view of one communicator in a thread's open
-    NCCL group: the calls of the torch-level operation in progress (`tag`,
-    0 for a coalescing block's members, whose own entries are made as they
-    come) and the deferred entries already made for it."""
+struct GroupFold(Copyable, Movable):
+    """One communicator in a thread's open NCCL group: its calls, folded
+    into the one entry the outermost ncclGroupEnd commits (`commit`), and
+    the flight recorder's view of them -- the calls of the torch-level
+    operation in progress (`entry`, `tag`; `members` if it holds a
+    coalescing block's members, whose own entries are made as they come)
+    and the deferred entries already made (`rids`). Per thread: another thread's group on
+    the same communicator has its own."""
 
+    var watch: Int
     var tracker: Int
+    var raw: Int
+    var commit: Entry
     var entry: Entry
     var tag: Int
+    var members: Bool
     var rids: List[Int]
 
 
@@ -492,8 +497,7 @@ struct Level(Copyable, Movable):
     var thread: Int
     var lib: Int
     var depth: Int
-    var pending: List[Int]  # (watch, tracker, raw stream) triples
-    var fr: List[FrFold]
+    var folds: List[GroupFold]
 
 
 @fieldwise_init
@@ -559,19 +563,13 @@ def group_enter(lib: Int):
         _groups()[].levels[i].depth += 1
         return
     _groups()[].levels.append(
-        Level(
-            external_call["pthread_self", Int](),
-            lib,
-            1,
-            List[Int](),
-            List[FrFold](),
-        )
+        Level(external_call["pthread_self", Int](), lib, 1, List[GroupFold]())
     )
 
 
 def group_exit(lib: Int, submitted: Bool):
     """The library's ncclGroupEnd returned: at the outermost level, commit
-    every tracker's folded calls (all were submitted just now)."""
+    every communicator's folded calls (all were submitted just now)."""
     var i = _level(_groups(), lib)
     if i < 0:
         return
@@ -579,31 +577,55 @@ def group_exit(lib: Int, submitted: Bool):
     levels[i].depth -= 1
     if levels[i].depth > 0:
         return
-    var pending = levels[i].pending.copy()
-    var folds = levels[i].fr.copy()
+    var folds = levels[i].folds.copy()
     _ = levels.pop(i)
-    for j in range(0, len(pending), 3):
-        var fr = 0
-        if submitted:
-            fr = _fr_submit(pending[j], pending[j + 1], folds)
-        _group_commit(pending[j], pending[j + 1], pending[j + 2], submitted, fr)
+    if not submitted:
+        return  # nothing was enqueued; its deferred entries stay unlinked
+    for k in range(len(folds)):
+        var fr = _fr_submit(folds[k])
+        ref f = folds[k]
+        if f.commit.nops != 0:  # a claimed tracker skips it
+            watch_commit(f.watch, f.tracker, f.raw, f.commit.copy(), fr_rid=fr)
 
 
-def group_note(lib: Int, w: Int, t: Int, raw_stream: Int):
+def _fold_of(mut lv: Level, w: Int, t: Int, raw: Int) -> Int:
+    for k in range(len(lv.folds)):
+        if lv.folds[k].tracker == t:
+            return k
+    lv.folds.append(
+        GroupFold(
+            w, t, raw, _empty_entry(), _empty_entry(), 0, False, List[Int]()
+        )
+    )
+    return len(lv.folds) - 1
+
+
+def group_add(lib: Int, w: Int, t: Int, raw: Int, e: Entry, tag: Int):
+    """A library call inside this thread's NCCL group: nothing is enqueued
+    before the outermost ncclGroupEnd, so it is folded into the entry
+    committed there; for the flight recorder, it is part of the torch-level
+    operation `tag` (a new one ends the previous: its entry is made now)."""
     var g = GroupsP(unsafe_from_address=_watch(w)[].groups)
     var i = _level(g, lib)
     if i < 0:
         return
-    ref pending = g[].levels[i].pending
-    for j in range(0, len(pending), 3):
-        if pending[j + 1] == t:
-            return
-    pending.append(w)
-    pending.append(t)
-    pending.append(raw_stream)
+    ref lv = g[].levels[i]
+    ref f = lv.folds[_fold_of(lv, w, t, raw)]
+    _fold(f.commit, e)
+    if _watch(w)[].fr == 0:
+        return
+    if tag & TAG_MEMBER:
+        if f.entry.nops != 0 and not f.members:  # an op before the block
+            _fr_flush(w, f, f.tag)
+        f.members = True
+    else:
+        if f.entry.nops != 0 and (f.members or f.tag != tag):
+            _fr_flush(w, f, f.tag)
+        f.tag = tag
+    _fold(f.entry, e)
 
 
-def _fr_flush(w: Int, mut f: FrFold, tag: Int):
+def _fr_flush(w: Int, mut f: GroupFold, tag: Int):
     """Make the deferred entry of `f`'s operation (`tag`)."""
     if f.entry.nops == 0:
         return
@@ -623,32 +645,7 @@ def _fr_flush(w: Int, mut f: FrFold, tag: Int):
     )
     f.entry = _empty_entry()
     f.tag = 0
-
-
-def _fr_fold_of(mut lv: Level, t: Int) -> Int:
-    for k in range(len(lv.fr)):
-        if lv.fr[k].tracker == t:
-            return k
-    lv.fr.append(FrFold(t, _empty_entry(), 0, List[Int]()))
-    return len(lv.fr) - 1
-
-
-def group_fr_fold(lib: Int, w: Int, t: Int, e: Entry, tag: Int):
-    """A call folded into this thread's NCCL group: part of the torch-level
-    operation `tag` (a new one ends the previous: its entry is made now)."""
-    if t == 0 or _watch(w)[].fr == 0:
-        return
-    var g = GroupsP(unsafe_from_address=_watch(w)[].groups)
-    var i = _level(g, lib)
-    if i < 0:
-        return
-    ref lv = g[].levels[i]
-    ref f = lv.fr[_fr_fold_of(lv, t)]
-    if tag & TAG_MEMBER == 0:
-        if f.entry.nops != 0 and f.tag != tag:
-            _fr_flush(w, f, f.tag)
-        f.tag = tag
-    _fold(f.entry, e)
+    f.members = False
 
 
 def group_fr_mark(lib: Int, w: Int, t: Int, tag: Int):
@@ -661,39 +658,36 @@ def group_fr_mark(lib: Int, w: Int, t: Int, tag: Int):
     if i < 0:
         return
     ref lv = g[].levels[i]
-    _fr_flush(w, lv.fr[_fr_fold_of(lv, t)], tag)
+    for k in range(len(lv.folds)):
+        if lv.folds[k].tracker == t:
+            _fr_flush(w, lv.folds[k], tag)
 
 
-def _fr_submit(w: Int, t: Int, mut folds: List[FrFold]) -> Int:
-    """The group was submitted: the last deferred entry of tracker `t`
-    is the one its commit stamps, the others complete with it."""
-    if _watch(w)[].fr == 0:
+def _fr_submit(mut f: GroupFold) -> Int:
+    """The group was submitted: its last deferred entry on `f`'s
+    communicator is the one the commit stamps, the others complete with
+    it."""
+    var fp = _watch(f.watch)[].fr
+    if fp == 0:
         return 0
-    for k in range(len(folds)):
-        if folds[k].tracker == t:
-            _fr_flush(w, folds[k], folds[k].tag)
-            ref rids = folds[k].rids
-            if len(rids) == 0:
-                return 0
-            var last = rids[len(rids) - 1]
-            for r in range(len(rids)):
-                fr_link(_watch(w)[].fr, rids[r], last)
-            return last
-    return 0
+    _fr_flush(f.watch, f, f.tag)
+    if len(f.rids) == 0:
+        return 0
+    var last = f.rids[len(f.rids) - 1]
+    for r in range(len(f.rids)):
+        fr_link(fp, f.rids[r], last)
+    return last
 
 
 def groups_forget(w: Int):
-    """A watch going away: drop its trackers from every open group."""
+    """A watch going away: drop its communicators from every open group."""
     ref levels = _groups()[].levels
     for i in range(len(levels)):
-        var kept = List[Int]()
-        ref pending = levels[i].pending
-        for j in range(0, len(pending), 3):
-            if pending[j] != w:
-                kept.append(pending[j])
-                kept.append(pending[j + 1])
-                kept.append(pending[j + 2])
-        levels[i].pending = kept^
+        var kept = List[GroupFold]()
+        for k in range(len(levels[i].folds)):
+            if levels[i].folds[k].watch != w:
+                kept.append(levels[i].folds[k].copy())
+        levels[i].folds = kept^
 
 
 # --- producer side (under the backend mutex) ---------------------------------
@@ -1056,12 +1050,6 @@ def _fr_record(w: Int, t: Int, e: Entry, tag: Int) -> Int:
     )
 
 
-def watch_group_add(t: Int, var e: Entry):
-    """A library call inside an NCCL group: nothing is enqueued before the
-    outermost ncclGroupEnd, so it is folded into one entry committed there."""
-    _fold(_tracker(t)[].g_entry, e)
-
-
 def _fold(mut g: Entry, e: Entry):
     if g.nops == 0:
         g = e.copy()  # a group of one hashes like the call itself
@@ -1080,17 +1068,6 @@ def _fold(mut g: Entry, e: Entry):
     g.nops += e.nops
     g.count += e.count
     g.fp = _mix(_mix(g.fp, Int(e.fp & 0xFFFFFFFF)), Int(e.fp >> 32))
-
-
-def _group_commit(
-    w: Int, t: Int, raw_stream: Int, submitted: Bool, fr_rid: Int
-):
-    ref tr = _tracker(t)[]
-    var g = tr.g_entry.copy()
-    tr.g_entry = _empty_entry()
-    if g.nops != 0 and submitted:
-        # a claimed tracker skips it
-        watch_commit(w, t, raw_stream, g^, fr_rid=fr_rid)
 
 
 def _drain(w: Int, t: Int, deadline_ns: Int) -> Bool:

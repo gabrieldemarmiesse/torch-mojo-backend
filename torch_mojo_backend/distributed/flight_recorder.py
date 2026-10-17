@@ -445,8 +445,8 @@ class Recorder:
         # communicator completing means it did (its comm stream runs in
         # order) -- unless it was folded into an NCCL group, whose
         # submission comes after its record. A folded entry completes with
-        # the entry its group's commit stamped (`link`), and never if that
-        # group was not submitted. A coalescing block's operations, like
+        # the entry its group's commit stamped (`link`, its own for that
+        # one), and never if that group was not submitted. A coalescing block's operations, like
         # ProcessGroupNCCL's, have no completion.
         done: list[int | None] = [e.done_ns for e in entries]
         later: dict[tuple[int, int], int] = {}
@@ -455,7 +455,8 @@ class Recorder:
             if e.flags & FL_MEMBER or not e.comm:
                 continue
             if e.flags & FL_UNTRACKED:
-                if not e.flags & FL_FOLDED:
+                # a folded entry here only once its group was submitted
+                if not e.flags & FL_FOLDED or e.link == e.rid + 1:
                     done[i] = later.get((e.pg, e.comm))
             elif e.done_ns is not None:
                 later[(e.pg, e.comm)] = e.done_ns
@@ -747,7 +748,11 @@ def _poll_backoff_cap() -> float:
 def incarnation(client: Store) -> str:
     """The store server's incarnation: a nonce its first client sets (a
     restarted server has none, so its first client sets a new one)."""
-    return bytes(client.compare_set(INCARNATION_KEY, "", uuid.uuid4().hex)).decode()
+    try:
+        value = client.compare_set(INCARNATION_KEY, "", uuid.uuid4().hex)
+    except Exception:  # a store without compare_set: no restart detection
+        return "fixed"
+    return bytes(value).decode()
 
 
 class _StoreState:
@@ -864,12 +869,16 @@ class _Poller:
                 read = None
         with self.lock:
             state = self.states.get(key)
-            # A state that went (its last group detached meanwhile), or one
-            # of another incarnation of the server at this address.
-            if state is None or (read is not None and state.nonce != read[0]):
+            if state is None:  # new, or it went (its last group detached)
                 self.states[key] = (
                     _StoreState(*read) if read else _StoreState(None, None, False)
                 )
+            elif read is not None and state.nonce is None:
+                self.states[key] = _StoreState(*read)
+            elif read is not None and state.nonce != read[0]:
+                # restarted at this address: as in the poll, its
+                # generations are all new
+                self.states[key] = _StoreState(read[0], 0, False)
             self.groups[group] = (key, base, rank)
             self._pipe(rank)  # before the caller's first collective
 

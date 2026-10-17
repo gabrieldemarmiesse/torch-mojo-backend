@@ -656,6 +656,43 @@ def test_a_restarted_store_is_a_new_incarnation(
     worker.close()
 
 
+def test_attach_to_a_restarted_store_serves_its_first_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A group attached through a fresh connection to a server restarted at
+    the address of a watched store: as in the poll, a new state from
+    generation 0, so the peer's generation 1 signalled before is served."""
+    monkeypatch.setattr(fr, "store_key", lambda _: ("same address",))
+    store = c10d_c.HashStore()
+    poller = _poller(store)
+    key = fr.store_key(store)
+    old = poller.state(key)
+    assert old is not None
+    monkeypatch.setattr(fr, "_RECORDER", [_Fake([_word(0, ALLREDUCE, 1)]).rec])
+    monkeypatch.setenv("TORCH_FR_DUMP_TEMP_FILE", str(tmp_path / "trace_"))
+    restarted = c10d_c.HashStore()
+    gen = fr.signal_dump(restarted, 1)
+    poller.attach(2, restarted, 0)
+    new = poller.state(key)
+    assert new is not None and new is not old and new.nonce != old.nonce
+    assert new.base == 0
+    worker = StoreWorker(restarted, clone=False, quiet=True)
+    _poll(poller, worker, key)
+    assert (tmp_path / "trace_0").exists()
+    assert restarted.check([f"{fr.ACK_KEY}/{gen}/0"])
+    worker.close()
+
+
+def test_a_store_without_compare_set_has_a_constant_incarnation():
+    """Only restart detection is lost: the monitor still reads the store."""
+
+    class NoCompareSet:
+        def compare_set(self, *_: Any) -> bytes:
+            raise RuntimeError("not supported")
+
+    assert fr.incarnation(cast(Any, NoCompareSet())) == "fixed"
+
+
 def test_a_delayed_read_never_resets_the_state():
     """A poll's generation read before a local incident advanced the base:
     the same incarnation, so nothing is reset (an acknowledgement still
@@ -739,7 +776,11 @@ def test_folded_entries_complete_with_their_commit():
     rows[1][fr.F_DONE] = 0
     rows[1][fr.F_FLAGS] |= fr.FL_UNTRACKED  # the commit was dropped
     states = [e["state"] for e in _Fake(rows).rec.dump()["entries"]]
-    assert states == ["scheduled", "scheduled", "scheduled", "completed"]
+    # submitted: the later one on its communicator completes it, and the
+    # entry linked to it with it
+    assert states == ["completed", "completed", "scheduled", "completed"]
+    states = [e["state"] for e in _Fake(rows[:3]).rec.dump()["entries"]]
+    assert states == ["scheduled", "scheduled", "scheduled"]
 
 
 def test_workers_follow_the_store_state(monkeypatch: pytest.MonkeyPatch):

@@ -766,12 +766,51 @@ def _fr_nested_blocks(failures: list[str], t: torch.Tensor):
     dist.destroy_process_group(b)
 
 
-def _fr_deferred_across_threads(failures: list[str], t: torch.Tensor):
+def _fr_ordinary_before_a_block(failures: list[str], t: torch.Tensor):
+    """Inside A's open block, an ordinary B broadcast, then a B block: the
+    broadcast keeps its own entry, seq id, shape and stack (folded into
+    the block's members, it lost them to the block's end)."""
+    world = dist.get_world_size()
+    a = cast(MojoProcessGroup, dist.group.WORLD)
+    b = cast(MojoProcessGroup, dist.new_group(list(range(world))))
+    x, y, z = (torch.ones_like(t) for _ in range(3))
+    a._start_coalescing(t.device)
+    dist.broadcast(y, 0, group=b)
+    b._start_coalescing(t.device)
+    dist.all_reduce(x, group=b)
+    b._end_coalescing(t.device)
+    dist.all_reduce(z, group=a)
+    a._end_coalescing(t.device)
+    torch.accelerator.synchronize()
+    time.sleep(0.5)
+    got = _fr_entries(b.getGroupName())
+    ok = (
+        _fr_summary(got)
+        == [
+            ("broadcast", 1, "completed"),
+            ("all_reduce", 2, "scheduled"),
+            ("coalesced", 2, "completed"),
+        ]
+        and got[0]["input_sizes"] == [list(t.shape)]
+        and any(f["name"] == "_fr_ordinary_before_a_block" for f in got[0]["frames"])  # ty: ignore[not-iterable] -- a list of frame dicts
+    )
+    if not ok:
+        print(
+            f"[rank {dist.get_rank()}] fr.ordinary_before: {_fr_summary(got)}",
+            flush=True,
+        )
+    _check(failures, "fr.ordinary_before_a_block", ok)
+    dist.destroy_process_group(b)
+
+
+def _fr_deferred_across_threads(failures: list[str], t: torch.Tensor, grouped: bool):
     """Thread 1 closes two B blocks inside A's still open block, so neither
-    is submitted; thread 2 then runs a B broadcast to completion. The
-    blocks' entries must stay scheduled -- a later completed entry of
-    another thread proves nothing about work not yet submitted -- and
-    complete once thread 1 closes A."""
+    is submitted; thread 2 then runs a B broadcast (or, `grouped`, an
+    allreduce_coalesced: its own NCCL group on B's communicator) to
+    completion. The blocks' entries must stay scheduled -- a later
+    completed entry of another thread proves nothing about work not yet
+    submitted -- and complete once thread 1 closes A (thread 2's group
+    committing thread 1's calls left A's commit nothing to stamp)."""
     world = dist.get_world_size()
     a = cast(MojoProcessGroup, dist.group.WORLD)
     b = cast(MojoProcessGroup, dist.new_group(list(range(world))))
@@ -783,7 +822,10 @@ def _fr_deferred_across_threads(failures: list[str], t: torch.Tensor):
         b._end_coalescing(t.device)
 
     def other():
-        dist.broadcast(w, 0, group=b)
+        if grouped:
+            dist.all_reduce_coalesced([w, w.clone()], group=b)
+        else:
+            dist.broadcast(w, 0, group=b)
         torch.accelerator.synchronize()
 
     thread = threading.Thread(target=other)
@@ -801,11 +843,12 @@ def _fr_deferred_across_threads(failures: list[str], t: torch.Tensor):
     ok = (
         ends_before == ["scheduled", "scheduled"]
         and ends_after == ["completed", "completed"]
-        and ("broadcast", 3, "completed") in after
+        and ("allreduce_coalesced" if grouped else "broadcast", 3, "completed") in after
     )
+    name = "fr.deferred_across_threads" + ("_grouped" if grouped else "")
     if not ok:
-        print(f"[rank {dist.get_rank()}] fr.deferred: {before} {after}", flush=True)
-    _check(failures, "fr.deferred_across_threads", ok)
+        print(f"[rank {dist.get_rank()}] {name}: {before} {after}", flush=True)
+    _check(failures, name, ok)
     dist.destroy_process_group(b)
 
 
@@ -943,7 +986,9 @@ def run_flight_recorder(failures: list[str]):
         _check(failures, "fr.snapshots_while_the_ring_wraps", _fr_wrap_stress(t, size))
     if size >= 2000:
         _fr_nested_blocks(failures, t)
-        _fr_deferred_across_threads(failures, t)
+        _fr_ordinary_before_a_block(failures, t)
+        _fr_deferred_across_threads(failures, t, grouped=False)
+        _fr_deferred_across_threads(failures, t, grouped=True)
 
 
 def run_fr_subgroup():
