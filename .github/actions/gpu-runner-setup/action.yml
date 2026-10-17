@@ -22,8 +22,12 @@ runs:
         # MAX's graph cache and Mojo's compile cache. Next to the native
         # builds because the runner mounts that directory into every container
         # on the host; the rest of $HOME is per-container, so each container
-        # recompiled the graphs and custom-op kernels the others had already compiled.
-        echo "MODULAR_CACHE_DIR=${MODULAR_CACHE_DIR:-$(dirname "$native")/modular-cache}" >> "$GITHUB_ENV"
+        # recompiled the graphs and custom-op kernels the others had already
+        # compiled. One directory per toolchain: MAX deletes the other
+        # versions' entries when it opens a cache, so a job pinning another
+        # MAX would wipe the cache the other containers are using.
+        toolchain=$(awk '/^name = "(max-core|mojo-compiler)"$/ {n=$3; getline; v=$3; gsub(/"/, "", n); gsub(/"/, "", v); printf "%s%s-%s", sep, n, v; sep="-"}' uv.lock || true)
+        echo "MODULAR_CACHE_DIR=${MODULAR_CACHE_DIR:-$(dirname "$native")/modular-cache/${toolchain:-unknown}}" >> "$GITHUB_ENV"
         echo "TORCH_MOJO_BACKEND_CACHE_DIR=$native" >> "$GITHUB_ENV"
 
     - name: Install uv
