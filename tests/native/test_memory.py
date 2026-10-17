@@ -1603,6 +1603,42 @@ def test_empty_cache_staging_contract(mojo_gpu: str, api_name: str):
     )
 
 
+def test_properties_are_cached_per_device(
+    mojo_gpu: str, monkeypatch: pytest.MonkeyPatch
+):
+    count = device_module.device_count()
+    first = [device_module.get_device_properties(i) for i in range(count)]
+    reads = []
+    real = device_module._read_device_properties
+
+    def counting(idx: int):
+        reads.append(idx)
+        return real(idx)
+
+    monkeypatch.setattr(device_module, "_read_device_properties", counting)
+    monkeypatch.setattr(device_module, "_properties_cache", {})
+    for i in range(count):
+        a = device_module.get_device_properties(i)
+        assert a == first[i]
+        assert device_module.get_device_properties(torch.device("mojo", i)) is a
+        assert device_module.get_device_properties(f"mojo:{i}") is a
+    assert sorted(reads) == list(range(count))
+    with pytest.raises(ValueError, match="Invalid mojo device index"):
+        device_module.get_device_properties(count)
+
+
+def test_properties_fork_while_the_cache_lock_is_held(mojo_device: str):
+    torch.empty(7, device=mojo_device)  # a context, so the child's fork is bad
+    with device_module._properties_lock:
+
+        def child() -> str:
+            with pytest.raises(RuntimeError, match="spawn"):
+                device_module.get_device_properties(mojo_device)
+            return "ok"
+
+        assert _in_forked_child(child) == "ok"
+
+
 def test_properties_and_memory_info(mojo_device: str):
     props = device_module.get_device_properties(mojo_device)
     assert props == device_module.get_device_properties(torch.device(mojo_device))

@@ -8,6 +8,8 @@ surface: device selection, RNG state, synchronize, amp dtypes, memory info.
 from __future__ import annotations
 
 import ctypes
+import os
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Never, TypeAlias
@@ -207,11 +209,39 @@ def _gfx_version(arch: str) -> tuple[int | None, int | None]:
     return int(digits[:-2]), int(digits[-2], 16)
 
 
+_properties_cache: dict[int, MojoDeviceProperties] = {}
+_properties_lock = threading.Lock()
+
+
+def _reset_properties_cache():
+    # A forked child starts empty, so its first read reaches the native
+    # bad-fork check, and with a fresh lock: another parent thread may have
+    # held this one at fork time.
+    global _properties_lock
+    _properties_cache.clear()
+    _properties_lock = threading.Lock()
+
+
+os.register_at_fork(after_in_child=_reset_properties_cache)
+
+
 def get_device_properties(
     device: int | str | torch.device | None = None,
 ) -> MojoDeviceProperties:
-    """Properties cached per device in Mojo."""
+    """Properties of the device, read once per process: like torch.cuda's,
+    the same object comes back every call."""
     idx = _index(device)
+    cached = _properties_cache.get(idx)
+    if cached is not None:
+        return cached
+    with _properties_lock:
+        cached = _properties_cache.get(idx)
+        if cached is None:
+            cached = _properties_cache[idx] = _read_device_properties(idx)
+        return cached
+
+
+def _read_device_properties(idx: int) -> MojoDeviceProperties:
     values = (ctypes.c_int64 * 16)()  # tmb.h TMB_DEVICE_PROPS_SLOTS
     text = ctypes.create_string_buffer(4096)
     fn = native.shim().tmb_device_properties
