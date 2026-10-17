@@ -588,6 +588,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#flight-recorder-dumps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Flight recorder dumps
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#the-first-training-step-takes-minutes" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -825,6 +836,17 @@
     <span class="md-ellipsis">
       
         A run hangs
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#flight-recorder-dumps" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Flight recorder dumps
       
     </span>
   </a>
@@ -1490,6 +1512,41 @@ suit the hardware the library was measured on:</p>
 <td><code>abort</code></td>
 <td>what a collective that outlives the <code>init_process_group</code> timeout does: <code>abort</code> reports and exits, <code>report</code> only reports, <code>off</code> disables the check (<a href="#a-run-hangs">A run hangs</a>)</td>
 </tr>
+<tr>
+<td><code>TORCH_FR_BUFFER_SIZE</code> (or <code>TORCH_NCCL_TRACE_BUFFER_SIZE</code>)</td>
+<td>2000</td>
+<td>collectives the <a href="#flight-recorder-dumps">flight recorder</a> keeps; <code>0</code> turns it off</td>
+</tr>
+<tr>
+<td><code>TORCH_FR_DUMP_TEMP_FILE</code> (or <code>TORCH_NCCL_DEBUG_INFO_TEMP_FILE</code>)</td>
+<td><code>~/.cache/torch/comm_lib_trace_rank_</code></td>
+<td>dump file prefix; the global rank is appended</td>
+</tr>
+<tr>
+<td><code>TORCH_NCCL_DUMP_ON_TIMEOUT</code></td>
+<td>on</td>
+<td><code>0</code>: a timeout doesn't dump</td>
+</tr>
+<tr>
+<td><code>TORCH_NCCL_DEBUG_INFO_PIPE_FILE</code></td>
+<td>unset</td>
+<td>stem of a pipe, <code>&lt;stem&gt;&lt;rank&gt;.pipe</code>; writing to it dumps that rank</td>
+</tr>
+<tr>
+<td><code>TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC</code></td>
+<td>15000</td>
+<td>how long the rank that timed out waits for the others' dumps</td>
+</tr>
+<tr>
+<td><code>TORCH_NCCL_COORD_CHECK_MILSEC</code></td>
+<td>1000</td>
+<td>how often a rank checks whether another one asked for a dump</td>
+</tr>
+<tr>
+<td><code>TORCH_INCLUDE_STACK_TRACE</code>, <code>TORCH_INCLUDE_ONLY_ACTIVE</code></td>
+<td>on, off</td>
+<td>Python stacks / completed collectives in the automatic dumps</td>
+</tr>
 </tbody>
 </table>
 <p><code>register_mojo_devices()</code> warns about any <code>TORCH_MOJO_BACKEND_*</code> or
@@ -1539,7 +1596,8 @@ somewhere else; that's where to look first, and
 <code>py-spy dump --pid &lt;pid&gt;</code> shows where it is. When every rank reports the
 same collective, or the ranks wait in point-to-point transfers (which
 don't compare across ranks), the report says it can't tell why. Every rank has to issue
-the same collectives, in the same order, with the same arguments. Finally
+the same collectives, in the same order, with the same arguments. Every
+rank then dumps its <a href="#flight-recorder-dumps">flight recorder</a>. Finally
 the rank aborts its communicators and exits with status 1, and torchrun
 stops the other workers. A device error on the rank (a faulted kernel) ends
 the run the same way.</p>
@@ -1554,6 +1612,73 @@ when the script ends (Ctrl-C included) gets two seconds to finish, then
 is reported like a timeout; <code>destroy_process_group()</code> waits for this
 rank's collectives but not for its peers. CPU work (<code>barrier</code>, object collectives) goes through gloo,
 which raises after the same timeout.</p>
+<h3 id="flight-recorder-dumps">Flight recorder dumps<a class="headerlink" href="#flight-recorder-dumps" title="Permanent link">&para;</a></h3>
+<p>As with NCCL in stock PyTorch, every process keeps its last 2000 collectives
+in a flight recorder: process group, sequence numbers, operation, shapes,
+dtypes, the Python stack that issued it, and whether it completed. When a
+collective times out, the rank that caught it asks every rank, through the
+c10d store, to write its record to
+<code>~/.cache/torch/comm_lib_trace_rank_&lt;global rank&gt;</code>. It waits up to 15
+seconds for the dumps of the ranks in its process groups, then aborts. A later timeout in the same job (with
+<code>TORCH_MOJO_BACKEND_PG_WATCHDOG=report</code>) dumps every rank again. Then run
+PyTorch's analyzer over the files; it names the collective a rank never
+joined, or the ranks that disagree on one:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>python<span class="w"> </span>-m<span class="w"> </span>torch.distributed.flight_recorder.fr_trace<span class="w"> </span>~/.cache/torch<span class="w"> </span>-p<span class="w"> </span>comm_lib_trace_rank_
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>Not all ranks joining collective, sequence number: 2
+<a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>group info: 1
+<a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a>collective: nccl:all_reduce
+<a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a>missing ranks: {1}
+<a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a>...
+<a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>collective stack trace:
+<a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a> all_reduce at .../torch/distributed/distributed_c10d.py:3068
+<a id="__codelineno-13-8" name="__codelineno-13-8" href="#__codelineno-13-8"></a>...
+</code></pre></div>
+<p>The files are in PyTorch's format, so the same tools read them. The
+environment variables are PyTorch's
+(<a href="#environment-variables">environment variables</a>). To dump while the job
+runs, call PyTorch's own functions:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pickle</span>
+<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>
+<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="n">trace</span> <span class="o">=</span> <span class="n">pickle</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">_C</span><span class="o">.</span><span class="n">_distributed_c10d</span><span class="o">.</span><span class="n">_dump_nccl_trace</span><span class="p">())</span>
+</code></pre></div>
+<p><code>_dump_nccl_trace_json()</code> returns the same dump as JSON, without stacks.
+Both work with the CPU build of torch too. While no process group of this
+backend is alive (none was created, all were destroyed, the watchdog is
+off, or <code>TORCH_FR_BUFFER_SIZE=0</code>), they are PyTorch's own. In a process
+that also runs a NCCL process group, they keep returning PyTorch's dump
+once that group recorded anything: one dump can't hold both backends (the
+analyzer aligns each rank by its first record id), so this backend's
+collectives are in its dump files, written on a timeout or through the
+debug pipe below. A NCCL process group's own timeout dump signal makes
+this backend's ranks dump too. You can also set
+<code>TORCH_NCCL_DEBUG_INFO_PIPE_FILE=/tmp/fr_</code> and write to
+<code>/tmp/fr_&lt;global rank&gt;.pipe</code>.</p>
+<p>How this differs from NCCL in stock PyTorch:</p>
+<ul>
+<li>Each rank's record lives with the watchdog. With
+  <code>TORCH_MOJO_BACKEND_PG_WATCHDOG=off</code>, nothing is recorded.</li>
+<li>The rank that caught the timeout waits until every rank has dumped, at
+  most <code>TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC</code>; PyTorch sleeps four times
+  that (60 seconds by default). The other ranks dump and keep running,
+  until torchrun or their own watchdog stops them; PyTorch's monitor thread
+  terminates them.</li>
+<li>The dump is written from Python. A process whose interpreter is stuck
+  holding the GIL writes no dump; the abort still happens.</li>
+<li>A collective is never shown as "started", only "scheduled" or
+  "completed", and there is no <code>duration_ms</code>. This is NCCL's behaviour
+  without <code>TORCH_NCCL_ENABLE_TIMING</code>, which isn't supported here.</li>
+<li>A collective from a graph compiled with <code>mojo_backend</code> is recorded with
+  its element count as its shape and no Python stack.</li>
+<li><code>barrier()</code> isn't recorded: it synchronizes the devices and goes through
+  Gloo, where NCCL records an <code>all_reduce_barrier</code>.</li>
+<li>A collective call that blocks on the host before it is enqueued isn't in
+  the dump; the watchdog's report names it.</li>
+<li><code>FlightRecorderHook</code> (PyTorch 2.14) and <code>_dump_fr_trace()</code> don't see
+  this backend's collectives; <code>_dump_fr_trace()</code> shows Gloo's. Neither
+  does <code>torch.distributed.debug</code>'s server, which reads PyTorch's recorder
+  directly.</li>
+</ul>
 <h3 id="the-first-training-step-takes-minutes">The first training step takes minutes<a class="headerlink" href="#the-first-training-step-takes-minutes" title="Permanent link">&para;</a></h3>
 <p>Kernels compile the first time each one is used; see
 <a href="#multi-node">warm the kernel cache first</a>. Later runs reuse the cache.</p>
