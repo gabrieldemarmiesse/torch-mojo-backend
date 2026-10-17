@@ -874,6 +874,15 @@ class _GraphFactory:
             self.collectives = GraphCollectives.scan(graph)
         except CollectiveLoweringError as e:
             raise MojoCompilerError(str(e)) from e
+        # Random state and collective handles belong to the parent graph:
+        # their existing lowerings retain that ordering. Metal has one queue
+        # and no indexed stream pool (MaxStreamPool skips it).
+        side_streams = (
+            not self.takes_seed
+            and self.collectives is None
+            and any(max_stream_id(node) for node in graph.nodes)
+            and not _metal_accelerators()
+        )
         try:
             nodes = list(enumerate(graph.nodes))
             position = 0
@@ -888,10 +897,8 @@ class _GraphFactory:
                     self.initialize_graph()
 
                 if node.op in ("call_function", "call_method"):
-                    stream_id = max_stream_id(node)
-                    # Random state and collective handles belong to the parent
-                    # graph. Their existing lowerings retain that ordering.
-                    if stream_id and not self.takes_seed and self.collectives is None:
+                    stream_id = max_stream_id(node) if side_streams else 0
+                    if stream_id:
                         group = [(node_idx, node)]
                         while position < len(nodes):
                             next_idx, next_node = nodes[position]
@@ -978,6 +985,13 @@ def _graph_uses_mojo_device(
 
 
 @functools.cache
+def _metal_accelerators() -> bool:
+    return any(
+        cast("max.driver.Accelerator", device).api == "metal"
+        for device in _mojo_accelerators()
+    )
+
+
 def _mojo_accelerators() -> tuple[max.driver.Device, ...]:
     """The concrete MAX devices backing each `mojo:<index>`, in the same
     order the native backend's `device.mojo` assigns them -- see
