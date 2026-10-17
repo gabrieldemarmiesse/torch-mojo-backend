@@ -34,6 +34,14 @@ from std.time import perf_counter_ns, sleep
 from max.gpu.host import DeviceContext
 
 from tmb.backend.device import be
+from tmb.backend.flight_recorder import (
+    TAG_MEMBER,
+    fr_commit,
+    fr_deferred,
+    fr_done,
+    fr_link,
+    fr_untracked,
+)
 from tmb.backend.vendor import NOT_READY
 
 comptime SEG = 1024  # slots per queue segment
@@ -110,7 +118,8 @@ comptime S_FP = 8
 comptime S_ISSUED = 9
 comptime S_EVENT = 10  # created on the slot's first use, then fixed
 comptime S_CPOS = 11
-comptime S_WORDS = 12
+comptime S_FR = 12  # its flight recorder entry (record id + 1), 0 if none
+comptime S_WORDS = 13
 
 comptime WordsP = Pointer[Int64, MutUntrackedOrigin]
 comptime EventRecordFn = def(Int, Int) thin abi("C") -> Int32
@@ -294,7 +303,7 @@ def _empty_entry() -> Entry:
 
 
 struct Tracker(Movable):
-    """One communicator's queue. `g_entry` is the producer's; `hist`,
+    """One communicator's queue. `hist`,
     `reported`, `fault_reported` and `push_failures` the watchdog's."""
 
     var words: WordsP
@@ -305,7 +314,6 @@ struct Tracker(Movable):
     var device: Int
     var handle: Int64
     var ctx: DeviceContext
-    var g_entry: Entry
     var reported: Int
     var fault_reported: Bool
     var published: Bool  # watchdog's: an incident line went out for it
@@ -332,7 +340,6 @@ struct Tracker(Movable):
         self.device = device
         self.handle = handle
         self.ctx = ctx
-        self.g_entry = _empty_entry()
         self.reported = 0
         self.fault_reported = False
         self.published = False
@@ -405,6 +412,7 @@ struct Watch(Movable):
     var reported_call: Int  # watchdog's: in-call mark already reported
     var warned_full: Bool
     var warned_overflow: Bool
+    var fr: Int  # flight_recorder.mojo `fr_pg`, 0 when not recording
 
     def __init__(
         out self,
@@ -445,6 +453,7 @@ struct Watch(Movable):
         self.reported_call = 0
         self.warned_full = False
         self.warned_overflow = False
+        self.fr = 0
 
 
 comptime WatchP = Pointer[Watch, MutUntrackedOrigin]
@@ -464,11 +473,31 @@ def _tracker(t: Int) -> TrackerP:
 
 
 @fieldwise_init
+struct GroupFold(Copyable, Movable):
+    """One communicator in a thread's open NCCL group: its calls, folded
+    into the one entry the outermost ncclGroupEnd commits (`commit`), and
+    the flight recorder's view of them -- the calls of the torch-level
+    operation in progress (`entry`, `tag`; `members` if it holds a
+    coalescing block's members, whose own entries are made as they come)
+    and the deferred entries already made (`rids`). Per thread: another thread's group on
+    the same communicator has its own."""
+
+    var watch: Int
+    var tracker: Int
+    var raw: Int
+    var commit: Entry
+    var entry: Entry
+    var tag: Int
+    var members: Bool
+    var rids: List[Int]
+
+
+@fieldwise_init
 struct Level(Copyable, Movable):
     var thread: Int
     var lib: Int
     var depth: Int
-    var pending: List[Int]  # (watch, tracker, raw stream) triples
+    var folds: List[GroupFold]
 
 
 @fieldwise_init
@@ -534,13 +563,13 @@ def group_enter(lib: Int):
         _groups()[].levels[i].depth += 1
         return
     _groups()[].levels.append(
-        Level(external_call["pthread_self", Int](), lib, 1, List[Int]())
+        Level(external_call["pthread_self", Int](), lib, 1, List[GroupFold]())
     )
 
 
 def group_exit(lib: Int, submitted: Bool):
     """The library's ncclGroupEnd returned: at the outermost level, commit
-    every tracker's folded calls (all were submitted just now)."""
+    every communicator's folded calls (all were submitted just now)."""
     var i = _level(_groups(), lib)
     if i < 0:
         return
@@ -548,38 +577,117 @@ def group_exit(lib: Int, submitted: Bool):
     levels[i].depth -= 1
     if levels[i].depth > 0:
         return
-    var pending = levels[i].pending.copy()
+    var folds = levels[i].folds.copy()
     _ = levels.pop(i)
-    for j in range(0, len(pending), 3):
-        _group_commit(pending[j], pending[j + 1], pending[j + 2], submitted)
+    if not submitted:
+        return  # nothing was enqueued; its deferred entries stay unlinked
+    for k in range(len(folds)):
+        var fr = _fr_submit(folds[k])
+        ref f = folds[k]
+        if f.commit.nops != 0:  # a claimed tracker skips it
+            watch_commit(f.watch, f.tracker, f.raw, f.commit.copy(), fr_rid=fr)
 
 
-def group_note(lib: Int, w: Int, t: Int, raw_stream: Int):
+def _fold_of(mut lv: Level, w: Int, t: Int, raw: Int) -> Int:
+    for k in range(len(lv.folds)):
+        if lv.folds[k].tracker == t:
+            return k
+    lv.folds.append(
+        GroupFold(
+            w, t, raw, _empty_entry(), _empty_entry(), 0, False, List[Int]()
+        )
+    )
+    return len(lv.folds) - 1
+
+
+def group_add(lib: Int, w: Int, t: Int, raw: Int, e: Entry, tag: Int):
+    """A library call inside this thread's NCCL group: nothing is enqueued
+    before the outermost ncclGroupEnd, so it is folded into the entry
+    committed there; for the flight recorder, it is part of the torch-level
+    operation `tag` (a new one ends the previous: its entry is made now)."""
     var g = GroupsP(unsafe_from_address=_watch(w)[].groups)
     var i = _level(g, lib)
     if i < 0:
         return
-    ref pending = g[].levels[i].pending
-    for j in range(0, len(pending), 3):
-        if pending[j + 1] == t:
-            return
-    pending.append(w)
-    pending.append(t)
-    pending.append(raw_stream)
+    ref lv = g[].levels[i]
+    ref f = lv.folds[_fold_of(lv, w, t, raw)]
+    _fold(f.commit, e)
+    if _watch(w)[].fr == 0:
+        return
+    if tag & TAG_MEMBER:
+        if f.entry.nops != 0 and not f.members:  # an op before the block
+            _fr_flush(w, f, f.tag)
+        f.members = True
+    else:
+        if f.entry.nops != 0 and (f.members or f.tag != tag):
+            _fr_flush(w, f, f.tag)
+        f.tag = tag
+    _fold(f.entry, e)
+
+
+def _fr_flush(w: Int, mut f: GroupFold, tag: Int):
+    """Make the deferred entry of `f`'s operation (`tag`)."""
+    if f.entry.nops == 0:
+        return
+    ref e = f.entry
+    f.rids.append(
+        fr_deferred(
+            _watch(w)[].fr,
+            e.op,
+            e.nops,
+            e.count,
+            e.dtype,
+            e.root,
+            e.op >= OP_SEND and e.op <= OP_SENDRECV,
+            f.tracker,
+            tag,
+        )
+    )
+    f.entry = _empty_entry()
+    f.tag = 0
+    f.members = False
+
+
+def group_fr_mark(lib: Int, w: Int, t: Int, tag: Int):
+    """A process group's group_end, at any depth: its operation (`tag`;
+    a coalescing block's end) is over, its deferred entry made now."""
+    if t == 0 or _watch(w)[].fr == 0:
+        return
+    var g = GroupsP(unsafe_from_address=_watch(w)[].groups)
+    var i = _level(g, lib)
+    if i < 0:
+        return
+    ref lv = g[].levels[i]
+    for k in range(len(lv.folds)):
+        if lv.folds[k].tracker == t:
+            _fr_flush(w, lv.folds[k], tag)
+
+
+def _fr_submit(mut f: GroupFold) -> Int:
+    """The group was submitted: its last deferred entry on `f`'s
+    communicator is the one the commit stamps, the others complete with
+    it."""
+    var fp = _watch(f.watch)[].fr
+    if fp == 0:
+        return 0
+    _fr_flush(f.watch, f, f.tag)
+    if len(f.rids) == 0:
+        return 0
+    var last = f.rids[len(f.rids) - 1]
+    for r in range(len(f.rids)):
+        fr_link(fp, f.rids[r], last)
+    return last
 
 
 def groups_forget(w: Int):
-    """A watch going away: drop its trackers from every open group."""
+    """A watch going away: drop its communicators from every open group."""
     ref levels = _groups()[].levels
     for i in range(len(levels)):
-        var kept = List[Int]()
-        ref pending = levels[i].pending
-        for j in range(0, len(pending), 3):
-            if pending[j] != w:
-                kept.append(pending[j])
-                kept.append(pending[j + 1])
-                kept.append(pending[j + 2])
-        levels[i].pending = kept^
+        var kept = List[GroupFold]()
+        for k in range(len(levels[i].folds)):
+            if levels[i].folds[k].watch != w:
+                kept.append(levels[i].folds[k].copy())
+        levels[i].folds = kept^
 
 
 # --- producer side (under the backend mutex) ---------------------------------
@@ -690,6 +798,13 @@ def watch_claim(t: Int) -> Bool:
     return ok
 
 
+def watch_set_fr(w: Int, fp: Int):
+    """Record this group's collectives in the flight recorder from now on
+    (`fp`: flight_recorder.mojo `fr_pg`). Under the backend mutex."""
+    if w != 0:
+        _watch(w)[].fr = fp
+
+
 def watch_fault(t: Int, rc: Int):
     """A driver error on either side: the watchdog reports it, and a destroy
     aborts the communicator instead of trusting its queue."""
@@ -735,6 +850,25 @@ def _boundary(
     return Boundary(lo, 0)
 
 
+def _fr_ids(w: Int, tr: Tracker, lo: Int, hi: Int) -> List[Int]:
+    """The flight recorder entries of [lo, hi), read before the tail moves
+    past them; stamped by `_fr_stamp` only once that move succeeded (a
+    segment can be recycled only after it, so these reads saw the right
+    slots)."""
+    var ids = List[Int]()
+    if _watch(w)[].fr != 0:
+        for i in range(lo, hi):
+            ids.append(_ld(_slot(tr, i), S_FR))
+    return ids^
+
+
+def _fr_stamp(w: Int, ids: List[Int]):
+    var fp = _watch(w)[].fr
+    var now = perf_counter_ns()
+    for i in range(len(ids)):
+        fr_done(fp, ids[i], now)
+
+
 def _retire_now(w: Int, t: Int):
     """Producer-side retirement, once per segment and never waiting: one
     query of the newest event (all done: everything retires), else the
@@ -754,8 +888,10 @@ def _retire_now(w: Int, t: Int):
             )
         if b.end > tail:
             var seq = _ld(_slot(tr, b.end - 1), S_SEQ)
+            var ids = _fr_ids(w, tr, tail, b.end)
             if _cas(tr.words, T_TAIL, tail, b.end):
                 _st_max(tr.words, T_DONE, seq)
+                _fr_stamp(w, ids)
     except:
         return  # nothing retired: the watchdog sees the same driver state
 
@@ -809,14 +945,18 @@ def _full(tr: Tracker, head: Int) -> Bool:
     )
 
 
-def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
+def watch_commit(
+    w: Int, t: Int, raw_stream: Int, var e: Entry, tag: Int = 0, fr_rid: Int = 0
+):
     """Record the completion point of what was just enqueued on the comm
     stream as the tracker's next collective. Never waits for the GPU: the
     queue grows by a segment instead; only with a whole table of segments
     in flight are commits dropped, until enough complete. A driver error
     goes to the watchdog (`watch_fault`)."""
     ref tr = _tracker(t)[]
+    var fr = fr_rid if fr_rid != 0 else _fr_record(w, t, e, tag)
     if _ld(tr.words, T_FAULT) != 0 or _ld(tr.words, T_STATE) != 0:
+        fr_untracked(_watch(w)[].fr, fr)
         return
     var seq = _ld(tr.words, T_SEQ) + 1
     _st(tr.words, T_SEQ, seq)
@@ -838,6 +978,7 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
                         ),
                     ),
                 )
+            fr_untracked(_watch(w)[].fr, fr)
             return
     if tr.overflowing:
         tr.overflowing = False
@@ -850,11 +991,13 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
             event = be()[].vendor.value().event_create(tr.ctx, False)
         except:
             watch_fault(t, -1)
+            fr_untracked(_watch(w)[].fr, fr)
             return
         _st(s, S_EVENT, event)
     var rc = call_fn[EventRecordFn](_watch(w)[].f_record)(event, raw_stream)
     if rc != 0:
         watch_fault(t, Int(rc))
+        fr_untracked(_watch(w)[].fr, fr)
         return
     var v = _ld(s, S_VER)
     _st(s, S_VER, v + 1)
@@ -868,6 +1011,7 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
     _st(s, S_FP, Int(e.fp & 0x3FFFFFFFFFFFFFFF))
     _st(s, S_ISSUED, perf_counter_ns())
     _st(s, S_CPOS, e.cpos)
+    _st(s, S_FR, fr)
     _st(s, S_VER, v + 2)
     _st(tr.words, T_HEAD, head + 1)
 
@@ -892,10 +1036,21 @@ def watch_test_limit(t: Int, entries: Int):
         _tracker(t)[].inflight_limit = max(min(entries, (NSEG - 1) * SEG), 1)
 
 
-def watch_group_add(t: Int, var e: Entry):
-    """A library call inside an NCCL group: nothing is enqueued before the
-    outermost ncclGroupEnd, so it is folded into one entry committed there."""
-    ref g = _tracker(t)[].g_entry
+def _fr_record(w: Int, t: Int, e: Entry, tag: Int) -> Int:
+    return fr_commit(
+        _watch(w)[].fr,
+        e.op,
+        e.nops,
+        e.count,
+        e.dtype,
+        e.root,
+        e.op >= OP_SEND and e.op <= OP_SENDRECV,
+        t,
+        tag,
+    )
+
+
+def _fold(mut g: Entry, e: Entry):
     if g.nops == 0:
         g = e.copy()  # a group of one hashes like the call itself
         return
@@ -913,14 +1068,6 @@ def watch_group_add(t: Int, var e: Entry):
     g.nops += e.nops
     g.count += e.count
     g.fp = _mix(_mix(g.fp, Int(e.fp & 0xFFFFFFFF)), Int(e.fp >> 32))
-
-
-def _group_commit(w: Int, t: Int, raw_stream: Int, submitted: Bool):
-    ref tr = _tracker(t)[]
-    var g = tr.g_entry.copy()
-    tr.g_entry = _empty_entry()
-    if g.nops != 0 and submitted:
-        watch_commit(w, t, raw_stream, g^)  # a claimed tracker skips it
 
 
 def _drain(w: Int, t: Int, deadline_ns: Int) -> Bool:
@@ -943,8 +1090,10 @@ def _drain(w: Int, t: Int, deadline_ns: Int) -> Bool:
             return False
         if b.end > tail:
             var seq = _ld(_slot(tr, b.end - 1), S_SEQ)
+            var ids = _fr_ids(w, tr, tail, b.end)
             if _cas(tr.words, T_TAIL, tail, b.end):
                 _st_max(tr.words, T_DONE, seq)
+                _fr_stamp(w, ids)
             continue
         if perf_counter_ns() > deadline_ns:
             return False
@@ -1426,9 +1575,11 @@ def _poll_tracker(w: Int, t: Int, now: Int) -> Bool:
         var last_seq = _ld(
             _slot(tr, b.end - 1), S_SEQ
         )  # before: reusable after
+        var ids = _fr_ids(w, tr, tail, b.end)
         if not _cas(tr.words, T_TAIL, tail, b.end):
             return True  # a drain retired entries: look again next round
         _st_max(tr.words, T_DONE, last_seq)
+        _fr_stamp(w, ids)
         for k in range(len(done)):
             tr.hist[unsafe_offset=tr.hist_n % HISTORY] = done[k].copy()
             tr.hist_n += 1
@@ -1494,6 +1645,7 @@ def _line(
     age_ns: Int,
     kind: StaticString,
     at_exit: Bool = False,
+    fr: Int = 0,
 ) -> String:
     """The machine-readable line for the Python desync reporter: `id` is the
     incident, `tid` the communicator (-1: a call blocked on the host)."""
@@ -1530,6 +1682,8 @@ def _line(
         + String(age_ns // 1_000_000)
         + " where="
         + String(kind)
+        + " fr="
+        + String(fr)
         + (" exit=1" if at_exit else "")
         + "\n"
     )
@@ -1575,7 +1729,15 @@ def _device_timeout(
     msg += _history(tr, pending, head - tail - len(pending), now, wa.rank)
     wa.incident += 1
     tr.published = True
-    var line = _line(wa, tr, pending[0].copy(), age, "device", at_exit)
+    var line = _line(
+        wa,
+        tr,
+        pending[0].copy(),
+        age,
+        "device",
+        at_exit,
+        _ld(_slot(tr, tail), S_FR),
+    )
     _fail(w, msg^, line, at_exit)
 
 

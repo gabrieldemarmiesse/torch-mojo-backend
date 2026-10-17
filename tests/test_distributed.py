@@ -9,14 +9,16 @@ demo_scripts/nanogpt_ddp and tests/multinode/.
 
 import datetime
 import os
+import pickle
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 import torch
@@ -522,6 +524,11 @@ def _run_torchrun(
     timeout: float = 900,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
+    # Flight recorder dumps of a timeout go here, not to ~/.cache/torch.
+    env.setdefault(
+        "TORCH_FR_DUMP_TEMP_FILE",
+        os.path.join(tempfile.mkdtemp(prefix="mojo-fr-"), "trace_"),
+    )
     # The worker pins per-rank visibility from LOCAL_RANK, slicing whichever
     # vendor list the launcher left (SLURM sets ROCR_VISIBLE_DEVICES on AMD).
     env.update(extra_env or {})
@@ -625,6 +632,134 @@ def test_two_rank_desync_watchdog(ccl: str):
     assert "#1 allreduce 1024 x float32 sum  completed" in output, context
 
 
+def _fr_trace(directory: Path) -> tuple[int, str]:
+    """torch's offline analyzer over the dumps in `directory`."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.flight_recorder.fr_trace",
+            str(directory),
+            "-p",
+            "trace_",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("ccl", "buffer"),
+    [("vendor", "2000"), ("mojo", "2000"), ("vendor", "8"), ("vendor", "0")],
+)
+@pytest.mark.gpu
+def test_two_rank_flight_recorder(ccl: str, buffer: str, tmp_path: Path):
+    """ddp_worker.py's `flight_recorder` mode checks `_dump_nccl_trace`
+    in-process (names, seq ids, shapes, states, the ring keeping the newest
+    TORCH_FR_BUFFER_SIZE, nothing at 0); each rank then dumps through the
+    debug pipe, and torch's analyzer reads the two dumps without an error."""
+    if _gpu_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    env = {
+        "TORCH_MOJO_BACKEND_CCL": ccl,
+        "TORCH_FR_BUFFER_SIZE": buffer,
+        "TORCH_FR_DUMP_TEMP_FILE": str(tmp_path / "trace_"),
+    }
+    if buffer != "0":
+        env["TORCH_NCCL_DEBUG_INFO_PIPE_FILE"] = str(tmp_path / "pipe_")
+    _run_torchrun(2, "flight_recorder", env)
+    if buffer == "0":
+        assert not list(tmp_path.glob("trace_*"))
+        return
+    for f in tmp_path.glob("pipe_*"):
+        f.unlink()  # the analyzer reads every file of the directory
+    rc, output = _fr_trace(tmp_path)
+    assert rc == 0, output
+    for problem in ("has errors", "Not all ranks", "MISMATCH"):
+        assert problem not in output, output
+
+
+def _fr_dumps(directory: Path) -> dict[int, dict[str, Any]]:
+    return {
+        int(f.name[len("trace_") :]): pickle.loads(f.read_bytes())
+        for f in directory.glob("trace_*")
+    }
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_flight_recorder_desync(ccl: str, tmp_path: Path):
+    """The `desync` hang dumps every rank's flight recorder before the abort:
+    rank 0 on its timeout, rank 1 on rank 0's store signal. torch's analyzer
+    then names collective #2 of the short group as the one rank 1 never
+    joined, and rank 0 printed that collective's Python stack."""
+    rc, output, context = _run_desync(
+        "desync", ccl, {"TORCH_FR_DUMP_TEMP_FILE": str(tmp_path / "trace_")}
+    )
+    _assert_aborted(rc, output, context, 2, "allreduce 1024 x float32 sum")
+    assert "[rank 0] flight recorder: collective timeout, dumped to" in output, context
+    assert "[rank 1] flight recorder: rank 0 signalled a dump, dumped to" in output, (
+        context
+    )
+    assert re.search(
+        r"\[rank 0\]   File .*ddp_worker.py\", line \d+, in run_desync", output
+    ), context
+    dumps = _fr_dumps(tmp_path)
+    assert sorted(dumps) == [0, 1], context
+    hung = [e for e in dumps[0]["entries"] if e["state"] != "completed"]
+    assert [(e["process_group"][0], e["collective_seq_id"]) for e in hung] == [
+        ("1", 2)
+    ], dumps[0]
+    rc, analysis = _fr_trace(tmp_path)
+    assert rc == 0, analysis
+    assert "Not all ranks joining collective, sequence number: 2" in analysis, analysis
+    assert "missing ranks: {1}" in analysis, analysis
+    assert "run_desync" in analysis, analysis  # the collective's stack
+
+
+@pytest.mark.parametrize(
+    "switch", ["TORCH_NCCL_DUMP_ON_TIMEOUT=0", "TORCH_INCLUDE_ONLY_ACTIVE=1"]
+)
+@pytest.mark.gpu
+def test_two_rank_flight_recorder_desync_switches(switch: str, tmp_path: Path):
+    """The `desync` hang with a dump switch: no dumps at all, or only the
+    collectives still in flight."""
+    name, value = switch.split("=")
+    rc, output, context = _run_desync(
+        "desync",
+        "vendor",
+        {"TORCH_FR_DUMP_TEMP_FILE": str(tmp_path / "trace_"), name: value},
+    )
+    _assert_aborted(rc, output, context, 2, "allreduce 1024 x float32 sum")
+    dumps = _fr_dumps(tmp_path)
+    if value == "0":
+        assert dumps == {} and "flight recorder:" not in output, context
+        return
+    assert sorted(dumps) == [0, 1], context
+    assert [e["state"] for e in dumps[0]["entries"]] == ["scheduled"], dumps[0]
+    assert dumps[1]["entries"] == [], dumps[1]
+
+
+@pytest.mark.gpu
+def test_two_rank_flight_recorder_subgroup(tmp_path: Path):
+    """A gloo default group and a mojo group of global rank 1 alone: its
+    pipe and dump file carry the global rank, 1, not its rank in the group."""
+    if _gpu_count() < 2:
+        pytest.skip("needs at least 2 GPUs")
+    _run_torchrun(
+        2,
+        "fr_subgroup",
+        {
+            "TORCH_FR_DUMP_TEMP_FILE": str(tmp_path / "trace_"),
+            "TORCH_NCCL_DEBUG_INFO_PIPE_FILE": str(tmp_path / "pipe_"),
+        },
+    )
+    assert sorted(f.name for f in tmp_path.glob("trace_*")) == ["trace_1"]
+    assert sorted(f.name for f in tmp_path.glob("pipe_*")) == ["pipe_1.pipe"]
+
+
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.gpu
 def test_two_rank_desync_watchdog_after_a_burst(ccl: str):
@@ -646,16 +781,35 @@ def test_two_rank_desync_watchdog_destroy(ccl: str):
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.gpu
-def test_two_rank_desync_watchdog_report_mode(ccl: str):
+def test_two_rank_desync_watchdog_report_mode(ccl: str, tmp_path: Path):
     """TORCH_MOJO_BACKEND_PG_WATCHDOG=report: three late collectives (#2 late
     on rank 0, #3 on rank 1, #4 on rank 0) are each reported by the rank
     left waiting, which keeps running; the run then finishes cleanly. A
     record of an earlier incident is gone from the store by the next one,
     so every report names the late rank as silent, never as behind."""
     rc, output, context = _run_desync(
-        "desync_report_twice", ccl, {"TORCH_MOJO_BACKEND_PG_WATCHDOG": "report"}
+        "desync_report_twice",
+        ccl,
+        {
+            "TORCH_MOJO_BACKEND_PG_WATCHDOG": "report",
+            "TORCH_FR_DUMP_TEMP_FILE": str(tmp_path / "trace_"),
+        },
     )
     assert rc == 0, context
+    # Every incident is a new dump generation: the waiting rank dumps for
+    # each, and so does its peer, so the files are of the last incident.
+    assert output.count("[rank 0] flight recorder: rank 1 signalled a dump") == 2
+    assert output.count("[rank 1] flight recorder: rank 0 signalled a dump") == 1
+    assert "no dump from ranks" not in output, context
+    last = {
+        r: max(
+            e["collective_seq_id"]
+            for e in d["entries"]
+            if e["process_group"][0] == "1" and e["state"] == "completed"
+        )
+        for r, d in _fr_dumps(tmp_path).items()
+    }
+    assert last == {0: 3, 1: 3}, last
     assert output.count("report_twice finished") == 2, context
     for waiting, late, seq in ((1, 0, 2), (0, 1, 3), (1, 0, 4)):
         assert (
@@ -824,7 +978,8 @@ def test_two_rank_fsdp2(mode: str, ccl: str):
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.parametrize(
-    "mode", ["functional", "interleaved", "tensor_parallel", "unsupported"]
+    "mode",
+    ["functional", "interleaved", "tensor_parallel", "unsupported", "flight_recorder"],
 )
 def test_two_rank_compiled_collectives(mode: str, ccl: str):
     """Collectives inside graphs compiled with `mojo_backend`

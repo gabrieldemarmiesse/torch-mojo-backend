@@ -459,6 +459,13 @@ suit the hardware the library was measured on:
 | `TORCH_MOJO_BACKEND_CACHE_DIR` | user cache directory | where compiled kernels (and `libmojoccl.so`) are cached |
 | `TORCH_MOJO_BACKEND_TRACE` | on | `0` hides the `[TRACE]` lines (library in use, build timings) |
 | `TORCH_MOJO_BACKEND_PG_WATCHDOG` | `abort` | what a collective that outlives the `init_process_group` timeout does: `abort` reports and exits, `report` only reports, `off` disables the check ([A run hangs](#a-run-hangs)) |
+| `TORCH_FR_BUFFER_SIZE` (or `TORCH_NCCL_TRACE_BUFFER_SIZE`) | 2000 | collectives the [flight recorder](#flight-recorder-dumps) keeps; `0` turns it off |
+| `TORCH_FR_DUMP_TEMP_FILE` (or `TORCH_NCCL_DEBUG_INFO_TEMP_FILE`) | `~/.cache/torch/comm_lib_trace_rank_` | dump file prefix; the global rank is appended |
+| `TORCH_NCCL_DUMP_ON_TIMEOUT` | on | `0`: a timeout doesn't dump |
+| `TORCH_NCCL_DEBUG_INFO_PIPE_FILE` | unset | stem of a pipe, `<stem><rank>.pipe`; writing to it dumps that rank |
+| `TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC` | 15000 | how long the rank that timed out waits for the others' dumps |
+| `TORCH_NCCL_COORD_CHECK_MILSEC` | 1000 | how often a rank checks whether another one asked for a dump |
+| `TORCH_INCLUDE_STACK_TRACE`, `TORCH_INCLUDE_ONLY_ACTIVE` | on, off | Python stacks / completed collectives in the automatic dumps |
 
 `register_mojo_devices()` warns about any `TORCH_MOJO_BACKEND_*` or
 `MOJOCCL_*` variable that it doesn't recognise, and suggests the real name
@@ -522,7 +529,8 @@ somewhere else; that's where to look first, and
 `py-spy dump --pid <pid>` shows where it is. When every rank reports the
 same collective, or the ranks wait in point-to-point transfers (which
 don't compare across ranks), the report says it can't tell why. Every rank has to issue
-the same collectives, in the same order, with the same arguments. Finally
+the same collectives, in the same order, with the same arguments. Every
+rank then dumps its [flight recorder](#flight-recorder-dumps). Finally
 the rank aborts its communicators and exits with status 1, and torchrun
 stops the other workers. A device error on the rank (a faulted kernel) ends
 the run the same way.
@@ -538,6 +546,83 @@ when the script ends (Ctrl-C included) gets two seconds to finish, then
 is reported like a timeout; `destroy_process_group()` waits for this
 rank's collectives but not for its peers. CPU work (`barrier`, object collectives) goes through gloo,
 which raises after the same timeout.
+
+### Flight recorder dumps
+
+As with NCCL in stock PyTorch, every process keeps its last 2000 collectives
+in a flight recorder: process group, sequence numbers, operation, shapes,
+dtypes, the Python stack that issued it, and whether it completed. When a
+collective times out, the rank that caught it asks every rank, through the
+c10d store, to write its record to
+`~/.cache/torch/comm_lib_trace_rank_<global rank>`. It waits up to 15
+seconds for the dumps of the ranks in its process groups, then aborts. A later timeout in the same job (with
+`TORCH_MOJO_BACKEND_PG_WATCHDOG=report`) dumps every rank again. Then run
+PyTorch's analyzer over the files; it names the collective a rank never
+joined, or the ranks that disagree on one:
+
+```bash
+python -m torch.distributed.flight_recorder.fr_trace ~/.cache/torch -p comm_lib_trace_rank_
+```
+
+```text
+Not all ranks joining collective, sequence number: 2
+group info: 1
+collective: nccl:all_reduce
+missing ranks: {1}
+...
+collective stack trace:
+ all_reduce at .../torch/distributed/distributed_c10d.py:3068
+...
+```
+
+The files are in PyTorch's format, so the same tools read them. The
+environment variables are PyTorch's
+([environment variables](#environment-variables)). To dump while the job
+runs, call PyTorch's own functions:
+
+```python
+import pickle
+
+trace = pickle.loads(torch._C._distributed_c10d._dump_nccl_trace())
+```
+
+`_dump_nccl_trace_json()` returns the same dump as JSON, without stacks.
+Both work with the CPU build of torch too. While no process group of this
+backend is alive (none was created, all were destroyed, the watchdog is
+off, or `TORCH_FR_BUFFER_SIZE=0`), they are PyTorch's own. In a process
+that also runs a NCCL process group, they keep returning PyTorch's dump
+once that group recorded anything: one dump can't hold both backends (the
+analyzer aligns each rank by its first record id), so this backend's
+collectives are in its dump files, written on a timeout or through the
+debug pipe below. A NCCL process group's own timeout dump signal makes
+this backend's ranks dump too. You can also set
+`TORCH_NCCL_DEBUG_INFO_PIPE_FILE=/tmp/fr_` and write to
+`/tmp/fr_<global rank>.pipe`.
+
+How this differs from NCCL in stock PyTorch:
+
+- Each rank's record lives with the watchdog. With
+  `TORCH_MOJO_BACKEND_PG_WATCHDOG=off`, nothing is recorded.
+- The rank that caught the timeout waits until every rank has dumped, at
+  most `TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC`; PyTorch sleeps four times
+  that (60 seconds by default). The other ranks dump and keep running,
+  until torchrun or their own watchdog stops them; PyTorch's monitor thread
+  terminates them.
+- The dump is written from Python. A process whose interpreter is stuck
+  holding the GIL writes no dump; the abort still happens.
+- A collective is never shown as "started", only "scheduled" or
+  "completed", and there is no `duration_ms`. This is NCCL's behaviour
+  without `TORCH_NCCL_ENABLE_TIMING`, which isn't supported here.
+- A collective from a graph compiled with `mojo_backend` is recorded with
+  its element count as its shape and no Python stack.
+- `barrier()` isn't recorded: it synchronizes the devices and goes through
+  Gloo, where NCCL records an `all_reduce_barrier`.
+- A collective call that blocks on the host before it is enqueued isn't in
+  the dump; the watchdog's report names it.
+- `FlightRecorderHook` (PyTorch 2.14) and `_dump_fr_trace()` don't see
+  this backend's collectives; `_dump_fr_trace()` shows Gloo's. Neither
+  does `torch.distributed.debug`'s server, which reads PyTorch's recorder
+  directly.
 
 ### The first training step takes minutes
 

@@ -344,7 +344,11 @@ communicators and does the actual library calls.
     too (a process-wide table, `group_enter`/`group_exit`): a collective of
     group B issued inside group A's `ncclGroupStart` is folded with the
     rest and committed by the outermost `ncclGroupEnd`, never before it is
-    submitted.
+    submitted. The folded entry is per (thread's group level,
+    communicator) (`GroupFold` in watchdog.mojo): one accumulator per
+    communicator let another thread's group commit this thread's calls,
+    leaving its own commit nothing to stamp. A destroyed group's folds
+    leave every open level (`groups_forget`).
   - *The issuer never waits for the GPU.* A thread whose next call is what
     lets the peer progress would deadlock on a full queue
     (`test_two_rank_watchdog_never_blocks_the_issuer`: 900 async
@@ -468,10 +472,11 @@ communicators and does the actual library calls.
     does no native work (the communicators and threads are the parent's).
   - *Known limitations* (reviewed, judged narrow, left as they are):
     - Not done: `ncclCommGetAsyncError` polling (mojoccl's needs a
-      device-to-host read that blocks behind the hung kernel), dumps from
-      ranks whose own watchdog did not fire (their missing record is the
-      signal, and the report says a rank that could not send one looks
-      the same), pairing a send with its recv across ranks.
+      device-to-host read that blocks behind the hung kernel), a desync
+      record from ranks whose own watchdog did not fire (their missing
+      record is the signal, and the report says a rank that could not
+      send one looks the same; their flight recorder dump has the rest),
+      pairing a send with its recv across ranks.
     - A thread blocked inside a library call holds the backend mutex, so
       an exiting thread that frees a tensor blocks behind it before the
       exit hook runs; the watchdog's timeout then reports it (in report
@@ -495,6 +500,193 @@ communicators and does the actual library calls.
       library call (an abort that may hang), so such an exit can end with
       status 1 even in report mode.
     - Groups across process groups and RCCL/HIP are untested.
+  - *Flight recorder* (`tmb/backend/flight_recorder.mojo`,
+    `distributed/flight_recorder.py`; user docs: "Flight recorder dumps").
+    PyTorch 2.14's (c10d/FlightRecorder.hpp, schema version "2.10"),
+    rebuilt because nothing of torch's reaches a Python `ProcessGroup`:
+    `FlightRecorderHook` hangs off the C++ c10d ops our methods bypass, and
+    its `c10d:` names fail the analyzer's backend whitelist
+    (fr/components/types.py), as `mojo:` would -- hence `nccl:` (`rccl:` on
+    RCCL) and ProcessGroupNCCL's op names.
+    - *Ring.* One per process, `TORCH_FR_BUFFER_SIZE` slots. Two kinds of
+      writers -- the producer under the backend mutex, and the stampers
+      (watchdog, retiring issuer) without it -- so a slot's version is
+      also its lock: even to odd by compare-exchange, write, next even;
+      the dump reads as a seqlock, yielding to a writer after a few tries.
+      `watch_commit` writes an entry for every commit (graph collectives
+      included), with its tracker as the communicator id, and stores the
+      record id in the tracker slot (`S_FR`). The three places that move
+      `tail` read those ids before their compare-exchange and stamp only
+      once it succeeded (a segment is recycled only after the tail passed
+      it, so the reads saw the right slots). A stamp checks the full
+      record id under the slot lock and writes the completion's monotonic
+      ns; the first stamp stays. No id or time field wraps (63 bits of
+      each). A commit the tracker drops (overflow, a fault, a failed
+      event) is flagged untracked; the dump takes it as completed once a
+      later collective of the same communicator is (one comm stream; a
+      group's other devices prove nothing) -- a folded entry only when it
+      is its own link, i.e. its group was submitted. Seq ids are ProcessGroupNCCL's,
+      counted per group in the native core (eager and graph collectives
+      share them). Off with the watchdog. `tmb_pg_fr_selftest` checks the
+      stamping, lapping, block and tag rules on a private ring.
+    - *Tag words.* Python cannot learn which ring entry a call made, so
+      every pg.mojo collective entry (and `group_end`) takes a tag word and
+      passes it down to the entries it causes (`PG.track`, `fr_member`,
+      `watch_commit`). Inside an NCCL group nothing is submitted before the
+      thread's outermost `group_end`, so the flight recorder keeps, per
+      (thread's group level, communicator), the calls of the torch-level
+      operation in progress (`GroupFold`): when it ends -- its process
+      group's own `group_end` (`group_fr_mark`), the next operation folded
+      on that communicator, or a coalescing block's first member -- its
+      entry is made with its own tag, deferred (`FL_FOLDED`). The commit that submits the group
+      links them to the one entry it stamps (`F_LINK`; `fr_link`); the
+      dump completes a folded entry with its link and never otherwise, so
+      a group not submitted (a failed `group_end`, or one still open while
+      another thread's later collective completes) stays scheduled. A
+      group-wide "latest tag" read at the enclosing commit took whatever
+      that group issued in between (a closed coalescing block lost its
+      end), and order-based inference completed blocks not yet submitted.
+      `_fr_op` builds the tag per
+      call -- a record id plus member/first/end/p2p bits -- and keeps it in
+      a `threading.local` the call sites read. Earlier designs (a
+      process-wide header word, then hashed or owned per-thread header
+      slots, then a per-group "current tag") each lost tags or flags under
+      some interleaving, slot exhaustion, a dead owner or a fork; an
+      argument has none of that, and the coalescing structure depends on
+      nothing optional. The dump joins entries with the
+      Python record (name, shapes, dtypes, `gather_traceback`). A torch op
+      issuing several library calls inside `_group()` is one entry (its
+      group commit); list all_gather / reduce_scatter record the stacked
+      buffer ProcessGroupNCCL does (`newLikeFlat`, [n, *shape]), which the
+      analyzer's numel checks expect. A coalescing block's operations are
+      member entries, never stamped (ProcessGroupNCCL's have no events
+      either: inheriting the end's state made the analyzer report state
+      mismatches inside blocks), plus a `coalesced` end entry --
+      ProcessGroupNCCL's layout, what lets the analyzer pair sends with
+      recvs. An END tag reaching a group that recorded no member is
+      dropped. Untagged entries (graph collectives) get names and
+      `[[count]]` sizes from the native op, send/recv as
+      `send <rank>-><peer>` from the ring's peer and the group's rank (a
+      bare `nccl:send` crashes the analyzer): the lowering knows the
+      FakeTensor shape, but carrying it to the ring needs a graph input or
+      a per-node op parameter (a recompile per node).
+    - *Dumps.* Written by Python: pickle protocol 2 to a uuid-named
+      temporary file without the prefix (the loader matches files by
+      substring; a pid-named one collided across hosts), renamed into
+      place, serialized per process. Entries of a group the process never
+      knew are left out (the analyzer needs each in `pg_config`). Every
+      dump is keyed by global rank -- file, pipe, acknowledgement.
+    - *Coordination.* On an incident `_desync_reporter` takes a new
+      generation (`add` on `mojo_fr/generation` of the unprefixed store),
+      sets torch's `exception_dump`, dumps, acknowledges
+      `mojo_fr/dumped/<generation>/<global rank>` only if the file was
+      written, prints the timed-out entry's stack (the incident line
+      carries `fr=`), runs the desync report, then waits for the
+      acknowledgements of the ranks of this process's live groups (a gloo
+      default group's other ranks never dump; one multi-key `check` per
+      100 ms, `TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC`) before acking; the
+      native ack window grows by that wait plus 20 s. One
+      `mojo-pg-fr-monitor` thread per process polls torch's
+      `exception_dump`, then the generation (the reverse of
+      `signal_dump`'s order, so a key it sees comes with its generation),
+      and the debug pipe, every `TORCH_NCCL_COORD_CHECK_MILSEC`.
+    - *Signal state* is per store (TCPStore host/port, FileStore path) and
+      incarnation: `mojo_fr/incarnation` holds a nonce the server's first
+      client sets (`compare_set`; a store without it gets a constant,
+      losing only restart detection), read at attach and every poll; a
+      different nonce, at either, means a server restarted at that
+      address, and a new state that serves its generations from the first (inferring a
+      restart from the generation going down missed one already past the
+      old base, and a delayed read faked one). Claims hand back the state
+      they were made on (`Claim`), and `finish` changes that state only. A
+      generation is
+      done, pending (a dump in progress), failed or to serve. A generation
+      never seen before is dumped at once; only retries of failed ones
+      back off (doubling up to a minute) -- a backoff that gated new
+      generations kept a recovered rank from dumping a fresh incident
+      within the firing rank's wait. A dump that was written but whose
+      acknowledgement did not get through is acknowledged again at the
+      next poll, without a new dump. A ProcessGroupNCCL's
+      `broadcastDumpSignal` -- the key appearing while the generation never
+      moved -- dumps once, its retries backed off the same way. Groups
+      attach their store (the baseline, the store's current generation, is
+      read before it is watched; an attach that finds the state gone
+      meanwhile makes a new one) and detach at shutdown; the newest
+      attached store is polled. Store operations run on a `StoreWorker`
+      (store_worker.py, shared with the desync reporter; it drops a client
+      that raised) owned by the store's state: a new incarnation, or the
+      state going with its last group, closes it, and an answer is applied
+      only to the state it was asked for. While its one abandoned job is
+      still blocked the poll is skipped and retried as soon as it returns;
+      a store that answers with errors is polled less often, never more
+      than a quarter of the dump wait apart (even when that is below the
+      poll interval). The signaller is read with
+      `check` before `get`.
+    - *Fork.* The native backend refuses device use in a forked child, so a
+      child never records; the hook only keeps one that touches the
+      recorder (a dump, a group's `__del__`) from deadlocking: fresh
+      recorder and monitor locks, no monitor, none of the parent's groups,
+      and the ring's slots a parent thread was writing released
+      (`fr_after_fork`). A group's `shutdown()` in the child returns before
+      touching any of it.
+    - *`_dump_nccl_trace[_json]`* (monkeypatching.py): torch's own while no
+      mojo group is alive (shutdown retires a group: its names stay for the
+      dumps, it no longer counts), and whenever ProcessGroupNCCL's recorder
+      holds anything; this backend's otherwise. No merge: the analyzer
+      aligns each rank by its first record id, so one dump cannot hold two
+      numbered streams, and pg_config keys by name. Within our own dump a
+      name belongs to the newest group of that name (re-created after a
+      destroy); an older one's entries are left out.
+    - *Host cost* (2 x H100, the watchdog's overhead.py legs with
+      TORCH_FR_BUFFER_SIZE=0 vs 2000, ABBA, medians of six legs): the
+      native entry costs 0.1 us or less (job 322681: NCCL 7.39 -> 7.46 us,
+      mojoccl 3.91 -> 4.05 us; job 322848, another node: 8.91 -> 8.99,
+      4.54 -> 4.56); `dist.all_reduce` pays +1.8-2.3 us on one node (job
+      322681: NCCL 23.4 -> 25.7, mojoccl 19.2 -> 21.0) and +3.0-4.7 us on
+      another (job 322848: 28.9 -> 31.9, 21.6 -> 26.3), the per-call
+      Python path unchanged between them. `Recorder.begin` alone is 1.5 us
+      on the login node, 0.66 us of it without `gather_traceback` (torch
+      records a Python stack per collective too). A dict keyed by tag cost
+      5.9 us per record (popping its oldest key scans the dummies left at
+      the front); the records are a list indexed by tag.
+    - *fr_trace quirks* (2.11 and 2.14.1 alike, on NCCL's dumps too): it
+      logs "does not have a coalesced end" for every `nccl:coalesced` (it
+      checks `endswith("_coalesced")`); it pairs a coalescing block's p2p
+      ops from its first rank's and looks a recv's peer up by the recv's
+      own rank, so a block where that rank receives is a MISMATCH; and its
+      MISMATCH table needs `tabulate` (2.14.1 raises NameError without
+      it). The worker's p2p check is one-way for that reason. It also
+      groups a collective and a following point-to-point op as one
+      coalesced block when the collective's `collective_seq_id` equals the
+      p2p op's `p2p_seq_id` (it compares across the two counters).
+      And it reports every collective coalescing block (members plus
+      `coalesced`, ProcessGroupNCCL's layout for `_coalescing_manager`) as
+      "Not all ranks joining collective" with the other ranks missing,
+      whatever the states: its non-p2p coalesced matching does not pair
+      the members across ranks.
+    - Verified by hand against the 2.14.1 analyzer (CPU wheel venv,
+      `~/ddp_work/flight_recorder/torch214`, run under `env -i`: from a
+      shell that imported the project its python can load the project
+      venv's torch instead) on real two-rank dumps: desync (NCCL, mojoccl,
+      compiled graph) names "Not all ranks joining collective, sequence
+      number: 2 ... missing ranks: {1}" with the eager stack; the clean
+      runs (list collectives and a p2p block included) report nothing, and
+      the CPU tests' scenarios read the same.
+    - Tests: `test_flight_recorder.py` (CPU: format, tags, member and
+      per-communicator untracked states, unknown groups and reused names,
+      `_dump_nccl_trace` following the mojo groups and leaving torch's
+      dump untouched, a mixed NCCL+mojo process analyzed per backend,
+      concurrent dumps, generation accounting under overlapping failures,
+      per-store state across store switches, backoff, a NCCL dump signal,
+      the StoreWorker's abandoned-job bound, the fork hook, and the
+      installed analyzer on a missing rank, untagged p2p, a p2p block, a
+      block retired on one rank, list collectives);
+      `test_two_rank_flight_recorder*` (names, seq ids, shapes, states,
+      tags across threads, the native selftest, wraparound with snapshots
+      racing it, buffer 0, the pipe, torch's dump after
+      `destroy_process_group`, a desync, the dump switches, a gloo-default
+      subgroup), report mode's fresh dumps per incident, and the compiled
+      `flight_recorder` mode in test_distributed.py.
   - *Host cost* (job 318657, 2 x H100, bare pg.mojo allreduce entry through
     ctypes, 1 element, sync every 200 calls, median of the six ABBA legs,
     legs the node slowed down for both sides left out): NCCL 7.11 ->
