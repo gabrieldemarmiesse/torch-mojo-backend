@@ -5,12 +5,15 @@ from torch_mojo_backend.custom_torch_ops_in_mojo.torch_custom_ops import (
 )
 from torch_mojo_backend.mojo_device.log_aten_calls import log_aten_calls
 from torch_mojo_backend.mojo_device.register import register_mojo_devices
+from torch_mojo_backend.monkeypatching import preserve_dynamo_stream_contexts
 from torch_mojo_backend.torch_compile_backend.compiler import (
     MAPPING_TORCH_ATEN_TO_MOJO,
     MojoCompilerError,
     get_accelerators,
     mojo_backend,
 )
+
+preserve_dynamo_stream_contexts()
 
 __all__ = [
     "mojo_backend",
