@@ -285,19 +285,6 @@ def test_build_key_is_the_hash_of_the_compiled_snapshot(tmp_path):
     assert proc.returncode == 0 and "OK" in proc.stdout, proc.stdout + proc.stderr
 
 
-def test_werror_flag_reaches_every_python_driven_mojo_build(monkeypatch, tmp_path):
-    """TORCH_MOJO_BACKEND_WERROR=1 (what conftest sets) turns compiler warnings
-    into build failures; unset, a user's build must not carry --Werror. The
-    Mojo-side builds (loader.mojo, kernel families) read
-    the same variable."""
-    monkeypatch.delenv("TORCH_MOJO_BACKEND_WERROR", raising=False)
-    assert "--Werror" not in native.backend_build_command(tmp_path / "a.so")
-    assert native.mojo_diagnostic_flags() == []
-    monkeypatch.setenv("TORCH_MOJO_BACKEND_WERROR", "1")
-    assert "--Werror" in native.backend_build_command(tmp_path / "a.so")
-    assert native.mojo_diagnostic_flags() == ["--Werror"]
-
-
 def test_cxx_standard_follows_the_torch_version(monkeypatch):
     for version, expected in (
         ("2.11.0+cpu", "-std=c++17"),

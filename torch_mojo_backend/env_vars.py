@@ -103,8 +103,9 @@ OWN_ENV_VARS: dict[str, str] = {
         "`1` prints the graph structures the torch.compile backend builds."
     ),
     "TORCH_MOJO_BACKEND_WERROR": (
-        "`1` makes every Mojo build fail on a compiler warning. Off by "
-        "default — a newer toolchain warning about something new must not "
+        "`1` makes every Mojo build fail on a compiler warning, a cached one "
+        "included (each build records its warnings beside the artifact). Off "
+        "by default — a newer toolchain warning about something new must not "
         "cost a user their device — and on under pytest."
     ),
     # -- torch-mojo-backend: legacy aliases -------------------------------

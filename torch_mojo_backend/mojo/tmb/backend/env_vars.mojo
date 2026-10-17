@@ -12,9 +12,9 @@
 # `tests/test_env_vars_are_registered.py` scans the sources and fails if one
 # of them grows a name the Python union does not carry.
 
-# `1` fails every Mojo build on a compiler warning. Off by default -- a user
-# on a newer toolchain that warns about something new must not lose their
-# device over it -- and on under pytest.
+# `1` fails every Mojo build on a compiler warning, a cached one included.
+# Off by default -- a user on a newer toolchain that warns about something
+# new must not lose their device over it -- and on under pytest.
 comptime TORCH_MOJO_BACKEND_WERROR = "TORCH_MOJO_BACKEND_WERROR"
 
 # Test hook: the device-to-device copy route to force ("host", "trace", ...)

@@ -94,7 +94,11 @@ Always use uv to run commands to ensure the correct environment is activated. Ne
     (`TORCH_MOJO_BACKEND_TRACE=0` silences them).
     `TORCH_MOJO_BACKEND_WERROR=1` makes every Mojo build fail on a compiler
     warning; off by default, on under pytest (`tests/conftest.py`), so keep
-    the Mojo sources warning-free.
+    the Mojo sources warning-free. It holds on a cache hit too: each build
+    records its warnings beside the artifact and WERROR replays them, so a
+    warm cache gives the same verdict as a cold one -- never empty the cache
+    or point `TORCH_MOJO_BACKEND_CACHE_DIR` at a fresh directory to check for
+    warnings.
   - `TORCH_MOJO_BACKEND_CCL=mojo` swaps NCCL/RCCL for the in-repo Mojo
     collectives (`agents_docs/distributed.md`, "Mojo collectives"); default is
     the vendor library.

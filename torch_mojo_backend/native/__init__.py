@@ -81,18 +81,118 @@ def _trace(msg: str):
         print(f"[TRACE] {msg}", file=sys.stderr, flush=True)
 
 
-def mojo_diagnostic_flags() -> list[str]:
-    """Extra `mojo build` flags every Mojo build gets (loader.mojo's `_build`
-    appends the same for the kernel families).
+def werror() -> bool:
+    """TORCH_MOJO_BACKEND_WERROR=1: a Mojo build the compiler warned about
+    fails. Off by default -- a user on a newer toolchain that warns about
+    something new must not lose their device over it -- and on in the test
+    suite (tests/conftest.py), so a warning in any Mojo source fails the tests
+    that build it instead of scrolling past in captured stderr. It is checked
+    against the warnings each build records, never passed as `--Werror`, so
+    it holds on a cache hit: agents_docs/mojo_extensions.md, "Warnings
+    records"."""
+    return os.environ.get("TORCH_MOJO_BACKEND_WERROR", "0") == "1"
 
-    TORCH_MOJO_BACKEND_WERROR=1 turns compiler warnings into build failures.
-    Off by default -- a user on a newer toolchain that warns about something
-    new must not lose their device over it -- and on in the test suite
-    (tests/conftest.py), so a warning in any Mojo source fails the tests that
-    build it instead of scrolling past in a subprocess's captured stderr."""
-    if os.environ.get("TORCH_MOJO_BACKEND_WERROR", "0") == "1":
-        return ["--Werror"]
-    return []
+
+_WARNINGS_SUFFIX = ".warnings"
+_SEVERITIES = ("warning", "error", "note", "remark")
+_LOCATION_RE = re.compile(r":\d+:\d+$")
+# What mojo prints above a diagnostic in an imported module.
+_INCLUDED_FROM = ("Included from ", "Imported from ")
+
+
+def warnings_record(artifact: Path) -> Path:
+    """`<artifact>.warnings`: the warning diagnostics of the build that made
+    `artifact`, empty when there were none. Published after the artifact
+    (`_install_mojo_build`), so a missing one means an entry cached before
+    records existed or an interrupted install."""
+    return artifact.with_name(artifact.name + _WARNINGS_SUFFIX)
+
+
+def _diagnostic_header(line: str) -> tuple[str, bool] | None:
+    """(severity, has a `file:line:col`) of one of mojo's diagnostics --
+    `<file>:<l>:<c>: warning: ...` or `<path>/mojo: error: ...` --, else
+    None: a linker's `ld: warning:` is not one, `--Werror` never counted it.
+    It fails open -- a diagnostic in another shape is not counted -- so a
+    toolchain that changes the shape needs this updated (and the sample in
+    tests/test_build_warning_replay.py). loader.mojo's `_diagnostic_header`
+    is the same rule."""
+    at = line.find(": ")
+    while at >= 0:
+        prefix, rest = line[:at], line[at + 2 :]
+        for sev in _SEVERITIES:
+            if rest.startswith(sev + ": "):
+                if _LOCATION_RE.search(prefix) is not None:
+                    return sev, True
+                if prefix.rsplit("/", 1)[-1] == "mojo":
+                    return sev, False
+        at = line.find(": ", at + 1)
+    return None
+
+
+def warning_diagnostics(output: str) -> str:
+    """The warnings in a compiler's output, each with the `Included from`
+    lines above it, its source line, caret and attached notes, and nothing
+    else (the Crashpad banner, errors, traces). loader.mojo's
+    `warning_diagnostics` is the same filter."""
+    kept = []
+    included = []  # `Included from` lines, kept with the diagnostic below
+    keeping = False
+    context = 0  # excerpt lines still expected: the source line, the caret
+    for line in output.splitlines():
+        if line.startswith(_INCLUDED_FROM):
+            included.append(line + "\n")
+            context = 0
+            continue
+        header = _diagnostic_header(line)
+        if header is not None:
+            sev, located = header
+            keeping = sev == "warning" or (sev == "note" and keeping)
+            context = 2 if keeping and located else 0
+            if keeping:
+                kept += included
+        elif keeping and context == 2:
+            context = 1
+        elif keeping and context == 1 and line.lstrip().startswith("^"):
+            context = 0
+        else:
+            keeping = False
+            context = 0
+        included = []
+        if keeping:
+            kept.append(line + "\n")
+    return "".join(kept)
+
+
+def werror_failure(record: Path, diagnostics: str) -> str:
+    """What a build under WERROR fails with after its "... failed:" line
+    (loader.mojo's `_werror_check` writes the same)."""
+    return (
+        "TORCH_MOJO_BACKEND_WERROR=1 makes these compiler warnings errors "
+        f"(recorded by the build in {record}):\n" + diagnostics
+    )
+
+
+def _cached_warnings(out: Path) -> str | None:
+    """The recorded warnings of a usable cache entry; None when there is no
+    entry to use: `out` is missing, or WERROR is on and the record is
+    missing or unreadable (unknown, so it is rebuilt once). Without WERROR
+    the record is never read: ""."""
+    if not out.exists():
+        return None
+    if not werror():
+        return ""
+    try:
+        return warnings_record(out).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _werror_check(out: Path, diagnostics: str, failed: str) -> Path:
+    """`out`, unless WERROR is on and its build warned: then the error,
+    the same whether the build just ran or was cached."""
+    if werror() and diagnostics:
+        raise RuntimeError(failed + werror_failure(warnings_record(out), diagnostics))
+    return out
 
 
 def _pkg_version(name: str) -> str:
@@ -374,6 +474,10 @@ def _atomic_install(tmp: Path, out: Path):
     if out.exists():
         tmp.unlink(missing_ok=True)
         return
+    _replace_from_scratch(tmp, out)
+
+
+def _replace_from_scratch(tmp: Path, out: Path):
     staged = out.parent / f".{out.name}.{os.getpid()}"
     try:
         os.replace(tmp, staged)
@@ -381,6 +485,26 @@ def _atomic_install(tmp: Path, out: Path):
         shutil.copy2(tmp, staged)
         tmp.unlink(missing_ok=True)
     os.replace(staged, out)
+
+
+def _install_mojo_build(tmp: Path, out: Path, log: str) -> str:
+    """Install a finished Mojo build, then its warnings record; returns the
+    warnings. An artifact already there (a record-less one, under WERROR) is
+    kept, prebuilt copy included: the key is content-addressed (a prebuilt
+    is matched by its sources and MAX version), so the record describes it
+    too, and replacing a library another NFS client has mapped can SIGBUS
+    that client."""
+    diagnostics = warning_diagnostics(log)
+    record = warnings_record(out)
+    if out.exists():
+        tmp.unlink(missing_ok=True)
+    else:
+        record.unlink(missing_ok=True)  # never ahead of its artifact
+        _replace_from_scratch(tmp, out)
+    staged = record.parent / f".{record.name}.{os.getpid()}"
+    staged.write_text(diagnostics, encoding="utf-8")
+    os.replace(staged, record)
+    return diagnostics
 
 
 def _lib_suffix() -> str:
@@ -476,7 +600,9 @@ def _install_prebuilt(src: Path, out: Path, what: str) -> bool:
     except OSError as exc:
         _trace(f"prebuilt {what} ({src.name}) could not be copied: {exc}")
         return False
-    # mark first: a library visible without its mark could not fall back
+    # mark first: a library visible without its mark could not fall back.
+    # A record left by a compiled build is not this library's.
+    warnings_record(out).unlink(missing_ok=True)
     (out.parent / (out.name + _PREBUILT_MARK)).touch()
     _atomic_install(tmp, out)
     _trace(f"using prebuilt {what}: {src.name}")
@@ -646,18 +772,23 @@ def build_backend(*, prebuilt: bool = True) -> Path:
     and platform."""
     key = _hash_files(mojo_import_closure(_BACKEND_ENTRY), toolchain_identity())
     out = _CACHE_DIR / f"libtmb_backend.hash-{key}{_lib_suffix()}"
-    if out.exists():
-        return out
+    failed = "building the Mojo backend failed:\n"
+    diagnostics = _cached_warnings(out)
+    if diagnostics is not None:
+        return _werror_check(out, diagnostics, failed)
     with _build_lock(out.name):
-        if out.exists():
-            return out
-        if prebuilt:
+        diagnostics = _cached_warnings(out)
+        if diagnostics is not None:
+            return _werror_check(out, diagnostics, failed)
+        # A shipped library carries no warnings record: under WERROR the
+        # build that writes one is needed anyway, so take the build.
+        if prebuilt and not werror():
             src = _prebuilt_match(prebuilt_backend_spec())
             if src is not None and _install_prebuilt(
                 src, out, f"Mojo base library for MAX {_pkg_version('max-core')}"
             ):
                 return out
-        return _build_backend_locked(key, out)
+        return _werror_check(out, _build_backend_locked(key, out, failed), failed)
 
 
 def portable_target_cpu() -> str:
@@ -693,7 +824,6 @@ def backend_build_command(out: Path, accelerator: str | None = None) -> list[str
         portable_target_cpu(),
         "-o",
         str(out),
-        *mojo_diagnostic_flags(),
     ]
     if accelerator is not None:
         cmd += ["--target-accelerator", accelerator]
@@ -704,7 +834,8 @@ def backend_build_command(out: Path, accelerator: str | None = None) -> list[str
     return cmd
 
 
-def _build_backend_locked(key: str, out: Path) -> Path:
+def _build_backend_locked(key: str, out: Path, failed: str) -> str:
+    """Build and install the base library; returns its warnings."""
     from torch_mojo_backend import (  # noqa: PLC0415 -- package imports MAX, absent from shim-only build environments
         _ptxas,
     )
@@ -716,16 +847,10 @@ def _build_backend_locked(key: str, out: Path) -> Path:
     if proc.returncode != 0:
         tmp.unlink(missing_ok=True)
         log = proc.stdout + proc.stderr
-        raise RuntimeError(
-            "building the Mojo backend failed:\n"
-            + " ".join(cmd)
-            + "\n"
-            + log
-            + _ptxas.diagnose(log)
-        )
-    _atomic_install(tmp, out)
+        raise RuntimeError(failed + " ".join(cmd) + "\n" + log + _ptxas.diagnose(log))
+    diagnostics = _install_mojo_build(tmp, out, proc.stdout + proc.stderr)
     _trace(f"built Mojo backend in {time.monotonic() - t0:.2f}s")
-    return out
+    return diagnostics
 
 
 def build_library(
@@ -742,28 +867,29 @@ def build_library(
     tag = "|".join(f"{k}={v}" for k, v in sorted((defines or {}).items()))
     key = _hash_files(closure, kernel_identity() + "|" + tag)  # device code inside
     out = _CACHE_DIR / f"lib{name}.hash-{key}.so"
-    if out.exists():
-        return out
+    failed = f"building lib{name} failed:\n"
+    diagnostics = _cached_warnings(out)
+    if diagnostics is not None:
+        return _werror_check(out, diagnostics, failed)
     with _build_lock(out.name):
-        if out.exists():
-            return out
+        diagnostics = _cached_warnings(out)
+        if diagnostics is not None:
+            return _werror_check(out, diagnostics, failed)
         t0 = time.monotonic()
         tmp = _scratch_dir() / f"{name}-{os.getpid()}-{key}.so"
         cmd = [_find_mojo(), "build", str(entry), "--emit", "shared-lib"]
         cmd += ["-I", str(_MOJO_ROOT)]
         for k, v in sorted((defines or {}).items()):
             cmd += ["-D", f"{k}={v}"]
-        cmd += ["-o", str(tmp), *mojo_diagnostic_flags()]
+        cmd += ["-o", str(tmp)]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
+        log = proc.stdout + proc.stderr
         if proc.returncode != 0:
             tmp.unlink(missing_ok=True)
-            log = proc.stdout + proc.stderr
-            raise RuntimeError(
-                f"building lib{name} failed:\n" + log + _ptxas.diagnose(log)
-            )
-        _atomic_install(tmp, out)
+            raise RuntimeError(failed + log + _ptxas.diagnose(log))
+        diagnostics = _install_mojo_build(tmp, out, log)
         _trace(f"built lib{name} in {time.monotonic() - t0:.2f}s")
-        return out
+        return _werror_check(out, diagnostics, failed)
 
 
 def _load(path: Path, mode: int) -> ctypes.CDLL:
@@ -942,11 +1068,17 @@ def _precompile_package(src: Path, key_sources: list[Path], roots: list[Path]) -
     tied to the compiler that wrote it, hence the toolchain in the key."""
     key = _hash_files(key_sources, toolchain_identity())
     out = _CACHE_DIR / f"{src.name}.hash-{key}" / f"{src.name}.mojoc"
-    if out.exists():
-        return out
+    failed = (
+        f"precompiling {src.name} (the custom-op package of the graph backend) "
+        "failed:\n"
+    )
+    diagnostics = _cached_warnings(out)
+    if diagnostics is not None:
+        return _werror_check(out, diagnostics, failed)
     with _build_lock(out.parent.name):
-        if out.exists():
-            return out
+        diagnostics = _cached_warnings(out)
+        if diagnostics is not None:
+            return _werror_check(out, diagnostics, failed)
         t0 = time.monotonic()
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp_dir = _scratch_dir() / f"{src.name}-{os.getpid()}-{key}"
@@ -955,18 +1087,15 @@ def _precompile_package(src: Path, key_sources: list[Path], roots: list[Path]) -
         cmd = [_find_mojo(), "precompile", str(src)]
         for root in roots:
             cmd += ["-I", str(root)]
-        cmd += ["-o", str(tmp), *mojo_diagnostic_flags()]
+        cmd += ["-o", str(tmp)]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=compiler_env())
         if proc.returncode != 0:
             shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise RuntimeError(
-                f"precompiling {src.name} (the custom-op package of the graph "
-                "backend) failed:\n" + proc.stdout + proc.stderr
-            )
-        _atomic_install(tmp, out)
+            raise RuntimeError(failed + proc.stdout + proc.stderr)
+        diagnostics = _install_mojo_build(tmp, out, proc.stdout + proc.stderr)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         _trace(f"built {src.name} in {time.monotonic() - t0:.2f}s")
-        return out
+        return _werror_check(out, diagnostics, failed)
 
 
 @functools.cache
