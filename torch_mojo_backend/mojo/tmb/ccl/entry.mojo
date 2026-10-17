@@ -33,6 +33,8 @@ from tmb.ccl.init import (
     ncclCommDestroy as _ncclCommDestroy,
     ncclCommAbort as _ncclCommAbort,
     ncclCommGetAsyncError as _ncclCommGetAsyncError,
+    mojocclCommPeekAsyncError as _mojocclCommPeekAsyncError,
+    mojocclCommAsyncErrorText as _mojocclCommAsyncErrorText,
     ncclCommCount as _ncclCommCount,
     ncclCommUserRank as _ncclCommUserRank,
 )
@@ -139,6 +141,23 @@ def ncclCommGetAsyncError(
     comm: Int64, err_out: Pointer[Int32, MutAnyOrigin]
 ) abi("C") -> Int32:
     return _ncclCommGetAsyncError(comm, err_out)
+
+
+# mojoccl-only: the host-only half of ncclCommGetAsyncError, which the
+# process group's watchdog thread polls (it never blocks).
+@export
+def mojocclCommPeekAsyncError(
+    comm: Int64, err_out: Pointer[Int32, MutAnyOrigin]
+) abi("C") -> Int32:
+    return _mojocclCommPeekAsyncError(comm, err_out)
+
+
+# mojoccl-only: the latched fault's text, for the watchdog's report.
+@export
+def mojocclCommAsyncErrorText(
+    comm: Int64, buf: Pointer[UInt8, MutAnyOrigin], cap: Int64
+) abi("C") -> Int64:
+    return _mojocclCommAsyncErrorText(comm, buf, cap)
 
 
 @export

@@ -14,6 +14,7 @@ from torch_mojo_backend.monkeypatching import (
     fix_privateuse1_dlpack_device_type,
     let_dtensor_differentiate_a_native_linear,
     print_apple_gpu_tensors_from_the_host,
+    serve_nccl_trace_dumps_from_the_mojo_backend,
     stage_mojo_checkpoint_tensors,
 )
 from torch_mojo_backend.native import device_module
@@ -56,6 +57,7 @@ def register_mojo_devices():
         fix_privateuse1_dlpack_device_type()
         fix_dynamo_current_stream_device()
         fix_batch_isend_irecv_for_python_process_groups()
+        serve_nccl_trace_dumps_from_the_mojo_backend()
         let_dtensor_differentiate_a_native_linear()
         print_apple_gpu_tensors_from_the_host()
         native.register()

@@ -52,6 +52,7 @@ from tmb.ccl.include.comm import (
     _raise_abort_word,
     _read_error_word,
     _report_fault,
+    _fault_text,
     _submission_failed,
     _try_lock,
     _unlock,
@@ -1280,25 +1281,12 @@ def ncclCommGetAsyncError(
 ) -> Int32:
     try:
         ref state = _comm_ptr(comm)[]
-        if state.aborted:
-            err_out[] = NCCL_SYSTEM_ERROR
-            return NCCL_SUCCESS
-        if state.ib != 0 and ib_error(state.ib) != 0:
-            # A host callback gave up (post failed, a completion came back
-            # with a bad status, or nothing arrived inside the deadline).
-            # Host-side state, so it needs no device read.
-            err_out[] = NCCL_REMOTE_ERROR
-            return NCCL_SUCCESS
-        if _fault_code(state) != 0 or _host_fault_word(state) != 0:
-            # A device deadline, latched in the status page. Also host memory,
-            # so a watchdog polling this function pays nothing for it and --
-            # unlike the arena read below -- does not block behind the kernel
-            # it is asking about.
-            _report_fault(state)
-            err_out[] = NCCL_REMOTE_ERROR
-            return NCCL_SUCCESS
-        if _submission_failed(state):
-            err_out[] = NCCL_REMOTE_ERROR
+        var host = _host_async_error(state)
+        if host != NCCL_SUCCESS:
+            if _try_lock(state, perf_counter_ns()):
+                _report_fault(state)
+                _unlock(state)
+            err_out[] = host
             return NCCL_SUCCESS
         # Never read ordering fields or share poll scratch without the lock.
         # A busy submitter is healthy unless it publishes a terminal failure.
@@ -1316,6 +1304,52 @@ def ncclCommGetAsyncError(
         return NCCL_SUCCESS
     except:
         return NCCL_INTERNAL_ERROR
+
+
+def mojocclCommPeekAsyncError(
+    comm: Int64, err_out: Pointer[Int32, MutAnyOrigin]
+) -> Int32:
+    """`ncclCommGetAsyncError`'s host-only half, for a watchdog thread: the
+    abort flag, the inter-node engine's error and the latched fault records
+    are all host memory, read without the submission lock, a stream
+    synchronization, a device copy or any output -- so it never blocks and
+    never holds up a concurrent submitter (mojoccl-only). A device deadline
+    is latched there too, so the arena words the full function reads add
+    nothing a hung kernel could report sooner."""
+    err_out[] = _host_async_error(_comm_ptr(comm)[])
+    return NCCL_SUCCESS
+
+
+def mojocclCommAsyncErrorText(
+    comm: Int64, buf: Pointer[UInt8, MutAnyOrigin], cap: Int64
+) -> Int64:
+    """The latched fault's description into `buf` (truncated to `cap`
+    bytes), for the watchdog's report: the bytes written, 0 if no fault is
+    latched. Pure host reads, like the peek (mojoccl-only)."""
+    var text = _fault_text(_comm_ptr(comm)[])
+    var n = min(text.byte_length(), Int(cap))
+    var src = text.unsafe_ptr()
+    for i in range(n):
+        buf[unsafe_offset=i] = src[unsafe_offset=i]
+    _ = text  # alive until the copy is done
+    return Int64(n)
+
+
+def _host_async_error(state: CommState) -> Int32:
+    """The errors recorded in host memory: no lock, no device read, no
+    write."""
+    if state.aborted or state.released:
+        return NCCL_SYSTEM_ERROR
+    if state.ib != 0 and ib_error(state.ib) != 0:
+        # A host callback gave up (post failed, a completion came back with
+        # a bad status, or nothing arrived inside the deadline).
+        return NCCL_REMOTE_ERROR
+    if _fault_code(state) != 0 or _host_fault_word(state) != 0:
+        # A device deadline or host fault, latched in the status page.
+        return NCCL_REMOTE_ERROR
+    if _submission_failed(state):
+        return NCCL_REMOTE_ERROR
+    return NCCL_SUCCESS
 
 
 def _async_error_locked(mut state: CommState) raises -> Int32:

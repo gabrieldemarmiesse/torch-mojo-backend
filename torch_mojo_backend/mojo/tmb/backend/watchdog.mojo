@@ -24,7 +24,10 @@ most once per segment and without waiting (`_retire_now`).
 
 Ownership. A communicator is aborted or destroyed by whoever wins
 `watch_claim` (explicit abort, destroy, or the watchdog's abort), never by
-two of them.
+two of them. The claim is visible as "teardown in progress" from the
+compare-exchange that wins it until the winner's `watch_release`, so the
+exit path keeps its reaper armed across an abort another thread has
+claimed but not finished, and that abort's release cancels it.
 """
 from std.atomic import Atomic, Ordering
 from std.ffi import _get_global_or_null, external_call, get_errno
@@ -34,6 +37,14 @@ from std.time import perf_counter_ns, sleep
 from max.gpu.host import DeviceContext
 
 from tmb.backend.device import be
+from tmb.backend.flight_recorder import (
+    TAG_MEMBER,
+    fr_commit,
+    fr_deferred,
+    fr_done,
+    fr_link,
+    fr_untracked,
+)
 from tmb.backend.vendor import NOT_READY
 
 comptime SEG = 1024  # slots per queue segment
@@ -76,7 +87,7 @@ comptime W_NTRACK = 1
 comptime W_CALL_NS = 2  # host start of a library call in progress, 0 if none
 comptime W_CALL_OP = 3
 comptime W_CALL_DEV = 4
-# word 5 is unused (the reaper keeps its deadline in a cell of its own)
+comptime W_RETAINED = 5  # exit: the reaper cell left armed over others' work
 comptime W_TEARDOWN = 6  # interpreter exit: driver teardown is a quiet stop
 comptime W_JOINER = 7  # 0, 1 while one stopper joins the thread, 2 joined
 comptime W_WORDS = 8
@@ -90,12 +101,19 @@ comptime OUT_POLL = 2  # a blocking fd we could not reopen: poll(POLLOUT) first
 comptime T_HEAD = 0  # entries committed (producer)
 comptime T_TAIL = 1  # entries retired (compare-exchange)
 comptime T_DONE = 2  # sequence number of the newest retired entry
-comptime T_STATE = 3  # 0 live, 1 claimed for abort/destroy
+comptime T_STATE = 3  # STATE_*: who may touch the communicator
 comptime T_UNWATCHED = 4  # 1: the watchdog skips it
 comptime T_FAULT = 5  # driver error seen by either side, 0 if none
 comptime T_SEQ = 6  # sequence number of the newest commit (producer)
 comptime T_CPOS = 7  # compared collective calls so far (producer)
-comptime T_WORDS = 8
+comptime T_ASYNC = 8  # the library's async error (ncclResult_t), 0 if none
+comptime T_WORDS = 9
+
+comptime STATE_LIVE = 0
+comptime STATE_CLAIMED = 1  # an abort/destroy owns it, teardown in progress
+comptime STATE_POLLING = 2  # the watchdog is inside the async-error query
+comptime STATE_RELEASED = 3  # claimed, and its owner's teardown returned
+comptime NCCL_IN_PROGRESS = 7  # ncclInProgress: not an error
 
 # Slot words: S_VER is the seqlock (odd while the producer writes).
 comptime S_VER = 0
@@ -110,12 +128,21 @@ comptime S_FP = 8
 comptime S_ISSUED = 9
 comptime S_EVENT = 10  # created on the slot's first use, then fixed
 comptime S_CPOS = 11
-comptime S_WORDS = 12
+comptime S_FR = 12  # its flight recorder entry (record id + 1), 0 if none
+comptime S_WORDS = 13
 
 comptime WordsP = Pointer[Int64, MutUntrackedOrigin]
 comptime EventRecordFn = def(Int, Int) thin abi("C") -> Int32
 comptime EventQueryFn = def(Int) thin abi("C") -> Int32
 comptime CommFn = def(Int64) thin abi("C") -> Int32
+comptime AsyncErrorFn = def(Int64, Pointer[Int32, MutAnyOrigin]) thin abi(
+    "C"
+) -> Int32
+comptime ErrorStringFn = def(Int32) thin abi("C") -> Pointer[
+    UInt8, ImmStaticOrigin
+]
+comptime ErrorTextFn = def(Int64, Int, Int64) thin abi("C") -> Int64
+comptime TEXT_CAP = 1024  # bytes of mojoccl's fault description kept
 comptime ThreadFn = def(OpaquePointer[MutAnyOrigin]) thin abi("C") -> None
 
 
@@ -125,6 +152,24 @@ def _ld(p: WordsP, i: Int) -> Int:
         Atomic[Scalar[DType.int64]].load[ordering=Ordering.ACQUIRE](
             p.unsafe_offset(i)
         )
+    )
+
+
+@always_inline
+def _ld_sc(p: WordsP, i: Int) -> Int:
+    return Int(
+        Atomic[Scalar[DType.int64]].load[ordering=Ordering.SEQUENTIAL](
+            p.unsafe_offset(i)
+        )
+    )
+
+
+@always_inline
+def _st_sc(p: WordsP, i: Int, v: Int):
+    """Store then load on two threads (`_cancel_reaper` vs `watch_release`):
+    with both sequentially consistent, at least one sees the other's store."""
+    Atomic[Scalar[DType.int64]].store[ordering=Ordering.SEQUENTIAL](
+        p.unsafe_offset(i), Int64(v)
     )
 
 
@@ -294,18 +339,18 @@ def _empty_entry() -> Entry:
 
 
 struct Tracker(Movable):
-    """One communicator's queue. `g_entry` is the producer's; `hist`,
+    """One communicator's queue. `hist`,
     `reported`, `fault_reported` and `push_failures` the watchdog's."""
 
     var words: WordsP
     var segs: WordsP  # NSEG segment addresses, 0 until first used
     var hist: Pointer[Entry, MutUntrackedOrigin]  # last HISTORY retired
     var hist_n: Int
+    var w: Int  # its watch
     var id: Int
     var device: Int
     var handle: Int64
     var ctx: DeviceContext
-    var g_entry: Entry
     var reported: Int
     var fault_reported: Bool
     var published: Bool  # watchdog's: an incident line went out for it
@@ -317,7 +362,12 @@ struct Tracker(Movable):
     var zero_seg: WordsP  # what an unmapped segment reads as
 
     def __init__(
-        out self, id: Int, device: Int, handle: Int64, ctx: DeviceContext
+        out self,
+        w: Int,
+        id: Int,
+        device: Int,
+        handle: Int64,
+        ctx: DeviceContext,
     ):
         self.words = _words(T_WORDS)
         self.segs = _words(NSEG)
@@ -328,11 +378,11 @@ struct Tracker(Movable):
             unsafe_from_address=Int(hist)
         )
         self.hist_n = 0
+        self.w = w
         self.id = id
         self.device = device
         self.handle = handle
         self.ctx = ctx
-        self.g_entry = _empty_entry()
         self.reported = 0
         self.fault_reported = False
         self.published = False
@@ -396,6 +446,9 @@ struct Watch(Movable):
     var f_record: Int
     var f_query: Int
     var f_abort: Int
+    var f_async: Int  # ncclCommGetAsyncError, or mojoccl's host-only peek
+    var f_errstr: Int  # ncclGetErrorString
+    var f_text: Int  # mojoccl's fault description, 0 for vendor NCCL
     var thread: Int
     var reaper_cell: Int  # the last armed reaper's cell, 0 if none
     var err_fd: Int  # where reports go: stderr, reopened non-blocking
@@ -405,6 +458,7 @@ struct Watch(Movable):
     var reported_call: Int  # watchdog's: in-call mark already reported
     var warned_full: Bool
     var warned_overflow: Bool
+    var fr: Int  # flight_recorder.mojo `fr_pg`, 0 when not recording
 
     def __init__(
         out self,
@@ -418,6 +472,9 @@ struct Watch(Movable):
         f_record: Int,
         f_query: Int,
         f_abort: Int,
+        f_async: Int,
+        f_errstr: Int,
+        f_text: Int,
     ):
         self.words = _words(W_WORDS)
         var t = unsafe_alloc[Int](MAX_TRACKERS)
@@ -436,6 +493,9 @@ struct Watch(Movable):
         self.f_record = f_record
         self.f_query = f_query
         self.f_abort = f_abort
+        self.f_async = f_async
+        self.f_errstr = f_errstr
+        self.f_text = f_text
         self.thread = 0
         self.reaper_cell = 0
         self.err_fd = 2
@@ -445,6 +505,7 @@ struct Watch(Movable):
         self.reported_call = 0
         self.warned_full = False
         self.warned_overflow = False
+        self.fr = 0
 
 
 comptime WatchP = Pointer[Watch, MutUntrackedOrigin]
@@ -464,11 +525,31 @@ def _tracker(t: Int) -> TrackerP:
 
 
 @fieldwise_init
+struct GroupFold(Copyable, Movable):
+    """One communicator in a thread's open NCCL group: its calls, folded
+    into the one entry the outermost ncclGroupEnd commits (`commit`), and
+    the flight recorder's view of them -- the calls of the torch-level
+    operation in progress (`entry`, `tag`; `members` if it holds a
+    coalescing block's members, whose own entries are made as they come)
+    and the deferred entries already made (`rids`). Per thread: another thread's group on
+    the same communicator has its own."""
+
+    var watch: Int
+    var tracker: Int
+    var raw: Int
+    var commit: Entry
+    var entry: Entry
+    var tag: Int
+    var members: Bool
+    var rids: List[Int]
+
+
+@fieldwise_init
 struct Level(Copyable, Movable):
     var thread: Int
     var lib: Int
     var depth: Int
-    var pending: List[Int]  # (watch, tracker, raw stream) triples
+    var folds: List[GroupFold]
 
 
 @fieldwise_init
@@ -534,13 +615,13 @@ def group_enter(lib: Int):
         _groups()[].levels[i].depth += 1
         return
     _groups()[].levels.append(
-        Level(external_call["pthread_self", Int](), lib, 1, List[Int]())
+        Level(external_call["pthread_self", Int](), lib, 1, List[GroupFold]())
     )
 
 
 def group_exit(lib: Int, submitted: Bool):
     """The library's ncclGroupEnd returned: at the outermost level, commit
-    every tracker's folded calls (all were submitted just now)."""
+    every communicator's folded calls (all were submitted just now)."""
     var i = _level(_groups(), lib)
     if i < 0:
         return
@@ -548,38 +629,117 @@ def group_exit(lib: Int, submitted: Bool):
     levels[i].depth -= 1
     if levels[i].depth > 0:
         return
-    var pending = levels[i].pending.copy()
+    var folds = levels[i].folds.copy()
     _ = levels.pop(i)
-    for j in range(0, len(pending), 3):
-        _group_commit(pending[j], pending[j + 1], pending[j + 2], submitted)
+    if not submitted:
+        return  # nothing was enqueued; its deferred entries stay unlinked
+    for k in range(len(folds)):
+        var fr = _fr_submit(folds[k])
+        ref f = folds[k]
+        if f.commit.nops != 0:  # a claimed tracker skips it
+            watch_commit(f.watch, f.tracker, f.raw, f.commit.copy(), fr_rid=fr)
 
 
-def group_note(lib: Int, w: Int, t: Int, raw_stream: Int):
+def _fold_of(mut lv: Level, w: Int, t: Int, raw: Int) -> Int:
+    for k in range(len(lv.folds)):
+        if lv.folds[k].tracker == t:
+            return k
+    lv.folds.append(
+        GroupFold(
+            w, t, raw, _empty_entry(), _empty_entry(), 0, False, List[Int]()
+        )
+    )
+    return len(lv.folds) - 1
+
+
+def group_add(lib: Int, w: Int, t: Int, raw: Int, e: Entry, tag: Int):
+    """A library call inside this thread's NCCL group: nothing is enqueued
+    before the outermost ncclGroupEnd, so it is folded into the entry
+    committed there; for the flight recorder, it is part of the torch-level
+    operation `tag` (a new one ends the previous: its entry is made now)."""
     var g = GroupsP(unsafe_from_address=_watch(w)[].groups)
     var i = _level(g, lib)
     if i < 0:
         return
-    ref pending = g[].levels[i].pending
-    for j in range(0, len(pending), 3):
-        if pending[j + 1] == t:
-            return
-    pending.append(w)
-    pending.append(t)
-    pending.append(raw_stream)
+    ref lv = g[].levels[i]
+    ref f = lv.folds[_fold_of(lv, w, t, raw)]
+    _fold(f.commit, e)
+    if _watch(w)[].fr == 0:
+        return
+    if tag & TAG_MEMBER:
+        if f.entry.nops != 0 and not f.members:  # an op before the block
+            _fr_flush(w, f, f.tag)
+        f.members = True
+    else:
+        if f.entry.nops != 0 and (f.members or f.tag != tag):
+            _fr_flush(w, f, f.tag)
+        f.tag = tag
+    _fold(f.entry, e)
+
+
+def _fr_flush(w: Int, mut f: GroupFold, tag: Int):
+    """Make the deferred entry of `f`'s operation (`tag`)."""
+    if f.entry.nops == 0:
+        return
+    ref e = f.entry
+    f.rids.append(
+        fr_deferred(
+            _watch(w)[].fr,
+            e.op,
+            e.nops,
+            e.count,
+            e.dtype,
+            e.root,
+            e.op >= OP_SEND and e.op <= OP_SENDRECV,
+            f.tracker,
+            tag,
+        )
+    )
+    f.entry = _empty_entry()
+    f.tag = 0
+    f.members = False
+
+
+def group_fr_mark(lib: Int, w: Int, t: Int, tag: Int):
+    """A process group's group_end, at any depth: its operation (`tag`;
+    a coalescing block's end) is over, its deferred entry made now."""
+    if t == 0 or _watch(w)[].fr == 0:
+        return
+    var g = GroupsP(unsafe_from_address=_watch(w)[].groups)
+    var i = _level(g, lib)
+    if i < 0:
+        return
+    ref lv = g[].levels[i]
+    for k in range(len(lv.folds)):
+        if lv.folds[k].tracker == t:
+            _fr_flush(w, lv.folds[k], tag)
+
+
+def _fr_submit(mut f: GroupFold) -> Int:
+    """The group was submitted: its last deferred entry on `f`'s
+    communicator is the one the commit stamps, the others complete with
+    it."""
+    var fp = _watch(f.watch)[].fr
+    if fp == 0:
+        return 0
+    _fr_flush(f.watch, f, f.tag)
+    if len(f.rids) == 0:
+        return 0
+    var last = f.rids[len(f.rids) - 1]
+    for r in range(len(f.rids)):
+        fr_link(fp, f.rids[r], last)
+    return last
 
 
 def groups_forget(w: Int):
-    """A watch going away: drop its trackers from every open group."""
+    """A watch going away: drop its communicators from every open group."""
     ref levels = _groups()[].levels
     for i in range(len(levels)):
-        var kept = List[Int]()
-        ref pending = levels[i].pending
-        for j in range(0, len(pending), 3):
-            if pending[j] != w:
-                kept.append(pending[j])
-                kept.append(pending[j + 1])
-                kept.append(pending[j + 2])
-        levels[i].pending = kept^
+        var kept = List[GroupFold]()
+        for k in range(len(levels[i].folds)):
+            if levels[i].folds[k].watch != w:
+                kept.append(levels[i].folds[k].copy())
+        levels[i].folds = kept^
 
 
 # --- producer side (under the backend mutex) ---------------------------------
@@ -623,6 +783,9 @@ def watch_create(
     f_record: Int,
     f_query: Int,
     f_abort: Int,
+    f_async: Int,
+    f_errstr: Int,
+    f_text: Int,
 ) raises -> Int:
     """Allocate the group's watch and start its thread."""
     var box = unsafe_alloc[Watch](1)
@@ -638,6 +801,9 @@ def watch_create(
             f_record,
             f_query,
             f_abort,
+            f_async,
+            f_errstr,
+            f_text,
         )
     )
     var w = Int(box)
@@ -673,7 +839,7 @@ def watch_add(w: Int, device: Int, handle: Int64, ctx: DeviceContext) -> Int:
             )
         return 0
     var box = unsafe_alloc[Tracker](1)
-    box.unsafe_write(Tracker(n, device, handle, ctx))
+    box.unsafe_write(Tracker(w, n, device, handle, ctx))
     var t = Int(box)
     wa.trackers[unsafe_offset=n] = t
     _st(wa.words, W_NTRACK, n + 1)  # publishes the slot
@@ -681,13 +847,67 @@ def watch_add(w: Int, device: Int, handle: Int64, ctx: DeviceContext) -> Int:
 
 
 def watch_claim(t: Int) -> Bool:
-    """Take the right to abort or destroy the tracker's communicator. False:
-    another path (an abort, a destroy, the watchdog) already has it."""
+    """Take the right to abort or destroy the tracker's communicator; the
+    winner calls `watch_release` once that returned. False: another path (an
+    abort, a destroy, the watchdog) already has it."""
     if t == 0:
         return True
-    var ok = _cas(_tracker(t)[].words, T_STATE, 0, 1)
-    _st(_tracker(t)[].words, T_UNWATCHED, 1)
+    ref words = _tracker(t)[].words
+    var ok = False
+    while True:
+        if _cas(words, T_STATE, STATE_LIVE, STATE_CLAIMED):
+            ok = True
+            break
+        var state = _ld(words, T_STATE)
+        if state == STATE_CLAIMED or state == STATE_RELEASED:
+            break
+        # POLLING (the watchdog's host-only library read hands it back
+        # within microseconds), or LIVE again since the exchange: retry.
+        _ = external_call["sched_yield", Int32]()
+    _st(words, T_UNWATCHED, 1)
     return ok
+
+
+def watch_set_fr(w: Int, fp: Int):
+    """Record this group's collectives in the flight recorder from now on
+    (`fp`: flight_recorder.mojo `fr_pg`). Under the backend mutex."""
+    if w != 0:
+        _watch(w)[].fr = fp
+
+
+def watch_release(t: Int):
+    """The `watch_claim` winner's abort or destroy returned. If the exit path
+    left its reaper armed over this claim, the last such release cancels it
+    (`_cancel_reaper` publishes the cell, then looks; this stores, then looks
+    for the cell: one of the two sees the other)."""
+    if t == 0:
+        return
+    ref tr = _tracker(t)[]
+    _st_sc(tr.words, T_STATE, STATE_RELEASED)
+    ref wa = _watch(tr.w)[]
+    var cell = _ld_sc(wa.words, W_RETAINED)
+    if cell != 0 and _idle(wa):
+        _st(WordsP(unsafe_from_address=cell), 1, 1)
+
+
+@always_inline
+def _claimed(tr: Tracker) -> Bool:
+    var state = _ld(tr.words, T_STATE)
+    return state == STATE_CLAIMED or state == STATE_RELEASED
+
+
+def _any_tearing(wa: Watch) -> Bool:
+    """A claimed abort or destroy whose owner has not returned yet."""
+    for i in range(_ld(wa.words, W_NTRACK)):
+        ref tr = _tracker(wa.trackers[unsafe_offset=i])[]
+        if _ld_sc(tr.words, T_STATE) == STATE_CLAIMED:
+            return True
+    return False
+
+
+def _idle(wa: Watch) -> Bool:
+    """No other thread inside a library call or a claimed abort/destroy."""
+    return _ld(wa.words, W_CALL_NS) == 0 and not _any_tearing(wa)
 
 
 def watch_fault(t: Int, rc: Int):
@@ -735,6 +955,25 @@ def _boundary(
     return Boundary(lo, 0)
 
 
+def _fr_ids(w: Int, tr: Tracker, lo: Int, hi: Int) -> List[Int]:
+    """The flight recorder entries of [lo, hi), read before the tail moves
+    past them; stamped by `_fr_stamp` only once that move succeeded (a
+    segment can be recycled only after it, so these reads saw the right
+    slots)."""
+    var ids = List[Int]()
+    if _watch(w)[].fr != 0:
+        for i in range(lo, hi):
+            ids.append(_ld(_slot(tr, i), S_FR))
+    return ids^
+
+
+def _fr_stamp(w: Int, ids: List[Int]):
+    var fp = _watch(w)[].fr
+    var now = perf_counter_ns()
+    for i in range(len(ids)):
+        fr_done(fp, ids[i], now)
+
+
 def _retire_now(w: Int, t: Int):
     """Producer-side retirement, once per segment and never waiting: one
     query of the newest event (all done: everything retires), else the
@@ -754,8 +993,10 @@ def _retire_now(w: Int, t: Int):
             )
         if b.end > tail:
             var seq = _ld(_slot(tr, b.end - 1), S_SEQ)
+            var ids = _fr_ids(w, tr, tail, b.end)
             if _cas(tr.words, T_TAIL, tail, b.end):
                 _st_max(tr.words, T_DONE, seq)
+                _fr_stamp(w, ids)
     except:
         return  # nothing retired: the watchdog sees the same driver state
 
@@ -809,14 +1050,18 @@ def _full(tr: Tracker, head: Int) -> Bool:
     )
 
 
-def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
+def watch_commit(
+    w: Int, t: Int, raw_stream: Int, var e: Entry, tag: Int = 0, fr_rid: Int = 0
+):
     """Record the completion point of what was just enqueued on the comm
     stream as the tracker's next collective. Never waits for the GPU: the
     queue grows by a segment instead; only with a whole table of segments
     in flight are commits dropped, until enough complete. A driver error
     goes to the watchdog (`watch_fault`)."""
     ref tr = _tracker(t)[]
-    if _ld(tr.words, T_FAULT) != 0 or _ld(tr.words, T_STATE) != 0:
+    var fr = fr_rid if fr_rid != 0 else _fr_record(w, t, e, tag)
+    if _ld(tr.words, T_FAULT) != 0 or _claimed(tr):
+        fr_untracked(_watch(w)[].fr, fr)
         return
     var seq = _ld(tr.words, T_SEQ) + 1
     _st(tr.words, T_SEQ, seq)
@@ -838,6 +1083,7 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
                         ),
                     ),
                 )
+            fr_untracked(_watch(w)[].fr, fr)
             return
     if tr.overflowing:
         tr.overflowing = False
@@ -850,11 +1096,13 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
             event = be()[].vendor.value().event_create(tr.ctx, False)
         except:
             watch_fault(t, -1)
+            fr_untracked(_watch(w)[].fr, fr)
             return
         _st(s, S_EVENT, event)
     var rc = call_fn[EventRecordFn](_watch(w)[].f_record)(event, raw_stream)
     if rc != 0:
         watch_fault(t, Int(rc))
+        fr_untracked(_watch(w)[].fr, fr)
         return
     var v = _ld(s, S_VER)
     _st(s, S_VER, v + 1)
@@ -868,6 +1116,7 @@ def watch_commit(w: Int, t: Int, raw_stream: Int, var e: Entry):
     _st(s, S_FP, Int(e.fp & 0x3FFFFFFFFFFFFFFF))
     _st(s, S_ISSUED, perf_counter_ns())
     _st(s, S_CPOS, e.cpos)
+    _st(s, S_FR, fr)
     _st(s, S_VER, v + 2)
     _st(tr.words, T_HEAD, head + 1)
 
@@ -892,10 +1141,21 @@ def watch_test_limit(t: Int, entries: Int):
         _tracker(t)[].inflight_limit = max(min(entries, (NSEG - 1) * SEG), 1)
 
 
-def watch_group_add(t: Int, var e: Entry):
-    """A library call inside an NCCL group: nothing is enqueued before the
-    outermost ncclGroupEnd, so it is folded into one entry committed there."""
-    ref g = _tracker(t)[].g_entry
+def _fr_record(w: Int, t: Int, e: Entry, tag: Int) -> Int:
+    return fr_commit(
+        _watch(w)[].fr,
+        e.op,
+        e.nops,
+        e.count,
+        e.dtype,
+        e.root,
+        e.op >= OP_SEND and e.op <= OP_SENDRECV,
+        t,
+        tag,
+    )
+
+
+def _fold(mut g: Entry, e: Entry):
     if g.nops == 0:
         g = e.copy()  # a group of one hashes like the call itself
         return
@@ -915,20 +1175,14 @@ def watch_group_add(t: Int, var e: Entry):
     g.fp = _mix(_mix(g.fp, Int(e.fp & 0xFFFFFFFF)), Int(e.fp >> 32))
 
 
-def _group_commit(w: Int, t: Int, raw_stream: Int, submitted: Bool):
-    ref tr = _tracker(t)[]
-    var g = tr.g_entry.copy()
-    tr.g_entry = _empty_entry()
-    if g.nops != 0 and submitted:
-        watch_commit(w, t, raw_stream, g^)  # a claimed tracker skips it
-
-
 def _drain(w: Int, t: Int, deadline_ns: Int) -> Bool:
     """Retire everything in flight, waiting for it (a destroy's flush).
     False on a driver error or when the deadline passed first."""
     ref tr = _tracker(t)[]
     var query = call_fn[EventQueryFn](_watch(w)[].f_query)
     while True:
+        if _ld(tr.words, T_FAULT) != 0 or _ld(tr.words, T_ASYNC) != 0:
+            return False  # its queue proves nothing now: abort instead
         var tail = _ld(tr.words, T_TAIL)
         var head = _ld(tr.words, T_HEAD)
         if tail == head:
@@ -943,8 +1197,10 @@ def _drain(w: Int, t: Int, deadline_ns: Int) -> Bool:
             return False
         if b.end > tail:
             var seq = _ld(_slot(tr, b.end - 1), S_SEQ)
+            var ids = _fr_ids(w, tr, tail, b.end)
             if _cas(tr.words, T_TAIL, tail, b.end):
                 _st_max(tr.words, T_DONE, seq)
+                _fr_stamp(w, ids)
             continue
         if perf_counter_ns() > deadline_ns:
             return False
@@ -965,9 +1221,13 @@ def watch_drain(w: Int, deadline_ns: Int) -> Bool:
     for i in range(_ld(wa.words, W_NTRACK)):
         var t = wa.trackers[unsafe_offset=i]
         ref tr = _tracker(t)[]
-        if _ld(tr.words, T_STATE) != 0:
-            continue  # claimed: an abort or the watchdog owns it
-        if _ld(tr.words, T_FAULT) != 0 or _ld(tr.words, T_UNWATCHED) != 0:
+        if _claimed(tr):
+            continue  # an abort or the watchdog owns it
+        if (
+            _ld(tr.words, T_FAULT) != 0
+            or _ld(tr.words, T_ASYNC) != 0
+            or _ld(tr.words, T_UNWATCHED) != 0
+        ):
             drained = False
             continue
         if not _drain(w, t, until):
@@ -1005,14 +1265,15 @@ def watch_stop(w: Int):
 
 
 def _pending(w: Int) -> Bool:
-    """Watched work not finished: a library call blocked on the host, a
-    collective in flight, a driver error not reported yet."""
+    """Watched work not finished: a library call blocked on the host, an
+    abort or destroy another thread claimed, a collective in flight, a
+    driver error not reported yet."""
     ref wa = _watch(w)[]
-    if _ld(wa.words, W_CALL_NS) != 0:
+    if _ld(wa.words, W_CALL_NS) != 0 or _any_tearing(wa):
         return True
     for i in range(_ld(wa.words, W_NTRACK)):
         ref tr = _tracker(wa.trackers[unsafe_offset=i])[]
-        if _ld(tr.words, T_STATE) != 0 or _ld(tr.words, T_UNWATCHED) != 0:
+        if _claimed(tr) or _ld(tr.words, T_UNWATCHED) != 0:
             continue
         if _ld(tr.words, T_FAULT) != 0 and not tr.fault_reported:
             return True
@@ -1027,8 +1288,9 @@ def watch_exit(w: Int):
     the driver tear down under it. Work still pending then is reported --
     unless it already was (report mode) -- and the communicators aborted,
     under a reaper in either mode (an abort can stall behind a stalled
-    kernel); in abort mode the process exits 1. Never waits for the
-    timeout."""
+    kernel); in abort mode the process exits 1. A communicator already
+    reported in error is aborted too, without a second report. Never waits
+    for the timeout."""
     if w == 0:
         return
     ref wa = _watch(w)[]
@@ -1045,23 +1307,67 @@ def watch_exit(w: Int):
     # The thread is gone: retire what completed meanwhile, then look again.
     for i in range(_ld(wa.words, W_NTRACK)):
         var t = wa.trackers[unsafe_offset=i]
-        if _ld(_tracker(t)[].words, T_STATE) == 0:
+        if not _claimed(_tracker(t)[]):
             _retire_now(w, t)
     if not _pending(w):
+        _exit_cleanup(w)
         return
     if _exit_report(w):
         return
-    # Everything pending was reported already (report mode): only abort.
-    watch_note(
-        w,
-        (
-            "exiting with reported collectives still pending; aborting the"
-            " communicators"
-        ),
-    )
+    # Everything pending was reported already (report mode), or is another
+    # thread's abort: only abort, under a reaper that stays armed until
+    # every claimed abort returned.
+    if _any_tearing(wa):
+        watch_note(
+            w,
+            "exiting while another thread is still aborting a"
+            " communicator; exiting with status 1 if that takes more than "
+            + String(ABORT_WAIT_NS // 1_000_000_000)
+            + " s",
+        )
+    else:
+        watch_note(
+            w,
+            (
+                "exiting with reported collectives still pending; aborting the"
+                " communicators"
+            ),
+        )
     if _arm_reaper(w, ABORT_WAIT_NS):
         _abort_all(w)
         _cancel_reaper(w)
+
+
+def _terminal(tr: Tracker) -> Bool:
+    """Made unwatched by a reported driver fault or async error: nothing is
+    pending as far as the exit path counts, yet its kernels may still spin
+    (vendor NCCL's proxy error does not release them)."""
+    return not _claimed(tr) and (
+        _ld(tr.words, T_ASYNC) != 0 or _ld(tr.words, T_FAULT) != 0
+    )
+
+
+def _exit_cleanup(w: Int):
+    """Exit with nothing pending: abort the communicators in error, already
+    reported (report mode). The reaper is armed before anything is looked
+    at, so the only decision is `_cancel_reaper`'s, one observation: an
+    abort another thread claims at any point before it is still bounded."""
+    ref wa = _watch(w)[]
+    if _ld(wa.words, W_NTRACK) == 0 or not _arm_reaper(w, ABORT_WAIT_NS):
+        return
+    var abort = call_fn[CommFn](wa.f_abort)
+    var noted = False
+    for i in range(_ld(wa.words, W_NTRACK)):
+        var t = wa.trackers[unsafe_offset=i]
+        if _terminal(_tracker(t)[]) and watch_claim(t):
+            if not noted:
+                watch_note(
+                    w, "exiting with a communicator in error; aborting it"
+                )
+                noted = True
+            _ = abort(_tracker(t)[].handle)
+            watch_release(t)
+    _cancel_reaper(w)
 
 
 def _exit_report(w: Int) -> Bool:
@@ -1070,7 +1376,8 @@ def _exit_report(w: Int) -> Bool:
     ref wa = _watch(w)[]
     var now = perf_counter_ns()
     var call_ns = _ld(wa.words, W_CALL_NS)
-    if call_ns != 0 and call_ns != wa.reported_call:
+    var aborting = _ld(wa.words, W_CALL_OP) == OP_ABORT and _any_tearing(wa)
+    if call_ns != 0 and call_ns != wa.reported_call and not aborting:
         wa.reported_call = call_ns
         _host_timeout(
             w,
@@ -1084,7 +1391,7 @@ def _exit_report(w: Int) -> Bool:
     for i in range(_ld(wa.words, W_NTRACK)):
         var t = wa.trackers[unsafe_offset=i]
         ref tr = _tracker(t)[]
-        if _ld(tr.words, T_STATE) != 0 or _ld(tr.words, T_UNWATCHED) != 0:
+        if _claimed(tr) or _ld(tr.words, T_UNWATCHED) != 0:
             continue
         var fault = _ld(tr.words, T_FAULT)
         if fault != 0 and not tr.fault_reported:
@@ -1311,10 +1618,14 @@ def _arm_reaper(w: Int, ns: Int) -> Bool:
 
 
 def _cancel_reaper(w: Int):
-    """Unless another thread is still inside a library call (an abort under
-    the in-call mark that may hang): then the deadline stays armed."""
+    """Unless another thread is still inside a library call or an abort it
+    claimed (either may hang): then the deadline stays armed, and the release
+    of the last such claim cancels it (`watch_release`)."""
     ref wa = _watch(w)[]
-    if wa.reaper_cell != 0 and _ld(wa.words, W_CALL_NS) == 0:
+    if wa.reaper_cell == 0:
+        return
+    _st_sc(wa.words, W_RETAINED, wa.reaper_cell)  # publish, then look
+    if _idle(wa):
         _st(WordsP(unsafe_from_address=wa.reaper_cell), 1, 1)
 
 
@@ -1325,6 +1636,7 @@ def _abort_all(w: Int):
         var t = wa.trackers[unsafe_offset=i]
         if watch_claim(t):
             _ = abort(_tracker(t)[].handle)
+            watch_release(t)
 
 
 def _poll(w: Int) -> Bool:
@@ -1365,8 +1677,8 @@ def _teardown(rc: Int32) -> Bool:
 def _poll_tracker(w: Int, t: Int, now: Int) -> Bool:
     ref wa = _watch(w)[]
     ref tr = _tracker(t)[]
-    if _ld(tr.words, T_STATE) != 0 or _ld(tr.words, T_UNWATCHED) != 0:
-        if _ld(tr.words, T_STATE) != 0:
+    if _claimed(tr) or _ld(tr.words, T_UNWATCHED) != 0:
+        if _claimed(tr):
             tr.reported = 0  # claimed (aborted, destroyed): retire its record
             _resolve(wa, tr)
         return True
@@ -1374,6 +1686,9 @@ def _poll_tracker(w: Int, t: Int, now: Int) -> Bool:
     if fault != 0:
         _fault(w, t, "an event record", fault, now)
         return True
+    _poll_async(w, t, now)
+    if _ld(tr.words, T_UNWATCHED) != 0:
+        return True  # an async error was reported: terminal
     if tr.reported != 0 and _ld(tr.words, T_DONE) >= tr.reported:
         tr.reported = 0  # report mode: the reported collective completed
         _resolve(wa, tr)
@@ -1426,9 +1741,11 @@ def _poll_tracker(w: Int, t: Int, now: Int) -> Bool:
         var last_seq = _ld(
             _slot(tr, b.end - 1), S_SEQ
         )  # before: reusable after
+        var ids = _fr_ids(w, tr, tail, b.end)
         if not _cas(tr.words, T_TAIL, tail, b.end):
             return True  # a drain retired entries: look again next round
         _st_max(tr.words, T_DONE, last_seq)
+        _fr_stamp(w, ids)
         for k in range(len(done)):
             tr.hist[unsafe_offset=tr.hist_n % HISTORY] = done[k].copy()
             tr.hist_n += 1
@@ -1449,6 +1766,115 @@ def _poll_tracker(w: Int, t: Int, now: Int) -> Bool:
     return True
 
 
+def _poll_async(w: Int, t: Int, now: Int):
+    """Ask the library for an asynchronous error on the tracker's
+    communicator, as ProcessGroupNCCL's watchdog does every poll: a socket
+    closed by a peer, an IB completion error, a proxy-thread failure (vendor
+    NCCL), a latched device deadline (mojoccl) is then reported within one
+    poll of the library recording it, not at the collective timeout.
+
+    Lifetime: the communicator is freed only by whoever `watch_claim`s it
+    (abort, destroy, the watchdog's own abort). The calls run with T_STATE
+    moved LIVE -> POLLING by compare-exchange, so they never start on a
+    claimed communicator, and a claimer retries until it moves LIVE ->
+    CLAIMED itself. Both calls only read host memory and write nothing
+    (vendor NCCL: atomic loads of comm->asyncResult and the proxy's; its GIN
+    branch, which takes a shared mutex and asks the GIN plugin, runs only
+    for communicators with device-API GIN connected, which this backend
+    never creates; mojoccl: its peek and fault text), so the wait is
+    microseconds and nothing here takes the backend mutex or blocks. The
+    report goes out after T_STATE is LIVE again, through the bounded
+    writer."""
+    ref wa = _watch(w)[]
+    ref tr = _tracker(t)[]
+    if wa.f_async == 0:
+        return
+    if not _cas(tr.words, T_STATE, STATE_LIVE, STATE_POLLING):
+        return  # claimed meanwhile
+    var err = Int32(0)
+    var rc = call_fn[AsyncErrorFn](wa.f_async)(
+        tr.handle, Pointer(to=err).unsafe_origin_cast[MutAnyOrigin]()
+    )
+    var failed = rc != 0 or (err != 0 and err != NCCL_IN_PROGRESS)
+    var detail = String("")
+    if failed and wa.f_text != 0:
+        var buf = unsafe_alloc[UInt8](TEXT_CAP)
+        var n = call_fn[ErrorTextFn](wa.f_text)(
+            tr.handle, Int(buf), Int64(TEXT_CAP)
+        )
+        # A copy (buf is freed next); lossy: TEXT_CAP may split a sequence.
+        detail = String(
+            from_utf8_lossy=Span[UInt8, MutUntrackedOrigin](
+                unsafe_ptr=buf, length=min(max(Int(n), 0), TEXT_CAP)
+            )
+        )
+        buf.unsafe_free()
+    _st(tr.words, T_STATE, STATE_LIVE)
+    if not failed:
+        return
+    var code = Int(rc) if rc != 0 else Int(err)
+    # Before the report: a destroy draining meanwhile aborts instead.
+    _st(tr.words, T_ASYNC, code)
+    _async_error(w, t, code, rc != 0, detail, now)
+    # Report mode: terminal, like a driver fault. Unwatched, the incident
+    # is resolved only when the communicator is claimed, never by a
+    # collective that completes later.
+    _st(tr.words, T_UNWATCHED, 1)
+
+
+def _error_string(wa: Watch, code: Int) -> String:
+    if wa.f_errstr == 0:
+        return String("error ") + String(code)
+    var text = call_fn[ErrorStringFn](wa.f_errstr)(Int32(code))
+    return String(unsafe_from_utf8_ptr=text)
+
+
+def _async_error(
+    w: Int, t: Int, code: Int, query_failed: Bool, detail: String, now: Int
+):
+    """The library's asynchronous error, or a failure of the query itself:
+    reported like a timeout (abort mode: abort and exit; report mode: once
+    per communicator)."""
+    ref wa = _watch(w)[]
+    ref tr = _tracker(t)[]
+    var p = _prefix(wa.rank)
+    var msg = p + "Watchdog: "
+    if query_failed:
+        msg += "the collectives library's asynchronous-error query failed"
+    else:
+        msg += "the collectives library reports an asynchronous error"
+    msg += (
+        " on device "
+        + String(tr.device)
+        + ": "
+        + _error_string(wa, code)
+        + " (ncclResult_t "
+        + String(code)
+        + "): a peer exited or a link failed, and collectives on this"
+        " communicator cannot complete.\n"
+    )
+    if detail.byte_length() > 0:
+        msg += p + "  " + detail + "\n"
+    var tail = _ld(tr.words, T_TAIL)
+    var head = _ld(tr.words, T_HEAD)
+    var pending = _pending(tr, tail, head)
+    msg += _history(
+        tr, pending, head - tail - len(pending), now, wa.rank, mark=""
+    )
+    wa.incident += 1
+    tr.published = True
+    var e = _empty_entry()
+    var fr = 0
+    if len(pending) > 0:
+        e = pending[0].copy()
+        fr = _ld(_slot(tr, tail), S_FR)
+    else:
+        e.seq = _ld(tr.words, T_DONE) + 1
+    var line = _line(wa, tr, e^, 0, "async", False, fr)
+    line = line.replace(" where=async", " where=async code=" + String(code))
+    _fail(w, msg^, line)
+
+
 def _pending(tr: Tracker, tail: Int, head: Int) -> List[Entry]:
     """Up to HISTORY in-flight entries from the oldest; empty when a slot
     was being rewritten or the tail moved (the report is then moot)."""
@@ -1464,7 +1890,12 @@ def _pending(tr: Tracker, tail: Int, head: Int) -> List[Entry]:
 
 
 def _history(
-    tr: Tracker, pending: List[Entry], more: Int, now: Int, rank: Int
+    tr: Tracker,
+    pending: List[Entry],
+    more: Int,
+    now: Int,
+    rank: Int,
+    mark: StaticString = "  <-- timed out",
 ) -> String:
     var p = _prefix(rank)
     var s = (
@@ -1481,7 +1912,7 @@ def _history(
         s += p + "    #" + String(pending[k].seq) + " "
         s += _describe(pending[k].copy())
         s += "  pending for " + _secs(now - pending[k].issued_ns)
-        s += "  <-- timed out\n" if k == 0 else "\n"
+        s += String(mark) + "\n" if k == 0 else "\n"
     if more > 0:
         s += p + "    ... and " + String(more) + " more pending\n"
     return s
@@ -1494,6 +1925,7 @@ def _line(
     age_ns: Int,
     kind: StaticString,
     at_exit: Bool = False,
+    fr: Int = 0,
 ) -> String:
     """The machine-readable line for the Python desync reporter: `id` is the
     incident, `tid` the communicator (-1: a call blocked on the host)."""
@@ -1530,6 +1962,8 @@ def _line(
         + String(age_ns // 1_000_000)
         + " where="
         + String(kind)
+        + " fr="
+        + String(fr)
         + (" exit=1" if at_exit else "")
         + "\n"
     )
@@ -1575,7 +2009,15 @@ def _device_timeout(
     msg += _history(tr, pending, head - tail - len(pending), now, wa.rank)
     wa.incident += 1
     tr.published = True
-    var line = _line(wa, tr, pending[0].copy(), age, "device", at_exit)
+    var line = _line(
+        wa,
+        tr,
+        pending[0].copy(),
+        age,
+        "device",
+        at_exit,
+        _ld(_slot(tr, tail), S_FR),
+    )
     _fail(w, msg^, line, at_exit)
 
 
@@ -1609,7 +2051,7 @@ def _host_timeout(
     var line = String("")
     for i in range(_ld(wa.words, W_NTRACK)):
         ref tr = _tracker(wa.trackers[unsafe_offset=i])[]
-        if _ld(tr.words, T_STATE) != 0:
+        if _claimed(tr):
             continue
         if device >= 0 and tr.device != device:
             continue

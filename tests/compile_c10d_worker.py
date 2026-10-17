@@ -10,6 +10,7 @@ eagerly on the mojo device. Exits non-zero on failure.
 # ruff: noqa: E402 -- use_local_rank_gpu() must run before torch/MAX initialize
 import datetime
 import os
+import pickle
 import sys
 import time
 from collections.abc import Callable
@@ -21,6 +22,7 @@ use_local_rank_gpu()
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
+from torch._C import _distributed_c10d as c10d_c
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (
@@ -382,6 +384,49 @@ def run_unsupported(failures: list[str]):
 DESYNC_TIMEOUT_S = 10
 
 
+def run_flight_recorder(failures: list[str]):
+    """A collective of a compiled graph is in the flight recorder between the
+    eager ones around it, with the next seq id (it shares the communicator's
+    counter) and no Python stack (a graph has none)."""
+    dev = torch.accelerator.current_accelerator()
+    assert dev is not None
+    group = _world()
+
+    @torch.compile(backend=mojo_backend, fullgraph=True)
+    def reduce(x: torch.Tensor) -> torch.Tensor:
+        return funcol.all_reduce(x, "sum", group) + 1
+
+    x = torch.ones(16, device=dev)
+    reduce(x).cpu()  # compile (and its collective) out of the way
+    dist.all_reduce(x)
+    reduce(x).cpu()
+    dist.all_reduce(x)
+    torch.accelerator.synchronize()
+    time.sleep(0.5)  # the watchdog retires (stamps) them within a poll
+    entries = pickle.loads(c10d_c._dump_nccl_trace())["entries"]  # ty: ignore[unresolved-attribute] -- stubbed for CUDA builds only; register_mojo_devices() installs it
+    last = entries[-3:]
+    _check(
+        failures,
+        "fr.compiled_between_eager",
+        [e["profiling_name"] for e in last] == ["nccl:all_reduce"] * 3
+        and [e["collective_seq_id"] for e in last]
+        == [last[0]["collective_seq_id"] + i for i in range(3)]
+        and last[0]["frames"]
+        and last[1]["frames"] == []
+        and last[1]["input_sizes"] == [[16]]
+        and all(e["state"] == "completed" for e in last),
+        str(
+            [
+                {
+                    k: e[k]
+                    for k in ("profiling_name", "collective_seq_id", "input_sizes")
+                }
+                for e in last
+            ]
+        ),
+    )
+
+
 def run_desync_compiled():
     """A collective issued from a graph compiled with `mojo_backend` that the
     other rank never issues: the watchdog reports it (collective #2 of a
@@ -435,6 +480,8 @@ def main():
         run_tensor_parallel(failures)
     elif mode == "unsupported":
         run_unsupported(failures)
+    elif mode == "flight_recorder":
+        run_flight_recorder(failures)
     elif mode == "desync_compiled":
         run_desync_compiled()
     else:

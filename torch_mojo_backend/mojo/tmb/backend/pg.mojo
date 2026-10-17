@@ -16,6 +16,9 @@ holds the backend mutex over its whole body itself (`with Locked():`).
 
 Every entry that enqueues collective work calls `PG.track` after it, which
 is what the collective watchdog (watchdog.mojo) watches; a new one must too.
+Each takes the flight recorder's tag word of the Python call (`tag`, 0 if
+none) and hands it to `track` (`group_end` to `group_fr_mark`): the entries
+it causes record it.
 """
 from std.collections import Dict
 from std.ffi import OwnedDLHandle, c_char, external_call
@@ -29,6 +32,15 @@ from tmb.backend.device import (
     dev,
     set_error,
     stream_ctx,
+)
+from tmb.backend.flight_recorder import (
+    fr_after_fork,
+    fr_init,
+    fr_member,
+    fr_pg,
+    fr_ring,
+    fr_selftest,
+    fr_snapshot,
 )
 from tmb.backend.vendor import raw_stream_of
 from tmb.backend.watchdog import (
@@ -49,10 +61,12 @@ from tmb.backend.watchdog import (
     call_fp,
     group_enter,
     group_exit,
-    group_note,
+    group_add,
+    group_fr_mark,
     group_open,
     watch_add,
     watch_claim,
+    watch_release,
     watch_commit,
     watch_create,
     watch_deadline_ns,
@@ -62,9 +76,9 @@ from tmb.backend.watchdog import (
     watch_note,
     watch_exit,
     watch_test_limit,
-    watch_group_add,
     watch_next_cpos,
     watch_process_exiting,
+    watch_set_fr,
 )
 
 comptime UID_BYTES = 128
@@ -147,6 +161,8 @@ struct PG(Movable):
     var watch: Int  # the collective watchdog (watchdog.mojo), 0 when off
     var timeout_ns: Int  # init_process_group's timeout, 0 when unknown
     var closing: Bool  # destroyed or being destroyed: every entry fails
+    var fr: Int  # its flight recorder state (flight_recorder.mojo), 0 if off
+    var test_abort_stall_ns: Int  # test hook: tmb_pg_abort sleeps once claimed
 
     def __init__(out self, path: String, rank: Int, world: Int) raises:
         self.lib = OwnedDLHandle(path)
@@ -167,6 +183,8 @@ struct PG(Movable):
         self.watch = 0
         self.timeout_ns = 0
         self.closing = False
+        self.fr = 0
+        self.test_abort_stall_ns = 0
 
     def symbol(self, name: String) raises -> Int:
         return _symbol(self.lib, name)
@@ -222,9 +240,11 @@ struct PG(Movable):
         dtype: Int32,
         root: Int = -1,
         redop: Int = -1,
+        tag: Int = 0,
     ):
         """Hand what a library call just enqueued on `c`'s comm stream to the
-        watchdog. Call it right after every successful call that enqueues
+        watchdog (and the flight recorder: `tag` is the Python call's tag
+        word, 0 if none). Call it right after every successful call that enqueues
         collective work there (`root` is the root or peer, `redop` the
         reduction). Inside an NCCL group -- this thread's, on this library,
         whichever process group opened it -- the calls are folded into one
@@ -246,10 +266,21 @@ struct PG(Movable):
             watch_next_cpos(c.tracker, op),
         )
         if group_open(self.watch, self.f_group_start):
-            watch_group_add(c.tracker, e^)
-            group_note(self.f_group_start, self.watch, c.tracker, c.raw)
+            # first: an operation before a block's first member is recorded
+            # before the member, as it was issued
+            group_add(self.f_group_start, self.watch, c.tracker, c.raw, e, tag)
+            fr_member(
+                self.fr,
+                op,
+                count,
+                d,
+                root,
+                op == OP_SEND or op == OP_RECV,
+                c.tracker,
+                tag,
+            )
         else:
-            watch_commit(self.watch, c.tracker, c.raw, e^)
+            watch_commit(self.watch, c.tracker, c.raw, e^, tag)
 
     def sync_in(self, c: Comm) raises:
         """The comm stream waits for everything the caller's current stream has
@@ -357,6 +388,7 @@ def tmb_pg_destroy(p: Int) abi("C"):
                 if watch_claim(c.tracker):
                     with InCall(w, OP_ABORT, c.device):
                         _ = f(c.handle)
+                    watch_release(c.tracker)
             if be()[].vendor:
                 for item in box[].graph_events.items():
                     for ev in item.value:
@@ -475,7 +507,13 @@ def tmb_pg_comm_stream(p: Int, device: Int32) abi("C") -> Int64:
 
 
 def tmb_pg_allreduce(
-    p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, op: Int32
+    p: Int,
+    device: Int32,
+    ptr: Int,
+    count: Int,
+    dtype: Int32,
+    op: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
@@ -488,7 +526,9 @@ def tmb_pg_allreduce(
                     ptr, ptr, count, dtype, op, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclAllReduce")
-            pg[].track(c, OP_ALLREDUCE, count, dtype, redop=Int(op))
+            pg[].track(
+                c, OP_ALLREDUCE, count, dtype, redop=Int(op), tag=Int(tag)
+            )
             return 0
         except e:
             set_error(String(e))
@@ -496,7 +536,13 @@ def tmb_pg_allreduce(
 
 
 def tmb_pg_broadcast(
-    p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, root: Int32
+    p: Int,
+    device: Int32,
+    ptr: Int,
+    count: Int,
+    dtype: Int32,
+    root: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
@@ -509,7 +555,9 @@ def tmb_pg_broadcast(
                     ptr, ptr, count, dtype, root, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclBroadcast")
-            pg[].track(c, OP_BROADCAST, count, dtype, root=Int(root))
+            pg[].track(
+                c, OP_BROADCAST, count, dtype, root=Int(root), tag=Int(tag)
+            )
             return 0
         except e:
             set_error(String(e))
@@ -524,6 +572,7 @@ def tmb_pg_reduce(
     dtype: Int32,
     op: Int32,
     root: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
@@ -537,7 +586,13 @@ def tmb_pg_reduce(
                 )
             pg[].check(rc, "ncclReduce")
             pg[].track(
-                c, OP_REDUCE, count, dtype, root=Int(root), redop=Int(op)
+                c,
+                OP_REDUCE,
+                count,
+                dtype,
+                root=Int(root),
+                redop=Int(op),
+                tag=Int(tag),
             )
             return 0
         except e:
@@ -546,7 +601,13 @@ def tmb_pg_reduce(
 
 
 def tmb_pg_allgather(
-    p: Int, device: Int32, send: Int, recv: Int, count: Int, dtype: Int32
+    p: Int,
+    device: Int32,
+    send: Int,
+    recv: Int,
+    count: Int,
+    dtype: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     """recv[world * count] <- every rank's send[count]."""
     with Locked():
@@ -560,7 +621,7 @@ def tmb_pg_allgather(
                     send, recv, count, dtype, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclAllGather")
-            pg[].track(c, OP_ALLGATHER, count, dtype)
+            pg[].track(c, OP_ALLGATHER, count, dtype, tag=Int(tag))
             return 0
         except e:
             set_error(String(e))
@@ -575,6 +636,7 @@ def tmb_pg_reduce_scatter(
     count: Int,
     dtype: Int32,
     op: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     """recv[count] <- reduce of send[world * count] chunk `rank`."""
     with Locked():
@@ -588,7 +650,9 @@ def tmb_pg_reduce_scatter(
                     send, recv, count, dtype, op, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclReduceScatter")
-            pg[].track(c, OP_REDUCE_SCATTER, count, dtype, redop=Int(op))
+            pg[].track(
+                c, OP_REDUCE_SCATTER, count, dtype, redop=Int(op), tag=Int(tag)
+            )
             return 0
         except e:
             set_error(String(e))
@@ -596,7 +660,13 @@ def tmb_pg_reduce_scatter(
 
 
 def tmb_pg_send(
-    p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, peer: Int32
+    p: Int,
+    device: Int32,
+    ptr: Int,
+    count: Int,
+    dtype: Int32,
+    peer: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
@@ -609,7 +679,7 @@ def tmb_pg_send(
                     ptr, count, dtype, peer, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclSend")
-            pg[].track(c, OP_SEND, count, dtype, root=Int(peer))
+            pg[].track(c, OP_SEND, count, dtype, root=Int(peer), tag=Int(tag))
             return 0
         except e:
             set_error(String(e))
@@ -617,7 +687,13 @@ def tmb_pg_send(
 
 
 def tmb_pg_recv(
-    p: Int, device: Int32, ptr: Int, count: Int, dtype: Int32, peer: Int32
+    p: Int,
+    device: Int32,
+    ptr: Int,
+    count: Int,
+    dtype: Int32,
+    peer: Int32,
+    tag: Int64,
 ) abi("C") -> Int32:
     with Locked():
         try:
@@ -630,7 +706,7 @@ def tmb_pg_recv(
                     ptr, count, dtype, peer, c.handle, Int64(c.raw)
                 )
             pg[].check(rc, "ncclRecv")
-            pg[].track(c, OP_RECV, count, dtype, root=Int(peer))
+            pg[].track(c, OP_RECV, count, dtype, root=Int(peer), tag=Int(tag))
             return 0
         except e:
             set_error(String(e))
@@ -651,11 +727,15 @@ def tmb_pg_group_start(p: Int) abi("C") -> Int32:
             return 1
 
 
-def tmb_pg_group_end(p: Int) abi("C") -> Int32:
+def tmb_pg_group_end(p: Int, tag: Int64) abi("C") -> Int32:
     with Locked():
         try:
             var pg = _pg(p)
             pg[].open_or_raise()
+            for c in pg[].comms.values():  # its operation (`tag`) ends
+                group_fr_mark(
+                    pg[].f_group_start, pg[].watch, c.tracker, Int(tag)
+                )
             var rc: Int32
             with InCall(pg[].watch, OP_GROUP_END, -1):
                 rc = call_fn[GroupFn](pg[].f_group_end)()
@@ -695,9 +775,12 @@ def tmb_pg_abort(p: Int, device: Int32) abi("C") -> Int32:
             _ = pg[].comms.pop(Int(device))
             if not watch_claim(c.tracker):
                 return 0  # the watchdog is aborting it (and exiting)
+            if pg[].test_abort_stall_ns > 0:  # test hook: a slow abort
+                sleep(Float64(pg[].test_abort_stall_ns) / 1.0e9)
             var rc: Int32
             with InCall(pg[].watch, OP_ABORT, c.device):
                 rc = call_fn[CommFn](pg[].symbol("ncclCommAbort"))(c.handle)
+            watch_release(c.tracker)
             pg[].check(rc, "ncclCommAbort")
             return 0
         except e:
@@ -837,6 +920,23 @@ def tmb_pg_graph_start(
             return 1
 
 
+def _optional_symbol(lib: OwnedDLHandle, name: StaticString) -> Int:
+    var f = lib.get_symbol[NoneType](name)
+    return Int(f.value()) if f else 0
+
+
+def _async_error_symbol(lib: OwnedDLHandle) raises -> Int:
+    """What the watchdog polls for an asynchronous error: mojoccl's host-only
+    `mojocclCommPeekAsyncError` when the library has it (its full
+    ncclCommGetAsyncError may take the submission lock and copy a word off
+    the device), else ncclCommGetAsyncError (vendor NCCL: atomic loads of
+    host state, see `_poll_async`)."""
+    var peek = _optional_symbol(lib, "mojocclCommPeekAsyncError")
+    if peek != 0:
+        return peek
+    return _symbol(lib, "ncclCommGetAsyncError")
+
+
 def tmb_pg_watchdog(
     p: Int,
     timeout_ms: Int64,
@@ -872,6 +972,9 @@ def tmb_pg_watchdog(
                 _symbol(v.lib, v.names.event_record),
                 _symbol(v.lib, v.names.event_query),
                 pg[].symbol("ncclCommAbort"),
+                _async_error_symbol(pg[].lib),
+                pg[].symbol("ncclGetErrorString"),
+                _optional_symbol(pg[].lib, "mojocclCommAsyncErrorText"),
             )
             return 0
         except e:
@@ -928,13 +1031,66 @@ def tmb_pg_watchdog_test_fault(p: Int, device: Int32) abi("C"):
             set_error(String(e))
 
 
+def tmb_pg_test_abort_stall(p: Int, ms: Int32) abi("C"):
+    """Test hook: every later abort sleeps `ms` once it has claimed its
+    communicator, as a preempted or slow abort would."""
+    with Locked():
+        _pg(p)[].test_abort_stall_ns = Int(ms) * 1_000_000
+
+
 def tmb_pg_watchdog_process_exiting() abi("C"):
     """Interpreter exit: every watch -- a group being shut down on another
     thread included -- takes driver teardown for a quiet stop."""
     watch_process_exiting()
 
 
-comptime PG_VTABLE_SLOTS = 25
+def tmb_pg_fr_init(size: Int64) abi("C") -> Int:
+    """The flight recorder's ring, made with `size` entries on the first
+    call: the address of its header, whose word 2 is the tag word
+    flight_recorder.py writes. 0 when `size` is 0."""
+    with Locked():
+        return fr_init(Int(size))
+
+
+def tmb_pg_fr_attach(p: Int, pg_id: Int64) abi("C") -> Int32:
+    """Record the group's collectives in the flight recorder as `pg_id`.
+    Needs the ring and the group's watchdog (the recorder follows it)."""
+    with Locked():
+        try:
+            var pg = _pg(p)
+            pg[].open_or_raise()
+            var ring = fr_ring()
+            if ring == 0 or pg[].watch == 0:
+                raise Error(
+                    "the flight recorder needs its ring and the watchdog"
+                )
+            if pg[].fr == 0:
+                pg[].fr = fr_pg(ring, Int(pg_id))
+                watch_set_fr(pg[].watch, pg[].fr)
+            return 0
+        except e:
+            set_error(String(e))
+            return 1
+
+
+def tmb_pg_fr_snapshot(buf: Int, cap: Int64) abi("C") -> Int64:
+    """Copy up to `cap` flight recorder entries, oldest first, into `buf`
+    (flight_recorder.mojo F_WORDS int64 words each). No backend mutex: a
+    dump must work while a hung thread holds it."""
+    return Int64(fr_snapshot(buf, Int(cap)))
+
+
+def tmb_pg_fr_selftest() abi("C") -> Int64:
+    """Test hook: flight_recorder.mojo `fr_selftest` (0 when it passes)."""
+    return Int64(fr_selftest())
+
+
+def tmb_pg_fr_after_fork() abi("C"):
+    """A forked child: flight_recorder.mojo `fr_after_fork`."""
+    fr_after_fork()
+
+
+comptime PG_VTABLE_SLOTS = 31
 
 
 def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
@@ -944,7 +1100,8 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     11 send, 12 recv, 13 group_start, 14 group_end, 15 async_error, 16 abort,
     17 synchronize_comm, 18 graph_start, 19 graph_wait, 20 watchdog,
     21 watchdog_exit, 22 watchdog_test_fault, 23 watchdog_test_limit,
-    24 watchdog_process_exiting.
+    24 watchdog_process_exiting, 25 fr_init, 26 fr_attach, 27 fr_snapshot,
+    28 fr_selftest, 29 fr_after_fork, 30 test_abort_stall.
     """
     var t = unsafe_alloc[Int](PG_VTABLE_SLOTS)
     var f0: def(Pointer[c_char, MutUntrackedOrigin], Int32, Int32) thin abi(
@@ -959,29 +1116,29 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
         "C"
     ) -> Int32 = tmb_pg_init_device
     var f5: def(Int, Int32) thin abi("C") -> Int64 = tmb_pg_comm_stream
-    var f6: def(Int, Int32, Int, Int, Int32, Int32) thin abi(
+    var f6: def(Int, Int32, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_allreduce
-    var f7: def(Int, Int32, Int, Int, Int32, Int32) thin abi(
+    var f7: def(Int, Int32, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_broadcast
-    var f8: def(Int, Int32, Int, Int, Int32, Int32, Int32) thin abi(
+    var f8: def(Int, Int32, Int, Int, Int32, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_reduce
-    var f9: def(Int, Int32, Int, Int, Int, Int32) thin abi(
+    var f9: def(Int, Int32, Int, Int, Int, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_allgather
-    var f10: def(Int, Int32, Int, Int, Int, Int32, Int32) thin abi(
+    var f10: def(Int, Int32, Int, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_reduce_scatter
-    var f11: def(Int, Int32, Int, Int, Int32, Int32) thin abi(
+    var f11: def(Int, Int32, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_send
-    var f12: def(Int, Int32, Int, Int, Int32, Int32) thin abi(
+    var f12: def(Int, Int32, Int, Int, Int32, Int32, Int64) thin abi(
         "C"
     ) -> Int32 = tmb_pg_recv
     var f13: def(Int) thin abi("C") -> Int32 = tmb_pg_group_start
-    var f14: def(Int) thin abi("C") -> Int32 = tmb_pg_group_end
+    var f14: def(Int, Int64) thin abi("C") -> Int32 = tmb_pg_group_end
     var f15: def(Int, Int32) thin abi("C") -> Int32 = tmb_pg_async_error
     var f16: def(Int, Int32) thin abi("C") -> Int32 = tmb_pg_abort
     var f17: def(Int, Int32) thin abi("C") -> Int32 = tmb_pg_synchronize_comm
@@ -1000,6 +1157,12 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
         "C"
     ) -> None = tmb_pg_watchdog_test_limit
     var f24: def() thin abi("C") -> None = tmb_pg_watchdog_process_exiting
+    var f25: def(Int64) thin abi("C") -> Int = tmb_pg_fr_init
+    var f26: def(Int, Int64) thin abi("C") -> Int32 = tmb_pg_fr_attach
+    var f27: def(Int, Int64) thin abi("C") -> Int64 = tmb_pg_fr_snapshot
+    var f28: def() thin abi("C") -> Int64 = tmb_pg_fr_selftest
+    var f29: def() thin abi("C") -> None = tmb_pg_fr_after_fork
+    var f30: def(Int, Int32) thin abi("C") -> None = tmb_pg_test_abort_stall
     t[unsafe_offset=0] = Pointer(to=f0).unsafe_bitcast[Int]()[]
     t[unsafe_offset=1] = Pointer(to=f1).unsafe_bitcast[Int]()[]
     t[unsafe_offset=2] = Pointer(to=f2).unsafe_bitcast[Int]()[]
@@ -1025,4 +1188,10 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=22] = Pointer(to=f22).unsafe_bitcast[Int]()[]
     t[unsafe_offset=23] = Pointer(to=f23).unsafe_bitcast[Int]()[]
     t[unsafe_offset=24] = Pointer(to=f24).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=25] = Pointer(to=f25).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=26] = Pointer(to=f26).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=27] = Pointer(to=f27).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=28] = Pointer(to=f28).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=29] = Pointer(to=f29).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=30] = Pointer(to=f30).unsafe_bitcast[Int]()[]
     return t

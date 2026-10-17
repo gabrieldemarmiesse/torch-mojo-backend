@@ -11,6 +11,7 @@ import itertools
 import math
 import operator
 import struct
+import sys
 from collections.abc import Callable, Sequence
 from typing import Literal, TypeVar, cast
 
@@ -30,11 +31,12 @@ from max.nn.attention import MHAMaskVariant
 from max.nn.kernels import flash_attention_gpu
 from torch._decomp import core_aten_decompositions
 from torch._ops import OpOverload, OpOverloadPacket
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 # torch.ops is a `_Ops` instance registered into sys.modules at runtime
 # (torch/_ops.py), not a real package on disk, so no static resolver can
 # see `torch/ops/__init__.py` or `torch/ops.py`.
-from torch.ops import aten  # ty: ignore[unresolved-import]
+from torch.ops import aten, prims  # ty: ignore[unresolved-import]
 
 import torch_mojo_backend.is_running_tests
 from torch_mojo_backend import custom_mojo_ops
@@ -134,6 +136,81 @@ def _only_first_output_used() -> bool:
     return all(
         user.target is operator.getitem and user.args[1] == 0 for user in node.users
     )
+
+
+# The compiler's SymInt -> MAX Dim conversion (over the graph's symbols), set
+# next to CURRENT_FX_NODE: raises NotImplementedError for an expression MAX
+# Dims cannot express.
+CURRENT_SYMINT_RESOLVER: contextvars.ContextVar[
+    Callable[[torch.SymInt | int], Dim | int] | None
+] = contextvars.ContextVar("CURRENT_SYMINT_RESOLVER", default=None)
+
+
+# The ids of the current node's operands that are 0-d CPU tensors in the
+# trace (moved to the op's device by the compiler), set next to
+# CURRENT_FX_NODE: CUDA computes with a CPU scalar in opmath, as with a number,
+# but rounds a 0-d device tensor to the result dtype first.
+CURRENT_CPU_SCALARS: contextvars.ContextVar[frozenset[int]] = contextvars.ContextVar(
+    "CURRENT_CPU_SCALARS", default=frozenset()
+)
+
+
+def _traced_branch(cond: bool | torch.SymBool) -> bool:
+    """The branch tracing took on a SymInt comparison: decided by the value
+    ranges, else by the example values (whose guards hold on every call)."""
+    if isinstance(cond, bool):
+        return cond
+    if statically_known_true(cond):
+        return True
+    if statically_known_true(torch.sym_not(cond)):
+        return False
+    hint = cond.node.hint
+    if hint is None:
+        raise NotImplementedError(f"{cond} has no example value")
+    return bool(hint)
+
+
+def _traced_slice_bounds(dim: int) -> tuple[Dim | int, Dim | int] | None:
+    """The current `aten.slice` node's start and end, normalized as ATen does
+    (negative counts from the end, clamped to the size; slice_forward in
+    torch/_decomp/decompositions.py) on the traced SymInts, whose guards
+    decide each branch."""
+    node = CURRENT_FX_NODE.get()
+    resolve = CURRENT_SYMINT_RESOLVER.get()
+    if node is None or resolve is None or node.target is not aten.slice.Tensor:
+        return None
+
+    def traced(index: int, name: str, default: int) -> torch.SymInt | int:
+        arg = node.args[index] if index < len(node.args) else node.kwargs.get(name)
+        value = arg.meta["val"] if isinstance(arg, torch.fx.Node) else arg
+        if value is None:
+            return default
+        assert isinstance(value, torch.SymInt | int)
+        return value
+
+    base = node.args[0]
+    assert isinstance(base, torch.fx.Node)
+    size = base.meta["val"].shape[dim]
+    start = traced(2, "start", 0)
+    end = traced(3, "end", sys.maxsize)
+    step = traced(4, "step", 1)
+    if _traced_branch(start < 0):
+        start = start + size
+    if _traced_branch(end < 0):
+        end = end + size
+    if _traced_branch(start < 0):
+        start = 0
+    elif _traced_branch(start > size):
+        start = size
+    if statically_known_true(end == sys.maxsize) or _traced_branch(end > size):
+        end = size
+    elif _traced_branch(end < start):
+        end = start
+    # the traced output has exactly this length, or a branch was misread
+    length = (end - start + step - 1) // step
+    if not statically_known_true(length == node.meta["val"].shape[dim]):
+        raise NotImplementedError(f"slice bounds {start}:{end} do not match the trace")
+    return resolve(start), resolve(end)
 
 
 # The compiler's fx-node -> MAX-value resolver (`TensorsBook.convert_to_max`),
@@ -442,64 +519,82 @@ def map_to(func: OpOverload | OpOverloadPacket) -> Callable[[_F], _F]:
 # Add direct mappings with decorators
 
 
-def get_float_dtype(x: MaxTensor, y: MaxTensor) -> DType | None:
-    for t in (x, y):
-        if t.dtype.is_float():
-            return t.dtype
-    return None
-
-
-def get_int_dtype(x: MaxTensor, y: MaxTensor) -> DType | None:
-    for t in (x, y):
-        if t.dtype.is_integral():
-            return t.dtype
-    return None
-
-
 def _materialize_dim(dim: Dim, like: MaxTensor | None = None) -> MaxTensor:
-    """A symbolic Dim as a scalar tensor, usable in tensor arithmetic.
-
-    torch treats SymInt operands like python scalars: the result keeps the
-    tensor operand's dtype, so cast to `like`'s dtype (and move to its
-    device) when a companion tensor is given.
-    """
-    t = max_ops.shape_to_tensor([dim])
-    t = F.reshape(t, [])
-    if like is not None:
-        t = F.cast(t, dtype=like.dtype)
-        if t.device != like.device:
-            t = _transfer_to(t, like.device)
+    """A symbolic Dim as an int64 scalar tensor, moved to `like`'s device."""
+    t = F.reshape(max_ops.shape_to_tensor([dim]), [])
+    if like is not None and t.device != like.device:
+        t = _transfer_to(t, like.device)
     return t
 
 
 def type_promotion(
     x: MaxTensor | Scalar, y: MaxTensor | Scalar
-) -> tuple[MaxTensor | int | float, MaxTensor | int | float]:
+) -> tuple[MaxTensor | int | float, MaxTensor | int | float, DType]:
+    """ATen's type promotion of a binary op's operands: the result dtype
+    (`torch.result_type`) and the operands in the dtype to compute in, a
+    symbolic Dim (a SymInt) made a tensor of it. A 0-d tensor or a number
+    only promotes across categories, so `bool_tensor * s` is int64 but
+    `fp16_tensor * s` stays fp16. As CUDA's opmath kernels do, a half
+    result with a scalar of another dtype (a number, a SymInt, a 0-d CPU
+    tensor) computes in float32, rounded once by the caller (`_round_to`);
+    a 0-d device tensor is rounded to the result dtype first. (CPU eager
+    rounds an add/sub scalar first: CUDA is the reference.) A Python number
+    stays one."""
     if isinstance(x, Dim) and isinstance(y, Dim):
         x = _materialize_dim(x)
-        y = _materialize_dim(y, x)
-    elif isinstance(x, Dim):
-        # A companion plain python scalar (no dtype/device to borrow) isn't
-        # a case this branch has ever handled; the isinstance/int/float
-        # check below only runs after materialization.
-        assert isinstance(y, TensorValue | MaxEagerTensor)
-        x = _materialize_dim(x, y)
-    elif isinstance(y, Dim):
-        assert isinstance(x, TensorValue | MaxEagerTensor)
-        y = _materialize_dim(y, x)
-    if isinstance(x, int | float) or isinstance(y, int | float):
-        # case not handled yet
-        return x, y
+        return x, _materialize_dim(y, x), DType.int64
+    tensors = [v for v in (x, y) if isinstance(v, TensorValue | MaxEagerTensor)]
+    if not tensors:
+        raise NotImplementedError(f"a binary op of {x!r} and {y!r}, no tensor")
 
-    assert not isinstance(x, Dim) and not isinstance(y, Dim)
-    float_dtype = get_float_dtype(x, y)
-    int_dtype = get_int_dtype(x, y)
-    if float_dtype is not None and int_dtype is not None:
-        # If both are float and int, promote to float
-        x = F.cast(x, dtype=float_dtype)
-        y = F.cast(y, dtype=float_dtype)
+    def probe(v: MaxTensor | Scalar) -> torch.Tensor | int | float:
+        if isinstance(v, TensorValue | MaxEagerTensor):
+            return torch.empty(
+                (0,) * v.rank, dtype=max_dtype_to_torch(v.dtype), device="meta"
+            )
+        return 1 if isinstance(v, Dim) else v  # a SymInt promotes like an int
 
-    return x, y
+    dtype = torch_dtype_to_max(torch.result_type(probe(x), probe(y)))
+    cpu_scalars = CURRENT_CPU_SCALARS.get()
+    compute = dtype
+    if dtype in (DType.float16, DType.bfloat16) and any(
+        not isinstance(v, TensorValue | MaxEagerTensor)
+        or (id(v) in cpu_scalars and v.dtype != dtype)
+        for v in (x, y)
+    ):
+        compute = DType.float32
+    like = max(tensors, key=lambda t: t.rank)
+
+    def operand(v: MaxTensor | Scalar) -> MaxTensor | int | float:
+        if isinstance(v, Dim):
+            v = _materialize_dim(v, like)
+        if isinstance(v, TensorValue | MaxEagerTensor) and v.dtype != compute:
+            return F.cast(v, dtype=compute)
+        return v
+
+    return operand(x), operand(y), dtype
+
+
+def _opmath(
+    x: MaxTensor | int | float, y: MaxTensor | int | float
+) -> tuple[MaxTensor | int | float, MaxTensor | int | float]:
+    """Half tensors in float32, CUDA's opmath, for `a + alpha * b` to round
+    once (`_round_to`) rather than after the scaling too."""
+
+    def widen(v: MaxTensor | int | float) -> MaxTensor | int | float:
+        if isinstance(v, TensorValue | MaxEagerTensor) and v.dtype in (
+            DType.float16,
+            DType.bfloat16,
+        ):
+            return F.cast(v, dtype=DType.float32)
+        return v
+
+    return widen(x), widen(y)
+
+
+def _round_to(result: MaxTensor, dtype: DType) -> MaxTensor:
+    """A result computed in a wider dtype (`type_promotion`), rounded once."""
+    return result if result.dtype == dtype else F.cast(result, dtype=dtype)
 
 
 def _scale_operand(
@@ -1625,15 +1720,18 @@ def aten_acosh(x: MaxTensor) -> MaxTensor:
 def aten_add(
     input: MaxTensor, other: MaxTensor | Scalar, alpha: Scalar = 1
 ) -> MaxTensor:
-    promoted_input, promoted_other = type_promotion(input, other)
+    promoted_input, promoted_other, dtype = type_promotion(input, other)
     # input is always a genuine Tensor per both ATen overloads, and
     # type_promotion only ever replaces a Dim operand or casts a tensor's
     # dtype -- never turns a MaxTensor into a plain Scalar. `other` may stay
     # a Python number (the Scalar overload).
     assert isinstance(promoted_input, TensorValue | MaxEagerTensor)
     if alpha != 1:
+        promoted_input, promoted_other = _opmath(promoted_input, promoted_other)
         promoted_other = _scale_operand(promoted_other, alpha, promoted_input)
-    return promoted_input + promoted_other
+    result = promoted_input + promoted_other
+    assert isinstance(result, TensorValue | MaxEagerTensor)
+    return _round_to(result, dtype)
 
 
 # addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
@@ -2443,6 +2541,13 @@ def _normalize_2d_params(
     else:
         output_padding = (0, 0)
     return stride, padding, dilation, output_padding
+
+
+# prims::convert_element_type(Tensor a, ScalarType dtype) -> Tensor
+@map_to(prims.convert_element_type.default)
+def prims_convert_element_type(a: MaxTensor, dtype: torch.dtype) -> MaxTensor:
+    max_dtype = torch_dtype_to_max(dtype)
+    return a if a.dtype == max_dtype else F.cast(a, dtype=max_dtype)
 
 
 # convolution(Tensor input, Tensor weight, Tensor? bias, SymInt[] stride, SymInt[] padding, SymInt[] dilation, bool transposed, SymInt[] output_padding, SymInt groups) -> Tensor
@@ -4439,7 +4544,7 @@ def aten_mm(x: MaxTensor, y: MaxTensor) -> MaxTensor:
 # mul.Tensor(Tensor self, Tensor other) -> Tensor
 @map_to(aten.mul)
 def aten_mul(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
-    promoted_input, other = type_promotion(input, other)
+    promoted_input, other, dtype = type_promotion(input, other)
     # input is always a genuine Tensor per both ATen overloads; type_promotion
     # only ever replaces a Dim operand or casts a tensor's dtype.
     assert isinstance(promoted_input, TensorValue | MaxEagerTensor)
@@ -4449,7 +4554,7 @@ def aten_mul(input: MaxTensor, other: MaxTensor | Scalar) -> MaxTensor:
     ):
         # MAX's mul doesn't lower for bool; torch defines it as logical AND.
         return F.logical_and(promoted_input, other)
-    return promoted_input * other
+    return _round_to(promoted_input * other, dtype)
 
 
 # multinomial(Tensor self, SymInt num_samples, bool replacement=False, *, Generator? generator=None) -> Tensor
@@ -5542,6 +5647,12 @@ def aten_slice(
     end: SymIntType | None = None,
     step: SymIntType = 1,
 ) -> MaxTensor:
+    # MAX takes a Dim bound as a plain index and rejects an out-of-range int:
+    # normalize the traced bounds as ATen does (internal callers pass in-range
+    # ones).
+    bounds = _traced_slice_bounds(dim % len(input.shape))
+    if bounds is not None:
+        start, end = bounds
     if end == 2**63 - 1:  # MAX_INT64
         end = None
     slices = [slice(None)] * len(input.shape)
@@ -5832,14 +5943,15 @@ def aten_squeeze(input: MaxTensor, dim: int | list[int]) -> MaxTensor:
 def aten_sub(
     input: MaxTensor | int | float, other: MaxTensor | Scalar, alpha: Scalar = 1
 ) -> MaxTensor:
-    promoted_input, other = type_promotion(input, other)
+    promoted_input, other, dtype = type_promotion(input, other)
     if alpha != 1:
+        promoted_input, other = _opmath(promoted_input, other)
         other = _scale_operand(other, alpha, promoted_input)
     result = promoted_input - other
     # At least one operand is a tensor (rsub decomposes to a number minus
     # a tensor, hence the widened `input`).
     assert isinstance(result, TensorValue | MaxEagerTensor)
-    return result
+    return _round_to(result, dtype)
 
 
 # sum.dim_IntList(Tensor self, int[1]? dim, bool keepdim=False, *, ScalarType? dtype=None) -> Tensor
@@ -6011,7 +6123,21 @@ def aten_view(
         target_shape = list(shape[0])
     else:
         target_shape = list(shape)
-    return F.reshape(tensor, target_shape)
+    try:
+        return F.reshape(tensor, target_shape)
+    except ValueError:
+        # MAX could not prove the element counts equal (`[12] -> [s, 12 // s]`)
+        # where torch's guards did: assert it at runtime instead.
+        sizes = cast("list[SymIntType]", target_shape)
+        numel = math.prod(tensor.shape, start=Dim(1))
+        known = math.prod((Dim(d) for d in sizes if d != -1), start=Dim(1))
+        dims = [numel // known if d == -1 else Dim(d) for d in sizes]
+        flat = F.rebind(
+            F.reshape(tensor, [numel]),
+            [math.prod(dims, start=Dim(1))],
+            message=f"view of {tensor.shape} as {dims}",
+        )
+        return F.reshape(flat, dims)
 
 
 # _unsafe_view(Tensor self, SymInt[] size) -> Tensor

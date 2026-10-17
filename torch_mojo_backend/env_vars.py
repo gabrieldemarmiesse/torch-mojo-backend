@@ -209,6 +209,42 @@ OWN_ENV_VARS: dict[str, str] = {
 # "forgotten"; they take no part in the typo check, since a misspelling of
 # one of these is not ours to diagnose.
 FOREIGN_ENV_VARS: dict[str, str] = {
+    # torch's flight recorder knobs (ProcessGroupNCCL's), read with the same
+    # meaning by the mojo process group's (distributed/flight_recorder.py).
+    "TORCH_FR_BUFFER_SIZE": (
+        "Entries in the collective flight recorder's ring (default 2000); 0 "
+        "turns recording and every dump off."
+    ),
+    "TORCH_NCCL_TRACE_BUFFER_SIZE": "Older alias of TORCH_FR_BUFFER_SIZE.",
+    "TORCH_FR_DUMP_TEMP_FILE": (
+        "Prefix of the flight recorder dump files, the global rank appended "
+        "(default ~/.cache/torch/comm_lib_trace_rank_)."
+    ),
+    "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": "Older alias of TORCH_FR_DUMP_TEMP_FILE.",
+    "TORCH_NCCL_DUMP_ON_TIMEOUT": (
+        "`0` keeps a collective timeout from dumping every rank's flight "
+        "recorder (on by default)."
+    ),
+    "TORCH_NCCL_DEBUG_INFO_PIPE_FILE": (
+        "Stem of a named pipe (`<stem><rank>.pipe`); writing to it dumps "
+        "this rank's flight recorder."
+    ),
+    "TORCH_NCCL_COORD_CHECK_MILSEC": (
+        "How often each rank polls the store for another rank's dump signal "
+        "and reads the debug pipe (default 1000 ms)."
+    ),
+    "TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC": (
+        "How long the rank whose watchdog fired waits for the other ranks' "
+        "dumps before aborting (default 15000 ms)."
+    ),
+    "TORCH_INCLUDE_STACK_TRACE": (
+        "`0` leaves the Python stacks out of the dumps written on a timeout "
+        "or through the pipe."
+    ),
+    "TORCH_INCLUDE_ONLY_ACTIVE": (
+        "`1` leaves completed collectives out of those dumps."
+    ),
+    "XDG_CACHE_HOME": "Where the default flight recorder dump prefix lives.",
     "CUDA_VISIBLE_DEVICES": "NVIDIA runtime device visibility; narrowed per rank.",
     "CXX": "C++ compiler for the shim; tried before c++, g++, clang++.",
     "HIP_PATH": "Older spelling of ROCM_PATH, searched for the HIP runtime.",

@@ -529,10 +529,10 @@ def _fault_code(state: CommState) -> UInt64:
 
     One acquire load of pinned host memory: no stream synchronized, no device
     memory copied, no lock taken -- which is the whole reason the record lives
-    there. `ncclCommGetAsyncError`'s D2H read of the arena error word blocks
-    behind the very kernels it is asking about (`_read_error_word`), so no
-    collective could afford to call it, so nothing ever read the only record a
-    timed-out barrier used to leave, and the run continued on garbage.
+    there. The arena error word needs a D2H copy (`_read_error_word`) that
+    can only run once the communicator's work completed, so it cannot report
+    a kernel that is still stuck; this record can, and the process group's
+    watchdog reads it every poll (`mojocclCommPeekAsyncError`).
     """
     if state.abort_host == 0:
         return UInt64(0)
@@ -614,36 +614,43 @@ def _report_fault(mut state: CommState):
 
     Once, because the record is permanent and every later collective reads it:
     the reader wants one line saying which barrier gave up and what it was
-    waiting for, not one per call for the rest of the run. Everything printed
-    comes from the record itself except the rank, which the process knows, and
-    the deadline, which is this process's own `MOJOCCL_IB_TIMEOUT_S`.
+    waiting for, not one per call for the rest of the run. Under the
+    submission lock only: `fault_said` is a plain field.
     """
     if state.fault_said:
         return
+    var text = _fault_text(state)
+    if text.byte_length() == 0:
+        return
+    state.fault_said = True
+    print(text)
+
+
+def _fault_text(state: CommState) -> String:
+    """The latched fault as one line, empty if none is fully published. Reads
+    host memory only and writes nothing, so a watchdog thread may call it.
+    Everything comes from the record itself except the rank, which the
+    process knows, and the deadline, which is this process's own
+    `MOJOCCL_IB_TIMEOUT_S`."""
     var code = _fault_code(state)
     var host = _host_fault_word(state)
     # Bit 63 snapshots precedence at host publication; a later device
     # fault must not replace the host fault before the first report.
     if host != 0 and host >> 63 == 0:
-        state.fault_said = True
-        print(
-            "mojoccl: rank",
-            state.rank,
-            ": HOST FAULT in",
-            _fault_kind(host >> 32),
-            "at exchange",
-            host & UInt64(0xFFFF_FFFF),
-            (
-                "-- the kernel launch failed after its exchanges were reserved,"
-                " so this rank's peers will report a deadline waiting for it;"
-                " every later collective on this communicator fails with"
-                " ncclRemoteError."
-            ),
+        return (
+            String("mojoccl: rank ")
+            + String(state.rank)
+            + ": HOST FAULT in "
+            + _fault_kind(host >> 32)
+            + " at exchange "
+            + String(host & UInt64(0xFFFF_FFFF))
+            + " -- the kernel launch failed after its exchanges were reserved,"
+            " so this rank's peers will report a deadline waiting for it;"
+            " every later collective on this communicator fails with"
+            " ncclRemoteError."
         )
-        return
     if code == 0:
-        return
-    state.fault_said = True
+        return String("")
     var phase = _fault_field(state, FAULT_PHASE)
     var block = _fault_field(state, FAULT_BLOCK)
     var peer = _fault_field(state, FAULT_PEER)
@@ -689,7 +696,7 @@ def _report_fault(mut state: CommState):
         " it waited for either died, timed out itself, or never reached the"
         " same collective."
     )
-    print(what)
+    return what
 
 
 def _latched_error(mut state: CommState) -> Int32:
