@@ -532,7 +532,14 @@ don't compare across ranks), the report says it can't tell why. Every rank has t
 the same collectives, in the same order, with the same arguments. Every
 rank then dumps its [flight recorder](#flight-recorder-dumps). Finally
 the rank aborts its communicators and exits with status 1, and torchrun
-stops the other workers. A device error on the rank (a faulted kernel) ends
+stops the other workers. An error the collectives library detects on its
+own -- a broken network connection, an InfiniBand error -- is reported the
+same way within a poll of the library detecting it instead of at the
+timeout. How soon that is depends on the transport: at once for a closed
+socket, tens of seconds for InfiniBand, `MOJOCCL_IB_TIMEOUT_S` with the
+Mojo collectives, and never with NCCL for a peer on the same
+node (NVLink, peer-to-peer or shared memory), where the timeout still
+applies. A device error on the rank (a faulted kernel) ends
 the run the same way.
 
 `TORCH_MOJO_BACKEND_PG_WATCHDOG=report` prints the same reports but leaves
@@ -593,7 +600,8 @@ off, or `TORCH_FR_BUFFER_SIZE=0`), they are PyTorch's own. In a process
 that also runs a NCCL process group, they keep returning PyTorch's dump
 once that group recorded anything: one dump can't hold both backends (the
 analyzer aligns each rank by its first record id), so this backend's
-collectives are in its dump files, written on a timeout or through the
+collectives are in its dump files, written on a timeout (or an error the
+library reports on its own) or through the
 debug pipe below. A NCCL process group's own timeout dump signal makes
 this backend's ranks dump too. You can also set
 `TORCH_NCCL_DEBUG_INFO_PIPE_FILE=/tmp/fr_` and write to

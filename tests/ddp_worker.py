@@ -16,6 +16,7 @@ inside main().
 """
 
 # ruff: noqa: E402 -- use_local_rank_gpu() must run before torch/MAX initialize
+import atexit
 import contextlib
 import datetime
 import json
@@ -39,7 +40,7 @@ from torch._C import _distributed_c10d as c10d_c
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torch_mojo_backend import monkeypatching, register_mojo_devices
-from torch_mojo_backend.distributed import flight_recorder
+from torch_mojo_backend.distributed import flight_recorder, process_group
 from torch_mojo_backend.distributed.process_group import MojoProcessGroup
 from torch_mojo_backend.native import device_module
 
@@ -1288,6 +1289,102 @@ def run_watchdog_fault_destroy():
     raise SystemExit(0)
 
 
+def _peer_exits_mid_collective() -> int:
+    """Rank 1 leaves (exit status 0, so torchrun does not stop rank 0) with
+    all_reduces in flight, once rank 0 has submitted one more than it: the
+    library on rank 0 then sees a real asynchronous error -- vendor NCCL's
+    socket transport a closed connection, mojoccl a device deadline latched
+    in its status page -- long before the 300 s timeout of the default
+    group. Rank 0 submits nothing after that, so no call of its can meet the
+    latched error before the watchdog does."""
+    rank = dist.get_rank()
+    store = dist.distributed_c10d._get_default_store()
+    x = torch.ones(1 << 26, device="mojo")  # 256 MiB per all_reduce
+    dist.all_reduce(x)
+    torch.accelerator.synchronize()
+    print(f"[rank {rank}] warm-up all_reduce done", flush=True)
+    for _ in range(3 if rank == 1 else 4):
+        dist.all_reduce(x, async_op=True)
+    if rank == 1:
+        store.wait(["async_error_submitted"])
+        print("[rank 1] leaving with all_reduces in flight", flush=True)
+        os._exit(0)
+    store.set("async_error_submitted", "1")
+    return rank
+
+
+def run_async_error():
+    """Abort mode: the async error is reported and rank 0 exits 1."""
+    _peer_exits_mid_collective()
+    torch.accelerator.synchronize()
+    time.sleep(30)
+    print("[rank 0] UNEXPECTED: still alive after the peer left", flush=True)
+    raise SystemExit(3)
+
+
+def run_async_error_report():
+    """Report mode: the async error is reported once and rank 0 runs on."""
+    _peer_exits_mid_collective()
+    time.sleep(30)  # several polls past the report
+    print("[rank 0] report mode: still running", flush=True)
+    sys.stdout.flush()
+    os._exit(0)
+
+
+def run_async_error_exit():
+    """Report mode, then a normal interpreter exit without
+    destroy_process_group: the exit hook aborts the communicator in error
+    (its kernel may still spin) without reporting it again, exit status 0."""
+    _peer_exits_mid_collective()
+    time.sleep(20)  # past the report
+    print("[rank 0] exiting without destroy_process_group", flush=True)
+    raise SystemExit(0)
+
+
+def run_abort_in_progress_at_exit():
+    """A daemon thread's abort() has claimed the default group's communicator
+    and is still in it (a test hook stalls it 120 s) when the interpreter
+    exits: the exit hook sees the claim, waits its grace, then keeps a
+    reaper armed, so the process ends within ABORT_WAIT_NS of that instead
+    of waiting on the abort."""
+    rank = dist.get_rank()
+    pg = dist.group.WORLD
+    assert isinstance(pg, MojoProcessGroup)
+    dist.all_reduce(torch.ones(4, device="mojo"))
+    torch.accelerator.synchronize()
+    pg._test_abort_stall(120_000)
+    threading.Thread(target=pg.abort, daemon=True).start()
+    time.sleep(1)  # the daemon claims the communicator, then stalls
+    print(f"[rank {rank}] exiting with an abort in progress", flush=True)
+    raise SystemExit(0)
+
+
+def _slow_exit_handler():
+    time.sleep(15)  # past the reaper's 10 s
+    print(f"[rank {os.environ['RANK']}] slow exit handler done", flush=True)
+
+
+def run_abort_finishes_after_the_grace():
+    """A daemon thread's abort() is claimed but stalled 5 s, past the exit
+    hook's 2 s grace, so the hook leaves its reaper armed; the abort then
+    returns, and its release cancels the reaper. An exit handler running
+    after the hook, past the reaper's deadline, ends with status 0."""
+    rank = dist.get_rank()
+    pg = dist.group.WORLD
+    assert isinstance(pg, MojoProcessGroup)
+    dist.all_reduce(torch.ones(4, device="mojo"))
+    torch.accelerator.synchronize()
+    # atexit runs last-registered first: the slow handler after the hook.
+    atexit.unregister(process_group._stop_watchdogs)
+    atexit.register(_slow_exit_handler)
+    atexit.register(process_group._stop_watchdogs)
+    pg._test_abort_stall(5_000)
+    threading.Thread(target=pg.abort, daemon=True).start()
+    time.sleep(1)  # the daemon claims the communicator, then stalls
+    print(f"[rank {rank}] exiting with an abort in progress", flush=True)
+    raise SystemExit(0)
+
+
 DESYNC_MODES = {
     "desync": run_desync,
     "desync_burst": run_desync_burst,
@@ -1303,6 +1400,11 @@ DESYNC_MODES = {
     "watchdog_async_burst": run_watchdog_async_burst,
     "watchdog_clean_exit": run_watchdog_clean_exit,
     "watchdog_fault_destroy": run_watchdog_fault_destroy,
+    "async_error": run_async_error,
+    "async_error_report": run_async_error_report,
+    "async_error_exit": run_async_error_exit,
+    "abort_in_progress_at_exit": run_abort_in_progress_at_exit,
+    "abort_finishes_after_the_grace": run_abort_finishes_after_the_grace,
 }
 
 

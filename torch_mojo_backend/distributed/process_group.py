@@ -244,6 +244,8 @@ def _describe(report: dict[str, str]) -> str:
         return f"{report.get('op')} call blocked on the host"
     if where == "error":
         return "a device error"
+    if where == "async":
+        return f"an asynchronous library error (ncclResult_t {report.get('code')})"
     text = f"{report.get('op')} {report.get('count')} x {report.get('dtype')}"
     if report.get("root", "-1") != "-1":
         peer = report.get("op") in ("send", "recv", "send/recv")
@@ -537,8 +539,13 @@ def _fr_incident(
     grank = flight_recorder.global_rank(rank)
     gen = worker.run(lambda client: flight_recorder.signal_dump(client, grank), 2.0)
     claimed = flight_recorder.claim(store, gen) if gen else None
+    why = (
+        "asynchronous library error"
+        if fields.get("where") == "async"
+        else "collective timeout"
+    )
     dumped = flight_recorder.dump_now(
-        grank, "collective timeout", flight_recorder.include_stack_traces()
+        grank, why, flight_recorder.include_stack_traces()
     )
     acked = False
     if gen and dumped:  # an acknowledgement means a file is there
@@ -745,6 +752,7 @@ class _Core:
         self.fr_snapshot = ctypes.CFUNCTYPE(i64, vp, i64)(table[27])
         self.fr_selftest = ctypes.CFUNCTYPE(i64)(table[28])
         self.fr_after_fork = ctypes.CFUNCTYPE(None)(table[29])
+        self.test_abort_stall = ctypes.CFUNCTYPE(None, vp, i32)(table[30])
 
     def check(self, rc: int, what: str):
         if rc != 0:
@@ -974,6 +982,11 @@ class MojoProcessGroup(dist.ProcessGroup):
         """Test hook: the watchdog keeps at most `entries` collectives in
         flight on this device's communicator, then drops commits."""
         self._core.watchdog_test_limit(self._handle, index, entries)
+
+    def _test_abort_stall(self, ms: int):
+        """Test hook: every later abort() sleeps `ms` once it has claimed its
+        communicator, before the library call."""
+        self._core.test_abort_stall(self._handle, ms)
 
     def abort(self):
         for index in list(self._ready):

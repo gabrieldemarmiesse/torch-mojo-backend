@@ -688,6 +688,47 @@ def _fr_dumps(directory: Path) -> dict[int, dict[str, Any]]:
     }
 
 
+# How each library turns a peer leaving mid-collective into an async error:
+# vendor NCCL over its socket transport (no P2P, no SHM, no IB) sees the
+# connection close; mojoccl's kernels give up on the peer after
+# MOJOCCL_IB_TIMEOUT_S and latch the fault in host memory.
+_ASYNC_ERROR_ENV = {
+    "vendor": {
+        "NCCL_P2P_DISABLE": "1",
+        "NCCL_SHM_DISABLE": "1",
+        "NCCL_IB_DISABLE": "1",
+        "NCCL_NET": "Socket",
+    },
+    "mojo": {"MOJOCCL_IB_TIMEOUT_S": "5"},
+}
+
+
+def _async_error_run(mode: str, ccl: str, extra_env: dict[str, str] | None = None):
+    # Rank 1 exits without dumping: a short wait for its flight recorder.
+    extra_env = {"TORCH_NCCL_WAIT_TIMEOUT_DUMP_MILSEC": "1000", **(extra_env or {})}
+    rc, output, context = _run_desync(
+        mode, ccl, {**_ASYNC_ERROR_ENV[ccl], **(extra_env or {})}
+    )
+    assert "[rank 1] leaving with all_reduces in flight" in output, context
+    assert "Watchdog caught collective operation timeout" not in output, context
+    found = re.findall(
+        r"\[rank 0\] Watchdog: the collectives library reports an asynchronous"
+        r" error on device 0: [^\n]*\(ncclResult_t (\d+)\)",
+        output,
+    )
+    assert found and all(code != "0" for code in found), context
+    if ccl == "mojo":  # mojoccl's own description, intact, inside the report
+        assert re.search(
+            r"\[rank 0\]   mojoccl: rank 0: DEVICE DEADLINE in the [^\n]*"
+            r" never reached the same collective\.\n",
+            output,
+        ), context
+    # Reported within a minute of rank 1 leaving, with the 300 s timeout far off.
+    ages = [float(a) for a in re.findall(r"pending for (\d+\.\d) s", output)]
+    assert ages and max(ages) < 60.0, context
+    return rc, output, context, found
+
+
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.gpu
 def test_two_rank_flight_recorder_desync(ccl: str, tmp_path: Path):
@@ -758,6 +799,97 @@ def test_two_rank_flight_recorder_subgroup(tmp_path: Path):
     )
     assert sorted(f.name for f in tmp_path.glob("trace_*")) == ["trace_1"]
     assert sorted(f.name for f in tmp_path.glob("pipe_*")) == ["pipe_1.pipe"]
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_async_error(ccl: str, tmp_path: Path):
+    """A peer that dies mid-collective is a real asynchronous library error
+    on the surviving rank: the watchdog's poll of ncclCommGetAsyncError (or
+    mojoccl's host-only peek) reports it within seconds, dumps the flight
+    recorder like a timeout would, then aborts and exits 1 -- instead of
+    waiting out the 300 s collective timeout."""
+    rc, output, context, found = _async_error_run(
+        "async_error", ccl, {"TORCH_FR_DUMP_TEMP_FILE": str(tmp_path / "trace_")}
+    )
+    assert rc != 0, context
+    assert len(found) == 1, context
+    assert "an asynchronous library error (ncclResult_t" in output, context
+    assert "Aborting the communicators and exiting with status 1" in output, context
+    assert (
+        "[rank 0] flight recorder: asynchronous library error, dumped to" in output
+    ), context
+    dumps = _fr_dumps(tmp_path)
+    assert sorted(dumps) == [0], context  # rank 1 is gone
+    assert any(e["state"] != "completed" for e in dumps[0]["entries"]), dumps[0]
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_async_error_report_mode(ccl: str):
+    """Report mode: the same async error is reported once per communicator
+    and the rank keeps running."""
+    rc, output, context, found = _async_error_run(
+        "async_error_report", ccl, {"TORCH_MOJO_BACKEND_PG_WATCHDOG": "report"}
+    )
+    assert rc == 0, context
+    assert len(found) == 1, context
+    assert "[rank 0] report mode: still running" in output, context
+    assert "Aborting the communicators" not in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_async_error_report_mode_exit(ccl: str):
+    """Report mode, then the interpreter exits without destroy_process_group:
+    the exit hook aborts the communicator in error, once, and the rank exits
+    0 -- not left to MAX's teardown with a kernel still spinning."""
+    rc, output, context, found = _async_error_run(
+        "async_error_exit", ccl, {"TORCH_MOJO_BACKEND_PG_WATCHDOG": "report"}
+    )
+    assert rc == 0, context
+    assert len(found) == 1, context
+    assert "[rank 0] exiting without destroy_process_group" in output, context
+    assert (
+        output.count("watchdog: exiting with a communicator in error; aborting it") == 1
+    ), context
+    assert "Aborting the communicators" not in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_exit_with_an_abort_in_progress(ccl: str):
+    """Another thread's abort has claimed its communicator but not returned
+    when the interpreter exits: claimed is not finished, so the exit hook
+    keeps a reaper armed instead of cancelling it -- the process ends within
+    the reaper's bound, never behind the stalled abort (120 s here)."""
+    start = time.monotonic()
+    rc, output, context = _run_desync(
+        "abort_in_progress_at_exit", ccl, {"TORCH_MOJO_BACKEND_PG_WATCHDOG": "report"}
+    )
+    assert time.monotonic() - start < 100.0, context  # startup + 2 s + 10 s
+    assert output.count("exiting with an abort in progress") == 2, context
+    note = "watchdog: exiting while another thread is still aborting a communicator"
+    assert output.count(note) == 2, context
+    assert rc in (0, 1), context  # 1: the reaper ended it
+    assert "Watchdog caught" not in output, context
+
+
+@pytest.mark.parametrize("ccl", ["vendor", "mojo"])
+@pytest.mark.gpu
+def test_two_rank_watchdog_exit_abort_finishes_after_the_grace(ccl: str):
+    """The exit hook left its reaper armed over another thread's abort; that
+    abort then returns, and its release cancels the reaper, so an exit
+    handler still running past the reaper's deadline ends with status 0."""
+    rc, output, context = _run_desync(
+        "abort_finishes_after_the_grace",
+        ccl,
+        {"TORCH_MOJO_BACKEND_PG_WATCHDOG": "report"},
+    )
+    note = "watchdog: exiting while another thread is still aborting a communicator"
+    assert output.count(note) == 2, context  # the reaper was left armed
+    assert output.count("slow exit handler done") == 2, context
+    assert rc == 0, context
 
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])

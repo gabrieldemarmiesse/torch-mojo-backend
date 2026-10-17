@@ -66,6 +66,7 @@ from tmb.backend.watchdog import (
     group_open,
     watch_add,
     watch_claim,
+    watch_release,
     watch_commit,
     watch_create,
     watch_deadline_ns,
@@ -161,6 +162,7 @@ struct PG(Movable):
     var timeout_ns: Int  # init_process_group's timeout, 0 when unknown
     var closing: Bool  # destroyed or being destroyed: every entry fails
     var fr: Int  # its flight recorder state (flight_recorder.mojo), 0 if off
+    var test_abort_stall_ns: Int  # test hook: tmb_pg_abort sleeps once claimed
 
     def __init__(out self, path: String, rank: Int, world: Int) raises:
         self.lib = OwnedDLHandle(path)
@@ -182,6 +184,7 @@ struct PG(Movable):
         self.timeout_ns = 0
         self.closing = False
         self.fr = 0
+        self.test_abort_stall_ns = 0
 
     def symbol(self, name: String) raises -> Int:
         return _symbol(self.lib, name)
@@ -385,6 +388,7 @@ def tmb_pg_destroy(p: Int) abi("C"):
                 if watch_claim(c.tracker):
                     with InCall(w, OP_ABORT, c.device):
                         _ = f(c.handle)
+                    watch_release(c.tracker)
             if be()[].vendor:
                 for item in box[].graph_events.items():
                     for ev in item.value:
@@ -771,9 +775,12 @@ def tmb_pg_abort(p: Int, device: Int32) abi("C") -> Int32:
             _ = pg[].comms.pop(Int(device))
             if not watch_claim(c.tracker):
                 return 0  # the watchdog is aborting it (and exiting)
+            if pg[].test_abort_stall_ns > 0:  # test hook: a slow abort
+                sleep(Float64(pg[].test_abort_stall_ns) / 1.0e9)
             var rc: Int32
             with InCall(pg[].watch, OP_ABORT, c.device):
                 rc = call_fn[CommFn](pg[].symbol("ncclCommAbort"))(c.handle)
+            watch_release(c.tracker)
             pg[].check(rc, "ncclCommAbort")
             return 0
         except e:
@@ -913,6 +920,23 @@ def tmb_pg_graph_start(
             return 1
 
 
+def _optional_symbol(lib: OwnedDLHandle, name: StaticString) -> Int:
+    var f = lib.get_symbol[NoneType](name)
+    return Int(f.value()) if f else 0
+
+
+def _async_error_symbol(lib: OwnedDLHandle) raises -> Int:
+    """What the watchdog polls for an asynchronous error: mojoccl's host-only
+    `mojocclCommPeekAsyncError` when the library has it (its full
+    ncclCommGetAsyncError may take the submission lock and copy a word off
+    the device), else ncclCommGetAsyncError (vendor NCCL: atomic loads of
+    host state, see `_poll_async`)."""
+    var peek = _optional_symbol(lib, "mojocclCommPeekAsyncError")
+    if peek != 0:
+        return peek
+    return _symbol(lib, "ncclCommGetAsyncError")
+
+
 def tmb_pg_watchdog(
     p: Int,
     timeout_ms: Int64,
@@ -948,6 +972,9 @@ def tmb_pg_watchdog(
                 _symbol(v.lib, v.names.event_record),
                 _symbol(v.lib, v.names.event_query),
                 pg[].symbol("ncclCommAbort"),
+                _async_error_symbol(pg[].lib),
+                pg[].symbol("ncclGetErrorString"),
+                _optional_symbol(pg[].lib, "mojocclCommAsyncErrorText"),
             )
             return 0
         except e:
@@ -1004,6 +1031,13 @@ def tmb_pg_watchdog_test_fault(p: Int, device: Int32) abi("C"):
             set_error(String(e))
 
 
+def tmb_pg_test_abort_stall(p: Int, ms: Int32) abi("C"):
+    """Test hook: every later abort sleeps `ms` once it has claimed its
+    communicator, as a preempted or slow abort would."""
+    with Locked():
+        _pg(p)[].test_abort_stall_ns = Int(ms) * 1_000_000
+
+
 def tmb_pg_watchdog_process_exiting() abi("C"):
     """Interpreter exit: every watch -- a group being shut down on another
     thread included -- takes driver teardown for a quiet stop."""
@@ -1056,7 +1090,7 @@ def tmb_pg_fr_after_fork() abi("C"):
     fr_after_fork()
 
 
-comptime PG_VTABLE_SLOTS = 30
+comptime PG_VTABLE_SLOTS = 31
 
 
 def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
@@ -1067,7 +1101,7 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     17 synchronize_comm, 18 graph_start, 19 graph_wait, 20 watchdog,
     21 watchdog_exit, 22 watchdog_test_fault, 23 watchdog_test_limit,
     24 watchdog_process_exiting, 25 fr_init, 26 fr_attach, 27 fr_snapshot,
-    28 fr_selftest, 29 fr_after_fork.
+    28 fr_selftest, 29 fr_after_fork, 30 test_abort_stall.
     """
     var t = unsafe_alloc[Int](PG_VTABLE_SLOTS)
     var f0: def(Pointer[c_char, MutUntrackedOrigin], Int32, Int32) thin abi(
@@ -1128,6 +1162,7 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     var f27: def(Int, Int64) thin abi("C") -> Int64 = tmb_pg_fr_snapshot
     var f28: def() thin abi("C") -> Int64 = tmb_pg_fr_selftest
     var f29: def() thin abi("C") -> None = tmb_pg_fr_after_fork
+    var f30: def(Int, Int32) thin abi("C") -> None = tmb_pg_test_abort_stall
     t[unsafe_offset=0] = Pointer(to=f0).unsafe_bitcast[Int]()[]
     t[unsafe_offset=1] = Pointer(to=f1).unsafe_bitcast[Int]()[]
     t[unsafe_offset=2] = Pointer(to=f2).unsafe_bitcast[Int]()[]
@@ -1158,4 +1193,5 @@ def pg_vtable() -> Pointer[Int, MutUntrackedOrigin]:
     t[unsafe_offset=27] = Pointer(to=f27).unsafe_bitcast[Int]()[]
     t[unsafe_offset=28] = Pointer(to=f28).unsafe_bitcast[Int]()[]
     t[unsafe_offset=29] = Pointer(to=f29).unsafe_bitcast[Int]()[]
+    t[unsafe_offset=30] = Pointer(to=f30).unsafe_bitcast[Int]()[]
     return t
