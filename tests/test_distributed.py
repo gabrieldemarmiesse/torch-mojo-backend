@@ -9,8 +9,8 @@ demo_scripts/nanogpt_ddp and tests/multinode/.
 
 import datetime
 import os
-import re
 import pickle
+import re
 import subprocess
 import sys
 import tempfile

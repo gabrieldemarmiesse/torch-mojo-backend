@@ -21,8 +21,8 @@ use_local_rank_gpu()
 
 import torch
 import torch.distributed as dist
-from torch._C import _distributed_c10d as c10d_c
 import torch.distributed._functional_collectives as funcol
+from torch._C import _distributed_c10d as c10d_c
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor.parallel import (

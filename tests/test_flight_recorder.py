@@ -20,8 +20,7 @@ import torch
 from torch._C import _distributed_c10d as c10d_c
 
 from torch_mojo_backend import monkeypatching
-from torch_mojo_backend.distributed import flight_recorder as fr
-from torch_mojo_backend.distributed import process_group
+from torch_mojo_backend.distributed import flight_recorder as fr, process_group
 from torch_mojo_backend.distributed.store_worker import StoreWorker
 
 ALLREDUCE, SEND, RECV, ALLGATHER, SENDRECV = 1, 6, 7, 4, 8
