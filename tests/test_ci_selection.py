@@ -43,8 +43,25 @@ def selection_suite(
         def device(request, cuda_available):
             return request.param
 
+        class Conf:
+            def __init__(self, device):
+                self.device = device
+
+        @pytest.fixture(params=[Conf("mojo:gpu")])
+        def conf(request):
+            return request.param
+
         @pytest.mark.parametrize("case", range(12))
         def test_cpu(case):
+            pass
+
+        def test_conf_default(conf):
+            pass
+
+        @pytest.mark.parametrize(
+            "conf", [Conf("cpu"), Conf("mojo:gpu")], ids=["cpu", "mojo"], indirect=True
+        )
+        def test_conf(conf):
             pass
 
         def test_device(device):
@@ -88,10 +105,14 @@ def test_ci_selections_are_disjoint_and_exhaustive(selection_suite: pytest.Pytes
     assert mojo == {
         "test_sample.py::test_transitive_gpu",
         "test_sample.py::test_explicit_gpu",
+        "test_sample.py::test_conf_default[conf0]",
+        "test_sample.py::test_conf[mojo]",
     }
     assert inductor == {"test_sample.py::test_inductor"}
     assert "test_sample.py::test_device[cpu]" in cpu
     assert "test_sample.py::test_inductor_cpu_validation" in cpu
+    # torch.compile on CPU tensors needs no accelerator.
+    assert "test_sample.py::test_conf[cpu]" in cpu
     groups = [cpu, cuda, mojo, inductor]
     assert set.union(*groups) == all_tests
     assert sum(map(len, groups)) == len(all_tests)
