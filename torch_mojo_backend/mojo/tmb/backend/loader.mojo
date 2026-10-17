@@ -5,13 +5,15 @@ export `tmb_call` and compile one (OP, dtypes, flags) specialization per
 build, selected with -D defines. A build hashes the entry file's import
 closure, looks the .so up in the cache, otherwise runs `mojo build` in a
 subprocess (under a cross-process flock, atomic rename), dlopens it and
-keeps the entry pointer.
+keeps the entry pointer. Every build records its compiler warnings beside the
+.so, which TORCH_MOJO_BACKEND_WERROR=1 checks, fresh build or cache hit
+(agents_docs/mojo_extensions.md, "Warnings records").
 """
 from std.builtin.sort import sort
 from std.collections import Dict
 from std.ffi import OwnedDLHandle, external_call, get_errno
 from std.os import getenv, makedirs
-from std.os.path import exists, isdir
+from std.os.path import exists, isdir, isfile
 from std.pathlib import Path
 from std.subprocess import run as run_command
 from std.sys.info import CompilationTarget
@@ -69,6 +71,131 @@ def _open_lock_cloexec(path: String) -> Int32:
 
 
 comptime KERNELS = "tmb/kernels"
+
+# `<so>.warnings`: the warning diagnostics of the build that made `<so>`,
+# empty when there were none (native/__init__.py's `warnings_record`).
+comptime WARNINGS_SUFFIX = ".warnings"
+
+
+def _werror() -> Bool:
+    return getenv(TORCH_MOJO_BACKEND_WERROR) == "1"
+
+
+def _severity_prefix(text: String) -> String:
+    """The diagnostic severity `text` starts with (`warning: ...`), or ""."""
+    for sev in ["warning", "error", "note", "remark"]:
+        if text.startswith(String(sev) + ": "):
+            return String(sev)
+    return String()
+
+
+def _is_location(prefix: String) -> Bool:
+    """`prefix` ends with `:<digits>:<digits>` (a `file:line:col`)."""
+    var b = prefix.as_bytes()
+    var i = len(b)
+    for _ in range(2):
+        var digits = 0
+        while i > 0:
+            var c = Int(b[i - 1])
+            if c < ord("0") or c > ord("9"):
+                break
+            i -= 1
+            digits += 1
+        if digits == 0 or i == 0 or Int(b[i - 1]) != ord(":"):
+            return False
+        i -= 1
+    return True
+
+
+def _diagnostic_header(line: String) -> Tuple[String, Bool]:
+    """(severity, has a `file:line:col`) of one of mojo's diagnostics, ""
+    for anything else; native/__init__.py's `_diagnostic_header` is the
+    same rule."""
+    var at = line.find(": ")
+    while at >= 0:
+        var sev = _severity_prefix(String(line[byte = at + 2 :]))
+        if sev != "":
+            var prefix = String(line[byte=:at])
+            if _is_location(prefix):
+                return (sev, True)
+            if prefix == "mojo" or prefix.endswith("/mojo"):
+                return (sev, False)
+        at = line.find(": ", at + 1)
+    return (String(), False)
+
+
+def warning_diagnostics(output: String) -> String:
+    """The warnings in a compiler's output, each with the `Included from`
+    lines above it, its source line, caret and attached notes, and nothing
+    else (the Crashpad banner, errors, traces); native/__init__.py's
+    `warning_diagnostics` is the same filter."""
+    var kept = String()
+    var included = String()  # `Included from` lines, kept with what follows
+    var keeping = False
+    var context = 0  # excerpt lines still expected: the source line, the caret
+    for l in output.splitlines():
+        var line = String(l)
+        if line.startswith("Included from ") or line.startswith(
+            "Imported from "
+        ):
+            included += line + "\n"
+            context = 0
+            continue
+        var header = _diagnostic_header(line)
+        if header[0] != "":
+            keeping = header[0] == "warning" or (
+                header[0] == "note" and keeping
+            )
+            context = 2 if keeping and header[1] else 0
+            if keeping:
+                kept += included
+        elif keeping and context == 2:
+            context = 1
+        elif keeping and context == 1 and line.lstrip().startswith("^"):
+            context = 0
+        else:
+            keeping = False
+            context = 0
+        included = String()
+        if keeping:
+            kept += line + "\n"
+    return kept
+
+
+def _defines_text(defines: List[String]) -> String:
+    var out = String()
+    for d in defines:
+        out += " -D " + d
+    return out
+
+
+def _recorded(so: String) -> Optional[String]:
+    """The warnings record of `so`, None when it cannot be read."""
+    try:
+        return Path(so + WARNINGS_SUFFIX).read_text()
+    except:
+        return None
+
+
+def _werror_check(
+    so: String, label: String, defines: List[String], diagnostics: String
+) raises:
+    """Under WERROR: fail if the build of `so` warned, fresh or cached
+    (native/__init__.py's `werror_failure` writes the same)."""
+    var record = so + WARNINGS_SUFFIX
+    if diagnostics != "":
+        raise Error(
+            "mojo build of ",
+            label,
+            _defines_text(defines),
+            (
+                " failed:\nTORCH_MOJO_BACKEND_WERROR=1 makes these compiler"
+                " warnings errors (recorded by the build in "
+            ),
+            record,
+            "):\n",
+            diagnostics,
+        )
 
 
 def _fnv1a(mut h: UInt64, bytes: Span[UInt8, _]):
@@ -444,12 +571,7 @@ struct Loader(Movable):
             cmd += " -Xlinker -undefined -Xlinker dynamic_lookup"
         for d in defines:
             cmd += " -D '" + d + "'"
-        # TORCH_MOJO_BACKEND_WERROR=1: warnings fail the build (off by
-        # default, on under pytest); native/__init__.py's
-        # mojo_diagnostic_flags is the same switch for the Python-driven
-        # builds.
-        if getenv(TORCH_MOJO_BACKEND_WERROR) == "1":
-            cmd += " --Werror"
+        # Never --Werror: WERROR is checked against the recorded warnings.
         cmd += (
             " -o '"
             + local
@@ -466,13 +588,10 @@ struct Loader(Movable):
         var rc = -1
         if marker >= 0:
             rc = Int(atol(String(String(output[byte = marker + 9 :]).strip())))
+        var log = String(output[byte=:marker]) if marker > 0 else output
         if rc != 0:
             if exists(tmp):
                 _ = external_call["unlink", Int32](tmp.as_c_string_span().ptr())
-            var defs = String()
-            for d in defines:
-                defs += " -D " + d
-            var log = String(output[byte=:marker]) if marker > 0 else output
             # The assembler is chosen for us (torch_mojo_backend/_ptxas.py),
             # and when it is the wrong one for this driver or this GPU that
             # shows up here as a ptxas line in someone else's log. Say where
@@ -487,7 +606,7 @@ struct Loader(Movable):
             raise Error(
                 "mojo build of ",
                 label,
-                defs,
+                _defines_text(defines),
                 " failed (rc ",
                 rc,
                 ", ",
@@ -496,18 +615,37 @@ struct Loader(Movable):
                 log,
                 hint,
             )
-        if exists(
-            out_path
-        ):  # another process installed the same build first: use theirs
+        # The .so, then its warnings record. A .so already there (a
+        # record-less one, under WERROR; lock-free, a concurrent builder's)
+        # is kept, as native/__init__.py's `_install_mojo_build` explains.
+        var record = out_path + WARNINGS_SUFFIX
+        if exists(out_path):
             _ = external_call["unlink", Int32](tmp.as_c_string_span().ptr())
         else:
+            _ = external_call["unlink", Int32](
+                record.as_c_string_span().ptr()
+            )  # never ahead of its .so
             var dst = String(out_path)
             var r = external_call["rename", Int32](
-                tmp.as_c_string_span().ptr(),
-                dst.as_c_string_span().ptr(),
+                tmp.as_c_string_span().ptr(), dst.as_c_string_span().ptr()
             )
-            if r != 0 and not exists(out_path):
-                raise Error("could not install ", out_path)
+            if r != 0:
+                _ = external_call["unlink", Int32](tmp.as_c_string_span().ptr())
+                if not exists(out_path):
+                    raise Error("could not install ", out_path)
+        var record_tmp = record + ".tmp" + String(perf_counter_ns())
+        Path(record_tmp).write_text(warning_diagnostics(log))
+        if (
+            external_call["rename", Int32](
+                record_tmp.as_c_string_span().ptr(),
+                record.as_c_string_span().ptr(),
+            )
+            != 0
+        ):
+            _ = external_call["unlink", Int32](
+                record_tmp.as_c_string_span().ptr()
+            )
+            raise Error("could not install ", record)
         if self.trace:
             print(
                 "[TRACE] built ",
@@ -518,6 +656,12 @@ struct Loader(Movable):
                 Float64(ms) / 1000.0,
                 "s",
             )
+
+    def _usable(self, so: String) -> Bool:
+        """A cache entry to load as is: present and, under WERROR, with its
+        warnings record (a record-less one is unknown, so it is rebuilt
+        once). Without WERROR the record is never looked at."""
+        return exists(so) and (not _werror() or isfile(so + WARNINGS_SUFFIX))
 
     def _ensure_built(
         mut self,
@@ -530,7 +674,7 @@ struct Loader(Movable):
     ) raises:
         """Build `so` unless it is already in the cache, once per box: the
         flock makes concurrent processes wait instead of building twice."""
-        if exists(so):
+        if self._usable(so):
             return
         if not isdir(self.cache_dir):
             makedirs(self.cache_dir, exist_ok=True)
@@ -544,7 +688,7 @@ struct Loader(Movable):
             )  # LOCK_EX (best effort: NFS may refuse)
 
         try:
-            if not exists(so):
+            if not self._usable(so):
                 self._build(label, src, root, defines, so)
         finally:
             if fd >= 0:
@@ -573,19 +717,36 @@ struct Loader(Movable):
                 + self.source_hash(family)
                 + ".so"
             )
-            if not exists(so):
-                # A miss compiles a snapshot of the sources and keys the
-                # build by THAT snapshot's hash, never by the memo.
-                var snap = self.snapshot(family)
-                so = self.cache_dir + "/" + key + ".hash-" + snap[1] + ".so"
-                self._ensure_built(
-                    key,
-                    so,
-                    family,
-                    snap[0] + "/" + KERNELS + "/" + family + "/entry.mojo",
-                    snap[0],
-                    defines,
+            var checked = not _werror()
+            # Twice: a record that cannot be read (removed by another
+            # process after `_usable`, or unreadable: removed here) is a miss.
+            for _ in range(2):
+                if not self._usable(so):
+                    # A miss compiles a snapshot of the sources and keys the
+                    # build by THAT snapshot's hash, never by the memo.
+                    var snap = self.snapshot(family)
+                    so = self.cache_dir + "/" + key + ".hash-" + snap[1] + ".so"
+                    self._ensure_built(
+                        key,
+                        so,
+                        family,
+                        snap[0] + "/" + KERNELS + "/" + family + "/entry.mojo",
+                        snap[0],
+                        defines,
+                    )
+                if checked:
+                    break
+                var diagnostics = _recorded(so)
+                if diagnostics:
+                    _werror_check(so, family, defines, diagnostics.value())
+                    checked = True
+                    break
+                var record = so + WARNINGS_SUFFIX
+                _ = external_call["unlink", Int32](
+                    record.as_c_string_span().ptr()
                 )
+            if not checked:
+                raise Error("cannot read ", so + WARNINGS_SUFFIX)
             var fam = Family(so)
             var addr = fam.entry
             self.families[key] = fam^

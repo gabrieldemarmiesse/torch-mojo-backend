@@ -19,11 +19,12 @@ and the call waits for it; every later call — and every later process, as
 long as the sources and the toolchain are unchanged — dlopens the cached
 `.so`. `TORCH_MOJO_BACKEND_TRACE` (on by default; `0` silences it) prints a
 `[TRACE]` line for each variant build, with its duration.
-`TORCH_MOJO_BACKEND_WERROR=1` passes `--Werror` to every Mojo build (kernel
-variants, the base library, mojoccl), so a compiler warning
-fails the build instead of scrolling past in captured stderr. It is off by
-default and `tests/conftest.py` turns it on, which is the repository's
-no-warnings check: a warning in any Mojo source fails the tests that build it.
+`TORCH_MOJO_BACKEND_WERROR=1` makes every Mojo build (kernel variants, the
+base library, mojoccl, the graph package) fail on a compiler warning instead
+of letting it scroll past in captured stderr. It is off by default and
+`tests/conftest.py` turns it on, which is the repository's no-warnings check:
+a warning in any Mojo source fails the tests that build it, whether the build
+runs now or was cached earlier (see "Warnings records" below).
 
 This mirrors the old Python loader's behavior (same "one `.so` per exact
 specialization, built inline at first use" design, same rationale — see
@@ -105,6 +106,41 @@ The ptxas 48 KiB static-shared-memory cap and the dynamic-shared-memory
 workaround for kernels that need more (unchanged from the old design) are
 documented in `agents_docs/fast_eager_design.md`'s "Milestone 3" section and at
 each affected kernel's `shared_mem_bytes` call site.
+
+## Warnings records
+
+WERROR is not in the cache key, and it is not a compiler flag either: no build
+passes `--Werror`. Every Mojo build -- `loader.mojo`'s `_build`, and
+`native/__init__.py`'s `build_backend`, `build_library` (mojoccl) and
+`_precompile_package` (`tmb/graph`) -- stores the compiler's warning
+diagnostics beside its artifact, `<artifact>.warnings` (`<so>.warnings`,
+`graph.hash-<key>/graph.mojoc.warnings`), empty when there were none. Only
+mojo's warnings are kept: each `file:line:col: warning:` (or `<path>/mojo:
+warning:`) line with the `Included from` lines above it, its source line and
+caret, and attached `note:`s -- not errors, not a linker's `ld: warning:`
+(`--Werror` never counted those), not the Crashpad banner, not traces.
+`warning_diagnostics` is the same filter on both sides, and
+`tests/test_build_warning_replay.py` checks they agree. The record is
+renamed into place after the artifact, so an interrupted install leaves an
+artifact without one.
+
+Under WERROR a fresh build and a cache hit then run the same check -- a
+non-empty record fails with the build's usual "... failed:" error followed by
+the recorded warnings -- so an artifact built once without WERROR can no
+longer hide its warnings from a later WERROR run, and the verdict never
+depends on how warm the cache is. The artifact of a build that warned stays
+cached: it is a valid build, and a run without WERROR uses it.
+
+An artifact with no readable record (cached before records existed, an
+interrupted install, or a copy of the wheel's prebuilt base library) is
+unknown under WERROR and is rebuilt once, under the same lock as a miss, to
+write the record. The artifact already there is never replaced, not even a
+prebuilt copy: the key is content-addressed (a prebuilt is matched by its
+sources and MAX version), so the rebuild's record describes it too, and
+replacing a library that another NFS client has mapped can SIGBUS that
+client. With an empty cache, WERROR compiles the base library rather than
+copying the prebuilt, since it needs that build for the record anyway.
+Without WERROR the record is never read, so a hit costs what it always did.
 
 ## Argv ABI
 
