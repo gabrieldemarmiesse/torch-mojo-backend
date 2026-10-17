@@ -41,12 +41,13 @@ def device(request, cuda_available: bool):
         # Conf("cuda", True),
     ]
 )
-def conf(request, mojo_gpu_available: bool, cuda_available: bool):
+def conf(request):
     conf = request.param
-    # to use mojo:gpu, we need to have a max supported gpu
-    if conf.device == "mojo:gpu" and not mojo_gpu_available:
+    # Requested lazily: a static dependency on a device fixture would mark the
+    # `Conf("cpu", True)` cases `gpu` (repo-root conftest.py).
+    if conf.device == "mojo:gpu" and not request.getfixturevalue("mojo_gpu_available"):
         pytest.skip("You do not have a GPU supported by MAX")
-    if conf.device == "cuda" and not cuda_available:
+    if conf.device == "cuda" and not request.getfixturevalue("cuda_available"):
         pytest.skip("Pytorch CUDA not available")
 
     # known issues:
