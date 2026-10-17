@@ -110,7 +110,13 @@ def built_cache(
         cache_dir.mkdir()
         for lib in (native.build_shim(), native.build_backend()):
             shutil.copy2(lib, cache_dir / lib.name)
-        _assert_ok(_run(cache_dir))
+        proc = _run(cache_dir)
+        _assert_ok(proc)
+        combined = proc.stdout + proc.stderr
+        # A cache-key mismatch would cold-build both again, silently.
+        assert "built C++ shim" not in combined, combined
+        assert "built Mojo backend" not in combined, combined
+        assert "built  logic" in combined, combined
         _BUILT.append(cache_dir)
     return Path(shutil.copytree(_BUILT[0], tmp_path / "cache"))
 
