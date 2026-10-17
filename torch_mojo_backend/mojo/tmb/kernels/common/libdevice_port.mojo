@@ -311,30 +311,26 @@ def nv_logf(a: Float32) -> Float32:
     """`__nv_logf` (libdevice_ir/__nv_logf.ll). Pure IEEE: exact everywhere."""
     var m = a
     var i = Float32(0.0)
-    if a < Float32(from_bits=UInt32(0x00800000)):  # 2**-126
-        m = a * Float32(from_bits=UInt32(0x4B000000))  # 2**23
+    if a < 1.1754944e-38:  # 2**-126
+        m = a * 8388608.0  # 2**23
         i = Float32(-23.0)
 
     var e = (_fb(m) - Int32(1059760811)) & Int32(-8388608)  # bits(2/3f)
     var f = _fr(_fb(m) - e)
-    i = fma(e.cast[DType.float32](), Float32(from_bits=UInt32(0x34000000)), i)
+    i = fma(e.cast[DType.float32](), Float32(1.1920929e-7), i)  # 2**-23
 
     var t = f - Float32(1.0)
-    var p = fma(
-        Float32(from_bits=UInt32(0xBE055027)),
-        t,
-        Float32(from_bits=UInt32(0x3E1039F6)),
-    )
-    p = fma(p, t, Float32(from_bits=UInt32(0xBDF8CDCC)))
-    p = fma(p, t, Float32(from_bits=UInt32(0x3E0F2955)))
-    p = fma(p, t, Float32(from_bits=UInt32(0xBE2AD8B9)))
-    p = fma(p, t, Float32(from_bits=UInt32(0x3E4CED0B)))
-    p = fma(p, t, Float32(from_bits=UInt32(0xBE7FFF22)))
-    p = fma(p, t, Float32(from_bits=UInt32(0x3EAAAA78)))
+    var p = fma(Float32(-0.13018857), t, Float32(0.1408461))
+    p = fma(p, t, Float32(-0.12148628))
+    p = fma(p, t, Float32(0.1398061))
+    p = fma(p, t, Float32(-0.16684236))
+    p = fma(p, t, Float32(0.200123))
+    p = fma(p, t, Float32(-0.24999669))
+    p = fma(p, t, Float32(0.33333182))
     p = fma(p, t, Float32(-0.5))
     p = p * t
     p = fma(p, t, t)
-    var r = fma(i, Float32(from_bits=UInt32(0x3F317218)), p)  # ln(2)
+    var r = fma(i, Float32(0.6931472), p)  # ln(2)
 
     if m.to_bits[DType.uint32]() >= UInt32(0x7F800000):
         r = fma(m, _F32_INF, _F32_INF)
@@ -354,30 +350,26 @@ def nv_log2f(a: Float32) -> Float32:
     """
     var m = a
     var i = Float32(0.0)
-    if a < Float32(from_bits=UInt32(0x00800000)):  # 2**-126
-        m = a * Float32(from_bits=UInt32(0x4B000000))  # 2**23
+    if a < 1.1754944e-38:  # 2**-126
+        m = a * 8388608.0  # 2**23
         i = Float32(-23.0)
 
     var e = (_fb(m) - Int32(1060439283)) & Int32(-8388608)  # bits(sqrt(.5f))
     var f = _fr(_fb(m) - e)
-    i = fma(e.cast[DType.float32](), Float32(from_bits=UInt32(0x34000000)), i)
+    i = fma(e.cast[DType.float32](), Float32(1.1920929e-7), i)  # 2**-23
 
     var t = f - Float32(1.0)
-    var p = fma(
-        Float32(from_bits=UInt32(0x3DC6B27F)),
-        t,
-        Float32(from_bits=UInt32(0xBE2C7F30)),
-    )
-    p = fma(p, t, Float32(from_bits=UInt32(0x3E2FCF2A)))
-    p = fma(p, t, Float32(from_bits=UInt32(0xBE374E43)))
-    p = fma(p, t, Float32(from_bits=UInt32(0x3E520BF4)))
-    p = fma(p, t, Float32(from_bits=UInt32(0xBE763C8B)))
-    p = fma(p, t, Float32(from_bits=UInt32(0x3E93BF99)))
-    p = fma(p, t, Float32(from_bits=UInt32(0xBEB8AA49)))
-    p = fma(p, t, Float32(from_bits=UInt32(0x3EF6384A)))
-    p = fma(p, t, Float32(from_bits=UInt32(0xBF38AA3B)))
+    var p = fma(Float32(0.09702014), t, Float32(-0.16845393))
+    p = fma(p, t, Float32(0.1716887))
+    p = fma(p, t, Float32(-0.17900948))
+    p = fma(p, t, Float32(0.20512372))
+    p = fma(p, t, Float32(-0.24046533))
+    p = fma(p, t, Float32(0.28857115))
+    p = fma(p, t, Float32(-0.36067417))
+    p = fma(p, t, Float32(0.4808982))
+    p = fma(p, t, Float32(-0.7213475))
     p = p * t * t
-    var r = fma(t, Float32(from_bits=UInt32(0x3FB8AA3B)), p) + i  # log2(e)
+    var r = fma(t, Float32(1.442695), p) + i  # log2(e)
 
     if m.to_bits[DType.uint32]() >= UInt32(0x7F800000):
         r = fma(m, _F32_INF, _F32_INF)
