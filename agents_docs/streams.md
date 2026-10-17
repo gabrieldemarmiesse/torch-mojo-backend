@@ -99,6 +99,14 @@ inputs/outputs. CUDA/ROCm waits are device-side; Metal uses its existing host
 synchronization path. Tensor calculations remain compiled; stream/event
 orchestration runs on the host, as it does in eager mode.
 
+A region with several contexts runs on the ambient stream, so two pieces of
+torch work land there rather than on a context's stream: the staged copy of a
+non-contiguous or misaligned input, which first waits for the participating
+streams, and AOT's copy back of mutated inputs after the graph, which the
+participating streams then wait for. Neither adds a dependency the graph did
+not already have. The side-stream type-inference graph declares all of the
+parent's inputs, so a SymInt carrier's Dim is defined there too.
+
 Explicit stream/event operations remain host orchestration boundaries, so
 parallel execution is within each contiguous tensor section, not across such
 boundaries. Graphs involving tensors that require gradients conservatively

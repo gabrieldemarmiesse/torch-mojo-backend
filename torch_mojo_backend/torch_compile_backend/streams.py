@@ -11,7 +11,7 @@ import ctypes
 import functools
 import threading
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import ExitStack
 from contextvars import ContextVar
 from typing import cast
@@ -172,6 +172,29 @@ def enter_streams(streams: tuple[torch.Stream, ...]) -> ExitStack:
     return contexts
 
 
+def current_stream(device: torch.device) -> torch.Stream:
+    # After PrivateUse1 registration torch.accelerator names the mojo device.
+    if device.type == "cuda":
+        return torch.cuda.current_stream(device)
+    return torch.accelerator.current_stream(device)
+
+
+def _streams_of(contexts: Iterable[tuple[torch.Stream, ...]]) -> list[torch.Stream]:
+    return list(dict.fromkeys(stream for streams in contexts for stream in streams))
+
+
+def wait_for_contexts(contexts: Iterable[tuple[torch.Stream, ...]]):
+    """Order each device's current stream after every stream of `contexts`."""
+    for stream in _streams_of(contexts):
+        current_stream(stream.device).wait_stream(stream)
+
+
+def publish_to_contexts(contexts: Iterable[tuple[torch.Stream, ...]]):
+    """Order every stream of `contexts` after its device's current stream."""
+    for stream in _streams_of(contexts):
+        stream.wait_stream(current_stream(stream.device))
+
+
 def max_stream_id(node: torch.fx.Node) -> int:
     return node.meta.get("custom", {}).get("torch_mojo_max_stream", 0)
 
@@ -267,6 +290,12 @@ class _CompiledRegion(_StreamRegion):
             result = self.compiled(*args)
         finally:
             ACTIVE_STREAM_CONTEXTS.reset(token)
+        if len(contexts) > 1:
+            # Several contexts run on the ambient stream, where AOT's epilogue
+            # also copies mutated inputs back, after the graph's own exit
+            # handoff. The graph already waited for the ambient stream, so
+            # this adds only that epilogue to what the contexts wait for.
+            publish_to_contexts(contexts)
         assert isinstance(result, list | tuple)
         return tree_unflatten(list(result), self.output_spec)
 

@@ -308,6 +308,104 @@ def test_compile_stream_dynamic_shapes(stream_device):
         torch.testing.assert_close(compiled(x).cpu(), x.cpu().sin() + 1)
 
 
+def slow_work(device):
+    # Queues enough work on the current stream to expose a missing wait.
+    work = torch.ones(1024, 1024, device=device)
+    for _ in range(32):
+        work = work @ work
+
+
+def test_compile_stream_regions_with_a_scalar_that_changes(stream_device):
+    # Once `scale` changes, dynamo retraces it as a SymInt that no tensor
+    # input has as a dimension: the side-stream regions must see its Dim,
+    # also as the size of a tensor they create.
+    first = torch.Stream(device=stream_device)
+    second = torch.Stream(device=stream_device)
+
+    def fn(x, scale):
+        current = current_stream(x.device)
+        first.wait_stream(current)
+        second.wait_stream(current)
+        with stream_context(first, stream_device):
+            a = x * scale
+            c = torch.ones(scale, device=x.device) * 2
+        with stream_context(second, stream_device):
+            b = x + scale
+        current.wait_stream(first)
+        current.wait_stream(second)
+        return a, b, c
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    x = torch.randn(64, device=stream_device)
+    for scale in (2, 3, 5, 7):
+        a, b, c = compiled(x, scale)
+        torch.testing.assert_close(a.cpu(), x.cpu() * scale)
+        torch.testing.assert_close(b.cpu(), x.cpu() + scale)
+        torch.testing.assert_close(c.cpu(), torch.full((scale,), 2.0))
+
+
+def test_compile_misaligned_input_written_on_its_stream(stream_device):
+    # `base[1:]` is contiguous but not 16-byte aligned, so the graph reads a
+    # staged copy. A multi-context region runs on the ambient stream, which
+    # never waited for `first`: the copy must still follow the write there.
+    first = torch.Stream(device=stream_device)
+    second = torch.Stream(device=stream_device)
+
+    def fn(v, w):
+        current = current_stream(v.device)
+        second.wait_stream(current)
+        with stream_context(first, stream_device):
+            a = v * 2
+        with stream_context(second, stream_device):
+            b = w.cos()
+        current.wait_stream(first)
+        current.wait_stream(second)
+        return a, b
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    base = torch.zeros(4097, device=stream_device)
+    view = base[1:]
+    w = torch.randn(64, device=stream_device)
+    for value in (3, 5, 7):
+        first.wait_stream(current_stream(view.device))
+        with stream_context(first, stream_device):
+            slow_work(stream_device)
+            view.fill_(value)
+        a, b = compiled(view, w)
+        torch.testing.assert_close(a.cpu(), torch.full((4096,), 2.0 * value))
+        torch.testing.assert_close(b.cpu(), w.cpu().cos())
+
+
+def test_compile_mutation_in_multi_context_region(stream_device):
+    # AOT autograd writes the mutated input back after the graph, on the
+    # ambient stream; a later reader on the mutation's stream must see it.
+    first = torch.Stream(device=stream_device)
+    second = torch.Stream(device=stream_device)
+
+    def fn(x, w):
+        current = current_stream(x.device)
+        first.wait_stream(current)
+        second.wait_stream(current)
+        with stream_context(first, stream_device):
+            x.mul_(2)
+        with stream_context(second, stream_device):
+            b = w.cos()
+        current.wait_stream(second)
+        return b
+
+    compiled = torch.compile(fn, backend=mojo_backend, fullgraph=True)
+    # Large enough that the copy back is still running when the reader starts.
+    x = torch.ones(1 << 26, device=stream_device)
+    w = torch.randn(64, device=stream_device)
+    for expected in (2.0, 4.0, 8.0):
+        b = compiled(x, w)
+        with stream_context(first, stream_device):
+            tail = x[-4096:].clone()
+        current_stream(x.device).wait_stream(first)
+        torch.testing.assert_close(tail.cpu(), torch.full((4096,), expected))
+        torch.testing.assert_close(b.cpu(), w.cpu().cos())
+
+
 @pytest.mark.parametrize("explicit_device", [False, True])
 def test_cuda_current_stream_after_mojo_registration(mojo_gpu, explicit_device):
     if not torch.cuda.is_available():

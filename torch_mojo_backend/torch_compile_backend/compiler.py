@@ -62,6 +62,7 @@ from torch_mojo_backend.torch_compile_backend.streams import (
     enter_streams,
     max_stream_id,
     uses_streams,
+    wait_for_contexts,
 )
 from torch_mojo_backend.torch_compile_backend.utils import (
     get_accelerators,
@@ -767,13 +768,16 @@ class _GraphFactory:
         # side_stream needs result types before building its body. Infer them
         # with the existing lowerings in a temporary graph; this also handles
         # symbolic shape expressions without duplicating ATen shape rules.
-        # MAX 26.6 does not permit ops.call inside mo.sequence.
+        # MAX 26.6 does not permit ops.call inside mo.sequence. The parent's
+        # inputs come along unused: they declare every symbol the lowerings
+        # may name, a SymInt carrier's included.
         with Graph(
             "stream_types",
-            input_types=[value.type for value in tensors],
+            input_types=[value.type for value in tensors] + self.graph_inputs,
             kernel_library=global_max_objects().kernel_library,
         ) as type_graph:
-            type_results = lower(*(value.tensor for value in type_graph.inputs))
+            captured = type_graph.inputs[: len(tensors)]
+            type_results = lower(*(value.tensor for value in captured))
             result_types = [value.type for value in type_results]
             type_graph.output(*type_results)
         side_results = max_ops.side_stream(
@@ -1182,12 +1186,24 @@ class BaseMaxCompiler:
                     (token, fast_from_dlpack(token), contexts)
                     for token in self.stream_tokens
                 )
+        # A staged input copy runs on the current stream, which in a region
+        # with several contexts is the ambient one: order it after them first.
+        active = ACTIVE_STREAM_CONTEXTS.get()
+        before_copy = (
+            functools.cache(functools.partial(wait_for_contexts, active))
+            if any(active)
+            else None
+        )
         if self.tensor_inputs_only:
             input_tensors = [
-                _cached_buffer_for(x) for x in args if isinstance(x, torch.Tensor)
+                _cached_buffer_for(x, before_copy)
+                for x in args
+                if isinstance(x, torch.Tensor)
             ]
         else:
-            input_tensors = [_graph_input(kind, args[i]) for kind, i in self.input_plan]
+            input_tensors = [
+                _graph_input(kind, args[i], before_copy) for kind, i in self.input_plan
+            ]
         if self.takes_seed:
             input_tensors.append(graph_seed())
         if self.collectives is not None:
@@ -1289,8 +1305,12 @@ def _evict_buffer(tensor_id: int, /):
 _MAX_INPUT_ALIGNMENT = 16
 
 
-def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
+def _cached_buffer_for(
+    t: torch.Tensor, before_copy: Callable[[], None] | None = None
+) -> max.driver.Buffer:
     if not t.is_contiguous() or t.data_ptr() % _MAX_INPUT_ALIGNMENT:
+        if before_copy is not None:
+            before_copy()
         # A MAX Buffer is dense row-major and aligned, and the graph input
         # type only carries a shape, so such an input has to be materialized.
         # The copy is a fresh allocation on every call and is deliberately NOT
@@ -1313,10 +1333,12 @@ def _cached_buffer_for(t: torch.Tensor) -> max.driver.Buffer:
 GraphValue = torch.Tensor | int | float | None
 
 
-def _graph_input(kind: GraphInputKind, arg: GraphValue) -> max.driver.Buffer:
+def _graph_input(
+    kind: GraphInputKind, arg: GraphValue, before_copy: Callable[[], None] | None = None
+) -> max.driver.Buffer:
     if kind is GraphInputKind.TENSOR:
         assert isinstance(arg, torch.Tensor)
-        return _cached_buffer_for(arg)
+        return _cached_buffer_for(arg, before_copy)
     assert isinstance(arg, int)
     if kind is GraphInputKind.SIZE:
         return _symint_carrier((arg, 0))
