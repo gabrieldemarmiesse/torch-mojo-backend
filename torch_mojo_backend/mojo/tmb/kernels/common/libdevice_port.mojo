@@ -14,18 +14,18 @@
 # cvt.rni.s32) are emitted verbatim as inline PTX.
 #
 # Portability: the routines whose libdevice body is pure IEEE arithmetic
-# (nv_logf, nv_exp, nv_log1pf, nv_sincospi, nv_sincos) run the ported body on every target
-# and are bit-exact everywhere.  The float64 nv_log / nv_log1p / nv_tan run
-# the ported body on every GPU too (std.math on the host): their one
-# approximation instruction, rcp.approx.ftz.f64, only seeds a reciprocal that
-# libdevice refines cubically, so an IEEE `1 / x` seed off NVIDIA gives the
-# same reciprocal (see `_rcp_approx_ftz_d`).  nv_log / nv_log1p must not fall
-# back to std.math on a GPU: its float64 `log` is the Cephes
-# *single-precision* polynomial evaluated in double (3e-9 relative off on
-# MI300A; log1p, which calls it, 1e-6), where this port is within an ulp.
-# The routines that depend on an NVIDIA hardware approximation for their
-# result (nv_expf, nv_tanf, nv_fast_sincosf) fall back to std.math off NVIDIA
-# and are NOT bit-exact there.
+# (nv_logf, nv_log2f, nv_exp, nv_log1pf, nv_sincospi, nv_sincos) run the ported
+# body on every target and are bit-exact everywhere.  The float64 nv_log /
+# nv_log1p / nv_tan run the ported body on every GPU too (std.math on the
+# host): their one approximation instruction, rcp.approx.ftz.f64, only seeds a
+# reciprocal that libdevice refines cubically, so an IEEE `1 / x` seed off
+# NVIDIA gives the same reciprocal (see `_rcp_approx_ftz_d`).  nv_log /
+# nv_log1p must not fall back to std.math on a GPU: its float64 `log` is the
+# Cephes *single-precision* polynomial evaluated in double (3e-9 relative off
+# on MI300A; log1p, which calls it, 1e-6), where this port is within an ulp.
+# The routines that depend on an NVIDIA hardware approximation for their result
+# (nv_expf, nv_tanf, nv_fast_sincosf) fall back to std.math off NVIDIA and are
+# NOT bit-exact there.
 # ===----------------------------------------------------------------------=== #
 
 from std.bit import count_leading_zeros
@@ -335,6 +335,49 @@ def nv_logf(a: Float32) -> Float32:
     p = p * t
     p = fma(p, t, t)
     var r = fma(i, Float32(from_bits=UInt32(0x3F317218)), p)  # ln(2)
+
+    if m.to_bits[DType.uint32]() >= UInt32(0x7F800000):
+        r = fma(m, _F32_INF, _F32_INF)
+    if m == Float32(0.0):
+        r = -_F32_INF
+    return r
+
+
+# --------------------------------------------------------------------------- #
+# __nv_log2f
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def nv_log2f(a: Float32) -> Float32:
+    """`__nv_log2f` (libdevice_ir/__nv_log2f.ll). Pure IEEE: exact everywhere.
+    """
+    var m = a
+    var i = Float32(0.0)
+    if a < Float32(from_bits=UInt32(0x00800000)):  # 2**-126
+        m = a * Float32(from_bits=UInt32(0x4B000000))  # 2**23
+        i = Float32(-23.0)
+
+    var e = (_fb(m) - Int32(1060439283)) & Int32(-8388608)  # bits(sqrt(.5f))
+    var f = _fr(_fb(m) - e)
+    i = fma(e.cast[DType.float32](), Float32(from_bits=UInt32(0x34000000)), i)
+
+    var t = f - Float32(1.0)
+    var p = fma(
+        Float32(from_bits=UInt32(0x3DC6B27F)),
+        t,
+        Float32(from_bits=UInt32(0xBE2C7F30)),
+    )
+    p = fma(p, t, Float32(from_bits=UInt32(0x3E2FCF2A)))
+    p = fma(p, t, Float32(from_bits=UInt32(0xBE374E43)))
+    p = fma(p, t, Float32(from_bits=UInt32(0x3E520BF4)))
+    p = fma(p, t, Float32(from_bits=UInt32(0xBE763C8B)))
+    p = fma(p, t, Float32(from_bits=UInt32(0x3E93BF99)))
+    p = fma(p, t, Float32(from_bits=UInt32(0xBEB8AA49)))
+    p = fma(p, t, Float32(from_bits=UInt32(0x3EF6384A)))
+    p = fma(p, t, Float32(from_bits=UInt32(0xBF38AA3B)))
+    p = p * t * t
+    var r = fma(t, Float32(from_bits=UInt32(0x3FB8AA3B)), p) + i  # log2(e)
 
     if m.to_bits[DType.uint32]() >= UInt32(0x7F800000):
         r = fma(m, _F32_INF, _F32_INF)
