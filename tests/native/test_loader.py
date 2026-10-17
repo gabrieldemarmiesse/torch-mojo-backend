@@ -79,29 +79,40 @@ def _assert_ok(proc: subprocess.CompletedProcess[str]):
     assert "OK" in proc.stdout, proc.stdout + proc.stderr
 
 
-_COLD = []
-
-
 @pytest.fixture
 def cold(
     tmp_path_factory: pytest.TempPathFactory, mojo_gpu: str
 ) -> tuple[Path, subprocess.CompletedProcess[str]]:
     """The one cold build of the module: an empty cache directory filled by a
-    single process. Building it per test was 15-60 s, four times over."""
-    if not _COLD:
-        cache_dir = tmp_path_factory.mktemp("cold") / "cache"
-        proc = _run(cache_dir)
-        _assert_ok(proc)
-        _COLD.append((cache_dir, proc))
-    return _COLD[0]
+    single process."""
+    cache_dir = tmp_path_factory.mktemp("cold") / "cache"
+    proc = _run(cache_dir)
+    _assert_ok(proc)
+    return cache_dir, proc
+
+
+_BUILT = []
 
 
 @pytest.fixture
 def built_cache(
-    cold: tuple[Path, subprocess.CompletedProcess[str]], tmp_path: Path
+    tmp_path_factory: pytest.TempPathFactory, tmp_path: Path, mojo_gpu: str
 ) -> Path:
-    """A private copy of the cold build (mtimes kept) for a test to damage."""
-    return Path(shutil.copytree(cold[0], tmp_path / "cache"))
+    """A private copy (mtimes kept) of a complete cache for a test to damage.
+
+    Seeded with this process's own shim and backend, so one subprocess only
+    builds the `logic` variant: a cold backend build costs ~9 minutes on a
+    one-core CI container, and the tests using this fixture are dealt to
+    different CI shards, so each shard paid it again. Only
+    `test_cache_dir_env_var_relocates_every_build` needs a cold one."""
+    if not _BUILT:
+        cache_dir = tmp_path_factory.mktemp("built") / "cache"
+        cache_dir.mkdir()
+        for lib in (native.build_shim(), native.build_backend()):
+            shutil.copy2(lib, cache_dir / lib.name)
+        _assert_ok(_run(cache_dir))
+        _BUILT.append(cache_dir)
+    return Path(shutil.copytree(_BUILT[0], tmp_path / "cache"))
 
 
 def test_cache_dir_env_var_relocates_every_build(
