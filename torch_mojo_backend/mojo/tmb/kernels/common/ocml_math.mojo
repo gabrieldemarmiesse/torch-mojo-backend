@@ -24,6 +24,7 @@
 
 from std.math import fma
 from std.sys import llvm_intrinsic
+from std.sys._assembly import inlined_assembly
 from std.sys.info import is_amd_gpu
 
 from tmb.kernels.common.libdevice_port import _trig_reduction_slowpath_f
@@ -282,3 +283,375 @@ def oc_sinf(x_in: Float32) -> Float32:
         ^ (x.to_bits[DType.uint32]() ^ ax.to_bits[DType.uint32]())
     )
     return Float32(from_bits=bits)
+
+
+# --------------------------------------------------------------------------- #
+# asinh: `asinhF.cl` / `asinhD.cl` over the double-word arithmetic of `ep.h`
+# and `lnepF.cl` / `lnepD.cl`. A pair is (hi, lo). Every add, subtract and
+# multiply of an error-free transform goes through `_o_add` / `_o_mul`, which
+# the GPU build's fast-math flags cannot reassociate or contract.
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _o_add[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    comptime if is_amd_gpu() and dt == DType.float32:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "v_add_f32 $0, $1, $2",
+                Float32,
+                constraints="=v,v,v",
+                has_side_effect=False,
+            ](rebind[Float32](a), rebind[Float32](b))
+        )
+    elif is_amd_gpu():
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "v_add_f64 $0, $1, $2",
+                Float64,
+                constraints="=v,v,v",
+                has_side_effect=False,
+            ](rebind[Float64](a), rebind[Float64](b))
+        )
+    else:
+        return a + b
+
+
+@always_inline
+def _o_sub[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    comptime if is_amd_gpu() and dt == DType.float32:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "v_sub_f32 $0, $1, $2",
+                Float32,
+                constraints="=v,v,v",
+                has_side_effect=False,
+            ](rebind[Float32](a), rebind[Float32](b))
+        )
+    elif is_amd_gpu():
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "v_add_f64 $0, $1, -$2",
+                Float64,
+                constraints="=v,v,v",
+                has_side_effect=False,
+            ](rebind[Float64](a), rebind[Float64](b))
+        )
+    else:
+        return a - b
+
+
+@always_inline
+def _o_mul[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    comptime if is_amd_gpu() and dt == DType.float32:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "v_mul_f32 $0, $1, $2",
+                Float32,
+                constraints="=v,v,v",
+                has_side_effect=False,
+            ](rebind[Float32](a), rebind[Float32](b))
+        )
+    elif is_amd_gpu():
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "v_mul_f64 $0, $1, $2",
+                Float64,
+                constraints="=v,v,v",
+                has_side_effect=False,
+            ](rebind[Float64](a), rebind[Float64](b))
+        )
+    else:
+        return a * b
+
+
+@always_inline
+def _ep_rcp[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """MATH_FAST_RCP: v_rcp_f32; v_rcp_f64 and two Newton steps."""
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](_fast_rcp(rebind[Float32](x)))
+    comptime if not is_amd_gpu():
+        return Scalar[dt](1.0) / x
+    var r = llvm_intrinsic[
+        "llvm.amdgcn.rcp", Scalar[dt], has_side_effect=False
+    ](x)
+    r = fma(fma(-x, r, Scalar[dt](1.0)), r, r)
+    return fma(fma(-x, r, Scalar[dt](1.0)), r, r)
+
+
+@always_inline
+def _ep_div[dt: DType](x: Scalar[dt], y: Scalar[dt]) -> Scalar[dt]:
+    """MATH_FAST_DIV: x * rcp(y); in double, the refined quotient."""
+    comptime if dt == DType.float32 or not is_amd_gpu():
+        return _o_mul(x, _ep_rcp(y))
+    var r = _ep_rcp(y)
+    var q = _o_mul(x, r)
+    return fma(fma(-y, q, x), r, q)
+
+
+@always_inline
+def _ep_sqrt[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """MATH_FAST_SQRT: v_sqrt_f32; in double, v_rsq_f64 refined."""
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](_fast_sqrt(rebind[Float32](x)))
+    comptime if not is_amd_gpu():
+        return llvm_intrinsic["llvm.sqrt", Scalar[dt], has_side_effect=False](x)
+    var y = llvm_intrinsic[
+        "llvm.amdgcn.rsq", Scalar[dt], has_side_effect=False
+    ](x)
+    var s0 = _o_mul(x, y)
+    var h0 = _o_mul(Scalar[dt](0.5), y)
+    var r0 = fma(-h0, s0, Scalar[dt](0.5))
+    var h1 = fma(h0, r0, h0)
+    var s1 = fma(s0, r0, s0)
+    var d0 = fma(-s1, s1, x)
+    var ret = fma(d0, h1, s1)
+    return x if x == Scalar[dt](0.0) else ret
+
+
+@always_inline
+def _ep_fadd[
+    dt: DType
+](a: Scalar[dt], b: Scalar[dt]) -> Tuple[Scalar[dt], Scalar[dt]]:
+    """fadd(T, T): fast two-sum."""
+    var s = _o_add(a, b)
+    return (s, _o_sub(b, _o_sub(s, a)))
+
+
+@always_inline
+def _ep_add[
+    dt: DType
+](a: Scalar[dt], b: Scalar[dt]) -> Tuple[Scalar[dt], Scalar[dt]]:
+    """add(T, T): two-sum."""
+    var s = _o_add(a, b)
+    var d = _o_sub(s, a)
+    return (s, _o_add(_o_sub(a, _o_sub(s, d)), _o_sub(b, d)))
+
+
+@always_inline
+def _ep_fsub[
+    dt: DType
+](a: Scalar[dt], b: Scalar[dt]) -> Tuple[Scalar[dt], Scalar[dt]]:
+    """fsub(T, T): fast two-difference."""
+    var d = _o_sub(a, b)
+    return (d, _o_sub(_o_sub(a, d), b))
+
+
+@always_inline
+def _ep_mul[
+    dt: DType
+](a: Scalar[dt], b: Scalar[dt]) -> Tuple[Scalar[dt], Scalar[dt]]:
+    """mul(T, T) and sqr(T): fma two-product."""
+    var p = _o_mul(a, b)
+    return (p, fma(a, b, -p))
+
+
+@always_inline
+def _ep_nrm[
+    dt: DType
+](a: Tuple[Scalar[dt], Scalar[dt]]) -> Tuple[Scalar[dt], Scalar[dt]]:
+    return _ep_fadd(a[0], a[1])
+
+
+@always_inline
+def _ep_ldx[
+    dt: DType
+](a: Tuple[Scalar[dt], Scalar[dt]], e: Int32) -> Tuple[Scalar[dt], Scalar[dt]]:
+    """ldx: both words times 2^e, exact (2^e is a normal number here)."""
+    var p: Scalar[dt]
+    comptime if dt == DType.float32:
+        p = rebind[Scalar[dt]](
+            Float32(from_bits=UInt32(e + Int32(127)) << UInt32(23))
+        )
+    else:
+        p = rebind[Scalar[dt]](
+            Float64(from_bits=UInt64(Int64(e) + Int64(1023)) << UInt64(52))
+        )
+    return (_o_mul(a[0], p), _o_mul(a[1], p))
+
+
+@always_inline
+def _oc_lnep[
+    dt: DType
+](a: Tuple[Scalar[dt], Scalar[dt]], ea: Int32) -> Scalar[dt]:
+    """`lnepF.cl` / `lnepD.cl`: log of the pair `a` (a.hi normal and
+    positive, or not finite), plus ea * ln 2."""
+    # frexp(a.hi): mantissa in [0.5, 1) and exponent, from the bits
+    var mh: Scalar[dt]
+    var ex: Int32
+    comptime if dt == DType.float32:
+        var b = rebind[Float32](a[0]).to_bits[DType.uint32]()
+        ex = Int32((b >> UInt32(23)) & UInt32(0xFF)) - Int32(126)
+        mh = rebind[Scalar[dt]](
+            Float32(from_bits=(b & UInt32(0x807FFFFF)) | UInt32(0x3F000000))
+        )
+    else:
+        var b = rebind[Float64](a[0]).to_bits[DType.uint64]()
+        ex = Int32((b >> UInt64(52)) & UInt64(0x7FF)) - Int32(1022)
+        mh = rebind[Scalar[dt]](
+            Float64(
+                from_bits=(b & UInt64(0x800FFFFFFFFFFFFF))
+                | UInt64(0x3FE0000000000000)
+            )
+        )
+    var two_thirds: Scalar[dt]
+    comptime if dt == DType.float32:
+        two_thirds = Scalar[dt](0.6666667)
+    else:
+        two_thirds = Scalar[dt](0.6666666666666666)
+    var e = ex - (Int32(1) if mh < two_thirds else Int32(0))
+    var m = _ep_ldx(a, -e)
+
+    # x = (m - 1) / (m + 1): fadd(-1, m) / fadd(1, m), div(T2, T2)
+    var n = _ep_fadd(Scalar[dt](-1.0), m[0])
+    n = _ep_nrm((n[0], _o_add(n[1], m[1])))
+    var d = _ep_fadd(Scalar[dt](1.0), m[0])
+    d = _ep_nrm((d[0], _o_add(d[1], m[1])))
+    var y = _ep_rcp(d[0])
+    var qhi = _o_mul(n[0], y)
+    var r = _ep_fsub2(n, _ep_mul2(qhi, d))
+    var qmi = _o_mul(r[0], y)
+    r = _ep_fsub2(r, _ep_mul2(qmi, d))
+    var qlo = _o_mul(r[0], y)
+    var x = _ep_fadd(qhi, qmi)
+    x = _ep_nrm((x[0], _o_add(x[1], qlo)))
+
+    var s = _o_mul(x[0], x[0])
+    var p: Scalar[dt]
+    var ln2: Tuple[Scalar[dt], Scalar[dt]]
+    comptime if dt == DType.float32:
+        p = fma(
+            s,
+            fma(s, Scalar[dt](0.3035711), Scalar[dt](0.39957914)),
+            Scalar[dt](0.6666695),
+        )
+        ln2 = (Scalar[dt](0.6931472), Scalar[dt](-1.9046542e-09))
+    else:
+        p = fma(
+            s, Scalar[dt](0.15367016165258582), Scalar[dt](0.15250306356700066)
+        )
+        p = fma(s, p, Scalar[dt](0.18186352772476638))
+        p = fma(s, p, Scalar[dt](0.2222213848310113))
+        p = fma(s, p, Scalar[dt](0.28571429397443554))
+        p = fma(s, p, Scalar[dt](0.39999999996131963))
+        p = fma(s, p, Scalar[dt](0.6666666666667282))
+        ln2 = (
+            Scalar[dt](0.6931471805599453),
+            Scalar[dt](2.3190468138462996e-17),
+        )
+
+    # mul(con(ln2), e + ea): mul(T2, T)
+    var k = (e + ea).cast[dt]()
+    var lk = _ep_mul(ln2[0], k)
+    lk = _ep_nrm((lk[0], fma(ln2[1], k, lk[1])))
+    # fadd(ldx(x, 1), s * x.hi * p): fadd(T2, T)
+    var x2 = _ep_ldx(x, Int32(1))
+    var t = _ep_fadd(x2[0], _o_mul(_o_mul(s, x[0]), p))
+    t = _ep_nrm((t[0], _o_add(t[1], x2[1])))
+    # add(T2, T2)
+    var hs = _ep_add(lk[0], t[0])
+    var ls = _ep_add(lk[1], t[1])
+    hs = _ep_nrm((hs[0], _o_add(hs[1], ls[0])))
+    hs = _ep_nrm((hs[0], _o_add(hs[1], ls[1])))
+    return hs[0]
+
+
+@always_inline
+def _ep_mul2[
+    dt: DType
+](a: Scalar[dt], b: Tuple[Scalar[dt], Scalar[dt]]) -> Tuple[
+    Scalar[dt], Scalar[dt]
+]:
+    """mul(T, T2)."""
+    var p = _ep_mul(a, b[0])
+    return _ep_nrm((p[0], fma(a, b[1], p[1])))
+
+
+@always_inline
+def _ep_fsub2[
+    dt: DType
+](a: Tuple[Scalar[dt], Scalar[dt]], b: Tuple[Scalar[dt], Scalar[dt]]) -> Tuple[
+    Scalar[dt], Scalar[dt]
+]:
+    """fsub(T2, T2)."""
+    var d = _ep_fsub(a[0], b[0])
+    return _ep_nrm((d[0], _o_sub(_o_add(d[1], a[1]), b[1])))
+
+
+@always_inline
+def _oc_asinh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """`asinhF.cl` / `asinhD.cl`."""
+    var big: Scalar[dt]
+    var small_scale: Scalar[dt]
+    var tiny: Scalar[dt]
+    var ebig: Int32
+    comptime if dt == DType.float32:
+        big = Scalar[dt](1.8446744e19)  # 2^64
+        small_scale = Scalar[dt](5.421011e-20)  # 2^-64
+        tiny = Scalar[dt](0.00024414062)  # 2^-12
+        ebig = Int32(64)
+    else:
+        big = Scalar[dt](1.3407807929942597e154)  # 2^512
+        small_scale = Scalar[dt](7.458340731200207e-155)  # 2^-512
+        tiny = Scalar[dt](7.450580596923828e-09)  # 2^-27
+        ebig = Int32(512)
+    var y = llvm_intrinsic["llvm.fabs", Scalar[dt], has_side_effect=False](x)
+    var b = y >= big
+    var s = small_scale if b else Scalar[dt](1.0)
+    var sy = _o_mul(y, s)
+    # add(sqr(sy), s * s): add(T2, T)
+    var q = _ep_mul(sy, sy)
+    var q2 = _ep_add(q[0], _o_mul(s, s))
+    q = _ep_nrm((q2[0], _o_add(q2[1], q[1])))
+    # root2(T2)
+    var shi = _ep_sqrt(q[0])
+    var e = _ep_fsub2(q, _ep_mul(shi, shi))
+    var slo = _ep_div(e[0], _o_mul(Scalar[dt](2.0), shi))
+    var rt = _ep_fadd(shi, Scalar[dt](0.0) if q[0] == Scalar[dt](0.0) else slo)
+    # add(sy, root): add(T, T2)
+    var a = _ep_add(sy, rt[0])
+    a = _ep_nrm((a[0], _o_add(a[1], rt[1])))
+    var z = _oc_lnep(a, ebig if b else Int32(0))
+    z = y if y < tiny else z
+    comptime if dt == DType.float32:
+        var yb = rebind[Float32](y).to_bits[DType.uint32]()
+        z = y if yb == UInt32(0x7F800000) else z
+        return rebind[Scalar[dt]](
+            Float32(
+                from_bits=(
+                    rebind[Float32](z).to_bits[DType.uint32]()
+                    & UInt32(0x7FFFFFFF)
+                )
+                | (
+                    rebind[Float32](x).to_bits[DType.uint32]()
+                    & UInt32(0x80000000)
+                )
+            )
+        )
+    else:
+        var yb = rebind[Float64](y).to_bits[DType.uint64]()
+        z = y if yb == UInt64(0x7FF0000000000000) else z
+        return rebind[Scalar[dt]](
+            Float64(
+                from_bits=(
+                    rebind[Float64](z).to_bits[DType.uint64]()
+                    & UInt64(0x7FFFFFFFFFFFFFFF)
+                )
+                | (
+                    rebind[Float64](x).to_bits[DType.uint64]()
+                    & UInt64(0x8000000000000000)
+                )
+            )
+        )
+
+
+@always_inline
+def oc_asinhf(x: Float32) -> Float32:
+    """`__ocml_asinh_f32`."""
+    return _oc_asinh[DType.float32](x)
+
+
+@always_inline
+def oc_asinh(x: Float64) -> Float64:
+    """`__ocml_asinh_f64`."""
+    return _oc_asinh[DType.float64](x)

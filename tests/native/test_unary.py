@@ -12,7 +12,9 @@ Public torch API only, run against the mojo device: `mojo_gpu`/`mojo_device`
 import base64
 import functools
 import json
+import math
 import pathlib
+import struct
 from collections.abc import Callable
 
 import pytest
@@ -25,7 +27,7 @@ from tests.native.conftest import (
     require_stock_cuda,
     skip_if_metal,
 )
-from torch_mojo_backend import aten_functions, get_accelerators, native
+from torch_mojo_backend import aten_functions, get_accelerators, mojo_backend, native
 
 
 def _native_count(name: str) -> int:
@@ -1301,104 +1303,155 @@ def test_log_subnormal_inputs(
     )
 
 
-# log / log2 against stock CUDA bit for bit (torch 2.11, H100;
-# log_cuda_bits.json next to this file). On NVIDIA the mojo device runs
-# ports of the libdevice routines CUDA's kernels call (`__nv_logf`,
-# `__nv_log2f`); bfloat16 / float16 compute in float32 and round, as CUDA
-# does. The JSON maps "op/dtype" to the results' bit patterns, little-endian,
-# base64, for the inputs of `_log_input_bits`. To rewrite it, on a machine
-# with stock CUDA torch:
-#   uv run python -c "from tests.native.test_unary import write_log_cuda_json; write_log_cuda_json()"
-_LOG_JSON = pathlib.Path(__file__).parent / "log_cuda_bits.json"
-_LOG_OPS = {"log": torch.log, "log2": torch.log2}
-_LOG_DTYPES = {
+# log / log2 / asinh against stock CUDA bit for bit (torch 2.11+cu130,
+# H100; unary_cuda_bits.json next to this file). On NVIDIA the mojo device
+# runs ports of the libdevice routines CUDA's kernels call (`__nv_logf`,
+# `__nv_log2f`, and CUDA 13's `__nv_asinhf` / `__nv_asinh`: a cu12 wheel's
+# asinh is another algorithm and rounds differently in places); bfloat16 /
+# float16 compute in float32 and round, as CUDA does. The JSON maps
+# "op/dtype" to the results' bit patterns, little-endian, base64, for the
+# inputs of `_bits_inputs`. To rewrite it, on a machine with stock cu13 torch:
+#   uv run python -c "from tests.native.test_unary import write_unary_cuda_json; write_unary_cuda_json()"
+_BITS_JSON = pathlib.Path(__file__).parent / "unary_cuda_bits.json"
+_BITS_OPS = {"log": torch.log, "log2": torch.log2, "asinh": torch.asinh}
+_BITS_DTYPES = {
     "float32": (torch.float32, torch.int32),
     "bfloat16": (torch.bfloat16, torch.int16),
     "float16": (torch.float16, torch.int16),
+    "float64": (torch.float64, torch.int64),
 }
+# (op, dtype) pairs recorded; float64 only for asinh
+_BITS_CASES = [
+    (op, dtype)
+    for op in _BITS_OPS
+    for dtype in _BITS_DTYPES
+    if dtype != "float64" or op == "asinh"
+]
 
 
-def _log_input_bits(dtype: str) -> list[int]:
-    """Both signs of: zero, infinity, NaNs, every power of two (subnormal
-    ones too) with its neighbours, the neighbourhoods of 1 and of the two
-    range-reduction thresholds, and pseudo-random patterns; a half dtype
-    takes every fifth pattern plus all bfloat16 subnormals."""
+def _hashed_bits(count: int, mask: int) -> list[int]:
+    h = 0x9E3779B97F4A7C15
+    out = []
+    for _ in range(count):
+        h = (h * 6364136223846793005 + 1442695040888963407) % (1 << 64)
+        out.append((h >> 1) & mask)
+    return out
+
+
+def _bits_input_bits(dtype: str) -> list[int]:
+    """The non-negative bit patterns (each is also run negated): zero,
+    infinity, NaNs, every power of two (subnormal ones too; every third
+    exponent in float64) with its neighbours, the normal/subnormal
+    boundary, the neighbourhoods of 1 and of the routines' range switches,
+    the values of issue #674, and pseudo-random patterns; a half dtype
+    takes every fifth pattern plus all bfloat16 subnormals and its own
+    boundaries."""
+    if dtype == "float64":
+        bits = {0x7FF0000000000001, 0x7FF8000000000000, 0x7FFFFFFFFFFFFFFF}
+        for e in range(0, 2048, 3):
+            bits.update(b for b in range((e << 52) - 1, (e << 52) + 2) if b >= 0)
+        # inf, the largest finite, the normal/subnormal boundary
+        bits.update((0x7FF0000000000000, 0x7FEFFFFFFFFFFFFF))
+        bits.update((0x0010000000000000, 0x0010000000000001, 0x000FFFFFFFFFFFFF))
+        for k in range(52):
+            bits.update((1 << k, (2 << k) - 1))
+        # __nv_asinh's log1p(|x|) + ln 2 switch at 2**63
+        bits.update(range(0x43E0000000000000 - 64, 0x43E0000000000000 + 65))
+        for v in (100.0, 5000.0, 1e5, 1e30, 1e300, 0.5, 1e-10):
+            bits.add(int.from_bytes(struct.pack("<d", v), "little"))
+        bits.update(_hashed_bits(1024, 0x7FFFFFFFFFFFFFFF))
+        return sorted(bits)
     if dtype != "float32":
-        return sorted(set(range(0, 1 << 15, 5)) | set(range(0x80)))
+        edges = (
+            {0x7C00, 0x7BFF, 0x7E00, 0x0400, 0x03FF, 0x0401}
+            if dtype == "float16"
+            else {0x7F80, 0x7F7F, 0x7FC0, 0x0080, 0x007F, 0x0081}
+        )
+        return sorted(set(range(0, 1 << 15, 5)) | set(range(0x80)) | edges)
     bits = {0x7F800001, 0x7FC00000, 0x7FFFFFFF}
     for e in range(256):
         bits.update(b for b in range((e << 23) - 2, (e << 23) + 3) if b >= 0)
     for k in range(23):
         bits.update((1 << k, (1 << k) + 1, (2 << k) - 1))
-    # 1, and where __nv_log2f / __nv_logf switch the reduced mantissa range
-    for center in (0x3F800000, 0x3F3504F3, 0x3F2AAAAB):
+    # 1, where __nv_log2f / __nv_logf switch the reduced mantissa range, and
+    # __nv_asinhf's log1p(|x|) + ln 2 switch at 2**23
+    for center in (0x3F800000, 0x3F3504F3, 0x3F2AAAAB, 0x4B000000):
         bits.update(range(center - 64, center + 65))
-    h = 0x9E3779B97F4A7C15
-    for _ in range(1024):
-        h = (h * 6364136223846793005 + 1442695040888963407) % (1 << 64)
-        bits.add((h >> 33) & 0x7FFFFFFF)
+    for v in (100.0, 5000.0, 1e5, 1e30, 3e38, 0.5, 1e-10):
+        bits.add(int.from_bytes(struct.pack("<f", v), "little"))
+    bits.update(b >> 32 for b in _hashed_bits(1024, 0x7FFFFFFFFFFFFFFF))
     return sorted(bits)
 
 
-def _log_inputs(dtype: str) -> torch.Tensor:
-    float_dtype, int_dtype = _LOG_DTYPES[dtype]
+def _bits_inputs(dtype: str) -> torch.Tensor:
+    float_dtype, int_dtype = _BITS_DTYPES[dtype]
     sign = 1 << (torch.iinfo(int_dtype).bits - 1)
-    positive = _log_input_bits(dtype)
+    positive = _bits_input_bits(dtype)
     # both signs, as the signed integers of the same bits
     signed = positive + [b - sign for b in positive]
     return torch.tensor(signed, dtype=int_dtype).view(float_dtype)
 
 
-def _log_bits(op: str, dtype: str, device: str, foreach: bool = False) -> torch.Tensor:
-    x = _log_inputs(dtype).to(device)
-    if foreach:
+def _unary_bits(op: str, dtype: str, device: str, route: str = "fn") -> torch.Tensor:
+    x = _bits_inputs(dtype).to(device)
+    if route == "foreach":
         out = getattr(torch, f"_foreach_{op}")([x])[0]
+    elif route == "compile":
+        out = torch.compile(_BITS_OPS[op], backend=mojo_backend, fullgraph=True)(x)
     else:
-        out = _LOG_OPS[op](x)
-    return out.cpu().view(_LOG_DTYPES[dtype][1])
+        out = _BITS_OPS[op](x)
+    return out.cpu().view(_BITS_DTYPES[dtype][1])
 
 
-def _log_cases(device: str) -> dict[str, str]:
+def _unary_cases(device: str) -> dict[str, str]:
     return {
         # every supported host is little-endian
         f"{op}/{dtype}": base64.b64encode(
-            _log_bits(op, dtype, device).numpy().tobytes()
+            _unary_bits(op, dtype, device).numpy().tobytes()
         ).decode()
-        for op in _LOG_OPS
-        for dtype in _LOG_DTYPES
+        for op, dtype in _BITS_CASES
     }
 
 
-def write_log_cuda_json():
-    """Rewrite log_cuda_bits.json from stock CUDA torch (see above)."""
+def write_unary_cuda_json():
+    """Rewrite unary_cuda_bits.json from stock CUDA torch (see above)."""
     assert torch.version.cuda is not None and torch.cuda.is_available(), (
         "needs stock CUDA torch"
     )
     lines = [
-        f" {json.dumps(k)}: {json.dumps(v)}" for k, v in _log_cases("cuda").items()
+        f" {json.dumps(k)}: {json.dumps(v)}" for k, v in _unary_cases("cuda").items()
     ]
-    _LOG_JSON.write_text("{\n" + ",\n".join(lines) + "\n}\n")
+    _BITS_JSON.write_text("{\n" + ",\n".join(lines) + "\n}\n")
 
 
 @functools.cache
-def _log_cuda() -> dict[str, str]:
-    return json.loads(_LOG_JSON.read_text())
+def _unary_cuda() -> dict[str, str]:
+    return json.loads(_BITS_JSON.read_text())
 
 
-@pytest.mark.parametrize("foreach", [False, True], ids=["fn", "foreach"])
-@pytest.mark.parametrize("op", list(_LOG_OPS))
-@pytest.mark.parametrize("dtype", list(_LOG_DTYPES))
-def test_log_matches_cuda_bits(mojo_gpu: str, op: str, dtype: str, foreach: bool):
+# The eager op declines float64 asinh, so that one runs through
+# torch.compile only; torch has no _foreach_asinh.
+@pytest.mark.parametrize(
+    ("op", "dtype", "route"),
+    [
+        (op, dtype, route)
+        for op, dtype in _BITS_CASES
+        for route in ("fn", "foreach", "compile")
+        if not (route == "foreach" and op == "asinh")
+        and not (route == "fn" and dtype == "float64")
+    ],
+)
+def test_unary_matches_cuda_bits(mojo_gpu: str, op: str, dtype: str, route: str):
     accelerator = list(get_accelerators())[int(mojo_gpu.rsplit(":", 1)[-1])]
     if accelerator.api != "cuda":
         pytest.skip("the recorded bits are CUDA's libdevice results")
-    int_dtype = _LOG_DTYPES[dtype][1]
+    int_dtype = _BITS_DTYPES[dtype][1]
     want = torch.frombuffer(
-        bytearray(base64.b64decode(_log_cuda()[f"{op}/{dtype}"])), dtype=int_dtype
+        bytearray(base64.b64decode(_unary_cuda()[f"{op}/{dtype}"])), dtype=int_dtype
     )
-    got = _log_bits(op, dtype, mojo_gpu, foreach)
-    inputs = _log_inputs(dtype).view(int_dtype)
-    mask = 0xFFFFFFFF if dtype == "float32" else 0xFFFF
+    got = _unary_bits(op, dtype, mojo_gpu, route)
+    inputs = _bits_inputs(dtype).view(int_dtype)
+    mask = (1 << torch.iinfo(int_dtype).bits) - 1
     bad = [
         f"in 0x{int(inputs[i]) & mask:x}: got 0x{int(got[i]) & mask:x},"
         f" CUDA 0x{int(want[i]) & mask:x}"
@@ -1408,10 +1461,59 @@ def test_log_matches_cuda_bits(mojo_gpu: str, op: str, dtype: str, foreach: bool
 
 
 @pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
-def test_log_cuda_bits_regenerate_on_stock_cuda():
-    """log_cuda_bits.json is what stock CUDA computes today."""
+def test_unary_cuda_bits_regenerate_on_stock_cuda():
+    """unary_cuda_bits.json is what stock CUDA computes today."""
     require_stock_cuda()
-    assert _log_cases("cuda") == _log_cuda()
+    assert _unary_cases("cuda") == _unary_cuda()
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.bfloat16, torch.float16, torch.float64]
+)
+def test_asinh_no_cancellation(mojo_gpu: str, dtype: torch.dtype):
+    """Issue #674: log(x + sqrt(x^2 + 1)) gave -inf at -5000 and lost
+    digits at -100. Every backend, against CPU torch; float64 through
+    torch.compile, as the eager op declines it."""
+    op = torch.asinh
+    if dtype == torch.float64:
+        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+        op = torch.compile(torch.asinh, backend=mojo_backend, fullgraph=True)
+    finfo = torch.finfo(dtype)
+    data = torch.tensor(
+        [-1e5, -5000.0, -100.0, -1.5, -1e-3, 1e-3, 1.5, 100.0, 5000.0, 1e5]
+        + [finfo.max, -finfo.max, finfo.tiny, -finfo.tiny],
+        dtype=torch.float64,
+    ).to(dtype)
+    if dtype == torch.float32:
+        data = torch.cat((data, torch.tensor([1e30, -1e30, 3e38, -3e38])))
+    if dtype == torch.float64:
+        # around ocml's rescaling at 2**512 and libdevice's switch at 2**63
+        big = [2.0**512, 2.0**512 * (1 + 2**-52), 2.0**63, 1e300]
+        data = torch.cat(
+            (data, torch.tensor(big + [-v for v in big], dtype=torch.float64))
+        )
+    rtol = {torch.float32: 2e-6, torch.float64: 1e-15}.get(dtype, 1e-2)
+    torch.testing.assert_close(
+        op(data.to(mojo_gpu)).cpu(), torch.asinh(data), rtol=rtol, atol=0
+    )
+    specials = torch.tensor([0.0, -0.0, math.inf, -math.inf, math.nan], dtype=dtype)
+    got = op(specials.to(mojo_gpu)).cpu()
+    torch.testing.assert_close(got, torch.asinh(specials), equal_nan=True)
+    assert torch.signbit(got[:4]).tolist() == [False, True, False, True]
+
+
+def test_asinh_wide_matches_cuda_bits(mojo_gpu: str):
+    """float32 asinh over 4M elements: the launcher's big-grid configuration."""
+    accelerator = list(get_accelerators())[int(mojo_gpu.rsplit(":", 1)[-1])]
+    if accelerator.api != "cuda":
+        pytest.skip("the recorded bits are CUDA's libdevice results")
+    x = _bits_inputs("float32")
+    reps = (1 << 22) // len(x) + 1
+    got = torch.asinh(x.repeat(reps).to(mojo_gpu)).cpu().view(torch.int32)
+    want = torch.frombuffer(
+        bytearray(base64.b64decode(_unary_cuda()["asinh/float32"])), dtype=torch.int32
+    )
+    assert torch.equal(got, want.repeat(reps))
 
 
 @pytest.mark.parametrize("shape", [(), (0,), (3, 5)])

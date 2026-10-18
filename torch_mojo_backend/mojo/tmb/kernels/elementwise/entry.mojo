@@ -294,9 +294,10 @@ def _bin_go[
 # Three of the ops deserve a note: `tan`, `acosh` and `asinh` cannot call the
 # std.math primitive of the same name, because those lower to libm
 # (`_call_libm`) which `comptime assert`s CPU-only and would refuse to compile
-# for the GPU target. `acosh` and `asinh` are composed from log/sqrt in shared
-# math; `tan` routes through
-# the shared `custom_tan`, which selects math per target and dtype.
+# for the GPU target. `acosh` is composed from log/sqrt in shared math,
+# `asinh` runs the vendor libm's routine (`unary_math._asinh`), and `tan`
+# routes through the shared `custom_tan`, which selects math per target and
+# dtype.
 # ---------------------------------------------------------------------------
 
 comptime UOP_RELU = 0
@@ -759,6 +760,7 @@ def _unary_elementwise[
                 ) and (
                     op_code == UOP_ACOS
                     or op_code == UOP_ACOSH
+                    or op_code == UOP_ASINH
                     or op_code == UOP_GELU_NONE
                     or op_code == UOP_GELU_TANH
                     or op_code == UOP_LOG2

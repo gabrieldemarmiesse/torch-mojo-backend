@@ -24,12 +24,13 @@
 # Cephes *single-precision* polynomial evaluated in double (3e-9 relative off
 # on MI300A; log1p, which calls it, 1e-6), where this port is within an ulp.
 # The routines that depend on an NVIDIA hardware approximation for their result
-# (nv_expf, nv_tanf, nv_fast_sincosf) fall back to std.math off NVIDIA and are
-# NOT bit-exact there.
+# (nv_expf, nv_tanf, nv_fast_sincosf) fall back to std.math off NVIDIA and
+# are NOT bit-exact there; nv_asinhf / nv_asinh are NVIDIA or host (libm) only.
 # ===----------------------------------------------------------------------=== #
 
 from std.bit import count_leading_zeros
 from std.collections import Array
+from std.math import asinh as _std_asinh
 from std.math import cos as _std_cos
 from std.math import exp as _std_exp
 from std.math import fma
@@ -414,8 +415,14 @@ def nv_expf(a: Float32) -> Float32:
 
 
 @always_inline
-def nv_log1pf(a: Float32) -> Float32:
-    """`__nv_log1pf` (libdevice_ir/__nv_log1pf.ll). Pure IEEE plus add.rz."""
+def nv_log1pf[rare_special: Bool = False](a: Float32) -> Float32:
+    """`__nv_log1pf` (libdevice_ir/__nv_log1pf.ll). Pure IEEE plus add.rz.
+
+    `rare_special`: for callers whose inputs are almost never negative, inf
+    or NaN (asinh): those cases become a branch around a call instead of
+    selects every element pays for, as in CUDA's SASS. A caller that takes
+    them often (log_ndtr, -erfc / 2 < 0) runs slower that way.
+    """
     var t = _add_rz_f(a, Float32(1.0))
     var e = (_fb(t) - Int32(1061158912)) & Int32(-8388608)  # bits(0.75f)
     var m = _fr(_fb(a) - e)
@@ -440,11 +447,28 @@ def nv_log1pf(a: Float32) -> Float32:
     var r = fma(i, Float32(from_bits=UInt32(0x3F317218)), p)  # ln(2)
 
     if a.to_bits[DType.uint32]() >= UInt32(0x7F800000):
-        if _fb(a) > Int32(-1082130432):  # signed bits(-1.0f)
-            r = fma(a, _F32_INF, _F32_INF)
-        if a == Float32(0.0):
-            r = Float32(-0.0)
+        comptime if rare_special:
+            r = _log1pf_special_call(a, r)
+        else:
+            r = _log1pf_special(a, r)
     return r
+
+
+@always_inline
+def _log1pf_special(a: Float32, r: Float32) -> Float32:
+    """nv_log1pf's negative, inf and NaN inputs."""
+    var s = r
+    if _fb(a) > Int32(-1082130432):  # signed bits(-1.0f)
+        s = fma(a, _F32_INF, _F32_INF)
+    if a == Float32(0.0):
+        s = Float32(-0.0)
+    return s
+
+
+@no_inline
+def _log1pf_special_call(a: Float32, r: Float32) -> Float32:
+    """A call LLVM cannot speculate, so the branch to it stays a branch."""
+    return _log1pf_special(a, r)
 
 
 # --------------------------------------------------------------------------- #
@@ -1094,3 +1118,81 @@ def nv_fast_tanf(a: Float32) -> Float32:
     comptime if not is_nvidia_gpu():
         return _std_sin(a) / _std_cos(a)
     return _div_approx_f(_sin_approx_f(a), _cos_approx_f(a))
+
+
+# --------------------------------------------------------------------------- #
+# __nv_asinhf / __nv_asinh
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _rsqrt_approx_ftz_f(x: Float32) -> Float32:
+    return inlined_assembly[
+        "rsqrt.approx.ftz.f32 $0, $1;",
+        Float32,
+        constraints="=f,f",
+        has_side_effect=False,
+    ](x)
+
+
+@always_inline
+def _rsqrt_approx_ftz_d(x: Float64) -> Float64:
+    return inlined_assembly[
+        "rsqrt.approx.ftz.f64 $0, $1;",
+        Float64,
+        constraints="=d,d",
+        has_side_effect=False,
+    ](x)
+
+
+@always_inline
+def nv_asinhf(a: Float32) -> Float32:
+    """`__nv_asinhf` of CUDA 13's libdevice (the nvidia-nvvm 13.0 wheel; the
+    CUDA 12 one is another algorithm), what torch's cu13 wheels run. NVIDIA
+    (rsqrt.approx, rcp.approx) or host (libm) only."""
+    comptime assert is_nvidia_gpu() or not is_gpu(), "NVIDIA or host only"
+    comptime if not is_nvidia_gpu():
+        return _std_asinh(a)
+    var x = _fabs_f(a)
+    var s = fma(a, a, Float32(1.0))
+    var d = fma(s, _rsqrt_approx_ftz_f(s), Float32(1.0))  # 1 + sqrt(1 + a^2)
+    var t = fma(x, x * _rcp_approx_ftz_f(d), x)
+    if x > Float32(8388608.0):  # 2**23: asinh(x) = log1p(x) + ln(2)
+        t = x
+    var r = nv_log1pf[rare_special=True](t)
+    if x > Float32(8388608.0):
+        r = r + Float32(0.6931472)
+    if x <= _F32_INF:  # not NaN
+        r = _fr((_fb(r) & Int32(0x7FFFFFFF)) | (_fb(a) & Int32(-2147483648)))
+    return r
+
+
+@always_inline
+def nv_asinh(a: Float64) -> Float64:
+    """`__nv_asinh` of CUDA 13's libdevice (see nv_asinhf), with its inlined
+    __nv_log1p. NVIDIA (rsqrt.approx, rcp.approx) or host (libm) only."""
+    comptime assert is_nvidia_gpu() or not is_gpu(), "NVIDIA or host only"
+    comptime if not is_nvidia_gpu():
+        return _std_asinh(a)
+    var ahi = _hi(a) & Int32(0x7FFFFFFF)
+    var x = _i2d(_lo(a), ahi)
+    var s = fma(a, a, Float64(1.0))
+    # rsqrt(s), refined once
+    var y = _rsqrt_approx_ftz_d(s)
+    var e = fma(s, -(y * y), Float64(1.0))
+    y = fma(fma(Float64(0.375), e, Float64(0.5)), e * y, y)
+    # 1 / (1 + sqrt(s)), refined
+    var d = fma(s, y, Float64(1.0))
+    var r0 = _rcp_approx_ftz_d(d)
+    var nr = fma(-d, r0, Float64(1.0))
+    var rc = fma(fma(nr, nr, nr), r0, r0)
+    var t = fma(x, x * rc, x)
+    var big = _u32(ahi) >= UInt32(1138753536)  # 2**63, inf and NaN too
+    if big:
+        t = x
+    var r = nv_log1p(t)
+    if big:
+        r = _add_rn_d(r, Float64(0.6931471805599453))  # + ln(2)
+    return _i2d(
+        _lo(r), (_hi(r) & Int32(0x7FFFFFFF)) | (_hi(a) & Int32(-2147483648))
+    )

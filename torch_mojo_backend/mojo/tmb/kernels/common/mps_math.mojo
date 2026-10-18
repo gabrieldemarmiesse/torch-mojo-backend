@@ -90,6 +90,11 @@ def air_asin(x: Float32) -> Float32:
 
 
 @always_inline
+def air_asinh(x: Float32) -> Float32:
+    return _air["llvm.air.asinh"](x)
+
+
+@always_inline
 def air_atan(x: Float32) -> Float32:
     return _air["llvm.air.atan"](x)
 
