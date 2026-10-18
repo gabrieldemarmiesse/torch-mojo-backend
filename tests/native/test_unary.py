@@ -1355,7 +1355,7 @@ def _bits_input_bits(dtype: str) -> list[int]:
         bits.update((0x0010000000000000, 0x0010000000000001, 0x000FFFFFFFFFFFFF))
         for k in range(52):
             bits.update((1 << k, (2 << k) - 1))
-        # __nv_asinh's log(2|x|) switch at 2**63
+        # __nv_asinh's log1p(|x|) + ln 2 switch at 2**63
         bits.update(range(0x43E0000000000000 - 64, 0x43E0000000000000 + 65))
         for v in (100.0, 5000.0, 1e5, 1e30, 1e300, 0.5, 1e-10):
             bits.add(int.from_bytes(struct.pack("<d", v), "little"))
@@ -1374,8 +1374,8 @@ def _bits_input_bits(dtype: str) -> list[int]:
     for k in range(23):
         bits.update((1 << k, (1 << k) + 1, (2 << k) - 1))
     # 1, where __nv_log2f / __nv_logf switch the reduced mantissa range, and
-    # __nv_asinhf's log(2|x|) switch at 2**126
-    for center in (0x3F800000, 0x3F3504F3, 0x3F2AAAAB, 0x7E800000):
+    # __nv_asinhf's log1p(|x|) + ln 2 switch at 2**23
+    for center in (0x3F800000, 0x3F3504F3, 0x3F2AAAAB, 0x4B000000):
         bits.update(range(center - 64, center + 65))
     for v in (100.0, 5000.0, 1e5, 1e30, 3e38, 0.5, 1e-10):
         bits.add(int.from_bytes(struct.pack("<f", v), "little"))

@@ -760,6 +760,7 @@ def _unary_elementwise[
                 ) and (
                     op_code == UOP_ACOS
                     or op_code == UOP_ACOSH
+                    or op_code == UOP_ASINH
                     or op_code == UOP_GELU_NONE
                     or op_code == UOP_GELU_TANH
                     or op_code == UOP_LOG2
