@@ -481,10 +481,6 @@ def _table_special[op_code: Int]() -> Bool:
 
 @always_inline
 def _wide_unary_f32[dtype: DType, op_code: Int]() -> Bool:
-    comptime if dtype == DType.float32 and op_code == UOP_ASINH:
-        # libdevice's asinhf (H100 SXM, 16M elements in [-100, 100], ABBA
-        # device time): 53.5 -> 49.0 us at 8 lanes, stock torch 47.6.
-        return True
     comptime if dtype != DType.float32 or op_code < UOP_TABLE_BASE:
         return False
     else:
@@ -764,7 +760,6 @@ def _unary_elementwise[
                 ) and (
                     op_code == UOP_ACOS
                     or op_code == UOP_ACOSH
-                    or op_code == UOP_ASINH
                     or op_code == UOP_GELU_NONE
                     or op_code == UOP_GELU_TANH
                     or op_code == UOP_LOG2

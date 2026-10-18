@@ -1126,22 +1126,9 @@ def nv_fast_tanf(a: Float32) -> Float32:
 
 
 @always_inline
-def _add_rn_f(a: Float32, b: Float32) -> Float32:
-    """add.rn.f32: libdevice rounds the product feeding it, so Mojo must not
-    contract the pair into an fma (see `_add_rn_d`)."""
+def _rsqrt_approx_ftz_f(x: Float32) -> Float32:
     return inlined_assembly[
-        "add.rn.f32 $0, $1, $2;",
-        Float32,
-        constraints="=f,f,f",
-        has_side_effect=False,
-    ](a, b)
-
-
-@always_inline
-def _rcp_rn_f(x: Float32) -> Float32:
-    """rcp.rn.f32: the IEEE `1 / x` CUDA's `fdiv 1.0, x` lowers to."""
-    return inlined_assembly[
-        "rcp.rn.f32 $0, $1;",
+        "rsqrt.approx.ftz.f32 $0, $1;",
         Float32,
         constraints="=f,f",
         has_side_effect=False,
@@ -1160,50 +1147,52 @@ def _rsqrt_approx_ftz_d(x: Float64) -> Float64:
 
 @always_inline
 def nv_asinhf(a: Float32) -> Float32:
-    """`__nv_asinhf` (libdevice_ir/__nv_asinhf.ll). NVIDIA (lg2.approx,
-    rcp.approx.ftz) or host (libm) only."""
+    """`__nv_asinhf` of CUDA 13's libdevice (the nvidia-nvvm 13.0 wheel; the
+    CUDA 12 one is another algorithm), what torch's cu13 wheels run. NVIDIA
+    (rsqrt.approx, rcp.approx) or host (libm) only."""
     comptime assert is_nvidia_gpu() or not is_gpu(), "NVIDIA or host only"
     comptime if not is_nvidia_gpu():
         return _std_asinh(a)
     var x = _fabs_f(a)
-    var t: Float32
-    if x > Float32(8.507059e37):  # 2**126
-        t = _add_rn_f(
-            Float32(0.6931472), Float32(0.6931472) * _lg2_approx_f(x)
-        )  # ln(2) + ln(x)
-    else:
-        var r = _rcp_rn_f(x)
-        var s = llvm_intrinsic["llvm.sqrt", Float32, has_side_effect=False](
-            fma(r, r, Float32(1.0))
-        )
-        # x + x^2 / (1 + sqrt(1 + x^2))
-        t = nv_log1pf[rare_special=True](fma(x, _rcp_approx_ftz_f(r + s), x))
+    var s = fma(a, a, Float32(1.0))
+    var d = fma(s, _rsqrt_approx_ftz_f(s), Float32(1.0))  # 1 + sqrt(1 + a^2)
+    var t = fma(x, x * _rcp_approx_ftz_f(d), x)
+    if x > Float32(8388608.0):  # 2**23: asinh(x) = log1p(x) + ln(2)
+        t = x
+    var r = nv_log1pf[rare_special=True](t)
+    if x > Float32(8388608.0):
+        r = r + Float32(0.6931472)
     if x <= _F32_INF:  # not NaN
-        t = _fr(_fb(t) | (_fb(a) & Int32(-2147483648)))
-    return t
+        r = _fr((_fb(r) & Int32(0x7FFFFFFF)) | (_fb(a) & Int32(-2147483648)))
+    return r
 
 
 @always_inline
 def nv_asinh(a: Float64) -> Float64:
-    """`__nv_asinh` (libdevice_ir/__nv_asinh.ll), with its inlined __nv_log
-    and __nv_log1p. NVIDIA (rsqrt.approx.ftz) or host (libm) only."""
+    """`__nv_asinh` of CUDA 13's libdevice (see nv_asinhf), with its inlined
+    __nv_log1p. NVIDIA (rsqrt.approx, rcp.approx) or host (libm) only."""
     comptime assert is_nvidia_gpu() or not is_gpu(), "NVIDIA or host only"
     comptime if not is_nvidia_gpu():
         return _std_asinh(a)
     var ahi = _hi(a) & Int32(0x7FFFFFFF)
     var x = _i2d(_lo(a), ahi)
-    var t: Float64
-    if ahi >= Int32(1138753536):  # |a| >= 2**63, NaN and inf included
-        t = _add_rn_d(_log_core(x), Float64(0.6931471805599453))  # + ln(2)
-    else:
-        var a2 = a * a
-        var s1 = fma(a, a, Float64(1.0))
-        # sqrt(s1) from an rsqrt seed y, refined
-        var y = _rsqrt_approx_ftz_d(s1)
-        var yh = _i2d(_lo(y), _hi(y) - Int32(1048576))  # y / 2
-        var g = s1 * y
-        var h = fma(fma(g, -g, s1), yh, g)
-        var w = fma(fma(y, -h, Float64(1.0)), yh, yh)
-        var sq = fma(fma(h, -h, s1), w, h)
-        t = nv_log1p(x + a2 / (Float64(1.0) + sq))
-    return _i2d(_lo(t), (_hi(a) & Int32(-2147483648)) | _hi(t))
+    var s = fma(a, a, Float64(1.0))
+    # rsqrt(s), refined once
+    var y = _rsqrt_approx_ftz_d(s)
+    var e = fma(s, -(y * y), Float64(1.0))
+    y = fma(fma(Float64(0.375), e, Float64(0.5)), e * y, y)
+    # 1 / (1 + sqrt(s)), refined
+    var d = fma(s, y, Float64(1.0))
+    var r0 = _rcp_approx_ftz_d(d)
+    var nr = fma(-d, r0, Float64(1.0))
+    var rc = fma(fma(nr, nr, nr), r0, r0)
+    var t = fma(x, x * rc, x)
+    var big = _u32(ahi) >= UInt32(1138753536)  # 2**63, inf and NaN too
+    if big:
+        t = x
+    var r = nv_log1p(t)
+    if big:
+        r = _add_rn_d(r, Float64(0.6931471805599453))  # + ln(2)
+    return _i2d(
+        _lo(r), (_hi(r) & Int32(0x7FFFFFFF)) | (_hi(a) & Int32(-2147483648))
+    )

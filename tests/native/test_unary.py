@@ -1303,13 +1303,14 @@ def test_log_subnormal_inputs(
     )
 
 
-# log / log2 / asinh against stock CUDA bit for bit (torch 2.11, H100;
-# unary_cuda_bits.json next to this file). On NVIDIA the mojo device runs
-# ports of the libdevice routines CUDA's kernels call (`__nv_logf`,
-# `__nv_log2f`, `__nv_asinhf`, `__nv_asinh`); bfloat16 / float16 compute in
-# float32 and round, as CUDA does. The JSON maps "op/dtype" to the results'
-# bit patterns, little-endian, base64, for the inputs of `_bits_inputs`. To
-# rewrite it, on a machine with stock CUDA torch:
+# log / log2 / asinh against stock CUDA bit for bit (torch 2.11+cu130,
+# H100; unary_cuda_bits.json next to this file). On NVIDIA the mojo device
+# runs ports of the libdevice routines CUDA's kernels call (`__nv_logf`,
+# `__nv_log2f`, and CUDA 13's `__nv_asinhf` / `__nv_asinh`: a cu12 wheel's
+# asinh is another algorithm and rounds differently in places); bfloat16 /
+# float16 compute in float32 and round, as CUDA does. The JSON maps
+# "op/dtype" to the results' bit patterns, little-endian, base64, for the
+# inputs of `_bits_inputs`. To rewrite it, on a machine with stock cu13 torch:
 #   uv run python -c "from tests.native.test_unary import write_unary_cuda_json; write_unary_cuda_json()"
 _BITS_JSON = pathlib.Path(__file__).parent / "unary_cuda_bits.json"
 _BITS_OPS = {"log": torch.log, "log2": torch.log2, "asinh": torch.asinh}
@@ -1502,12 +1503,12 @@ def test_asinh_no_cancellation(mojo_gpu: str, dtype: torch.dtype):
 
 
 def test_asinh_wide_matches_cuda_bits(mojo_gpu: str):
-    """float32 asinh past 2**21 elements takes the 8-lane route."""
+    """float32 asinh over 4M elements: the launcher's big-grid configuration."""
     accelerator = list(get_accelerators())[int(mojo_gpu.rsplit(":", 1)[-1])]
     if accelerator.api != "cuda":
         pytest.skip("the recorded bits are CUDA's libdevice results")
     x = _bits_inputs("float32")
-    reps = (1 << 21) // len(x) + 1
+    reps = (1 << 22) // len(x) + 1
     got = torch.asinh(x.repeat(reps).to(mojo_gpu)).cpu().view(torch.int32)
     want = torch.frombuffer(
         bytearray(base64.b64decode(_unary_cuda()["asinh/float32"])), dtype=torch.int32
