@@ -19,4 +19,16 @@ extern bool tmb_ready;
 extern bool tmb_in_bad_fork;
 void tmb_check_not_forked();
 std::string& tmb_thread_error();
+
+// The body of a C-ABI entry that returns a status: an exception becomes
+// status 1 with its message for tmb_get_error.
+template <class F>
+int32_t tmb_guarded(F&& body) {
+  try {
+    return body();
+  } catch (const std::exception& e) {
+    tmb_set_error(e.what());
+    return 1;
+  }
+}
 void tmb_count_op_call(const char* qualified_name);  // shim_dispatch.cpp

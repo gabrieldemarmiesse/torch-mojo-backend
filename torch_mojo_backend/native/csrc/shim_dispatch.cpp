@@ -626,25 +626,19 @@ TmbLibrary tmb_library_new(const char* ns, const char* dispatch_key) {
 }
 
 int32_t tmb_library_impl(TmbLibrary lib, const char* name, TmbKernelFn fn, void* ctx) {
-  try {
+  return tmb_guarded([&] {
     reinterpret_cast<torch::Library*>(lib)->impl(
         name, torch::CppFunction::makeFromBoxedFunctor(std::make_unique<MojoBoxedKernel>(fn, ctx)));
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_library_fallback(TmbLibrary lib, TmbKernelFn fn, void* ctx) {
-  try {
+  return tmb_guarded([&] {
     reinterpret_cast<torch::Library*>(lib)->fallback(
         torch::CppFunction::makeFromBoxedFunctor(std::make_unique<MojoBoxedKernel>(fn, ctx)));
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_call_op(const char* op, const char* overload, const TmbValue* args, int32_t n_args,
