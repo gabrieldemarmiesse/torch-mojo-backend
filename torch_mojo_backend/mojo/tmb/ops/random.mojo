@@ -75,6 +75,7 @@ from tmb.ops.common import (
     philox_reserve,
     resize_out,
     shares_storage,
+    sizes_str,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
@@ -1735,22 +1736,12 @@ def _philox_dtype_name(dt: DType) -> String:
     return _scalar_type_name(dt)
 
 
-def _int_list_str(t: T, n: Int) -> String:
-    """The first `n` sizes of `t` as torch prints an IntArrayRef."""
-    var s = String("[")
-    for i in range(n):
-        if i:
-            s += ", "
-        s += String(t.dim(i))
-    return s + "]"
-
-
 def _philox_key_check(key: T, what: StaticString) raises:
     if not (key.rank >= 1 and key.dim(key.rank - 1) == 2):
         raise Error(
             what,
             ": key must have shape (*batch, 2), got shape ",
-            _int_list_str(key, key.rank),
+            sizes_str(key, key.rank),
         )
     if key.stype != ST_UINT64:
         raise Error(
@@ -1902,7 +1893,7 @@ def _philox_distribution(
         raise Error(
             what,
             ": key must have shape (2,) or (*batch, 2), got shape ",
-            _int_list_str(key, key.rank),
+            sizes_str(key, key.rank),
         )
     if key.rank > 1:
         if key.rank != self_t.rank + 1:
@@ -1912,18 +1903,18 @@ def _philox_distribution(
                     ": batched key must have ndim == output ndim + 1, got key"
                     " shape "
                 ),
-                _int_list_str(key, key.rank),
+                sizes_str(key, key.rank),
                 " with output shape ",
-                _int_list_str(self_t, self_t.rank),
+                sizes_str(self_t, self_t.rank),
             )
         for i in range(self_t.rank):
             if key.dim(i) != 1 and key.dim(i) != self_t.dim(i):
                 raise Error(
                     what,
                     ": key batch shape ",
-                    _int_list_str(key, self_t.rank),
+                    sizes_str(key, self_t.rank),
                     " is not broadcastable with output shape ",
-                    _int_list_str(self_t, self_t.rank),
+                    sizes_str(self_t, self_t.rank),
                 )
     if self_t.numel == 0:
         ret_ref(rets, 0, self_t)

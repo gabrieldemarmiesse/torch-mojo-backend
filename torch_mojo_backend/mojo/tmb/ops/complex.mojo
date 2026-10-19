@@ -136,6 +136,7 @@ from tmb.ops.common import (
     assert_no_partial_overlap,
     check_expands_to,
     store_out,
+    sizes_str,
 )
 
 
@@ -302,16 +303,6 @@ def _store(
     ret_ref(rets, 0, dest)
 
 
-def _sizes(t: T) -> String:
-    """`t.sizes()` as torch prints it in an error: [2, 3]."""
-    var s = String("[")
-    for i in range(t.rank):
-        if i:
-            s += ", "
-        s += String(t.dim(i))
-    return s + "]"
-
-
 def _exact_dtype(dest: T, st: Int32) raises:
     """An `out=` that must already hold the result's dtype (structured
     kernels' resize_out: no cast)."""
@@ -476,9 +467,9 @@ def _store_ew_n(
                 if _is_same(dest, v_tensor_c(v)):
                     raise Error(
                         "output with shape ",
-                        _sizes(dest),
+                        sizes_str(dest),
                         " doesn't match the broadcast shape ",
-                        _sizes(res.t),
+                        sizes_str(res.t),
                     )
     _store(dest, res^, rets)
 
@@ -1569,11 +1560,11 @@ def _index_put_as_masked_fill(self: T, args: Values, values: T) raises -> Bool:
             if num_ind + j >= self.rank or idx.dim(j) != self.dim(num_ind + j):
                 index_error(
                     "The shape of the mask "
-                    + _sizes(idx)
+                    + sizes_str(idx)
                     + " at index "
                     + String(j)
                     + " does not match the shape of the indexed tensor "
-                    + _sizes(self)
+                    + sizes_str(self)
                     + " at index "
                     + String(num_ind + j)
                 )
@@ -1690,11 +1681,11 @@ def cx_index_put_impl_(
             if index.dim(d) != self.dim(p + d):
                 index_error(
                     "The shape of the mask "
-                    + _sizes(index)
+                    + sizes_str(index)
                     + " at index "
                     + String(d)
                     + " does not match the shape of the indexed tensor "
-                    + _sizes(self)
+                    + sizes_str(self)
                     + " at index "
                     + String(p + d)
                 )
@@ -1823,7 +1814,7 @@ def cx_index_put_impl_(
             rs += String(rshape[i]) + (", " if i + 1 < rr else "")
         raise Error(
             "shape mismatch: value tensor of shape ",
-            _sizes(vals.t),
+            sizes_str(vals.t),
             " cannot be broadcast to indexing result of shape ",
             rs + "]",
         )

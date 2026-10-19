@@ -120,7 +120,6 @@ from tmb.ops.binary import (
     _b_out_guard3,
     _b_ret,
     _b_self,
-    _b_shape_list,
     _b_side,
     _b_sside,
     _b_store_inplace,
@@ -160,6 +159,7 @@ from tmb.ops.common import (
     resize_out,
     scalar_to_float,
     scalar_to_int,
+    shape_list_str,
 )
 from tmb.ops.random import _draw, _sample, _sampler_dtype_check
 from tmb.ops.data_movement import _scalar_type_name
@@ -2152,9 +2152,9 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
     if not grad.same_shape(a.t):
         raise Error(
             "glu_backward: grad_output of shape ",
-            _b_shape_list(grad.shape, grad.rank),
+            shape_list_str(grad.shape, grad.rank),
             " does not match the halved input shape ",
-            _b_shape_list(a.t.shape, a.t.rank),
+            shape_list_str(a.t.shape, a.t.rank),
         )
     if grad.stype != self.stype:
         # glu_backward_cuda_out's TensorIterator checks every operand has
@@ -3520,9 +3520,9 @@ def _loss_fits(
     if not same:
         raise Error(
             "output with shape ",
-            _b_shape_list(shape, rank),
+            shape_list_str(shape, rank),
             " doesn't match the broadcast shape ",
-            _b_shape_list(bs[0], bs[1]),
+            shape_list_str(bs[0], bs[1]),
         )
 
 

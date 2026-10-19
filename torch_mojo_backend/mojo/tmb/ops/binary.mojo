@@ -96,6 +96,7 @@ from tmb.ops.common import (
     sub_check,
     assert_no_partial_overlap,
     one_device,
+    shape_list_str,
 )
 from tmb.ops.core import cast_for_copy
 from tmb.ops.f8_iter import (
@@ -1366,9 +1367,9 @@ def _b_store_inplace(rets: Values, self: T, var res: Res) raises:
     if not self.same_shape(held.t):
         raise Error(
             "output with shape ",
-            _b_shape_list(self.shape, self.rank),
+            shape_list_str(self.shape, self.rank),
             " doesn't match the broadcast shape ",
-            _b_shape_list(held.t.shape, held.t.rank),
+            shape_list_str(held.t.shape, held.t.rank),
         )
     if held.t.stype == self.stype:
         _b_copy_into(self, held.t)
@@ -1416,15 +1417,6 @@ def _b_same_tensor(a: T, b: T) -> Bool:
     The boxed call hands the two records separately, and pointer equality is
     no substitute: independent empty tensors share a null data pointer."""
     return a.h == b.h or a.impl() == b.impl()
-
-
-def _b_shape_list(shape: IndexList[MAX_RANK], rank: Int) -> String:
-    var s = String("[")
-    for i in range(rank):
-        if i:
-            s += ", "
-        s += String(shape[MAX_RANK - rank + i])
-    return s + "]"
 
 
 def _b_tname(st: Int32) raises -> String:
@@ -1516,9 +1508,9 @@ def _b_out_guard3(
     if not fits:
         raise Error(
             "output with shape ",
-            _b_shape_list(dest.shape, dest.rank),
+            shape_list_str(dest.shape, dest.rank),
             " doesn't match the broadcast shape ",
-            _b_shape_list(shape, rank),
+            shape_list_str(shape, rank),
         )
 
 

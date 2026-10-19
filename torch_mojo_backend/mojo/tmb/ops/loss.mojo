@@ -70,9 +70,9 @@ from tmb.ops.common import (
     scalar_to_int,
     shares_storage,
     store_out,
+    sizes_str,
 )
 from tmb.ops.data_movement import _scalar_type_name
-from tmb.ops.nn import sizes_str
 from tmb.backend.registry import Site, impl
 
 

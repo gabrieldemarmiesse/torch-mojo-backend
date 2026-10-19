@@ -50,6 +50,7 @@ from tmb.ops.common import (
     fill_value,
     resize_out,
     shares_storage,
+    sizes_str,
 )
 from tmb.backend.registry import Site, impl
 
@@ -57,16 +58,6 @@ from tmb.backend.registry import Site, impl
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
-
-
-def _sizes(t: T) -> String:
-    """`IntArrayRef` as torch streams it into a message: `[2, 3, 4]`."""
-    var s = String("[")
-    for i in range(t.rank):
-        if i:
-            s += ", "
-        s += String(t.dim(i))
-    return s + "]"
 
 
 def _trunc_div(a: Int, b: Int) -> Int:
@@ -421,14 +412,14 @@ struct Window(Copyable, Movable):
                         "Expected 3D or 4D (batch mode) tensor with optional 0"
                         " dim batch size for input, but got:"
                     ),
-                    _sizes(x),
+                    sizes_str(x),
                 )
         else:
             if x.rank != 4 and x.rank != 5:
                 raise Error(
                     fn_name,
                     ": Expected 4D or 5D tensor for input, but got: ",
-                    _sizes(x),
+                    sizes_str(x),
                 )
             for i in range(x.rank):
                 if x.rank == 5 and i == 0:
@@ -440,7 +431,7 @@ struct Window(Copyable, Movable):
                             ": Expected input's non-batch dimensions to have"
                             " positive length, but input has a shape of "
                         ),
-                        _sizes(x),
+                        sizes_str(x),
                         " and non-batch dimension ",
                         x.dim(i),
                         " has length zero!",
@@ -533,7 +524,9 @@ def _max_pool_check[
     elif x.rank != 4 and x.rank != 5:
         # pool3d_shape_check reports it; sizes below would misread dims.
         raise Error(
-            name, ": Expected 4D or 5D tensor for input, but got: ", _sizes(x)
+            name,
+            ": Expected 4D or 5D tensor for input, but got: ",
+            sizes_str(x),
         )
     var ins = _in_spatial(x, n)
     var outs = w.out_spatial(ins, n)
@@ -670,7 +663,7 @@ def _grad_matches(
                 " at dimension ",
                 i,
                 " but got ",
-                _sizes(grad),
+                sizes_str(grad),
             )
     for i in range(n):
         if grad.dim(x.rank - n + i) != outs[3 - n + i]:
@@ -682,7 +675,7 @@ def _grad_matches(
                 " at dimension ",
                 x.rank - n + i,
                 " but got ",
-                _sizes(grad),
+                sizes_str(grad),
             )
 
 
@@ -882,7 +875,7 @@ def _avg_check[
                 "Expected 3D or 4D (batch mode) tensor with optional 0 dim"
                 " batch size for input, but got:"
             ),
-            _sizes(x),
+            sizes_str(x),
         )
     var ins = _in_spatial(x, n)
     var outs = w.out_spatial(ins, n)
@@ -1047,7 +1040,7 @@ def _adaptive_size[
                 "D or ",
                 lo + 1,
                 "D tensor, but got: ",
-                _sizes(x),
+                sizes_str(x),
             )
         for i in range(1, x.rank):
             if x.dim(i) <= 0:
@@ -1057,7 +1050,7 @@ def _adaptive_size[
                         "(): Expected input to have non-zero size for non-batch"
                         " dimensions, but input has sizes "
                     ),
-                    _sizes(x),
+                    sizes_str(x),
                     " with dimension ",
                     i,
                     " being empty",
@@ -1077,7 +1070,7 @@ def _adaptive_size[
                 "D or ",
                 lo + 1,
                 "D tensor, but got ",
-                _sizes(x),
+                sizes_str(x),
             )
         # 2-D checks the spatial dims only; 3-D every non-batch dim, so a
         # zero-channel batch raises (CUDA's adaptive_avg_pool3d templates).
@@ -1089,7 +1082,7 @@ def _adaptive_size[
                         "(): Expected input to have non-zero size for non-batch"
                         " dimensions, but input has sizes "
                     ),
-                    _sizes(x),
+                    sizes_str(x),
                     " with dimension ",
                     i,
                     " being empty",
@@ -1180,7 +1173,7 @@ def _adaptive_grad_check[
             "D or ",
             n + 2,
             "D grad_output, but got: ",
-            _sizes(grad),
+            sizes_str(grad),
         )
     for i in range(1, grad.rank):
         if grad.dim(i) <= 0:
@@ -1190,7 +1183,7 @@ def _adaptive_grad_check[
                     "(): Expected grad_output to have non-zero size for"
                     " non-batch dimensions, but grad_output has sizes "
                 ),
-                _sizes(grad),
+                sizes_str(grad),
                 " with dimension ",
                 i,
                 " being empty",
@@ -1207,9 +1200,9 @@ def _adaptive_grad_check[
             raise Error(
                 name,
                 "(): grad_output sizes ",
-                _sizes(grad),
+                sizes_str(grad),
                 " do not match input sizes ",
-                _sizes(x),
+                sizes_str(x),
             )
     if grad.stype != x.stype:
         raise Error(
@@ -1345,9 +1338,9 @@ def _adaptive_max_backward[
     if not indices.same_shape(grad):
         raise Error(
             "expected sizes ",
-            _sizes(indices),
+            sizes_str(indices),
             " for `grad_output` but got sizes ",
-            _sizes(grad),
+            sizes_str(grad),
         )
     if indices.stype != ST_INT64:
         raise Error("indices must be an int64 tensor")
@@ -1452,7 +1445,7 @@ def _frac_check[
             "D or ",
             n + 2,
             "D tensor, but got: ",
-            _sizes(x),
+            sizes_str(x),
         )
     for i in range(1, x.rank):
         if x.dim(i) <= 0:
@@ -1462,7 +1455,7 @@ def _frac_check[
                     ": Expected input to have non-zero size for non-batch"
                     " dimensions, but got"
                 ),
-                _sizes(x),
+                sizes_str(x),
                 " with dimension ",
                 i,
                 " being empty.",
@@ -1509,7 +1502,7 @@ def _frac_check[
                 "Trying to create tensor with negative dimension ",
                 outs[i],
                 ": ",
-                _sizes(x),
+                sizes_str(x),
             )
     return (pool, outs)
 
@@ -1634,7 +1627,7 @@ def _fractional_max_pool_backward[
             "D or ",
             n + 2,
             "D tensor, but got: ",
-            _sizes(x),
+            sizes_str(x),
         )
     if len(out_l) != n:
         raise Error(name, ": output_size must have ", n, " elements")
@@ -1764,7 +1757,7 @@ def _max_unpool[n: Int](args: Values, dest: Optional[T] = None) raises -> Owned:
                         "max_unpooling2d_forward_out_cuda(): Expected input to"
                         " have non-zero size for non-batch dimensions, but got "
                     ),
-                    _sizes(x),
+                    sizes_str(x),
                     " with dimension ",
                     i,
                     " being empty.",
@@ -1780,9 +1773,9 @@ def _max_unpool[n: Int](args: Values, dest: Optional[T] = None) raises -> Owned:
         if not x.same_shape(indices):
             raise Error(
                 "Expected shape of indices to be: ",
-                _sizes(x),
+                sizes_str(x),
                 " but got: ",
-                _sizes(indices),
+                sizes_str(indices),
             )
         if len(osize) != 2:
             raise Error(
@@ -1845,9 +1838,9 @@ def _max_unpool[n: Int](args: Values, dest: Optional[T] = None) raises -> Owned:
         if not x.same_shape(indices):
             raise Error(
                 "Expected shape of indices to be: ",
-                _sizes(x),
+                sizes_str(x),
                 " but got: ",
-                _sizes(indices),
+                sizes_str(indices),
             )
         for i in range(1, x.rank):
             if x.dim(i) <= 0:
@@ -1856,7 +1849,7 @@ def _max_unpool[n: Int](args: Values, dest: Optional[T] = None) raises -> Owned:
                         "max_unpooling3d_forward_out_cuda(): Expected input to"
                         " have non-zero size for non-batch dimensions, but got "
                     ),
-                    _sizes(x),
+                    sizes_str(x),
                     " with dimension ",
                     i,
                     " being empty.",
@@ -2059,7 +2052,7 @@ def _im2col(args: Values, dest: Optional[T] = None) raises -> Owned:
                 "Expected 3D or 4D (batch mode) tensor with possibly 0 batch"
                 " size and other non-zero dimensions for input, but got: "
             ),
-            _sizes(x),
+            sizes_str(x),
         )
     var in_h = x.dim(-2)
     var in_w = x.dim(-1)
@@ -2146,7 +2139,7 @@ def _col2im(args: Values, dest: Optional[T] = None) raises -> Owned:
                 "Expected 2D or 3D (batch mode) tensor for input with possibly"
                 " 0 batch size and non-zero dimensions for input, but got: "
             ),
-            _sizes(x),
+            sizes_str(x),
         )
     var planes_in = x.dim(-2)
     var kk = k[0] * k[1]

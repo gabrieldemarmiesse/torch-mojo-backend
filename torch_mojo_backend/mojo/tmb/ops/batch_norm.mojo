@@ -58,6 +58,7 @@ from tmb.ops.common import (
     is_channels_last_layout,
     like_layout,
     store_out,
+    sizes_str,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.loss import (
@@ -71,7 +72,6 @@ from tmb.ops.nn import (
     _bool_list,
     op_batch_norm_legit_no_training,
     op_native_batch_norm,
-    sizes_str,
 )
 from tmb.backend.registry import Site, impl
 

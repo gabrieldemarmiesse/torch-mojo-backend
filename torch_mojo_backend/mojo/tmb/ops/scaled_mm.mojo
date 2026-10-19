@@ -96,6 +96,7 @@ from tmb.ops.common import (
     device_str,
     fill_value,
     resize_out,
+    sizes_str,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.matmul import (
@@ -290,15 +291,6 @@ def _is_scaling(
 
 def _mat_str(t: T) -> String:
     return String(t.dim(0)) + "x" + String(t.dim(1))
-
-
-def _shape_str(t: T) -> String:
-    var s = String("[")
-    for i in range(t.rank):
-        if i:
-            s += ", "
-        s += String(t.dim(i))
-    return s + "]"
 
 
 def _stride_str(t: T) -> String:
@@ -714,7 +706,7 @@ def _invalid_scaling(a: T, b: T, sa: T, sb: T) raises:
         ", scale_a.dtype()=",
         _tname(sa),
         ", scale_a.size()=",
-        _shape_str(sa),
+        sizes_str(sa),
         ", scale_a.stride()=",
         _stride_str(sa),
         ", b.dtype()=",
@@ -722,7 +714,7 @@ def _invalid_scaling(a: T, b: T, sa: T, sb: T) raises:
         ", scale_b.dtype()=",
         _tname(sb),
         ", scale_b.size()=",
-        _shape_str(sb),
+        sizes_str(sb),
         " and scale_b.stride()=",
         _stride_str(sb),
     )
@@ -1148,7 +1140,7 @@ def _v2_invalid(a: T, b: T, sa: T, sb: T) raises:
         ", scale_a[0].dtype()=",
         _tname(sa),
         ", scale_a[0].size()=",
-        _shape_str(sa),
+        sizes_str(sa),
         ", scale_a[0].stride()=",
         _stride_str(sa),
         ", mat_b.dtype()=",
@@ -1156,7 +1148,7 @@ def _v2_invalid(a: T, b: T, sa: T, sb: T) raises:
         ", scale_b[0].dtype()=",
         _tname(sb),
         ", scale_b[0].size()=",
-        _shape_str(sb),
+        sizes_str(sb),
         " and scale_b[0].stride()=",
         _stride_str(sb),
     )
@@ -1190,7 +1182,7 @@ def _v2_deepseek_checks(
                 " x ",
                 kb,
                 " Float elements, got ",
-                _shape_str(s),
+                sizes_str(s),
             )
         if not (
             s.stride(0) == 1
@@ -1216,7 +1208,7 @@ def _v2_deepseek_checks(
                 " x ",
                 ob,
                 " Float elements, got ",
-                _shape_str(s),
+                sizes_str(s),
             )
         if not (
             s.stride(0) == 1
@@ -1357,7 +1349,7 @@ def _scaled_mm_v2(args: Values, mut dest: T) raises:
                 "scale_a must have shape [",
                 m,
                 ", 1], got [",
-                _shape_str(sa),
+                sizes_str(sa),
                 "]",
             )
         if not (sa.stride(1) == 1 or sa.dim(1) == 1):
@@ -1471,7 +1463,7 @@ def _valid_strides_transposed(m: T) raises -> Bool:
         "Invalid strides/sizes, got ",
         _stride_str(m),
         " for strides and ",
-        _shape_str(m),
+        sizes_str(m),
         " for sizes",
     )
 
@@ -1535,13 +1527,13 @@ def _grouped_common_checks(
                 "Expected trailing dimension of mat_a to be divisible by 16 but"
                 " got mat1 shape: ("
             ),
-            _shape_str(a),
+            sizes_str(a),
             ").",
         )
     if b.dim(b.rank - 2) % 16 != 0 or b.dim(b.rank - 1) % 16 != 0:
         raise Error(
             "Expected mat_b shape to be divisible by 16 but got mat_b shape: (",
-            _shape_str(b),
+            sizes_str(b),
             ").",
         )
     if has_bias:

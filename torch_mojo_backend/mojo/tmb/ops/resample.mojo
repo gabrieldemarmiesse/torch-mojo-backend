@@ -77,6 +77,8 @@ from tmb.ops.common import (
     contiguous,
     copy_strided_into,
     resize_out,
+    sizes_str,
+    int_list_str,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
@@ -88,25 +90,6 @@ comptime CUBIC = 3
 comptime BILINEAR_AA = 4
 comptime BICUBIC_AA = 5
 comptime LANCZOS_AA = 6
-
-
-def _sizes_str(t: T) -> String:
-    """`IntArrayRef` as torch prints it: [2, 3, 4]."""
-    var s = String("[")
-    for i in range(t.rank):
-        if i:
-            s += ", "
-        s += String(t.dim(i))
-    return s + "]"
-
-
-def _list_str(l: List[Int]) -> String:
-    var s = String("[")
-    for i in range(len(l)):
-        if i:
-            s += ", "
-        s += String(l[i])
-    return s + "]"
 
 
 def _pick(i: Int, a: StaticString, b: StaticString, c: StaticString) -> String:
@@ -481,7 +464,7 @@ def op_upsample[
             "Non-empty ",
             RANK + 2,
             "D data tensor expected but got a tensor with sizes ",
-            _sizes_str(a),
+            sizes_str(a),
         )
     if not _up_dtype_ok[MODE](a):
         unsupported(String(name, ": dtype ", a.dtype))
@@ -726,7 +709,7 @@ def _reflect_check[RANK: Int](t: T, padding: IntList) raises:
                 ") at dimension ",
                 lead + axis,
                 " of input ",
-                _sizes_str(t),
+                sizes_str(t),
             )
 
 
@@ -762,7 +745,7 @@ def _pad_geom[
                 "D (batch mode) tensor with possibly 0 batch size and other"
                 " non-zero dimensions for input, but got: "
             ),
-            _sizes_str(t),
+            sizes_str(t),
         )
     var lead = t.rank - RANK
     comptime if REFLECT:
@@ -816,7 +799,7 @@ def _pad_geom[
                 "Trying to create tensor with negative dimension ",
                 dims[k],
                 ": ",
-                _list_str(dims),
+                int_list_str(dims),
             )
     return dims^
 
@@ -1051,16 +1034,16 @@ def _grid_check[
                 "grid_sampler(): expected grid and input to have same batch"
                 " size, but got input with sizes "
             ),
-            _sizes_str(input),
+            sizes_str(input),
             " and grid with sizes ",
-            _sizes_str(grid),
+            sizes_str(grid),
         )
     if grid.dim(-1) != input.rank - 2:
         raise Error(
             "grid_sampler(): expected grid to have size ",
             input.rank - 2,
             " in last dimension, but got grid with sizes ",
-            _sizes_str(grid),
+            sizes_str(grid),
         )
     for i in range(2, input.rank):
         if input.dim(i) <= 0:
@@ -1069,7 +1052,7 @@ def _grid_check[
                     "grid_sampler(): expected input to have non-empty spatial"
                     " dimensions, but input has sizes "
                 ),
-                _sizes_str(input),
+                sizes_str(input),
                 " with dimension ",
                 i,
                 " being empty",
@@ -1082,9 +1065,9 @@ def _grid_check[
                 "D input and grid with same number of dimensions, but got input"
                 " with sizes "
             ),
-            _sizes_str(input),
+            sizes_str(input),
             " and grid with sizes ",
-            _sizes_str(grid),
+            sizes_str(grid),
         )
     comptime if RANK == 3:
         if interp == 2:
@@ -1296,9 +1279,9 @@ def op_grid_sampler_backward[
     if not shape_ok:
         raise Error(
             "grid_sampler(): expected grad_output to have sizes ",
-            _list_str(expected),
+            int_list_str(expected),
             " but got grad_output with sizes ",
-            _sizes_str(grad),
+            sizes_str(grad),
         )
     if not grad.on_mojo() or grad.device != input.device:
         unsupported(name + ": grad_output must be on the input's mojo device")

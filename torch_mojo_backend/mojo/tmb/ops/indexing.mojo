@@ -112,6 +112,8 @@ from tmb.ops.common import (
     resize_out,
     same_view,
     shape_str,
+    int_list_str,
+    sizes_str,
 )
 from tmb.ops.compare import _where_select, scalar_as_fill
 from tmb.ops.data_movement import (
@@ -540,17 +542,12 @@ def op_channel_shuffle(
     var a = v_tensor(args[unsafe_offset=0])
     var groups = v_int(args[unsafe_offset=1])
     if a.rank <= 2:
-        var sizes = String("[")
-        for i in range(a.rank):
-            if i:
-                sizes += ", "
-            sizes += String(a.dim(i))
         raise Error(
             (
                 "channel_shuffle expects input to have at least 3 dimensions,"
                 " but got input with sizes "
             ),
-            sizes + "]",
+            sizes_str(a),
         )
     var c = a.dim(1)
     if groups <= 0:
@@ -964,8 +961,10 @@ def _index_copy_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
             "index_copy_(): Source/destination tensor must have same slice"
             " shapes. Destination slice shape: "
         )
-        msg += _list_str(sa) + " at dimension " + String(dim)
-        msg += " and source slice shape: " + _list_str(ss) + " at dimension 0."
+        msg += int_list_str(sa) + " at dimension " + String(dim)
+        msg += (
+            " and source slice shape: " + int_list_str(ss) + " at dimension 0."
+        )
         raise Error(msg)
     if source.rank != 0 and num != source.dim(dim):
         raise Error(
@@ -976,15 +975,6 @@ def _index_copy_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
             ")",
         )
     return dim
-
-
-def _list_str(xs: List[Int]) -> String:
-    var s = String("[")
-    for i in range(len(xs)):
-        if i:
-            s += ", "
-        s += String(xs[i])
-    return s + "]"
 
 
 def _index_copy_into(dest: T, dim: Int, index: T, source: T) raises:

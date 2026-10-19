@@ -74,6 +74,7 @@ from tmb.ops.common import (
     resize_out,
     store_out,
     one_device,
+    sizes_str,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
@@ -474,16 +475,6 @@ def _check_rows(dst: T, cols: Int, numel: Int) raises:
 # ---------------------------------------------------------------------------
 # Softmax `out=` overloads and the masked softmax pair
 # ---------------------------------------------------------------------------
-
-
-def sizes_str(t: T) -> String:
-    """`IntArrayRef` as torch streams it into an error message: `[2, 3]`."""
-    var s = String("[")
-    for i in range(t.rank):
-        if i:
-            s += ", "
-        s += String(t.dim(i))
-    return s + "]"
 
 
 def _softmax_out(

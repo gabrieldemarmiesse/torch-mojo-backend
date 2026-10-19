@@ -145,6 +145,7 @@ from tmb.ops.common import (
     release_if_new,
     resize_out,
     resize_storage_bytes,
+    int_list_str,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
@@ -1236,16 +1237,6 @@ def _split_resize_out(mut out: T, src: T) raises:
         out = T(out.h)
 
 
-def _sizes_str(sizes: IntList) raises -> String:
-    """`split_sizes` the way TORCH_CHECK prints an IntArrayRef."""
-    var s = String("[")
-    for i in range(len(sizes)):
-        if i:
-            s += ", "
-        s += String(sizes[i])
-    return s + "]"
-
-
 # aten::split_with_sizes_copy.out(Tensor self, SymInt[] split_sizes, int dim=0, *, Tensor(a!)[] out) -> ()
 def op_split_with_sizes_copy_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -1277,7 +1268,7 @@ def op_split_with_sizes_copy_out(
                     "split_with_sizes expects split_sizes have only"
                     " non-negative entries, but got split_sizes="
                 ),
-                _sizes_str(sizes),
+                int_list_str(sizes.to_list()),
             )
         total += sizes[i]
     if total != src.dim(dim):
@@ -1287,7 +1278,7 @@ def op_split_with_sizes_copy_out(
             " (input tensor's size at dimension ",
             dim,
             "), but got split_sizes=",
-            _sizes_str(sizes),
+            int_list_str(sizes.to_list()),
         )
     if len(outs) != len(sizes):
         raise Error(
@@ -3860,7 +3851,8 @@ def op_resize_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         raise Error("numel: integer multiplication overflow")
     if not has_zero and numel > (_INT64_MAX // self_t.itemsize) - offset:
         raise Error(
-            "Storage size calculation overflowed with sizes=", _sizes_str(sizes)
+            "Storage size calculation overflowed with sizes=",
+            int_list_str(sizes.to_list()),
         )
     var t = self_t.copy()
     resize_out(t, shape, rank)

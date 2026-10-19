@@ -80,6 +80,7 @@ from tmb.ops.common import (
     device_str,
     fill_value,
     resize_storage_bytes,
+    int_list_str,
 )
 
 
@@ -130,15 +131,6 @@ def _is_float(st: Int32) -> Bool:
         or st == ST_FLOAT16
         or st == ST_BFLOAT16
     )
-
-
-def _sizes_str(dims: List[Int]) -> String:
-    var s = String("[")
-    for i in range(len(dims)):
-        if i:
-            s += ", "
-        s += String(dims[i])
-    return s + "]"
 
 
 def _dims(t: T) -> List[Int]:
@@ -948,7 +940,7 @@ def _lu_factor(A: T, pivot: Bool) raises -> Tuple[Owned, Owned, Owned]:
                 "torch.lu_factor: Expected tensor with 2 or more dimensions."
                 " Got size: "
             ),
-            _sizes_str(_dims(A)),
+            int_list_str(_dims(A)),
             " instead",
         )
     _check_compute(A, "linalg.lu_factor")
@@ -1059,7 +1051,7 @@ def _lu_unpack(
                 "torch.lu_unpack: Expected tensor with 2 or more dimensions."
                 " Got size: "
             ),
-            _sizes_str(_dims(LU)),
+            int_list_str(_dims(LU)),
             " instead",
         )
     var m = LU.dim(-2)
@@ -1083,9 +1075,9 @@ def _lu_unpack(
         if not same:
             raise Error(
                 "Expected LU_pivots to have shape ",
-                _sizes_str(expected),
+                int_list_str(expected),
                 " but got ",
-                _sizes_str(got),
+                int_list_str(got),
                 " instead.",
             )
     if unpack_pivots:
@@ -1151,7 +1143,7 @@ def _linalg_lu(A: T, pivot: Bool) raises -> Tuple[Owned, Owned, Owned]:
     if A.rank < 2:
         raise Error(
             "linalg.lu: Expected tensor with 2 or more dimensions. Got size: ",
-            _sizes_str(_dims(A)),
+            int_list_str(_dims(A)),
             " instead",
         )
     var f = _lu_factor(A, pivot)
@@ -1259,7 +1251,7 @@ def _lu_solve(LU: T, piv: T, B: T, left: Bool, adjoint: Bool) raises -> Owned:
                 "linalg.lu_solve: Expected LU.shape[:-1] and pivots.shape to be"
                 " the same, but got pivots with shape "
             ),
-            _sizes_str(pd),
+            int_list_str(pd),
             " instead",
         )
     _all_on(LU, piv)
@@ -1927,7 +1919,7 @@ def _householder_product(input: T, tau: T) raises -> Owned:
                     " dimensions of tau to be equal to input.shape[:-2], but"
                     " got "
                 ),
-                _sizes_str(tb),
+                int_list_str(tb),
             )
     if tau.stype != input.stype:
         raise Error(
@@ -2033,7 +2025,7 @@ def _ormqr(
                     "torch.ormqr: Expected batch dimensions of tau to be equal"
                     " to input.shape[:-2], but got "
                 ),
-                _sizes_str(tb),
+                int_list_str(tb),
             )
         if not same_o:
             raise Error(
@@ -2041,7 +2033,7 @@ def _ormqr(
                     "torch.ormqr: Expected batch dimensions of other to be"
                     " equal to input.shape[:-2], but got "
                 ),
-                _sizes_str(ob),
+                int_list_str(ob),
             )
     if tau.stype != input.stype:
         raise Error(
@@ -2657,7 +2649,7 @@ def _ldl_solve(LD: T, piv: T, B: T, hermitian: Bool) raises -> Owned:
                 "torch.linalg.ldl_solve: Expected LD.shape[:-1] and"
                 " pivots.shape to be the same, but got pivots with shape "
             ),
-            _sizes_str(got),
+            int_list_str(got),
             " instead",
         )
     if not _is_int_st(piv.stype):

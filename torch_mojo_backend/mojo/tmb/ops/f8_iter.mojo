@@ -77,6 +77,7 @@ from tmb.ops.common import (
     resize_out,
     scalar_type_name,
     store_generated_out,
+    shape_list_str,
 )
 
 # out= dtype rule of the op's TensorIterator (MODE_FN: no out, functional).
@@ -415,15 +416,6 @@ def _fmt_g(x: Float64) -> String:
     return s
 
 
-def _shape_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
-    var s = String("[")
-    for i in range(rank):
-        if i > 0:
-            s += ", "
-        s += String(shape[MAX_RANK - rank + i])
-    return s + "]"
-
-
 @fieldwise_init
 struct _Pre(Movable):
     var mode: Int  # -1: the op's own
@@ -581,9 +573,9 @@ def _pre[
             if it.shape_ok and not _shape_is(a, it.shape, it.rank):
                 raise Error(
                     "output with shape ",
-                    _shape_str(a.shape, a.rank),
+                    shape_list_str(a.shape, a.rank),
                     " doesn't match the broadcast shape ",
-                    _shape_str(it.shape, it.rank),
+                    shape_list_str(it.shape, it.rank),
                 )
         if a.rank > 0 and b.rank > 0:
             _ = promote_types(a.stype, pdt)
@@ -761,9 +753,9 @@ def f8_iter[
         if read_write and not _shape_is(o, it.shape, it.rank):
             raise Error(
                 "output with shape ",
-                _shape_str(o.shape, o.rank),
+                shape_list_str(o.shape, o.rank),
                 " doesn't match the broadcast shape ",
-                _shape_str(it.shape, it.rank),
+                shape_list_str(it.shape, it.rank),
             )
         # (a) + (c), with the device check where TensorIterator's
         # compute_types makes it: after an exact-dtype out's check, before

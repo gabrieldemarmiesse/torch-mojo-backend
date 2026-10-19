@@ -109,7 +109,9 @@ def _padded(shape: IndexList[MAX_RANK]) -> List[Int]:
     return out^
 
 
-def _shape_list_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
+def shape_list_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
+    """The last `rank` dims of a padded shape as torch prints an IntArrayRef:
+    `[2, 3]`."""
     var s = String("[")
     for i in range(rank):
         if i > 0:
@@ -185,12 +187,28 @@ def broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
     return shape
 
 
-def _sizes_str(t: T) -> String:
+def sizes_str(t: T) -> String:
+    """`t.sizes()` as torch streams an IntArrayRef into a message: `[2, 3]`."""
+    return sizes_str(t, t.rank)
+
+
+def sizes_str(t: T, n: Int) -> String:
+    """The first `n` sizes of `t`, as `sizes_str`."""
     var s = String("[")
-    for i in range(t.rank):
+    for i in range(n):
         if i > 0:
             s += ", "
         s += String(t.dim(i))
+    return s + "]"
+
+
+def int_list_str(xs: List[Int]) -> String:
+    """`[a, b, c]`, the way c10 streams an IntArrayRef."""
+    var s = String("[")
+    for i in range(len(xs)):
+        if i > 0:
+            s += ", "
+        s += String(xs[i])
     return s + "]"
 
 
@@ -203,9 +221,9 @@ def check_expands_to(t: T, target: T) raises:
             "expand(",
             scalar_type_name(t.stype),
             "Type{",
-            _sizes_str(t),
+            sizes_str(t),
             "}, size=",
-            _sizes_str(target),
+            sizes_str(target),
             "): the number of sizes provided (",
             target.rank,
             (
@@ -227,9 +245,9 @@ def check_expands_to(t: T, target: T) raises:
                 ") at non-singleton dimension ",
                 target.rank - i,
                 ".  Target sizes: ",
-                _sizes_str(target),
+                sizes_str(target),
                 ".  Tensor sizes: ",
-                _sizes_str(t),
+                sizes_str(t),
             )
 
 
@@ -1728,9 +1746,9 @@ def threshold_into_overlapping(
         if aliased:
             raise Error(
                 "output with shape ",
-                _shape_list_str(dst.shape, dst.rank),
+                shape_list_str(dst.shape, dst.rank),
                 " doesn't match the broadcast shape ",
-                _shape_list_str(shape, rank),
+                shape_list_str(shape, rank),
             )
         resize_out(dst, shape, rank)
     # The kernel's dispatch on out's dtype (no bool), then its Scalar

@@ -100,6 +100,7 @@ from tmb.ops.common import (
     scalar_to_int,
     shares_storage,
     assert_no_partial_overlap,
+    int_list_str,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.pointwise import _none_side, _p, _pw_run
@@ -1317,15 +1318,6 @@ def _addmm_route(bias: T, mat1: T, mat2: T) raises -> Optional[T]:
 # accumulator (`IntMmSpec`); stock CUDA has no integer GEMM but these.
 
 
-def _dims_str(dims: List[Int]) -> String:
-    var s = String("[")
-    for i in range(len(dims)):
-        if i:
-            s += ", "
-        s += String(dims[i])
-    return s + "]"
-
-
 def _matrix_str(t: T) -> String:
     return String(t.dim(0), "x", t.dim(1))
 
@@ -1380,9 +1372,9 @@ def _check_expand(self: T, dims: List[Int], fname: StaticString) raises:
                 ") at non-singleton dimension ",
                 d,
                 ".  Target sizes: ",
-                _dims_str(dims),
+                int_list_str(dims),
                 ".  Tensor sizes: ",
-                _dims_str(self.logical_shape()),
+                int_list_str(self.logical_shape()),
             )
 
 
@@ -1396,9 +1388,9 @@ def _check_inplace(self: T, dims: List[Int]) raises:
     if not same:
         raise Error(
             "Bad in-place call: input tensor size ",
-            _dims_str(self.logical_shape()),
+            int_list_str(self.logical_shape()),
             " and output tensor size ",
-            _dims_str(dims),
+            int_list_str(dims),
             " should match",
         )
 
@@ -2486,9 +2478,9 @@ def op_baddbmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not _has_dims(self, dims):
         raise Error(
             "Expected an output tensor with shape ",
-            _dims_str(dims),
+            int_list_str(dims),
             " but got shape ",
-            _dims_str(self.logical_shape()),
+            int_list_str(self.logical_shape()),
         )
     _baddbmm_run(
         rets,
@@ -3903,16 +3895,6 @@ def op_addr(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # --- aten::convolution --------------------------------------------------------
 
 
-def _list_str(xs: List[Int]) -> String:
-    """`[a, b, c]`, the way c10 streams an IntArrayRef."""
-    var s = String("[")
-    for i in range(len(xs)):
-        if i:
-            s += ", "
-        s += String(xs[i])
-    return s + "]"
-
-
 def _expand_param(
     xs: List[Int], name: StaticString, dims: Int
 ) raises -> List[Int]:
@@ -3932,7 +3914,7 @@ def _expand_param(
             " values to match the convolution dimensions, but got ",
             name,
             "=",
-            _list_str(xs),
+            int_list_str(xs),
         )
     return xs.copy()
 
@@ -4220,11 +4202,11 @@ def _check_conv_shapes(
             "-dimensional input for ",
             weight.rank,
             "-dimensional weight ",
-            _list_str(w_sizes),
+            int_list_str(w_sizes),
             ", but got ",
             k,
             "-dimensional input of size ",
-            _list_str(in_sizes),
+            int_list_str(in_sizes),
             " instead",
         )
     if w_sizes[0] < groups:
@@ -4234,7 +4216,7 @@ def _check_conv_shapes(
             ", expected weight to be at least ",
             groups,
             " at dimension 0, but got weight of size ",
-            _list_str(w_sizes),
+            int_list_str(w_sizes),
             " instead",
         )
     if w_sizes[0] % groups != 0:
@@ -4244,7 +4226,7 @@ def _check_conv_shapes(
             ", expected weight to be divisible by ",
             groups,
             " at dimension 0, but got weight of size [",
-            _list_str(w_sizes),
+            int_list_str(w_sizes),
             "] instead",
         )
     if not p.transposed:
@@ -4253,9 +4235,9 @@ def _check_conv_shapes(
                 "Given groups=",
                 groups,
                 ", weight of size ",
-                _list_str(w_sizes),
+                int_list_str(w_sizes),
                 ", expected input",
-                _list_str(in_sizes),
+                int_list_str(in_sizes),
                 " to have ",
                 w_sizes[1] * groups,
                 " channels, but got ",
@@ -4267,11 +4249,11 @@ def _check_conv_shapes(
             if b.rank != 1 or b.dim(0) != w_sizes[0]:
                 raise Error(
                     "Given weight of size ",
-                    _list_str(w_sizes),
+                    int_list_str(w_sizes),
                     ", expected bias to be 1-dimensional with ",
                     w_sizes[0],
                     " elements, but got bias of size ",
-                    _list_str(b.logical_shape()),
+                    int_list_str(b.logical_shape()),
                     " instead",
                 )
         var fits = True
@@ -4299,9 +4281,9 @@ def _check_conv_shapes(
         if in_sizes[1] != w_sizes[0]:
             raise Error(
                 "Given transposed=1, weight of size ",
-                _list_str(w_sizes),
+                int_list_str(w_sizes),
                 ", expected input",
-                _list_str(in_sizes),
+                int_list_str(in_sizes),
                 " to have ",
                 w_sizes[0],
                 " channels, but got ",
@@ -4313,11 +4295,11 @@ def _check_conv_shapes(
             if b.rank != 1 or b.dim(0) != w_sizes[1] * groups:
                 raise Error(
                     "Given transposed=1, weight of size ",
-                    _list_str(w_sizes),
+                    int_list_str(w_sizes),
                     ", expected bias to be 1-dimensional with ",
                     w_sizes[1] * groups,
                     " elements, but got bias of size ",
-                    _list_str(b.logical_shape()),
+                    int_list_str(b.logical_shape()),
                     " instead",
                 )
     if input.stype != weight.stype or input.device != weight.device:
@@ -4634,7 +4616,7 @@ def _run_conv(input: T, weight: T, bias: Optional[T], p: ConvArgs) raises -> T:
                 "Trying to create tensor with negative dimension ",
                 out_shape[i],
                 ": ",
-                _list_str(out_shape),
+                int_list_str(out_shape),
             )
     if not _is_float(input.dtype) or not input.on_mojo():
         unsupported("convolution of " + dtype_name(input.stype) + " operands")
@@ -4651,7 +4633,7 @@ def _run_conv(input: T, weight: T, bias: Optional[T], p: ConvArgs) raises -> T:
                 "Only zero batch or zero channel inputs are supported, but got"
                 " input shape: "
             ),
-            _list_str(input.logical_shape()),
+            int_list_str(input.logical_shape()),
         )
     if not _conv_runs_here(input, g):
         # An empty output extent (a transposed conv of a degenerate size).
@@ -4911,9 +4893,9 @@ def _conv_backward(
         if grad.dim(i) != expected[i]:
             raise Error(
                 "Expected grad_output of size ",
-                _list_str(expected),
+                int_list_str(expected),
                 ", but got ",
-                _list_str(grad.logical_shape()),
+                int_list_str(grad.logical_shape()),
             )
     if not _is_float(input.dtype) or not input.on_mojo():
         unsupported(
@@ -5063,15 +5045,15 @@ def _check_kernel_size(weight: T, kernel_size: List[Int], spatial: Int) raises:
             "expected kernel_size to have ",
             spatial,
             " elements, but got ",
-            _list_str(kernel_size),
+            int_list_str(kernel_size),
         )
     for i in range(spatial):
         if weight.rank != spatial + 2 or weight.dim(i + 2) != kernel_size[i]:
             raise Error(
                 "expected weight of kernel size ",
-                _list_str(kernel_size),
+                int_list_str(kernel_size),
                 ", but got weight of size ",
-                _list_str(weight.logical_shape()),
+                int_list_str(weight.logical_shape()),
             )
 
 
@@ -5214,7 +5196,7 @@ def _entry_conv(
             "Expected ",
             spatial + 2,
             "D input tensor, but got ",
-            _list_str(input.logical_shape()),
+            int_list_str(input.logical_shape()),
         )
     var unbatched = input.rank == spatial + 1
     if not unbatched and input.rank != spatial + 2:
@@ -5226,7 +5208,7 @@ def _entry_conv(
             "D (batched) input to ",
             name,
             ", but got input of size: ",
-            _list_str(input.logical_shape()),
+            int_list_str(input.logical_shape()),
         )
     var held = own(_empty_result(input.stype, input.device))
     var x = input.copy()
@@ -5529,7 +5511,7 @@ def _slow_conv2d_grads(
     if input.rank != 4:
         raise Error(
             "Expected 4D input tensor, but got ",
-            _list_str(input.logical_shape()),
+            int_list_str(input.logical_shape()),
         )
     _check_conv_shapes(input, weight, None, p)
     _check_conv_backend(input, p)
