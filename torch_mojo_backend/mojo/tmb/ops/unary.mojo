@@ -1438,11 +1438,90 @@ def _promote(t: T) raises -> T:
     return t.copy()
 
 
+def _special_cuda_name(op: String) -> String:
+    """The CUDA kernel name of a special function whose CUDA dispatch is
+    float / double only (`AT_DISPATCH_FLOATING_TYPES`), else ""."""
+    if op == "ErfcxSpec":
+        return "erfcx_cuda"
+    if op == "NdtriSpec":
+        return "ndtri_cuda"
+    if op == "LogNdtrSpec":
+        return "log_ndtr_cuda"
+    if op == "AiryAiSpec":
+        return "airy_ai_cuda"
+    if op == "BesselJ0Spec":
+        return "bessel_j0_cuda"
+    if op == "BesselJ1Spec":
+        return "bessel_j1_cuda"
+    if op == "BesselY0Spec":
+        return "bessel_y0_cuda"
+    if op == "BesselY1Spec":
+        return "bessel_y1_cuda"
+    if op == "ModifiedBesselI0Spec":
+        return "modified_bessel_i0_cuda"
+    if op == "ModifiedBesselI1Spec":
+        return "modified_bessel_i1_cuda"
+    if op == "ModifiedBesselK0Spec":
+        return "modified_bessel_k0_cuda"
+    if op == "ModifiedBesselK1Spec":
+        return "modified_bessel_k1_cuda"
+    if op == "ScaledModifiedBesselK0Spec":
+        return "scaled_modified_bessel_k0_cuda"
+    if op == "ScaledModifiedBesselK1Spec":
+        return "scaled_modified_bessel_k1_cuda"
+    if op == "SphericalBesselJ0Spec":
+        return "spherical_bessel_j0_cuda"
+    return ""
+
+
+def _is_special_f64(op: String) -> Bool:
+    """The special functions with a float64 kernel (the jiterator strings
+    and kernels instantiated for double, `unary_math.has_f64_port`)."""
+    return (
+        _special_cuda_name(op) != ""
+        or op == "ErfSpec"
+        or op == "ErfcSpec"
+        or op == "ErfinvSpec"
+        or op == "LgammaSpec"
+        or op == "DigammaSpec"
+        or op == "I0Spec"
+        or op == "I0eSpec"
+        or op == "I1Spec"
+        or op == "I1eSpec"
+        or op == "SincSpec"
+        or op == "EntrSpec"
+    )
+
+
+def require_special_dtype(op: String, cuda_name: String, t: T) raises:
+    """A special function's dtypes off Apple GPUs: CUDA's (float, double,
+    and half / bfloat16 unless `cuda_name` says the CUDA dispatch is float /
+    double only, which raises NotImplementedError for them). Apple GPUs keep
+    MPS's: float and the half types."""
+    if dev(t.device)[].api == "metal":
+        _require_float(op, t.dtype)
+        return
+    if cuda_name != "" and (
+        t.dtype == DType.float16 or t.dtype == DType.bfloat16
+    ):
+        unsupported(
+            '"'
+            + cuda_name
+            + "\" not implemented for '"
+            + _scalar_type_name(t.dtype)
+            + "'"
+        )
+    _require_float_or_f64(op, t)
+
+
 def _promoting_unary(op: String, t: T) raises -> T:
     _f8_refuse(op, t.dtype)
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":  # the one op of these that takes float64
         return _float_or_f64_unary(op, src.t)
+    if _is_special_f64(op):
+        require_special_dtype(op, _special_cuda_name(op), src.t)
+        return _unary("elementwise", op, src.t, src.t.dtype)
     return _float_unary(op, src.t)
 
 
@@ -1452,6 +1531,9 @@ def _promoting_unary_out(op: String, t: T, mut dst: T) raises:
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":
         _float_or_f64_unary_out(op, src.t, dst, True)
+    elif _is_special_f64(op):
+        require_special_dtype(op, _special_cuda_name(op), src.t)
+        _unary_out("elementwise", op, src.t, dst, src.t.dtype, True)
     else:
         _require_float(op, src.t.dtype)
         _unary_out("elementwise", op, src.t, dst, src.t.dtype, True)
@@ -1742,7 +1824,7 @@ def op_logit(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var eps = _logit_eps(args[unsafe_offset=1])
     var src = own_if_new(_promote(t), t)
-    _require_float("logit", src.t.dtype)
+    require_special_dtype("logit", "", src.t)
     var b = _logit_bounds(eps, src.t.dtype)
     var out = own(_param_unary("LogitSpec", src.t, eps, b[0], b[1]))
     ret_owned(rets, 0, out)
@@ -1754,7 +1836,7 @@ def op_logit_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var eps = _logit_eps(args[unsafe_offset=1])
     var dst = v_tensor(args[unsafe_offset=2])
     var src = own_if_new(_promote(t), t)
-    _require_float("logit", src.t.dtype)
+    require_special_dtype("logit", "", src.t)
     var b = _logit_bounds(eps, src.t.dtype)
     _param_unary_out("LogitSpec", src.t, dst, eps, b[0], b[1], cast_ok=True)
     ret_ref(rets, 0, dst)
@@ -1788,7 +1870,7 @@ def op_logit_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             _scalar_type_name(t.dtype),
         )
     var src = own_if_new(_promote(t), t)
-    _require_float("logit", src.t.dtype)
+    require_special_dtype("logit", "", src.t)
     var b = _logit_bounds(eps, src.t.dtype)
     var dst = t.copy()
     _param_unary_out("LogitSpec", src.t, dst, eps, b[0], b[1], cast_ok=True)
@@ -1799,7 +1881,7 @@ def op_logit_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def _polygamma_check(n: Int, t: T) raises:
     if n < 0:
         raise Error("polygamma(n, x) does not support negative n.")
-    _require_float("polygamma", t.dtype)
+    require_special_dtype("polygamma", "", t)
 
 
 def _polygamma_params(n: Int) -> Tuple[Float64, Float64, Float64]:

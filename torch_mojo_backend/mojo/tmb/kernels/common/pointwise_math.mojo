@@ -48,18 +48,21 @@ from tmb.kernels.common.cuda_math import (
 )
 from tmb.kernels.common.libdevice_port import (
     _trig_reduction_slowpath_d,
+    nv_acos,
+    nv_cos,
     nv_exp,
     nv_expf,
     nv_log,
     nv_log1p,
     nv_log1pf,
     nv_logf,
+    nv_sin,
 )
 from tmb.kernels.common.dtype_arithmetic import amd_opaque, cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
 from tmb.kernels.common.pow_math import pow_c99, torch_pow
-from tmb.kernels.common.special_math import igamma_f, igammac_f, zeta_f
+from tmb.kernels.common.special_math import igamma_f, igammac_f, jit_nan, zeta
 
 
 @always_inline
@@ -400,88 +403,31 @@ def _hypot_f64(x: Float64, y: Float64) -> Float64:
 
 
 @always_inline
-def _zeta_scalar(x: Float64, q: Float64) -> Float64:
-    """Hurwitz zeta, Cephes (aten/src/ATen/native/Math.h `zeta`), in double
-    for every input dtype: CPU torch accumulates float in double too."""
-    comptime MACHEP = 1.11022302462515654042e-16
-    var A = Array[Float64, 12](fill=0.0)
-    A[0] = 12.0
-    A[1] = -720.0
-    A[2] = 30240.0
-    A[3] = -1209600.0
-    A[4] = 47900160.0
-    A[5] = -1.8924375803183791606e9
-    A[6] = 7.47242496e10
-    A[7] = -2.950130727918164224e12
-    A[8] = 1.1646782814350067249e14
-    A[9] = -4.5979787224074726105e15
-    A[10] = 1.8152105401943546773e17
-    A[11] = -7.1661652561756670113e18
-    # C's comparisons with NaN are all false (zeta_f spells out why).
-    var x_nan = isnan(x)
-    var q_nan = isnan(q)
-    if not x_nan and x == 1.0:
-        return inf[DType.float64]()
-    if not x_nan and x < 1.0:
-        return nan[DType.float64]()
-    if not q_nan and q <= 0.0:
-        if q == floor(q):
-            return inf[DType.float64]()
-        if x_nan or x != floor(x):
-            return nan[DType.float64]()
-    if x_nan or q_nan:
-        return nan[DType.float64]()
-    var s = _zeta_pow(q, -x)
-    var a = q
-    var i = 0
-    var b = 0.0
-    while i < 9 or a <= 9.0:
-        i += 1
-        a += 1.0
-        b = _zeta_pow(a, -x)
-        s += b
-        if -MACHEP * s < b and b < MACHEP * s:
-            return s
-    var w = a
-    s += b * w / (x - 1.0)
-    s -= 0.5 * b
-    a = 1.0
-    var k = 0.0
-    for j in range(12):
-        a *= x + k
-        b /= w
-        var t = a * b / A[j]
-        s = s + t
-        t = abs(t / s)
-        if t < MACHEP:
-            return s
-        k += 1.0
-        a *= x + k
-        b /= w
-        k += 1.0
-    return s
-
-
-@always_inline
-def _zeta_pow(a: Float64, b: Float64) -> Float64:
-    """C's pow for zeta's terms (the jiterator's `pow` for T = double):
-    pow_math's special cases (pow(1, -inf) = 1, zero and negative bases)
-    around its double-double core."""
-    return torch_pow[DType.float64, 1](a, b)[0]
-
-
-@always_inline
 def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
-    """`static_cast<int64_t>(n)` for the polynomial degree (truncation), in
-    the operand's own float type (no float64 on Apple GPUs); NaN and
-    degrees outside int64's range (-2^63, 2^63) read as -1, which every
-    polynomial maps to 0 (hermite does exactly this; the others are UB in
-    C++, which x86's cvttsd2si turns into INT64_MIN, a negative degree).
-    The cutoff is 2^63 exactly: every float below it converts, so a degree
-    such as 9.21e18 keeps its value."""
-    if isnan(n) or n >= 9223372036854775808.0 or n <= -9223372036854775808.0:
-        return -1
+    """`static_cast<int64_t>(n)` for the polynomial degree as the GPU
+    converts (cvt.rzi.s64): truncation, saturating at int64's bounds, NaN
+    to 0. Apple GPUs have no float64, so their degrees convert from float."""
+    if _poly_isnan(n):
+        return 0
+    if n >= Scalar[w](9223372036854775808.0):
+        return Int.MAX
+    if n <= Scalar[w](-9223372036854775808.0):
+        return Int.MIN
     return Int(n)
+
+
+@always_inline
+def _poly_isnan[w: DType](x: Scalar[w]) -> Bool:
+    """On the bits, as `special_math._isnan`."""
+    comptime if w == DType.float64:
+        return (
+            rebind[Float64](x).to_bits[DType.uint64]()
+            & UInt64(0x7FFFFFFFFFFFFFFF)
+        ) > UInt64(0x7FF0000000000000)
+    else:
+        return (
+            rebind[Float32](x).to_bits[DType.uint32]() & UInt32(0x7FFFFFFF)
+        ) > UInt32(0x7F800000)
 
 
 @always_inline
@@ -538,73 +484,13 @@ def _sincos_f64(a: Float64) -> Tuple[Float64, Float64]:
 
 
 @always_inline
-def _acos_f64(x: Float64) -> Float64:
-    """fdlibm's `__ieee754_acos` (a rational fit of asin on [0, 1/2], within
-    an ulp): std.math has no float64 acos on NVIDIA or AMD (`facos` has no
-    libcall there)."""
-    comptime PIO2_HI = 1.57079632679489655800e00
-    comptime PIO2_LO = 6.12323399573676603587e-17
-
-    @always_inline
-    def rat(z: Float64) -> Float64:
-        var p = z * (
-            1.66666666666666657415e-01
-            + z
-            * (
-                -3.25565818622400915405e-01
-                + z
-                * (
-                    2.01212532134862925881e-01
-                    + z
-                    * (
-                        -4.00555345006794114027e-02
-                        + z
-                        * (
-                            7.91534994289814532176e-04
-                            + z * 3.47933107596021167570e-05
-                        )
-                    )
-                )
-            )
-        )
-        var q = 1.0 + z * (
-            -2.40339491173441421878e00
-            + z
-            * (
-                2.02094576023350569471e00
-                + z
-                * (-6.88283971605453293030e-01 + z * 7.70381505559019352791e-02)
-            )
-        )
-        return p / q
-
-    if isnan(x) or abs(x) > 1.0:
-        return nan[DType.float64]()
-    if abs(x) < 0.5:
-        return PIO2_HI - (x - (PIO2_LO - x * rat(x * x)))
-    if x < 0.0:
-        var z = (1.0 + x) * 0.5
-        var s = ieee_sqrt(z)
-        var w = rat(z) * s - PIO2_LO
-        return 2.0 * (PIO2_HI - (s + w))
-    var z = (1.0 - x) * 0.5
-    var s = ieee_sqrt(z)
-    var df = bitcast[DType.float64](
-        bitcast[DType.uint64](s) & UInt64(0xFFFFFFFF00000000)
-    )
-    var c = (z - df * df) / (s + df)
-    var w = rat(z) * s + c
-    return 2.0 * (df + w)
-
-
-@always_inline
 def _pacos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
     """The polynomials' `acos`: the CUDA acosf on NVIDIA (n acos(x) carries
-    its last-ulp differences n-fold), `_acos_f64` for float64."""
+    its last-ulp differences n-fold), libdevice's acos for float64."""
     comptime if w == DType.float32 and is_nvidia_gpu():
         return cuda_acosf(x.cast[DType.float32]()).cast[w]()
     elif w == DType.float64:
-        return _acos_f64(x.cast[DType.float64]()).cast[w]()
+        return nv_acos(x.cast[DType.float64]()).cast[w]()
     else:
         return acos(x)
 
@@ -643,6 +529,23 @@ def _psin[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
 
 
 @always_inline
+def _poly_cos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
+    """The polynomials' `cos`: libdevice's for double too."""
+    comptime if w == DType.float64:
+        return rebind[Scalar[w]](nv_cos(rebind[Float64](x)))
+    else:
+        return _pcos(x)
+
+
+@always_inline
+def _poly_sin[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
+    comptime if w == DType.float64:
+        return rebind[Scalar[w]](nv_sin(rebind[Float64](x)))
+    else:
+        return _psin(x)
+
+
+@always_inline
 def _polynomial[
     kind: StaticString, w: DType
 ](x: Scalar[w], n_f: Scalar[w]) -> Scalar[w] where w.is_floating_point():
@@ -652,18 +555,13 @@ def _polynomial[
     comptime one = Scalar[w](1.0)
     if n < 0:
         return 0
-    if isnan(x):
-        # Every special case compares x and fails for NaN, so the result is
-        # the degree-0 constant or NaN; tested up front because the GPU's
-        # fast-math flags may fold those comparisons either way.
-        return one if n == 0 else x
     comptime if kind == "chebyshev_polynomial_t":
         if abs(x) == one:
             if x > 0 or n % 2 == 0:
                 return one
             return -one
         if n > 6 and abs(x) < one:
-            return _pcos(Scalar[w](n) * _pacos(x))
+            return _poly_cos(Scalar[w](n) * _pacos(x))
         if n == 0:
             return one
         if n == 1:
@@ -672,7 +570,7 @@ def _polynomial[
         var q = x
         var r = x
         var k = 2
-        while k <= n and not isnan(q):
+        while k <= n and not _poly_isnan(q):
             r = (x + x) * q - p
             p = q
             q = r
@@ -685,9 +583,9 @@ def _polynomial[
             return -Scalar[w](n + 1)
         if n > 8 and abs(x) < one:
             var t = _pacos(x)
-            if _psin(t) != 0:
-                return _psin(Scalar[w](n + 1) * t) / _psin(t)
-            return Scalar[w](n + 1) * _pcos(Scalar[w](n + 1) * t) / x
+            if _poly_sin(t) != 0:
+                return _poly_sin(Scalar[w](n + 1) * t) / _poly_sin(t)
+            return Scalar[w](n + 1) * _poly_cos(Scalar[w](n + 1) * t) / x
         if n == 0:
             return one
         if n == 1:
@@ -696,7 +594,7 @@ def _polynomial[
         var q = x + x
         var r = q
         var k = 2
-        while k <= n and not isnan(q):
+        while k <= n and not _poly_isnan(q):
             r = (x + x) * q - p
             p = q
             q = r
@@ -711,8 +609,8 @@ def _polynomial[
             return -Scalar[w](n + n + 1)
         if n > 8 and abs(x) < one:
             var t = _pacos(x)
-            if _psin(t / 2) != one:
-                return _pcos((Scalar[w](n) + 0.5) * t) / _pcos(t / 2)
+            if _poly_sin(t / 2) != one:
+                return _poly_cos((Scalar[w](n) + 0.5) * t) / _poly_cos(t / 2)
             if n % 2 == 0:
                 return Scalar[w](n + n + 1)
             return -Scalar[w](n + n + 1)
@@ -724,7 +622,7 @@ def _polynomial[
         var q = x + x - one
         var r = q
         var k = 2
-        while k <= n and not isnan(q):
+        while k <= n and not _poly_isnan(q):
             r = (x + x) * q - p
             p = q
             q = r
@@ -739,8 +637,8 @@ def _polynomial[
             return -one
         if n > 8 and abs(x) < one:
             var t = _pacos(x)
-            if _pcos(t / 2) != one:
-                return _psin((Scalar[w](n) + 0.5) * t) / _psin(t / 2)
+            if _poly_cos(t / 2) != one:
+                return _poly_sin((Scalar[w](n) + 0.5) * t) / _poly_sin(t / 2)
             if x > 0:
                 return Scalar[w](n + n + 1)
             if n % 2 == 0:
@@ -754,7 +652,7 @@ def _polynomial[
         var q = x + x + one
         var r = q
         var k = 2
-        while k <= n and not isnan(q):
+        while k <= n and not _poly_isnan(q):
             r = (x + x) * q - p
             p = q
             q = r
@@ -767,7 +665,7 @@ def _polynomial[
             return x + x
         comptime limit = 512 if w == DType.float64 else 128
         if n > limit:
-            return nan[w]()
+            return jit_nan[w]()
         var p = one
         var q = x + x
         var r = Scalar[w](0)
@@ -785,7 +683,7 @@ def _polynomial[
             return x
         comptime limit = 512 if w == DType.float64 else 128
         if n > limit:
-            return nan[w]()
+            return jit_nan[w]()
         var p = one
         var q = x
         var r = Scalar[w](0)
@@ -805,7 +703,7 @@ def _polynomial[
         var q = one - x
         var r = q
         var k = 1
-        while k < n and not isnan(q):
+        while k < n and not _poly_isnan(q):
             r = (
                 (Scalar[w](k + k) + (one - x)) * q - Scalar[w](k) * p
             ) / Scalar[w](k + 1)
@@ -826,7 +724,7 @@ def _polynomial[
         var q = x
         var r = q
         var k = 1
-        while k < n and not isnan(q):
+        while k < n and not _poly_isnan(q):
             r = (Scalar[w](k + k + 1) * x * q - Scalar[w](k) * p) / Scalar[w](
                 k + 1
             )
@@ -844,7 +742,7 @@ def _polynomial[
             if x == 0:
                 return one if n % 2 == 0 else -one
             if n > 6 and abs(y) < one:
-                return _pcos(Scalar[w](n) * _pacos(y))
+                return _poly_cos(Scalar[w](n) * _pacos(y))
             if n == 0:
                 return one
             if n == 1:
@@ -853,7 +751,7 @@ def _polynomial[
             var q = y
             var r = q
             var k = 2
-            while k <= n and not isnan(q):
+            while k <= n and not _poly_isnan(q):
                 r = (y + y) * q - p
                 p = q
                 q = r
@@ -866,9 +764,9 @@ def _polynomial[
                 return Scalar[w](n + 1) if n % 2 == 0 else -Scalar[w](n + 1)
             if n > 6 and abs(y) < one:
                 var t = _pacos(y)
-                if _psin(t) != 0:
-                    return _psin(Scalar[w](n + 1) * t) / _psin(t)
-                return Scalar[w](n + 1) * _pcos(Scalar[w](n + 1) * t) / y
+                if _poly_sin(t) != 0:
+                    return _poly_sin(Scalar[w](n + 1) * t) / _poly_sin(t)
+                return Scalar[w](n + 1) * _poly_cos(Scalar[w](n + 1) * t) / y
             if n == 0:
                 return one
             if n == 1:
@@ -877,7 +775,7 @@ def _polynomial[
             var q = y + y
             var r = q
             var k = 2
-            while k <= n and not isnan(q):
+            while k <= n and not _poly_isnan(q):
                 r = (y + y) * q - p
                 p = q
                 q = r
@@ -892,8 +790,10 @@ def _polynomial[
                 )
             if n > 6 and abs(y) < one:
                 var t = _pacos(y)
-                if _psin(t / 2) != one:
-                    return _pcos((Scalar[w](n) + 0.5) * t) / _pcos(t / 2)
+                if _poly_sin(t / 2) != one:
+                    return _poly_cos((Scalar[w](n) + 0.5) * t) / _poly_cos(
+                        t / 2
+                    )
                 return Scalar[w](n + n + 1) if n % 2 == 0 else -Scalar[w](
                     n + n + 1
                 )
@@ -905,7 +805,7 @@ def _polynomial[
             var q = y + y - one
             var r = q
             var k = 2
-            while k <= n and not isnan(q):
+            while k <= n and not _poly_isnan(q):
                 r = (y + y) * q - p
                 p = q
                 q = r
@@ -921,8 +821,10 @@ def _polynomial[
                 return one if n % 2 == 0 else -one
             if n > 4 and abs(y) < one:
                 var t = _pacos(y)
-                if _pcos(t / 2) != one:
-                    return _psin((Scalar[w](n) + 0.5) * t) / _psin(t / 2)
+                if _poly_cos(t / 2) != one:
+                    return _poly_sin((Scalar[w](n) + 0.5) * t) / _poly_sin(
+                        t / 2
+                    )
                 return one if n % 2 == 0 else -one
             if n == 0:
                 return one
@@ -932,7 +834,7 @@ def _polynomial[
             var q = y + y + one
             var r = q
             var k = 2
-            while k <= n and not isnan(q):
+            while k <= n and not _poly_isnan(q):
                 r = (y + y) * q - p
                 p = q
                 q = r
@@ -1655,9 +1557,10 @@ def _wide[
         var r = a * l
         comptime if is_apple_gpu():
             r = a.eq(0).select(a, r)
+            r = isnan(a).select(a, r)
         else:
+            # A NaN x reaches `x * log(y)`: the GPU's NaN of a product.
             r = a.eq(0).select(zero, r)
-        r = isnan(a).select(a, r)
         return isnan(b).select(SIMD[w, n](nan[w]()), r)
     elif kind == "igamma" or kind == "igammac":
         # IGammaKernel.cu calc_igamma / calc_igammac, float accscalar_t
@@ -1672,20 +1575,11 @@ def _wide[
                 r[i] = igammac_f(ai, xi).cast[w]()
         return r
     elif kind == "zeta":
+        # CUDA's zeta_string in the opmath type (the jiterator's T, on ROCm
+        # as well; MPS's c10::metal::zeta is float too).
         var r = SIMD[w, n]()
         comptime for i in range(n):
-            comptime if w == DType.float32:
-                # CUDA's zeta_string runs in float (the jiterator's T, on
-                # ROCm as well), MPS's c10::metal::zeta too:
-                # special_math.zeta_f, about 3x cheaper than the double
-                # loop (special_zeta f32 357x789: 1.59x torch before).
-                r[i] = zeta_f(
-                    a[i].cast[DType.float32](), b[i].cast[DType.float32]()
-                ).cast[w]()
-            else:
-                r[i] = _zeta_scalar(
-                    a[i].cast[DType.float64](), b[i].cast[DType.float64]()
-                ).cast[w]()
+            r[i] = zeta(a[i], b[i])
         return r
     elif is_polynomial[kind]():
         var r = SIMD[w, n]()

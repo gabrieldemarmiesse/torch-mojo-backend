@@ -1,26 +1,30 @@
 # ===----------------------------------------------------------------------=== #
 # Scalar ports of ATen's special functions, as stock torch runs them on CUDA.
 #
-# Every function is the float32 instantiation of the jiterator string of the
-# same name in aten/src/ATen/native/cuda/Math.cuh (torch v2.14; Cephes-derived
+# Every function is the instantiation of the jiterator string of the same
+# name in aten/src/ATen/native/cuda/Math.cuh (torch v2.11; Cephes-derived
 # polynomials, Faddeeva's erfcx), or of the CUDA kernel lambda where the op
-# has no jiterator string (UnarySpecialOpsKernel.cu, UnaryGammaKernels.cu).
-# The C++ templates run with T = float for float, half and bfloat16 inputs
-# (the jiterator computes reduced floats in float), with each `static const T
-# A[] = {double literals}` rounded to float -- which `Float32(c)` on the
-# comptime lists below reproduces -- and with the CUDA float libm the device
-# code calls (`cuda_math.mojo` / `libdevice_port.mojo`). A few steps compute
-# in double in the C++ (a double literal in the expression, `modf` on a
-# double); those do here too, and are marked.
+# has no jiterator string (UnarySpecialOpsKernel.cu, UnaryGammaKernels.cu),
+# for T = float (float, half and bfloat16 inputs: the jiterator computes
+# reduced floats in float) or T = double. Each `static const T A[] = {double
+# literals}` is rounded to T, which `c.cast[dt]()` on the comptime lists
+# below reproduces, and the libm calls are CUDA's float / double libdevice
+# (`cuda_math.mojo` / `libdevice_port.mojo`). A few steps compute in double
+# for T = float too in the C++ (a double literal in the expression, `modf`
+# on a double); those do here too, and are marked.
 #
-# nvrtc contracts `a * b + c` into an fma (default -fmad=true), so the Horner
-# and Clenshaw recurrences below spell the fma out.
+# nvrtc contracts a single-use `a * b + c` into an fma (default
+# -fmad=true) and leaves a product with several uses rounded; LLVM fuses
+# both, so every such pair below is spelled out (`fma`, `_mul_rn`).
+# The jiterator's `NAN` is the float 0x7fffffff (0x7fffffffe0000000 as a
+# double), `_nan`.
 # ===----------------------------------------------------------------------=== #
 
 from std.builtin.globals import global_constant
 from std.collections import Array
 from std.math import fma
 from std.sys import llvm_intrinsic
+from std.sys._assembly import inlined_assembly
 from std.sys.info import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
 
 from tmb.kernels.common.cuda_math import (
@@ -31,16 +35,23 @@ from tmb.kernels.common.cuda_math import (
     ieee_sqrtf,
     nv_cosf,
     nv_erfcf,
+    nv_expm1,
     nv_expm1f,
     nv_lgammaf,
     nv_sinf,
 )
 from tmb.kernels.common.libdevice_port import (
+    nv_cos,
+    nv_erfc,
     nv_exp,
     nv_expf,
+    nv_lgamma,
     nv_log,
+    nv_log1p,
     nv_log1pf,
     nv_logf,
+    nv_pow,
+    nv_sin,
     nv_tan,
 )
 from tmb.kernels.common.ocml_math import oc_expf, oc_logf, oc_sinf
@@ -48,52 +59,202 @@ from tmb.kernels.common.pow_math import powf_c99
 
 comptime _INF = Float32(from_bits=UInt32(0x7F800000))
 comptime _NAN = Float32(from_bits=UInt32(0x7FC00000))
+comptime F32 = DType.float32
+comptime F64 = DType.float64
+
+
+# --------------------------------------------------------------------------- #
+# Generic scalar helpers (T = float or double)
+# --------------------------------------------------------------------------- #
 
 
 @always_inline
-def _isnan(x: Float32) -> Bool:
+def _f64[dt: DType](x: Scalar[dt]) -> Float64:
+    return x.cast[F64]()
+
+
+@always_inline
+def _t[dt: DType](x: Float64) -> Scalar[dt]:
+    return x.cast[dt]()
+
+
+@always_inline
+def _isnan[dt: DType](x: Scalar[dt]) -> Bool:
     """On the bits (the GPU build's fast-math flags may fold `x != x`)."""
-    return (x.to_bits[DType.uint32]() & UInt32(0x7FFFFFFF)) > UInt32(0x7F800000)
+    comptime if dt == F64:
+        return (
+            rebind[Float64](x).to_bits[DType.uint64]()
+            & UInt64(0x7FFFFFFFFFFFFFFF)
+        ) > UInt64(0x7FF0000000000000)
+    else:
+        return (
+            rebind[Float32](x).to_bits[DType.uint32]() & UInt32(0x7FFFFFFF)
+        ) > UInt32(0x7F800000)
 
 
 @always_inline
-def _horner[n: Int, //, c: Array[Float64, n]](x: Float32) -> Float32:
+def _isinf[dt: DType](x: Scalar[dt]) -> Bool:
+    """On the bits: the GPU build's fast-math flags may fold `|x| == inf`."""
+    comptime if dt == F64:
+        return (
+            rebind[Float64](x).to_bits[DType.uint64]()
+            & UInt64(0x7FFFFFFFFFFFFFFF)
+        ) == UInt64(0x7FF0000000000000)
+    else:
+        return (
+            rebind[Float32](x).to_bits[DType.uint32]() & UInt32(0x7FFFFFFF)
+        ) == UInt32(0x7F800000)
+
+
+@always_inline
+def _inf[dt: DType]() -> Scalar[dt]:
+    return _INF.cast[dt]()
+
+
+@always_inline
+def _nan[dt: DType]() -> Scalar[dt]:
+    return jit_nan[dt]()
+
+
+@always_inline
+def jit_nan[dt: DType]() -> Scalar[dt]:
+    """The jiterator's `NAN` (`__int_as_float(0x7fffffff)`, widened for a
+    double). Apple GPUs run MPS's kernels, whose NaN is 0x7fc00000."""
+    comptime if is_apple_gpu():
+        return _NAN.cast[dt]()
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](Float64(from_bits=UInt64(0x7FFFFFFFE0000000)))
+    else:
+        return rebind[Scalar[dt]](Float32(from_bits=UInt32(0x7FFFFFFF)))
+
+
+@always_inline
+def _absg[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    return llvm_intrinsic["llvm.fabs", Scalar[dt], has_side_effect=False](x)
+
+
+@always_inline
+def _truncg[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    return llvm_intrinsic["llvm.trunc", Scalar[dt], has_side_effect=False](x)
+
+
+@always_inline
+def _floorg[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    return llvm_intrinsic["llvm.floor", Scalar[dt], has_side_effect=False](x)
+
+
+@always_inline
+def _copysigng[dt: DType](mag: Scalar[dt], sgn: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        comptime m = UInt64(0x8000000000000000)
+        return rebind[Scalar[dt]](
+            Float64(
+                from_bits=(rebind[Float64](mag).to_bits[DType.uint64]() & ~m)
+                | (rebind[Float64](sgn).to_bits[DType.uint64]() & m)
+            )
+        )
+    else:
+        return rebind[Scalar[dt]](
+            _copysign(rebind[Float32](mag), rebind[Float32](sgn))
+        )
+
+
+@always_inline
+def _sqrt[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """sqrt.rn (nvcc's default -prec-sqrt=true)."""
+    return llvm_intrinsic["llvm.sqrt", Scalar[dt], has_side_effect=False](x)
+
+
+@always_inline
+def _mul_rn[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """A rounded product LLVM may not fuse into a later add (nvrtc keeps a
+    product with several uses rounded)."""
+    comptime if is_nvidia_gpu():
+        comptime if dt == F64:
+            return inlined_assembly[
+                "mul.rn.f64 $0, $1, $2;",
+                Scalar[dt],
+                constraints="=d,d,d",
+                has_side_effect=False,
+            ](a, b)
+        else:
+            return inlined_assembly[
+                "mul.rn.f32 $0, $1, $2;",
+                Scalar[dt],
+                constraints="=f,f,f",
+                has_side_effect=False,
+            ](a, b)
+    else:
+        return a * b
+
+
+@always_inline
+def _neg[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """nvcc's `-x`: neg.f32 / neg.f64, which the GPU computes as -x - 0 (a
+    NaN comes out as the arithmetic NaN: canonical in float, its sign kept
+    in double), where LLVM may flip the sign bit instead."""
+    comptime if is_nvidia_gpu():
+        comptime if dt == F64:
+            return inlined_assembly[
+                "neg.f64 $0, $1;",
+                Scalar[dt],
+                constraints="=d,d",
+                has_side_effect=False,
+            ](x)
+        else:
+            return inlined_assembly[
+                "neg.f32 $0, $1;",
+                Scalar[dt],
+                constraints="=f,f",
+                has_side_effect=False,
+            ](x)
+    else:
+        return -x
+
+
+@always_inline
+def _horner[
+    n: Int, dt: DType, //, c: Array[Float64, n]
+](x: Scalar[dt]) -> Scalar[dt]:
     """`result = result * x + A[i]` from 0 over the coefficient list, highest
     degree first (the jiterator `polevl` and the open-coded bessel loops)."""
-    var r = Float32(0.0)
+    var r = Scalar[dt](0.0)
     comptime for i in range(n):
         comptime ci = c[i]
-        r = fma(r, x, Float32(ci))
+        r = fma(r, x, ci.cast[dt]())
     return r
 
 
 @always_inline
-def _chbevl[n: Int, //, c: Array[Float64, n]](x: Float32) -> Float32:
+def _chbevl[
+    n: Int, dt: DType, //, c: Array[Float64, n]
+](x: Scalar[dt]) -> Scalar[dt]:
     """Cephes `chbevl`: the Clenshaw sum 0.5 (b0 - b2) of a Chebyshev series."""
     comptime c0 = c[0]
-    var b0 = Float32(c0)
-    var b1 = Float32(0.0)
-    var b2 = Float32(0.0)
+    var b0 = c0.cast[dt]()
+    var b1 = Scalar[dt](0.0)
+    var b2 = Scalar[dt](0.0)
     comptime for i in range(1, n):
         b2 = b1
         b1 = b0
         comptime ci = c[i]
-        b0 = fma(x, b1, -b2) + Float32(ci)
-    return Float32(0.5) * (b0 - b2)
+        b0 = fma(x, b1, -b2) + ci.cast[dt]()
+    return Scalar[dt](0.5) * (b0 - b2)
 
 
 # --------------------------------------------------------------------------- #
-# The float libm of each platform
+# The libm of each platform
 # --------------------------------------------------------------------------- #
 #
 # NVIDIA and AMD run the jiterator strings (ROCm jits them through hiprtc):
-# the CUDA float libm ports. Apple runs torch's own Metal kernels
+# the CUDA libm ports. Apple runs torch's own Metal kernels
 # (c10/metal/special_math.h, mps/kernels/SpecialOps.metal and
 # UnaryKernel.metal), the same Cephes polynomials in float with Metal's
 # precise libm (torch builds its metallib with -fno-fast-math), and no
 # double anywhere: Metal has none, and one f64 value fails the pipeline.
 # The CUDA ports cannot stand in there, as `nv_sinf`'s Payne-Hanek
-# reduction and `nv_log` compute in double.
+# reduction and `nv_log` compute in double. Double is CUDA's libdevice on
+# every GPU that has it.
 
 
 @always_inline
@@ -138,19 +299,6 @@ def _cosf(x: Float32) -> Float32:
 
 
 @always_inline
-def _isinf(x: Float32) -> Bool:
-    """On the bits: the GPU build's fast-math flags may fold `|x| == inf`."""
-    return (x.to_bits[DType.uint32]() & UInt32(0x7FFFFFFF)) == UInt32(
-        0x7F800000
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Elementary compositions
-# --------------------------------------------------------------------------- #
-
-
-@always_inline
 def _libm_logf(x: Float32) -> Float32:
     """The float `log` a jiterator string calls: CUDA's logf, or ocml's on
     AMD GPUs (what the hipified string calls)."""
@@ -178,46 +326,157 @@ def _libm_sinf(x: Float32) -> Float32:
         return nv_sinf(x)
 
 
-@always_inline
-def sinc_f(a: Float32) -> Float32:
-    """`sinc_string`: sin(pi a) / (pi a), 1 at 0."""
-    if a == Float32(0.0):
-        return Float32(1.0)
-    var product = Float32(3.14159265358979323846) * a
-    return _libm_sinf(product) / product
+# The generic forms: `_exp` / `_log` / `_sin` / `_cos` are the float
+# routines above that differ per platform, `_libm_*` the jiterator's own
+# (identical on NVIDIA); double is libdevice's everywhere.
 
 
 @always_inline
-def entr_f(a: Float32) -> Float32:
-    """`entr_string`: -a log a; 0 at 0, -inf below."""
-    if _isnan(a):
-        return a
-    if a > Float32(0.0):
-        return -a * _logf(a)
-    if a == Float32(0.0):
-        return Float32(0.0)
-    return -_INF
+def _exp[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_exp(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](_expf(rebind[Float32](x)))
 
 
 @always_inline
-def logit_f(x: Float32, eps: Float32) -> Float32:
-    """`logit_kernel_cuda`: log(z / (1 - z)), z = x clamped to [eps, 1 - eps]
-    when eps >= 0 (a negative eps is the "None" of the schema)."""
-    var z = x
-    if not (eps < Float32(0.0)):
-        var hi = Float32(1.0) - eps
-        z = eps if x < eps else (hi if x > hi else x)
-    return _libm_logf(z / (Float32(1.0) - z))
+def _libm_exp[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_exp(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](_libm_expf(rebind[Float32](x)))
+
+
+@always_inline
+def _log[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_log(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](_logf(rebind[Float32](x)))
+
+
+@always_inline
+def _libm_log[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_log(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](_libm_logf(rebind[Float32](x)))
+
+
+@always_inline
+def _sin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_sin(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](_sinf(rebind[Float32](x)))
+
+
+@always_inline
+def _libm_sin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_sin(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](_libm_sinf(rebind[Float32](x)))
+
+
+@always_inline
+def _cos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_cos(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](_cosf(rebind[Float32](x)))
+
+
+@always_inline
+def _log1p[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_log1p(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_log1pf(rebind[Float32](x)))
+
+
+@always_inline
+def _erfc[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_erfc(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_erfcf(rebind[Float32](x)))
+
+
+@always_inline
+def _lgamma[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_lgamma(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_lgammaf(rebind[Float32](x)))
+
+
+@always_inline
+def _expm1[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_expm1(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_expm1f(rebind[Float32](x)))
+
+
+@always_inline
+def _pow[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """C's `pow` for zeta's `pow(q, -x)`. float: `pow_math.powf_c99`, C's
+    special cases (pow(1, -inf) = 1 included) around the CUDA powf on
+    NVIDIA and Apple (what the jiterator's `pow` and MPS's float pow
+    compute; no float64 on Apple), a double exp / log core elsewhere. zeta
+    calls it ten times per element: the double exp/log made polygamma(2, x)
+    1.5x torch. double: libdevice's pow."""
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](
+            nv_pow(rebind[Float64](a), rebind[Float64](b))
+        )
+    else:
+        return rebind[Scalar[dt]](
+            powf_c99(rebind[Float32](a), rebind[Float32](b))
+        )
 
 
 @always_inline
 def _powf(a: Float32, b: Float32) -> Float32:
-    """`pow(float, float)` for zeta's `pow(q, -x)`: `pow_math.powf_c99`, C's
-    special cases (pow(1, -inf) = 1 included) around the CUDA powf on NVIDIA
-    and Apple (what the jiterator's `pow` and MPS's float pow compute; no
-    float64 on Apple), a double exp / log core elsewhere. zeta calls it ten
-    times per element: the double exp/log made polygamma(2, x) 1.5x torch."""
-    return powf_c99(a, b)
+    return _pow(a, b)
+
+
+# --------------------------------------------------------------------------- #
+# Elementary compositions
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def sinc[dt: DType](a: Scalar[dt]) -> Scalar[dt]:
+    """`sinc_string`: sin(pi a) / (pi a), 1 at 0."""
+    if a == Scalar[dt](0.0):
+        return Scalar[dt](1.0)
+    var product = Scalar[dt](3.14159265358979323846) * a
+    return _libm_sin(product) / product
+
+
+@always_inline
+def entr[dt: DType](a: Scalar[dt]) -> Scalar[dt]:
+    """`entr_string`: -a log a; 0 at 0, -inf below."""
+    if _isnan(a):
+        return a
+    if a > Scalar[dt](0.0):
+        return -a * _log(a)
+    if a == Scalar[dt](0.0):
+        return Scalar[dt](0.0)
+    return -_inf[dt]()
+
+
+@always_inline
+def logit[dt: DType](x: Scalar[dt], eps: Scalar[dt]) -> Scalar[dt]:
+    """`logit_kernel_cuda`: log(z / (1 - z)), z = x clamped to [eps, 1 - eps]
+    when eps >= 0 (a negative eps is the "None" of the schema)."""
+    var z = x
+    if not (eps < Scalar[dt](0.0)):
+        var hi = Scalar[dt](1.0) - eps
+        z = eps if x < eps else (hi if x > hi else x)
+    return _libm_log(z / (Scalar[dt](1.0) - z))
 
 
 # --------------------------------------------------------------------------- #
@@ -226,33 +485,34 @@ def _powf(a: Float32, b: Float32) -> Float32:
 
 
 @always_inline
-def digamma_f(x_in: Float32) -> Float32:
+def digamma[dt: DType](x_in: Scalar[dt]) -> Scalar[dt]:
     """`digamma_string`."""
+    comptime T = Scalar[dt]
     var x = x_in
-    if x == Float32(0.0):
-        return _copysign(_INF, -x)
-    var result = Float32(0.0)
-    if x < Float32(0.0):
-        if x == _trunc(x):
-            return _NAN
+    if x == T(0.0):
+        return _copysigng(_inf[dt](), -x)
+    var result = T(0.0)
+    if x < T(0.0):
+        if x == _truncg(x):
+            return _nan[dt]()
         # double: r = modf(double(x)), -pi / tan(pi r).
         comptime PI_F64 = 3.14159265358979323846
-        var xd = Float64(x)
-        var r = xd - Float64(_trunc(x))
-        result = Float32(-PI_F64 / nv_tan(PI_F64 * r))
-        x = Float32(1.0) - x
+        var xd = _f64(x)
+        var r = xd - _f64(_truncg(x))
+        result = _t[dt](-PI_F64 / nv_tan(PI_F64 * r))
+        x = T(1.0) - x
     # The C++ `while (x < 10)`, bounded: x > 0 here, so it runs at most 10
     # times, and a NaN (which leaves at once in IEEE arithmetic) cannot spin
     # it under a build that folds the comparison.
     for _ in range(11):
-        if not (x < Float32(10.0)):
+        if not (x < T(10.0)):
             break
-        result -= Float32(1.0) / x
-        x += Float32(1.0)
-    if x == Float32(10.0):
-        return result + Float32(2.25175258906672110764)
-    var y = Float32(0.0)
-    if x < Float32(1.0e17):
+        result -= T(1.0) / x
+        x += T(1.0)
+    if x == T(10.0):
+        return result + T(2.25175258906672110764)
+    var y = T(0.0)
+    if x < T(1.0e17):
         comptime A = [
             8.33333333333333333333e-2,
             -2.10927960927960927961e-2,
@@ -262,44 +522,42 @@ def digamma_f(x_in: Float32) -> Float32:
             -8.33333333333333333333e-3,
             8.33333333333333333333e-2,
         ]
-        var z = Float32(1.0) / (x * x)
+        var z = T(1.0) / (x * x)
         y = z * _horner[A](z)
-    return ((_libm_logf(x) - (Float32(0.5) / x)) - y) + result
+    return ((_libm_log(x) - (T(0.5) / x)) - y) + result
 
 
 @always_inline
-def trigamma_f(x_in: Float32) -> Float32:
+def trigamma[dt: DType](x_in: Scalar[dt]) -> Scalar[dt]:
     """`trigamma_string`."""
-    comptime PI = Float32(3.14159265358979323846)
+    comptime T = Scalar[dt]
+    comptime PI = T(3.14159265358979323846)
     var x = x_in
-    var sign = Float32(1.0)
-    var result = Float32(0.0)
-    if x < Float32(0.5):
-        sign = Float32(-1.0)
-        var sin_pi_x = _libm_sinf(PI * x)
+    var sign = T(1.0)
+    var result = T(0.0)
+    if x < T(0.5):
+        sign = T(-1.0)
+        var sin_pi_x = _libm_sin(PI * x)
         result -= (PI * PI) / (sin_pi_x * sin_pi_x)
-        x = Float32(1.0) - x
+        x = T(1.0) - x
     for _ in range(6):
-        result += Float32(1.0) / (x * x)
-        x += Float32(1.0)
-    var ixx = Float32(1.0) / (x * x)
-    comptime one = Float32(1.0)
+        result += T(1.0) / (x * x)
+        x += T(1.0)
+    var ixx = T(1.0) / (x * x)
+    comptime one = T(1.0)
     result += (
         one
-        + one / (Float32(2.0) * x)
-        + ixx
-        * (
-            one / Float32(6.0)
-            - ixx * (one / Float32(30.0) - ixx * (one / Float32(42.0)))
-        )
+        + one / (T(2.0) * x)
+        + ixx * (one / T(6.0) - ixx * (one / T(30.0) - ixx * (one / T(42.0))))
     ) / x
     return sign * result
 
 
 @always_inline
-def zeta_f(x: Float32, q: Float32) -> Float32:
+def zeta[dt: DType](x: Scalar[dt], q: Scalar[dt]) -> Scalar[dt]:
     """`zeta_string`: the Hurwitz zeta function (Cephes, Euler-Maclaurin)."""
-    comptime MACHEP = Float32(1.11022302462515654042e-16)
+    comptime T = Scalar[dt]
+    comptime MACHEP = T(1.11022302462515654042e-16)
     comptime A = [
         12.0,
         -720.0,
@@ -319,72 +577,71 @@ def zeta_f(x: Float32, q: Float32) -> Float32:
     # below could otherwise never leave it).
     var x_nan = _isnan(x)
     var q_nan = _isnan(q)
-    if not x_nan and x == Float32(1.0):
-        return _INF
-    if not x_nan and x < Float32(1.0):
-        return _NAN
-    if not q_nan and q <= Float32(0.0):
-        if q == _floor(q):
-            return _INF
-        if x_nan or x != _floor(x):
-            return _NAN
+    if not x_nan and x == T(1.0):
+        return _inf[dt]()
+    if not x_nan and x < T(1.0):
+        return _nan[dt]()
+    if not q_nan and q <= T(0.0):
+        if q == _floorg(q):
+            return _inf[dt]()
+        if x_nan or x != _floorg(x):
+            return _nan[dt]()
     if x_nan or q_nan:
-        return _NAN
-    var s = _powf(q, -x)
+        return _nan[dt]()
+    var s = _pow(q, -x)
     var a = q
     var i = 0
-    var b = Float32(0.0)
-    while (i < 9) or (a <= Float32(9.0)):
+    var b = T(0.0)
+    while (i < 9) or (a <= T(9.0)):
         i += 1
-        a += Float32(1.0)
-        b = _powf(a, -x)
+        a += T(1.0)
+        b = _pow(a, -x)
         s += b
         if (-MACHEP * s < b) and (b < MACHEP * s):
             return s
     var w = a
-    s += b * w / (x - Float32(1.0))
-    s -= Float32(0.5) * b
-    var aa = Float32(1.0)
-    var k = Float32(0.0)
+    s += b * w / (x - T(1.0))
+    s -= T(0.5) * b
+    var aa = T(1.0)
+    var k = T(0.0)
     comptime for j in range(12):
         aa *= x + k
         b /= w
         comptime aj = A[j]
-        var t = aa * b / Float32(aj)
+        var t = aa * b / aj.cast[dt]()
         s = s + t
-        t = _abs(t / s)
+        t = _absg(t / s)
         if t < MACHEP:
             return s
-        k += Float32(1.0)
+        k += T(1.0)
         aa *= x + k
         b /= w
-        k += Float32(1.0)
+        k += T(1.0)
     return s
 
 
 @always_inline
-def polygamma_f(x: Float32, n: Int) -> Float32:
+def polygamma[dt: DType](x: Scalar[dt], n: Int) -> Scalar[dt]:
     """`polygamma_kernel_cuda` for an order that fits an int: digamma,
-    trigamma, then `polygamma_series_f` from n = 2 on."""
+    trigamma, then `polygamma_series` from n = 2 on."""
     if n == 0:
-        return digamma_f(x)
+        return digamma(x)
     if n == 1:
-        return trigamma_f(x)
-    return polygamma_series_f(x, Int32(n))
+        return trigamma(x)
+    return polygamma_series(x, Int32(n))
 
 
 @always_inline
-def polygamma_series_f(x: Float32, n: Int32) -> Float32:
+def polygamma_series[dt: DType](x: Scalar[dt], n: Int32) -> Scalar[dt]:
     """`polygamma_string`: (-1)^(n+1) n! zeta(n + 1, x), with the `int n`
     the kernel receives (the int64 order truncated to 32 bits; C's `n % 2`
     is truthy for any odd n, negative included; `n + 1` wraps)."""
-    var one = Float32(1.0)
+    comptime T = Scalar[dt]
+    var one = T(1.0)
     var sign = one if n % 2 != 0 else -one
-    var nf = Float32(n)
+    var nf = n.cast[dt]()
     return (
-        sign
-        * _libm_expf(nv_lgammaf(nf + one))
-        * zeta_f(Float32(n + Int32(1)), x)
+        sign * _libm_exp(_lgamma(nf + one)) * zeta((n + Int32(1)).cast[dt](), x)
     )
 
 
@@ -394,40 +651,42 @@ def polygamma_series_f(x: Float32, n: Int32) -> Float32:
 
 
 @always_inline
-def _erfcx_y100(y100: Float32) -> Float32:
+def _erfcx_y100[dt: DType](y100: Scalar[dt]) -> Scalar[dt]:
     """`erfcx_y100`: erfcx on y = 4 / (4 + x), one of 100 Chebyshev fits
     picked by int(100 y); the double literals make it a double polynomial."""
+    comptime T = Scalar[dt]
     var k = Int(y100)
     if k < 0 or k > 99:
         # y = 1, i.e. |x| < 4 eps: erfcx is 1 to within 1e-15.
-        return Float32(1.0)
+        return T(1.0)
     comptime if is_apple_gpu():
         # UnaryKernel.metal's erfcx: the same fits with float coefficients,
         # evaluated in float, one `switch` case per fit as the Metal source
         # spells it. No table: `global_constant` and `materialize` both
         # emit a generic-address-space global the Metal linker leaves
         # undefined.
-        var tf = Float32(2.0) * y100 - Float32(2 * k + 1)
+        comptime assert dt == F32, "no float64 on Apple GPUs"
+        var tf = rebind[Float32](T(2.0) * y100 - T(2 * k + 1))
         comptime for j in range(100):
             if k == j:
-                return _erfcx_fit_f32[j](tf)
-        return Float32(1.0)
-    var t = Float64(Float32(2.0) * y100 - Float32(2 * k + 1))
+                return rebind[T](_erfcx_fit_f32[j](tf))
+        return T(1.0)
+    var t = _f64(T(2.0) * y100 - T(2 * k + 1))
     comptime if is_nvidia_gpu():
         # A reference to the table in global memory: `materialize` builds
         # the 700-entry array per thread (the erfcx / igamma suspects).
-        return _erfcx_poly(global_constant[_ERFCX_Y100](), k, t)
+        return _erfcx_poly(global_constant[_ERFCX_Y100](), k, t).cast[dt]()
     else:
-        return _erfcx_poly(materialize[_ERFCX_Y100](), k, t)
+        return _erfcx_poly(materialize[_ERFCX_Y100](), k, t).cast[dt]()
 
 
 @always_inline
-def _erfcx_poly(table: Array[Float64, 700], k: Int, t: Float64) -> Float32:
+def _erfcx_poly(table: Array[Float64, 700], k: Int, t: Float64) -> Float64:
     var base = 7 * k
     var p = table[base + 6]
     comptime for j in range(5, -1, -1):
         p = fma(p, t, table[base + j])
-    return Float32(p)
+    return p
 
 
 @always_inline
@@ -442,55 +701,56 @@ def _erfcx_fit_f32[k: Int](t: Float32) -> Float32:
 
 
 @always_inline
-def erfcx_f(x: Float32) -> Float32:
+def erfcx[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`erfcx_string`: exp(x^2) erfc(x)."""
+    comptime T = Scalar[dt]
     if _isnan(x):
         return x
-    if x >= Float32(0.0):
-        if x > Float32(50.0):
-            comptime ispi = Float32(0.56418958354775628694807945156)
-            if x > Float32(5e7):
+    if x >= T(0.0):
+        if x > T(50.0):
+            comptime ispi = T(0.56418958354775628694807945156)
+            if x > T(5e7):
                 return ispi / x
-            var x2 = x * x
-            return (
-                ispi
-                * (x2 * (x2 + Float32(4.5)) + Float32(2.0))
-                / (x * (x2 * (x2 + Float32(5.0)) + Float32(3.75)))
-            )
-        return _erfcx_y100(Float32(400.0) / (Float32(4.0) + x))
-    if x < Float32(-26.7):
-        return _INF
-    if x < Float32(-6.1):
-        return Float32(2.0) * _expf(x * x)
-    return Float32(2.0) * _expf(x * x) - _erfcx_y100(
-        Float32(400.0) / (Float32(4.0) - x)
-    )
+            # x * x has four uses: nvrtc rounds it and fuses none of the
+            # adds, only `(x*x) * (x*x + c) + d`.
+            var x2 = _mul_rn(x, x)
+            var den = x * fma(x2, x2 + T(5.0), T(3.75))
+            var num = fma(x2, x2 + T(4.5), T(2.0))
+            return ispi * num / den
+        return _erfcx_y100(T(400.0) / (T(4.0) + x))
+    if x < T(-26.7):
+        return _inf[dt]()
+    if x < T(-6.1):
+        return T(2.0) * _exp(x * x)
+    return T(2.0) * _exp(x * x) - _erfcx_y100(T(400.0) / (T(4.0) - x))
 
 
 @always_inline
-def log_ndtr_f(x: Float32) -> Float32:
+def log_ndtr[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`log_ndtr_string`: log of the standard normal CDF."""
-    comptime SQRT1_2 = Float32(0.707106781186547524400844362104849039)
+    comptime T = Scalar[dt]
+    comptime SQRT1_2 = T(0.707106781186547524400844362104849039)
     var t = x * SQRT1_2
-    if x < Float32(-1.0):
-        return _logf(erfcx_f(-t) / Float32(2.0)) - t * t
-    return nv_log1pf(-nv_erfcf(t) / Float32(2.0))
+    if x < T(-1.0):
+        return _log(erfcx(-t) / T(2.0)) - t * t
+    return _log1p(-_erfc(t) / T(2.0))
 
 
 @always_inline
-def ndtri_f(y0: Float32) -> Float32:
+def ndtri[dt: DType](y0: Scalar[dt]) -> Scalar[dt]:
     """`ndtri_string`: the inverse of the standard normal CDF (Cephes)."""
-    comptime zero = Float32(0.0)
-    comptime one = Float32(1.0)
+    comptime T = Scalar[dt]
+    comptime zero = T(0.0)
+    comptime one = T(1.0)
     if y0 == zero:
-        return -_INF
+        return -_inf[dt]()
     if y0 == one:
-        return _INF
+        return _inf[dt]()
     if y0 < zero or y0 > one:
-        return _NAN
+        return _nan[dt]()
     var code = True
     var y = y0
-    comptime EXPM2 = Float32(0.13533528323661269189)
+    comptime EXPM2 = T(0.13533528323661269189)
     if y > one - EXPM2:
         y = one - y
         code = False
@@ -513,16 +773,16 @@ def ndtri_f(y0: Float32) -> Float32:
             1.59056225126211695515e1,
             -1.18331621121330003142e0,
         ]
-        comptime s2pi = Float32(2.50662827463100050242e0)
-        y = y - Float32(0.5)
+        comptime s2pi = T(2.50662827463100050242e0)
+        y = y - T(0.5)
         var y2 = y * y
         var x = y + y * (y2 * _horner[P0](y2) / _horner[Q0](y2))
         return x * s2pi
-    var x = ieee_sqrtf(Float32(-2.0) * _logf(y))
-    var x0 = x - (_logf(x) / x)
+    var x = _sqrt(T(-2.0) * _log(y))
+    var x0 = x - (_log(x) / x)
     var z = one / x
-    var x1: Float32
-    if x < Float32(8.0):
+    var x1: T
+    if x < T(8.0):
         comptime P1 = [
             4.05544892305962419923e0,
             3.15251094599893866154e1,
@@ -574,828 +834,382 @@ def ndtri_f(y0: Float32) -> Float32:
     return x if not code else -x
 
 
-# --------------------------------------------------------------------------- #
-# Modified Bessel functions of the first kind (i0, i0e, i1, i1e)
-# --------------------------------------------------------------------------- #
-
-comptime _I0_A = [
-    -4.41534164647933937950e-18,
-    3.33079451882223809783e-17,
-    -2.43127984654795469359e-16,
-    1.71539128555513303061e-15,
-    -1.16853328779934516808e-14,
-    7.67618549860493561688e-14,
-    -4.85644678311192946090e-13,
-    2.95505266312963983461e-12,
-    -1.72682629144155570723e-11,
-    9.67580903537323691224e-11,
-    -5.18979560163526290666e-10,
-    2.65982372468238665035e-9,
-    -1.30002500998624804212e-8,
-    6.04699502254191894932e-8,
-    -2.67079385394061173391e-7,
-    1.11738753912010371815e-6,
-    -4.41673835845875056359e-6,
-    1.64484480707288970893e-5,
-    -5.75419501008210370398e-5,
-    1.88502885095841655729e-4,
-    -5.76375574538582365885e-4,
-    1.63947561694133579842e-3,
-    -4.32430999505057594430e-3,
-    1.05464603945949983183e-2,
-    -2.37374148058994688156e-2,
-    4.93052842396707084878e-2,
-    -9.49010970480476444210e-2,
-    1.71620901522208775349e-1,
-    -3.04682672343198398683e-1,
-    6.76795274409476084995e-1,
-]
-
-comptime _I0_B = [
-    -7.23318048787475395456e-18,
-    -4.83050448594418207126e-18,
-    4.46562142029675999901e-17,
-    3.46122286769746109310e-17,
-    -2.82762398051658348494e-16,
-    -3.42548561967721913462e-16,
-    1.77256013305652638360e-15,
-    3.81168066935262242075e-15,
-    -9.55484669882830764870e-15,
-    -4.15056934728722208663e-14,
-    1.54008621752140982691e-14,
-    3.85277838274214270114e-13,
-    7.18012445138366623367e-13,
-    -1.79417853150680611778e-12,
-    -1.32158118404477131188e-11,
-    -3.14991652796324136454e-11,
-    1.18891471078464383424e-11,
-    4.94060238822496958910e-10,
-    3.39623202570838634515e-9,
-    2.26666899049817806459e-8,
-    2.04891858946906374183e-7,
-    2.89137052083475648297e-6,
-    6.88975834691682398426e-5,
-    3.36911647825569408990e-3,
-    8.04490411014108831608e-1,
-]
-
-comptime _I1_A = [
-    2.77791411276104639959e-18,
-    -2.11142121435816608115e-17,
-    1.55363195773620046921e-16,
-    -1.10559694773538630805e-15,
-    7.60068429473540693410e-15,
-    -5.04218550472791168711e-14,
-    3.22379336594557470981e-13,
-    -1.98397439776494371520e-12,
-    1.17361862988909016308e-11,
-    -6.66348972350202774223e-11,
-    3.62559028155211703701e-10,
-    -1.88724975172282928790e-9,
-    9.38153738649577178388e-9,
-    -4.44505912879632808065e-8,
-    2.00329475355213526229e-7,
-    -8.56872026469545474066e-7,
-    3.47025130813767847674e-6,
-    -1.32731636560394358279e-5,
-    4.78156510755005422638e-5,
-    -1.61760815825896745588e-4,
-    5.12285956168575772895e-4,
-    -1.51357245063125314899e-3,
-    4.15642294431288815669e-3,
-    -1.05640848946261981558e-2,
-    2.47264490306265168283e-2,
-    -5.29459812080949914269e-2,
-    1.02643658689847095384e-1,
-    -1.76416518357834055153e-1,
-    2.52587186443633654823e-1,
-]
-
-comptime _I1_B = [
-    7.51729631084210481353e-18,
-    4.41434832307170791151e-18,
-    -4.65030536848935832153e-17,
-    -3.20952592199342395980e-17,
-    2.96262899764595013876e-16,
-    3.30820231092092828324e-16,
-    -1.88035477551078244854e-15,
-    -3.81440307243700780478e-15,
-    1.04202769841288027642e-14,
-    4.27244001671195135429e-14,
-    -2.10154184277266431302e-14,
-    -4.08355111109219731823e-13,
-    -7.19855177624590851209e-13,
-    2.03562854414708950722e-12,
-    1.41258074366137813316e-11,
-    3.25260358301548823856e-11,
-    -1.89749581235054123450e-11,
-    -5.58974346219658380687e-10,
-    -3.83538038596423702205e-9,
-    -2.63146884688951950684e-8,
-    -2.51223623787020892529e-7,
-    -3.88256480887769039346e-6,
-    -1.10588938762623716291e-4,
-    -9.76109749136146840777e-3,
-    7.78576235018280120474e-1,
-]
-
-# The float specialization of `i1e_string` keeps only the tail of each series.
-comptime _I1E_A_F32 = [
-    9.38153738649577178388e-9,
-    -4.44505912879632808065e-8,
-    2.00329475355213526229e-7,
-    -8.56872026469545474066e-7,
-    3.47025130813767847674e-6,
-    -1.32731636560394358279e-5,
-    4.78156510755005422638e-5,
-    -1.61760815825896745588e-4,
-    5.12285956168575772895e-4,
-    -1.51357245063125314899e-3,
-    4.15642294431288815669e-3,
-    -1.05640848946261981558e-2,
-    2.47264490306265168283e-2,
-    -5.29459812080949914269e-2,
-    1.02643658689847095384e-1,
-    -1.76416518357834055153e-1,
-    2.52587186443633654823e-1,
-]
-
-comptime _I1E_B_F32 = [
-    -3.83538038596423702205e-9,
-    -2.63146884688951950684e-8,
-    -2.51223623787020892529e-7,
-    -3.88256480887769039346e-6,
-    -1.10588938762623716291e-4,
-    -9.76109749136146840777e-3,
-    7.78576235018280120474e-1,
-]
+@always_inline
+def i0[dt: DType](a: Scalar[dt]) -> Scalar[dt]:
+    """`i0_string`."""
+    comptime T = Scalar[dt]
+    var x = _absg(a)
+    if x <= T(8.0):
+        var y = (x / T(2.0)) - T(2.0)
+        return _libm_exp(x) * _chbevl[_I0_A](y)
+    return (_libm_exp(x) * _chbevl[_I0_B](T(32.0) / x - T(2.0))) / _sqrt(x)
 
 
 @always_inline
-def i0_f(a: Float32) -> Float32:
-    """`i0_string` (also `modified_bessel_i0_string`, the same series)."""
-    var x = _abs(a)
-    if x <= Float32(8.0):
-        var y = (x / Float32(2.0)) - Float32(2.0)
-        return _libm_expf(x) * _chbevl[_I0_A](y)
-    return (
-        _libm_expf(x) * _chbevl[_I0_B](Float32(32.0) / x - Float32(2.0))
-    ) / ieee_sqrtf(x)
-
-
-@always_inline
-def i0e_f(a: Float32) -> Float32:
+def i0e[dt: DType](a: Scalar[dt]) -> Scalar[dt]:
     """`i0e_string` (Math.h `calc_i0e`)."""
-    var x = _abs(a)
-    if x <= Float32(8.0):
-        return _chbevl[_I0_A]((x / Float32(2.0)) - Float32(2.0))
-    return _chbevl[_I0_B](Float32(32.0) / x - Float32(2.0)) / ieee_sqrtf(x)
+    comptime T = Scalar[dt]
+    var x = _absg(a)
+    if x <= T(8.0):
+        return _chbevl[_I0_A]((x / T(2.0)) - T(2.0))
+    return _chbevl[_I0_B](T(32.0) / x - T(2.0)) / _sqrt(x)
 
 
 @always_inline
-def i1_f(a: Float32) -> Float32:
+def i1[dt: DType](a: Scalar[dt]) -> Scalar[dt]:
     """`i1_string` (also `modified_bessel_i1_string`)."""
-    var x = _abs(a)
-    var res: Float32
-    if x <= Float32(8.0):
-        var y = x / Float32(2.0) - Float32(2.0)
-        res = _expf(x) * x * _chbevl[_I1_A](y)
+    comptime T = Scalar[dt]
+    var x = _absg(a)
+    var res: T
+    if x <= T(8.0):
+        var y = x / T(2.0) - T(2.0)
+        res = _exp(x) * x * _chbevl[_I1_A](y)
     else:
-        res = (
-            _expf(x) * _chbevl[_I1_B](Float32(32.0) / x - Float32(2.0))
-        ) / ieee_sqrtf(x)
-    return -res if a < Float32(0.0) else res
+        res = (_exp(x) * _chbevl[_I1_B](T(32.0) / x - T(2.0))) / _sqrt(x)
+    return _neg(res) if a < T(0.0) else res
 
 
 @always_inline
-def i1e_f(a: Float32) -> Float32:
-    """`i1e_string`, float specialization."""
-    var x = _abs(a)
-    var res: Float32
-    if x <= Float32(8.0):
-        var y = x / Float32(2.0) - Float32(2.0)
-        res = _chbevl[_I1E_A_F32](y) * x
+def i1e[dt: DType](a: Scalar[dt]) -> Scalar[dt]:
+    """`i1e_string`: its float specialization keeps only the tail of each
+    series."""
+    comptime T = Scalar[dt]
+    var x = _absg(a)
+    var res: T
+    if x <= T(8.0):
+        var y = x / T(2.0) - T(2.0)
+        comptime if dt == F64:
+            res = _chbevl[_I1_A](y) * x
+        else:
+            res = _chbevl[_I1E_A_F32](y) * x
     else:
-        res = _chbevl[_I1E_B_F32](
-            Float32(32.0) / x - Float32(2.0)
-        ) / ieee_sqrtf(x)
-    return -res if a < Float32(0.0) else res
+        var y = T(32.0) / x - T(2.0)
+        comptime if dt == F64:
+            res = _chbevl[_I1_B](y) / _sqrt(x)
+        else:
+            res = _chbevl[_I1E_B_F32](y) / _sqrt(x)
+    return _neg(res) if a < T(0.0) else res
 
 
 @always_inline
-def modified_bessel_i0_f(x: Float32) -> Float32:
+def modified_bessel_i0[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`modified_bessel_i0_string`: i0's series, with the scaling written
     exp(|x|) * (0.5 (a - p)) [/ sqrt(|x|)]."""
-    var ax = _abs(x)
-    if ax <= Float32(8.0):
-        return _expf(ax) * _chbevl[_I0_A]((ax / Float32(2.0)) - Float32(2.0))
-    return (
-        _expf(ax) * _chbevl[_I0_B](Float32(32.0) / ax - Float32(2.0))
-    ) / ieee_sqrtf(ax)
+    comptime T = Scalar[dt]
+    var ax = _absg(x)
+    if ax <= T(8.0):
+        return _exp(ax) * _chbevl[_I0_A]((ax / T(2.0)) - T(2.0))
+    return (_exp(ax) * _chbevl[_I0_B](T(32.0) / ax - T(2.0))) / _sqrt(ax)
 
 
 @always_inline
-def modified_bessel_i1_f(x: Float32) -> Float32:
+def modified_bessel_i1[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`modified_bessel_i1_string`."""
-    var ax = _abs(x)
-    var res: Float32
-    if ax <= Float32(8.0):
-        var s = _chbevl[_I1_A]((ax / Float32(2.0)) - Float32(2.0))
-        res = s * ax * _expf(ax)
+    comptime T = Scalar[dt]
+    var ax = _absg(x)
+    var res: T
+    if ax <= T(8.0):
+        var s = _chbevl[_I1_A]((ax / T(2.0)) - T(2.0))
+        res = s * ax * _exp(ax)
     else:
-        res = (
-            _expf(ax) * _chbevl[_I1_B](Float32(32.0) / ax - Float32(2.0))
-        ) / ieee_sqrtf(ax)
-    return -res if x < Float32(0.0) else res
-
-
-# --------------------------------------------------------------------------- #
-# Modified Bessel functions of the second kind (k0, k1, and scaled)
-# --------------------------------------------------------------------------- #
-
-comptime _K0_A = [
-    1.37446543561352307156e-16,
-    4.25981614279661018399e-14,
-    1.03496952576338420167e-11,
-    1.90451637722020886025e-09,
-    2.53479107902614945675e-07,
-    2.28621210311945178607e-05,
-    1.26461541144692592338e-03,
-    3.59799365153615016266e-02,
-    3.44289899924628486886e-01,
-    -5.35327393233902768720e-01,
-]
-
-comptime _K0_B = [
-    5.30043377268626276149e-18,
-    -1.64758043015242134646e-17,
-    5.21039150503902756861e-17,
-    -1.67823109680541210385e-16,
-    5.51205597852431940784e-16,
-    -1.84859337734377901440e-15,
-    6.34007647740507060557e-15,
-    -2.22751332699166985548e-14,
-    8.03289077536357521100e-14,
-    -2.98009692317273043925e-13,
-    1.14034058820847496303e-12,
-    -4.51459788337394416547e-12,
-    1.85594911495471785253e-11,
-    -7.95748924447710747776e-11,
-    3.57739728140030116597e-10,
-    -1.69753450938905987466e-09,
-    8.57403401741422608519e-09,
-    -4.66048989768794782956e-08,
-    2.76681363944501510342e-07,
-    -1.83175552271911948767e-06,
-    1.39498137188764993662e-05,
-    -1.28495495816278026384e-04,
-    1.56988388573005337491e-03,
-    -3.14481013119645005427e-02,
-    2.44030308206595545468e00,
-]
-
-comptime _K1_A = [
-    -7.02386347938628759343e-18,
-    -2.42744985051936593393e-15,
-    -6.66690169419932900609e-13,
-    -1.41148839263352776110e-10,
-    -2.21338763073472585583e-08,
-    -2.43340614156596823496e-06,
-    -1.73028895751305206302e-04,
-    -6.97572385963986435018e-03,
-    -1.22611180822657148235e-01,
-    -3.53155960776544875667e-01,
-    1.52530022733894777053e00,
-]
-
-comptime _K1_B = [
-    -5.75674448366501715755e-18,
-    1.79405087314755922667e-17,
-    -5.68946255844285935196e-17,
-    1.83809354436663880070e-16,
-    -6.05704724837331885336e-16,
-    2.03870316562433424052e-15,
-    -7.01983709041831346144e-15,
-    2.47715442448130437068e-14,
-    -8.97670518232499435011e-14,
-    3.34841966607842919884e-13,
-    -1.28917396095102890680e-12,
-    5.13963967348173025100e-12,
-    -2.12996783842756842877e-11,
-    9.21831518760500529508e-11,
-    -4.19035475934189648750e-10,
-    2.01504975519703286596e-09,
-    -1.03457624656780970260e-08,
-    5.74108412545004946722e-08,
-    -3.50196060308781257119e-07,
-    2.40648494783721712015e-06,
-    -1.93619797416608296024e-05,
-    1.95215518471351631108e-04,
-    -2.85781685962277938680e-03,
-    1.03923736576817238437e-01,
-    2.72062619048444266945e00,
-]
+        res = (_exp(ax) * _chbevl[_I1_B](T(32.0) / ax - T(2.0))) / _sqrt(ax)
+    return _neg(res) if x < T(0.0) else res
 
 
 @always_inline
-def modified_bessel_k0_f(x: Float32, scaled: Bool) -> Float32:
+def modified_bessel_k0[dt: DType](x: Scalar[dt], scaled: Bool) -> Scalar[dt]:
     """`modified_bessel_k0_string` / `scaled_modified_bessel_k0_string`."""
-    if x == Float32(0.0):
-        return _INF
-    if x < Float32(0.0):
-        return _NAN
-    if x <= Float32(2.0):
-        var s = _chbevl[_K0_A](x * x - Float32(2.0))
-        var i0 = modified_bessel_i0_f(x)
+    comptime T = Scalar[dt]
+    if x == T(0.0):
+        return _inf[dt]()
+    if x < T(0.0):
+        return _nan[dt]()
+    if x <= T(2.0):
+        var s = _chbevl[_K0_A](x * x - T(2.0))
+        var i0 = modified_bessel_i0(x)
         if scaled:
-            return (s - _logf(Float32(0.5) * x) * i0) * _expf(x)
+            return (s - _log(T(0.5) * x) * i0) * _exp(x)
         comptime if is_apple_gpu():
             # special_math.h: `::metal::log(0.5 * x)`, float (no double).
-            return s - _logf(Float32(0.5) * x) * i0
+            return s - _log(T(0.5) * x) * i0
         # double: `log(0.5 * x)` has a double literal, so the whole
         # expression is evaluated in double and rounded once.
-        var lg = nv_log(0.5 * Float64(x))
-        return Float32(Float64(s) - lg * Float64(i0))
-    var s = _chbevl[_K0_B](Float32(8.0) / x - Float32(2.0))
+        var lg = nv_log(0.5 * _f64(x))
+        return _t[dt](_f64(s) - lg * _f64(i0))
+    var s = _chbevl[_K0_B](T(8.0) / x - T(2.0))
     if scaled:
-        return s / ieee_sqrtf(x)
-    return _expf(-x) * s / ieee_sqrtf(x)
+        return s / _sqrt(x)
+    return _exp(-x) * s / _sqrt(x)
 
 
 @always_inline
-def modified_bessel_k1_f(x: Float32, scaled: Bool) -> Float32:
+def modified_bessel_k1[dt: DType](x: Scalar[dt], scaled: Bool) -> Scalar[dt]:
     """`modified_bessel_k1_string` / `scaled_modified_bessel_k1_string`."""
-    if x == Float32(0.0):
-        return _INF
-    if x < Float32(0.0):
-        return _NAN
-    if x <= Float32(2.0):
-        var s = _chbevl[_K1_A](x * x - Float32(2.0))
-        var r = _logf(Float32(0.5) * x) * modified_bessel_i1_f(x) + s / x
+    comptime T = Scalar[dt]
+    if x == T(0.0):
+        return _inf[dt]()
+    if x < T(0.0):
+        return _nan[dt]()
+    if x <= T(2.0):
+        var s = _chbevl[_K1_A](x * x - T(2.0))
+        var r = _log(T(0.5) * x) * modified_bessel_i1(x) + s / x
         if scaled:
-            return r * _expf(x)
+            return r * _exp(x)
         return r
-    var s = _chbevl[_K1_B](Float32(8.0) / x - Float32(2.0))
+    var s = _chbevl[_K1_B](T(8.0) / x - T(2.0))
     if scaled:
-        return s / ieee_sqrtf(x)
-    return _expf(-x) * s / ieee_sqrtf(x)
+        return s / _sqrt(x)
+    return _exp(-x) * s / _sqrt(x)
 
 
-# --------------------------------------------------------------------------- #
-# Bessel functions of the first and second kind (j0, j1, y0, y1)
-# --------------------------------------------------------------------------- #
-
-comptime _J0_PP = [
-    7.96936729297347051624e-04,
-    8.28352392107440799803e-02,
-    1.23953371646414299388e00,
-    5.44725003058768775090e00,
-    8.74716500199817011941e00,
-    5.30324038235394892183e00,
-    9.99999999999999997821e-01,
-]
-comptime _J0_PQ = [
-    9.24408810558863637013e-04,
-    8.56288474354474431428e-02,
-    1.25352743901058953537e00,
-    5.47097740330417105182e00,
-    8.76190883237069594232e00,
-    5.30605288235394617618e00,
-    1.00000000000000000218e00,
-]
-comptime _J0_QP = [
-    -1.13663838898469149931e-02,
-    -1.28252718670509318512e00,
-    -1.95539544257735972385e01,
-    -9.32060152123768231369e01,
-    -1.77681167980488050595e02,
-    -1.47077505154951170175e02,
-    -5.14105326766599330220e01,
-    -6.05014350600728481186e00,
-]
-comptime _J0_QQ = [
-    6.43178256118178023184e01,
-    8.56430025976980587198e02,
-    3.88240183605401609683e03,
-    7.24046774195652478189e03,
-    5.93072701187316984827e03,
-    2.06209331660327847417e03,
-    2.42005740240291393179e02,
-]
-comptime _J0_RP = [
-    -4.79443220978201773821e09,
-    1.95617491946556577543e12,
-    -2.49248344360967716204e14,
-    9.70862251047306323952e15,
-]
-comptime _J0_RQ = [
-    4.99563147152651017219e02,
-    1.73785401676374683123e05,
-    4.84409658339962045305e07,
-    1.11855537045356834862e10,
-    2.11277520115489217587e12,
-    3.10518229857422583814e14,
-    3.18121955943204943306e16,
-    1.71086294081043136091e18,
-]
-comptime _Y0_YP = [
-    1.55924367855235737965e04,
-    -1.46639295903971606143e07,
-    5.43526477051876500413e09,
-    -9.82136065717911466409e11,
-    8.75906394395366999549e13,
-    -3.46628303384729719441e15,
-    4.42733268572569800351e16,
-    -1.84950800436986690637e16,
-]
-comptime _Y0_YQ = [
-    1.04128353664259848412e03,
-    6.26107330137134956842e05,
-    2.68919633393814121987e08,
-    8.64002487103935000337e10,
-    2.02979612750105546709e13,
-    3.17157752842975028269e15,
-    2.50596256172653059228e17,
-]
-comptime _J1_PP = [
-    7.62125616208173112003e-04,
-    7.31397056940917570436e-02,
-    1.12719608129684925192e00,
-    5.11207951146807644818e00,
-    8.42404590141772420927e00,
-    5.21451598682361504063e00,
-    1.00000000000000000254e00,
-]
-comptime _J1_PQ = [
-    5.71323128072548699714e-04,
-    6.88455908754495404082e-02,
-    1.10514232634061696926e00,
-    5.07386386128601488557e00,
-    8.39985554327604159757e00,
-    5.20982848682361821619e00,
-    9.99999999999999997461e-01,
-]
-comptime _J1_QP = [
-    5.10862594750176621635e-02,
-    4.98213872951233449420e00,
-    7.58238284132545283818e01,
-    3.66779609360150777800e02,
-    7.10856304998926107277e02,
-    5.97489612400613639965e02,
-    2.11688757100572135698e02,
-    2.52070205858023719784e01,
-]
-comptime _J1_QQ = [
-    7.42373277035675149943e01,
-    1.05644886038262816351e03,
-    4.98641058337653607651e03,
-    9.56231892404756170795e03,
-    7.99704160447350683650e03,
-    2.82619278517639096600e03,
-    3.36093607810698293419e02,
-]
-comptime _J1_RP = [
-    -8.99971225705559398224e08,
-    4.52228297998194034323e11,
-    -7.27494245221818276015e13,
-    3.68295732863852883286e15,
-]
-comptime _J1_RQ = [
-    6.20836478118054335476e02,
-    2.56987256757748830383e05,
-    8.35146791431949253037e07,
-    2.21511595479792499675e10,
-    4.74914122079991414898e12,
-    7.84369607876235854894e14,
-    8.95222336184627338078e16,
-    5.32278620332680085395e18,
-]
-comptime _Y1_YP = [
-    1.26320474790178026440e09,
-    -6.47355876379160291031e11,
-    1.14509511541823727583e14,
-    -8.12770255501325109621e15,
-    2.02439475713594898196e17,
-    -7.78877196265950026825e17,
-]
-comptime _Y1_YQ = [
-    5.94301592346128195359e02,
-    2.35564092943068577943e05,
-    7.34811944459721705660e07,
-    1.87601316108706159478e10,
-    3.88231277496238566008e12,
-    6.20557727146953693363e14,
-    6.87141087355300489866e16,
-    3.97270608116560655612e18,
-]
-
-comptime _PIO4 = Float32(0.785398163397448309615660845819875721)
-comptime _3PIO4 = Float32(2.356194490192344928846982537459627163)
-comptime _SQ2OPI = Float32(0.797884560802865355879892119868763737)
-comptime _TWOOPI = Float32(0.636619772367581343075535053490057448)
+comptime _PIO4 = 0.785398163397448309615660845819875721
+comptime _3PIO4 = 2.356194490192344928846982537459627163
+comptime _SQ2OPI = 0.797884560802865355879892119868763737
+comptime _TWOOPI = 0.636619772367581343075535053490057448
 
 
 @always_inline
-def bessel_j0_f(x_in: Float32) -> Float32:
+def bessel_j0[dt: DType](x_in: Scalar[dt]) -> Scalar[dt]:
     """`bessel_j0_string`."""
-    var x = _abs(x_in) if x_in < Float32(0.0) else x_in
-    if x <= Float32(5.0):
-        if x < Float32(0.00001):
-            return Float32(1.0) - x * x / Float32(4.0)
-        var xx = x * x
+    comptime T = Scalar[dt]
+    var x = _absg(x_in) if x_in < T(0.0) else x_in
+    if x <= T(5.0):
+        # x * x has several uses: nvrtc rounds it and fuses none of them.
+        var xx = _mul_rn(x, x)
+        if x < T(0.00001):
+            return fma(xx, T(-0.25), T(1.0))
         var rp = _horner[_J0_RP](xx)
         var rq = _horner[_J0_RQ](xx)
         return (
-            (x * x - Float32(5.78318596294678452118e00))
-            * (x * x - Float32(3.04712623436620863991e01))
+            (xx - _t[dt](5.78318596294678452118e00))
+            * (xx - _t[dt](3.04712623436620863991e01))
             * rp
             / rq
         )
-    var z = Float32(25.0) / (x * x)
+    var z = T(25.0) / (x * x)
     var pp = _horner[_J0_PP](z)
     var pq = _horner[_J0_PQ](z)
     var qp = _horner[_J0_QP](z)
     var qq = _horner[_J0_QQ](z)
     return (
-        (
-            pp / pq * _cosf(x - _PIO4)
-            - Float32(5.0) / x * (qp / qq) * _sinf(x - _PIO4)
+        fma(
+            -(T(5.0) / x) * (qp / qq),
+            _sin(x - _t[dt](_PIO4)),
+            pp / pq * _cos(x - _t[dt](_PIO4)),
         )
-        * _SQ2OPI
-        / ieee_sqrtf(x)
+        * _t[dt](_SQ2OPI)
+        / _sqrt(x)
     )
 
 
 @always_inline
-def bessel_y0_f(x: Float32) -> Float32:
+def bessel_y0[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`bessel_y0_string`."""
-    if x <= Float32(5.0):
-        if x == Float32(0.0):
-            return -_INF
+    comptime T = Scalar[dt]
+    if x <= T(5.0):
+        if x == T(0.0):
+            return -_inf[dt]()
+        # The C++ has `if (x < T(0.0)) { NAN; }`: no return, log(x) makes
+        # the NaN.
         var xx = x * x
         var yp = _horner[_Y0_YP](xx)
         var yq = _horner[_Y0_YQ](xx)
-        return yp / yq + (_TWOOPI * _logf(x) * bessel_j0_f(x))
-    var z = Float32(25.0) / (x * x)
+        return yp / yq + (_t[dt](_TWOOPI) * _log(x) * bessel_j0(x))
+    var z = T(25.0) / (x * x)
     var pp = _horner[_J0_PP](z)
     var pq = _horner[_J0_PQ](z)
     var qp = _horner[_J0_QP](z)
     var qq = _horner[_J0_QQ](z)
     return (
-        (
-            pp / pq * _sinf(x - _PIO4)
-            + Float32(5.0) / x * (qp / qq) * _cosf(x - _PIO4)
+        fma(
+            (T(5.0) / x) * (qp / qq),
+            _cos(x - _t[dt](_PIO4)),
+            pp / pq * _sin(x - _t[dt](_PIO4)),
         )
-        * _SQ2OPI
-        / ieee_sqrtf(x)
+        * _t[dt](_SQ2OPI)
+        / _sqrt(x)
     )
 
 
 @always_inline
-def _bessel_j1_pos(x: Float32) -> Float32:
-    if x <= Float32(5.0):
-        var xx = x * x
+def _bessel_j1_pos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime T = Scalar[dt]
+    if x <= T(5.0):
+        var xx = _mul_rn(x, x)
         var rp = _horner[_J1_RP](xx)
         var rq = _horner[_J1_RQ](xx)
         return (
             rp
             / rq
             * x
-            * (x * x - Float32(1.46819706421238932572e01))
-            * (x * x - Float32(4.92184563216946036703e01))
+            * (xx - _t[dt](1.46819706421238932572e01))
+            * (xx - _t[dt](4.92184563216946036703e01))
         )
-    var z = Float32(5.0) / x * (Float32(5.0) / x)
+    var z = T(5.0) / x * (T(5.0) / x)
     var pp = _horner[_J1_PP](z)
     var pq = _horner[_J1_PQ](z)
     var qp = _horner[_J1_QP](z)
     var qq = _horner[_J1_QQ](z)
     return (
-        (
-            pp / pq * _cosf(x - _3PIO4)
-            - Float32(5.0) / x * (qp / qq) * _sinf(x - _3PIO4)
+        fma(
+            -(T(5.0) / x) * (qp / qq),
+            _sin(x - _t[dt](_3PIO4)),
+            pp / pq * _cos(x - _t[dt](_3PIO4)),
         )
-        * _SQ2OPI
-        / ieee_sqrtf(x)
+        * _t[dt](_SQ2OPI)
+        / _sqrt(x)
     )
 
 
 @always_inline
-def bessel_j1_f(x: Float32) -> Float32:
+def bessel_j1[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`bessel_j1_string` (odd: j1(-x) = -j1(x)). One inlined body with the
     sign applied after, not one per sign: the same values (-x is exact),
     half the code, and the float16 pipeline of the two-body form never
     finished building in the M4's Metal compiler."""
-    var neg = x < Float32(0.0)
+    var neg = x < Scalar[dt](0.0)
     var r = _bessel_j1_pos(-x if neg else x)  # keeps -0 -> -0, as the C++
-    return -r if neg else r
+    return _neg(r) if neg else r
 
 
 @always_inline
-def bessel_y1_f(x: Float32) -> Float32:
+def bessel_y1[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`bessel_y1_string`."""
-    if x <= Float32(5.0):
-        if x == Float32(0.0):
-            return -_INF
-        if x <= Float32(0.0):
-            return _NAN
+    comptime T = Scalar[dt]
+    if x <= T(5.0):
+        if x == T(0.0):
+            return -_inf[dt]()
+        if x <= T(0.0):
+            return _nan[dt]()
         var xx = x * x
         var yp = _horner[_Y1_YP](xx)
         var yq = _horner[_Y1_YQ](xx)
         return x * (yp / yq) + (
-            _TWOOPI * (bessel_j1_f(x) * _logf(x) - Float32(1.0) / x)
+            _t[dt](_TWOOPI) * (bessel_j1(x) * _log(x) - T(1.0) / x)
         )
-    var z = Float32(5.0) / x * (Float32(5.0) / x)
+    var z = T(5.0) / x * (T(5.0) / x)
     var pp = _horner[_J1_PP](z)
     var pq = _horner[_J1_PQ](z)
     var qp = _horner[_J1_QP](z)
     var qq = _horner[_J1_QQ](z)
     return (
-        (
-            pp / pq * _sinf(x - _3PIO4)
-            + Float32(5.0) / x * (qp / qq) * _cosf(x - _3PIO4)
+        fma(
+            (T(5.0) / x) * (qp / qq),
+            _cos(x - _t[dt](_3PIO4)),
+            pp / pq * _sin(x - _t[dt](_3PIO4)),
         )
-        * _SQ2OPI
-        / ieee_sqrtf(x)
+        * _t[dt](_SQ2OPI)
+        / _sqrt(x)
     )
 
 
 @always_inline
-def spherical_bessel_j0_f(x: Float32) -> Float32:
+def spherical_bessel_j0[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`spherical_bessel_j0_string`: sin(x) / x."""
+    comptime T = Scalar[dt]
     if _isinf(x):
-        return Float32(0.0)
-    if _abs(x) < Float32(0.5):
+        return T(0.0)
+    if _absg(x) < T(0.5):
         var x2 = x * x
-        return Float32(1.0) + x2 * (
-            Float32(-1.0) / Float32(6.0)
+        return T(1.0) + x2 * (
+            T(-1.0) / T(6.0)
             + x2
             * (
-                Float32(1.0) / Float32(120.0)
+                T(1.0) / T(120.0)
                 + x2
                 * (
-                    Float32(-1.0) / Float32(5040.0)
+                    T(-1.0) / T(5040.0)
                     + x2
                     * (
-                        Float32(1.0) / Float32(362880.0)
+                        T(1.0) / T(362880.0)
                         + x2
                         * (
-                            Float32(-1.0) / Float32(39916800.0)
-                            + x2 * (Float32(1.0) / Float32(6227020800.0))
+                            T(-1.0) / T(39916800.0)
+                            + x2 * (T(1.0) / T(6227020800.0))
                         )
                     )
                 )
             )
         )
-    return _sinf(x) / x
-
-
-# --------------------------------------------------------------------------- #
-# Airy Ai
-# --------------------------------------------------------------------------- #
-
-comptime _AI_AN = [
-    3.46538101525629032477e-01,
-    1.20075952739645805542e01,
-    7.62796053615234516538e01,
-    1.68089224934630576269e02,
-    1.59756391350164413639e02,
-    7.05360906840444183113e01,
-    1.40264691163389668864e01,
-    9.99999999999999995305e-01,
-]
-comptime _AI_AD = [
-    5.67594532638770212846e-01,
-    1.47562562584847203173e01,
-    8.45138970141474626562e01,
-    1.77318088145400459522e02,
-    1.64234692871529701831e02,
-    7.14778400825575695274e01,
-    1.40959135607834029598e01,
-    1.00000000000000000470e00,
-]
-comptime _AI_AFN = [
-    -1.31696323418331795333e-01,
-    -6.26456544431912369773e-01,
-    -6.93158036036933542233e-01,
-    -2.79779981545119124951e-01,
-    -4.91900132609500318020e-02,
-    -4.06265923594885404393e-03,
-    -1.59276496239262096340e-04,
-    -2.77649108155232920844e-06,
-    -1.67787698489114633780e-08,
-]
-comptime _AI_AFD = [
-    1.33560420706553243746e01,
-    3.26825032795224613948e01,
-    2.67367040941499554804e01,
-    9.18707402907259625840e00,
-    1.47529146771666414581e00,
-    1.15687173795188044134e-01,
-    4.40291641615211203805e-03,
-    7.54720348287414296618e-05,
-    4.51850092970580378464e-07,
-]
-comptime _AI_AGN = [
-    1.97339932091685679179e-02,
-    3.91103029615688277255e-01,
-    1.06579897599595591108e00,
-    9.39169229816650230044e-01,
-    3.51465656105547619242e-01,
-    6.33888919628925490927e-02,
-    5.85804113048388458567e-03,
-    2.82851600836737019778e-04,
-    6.98793669997260967291e-06,
-    8.11789239554389293311e-08,
-    3.41551784765923618484e-10,
-]
-comptime _AI_AGD = [
-    9.30892908077441974853e00,
-    1.98352928718312140417e01,
-    1.55646628932864612953e01,
-    5.47686069422975497931e00,
-    9.54293611618961883998e-01,
-    8.64580826352392193095e-02,
-    4.12656523824222607191e-03,
-    1.01259085116509135510e-04,
-    1.17166733214413521882e-06,
-    4.91834570062930015649e-09,
-]
+    return _sin(x) / x
 
 
 @always_inline
-def airy_ai_f(x: Float32) -> Float32:
+def airy_ai[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`airy_ai_string` (Cephes airy, Ai only)."""
-    if _isinf(x) or _isnan(x):
-        # NaN would reach the series loop below; it leaves at once in IEEE
-        # arithmetic (`NaN > eps` is false), and the loop bound covers a
-        # fast-math build that folds the comparison.
-        return _NAN
-    if x > Float32(103.892):
-        return Float32(0.0)
-    comptime isqpi = Float32(5.64189583547756286948e-01)
-    if x < Float32(-2.09):
-        var zeta = Float32(-2.0) * x * ieee_sqrtf(-x) / Float32(3.0)
-        var z = Float32(1.0) / zeta
+    comptime T = Scalar[dt]
+    if _isinf(x):
+        return _nan[dt]()
+    if _isnan(x):
+        # The C++ runs a NaN through the series below (every comparison
+        # fails) and returns 0.355 f - 0.259 g of NaNs: the GPU's NaN of
+        # an arithmetic result, made here at once. The series' loop bound
+        # also covers a fast-math build that folds `NaN > eps`.
+        comptime if is_apple_gpu():
+            return _nan[dt]()
+        return x + x
+    if x > _t[dt](103.892):
+        return T(0.0)
+    comptime isqpi = 5.64189583547756286948e-01
+    if x < _t[dt](-2.09):
+        var zeta = T(-2.0) * x * _sqrt(-x) / T(3.0)
+        var z = T(1.0) / zeta
         var zz = z * z
         var afn = _horner[_AI_AFN](zz)
         var afd = _horner[_AI_AFD](zz)
         var agn = _horner[_AI_AGN](zz)
         var agd = _horner[_AI_AGD](zz)
-        var t = zeta + Float32(0.25) * Float32(3.14159265358979323846)
+        var t = zeta + T(0.25) * _t[dt](3.14159265358979323846)
         return (
-            isqpi
-            / ieee_sqrtf(ieee_sqrtf(-x))
+            _t[dt](isqpi)
+            / _sqrt(_sqrt(-x))
             * (
-                _sinf(t) * (Float32(1.0) + z * z * afn / afd)
-                - _cosf(t) * (z * agn / agd)
+                _sin(t) * (T(1.0) + z * z * afn / afd)
+                - _cos(t) * (z * agn / agd)
             )
         )
     var odd_domain = False
-    var ai = Float32(0.0)
-    if x >= Float32(2.09):
+    var ai = T(0.0)
+    if x >= _t[dt](2.09):
         odd_domain = True
-        var zeta = Float32(2.0) * x * ieee_sqrtf(x) / Float32(3.0)
-        var rz = Float32(1.0) / zeta
+        var zeta = T(2.0) * x * _sqrt(x) / T(3.0)
+        var rz = T(1.0) / zeta
         var an = _horner[_AI_AN](rz)
         var ad = _horner[_AI_AD](rz)
-        ai = (
-            isqpi
-            * (an / ad)
-            / (Float32(2.0) * ieee_sqrtf(ieee_sqrtf(x)) * _expf(zeta))
-        )
-        if x > Float32(8.3203353):
+        ai = _t[dt](isqpi) * (an / ad) / (T(2.0) * _sqrt(_sqrt(x)) * _exp(zeta))
+        if x > _t[dt](8.3203353):
             return ai
     # Maclaurin series of Ai = c1 f - c2 g.
-    var f = Float32(1.0)
+    var f = T(1.0)
     var g = x
-    var k = Float32(1.0)
-    var m = Float32(1.0)
+    var k = T(1.0)
+    var m = T(1.0)
     var n = x
-    var t = Float32(1.0)
+    var t = T(1.0)
     var z = x * x * x
-    # Bounded, unlike the C++ `while`: over x in [-2.09, 8.33] the float
-    # series converges in at most 30 rounds (measured; x = 8.33 is the
-    # slowest), so the cap never binds, and no input -- nor a build that
-    # folds the NaN comparison -- can spin a GPU thread forever.
+    # Bounded, unlike the C++ `while`: over x in [-2.09, 8.33] the series
+    # converges in at most 30 rounds in float and 40 in double (x = 8.33
+    # is the slowest), so the cap never binds, and no input -- nor a build
+    # that folds the NaN comparison -- can spin a GPU thread forever.
     for _ in range(100):
-        if not (t > Float32(1.11022302462515654042e-16)):
+        if not (t > _t[dt](1.11022302462515654042e-16)):
             break
         m *= z
-        k += Float32(1.0)
+        k += T(1.0)
         m /= k
         n *= z
-        k += Float32(1.0)
+        k += T(1.0)
         n /= k
         m /= k
         f += m
-        k += Float32(1.0)
+        k += T(1.0)
         n /= k
         g += n
-        t = _abs(m / f)
+        t = _absg(m / f)
     if not odd_domain:
         return (
-            Float32(0.355028053887817239260) * f
-            - Float32(0.258819403792806798405) * g
+            _t[dt](0.355028053887817239260) * f
+            - _t[dt](0.258819403792806798405) * g
         )
     return ai
 
@@ -1778,6 +1592,469 @@ def igamma_f(a: Float32, x: Float32) -> Float32:
         return Float32(D(1.0) - D(igammac_f(a, x)))
     return _igam_helper_series(a, x)
 
+
+# --------------------------------------------------------------------------- #
+# Modified Bessel functions of the first kind (i0, i0e, i1, i1e)
+# --------------------------------------------------------------------------- #
+
+comptime _I0_A = [
+    -4.41534164647933937950e-18,
+    3.33079451882223809783e-17,
+    -2.43127984654795469359e-16,
+    1.71539128555513303061e-15,
+    -1.16853328779934516808e-14,
+    7.67618549860493561688e-14,
+    -4.85644678311192946090e-13,
+    2.95505266312963983461e-12,
+    -1.72682629144155570723e-11,
+    9.67580903537323691224e-11,
+    -5.18979560163526290666e-10,
+    2.65982372468238665035e-9,
+    -1.30002500998624804212e-8,
+    6.04699502254191894932e-8,
+    -2.67079385394061173391e-7,
+    1.11738753912010371815e-6,
+    -4.41673835845875056359e-6,
+    1.64484480707288970893e-5,
+    -5.75419501008210370398e-5,
+    1.88502885095841655729e-4,
+    -5.76375574538582365885e-4,
+    1.63947561694133579842e-3,
+    -4.32430999505057594430e-3,
+    1.05464603945949983183e-2,
+    -2.37374148058994688156e-2,
+    4.93052842396707084878e-2,
+    -9.49010970480476444210e-2,
+    1.71620901522208775349e-1,
+    -3.04682672343198398683e-1,
+    6.76795274409476084995e-1,
+]
+
+comptime _I0_B = [
+    -7.23318048787475395456e-18,
+    -4.83050448594418207126e-18,
+    4.46562142029675999901e-17,
+    3.46122286769746109310e-17,
+    -2.82762398051658348494e-16,
+    -3.42548561967721913462e-16,
+    1.77256013305652638360e-15,
+    3.81168066935262242075e-15,
+    -9.55484669882830764870e-15,
+    -4.15056934728722208663e-14,
+    1.54008621752140982691e-14,
+    3.85277838274214270114e-13,
+    7.18012445138366623367e-13,
+    -1.79417853150680611778e-12,
+    -1.32158118404477131188e-11,
+    -3.14991652796324136454e-11,
+    1.18891471078464383424e-11,
+    4.94060238822496958910e-10,
+    3.39623202570838634515e-9,
+    2.26666899049817806459e-8,
+    2.04891858946906374183e-7,
+    2.89137052083475648297e-6,
+    6.88975834691682398426e-5,
+    3.36911647825569408990e-3,
+    8.04490411014108831608e-1,
+]
+
+comptime _I1_A = [
+    2.77791411276104639959e-18,
+    -2.11142121435816608115e-17,
+    1.55363195773620046921e-16,
+    -1.10559694773538630805e-15,
+    7.60068429473540693410e-15,
+    -5.04218550472791168711e-14,
+    3.22379336594557470981e-13,
+    -1.98397439776494371520e-12,
+    1.17361862988909016308e-11,
+    -6.66348972350202774223e-11,
+    3.62559028155211703701e-10,
+    -1.88724975172282928790e-9,
+    9.38153738649577178388e-9,
+    -4.44505912879632808065e-8,
+    2.00329475355213526229e-7,
+    -8.56872026469545474066e-7,
+    3.47025130813767847674e-6,
+    -1.32731636560394358279e-5,
+    4.78156510755005422638e-5,
+    -1.61760815825896745588e-4,
+    5.12285956168575772895e-4,
+    -1.51357245063125314899e-3,
+    4.15642294431288815669e-3,
+    -1.05640848946261981558e-2,
+    2.47264490306265168283e-2,
+    -5.29459812080949914269e-2,
+    1.02643658689847095384e-1,
+    -1.76416518357834055153e-1,
+    2.52587186443633654823e-1,
+]
+
+comptime _I1_B = [
+    7.51729631084210481353e-18,
+    4.41434832307170791151e-18,
+    -4.65030536848935832153e-17,
+    -3.20952592199342395980e-17,
+    2.96262899764595013876e-16,
+    3.30820231092092828324e-16,
+    -1.88035477551078244854e-15,
+    -3.81440307243700780478e-15,
+    1.04202769841288027642e-14,
+    4.27244001671195135429e-14,
+    -2.10154184277266431302e-14,
+    -4.08355111109219731823e-13,
+    -7.19855177624590851209e-13,
+    2.03562854414708950722e-12,
+    1.41258074366137813316e-11,
+    3.25260358301548823856e-11,
+    -1.89749581235054123450e-11,
+    -5.58974346219658380687e-10,
+    -3.83538038596423702205e-9,
+    -2.63146884688951950684e-8,
+    -2.51223623787020892529e-7,
+    -3.88256480887769039346e-6,
+    -1.10588938762623716291e-4,
+    -9.76109749136146840777e-3,
+    7.78576235018280120474e-1,
+]
+
+# The float specialization of `i1e_string` keeps only the tail of each series.
+comptime _I1E_A_F32 = [
+    9.38153738649577178388e-9,
+    -4.44505912879632808065e-8,
+    2.00329475355213526229e-7,
+    -8.56872026469545474066e-7,
+    3.47025130813767847674e-6,
+    -1.32731636560394358279e-5,
+    4.78156510755005422638e-5,
+    -1.61760815825896745588e-4,
+    5.12285956168575772895e-4,
+    -1.51357245063125314899e-3,
+    4.15642294431288815669e-3,
+    -1.05640848946261981558e-2,
+    2.47264490306265168283e-2,
+    -5.29459812080949914269e-2,
+    1.02643658689847095384e-1,
+    -1.76416518357834055153e-1,
+    2.52587186443633654823e-1,
+]
+
+comptime _I1E_B_F32 = [
+    -3.83538038596423702205e-9,
+    -2.63146884688951950684e-8,
+    -2.51223623787020892529e-7,
+    -3.88256480887769039346e-6,
+    -1.10588938762623716291e-4,
+    -9.76109749136146840777e-3,
+    7.78576235018280120474e-1,
+]
+
+# --------------------------------------------------------------------------- #
+# Modified Bessel functions of the second kind (k0, k1, and scaled)
+# --------------------------------------------------------------------------- #
+
+comptime _K0_A = [
+    1.37446543561352307156e-16,
+    4.25981614279661018399e-14,
+    1.03496952576338420167e-11,
+    1.90451637722020886025e-09,
+    2.53479107902614945675e-07,
+    2.28621210311945178607e-05,
+    1.26461541144692592338e-03,
+    3.59799365153615016266e-02,
+    3.44289899924628486886e-01,
+    -5.35327393233902768720e-01,
+]
+
+comptime _K0_B = [
+    5.30043377268626276149e-18,
+    -1.64758043015242134646e-17,
+    5.21039150503902756861e-17,
+    -1.67823109680541210385e-16,
+    5.51205597852431940784e-16,
+    -1.84859337734377901440e-15,
+    6.34007647740507060557e-15,
+    -2.22751332699166985548e-14,
+    8.03289077536357521100e-14,
+    -2.98009692317273043925e-13,
+    1.14034058820847496303e-12,
+    -4.51459788337394416547e-12,
+    1.85594911495471785253e-11,
+    -7.95748924447710747776e-11,
+    3.57739728140030116597e-10,
+    -1.69753450938905987466e-09,
+    8.57403401741422608519e-09,
+    -4.66048989768794782956e-08,
+    2.76681363944501510342e-07,
+    -1.83175552271911948767e-06,
+    1.39498137188764993662e-05,
+    -1.28495495816278026384e-04,
+    1.56988388573005337491e-03,
+    -3.14481013119645005427e-02,
+    2.44030308206595545468e00,
+]
+
+comptime _K1_A = [
+    -7.02386347938628759343e-18,
+    -2.42744985051936593393e-15,
+    -6.66690169419932900609e-13,
+    -1.41148839263352776110e-10,
+    -2.21338763073472585583e-08,
+    -2.43340614156596823496e-06,
+    -1.73028895751305206302e-04,
+    -6.97572385963986435018e-03,
+    -1.22611180822657148235e-01,
+    -3.53155960776544875667e-01,
+    1.52530022733894777053e00,
+]
+
+comptime _K1_B = [
+    -5.75674448366501715755e-18,
+    1.79405087314755922667e-17,
+    -5.68946255844285935196e-17,
+    1.83809354436663880070e-16,
+    -6.05704724837331885336e-16,
+    2.03870316562433424052e-15,
+    -7.01983709041831346144e-15,
+    2.47715442448130437068e-14,
+    -8.97670518232499435011e-14,
+    3.34841966607842919884e-13,
+    -1.28917396095102890680e-12,
+    5.13963967348173025100e-12,
+    -2.12996783842756842877e-11,
+    9.21831518760500529508e-11,
+    -4.19035475934189648750e-10,
+    2.01504975519703286596e-09,
+    -1.03457624656780970260e-08,
+    5.74108412545004946722e-08,
+    -3.50196060308781257119e-07,
+    2.40648494783721712015e-06,
+    -1.93619797416608296024e-05,
+    1.95215518471351631108e-04,
+    -2.85781685962277938680e-03,
+    1.03923736576817238437e-01,
+    2.72062619048444266945e00,
+]
+
+# --------------------------------------------------------------------------- #
+# Bessel functions of the first and second kind (j0, j1, y0, y1)
+# --------------------------------------------------------------------------- #
+
+comptime _J0_PP = [
+    7.96936729297347051624e-04,
+    8.28352392107440799803e-02,
+    1.23953371646414299388e00,
+    5.44725003058768775090e00,
+    8.74716500199817011941e00,
+    5.30324038235394892183e00,
+    9.99999999999999997821e-01,
+]
+comptime _J0_PQ = [
+    9.24408810558863637013e-04,
+    8.56288474354474431428e-02,
+    1.25352743901058953537e00,
+    5.47097740330417105182e00,
+    8.76190883237069594232e00,
+    5.30605288235394617618e00,
+    1.00000000000000000218e00,
+]
+comptime _J0_QP = [
+    -1.13663838898469149931e-02,
+    -1.28252718670509318512e00,
+    -1.95539544257735972385e01,
+    -9.32060152123768231369e01,
+    -1.77681167980488050595e02,
+    -1.47077505154951170175e02,
+    -5.14105326766599330220e01,
+    -6.05014350600728481186e00,
+]
+comptime _J0_QQ = [
+    6.43178256118178023184e01,
+    8.56430025976980587198e02,
+    3.88240183605401609683e03,
+    7.24046774195652478189e03,
+    5.93072701187316984827e03,
+    2.06209331660327847417e03,
+    2.42005740240291393179e02,
+]
+comptime _J0_RP = [
+    -4.79443220978201773821e09,
+    1.95617491946556577543e12,
+    -2.49248344360967716204e14,
+    9.70862251047306323952e15,
+]
+comptime _J0_RQ = [
+    4.99563147152651017219e02,
+    1.73785401676374683123e05,
+    4.84409658339962045305e07,
+    1.11855537045356834862e10,
+    2.11277520115489217587e12,
+    3.10518229857422583814e14,
+    3.18121955943204943306e16,
+    1.71086294081043136091e18,
+]
+comptime _Y0_YP = [
+    1.55924367855235737965e04,
+    -1.46639295903971606143e07,
+    5.43526477051876500413e09,
+    -9.82136065717911466409e11,
+    8.75906394395366999549e13,
+    -3.46628303384729719441e15,
+    4.42733268572569800351e16,
+    -1.84950800436986690637e16,
+]
+comptime _Y0_YQ = [
+    1.04128353664259848412e03,
+    6.26107330137134956842e05,
+    2.68919633393814121987e08,
+    8.64002487103935000337e10,
+    2.02979612750105546709e13,
+    3.17157752842975028269e15,
+    2.50596256172653059228e17,
+]
+comptime _J1_PP = [
+    7.62125616208173112003e-04,
+    7.31397056940917570436e-02,
+    1.12719608129684925192e00,
+    5.11207951146807644818e00,
+    8.42404590141772420927e00,
+    5.21451598682361504063e00,
+    1.00000000000000000254e00,
+]
+comptime _J1_PQ = [
+    5.71323128072548699714e-04,
+    6.88455908754495404082e-02,
+    1.10514232634061696926e00,
+    5.07386386128601488557e00,
+    8.39985554327604159757e00,
+    5.20982848682361821619e00,
+    9.99999999999999997461e-01,
+]
+comptime _J1_QP = [
+    5.10862594750176621635e-02,
+    4.98213872951233449420e00,
+    7.58238284132545283818e01,
+    3.66779609360150777800e02,
+    7.10856304998926107277e02,
+    5.97489612400613639965e02,
+    2.11688757100572135698e02,
+    2.52070205858023719784e01,
+]
+comptime _J1_QQ = [
+    7.42373277035675149943e01,
+    1.05644886038262816351e03,
+    4.98641058337653607651e03,
+    9.56231892404756170795e03,
+    7.99704160447350683650e03,
+    2.82619278517639096600e03,
+    3.36093607810698293419e02,
+]
+comptime _J1_RP = [
+    -8.99971225705559398224e08,
+    4.52228297998194034323e11,
+    -7.27494245221818276015e13,
+    3.68295732863852883286e15,
+]
+comptime _J1_RQ = [
+    6.20836478118054335476e02,
+    2.56987256757748830383e05,
+    8.35146791431949253037e07,
+    2.21511595479792499675e10,
+    4.74914122079991414898e12,
+    7.84369607876235854894e14,
+    8.95222336184627338078e16,
+    5.32278620332680085395e18,
+]
+comptime _Y1_YP = [
+    1.26320474790178026440e09,
+    -6.47355876379160291031e11,
+    1.14509511541823727583e14,
+    -8.12770255501325109621e15,
+    2.02439475713594898196e17,
+    -7.78877196265950026825e17,
+]
+comptime _Y1_YQ = [
+    5.94301592346128195359e02,
+    2.35564092943068577943e05,
+    7.34811944459721705660e07,
+    1.87601316108706159478e10,
+    3.88231277496238566008e12,
+    6.20557727146953693363e14,
+    6.87141087355300489866e16,
+    3.97270608116560655612e18,
+]
+
+# --------------------------------------------------------------------------- #
+# Airy Ai
+# --------------------------------------------------------------------------- #
+
+comptime _AI_AN = [
+    3.46538101525629032477e-01,
+    1.20075952739645805542e01,
+    7.62796053615234516538e01,
+    1.68089224934630576269e02,
+    1.59756391350164413639e02,
+    7.05360906840444183113e01,
+    1.40264691163389668864e01,
+    9.99999999999999995305e-01,
+]
+comptime _AI_AD = [
+    5.67594532638770212846e-01,
+    1.47562562584847203173e01,
+    8.45138970141474626562e01,
+    1.77318088145400459522e02,
+    1.64234692871529701831e02,
+    7.14778400825575695274e01,
+    1.40959135607834029598e01,
+    1.00000000000000000470e00,
+]
+comptime _AI_AFN = [
+    -1.31696323418331795333e-01,
+    -6.26456544431912369773e-01,
+    -6.93158036036933542233e-01,
+    -2.79779981545119124951e-01,
+    -4.91900132609500318020e-02,
+    -4.06265923594885404393e-03,
+    -1.59276496239262096340e-04,
+    -2.77649108155232920844e-06,
+    -1.67787698489114633780e-08,
+]
+comptime _AI_AFD = [
+    1.33560420706553243746e01,
+    3.26825032795224613948e01,
+    2.67367040941499554804e01,
+    9.18707402907259625840e00,
+    1.47529146771666414581e00,
+    1.15687173795188044134e-01,
+    4.40291641615211203805e-03,
+    7.54720348287414296618e-05,
+    4.51850092970580378464e-07,
+]
+comptime _AI_AGN = [
+    1.97339932091685679179e-02,
+    3.91103029615688277255e-01,
+    1.06579897599595591108e00,
+    9.39169229816650230044e-01,
+    3.51465656105547619242e-01,
+    6.33888919628925490927e-02,
+    5.85804113048388458567e-03,
+    2.82851600836737019778e-04,
+    6.98793669997260967291e-06,
+    8.11789239554389293311e-08,
+    3.41551784765923618484e-10,
+]
+comptime _AI_AGD = [
+    9.30892908077441974853e00,
+    1.98352928718312140417e01,
+    1.55646628932864612953e01,
+    5.47686069422975497931e00,
+    9.54293611618961883998e-01,
+    8.64580826352392193095e-02,
+    4.12656523824222607191e-03,
+    1.01259085116509135510e-04,
+    1.17166733214413521882e-06,
+    4.91834570062930015649e-09,
+]
 
 # --------------------------------------------------------------------------- #
 # The erfcx lookup table

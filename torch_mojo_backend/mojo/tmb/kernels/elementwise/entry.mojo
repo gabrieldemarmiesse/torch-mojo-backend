@@ -25,6 +25,7 @@ from tmb.kernels.common.unary_math import (
     elementwise_predicate,
     elementwise_unary,
     elementwise_unary_param,
+    has_f64_port,
     is_rounding,
     param_compute_dtype,
 )
@@ -531,11 +532,14 @@ def _unary_float64_on[op_code: Int]() -> Bool:
     on NVIDIA GPU"; LLVM on AMD: "Cannot select: f64 = fcos").
     """
     comptime if op_code >= UOP_TABLE_BASE:
-        # trunc / round / frac / angle are exact in float64.
-        return is_rounding[_table_uop_kind[op_code]()]()
+        # trunc / round / frac / angle are exact in float64; the special
+        # functions have double ports.
+        comptime kind = _table_uop_kind[op_code]()
+        return is_rounding[kind]() or has_f64_port[kind]()
     else:
         return (
             _unary_is_direct[op_code]()
+            or op_code == UOP_ERF
             or op_code == UOP_LOG2
             or op_code == UOP_RECIPROCAL
             or op_code == UOP_CEIL
@@ -1377,7 +1381,12 @@ comptime _PARAM_UOP_SPECS: List[StaticString] = [
 @always_inline
 def _param_float64_on[index: Int]() -> Bool:
     comptime kind = _PARAM_UOP_KINDS[index]
-    return kind == "nan_to_num" or kind == "round_decimals"
+    return (
+        kind == "nan_to_num"
+        or kind == "round_decimals"
+        or kind == "logit"
+        or kind == "polygamma"
+    )
 
 
 @always_inline

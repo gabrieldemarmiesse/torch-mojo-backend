@@ -601,6 +601,51 @@ def _pw_no_float8(kind: StaticString, compute: Int32) raises:
         )
 
 
+def _pw_no_half(kind: StaticString) -> Bool:
+    """The kinds whose CUDA kernel dispatches float and double only
+    (`AT_DISPATCH_FLOATING_TYPES`): half types raise NotImplementedError."""
+    return (
+        kind == "zeta"
+        or kind == "igamma"
+        or kind == "igammac"
+        or kind == "chebyshev_polynomial_t"
+        or kind == "chebyshev_polynomial_u"
+        or kind == "chebyshev_polynomial_v"
+        or kind == "chebyshev_polynomial_w"
+        or kind == "shifted_chebyshev_polynomial_t"
+        or kind == "shifted_chebyshev_polynomial_u"
+        or kind == "shifted_chebyshev_polynomial_v"
+        or kind == "shifted_chebyshev_polynomial_w"
+        or kind == "hermite_polynomial_h"
+        or kind == "hermite_polynomial_he"
+        or kind == "laguerre_polynomial_l"
+        or kind == "legendre_polynomial_p"
+    )
+
+
+def _pw_half_refuse(
+    kind: StaticString, compute: Int32, a: Side, b: Side
+) raises:
+    """`_pw_no_half` off Apple GPUs (MPS computes the half types)."""
+    if not _pw_no_half(kind) or (
+        compute != ST_FLOAT16 and compute != ST_BFLOAT16
+    ):
+        return
+    var device = a.t.value().device if a.is_t else b.t.value().device
+    var ctx = ctx_for(device)
+    var metal = ctx.api() == "metal"
+    _ = ctx
+    if metal:
+        return
+    unsupported(
+        '"'
+        + String(kind)
+        + "_cuda\" not implemented for '"
+        + _scalar_type_name(max_dtype(compute))
+        + "'"
+    )
+
+
 def _pw_math(
     kind: StaticString,
     policy: Int,
@@ -614,7 +659,8 @@ def _pw_math(
 ) raises:
     """A math op over args[0 .. arity): promoted, computed, stored.
     `exact_dtype` (or `_pw_out_exact(kind)`) demands an `out` of the result
-    dtype instead of casting into it."""
+    dtype instead of casting into it. A `_pw_no_half` kind refuses float16
+    / bfloat16 as its CUDA dispatch does."""
     var a = _b_side(args[unsafe_offset=0])
     var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
     var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
@@ -625,6 +671,7 @@ def _pw_math(
         # dispatch (a float8 computation is refused after the resize).
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
     var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
+    _pw_half_refuse(kind, compute, a, b)
     _pw_finish(
         rets,
         dest,
@@ -651,6 +698,7 @@ def _pw_math_inplace(
     var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
     var common = _pw_result_type(a, b, c, arity)
     var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
+    _pw_half_refuse(kind, compute, a, b)
     _b_store_inplace(
         rets,
         self,
