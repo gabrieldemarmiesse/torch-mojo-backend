@@ -42,6 +42,8 @@ import functools
 from dataclasses import dataclass
 
 import torch
+import torch._dynamo.exc
+import torch.utils._triton
 from torch._dynamo.device_interface import (
     DeviceInterface,
     register_interface_for_device,
@@ -267,7 +269,11 @@ class MojoInterface(DeviceInterface):
             raise RuntimeError("the mojo device is too old for Triton (pre-Volta)")
         vendor_backend = "amd" if accelerator_api() == "hip" else "nvidia"
         if vendor_backend not in triton.backends.backends:
-            raise RuntimeError(f"triton not built with the {vendor_backend!r} backend")
+            # torch >= 2.14's has_triton() reads only this subclass as "no".
+            unavailable = getattr(
+                torch._dynamo.exc, "TritonUnavailableError", RuntimeError
+            )
+            raise unavailable(f"triton not built with the {vendor_backend!r} backend")
 
 
 class MojoDeviceOpOverrides(DeviceOpOverrides):
@@ -324,3 +330,6 @@ def enable_inductor():
         register_interface_for_device(f"mojo:{index}", MojoInterface)
     register_device_op_overrides("mojo", MojoDeviceOpOverrides())
     register_backend_for_device("mojo", TritonScheduling, PythonWrapperCodegen)
+    # torch >= 2.14's has_triton() asks the interfaces just registered; drop
+    # an answer cached before them.
+    torch.utils._triton.has_triton.cache_clear()

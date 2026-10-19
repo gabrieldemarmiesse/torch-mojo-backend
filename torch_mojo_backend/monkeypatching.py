@@ -40,6 +40,7 @@ from torch._dynamo.variables.base import VariableTracker
 from torch._dynamo.variables.constant import ConstantVariable
 from torch._dynamo.variables.lazy import LazyVariableTracker
 from torch._dynamo.variables.torch import TorchInGraphFunctionVariable
+from torch.torch_version import TorchVersion
 
 from torch_mojo_backend.distributed import flight_recorder
 from torch_mojo_backend.native import device_module
@@ -48,6 +49,10 @@ try:
     from torch._dynamo.variables import streams as dynamo_streams
 except ImportError:  # Older torch releases predate generic stream tracing.
     dynamo_streams = None
+
+# torch 2.14 ships the fixes some patches below backport; a 2.14 nightly
+# counts as older (pre-release), which keeps the patch, harmlessly.
+_TORCH_BELOW_2_14 = TorchVersion(torch.__version__) < "2.14"  # a Version compare
 
 if TYPE_CHECKING:
     from torch._dynamo.variables.streams import (
@@ -295,7 +300,13 @@ def fix_batch_isend_irecv_for_python_process_groups():
     ``supports_coalescing``, which is the real question; ``isinstance`` is
     what the type check means. Everything else is torch's own code path,
     called unchanged.
+
+    Only needed below torch 2.14, which made the same fix (pytorch#186964);
+    delete once the minimum torch is 2.14.
     """
+    # TODO: remove when we drop support for torch versions older than 2.14
+    if not _TORCH_BELOW_2_14:
+        return
     original = c10d.batch_isend_irecv
     if getattr(original, "_torch_mojo_backend", False):
         return
@@ -472,7 +483,14 @@ def let_has_triton_see_the_mojo_device():
 
     The rebinding loop is the price of ``from torch.utils._triton import
     has_triton``: a dozen torch modules hold the original by value.
+
+    Only needed below torch 2.14, whose ``has_triton`` asks the registered
+    device interfaces (pytorch#190324, ``MojoInterface`` answers it);
+    delete once the minimum torch is 2.14.
     """
+    # TODO: remove when we drop support for torch versions older than 2.14
+    if not _TORCH_BELOW_2_14:
+        return
     from torch_mojo_backend.native import (  # noqa: PLC0415 -- `torch.mojo`, imported here so registering the devices does not pull in the native backend
         device_module,
     )
@@ -482,8 +500,8 @@ def let_has_triton_see_the_mojo_device():
         return
 
     @functools.cache
-    def has_triton() -> bool:
-        return original() or (
+    def has_triton(*args: bool, **kwargs: bool) -> bool:  # 2.15: include_cpu=
+        return original(*args, **kwargs) or (
             torch.utils._triton.has_triton_package() and device_module.is_available()
         )
 
