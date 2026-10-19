@@ -1807,10 +1807,8 @@ def aten_alias(input: MaxTensor) -> MaxTensor:
     return input
 
 
-# amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor
-@map_to(aten.amax)
-def aten_amax(
-    input: MaxTensor, dim: list[int] = [], keepdim: bool = False
+def _extremum(
+    reduce: Callable[..., MaxTensor], input: MaxTensor, dim: list[int], keepdim: bool
 ) -> MaxTensor:
     # If empty dim list is provided, reduce over all dimensions
     if not dim:
@@ -1819,7 +1817,7 @@ def aten_amax(
     # Reduce each dimension one by one, similar to aten_mean
     result = input
     for axis in dim:
-        result = _reduce_max(result, axis=axis)
+        result = reduce(result, axis=axis)
 
     if not keepdim:
         # Squeeze the reduced dimensions - sort in reverse order to avoid index shifting
@@ -1827,6 +1825,14 @@ def aten_amax(
             result = F.squeeze(result, axis=axis)
 
     return result
+
+
+# amax(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor
+@map_to(aten.amax)
+def aten_amax(
+    input: MaxTensor, dim: list[int] = [], keepdim: bool = False
+) -> MaxTensor:
+    return _extremum(_reduce_max, input, dim, keepdim)
 
 
 # amin(Tensor self, int[1] dim=[], bool keepdim=False) -> Tensor
@@ -1834,21 +1840,7 @@ def aten_amax(
 def aten_amin(
     input: MaxTensor, dim: list[int] = [], keepdim: bool = False
 ) -> MaxTensor:
-    # If empty dim list is provided, reduce over all dimensions
-    if not dim:
-        dim = [i for i in range(len(input.shape))]
-
-    # Reduce each dimension one by one, similar to aten_mean
-    result = input
-    for axis in dim:
-        result = _reduce_min(result, axis=axis)
-
-    if not keepdim:
-        # Squeeze the reduced dimensions - sort in reverse order to avoid index shifting
-        for axis in sorted(dim, reverse=True):
-            result = F.squeeze(result, axis=axis)
-
-    return result
+    return _extremum(_reduce_min, input, dim, keepdim)
 
 
 # any(Tensor self) -> Tensor
@@ -1949,16 +1941,14 @@ def aten_arange(
     return F.cast(result, dtype=max_dtype)
 
 
-# argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor
-@map_to(aten.argmax)
-def aten_argmax(
-    input: MaxTensor, dim: int | None = None, keepdim: bool = False
+def _arg_reduce(
+    reduce: Callable[..., MaxTensor], input: MaxTensor, dim: int | None, keepdim: bool
 ) -> MaxTensor:
-    # If dim is None, return argmax of flattened tensor
+    # If dim is None, return arg-reduction of flattened tensor
     if dim is None:
-        # Flatten the tensor and compute argmax along axis 0
+        # Flatten the tensor and compute arg-reduction along axis 0
         flattened = F.reshape(input, [-1])
-        result = _reduce_argmax(flattened, axis=0)
+        result = reduce(flattened, axis=0)
         if keepdim:
             # Return tensor with same number of dimensions as input, all size 1
             result_shape = [1] * len(input.shape)
@@ -1967,8 +1957,8 @@ def aten_argmax(
             # Return scalar (0-dimensional tensor)
             result = F.squeeze(result, axis=0)
     else:
-        # Compute argmax along specified dimension
-        # MAX only supports argmax on innermost axis, so we need to transpose
+        # Compute arg-reduction along specified dimension
+        # MAX only supports arg-reduction on innermost axis, so we need to transpose
         ndim = len(input.shape)
 
         # Normalize negative axis
@@ -1980,8 +1970,8 @@ def aten_argmax(
             # Swap target dimension with last dimension
             transposed_input = F.transpose(input, dim, ndim - 1)
 
-            # Perform argmax on last axis
-            result = _reduce_argmax(transposed_input, axis=-1)
+            # Perform arg-reduction on last axis
+            result = reduce(transposed_input, axis=-1)
 
             # Swap back if needed
             if not keepdim:
@@ -1997,7 +1987,7 @@ def aten_argmax(
                 result = F.transpose(result, dim, ndim - 1)
         else:
             # Target axis is already the last dimension
-            result = _reduce_argmax(input, axis=dim)
+            result = reduce(input, axis=dim)
 
         if not keepdim:
             # Find the dimension with size 1 and squeeze it
@@ -2006,6 +1996,14 @@ def aten_argmax(
                     result = F.squeeze(result, axis=i)
                     break
     return result
+
+
+# argmax(Tensor self, int? dim=None, bool keepdim=False) -> Tensor
+@map_to(aten.argmax)
+def aten_argmax(
+    input: MaxTensor, dim: int | None = None, keepdim: bool = False
+) -> MaxTensor:
+    return _arg_reduce(_reduce_argmax, input, dim, keepdim)
 
 
 # argmin(Tensor self, int? dim=None, bool keepdim=False) -> Tensor
@@ -2013,58 +2011,7 @@ def aten_argmax(
 def aten_argmin(
     input: MaxTensor, dim: int | None = None, keepdim: bool = False
 ) -> MaxTensor:
-    # If dim is None, return argmin of flattened tensor
-    if dim is None:
-        # Flatten the tensor and compute argmin along axis 0
-        flattened = F.reshape(input, [-1])
-        result = _reduce_argmin(flattened, axis=0)
-        if keepdim:
-            # Return tensor with same number of dimensions as input, all size 1
-            result_shape = [1] * len(input.shape)
-            result = F.reshape(result, result_shape)
-        else:
-            # Return scalar (0-dimensional tensor)
-            result = F.squeeze(result, axis=0)
-    else:
-        # Compute argmin along specified dimension
-        # MAX only supports argmin on innermost axis, so we need to transpose
-        ndim = len(input.shape)
-
-        # Normalize negative axis
-        if dim < 0:
-            dim = ndim + dim
-
-        # If dim is not the last dimension, transpose to make it last
-        if dim != ndim - 1:
-            # Swap target dimension with last dimension
-            transposed_input = F.transpose(input, dim, ndim - 1)
-
-            # Perform argmin on last axis
-            result = _reduce_argmin(transposed_input, axis=-1)
-
-            # Swap back if needed
-            if not keepdim:
-                # The result has one fewer dimension, so we need to be careful about indexing
-                result_ndim = ndim - 1
-                if dim < result_ndim:
-                    # Swap back: what was at position dim is now at position (result_ndim - 1)
-                    # We want to move it back to position dim
-                    result = F.transpose(result, dim, result_ndim - 1)
-            else:
-                # For keepdim=True, the result still has the same number of dimensions
-                # Swap the dimensions back
-                result = F.transpose(result, dim, ndim - 1)
-        else:
-            # Target axis is already the last dimension
-            result = _reduce_argmin(input, axis=dim)
-
-        if not keepdim:
-            # Find the dimension with size 1 and squeeze it
-            for i, size in enumerate(result.shape):
-                if size == 1:
-                    result = F.squeeze(result, axis=i)
-                    break
-    return result
+    return _arg_reduce(_reduce_argmin, input, dim, keepdim)
 
 
 # as_strided(Tensor(a) self, SymInt[] size, SymInt[] stride, SymInt? storage_offset=None) -> Tensor(a)
@@ -6427,6 +6374,15 @@ def torch_transpose_equivalent(tensor: MaxTensor, dim0: int, dim1: int) -> MaxTe
     return F.permute(tensor, perm)
 
 
+def _check_same_len(**lists: Sequence[object]):
+    """The _foreach overloads' length check, naming the ATen parameters."""
+    lengths = [len(v) for v in lists.values()]
+    if len(set(lengths)) > 1:
+        names = " == ".join(f"len({k})" for k in lists)
+        got = (" and " if len(lengths) == 2 else ", ").join(map(str, lengths))
+        raise ValueError(f"Expected {names}, but got {got}")
+
+
 # _foreach_add.Scalar(Tensor[] self, Scalar scalar) -> Tensor[]
 @map_to(aten._foreach_add.Scalar)
 def aten__foreach_add_scalar(
@@ -6440,10 +6396,7 @@ def aten__foreach_add_scalar(
 def aten__foreach_add_scalar_list(
     self: list[MaxTensor], other: list[Scalar]
 ) -> list[MaxTensor]:
-    if len(self) != len(other):
-        raise ValueError(
-            f"Expected len(self) == len(scalars), but got {len(self)} and {len(other)}"
-        )
+    _check_same_len(self=self, scalars=other)
     return [aten_add(tensor, scalar) for tensor, scalar in zip(self, other)]
 
 
@@ -6460,10 +6413,7 @@ def aten__foreach_add_tensor(
 def aten__foreach_add_list(
     self: list[MaxTensor], other: list[MaxTensor], alpha: Scalar = 1
 ) -> list[MaxTensor]:
-    if len(self) != len(other):
-        raise ValueError(
-            f"Expected len(self) == len(other), but got {len(self)} and {len(other)}"
-        )
+    _check_same_len(self=self, other=other)
     return [aten_add(x, y, alpha=alpha) for x, y in zip(self, other)]
 
 
@@ -6480,10 +6430,7 @@ def aten__foreach_sub_scalar(
 def aten__foreach_sub_scalar_list(
     self: list[MaxTensor], other: list[Scalar]
 ) -> list[MaxTensor]:
-    if len(self) != len(other):
-        raise ValueError(
-            f"Expected len(self) == len(scalars), but got {len(self)} and {len(other)}"
-        )
+    _check_same_len(self=self, scalars=other)
     return [aten_sub(tensor, scalar) for tensor, scalar in zip(self, other)]
 
 
@@ -6492,10 +6439,7 @@ def aten__foreach_sub_scalar_list(
 def aten__foreach_sub_list(
     self: list[MaxTensor], other: list[MaxTensor], alpha: Scalar = 1
 ) -> list[MaxTensor]:
-    if len(self) != len(other):
-        raise ValueError(
-            f"Expected len(self) == len(other), but got {len(self)} and {len(other)}"
-        )
+    _check_same_len(self=self, other=other)
     return [aten_sub(x, y, alpha=alpha) for x, y in zip(self, other)]
 
 
@@ -6510,10 +6454,7 @@ def aten__foreach_mul_scalar(self: list[MaxTensor], other: Scalar) -> list[MaxTe
 def aten__foreach_mul_scalar_list(
     self: list[MaxTensor], other: list[Scalar]
 ) -> list[MaxTensor]:
-    if len(self) != len(other):
-        raise ValueError(
-            f"Expected len(self) == len(scalars), but got {len(self)} and {len(other)}"
-        )
+    _check_same_len(self=self, scalars=other)
     return [aten_mul(tensor, scalar) for tensor, scalar in zip(self, other)]
 
 
@@ -6530,10 +6471,7 @@ def aten__foreach_mul_tensor(
 def aten__foreach_mul_list(
     self: list[MaxTensor], other: list[MaxTensor]
 ) -> list[MaxTensor]:
-    if len(self) != len(other):
-        raise ValueError(
-            f"Expected len(self) == len(other), but got {len(self)} and {len(other)}"
-        )
+    _check_same_len(self=self, other=other)
     return [aten_mul(x, y) for x, y in zip(self, other)]
 
 
@@ -6556,10 +6494,7 @@ def aten__foreach_pow_scalar(
 def aten__foreach_pow_scalar_list(
     self: list[MaxTensor], exponent: list[Scalar]
 ) -> list[MaxTensor]:
-    if len(self) != len(exponent):
-        raise ValueError(
-            f"Expected len(self) == len(exponent), but got {len(self)} and {len(exponent)}"
-        )
+    _check_same_len(self=self, exponent=exponent)
     return [aten_pow(tensor, exp) for tensor, exp in zip(self, exponent)]
 
 
@@ -6568,10 +6503,7 @@ def aten__foreach_pow_scalar_list(
 def aten__foreach_pow_list(
     self: list[MaxTensor], exponent: list[MaxTensor]
 ) -> list[MaxTensor]:
-    if len(self) != len(exponent):
-        raise ValueError(
-            f"Expected len(self) == len(exponent), but got {len(self)} and {len(exponent)}"
-        )
+    _check_same_len(self=self, exponent=exponent)
     return [aten_pow(x, exp) for x, exp in zip(self, exponent)]
 
 
@@ -6594,10 +6526,7 @@ def aten__foreach_div_scalar(self: list[MaxTensor], other: Scalar) -> list[MaxTe
 def aten__foreach_div_scalar_list(
     self: list[MaxTensor], other: list[Scalar]
 ) -> list[MaxTensor]:
-    if len(self) != len(other):
-        raise ValueError(
-            f"Expected len(self) == len(scalars), but got {len(self)} and {len(other)}"
-        )
+    _check_same_len(self=self, scalars=other)
     return [aten_div(tensor, scalar) for tensor, scalar in zip(self, other)]
 
 
@@ -6614,10 +6543,7 @@ def aten__foreach_div_tensor(
 def aten__foreach_div_list(
     self: list[MaxTensor], other: list[MaxTensor]
 ) -> list[MaxTensor]:
-    if len(self) != len(other):
-        raise ValueError(
-            f"Expected len(self) == len(other), but got {len(self)} and {len(other)}"
-        )
+    _check_same_len(self=self, other=other)
     return [aten_div(x, y) for x, y in zip(self, other)]
 
 
@@ -6641,10 +6567,7 @@ def aten__foreach_addcdiv_scalar(
     tensor2: list[MaxTensor],
     value: Scalar = 1,
 ) -> list[MaxTensor]:
-    if len(self) != len(tensor1) or len(self) != len(tensor2):
-        raise ValueError(
-            f"Expected len(self) == len(tensor1) == len(tensor2), but got {len(self)}, {len(tensor1)}, {len(tensor2)}"
-        )
+    _check_same_len(self=self, tensor1=tensor1, tensor2=tensor2)
     return [
         aten_addcdiv(s, t1, t2, value=value)
         for s, t1, t2 in zip(self, tensor1, tensor2)
@@ -6659,14 +6582,7 @@ def aten__foreach_addcdiv_scalarlist(
     tensor2: list[MaxTensor],
     scalars: list[Scalar],
 ) -> list[MaxTensor]:
-    if (
-        len(self) != len(tensor1)
-        or len(self) != len(tensor2)
-        or len(self) != len(scalars)
-    ):
-        raise ValueError(
-            f"Expected len(self) == len(tensor1) == len(tensor2) == len(scalars), but got {len(self)}, {len(tensor1)}, {len(tensor2)}, {len(scalars)}"
-        )
+    _check_same_len(self=self, tensor1=tensor1, tensor2=tensor2, scalars=scalars)
     return [
         aten_addcdiv(s, t1, t2, value=val)
         for s, t1, t2, val in zip(self, tensor1, tensor2, scalars)
@@ -6688,10 +6604,7 @@ def aten__foreach_addcmul_scalar(
     tensor2: list[MaxTensor],
     value: Scalar = 1,
 ) -> list[MaxTensor]:
-    if len(self) != len(tensor1) or len(self) != len(tensor2):
-        raise ValueError(
-            f"Expected len(self) == len(tensor1) == len(tensor2), but got {len(self)}, {len(tensor1)}, {len(tensor2)}"
-        )
+    _check_same_len(self=self, tensor1=tensor1, tensor2=tensor2)
     return [
         aten_addcmul(s, t1, t2, value=value)
         for s, t1, t2 in zip(self, tensor1, tensor2)
@@ -6706,14 +6619,7 @@ def aten__foreach_addcmul_scalarlist(
     tensor2: list[MaxTensor],
     scalars: list[Scalar],
 ) -> list[MaxTensor]:
-    if (
-        len(self) != len(tensor1)
-        or len(self) != len(tensor2)
-        or len(self) != len(scalars)
-    ):
-        raise ValueError(
-            f"Expected len(self) == len(tensor1) == len(tensor2) == len(scalars), but got {len(self)}, {len(tensor1)}, {len(tensor2)}, {len(scalars)}"
-        )
+    _check_same_len(self=self, tensor1=tensor1, tensor2=tensor2, scalars=scalars)
     return [
         aten_addcmul(s, t1, t2, value=val)
         for s, t1, t2, val in zip(self, tensor1, tensor2, scalars)
