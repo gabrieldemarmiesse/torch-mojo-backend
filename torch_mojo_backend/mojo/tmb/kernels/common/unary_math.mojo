@@ -265,15 +265,15 @@ def _scalar_special[kind: StaticString, ct: DType](a: Scalar[ct]) -> Scalar[ct]:
     elif kind == "modified_bessel_i1":
         return modified_bessel_i1(a)
     elif kind == "modified_bessel_k0":
-        return modified_bessel_k0(a, scaled=False)
+        return modified_bessel_k0[ct, False](a)
     elif kind == "modified_bessel_k1":
-        return modified_bessel_k1(a, scaled=False)
+        return modified_bessel_k1[ct, False](a)
     elif kind == "ndtri":
         return ndtri(a)
     elif kind == "scaled_modified_bessel_k0":
-        return modified_bessel_k0(a, scaled=True)
+        return modified_bessel_k0[ct, True](a)
     elif kind == "scaled_modified_bessel_k1":
-        return modified_bessel_k1(a, scaled=True)
+        return modified_bessel_k1[ct, True](a)
     elif kind == "sinc":
         return sinc(a)
     elif kind == "spherical_bessel_j0":

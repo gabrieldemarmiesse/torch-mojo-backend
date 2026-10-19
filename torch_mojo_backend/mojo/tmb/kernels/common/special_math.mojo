@@ -227,9 +227,11 @@ def _horner[
 
 @always_inline
 def _chbevl[
-    n: Int, dt: DType, //, c: Array[Float64, n]
+    n: Int, dt: DType, //, c: Array[Float64, n], fuse_last: Bool = True
 ](x: Scalar[dt]) -> Scalar[dt]:
-    """Cephes `chbevl`: the Clenshaw sum 0.5 (b0 - b2) of a Chebyshev series."""
+    """Cephes `chbevl`: the Clenshaw sum 0.5 (b0 - b2) of a Chebyshev series.
+    `fuse_last=False`: the last step's product rounded, as ptxas leaves it
+    in some of the open-coded loops (read from their SASS)."""
     comptime c0 = c[0]
     var b0 = c0.cast[dt]()
     var b1 = Scalar[dt](0.0)
@@ -238,7 +240,10 @@ def _chbevl[
         b2 = b1
         b1 = b0
         comptime ci = c[i]
-        b0 = fma(x, b1, -b2) + ci.cast[dt]()
+        comptime if fuse_last or i < n - 1:
+            b0 = fma(x, b1, -b2) + ci.cast[dt]()
+        else:
+            b0 = (_mul_rn(x, b1) - b2) + ci.cast[dt]()
     return Scalar[dt](0.5) * (b0 - b2)
 
 
@@ -892,42 +897,56 @@ def i1e[dt: DType](a: Scalar[dt]) -> Scalar[dt]:
 
 
 @always_inline
-def modified_bessel_i0[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+def modified_bessel_i0[
+    dt: DType, fa: Bool = dt == F32, fb: Bool = dt == F32
+](x: Scalar[dt]) -> Scalar[dt]:
     """`modified_bessel_i0_string`: i0's series, with the scaling written
-    exp(|x|) * (0.5 (a - p)) [/ sqrt(|x|)]."""
+    exp(|x|) * (0.5 (a - p)) [/ sqrt(|x|)]. `fa` / `fb`: whether ptxas
+    fused the last step of the [0, 8] / (8, inf) loop (the double kernel
+    keeps both rounded)."""
     comptime T = Scalar[dt]
     var ax = _absg(x)
     if ax <= T(8.0):
-        return _exp(ax) * _chbevl[_I0_A]((ax / T(2.0)) - T(2.0))
-    return (_exp(ax) * _chbevl[_I0_B](T(32.0) / ax - T(2.0))) / _sqrt(ax)
+        return _exp(ax) * _chbevl[_I0_A, fa]((ax / T(2.0)) - T(2.0))
+    return (_exp(ax) * _chbevl[_I0_B, fb](T(32.0) / ax - T(2.0))) / _sqrt(ax)
 
 
 @always_inline
-def modified_bessel_i1[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
-    """`modified_bessel_i1_string`."""
+def modified_bessel_i1[
+    dt: DType, fa: Bool = True, fb: Bool = dt == F32
+](x: Scalar[dt]) -> Scalar[dt]:
+    """`modified_bessel_i1_string` (`fa` / `fb` as `modified_bessel_i0`)."""
     comptime T = Scalar[dt]
     var ax = _absg(x)
     var res: T
     if ax <= T(8.0):
-        var s = _chbevl[_I1_A]((ax / T(2.0)) - T(2.0))
+        var s = _chbevl[_I1_A, fa]((ax / T(2.0)) - T(2.0))
         res = s * ax * _exp(ax)
     else:
-        res = (_exp(ax) * _chbevl[_I1_B](T(32.0) / ax - T(2.0))) / _sqrt(ax)
+        res = (_exp(ax) * _chbevl[_I1_B, fb](T(32.0) / ax - T(2.0))) / _sqrt(ax)
     return _neg(res) if x < T(0.0) else res
 
 
 @always_inline
-def modified_bessel_k0[dt: DType](x: Scalar[dt], scaled: Bool) -> Scalar[dt]:
-    """`modified_bessel_k0_string` / `scaled_modified_bessel_k0_string`."""
+def modified_bessel_k0[
+    dt: DType,
+    scaled: Bool,
+    fa: Bool = True,
+    fi: Bool = dt == F32,
+    fb: Bool = dt == F32,
+](x: Scalar[dt]) -> Scalar[dt]:
+    """`modified_bessel_k0_string` / `scaled_modified_bessel_k0_string`.
+    `fa` / `fb`: ptxas fused the last step of the (0, 2] / (2, inf) loop,
+    `fi`: of the inlined i0's loop."""
     comptime T = Scalar[dt]
     if x == T(0.0):
         return _inf[dt]()
     if x < T(0.0):
         return _nan[dt]()
     if x <= T(2.0):
-        var s = _chbevl[_K0_A](x * x - T(2.0))
-        var i0 = modified_bessel_i0(x)
-        if scaled:
+        var s = _chbevl[_K0_A, fa](x * x - T(2.0))
+        var i0 = modified_bessel_i0[dt, fi, fi](x)
+        comptime if scaled:
             return (s - _log(T(0.5) * x) * i0) * _exp(x)
         comptime if is_apple_gpu():
             # special_math.h: `::metal::log(0.5 * x)`, float (no double).
@@ -936,28 +955,35 @@ def modified_bessel_k0[dt: DType](x: Scalar[dt], scaled: Bool) -> Scalar[dt]:
         # expression is evaluated in double and rounded once.
         var lg = nv_log(0.5 * _f64(x))
         return _t[dt](_f64(s) - lg * _f64(i0))
-    var s = _chbevl[_K0_B](T(8.0) / x - T(2.0))
-    if scaled:
+    var s = _chbevl[_K0_B, fb](T(8.0) / x - T(2.0))
+    comptime if scaled:
         return s / _sqrt(x)
     return _exp(-x) * s / _sqrt(x)
 
 
 @always_inline
-def modified_bessel_k1[dt: DType](x: Scalar[dt], scaled: Bool) -> Scalar[dt]:
-    """`modified_bessel_k1_string` / `scaled_modified_bessel_k1_string`."""
+def modified_bessel_k1[
+    dt: DType,
+    scaled: Bool,
+    fa: Bool = False,
+    fi: Bool = True,
+    fb: Bool = True,
+](x: Scalar[dt]) -> Scalar[dt]:
+    """`modified_bessel_k1_string` / `scaled_modified_bessel_k1_string`
+    (`fa` / `fi` / `fb` as `modified_bessel_k0`)."""
     comptime T = Scalar[dt]
     if x == T(0.0):
         return _inf[dt]()
     if x < T(0.0):
         return _nan[dt]()
     if x <= T(2.0):
-        var s = _chbevl[_K1_A](x * x - T(2.0))
-        var r = _log(T(0.5) * x) * modified_bessel_i1(x) + s / x
-        if scaled:
+        var s = _chbevl[_K1_A, fa](x * x - T(2.0))
+        var r = _log(T(0.5) * x) * modified_bessel_i1[dt, fi, fi](x) + s / x
+        comptime if scaled:
             return r * _exp(x)
         return r
-    var s = _chbevl[_K1_B](T(8.0) / x - T(2.0))
-    if scaled:
+    var s = _chbevl[_K1_B, fb](T(8.0) / x - T(2.0))
+    comptime if scaled:
         return s / _sqrt(x)
     return _exp(-x) * s / _sqrt(x)
 
@@ -1163,9 +1189,10 @@ def airy_ai[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
         return (
             _t[dt](isqpi)
             / _sqrt(_sqrt(-x))
-            * (
-                _sin(t) * (T(1.0) + z * z * afn / afd)
-                - _cos(t) * (z * agn / agd)
+            * fma(
+                -(z * agn / agd),
+                _cos(t),
+                _sin(t) * (T(1.0) + z * z * afn / afd),
             )
         )
     var odd_domain = False
