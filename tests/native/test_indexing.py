@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from tests.native.conftest import is_metal, ran
+from tests.native.conftest import assert_dim_error_like_cpu, is_metal, ran
 from torch_mojo_backend import get_accelerators
 
 DTYPES = [torch.float32, torch.float16, torch.bfloat16, torch.int64, torch.bool]
@@ -170,6 +170,31 @@ def test_unfold_backward(mojo_device, shape, dim, size, step):
     d.unfold(dim, size, step).backward(grad.to(mojo_device))
     assert d.grad is not None
     torch.testing.assert_close(d.grad.cpu(), expected)
+
+
+# An out-of-range dim is maybe_wrap_dim's IndexError, as on CPU.
+_DIM_ERRORS = {
+    "flip": lambda to: torch.flip(to(torch.randn(2, 3)), [5]),
+    "roll": lambda to: torch.roll(to(torch.randn(2, 3)), 1, 5),
+    "unfold": lambda to: to(torch.randn(2, 3)).unfold(5, 1, 1),
+    "unfold_backward": lambda to: torch.ops.aten.unfold_backward(
+        to(torch.randn(2, 3, 1)), [2, 3], 5, 1, 1
+    ),
+    "index_fill_": lambda to: to(torch.randn(2, 3)).index_fill_(
+        5, to(torch.tensor([0, 1])), 1.0
+    ),
+    "index_copy_": lambda to: to(torch.randn(2, 3)).index_copy_(
+        5, to(torch.tensor([0, 1])), to(torch.randn(2, 3))
+    ),
+    "index_reduce": lambda to: to(torch.randn(2, 3)).index_reduce(
+        5, to(torch.tensor([0, 1])), to(torch.randn(2, 3)), "prod"
+    ),
+}
+
+
+@pytest.mark.parametrize("op", list(_DIM_ERRORS))
+def test_dim_out_of_range_is_index_error(mojo_gpu, op):
+    assert_dim_error_like_cpu(_DIM_ERRORS[op], mojo_gpu)
 
 
 # ---------------------------------------------------------------------------

@@ -160,6 +160,7 @@ from tmb.ops.common import (
     scalar_to_float,
     scalar_to_int,
     shape_list_str,
+    wrap_dim,
 )
 from tmb.ops.random import _draw, _sample, _sampler_dtype_check
 from tmb.ops.core import cast_for_copy
@@ -2016,17 +2017,7 @@ def _glu_dim(t: T, dim: Int, scalar_msg: StaticString) raises -> Int:
     range, an even size to halve. The wrapped dim."""
     if t.rank == 0:
         raise Error(scalar_msg)
-    if dim < -t.rank or dim >= t.rank:
-        raise Error(
-            "Dimension out of range (expected to be in range of [",
-            -t.rank,
-            ", ",
-            t.rank - 1,
-            "], but got ",
-            dim,
-            ")",
-        )
-    var d = dim + t.rank if dim < 0 else dim
+    var d = wrap_dim(dim, t.rank)
     var n = t.shape[MAX_RANK - t.rank + d]
     if n % 2 != 0:
         raise Error(
@@ -2208,22 +2199,6 @@ def op_glu_backward_grad_input(
     _glu_backward(args, rets, 3)
 
 
-def _glu_wrap_dim(dim: Int, rank: Int) raises -> Int:
-    """`maybe_wrap_dim(dim, rank)` (a 0-d tensor wraps as 1-d)."""
-    var r = max(rank, 1)
-    if dim < -r or dim >= r:
-        raise Error(
-            "Dimension out of range (expected to be in range of [",
-            -r,
-            ", ",
-            r - 1,
-            "], but got ",
-            dim,
-            ")",
-        )
-    return dim + r if dim < 0 else dim
-
-
 def _glu_narrow(t: T, d: Int, start: Int, length: Int) raises -> T:
     """`t.narrow(d, start, length)`: a view over t's storage."""
     if d >= t.rank:
@@ -2262,7 +2237,7 @@ def _glu_jvp(args: Values) raises -> Owned:
     var glu = v_tensor(args[unsafe_offset=0])
     var x = v_tensor(args[unsafe_offset=1])
     var dx = v_tensor(args[unsafe_offset=2])
-    var d = _glu_wrap_dim(v_int(args[unsafe_offset=3]), x.rank)
+    var d = wrap_dim(v_int(args[unsafe_offset=3]), x.rank)
     if d >= glu.rank:
         raise Error(
             "Dimension out of range (expected to be in range of [",
@@ -2363,7 +2338,7 @@ def _glu_backward_jvp(args: Values) raises -> Owned:
     var x = v_tensor(args[unsafe_offset=2])
     var dgrad_glu = _glu_bjvp_view(v_tensor(args[unsafe_offset=3]))
     var dx = v_tensor(args[unsafe_offset=4])
-    var d = _glu_wrap_dim(v_int(args[unsafe_offset=5]), x.rank)
+    var d = wrap_dim(v_int(args[unsafe_offset=5]), x.rank)
     if d >= grad_glu.rank:
         raise Error(
             "Dimension out of range (expected to be in range of [",

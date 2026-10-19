@@ -146,6 +146,7 @@ from tmb.ops.common import (
     resize_out,
     resize_storage_bytes,
     int_list_str,
+    wrap_dim,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
@@ -1249,17 +1250,7 @@ def op_split_with_sizes_copy_out(
         raise Error("split expects at least a 1-dimensional tensor")
     # Every message below is ATen's own text: this op is registered, so its
     # composite kernel no longer runs and these are the only ones a user sees.
-    if dim_in < -src.rank or dim_in >= src.rank:
-        raise Error(
-            "Dimension out of range (expected to be in range of [",
-            -src.rank,
-            ", ",
-            src.rank - 1,
-            "], but got ",
-            dim_in,
-            ")",
-        )
-    var dim = dim_in + src.rank if dim_in < 0 else dim_in
+    var dim = wrap_dim(dim_in, src.rank)
     var total = 0
     for i in range(len(sizes)):
         if sizes[i] < 0:
@@ -2382,23 +2373,6 @@ def op_scatter_value(
 # ---------------------------------------------------------------------------
 
 
-def _norm_dim(dim_in: Int, rank: Int, what: String) raises -> Int:
-    var r = max(rank, 1)
-    var dim = dim_in + r if dim_in < 0 else dim_in
-    if dim < 0 or dim >= r:
-        raise Error(
-            what,
-            ": Dimension out of range (expected to be in range of [",
-            -r,
-            ", ",
-            r - 1,
-            "], but got ",
-            dim_in,
-            ")",
-        )
-    return dim
-
-
 def _out_target(
     mut out: T, shape: IndexList[MAX_RANK], rank: Int, like: T, what: String
 ) raises:
@@ -2465,7 +2439,7 @@ def _check_index(index: T, like: T, what: String) raises:
 
 
 def _gather_into(dst: T, a: T, dim_in: Int, index: T, what: String) raises:
-    var dim = _norm_dim(dim_in, a.rank, what)
+    var dim = wrap_dim(dim_in, a.rank)
     if dst.numel == 0:
         return
     if _dim_or1(a, dim) == 0:
@@ -2488,7 +2462,7 @@ def _gather_check(a: T, dim_in: Int, index: T) raises -> IndexList[MAX_RANK]:
     check); a 0-d operand counts as 1-d."""
     if a.rank > 4:
         unsupported("aten::gather of rank greater than 4")
-    var dim = _norm_dim(dim_in, a.rank, "gather")
+    var dim = wrap_dim(dim_in, a.rank)
     if index.numel == 0:
         return index.shape
     _check_index(index, a, "gather")
@@ -2550,7 +2524,7 @@ def _index_select_shape(
     _check_index(index, a, "index_select")
     if index.rank > 1:
         raise Error("index_select(): Index is supposed to be a vector")
-    var dim = _norm_dim(dim_in, a.rank, "index_select")
+    var dim = wrap_dim(dim_in, a.rank)
     var shape = a.shape
     if a.rank == 0:
         if index.numel != 1:
@@ -2565,7 +2539,7 @@ def _index_select_shape(
 
 
 def _index_select_into(dst: T, a: T, dim_in: Int, index: T) raises:
-    var dim = _norm_dim(dim_in, a.rank, "index_select")
+    var dim = wrap_dim(dim_in, a.rank)
     if dst.numel == 0:
         return
     if _dim_or1(a, dim) == 0:
@@ -2664,7 +2638,7 @@ def op_index_select_out(
     if shares_storage(out, a2) and index2.numel <= 16 and index2.numel > 1:
         # CUDA's small-index kernel (<= 16 indices) walks the indices in
         # order: a slice read after an earlier one was written sees it.
-        var d = _norm_dim(dim, a2.rank, "index_select")
+        var d = wrap_dim(dim, a2.rank)
         for i in range(index2.numel):
             var ish = IndexList[MAX_RANK](1)
             var ist = IndexList[MAX_RANK](0)
@@ -2778,7 +2752,7 @@ def op_scatter_add_out(
 def _index_add_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
     """index_add's argument checks (index_func_meta_impl's), before any
     overlap check or write; returns the normalized dim."""
-    var dim = _norm_dim(dim_in, a.rank, "index_add")
+    var dim = wrap_dim(dim_in, a.rank)
     var rank = max(a.rank, 1)
     _check_index(index, a, "index_add")
     if index.rank > 1:

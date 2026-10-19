@@ -1,5 +1,6 @@
 import contextlib
 import os
+import re
 
 import pytest
 import torch
@@ -119,3 +120,12 @@ def ran(*op_names: str):
     assert any(native.op_count(name) > before[name] for name in op_names), (
         f"none of {op_names} ran natively"
     )
+
+
+def assert_dim_error_like_cpu(fn, device: str):
+    """`fn(to)`, given an out-of-range dim, raises CPU torch's IndexError word
+    for word on `device` (`to` moves each tensor argument there)."""
+    with pytest.raises(IndexError) as cpu:
+        fn(lambda t: t)
+    with pytest.raises(IndexError, match=re.escape(str(cpu.value))):
+        fn(lambda t: t.to(device))

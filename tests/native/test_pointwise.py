@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import is_metal, skip_if_metal
+from tests.native.conftest import assert_dim_error_like_cpu, is_metal, skip_if_metal
 from torch_mojo_backend import get_accelerators, native
 
 FLOATS = [torch.float32, torch.float16, torch.bfloat16]
@@ -1285,6 +1285,31 @@ def test_glu_errors(mojo_gpu):
         F.glu(torch.randn(()).to(mojo_gpu))
     with pytest.raises(Exception, match="Dimension out of range"):
         F.glu(torch.randn(3, 4).to(mojo_gpu), 2)
+
+
+# An out-of-range dim is maybe_wrap_dim's IndexError, as on CPU.
+_GLU_DIM_ERRORS = {
+    "glu": lambda to: F.glu(to(torch.randn(2, 4)), 5),
+    "glu_backward": lambda to: torch.ops.aten.glu_backward(
+        to(torch.randn(2, 2)), to(torch.randn(2, 4)), 5
+    ),
+    "glu_jvp": lambda to: torch.ops.aten.glu_jvp(
+        to(torch.randn(2, 2)), to(torch.randn(2, 4)), to(torch.randn(2, 4)), 5
+    ),
+    "glu_backward_jvp": lambda to: torch.ops.aten.glu_backward_jvp(
+        to(torch.randn(2, 4)),
+        to(torch.randn(2, 2)),
+        to(torch.randn(2, 4)),
+        to(torch.randn(2, 2)),
+        to(torch.randn(2, 4)),
+        5,
+    ),
+}
+
+
+@pytest.mark.parametrize("op", list(_GLU_DIM_ERRORS))
+def test_glu_dim_out_of_range_is_index_error(mojo_gpu, op):
+    assert_dim_error_like_cpu(_GLU_DIM_ERRORS[op], mojo_gpu)
 
 
 def test_glu_backward_grad_input_partial_overlap_raises(mojo_gpu):

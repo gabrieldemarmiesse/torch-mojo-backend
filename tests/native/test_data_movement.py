@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import assert_dim_error_like_cpu, ran, skip_if_metal
 from tests.native.test_matmul import assert_ran
 from torch_mojo_backend import aten_functions, get_accelerators
 
@@ -1992,6 +1992,34 @@ def test_gather_and_scatter_rank_mismatch_errors(mojo_gpu):
         torch.gather(a, 0, index)
     with pytest.raises(RuntimeError, match="same number of dimensions"):
         a.scatter_add(0, index, torch.zeros(2, 5, device=mojo_gpu))
+
+
+# An out-of-range dim is maybe_wrap_dim's IndexError, as on CPU.
+_DIM_ERRORS = {
+    "split_with_sizes_copy.out": lambda to: torch.ops.aten.split_with_sizes_copy.out(
+        to(torch.randn(2, 3)),
+        [1, 1],
+        5,
+        out=[to(torch.empty(1, 3)), to(torch.empty(1, 3))],
+    ),
+    "gather": lambda to: torch.gather(
+        to(torch.randn(2, 3)), 5, to(torch.tensor([[0, 1]]))
+    ),
+    "index_select": lambda to: torch.index_select(
+        to(torch.randn(2, 3)), 5, to(torch.tensor([0, 1]))
+    ),
+    "index_select.out": lambda to: torch.index_select(
+        to(torch.randn(2, 3)), 5, to(torch.tensor([0, 1])), out=to(torch.empty(2, 3))
+    ),
+    "index_add": lambda to: torch.index_add(
+        to(torch.randn(2, 3)), 5, to(torch.tensor([0, 1])), to(torch.randn(2, 3))
+    ),
+}
+
+
+@pytest.mark.parametrize("op", list(_DIM_ERRORS))
+def test_dim_out_of_range_is_index_error(mojo_gpu, op):
+    assert_dim_error_like_cpu(_DIM_ERRORS[op], mojo_gpu)
 
 
 @pytest.mark.parametrize("idx_dtype", [torch.int64, torch.int32])

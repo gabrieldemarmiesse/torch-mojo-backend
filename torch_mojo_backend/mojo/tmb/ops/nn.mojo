@@ -78,6 +78,7 @@ from tmb.ops.common import (
     sizes_str,
     is_f32_f16_bf16,
     scalar_type_name,
+    wrap_dim,
 )
 from tmb.backend.registry import Site, impl
 
@@ -675,19 +676,7 @@ def op_masked_softmax_backward(
     var rank = o.t.rank
     var dim = rank - 1
     if not v_is_none(args[unsafe_offset=3]):
-        dim = v_int(args[unsafe_offset=3])
-        if dim < -rank or dim >= rank:
-            raise Error(
-                "Dimension out of range (expected to be in range of [",
-                -rank,
-                ", ",
-                rank - 1,
-                "], but got ",
-                dim,
-                ")",
-            )
-        if dim < 0:
-            dim += rank
+        dim = wrap_dim(v_int(args[unsafe_offset=3]), rank)
     if dim < 0 or dim >= g.t.rank:
         raise Error("dim must be non-negative and less than input dimensions")
     if not g.t.same_shape(m.t):
