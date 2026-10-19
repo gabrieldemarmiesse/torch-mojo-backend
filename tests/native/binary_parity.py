@@ -261,14 +261,33 @@ def scalar_cases(
     reverse: Sequence[object] = (),
     zero_dim: bool = True,
 ) -> list[tuple[str, Callable[..., object], Sequence[object]]]:
-    """Tensor-with-number cases: `fn(t, s)`, the 0-d CPU tensor `torch.tensor(s)`
-    in its place, the in-place method, and `fn(s, t)` for `reverse`."""
+    """Tensor-with-number cases: `fn(t, s)`; the 0-d CPU tensor
+    `torch.tensor(s)` in its place (a CPU scalar to CUDA's kernels, built
+    inside the call: `assert_bitwise_equal` moves its tensor arguments to the
+    device) and a 0-d device tensor (an ordinary operand); the in-place
+    method; and `fn(s, t)` with the same three forms for `reverse`.
+
+    A NaN `s` skips the 0-d device form for float64 / complex128 tensors:
+    that is two tensor NaNs (`two_distinct_nans`)."""
     a, b = pairs(dtype)
+    wide = dtype in (torch.float64, torch.complex128)
     cases: list[tuple[str, Callable[..., object], Sequence[object]]] = []
+
+    def device_ok(s: object) -> bool:
+        return not (wide and isinstance(s, (float, complex)) and s != s)
+
     for s in scalars:
         cases.append((f"ts={s!r}", lambda x, s=s: fn(x, s), (a,)))
         if zero_dim:
-            cases.append((f"t0d={s!r}", fn, (a, torch.tensor(s))))
+            cases.append((f"t0d={s!r}", lambda x, s=s: fn(x, torch.tensor(s)), (a,)))
+            if device_ok(s):
+                cases.append(
+                    (
+                        f"tdev0d={s!r}",
+                        lambda x, s=s: fn(x, torch.tensor(s, device=x.device)),
+                        (a,),
+                    )
+                )
         if inplace is not None:
             cases.append(
                 (f"inplace_s={s!r}", lambda x, s=s: getattr(x, inplace)(s), (a,))
@@ -276,5 +295,13 @@ def scalar_cases(
     for s in reverse:
         cases.append((f"st={s!r}", lambda y, s=s: fn(s, y), (b,)))
         if zero_dim:
-            cases.append((f"0dt={s!r}", fn, (torch.tensor(s), b)))
+            cases.append((f"0dt={s!r}", lambda y, s=s: fn(torch.tensor(s), y), (b,)))
+            if device_ok(s):
+                cases.append(
+                    (
+                        f"dev0dt={s!r}",
+                        lambda y, s=s: fn(torch.tensor(s, device=y.device), y),
+                        (b,),
+                    )
+                )
     return cases
