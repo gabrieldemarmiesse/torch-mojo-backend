@@ -290,7 +290,7 @@ def overlap_status(a: T, b: T) -> Int:
     non-overlapping-and-dense (a broadcast, a strided view such as `x[::2]`)
     is TOO_HARD; different storages are NO; otherwise the dense byte ranges
     decide FULL / PARTIAL / NO."""
-    if a.impl() == b.impl():
+    if a.h == b.h or a.impl() == b.impl():
         return OVERLAP_FULL
     if a.numel == 0 or b.numel == 0:
         return OVERLAP_NO

@@ -73,7 +73,10 @@ from tmb.backend.abi import (
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall, loader
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.binary import Res, _b_no_partial_overlap, _b_tside
+from tmb.ops.binary import (
+    Res,
+    _b_tside,
+)
 from tmb.ops.common import (
     assert_no_internal_overlap,
     assert_no_overlap,
@@ -96,6 +99,7 @@ from tmb.ops.common import (
     scalar_to_float,
     scalar_to_int,
     shares_storage,
+    assert_no_partial_overlap,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.pointwise import _none_side, _p, _pw_run
@@ -1760,7 +1764,7 @@ def _self_partial_overlap(dest: T, self: T, dims: List[Int]) raises:
         if dims[i] > 1 and (d < 0 or self.dim(d) == 1):
             return
     if _has_dims(dest, dims):
-        _b_no_partial_overlap(dest, self)
+        assert_no_partial_overlap(dest, self)
         return
     var resized = dest.copy()
     resized.rank = r
@@ -1768,7 +1772,7 @@ def _self_partial_overlap(dest: T, self: T, dims: List[Int]) raises:
     resized.strides = contiguous_strides(resized.shape, r)
     resized.numel = _prod(dims)
     resized.contig = True
-    _b_no_partial_overlap(resized, self)
+    assert_no_partial_overlap(resized, self)
 
 
 def _dest_overlap(dest: Optional[T], dims: List[Int]) raises:

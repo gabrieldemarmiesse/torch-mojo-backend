@@ -118,7 +118,6 @@ from tmb.ops.binary import (
     _b_inplace_operand,
     _b_no_overlap_side,
     _b_out_guard3,
-    _b_no_partial_overlap,
     _b_ret,
     _b_self,
     _b_shape_list,
@@ -1005,8 +1004,8 @@ def op_frexp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if expo.stype != ST_INT32:
         raise Error("torch.frexp() expects exponent to have int dtype")
     # TensorIterator's meta: an output that partially overlaps self raises.
-    _b_no_partial_overlap(mant, self)
-    _b_no_partial_overlap(expo, self)
+    assert_no_partial_overlap(mant, self)
+    assert_no_partial_overlap(expo, self)
     var r = _pw_frexp(self)
     _pw_store_slot(rets, 0, mant, r[0].copy())
     _pw_store_slot(rets, 1, expo, r[1].copy())
@@ -2219,8 +2218,8 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
             resize_out(gi, self.shape, self.rank)
         # TensorIterator's at::assert_no_partial_overlap against both inputs
         # (`self=base[:8], grad_input=base[1:]` raises, as on CUDA).
-        _b_no_partial_overlap(gi, self)
-        _b_no_partial_overlap(gi, grad)
+        assert_no_partial_overlap(gi, self)
+        assert_no_partial_overlap(gi, grad)
     var held = own(gi.copy())
     held.live = fresh  # a caller's grad_input is not ours to release
     var gi_a = own(_glu_half(gi, d, False))
@@ -3615,7 +3614,7 @@ def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
         var d = v_tensor(out_v.value())
         var w = weight.value().copy()
         if d.storage_ptr() != 0 and d.storage_ptr() == w.storage_ptr():
-            _b_no_partial_overlap(d, w)
+            assert_no_partial_overlap(d, w)
             weight_is_out = _pw_same_view(d, w)
             if weight_is_out and reduction != REDUCTION_NONE:
                 unsupported(
@@ -3721,7 +3720,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
         if weight:
             # `grad_input.mul_(weight)`: its in-place meta refuses a weight
             # partially overlapping grad_input.
-            _b_no_partial_overlap(dest.value(), weight.value())
+            assert_no_partial_overlap(dest.value(), weight.value())
     # grad_input that IS the weight: ATen's `mul_(weight)` then reads the
     # gradient it just wrote there (grad^2).
     var weight_is_out = False

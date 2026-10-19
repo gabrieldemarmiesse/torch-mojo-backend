@@ -91,6 +91,7 @@ from tmb.ops.common import (
     scalar_embed,
     scalar_to_float,
     scalar_to_int,
+    one_device,
 )
 from tmb.ops.f8_iter import (
     f8_iter,
@@ -206,19 +207,6 @@ def _ensure_out_shape(
 # ---------------------------------------------------------------------------
 
 
-def _one_device(a: T, b: T) raises:
-    """Both operands of a raw-pointer launch on the same mojo device.
-
-    A kernel gets bare pointers and one stream: a pointer belonging to
-    another device -- or to no mojo device at all -- would be dereferenced
-    against the wrong context. The fields are cached on `T`, so this costs
-    nothing. Private to this file until the port is merged; it belongs in
-    tmb/ops/common.mojo.
-    """
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
-        raise Error("expected every operand on the same mojo device")
-
-
 def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
     if is_float8(a.dtype) or is_float8(b.dtype):
         # CUDA's compare_eq_ne_kernel takes AT_FLOAT8_TYPES (it compares the
@@ -237,8 +225,8 @@ def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
         _ = fa^
         _ = fb^
         return
-    _one_device(a, dst)
-    _one_device(b, dst)
+    one_device(a, dst)
+    one_device(b, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("logic", String(op))
@@ -693,8 +681,8 @@ def _isin_validate(el: T, te: T) raises -> Int32:
 
 
 def _isin_launch(el: T, te: T, invert: Bool, dst: T) raises:
-    _one_device(el, dst)
-    _one_device(te, dst)
+    one_device(el, dst)
+    one_device(te, dst)
     var elc = contiguous(el)
     var tec = contiguous(te)
     var ctx = ctx_for(el.device)
@@ -989,9 +977,9 @@ def _where_select(
 ) raises:
     """dst[i] = cond[i] ? a[i] : b[i], for rank<=4 operands (each stride
     array already the correct broadcast strides against dst's shape)."""
-    _one_device(cond, dst)
-    _one_device(a, dst)
-    _one_device(b, dst)
+    one_device(cond, dst)
+    one_device(a, dst)
+    one_device(b, dst)
     if dst.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -1112,8 +1100,8 @@ def _masked_fill_scalar_launch(
     """The fast path: `value` is baked into the launch (no separate Fill
     kernel first). Only float32/float16/bfloat16 `self` is wired to this;
     every other dtype goes through `_masked_fill_where` below."""
-    _one_device(mask, dst)
-    _one_device(self_t, dst)
+    one_device(mask, dst)
+    one_device(self_t, dst)
     var mask_s = _bcast_strides(mask, self_t.shape)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)

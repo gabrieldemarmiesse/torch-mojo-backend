@@ -31,7 +31,6 @@ from tmb.backend.abi import (
     default_dtype,
     dtype_code,
     dtype_name,
-    is_dense,
     max_dtype,
     new_like,
     new_tensor,
@@ -64,6 +63,7 @@ from tmb.ops.common import (
     resize_out,
     same_view,
     shares_storage,
+    assert_no_partial_overlap,
 )
 from tmb.ops.f8_iter import (
     f8_iter,
@@ -238,48 +238,6 @@ def _require_bool_spec(op: String, dt: DType) raises:
 # ---------------------------------------------------------------------------
 
 
-def _dense_enough(t: T) -> Bool:
-    """`TensorImpl::is_non_overlapping_and_dense` (see binary.mojo's
-    `_b_dense_enough`): any other view is `TooHard` for ATen's check."""
-    return t.contig or is_dense(t.shape, t.strides, t.rank)
-
-
-def _no_partial_overlap(written: T, other: T) raises:
-    """`at::assert_no_partial_overlap`: an `out=` that shares storage with
-    the input without being the same view of it is a read/write race
-    (`torch.neg(x[:-1], out=x[1:])`). The identical view is fine -- that is
-    how the in-place variants reuse this path. Private to this file until the
-    port is merged; ops_binary.mojo has the same helper and both belong in
-    tmb/ops/common.mojo.
-    """
-    if written.h == other.h or written.numel == 0 or other.numel == 0:
-        return
-    var storage = written.storage_ptr()
-    if storage == 0 or storage != other.storage_ptr():
-        return
-    if not _dense_enough(written) or not _dense_enough(other):
-        return
-    var a_begin = written.ptr
-    var a_end = a_begin + written.numel * written.itemsize
-    var b_begin = other.ptr
-    var b_end = b_begin + other.numel * other.itemsize
-    if a_begin == b_begin and a_end == b_end:
-        if written.rank == other.rank:
-            var same = True
-            for i in range(written.rank):
-                if written.stride(i) != other.stride(i):
-                    same = False
-            if same:
-                return
-    elif not (a_begin < b_end and b_begin < a_end):
-        return
-    raise Error(
-        "unsupported operation: some elements of the input tensor and the"
-        " written-to tensor refer to a single memory location. Please clone()"
-        " the tensor before performing the operation."
-    )
-
-
 def _unary_direct(
     family: String, op: String, src_c: T, mut dst: T, out_dtype: DType
 ) raises:
@@ -308,7 +266,7 @@ def _out_prologue(t_in: T, mut dst: T, result_stype: Int32) raises:
     shaped `out` keeps its own strides and storage offset)."""
     one_device(t_in, dst)
     assert_no_internal_overlap(dst)
-    _no_partial_overlap(dst, t_in)
+    assert_no_partial_overlap(dst, t_in)
     if dst.stype != result_stype:
         # TensorIterator's check_dtype wording (stock CUDA, every dtype).
         raise Error(
@@ -351,7 +309,7 @@ def _unary_out(
     ):
         one_device(t_in, dst)
         assert_no_internal_overlap(dst)
-        _no_partial_overlap(dst, t_in)
+        assert_no_partial_overlap(dst, t_in)
         if not dst.same_shape(t_in):
             resize_out(dst, t_in.shape, t_in.rank)
         var result = own(_unary(family, op, t_in, out_dtype))
@@ -1629,7 +1587,7 @@ def _param_unary_out(
             )
         one_device(t_in, dst)
         assert_no_internal_overlap(dst)
-        _no_partial_overlap(dst, t_in)
+        assert_no_partial_overlap(dst, t_in)
         if not dst.same_shape(t_in):
             resize_out(dst, t_in.shape, t_in.rank)
         var result = own(_param_unary(op, t_in, p0, p1, p2))

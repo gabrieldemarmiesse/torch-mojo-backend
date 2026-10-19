@@ -732,7 +732,9 @@ def _bernoulli_tensor_into(t: T, p_in: T, generator: Int) raises:
     # separately from the strides the kernel reads with.
     var p_stype = ST_FLOAT64 if t.dtype == DType.float64 else ST_FLOAT32
     var p = own_if_new(cast_to(p_in, p_stype), p_in)
-    var p_keeps_layout = p_in.stype == p_stype or _is_dense(p_in)
+    var p_keeps_layout = p_in.stype == p_stype or is_dense(
+        p_in.shape, p_in.strides, p_in.rank
+    )
     if p_in.rank > t.rank:
         raise Error("bernoulli_: p has more dimensions than self")
     # CUDA_tensor_apply2 computes into a contiguous temporary when self may
@@ -1041,39 +1043,6 @@ def op_random_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def _is_dense(t: T) -> Bool:
-    """is_non_overlapping_and_dense."""
-    var r = t.rank
-    var perm = IndexList[MAX_RANK](0)
-    for i in range(r):
-        perm[i] = i
-    # dims of size >= 2 sorted by stride; size < 2 dims last
-    for i in range(1, r):
-        var j = i
-        while j > 0:
-            var a = perm[j - 1]
-            var b = perm[j]
-            var swap = False
-            if t.dim(a) < 2:
-                swap = t.dim(b) >= 2
-            elif t.dim(b) >= 2:
-                swap = t.stride(a) > t.stride(b)
-            if not swap:
-                break
-            perm[j - 1] = b
-            perm[j] = a
-            j -= 1
-    var require = 1
-    for i in range(r):
-        var d = perm[i]
-        if t.dim(d) < 2:
-            return True
-        if t.stride(d) != require:
-            return False
-        require *= t.dim(d)
-    return True
-
-
 def _maybe_overlapping(t: T) -> Bool:
     """cuda::detail::maybeOverlappingIndices: size>1 dims sorted by stride
     must each end before the next one starts."""
@@ -1216,7 +1185,7 @@ def _dropout_cuda(
     (output, mask) into rets 0 and 1. The mask is one 0/1 byte per element
     whether it is bool (native_dropout) or uint8 (_fused_dropout)."""
     # empty_like preserves a dense layout; anything else comes out contiguous.
-    var dense = _is_dense(a)
+    var dense = is_dense(a.shape, a.strides, a.rank)
     var output = own(
         new_strided(a.shape, a.strides, a.rank, a.stype, a.device)
     ) if dense else own(new_like(a))

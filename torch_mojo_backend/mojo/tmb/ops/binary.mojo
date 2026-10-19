@@ -94,6 +94,8 @@ from tmb.ops.common import (
     scalar_to_float,
     scalar_to_int,
     sub_check,
+    assert_no_partial_overlap,
+    one_device,
 )
 from tmb.ops.core import cast_for_copy
 from tmb.ops.f8_iter import (
@@ -623,23 +625,10 @@ def _b_fits(t: T, shape: IndexList[MAX_RANK]) -> Bool:
 # ---------------------------------------------------------------------------
 
 
-def _one_device(a: T, b: T) raises:
-    """Both operands of a raw-pointer launch on the same mojo device.
-
-    A kernel gets bare pointers and one stream: a pointer belonging to
-    another device -- or to no mojo device at all -- would be dereferenced
-    against the wrong context. The fields are cached on `T`, so this costs
-    nothing. Private to this file until the port is merged; it belongs in
-    tmb/ops/common.mojo.
-    """
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
-        raise Error("expected every operand on the same mojo device")
-
-
 def _b_binary_spec(op: StaticString, a: T, b: T, dst: T) raises:
     """logic broadcast binary into a caller-allocated contiguous output."""
-    _one_device(a, dst)
-    _one_device(b, dst)
+    one_device(a, dst)
+    one_device(b, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("logic", String(op))
@@ -655,7 +644,7 @@ def _b_binary_spec(op: StaticString, a: T, b: T, dst: T) raises:
 
 def _b_scalar_spec(op: StaticString, a: T, value: Float64, dst: T) raises:
     """elementwise contiguous tensor-with-float-scalar."""
-    _one_device(a, dst)
+    one_device(a, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("elementwise", String(op))
@@ -670,7 +659,7 @@ def _b_scalar_spec(op: StaticString, a: T, value: Float64, dst: T) raises:
 
 def _b_int_scalar_spec(op: StaticString, a: T, value: Int, dst: T) raises:
     """elementwise contiguous tensor-with-int-scalar."""
-    _one_device(a, dst)
+    one_device(a, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("elementwise", String(op))
@@ -700,8 +689,8 @@ def _b_raw_add(dst: T, a: T, b: T) raises:
     """elementwise `Add`: contiguous, equal shapes, one dtype. `dst` may
     be `a` — that is the in-place route, and the kernel is a flat elementwise
     loop, so aliasing the destination with an operand is exact."""
-    _one_device(a, dst)
-    _one_device(b, dst)
+    one_device(a, dst)
+    one_device(b, dst)
     if a.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -808,7 +797,7 @@ def _b_write_safe(dest: T, other: T) -> Bool:
     with `dest`. Both are contiguous on this path, so `numel * itemsize` is
     their exact span.
 
-    Weaker than `_b_no_partial_overlap`, which also passes non-dense views it
+    Weaker than `assert_no_partial_overlap`, which also passes non-dense views it
     cannot judge; those return False here and take the cascade, where that
     function decides.
     """
@@ -1416,56 +1405,9 @@ def _b_device_of(lhs: Side, rhs: Side) raises -> Int:
     return 0
 
 
-def _b_dense_enough(t: T) -> Bool:
-    """`TensorImpl::is_non_overlapping_and_dense`: only then is the view's
-    memory exactly `[ptr, ptr + numel * itemsize)`. Anything else -- a
-    broadcast (stride 0) or a strided view such as `x[::2]` -- is what
-    ATen's overlap check calls `TooHard` and lets through, so disjoint
-    interleaved views (`x[::2] >>= x[1::2]`) are accepted as in torch."""
-    return t.contig or is_dense(t.shape, t.strides, t.rank)
-
-
-def _b_no_partial_overlap(written: T, other: T) raises:
-    """`at::assert_no_partial_overlap` (c10/core/MemOverlap.cpp).
-
-    An in-place or `out=` op whose input shares storage with the tensor being
-    written, WITHOUT being the same view of it, is a read/write race: the
-    kernel reads and writes the same bytes from different threads in an order
-    nothing fixes. `x[1:].add_(x[:-1])` is the canonical case. The same view
-    (identical span AND identical strides) is fine -- element i is written
-    from element i -- and that is how `x.add_(x)` works.
-    """
-    if written.h == other.h or written.numel == 0 or other.numel == 0:
-        return
-    var storage = written.storage_ptr()
-    if storage == 0 or storage != other.storage_ptr():
-        return
-    if not _b_dense_enough(written) or not _b_dense_enough(other):
-        return
-    var a_begin = written.ptr
-    var a_end = a_begin + written.numel * written.itemsize
-    var b_begin = other.ptr
-    var b_end = b_begin + other.numel * other.itemsize
-    if a_begin == b_begin and a_end == b_end:
-        if written.rank == other.rank:
-            var same = True
-            for i in range(written.rank):
-                if written.stride(i) != other.stride(i):
-                    same = False
-            if same:
-                return
-    elif not (a_begin < b_end and b_begin < a_end):
-        return
-    raise Error(
-        "unsupported operation: some elements of the input tensor and the"
-        " written-to tensor refer to a single memory location. Please clone()"
-        " the tensor before performing the operation."
-    )
-
-
 def _b_no_overlap_side(written: T, side: Side) raises:
     if side.is_t:
-        _b_no_partial_overlap(written, side.t.value())
+        assert_no_partial_overlap(written, side.t.value())
 
 
 def _b_same_tensor(a: T, b: T) -> Bool:
@@ -1534,7 +1476,7 @@ def _b_out_guard3(
         if not side.is_t:
             continue
         var t = side.t.value().copy()
-        _b_no_partial_overlap(dest, t)
+        assert_no_partial_overlap(dest, t)
         if _b_same_tensor(dest, t):
             read_write = True
         rank = max(rank, t.rank)
@@ -3140,9 +3082,9 @@ def _b_addc(
             and a.same_shape(b)
             and a.same_shape(c)
         ):
-            _b_no_partial_overlap(dest, a)
-            _b_no_partial_overlap(dest, b)
-            _b_no_partial_overlap(dest, c)
+            assert_no_partial_overlap(dest, a)
+            assert_no_partial_overlap(dest, b)
+            assert_no_partial_overlap(dest, c)
             if _b_same_tensor(dest, a) and a.dtype == DType.float32:
                 foreach_addc_inplace(
                     dest, b, c, s.f, multiplies=op == "AddcmulBcast"
@@ -3177,7 +3119,7 @@ def _b_inplace_operand(dest: T, other: T) raises:
     if (dest.contig or is_dense(dest.shape, dest.strides, dest.rank)) and (
         other.contig or is_dense(other.shape, other.strides, other.rank)
     ):
-        _b_no_partial_overlap(dest, other)
+        assert_no_partial_overlap(dest, other)
 
 
 def _b_addc_inplace(
@@ -3311,7 +3253,7 @@ def _b_lerp(args: Values, dst: Optional[T] = None) raises -> Res:
             and dest.same_shape(start)
             and start.same_shape(finish)
         ):
-            _b_no_partial_overlap(dest, finish)
+            assert_no_partial_overlap(dest, finish)
             # The single-tensor in-place decomposition reaches Scalar_out.
             # Reuse the foreach multi-tensor apply for one tensor;
             # ADInplaceOrView handles this op's version increment itself.

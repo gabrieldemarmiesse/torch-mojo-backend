@@ -73,6 +73,7 @@ from tmb.ops.common import (
     is_channels_last_layout,
     resize_out,
     store_out,
+    one_device,
 )
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
@@ -202,21 +203,8 @@ def _stat_shape(t: T, k: Int) -> IndexList[MAX_RANK]:
 # ---------------------------------------------------------------------------
 
 
-def _one_device(a: T, b: T) raises:
-    """Both operands of a raw-pointer launch on the same mojo device.
-
-    A kernel gets bare pointers and one stream: a pointer belonging to
-    another device -- or to no mojo device at all -- would be dereferenced
-    against the wrong context. The fields are cached on `T`, so this costs
-    nothing. Private to this file until the port is merged; it belongs in
-    tmb/ops/common.mojo.
-    """
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
-        raise Error("expected every operand on the same mojo device")
-
-
 def _spec_unary(family: String, op: String, src: T, dst: T) raises:
-    _one_device(src, dst)
+    one_device(src, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall(family, op)
@@ -236,7 +224,7 @@ def _softmax_launch(
     if op != "SoftmaxF64Spec":
         _spec_unary(family, op, src, dst)
         return
-    _one_device(src, dst)
+    one_device(src, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall(family, op)
@@ -357,8 +345,8 @@ def op_log_softmax(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _lsm_backward(dst: T, grad: T, output: T, rows: Int, cols: Int) raises:
-    _one_device(grad, dst)
-    _one_device(output, dst)
+    one_device(grad, dst)
+    one_device(output, dst)
     var ctx = ctx_for(dst.device)
     var call = KernelCall("softmax_backward", "LogSoftmaxBackwardData")
     call.arg_dtype(0, grad.dtype)
