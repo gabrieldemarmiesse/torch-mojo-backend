@@ -321,8 +321,9 @@ class CudaOracle:
         device first, one copy per distinct tensor object (passing `x` twice
         aliases the two; a view arrives as a dense copy that aliases nothing,
         so build strided or overlapping operands inside `fn`). The inputs are
-        compared after the call too, raised or not, which covers in-place ops
-        and `out=`."""
+        compared after the call too, raised or not (after a raise, a tensor
+        resized by the call by its shape only), which covers in-place ops and
+        `out=`."""
         flat_inputs = [
             t for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor)
         ]
@@ -338,7 +339,20 @@ class CudaOracle:
                 return copies[id(v)]
 
             moved = tree_map(copy, (args, kwargs or {}))
+            before = {id(t): (t.shape, t.data_ptr()) for t in copies.values()}
             out = _call(lambda _: fn(*moved[0], **moved[1]), device)
+            if isinstance(out, Raised):
+                # an out= resized before the raise holds uninitialized
+                # memory: its shape only
+                moved = tree_map(
+                    lambda v: (
+                        tuple(v.shape)
+                        if isinstance(v, torch.Tensor)
+                        and before[id(v)] != (v.shape, v.data_ptr())
+                        else v
+                    ),
+                    moved,
+                )
             return {"result": out, "inputs_after": moved}
 
         self.assert_bitwise_equal_by_device(

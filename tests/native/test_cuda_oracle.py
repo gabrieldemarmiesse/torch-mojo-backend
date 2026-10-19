@@ -102,8 +102,25 @@ def test_round_trip_on_both_devices(cuda_oracle: CudaOracle):
 
 def test_inputs_alias_and_errors_keep_state(cuda_oracle: CudaOracle):
     x = torch.arange(4.0)
-    # one tensor passed twice is one tensor on each device
-    cuda_oracle.assert_bitwise_equal(lambda a, b: a.add_(1) is b, x, x)
+    # one tensor passed twice is one tensor on each device, a fresh copy
+    # even when it already lives there
+    seen = []
+
+    def same(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        seen.append(a is b)
+        return a.add_(1)
+
+    on_mojo = x.to(cuda_oracle.mojo)
+    cuda_oracle.assert_bitwise_equal(same, on_mojo, on_mojo)
+    assert seen == [True, True]
+    assert torch.equal(on_mojo.cpu(), x)
+
+    # a raise after an out= resize compares the out's shape, not its bytes
+    cuda_oracle.assert_bitwise_equal(
+        lambda a, out: torch.neg(a, out=out),
+        torch.ones(64).to(torch.float8_e4m3fn),
+        kwargs={"out": torch.empty(0, dtype=torch.float8_e4m3fn)},
+    )
 
     # both raise, but only the mojo side wrote its input first
     def wrote(t: torch.Tensor):
