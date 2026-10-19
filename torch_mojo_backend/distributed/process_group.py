@@ -833,12 +833,7 @@ class MojoProcessGroup(dist.ProcessGroup):
         vendor = nccl.vendor_name()
         name = "mojoccl" if nccl.uses_mojoccl() else vendor
         self._fr_lib = ("rccl" if vendor == "rccl" else "nccl", version)
-        if os.environ.get("TORCH_MOJO_BACKEND_TRACE", "1") != "0":
-            print(
-                f"[TRACE] collectives via {self._path} ({name} version {version})",
-                file=sys.stderr,
-                flush=True,
-            )
+        native._trace(f"collectives via {self._path} ({name} version {version})")
         self._start_watchdog()
 
     def _start_watchdog(self):

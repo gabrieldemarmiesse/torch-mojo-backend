@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Generic, TypeVar
 
 import torch
 
+from torch_mojo_backend import _cuda_driver
 from torch_mojo_backend.native import device_module
 
 if TYPE_CHECKING:
@@ -45,8 +46,6 @@ if TYPE_CHECKING:
     from triton.backends.driver import DriverBase, GPUDriver
     from triton.backends.nvidia.driver import CudaUtils
 
-_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
-_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
 _DRIVER_MODULE = "triton.runtime.driver"
 
 _Previous = TypeVar("_Previous")
@@ -67,28 +66,14 @@ def accelerator_api() -> str:
 
 
 @functools.cache
-def _libcuda() -> ctypes.CDLL:
-    cuda = ctypes.CDLL("libcuda.so.1")
-    cuda.cuInit(0)
-    return cuda
-
-
-@functools.cache
 def _device_capability(device: int) -> tuple[int, int]:
     """(major, minor) straight from the CUDA driver API, like Triton's own
     torch-free path; independent of the torch build and Triton version."""
-    cuda = _libcuda()
-    handle = ctypes.c_int()
-    if cuda.cuDeviceGet(ctypes.byref(handle), device) != 0:
-        raise RuntimeError(f"cuDeviceGet({device}) failed")
-    major, minor = ctypes.c_int(), ctypes.c_int()
-    cuda.cuDeviceGetAttribute(
-        ctypes.byref(major), _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, handle
+    handle = _cuda_driver.device(device)
+    return (
+        _cuda_driver.attribute(handle, _cuda_driver.COMPUTE_CAPABILITY_MAJOR),
+        _cuda_driver.attribute(handle, _cuda_driver.COMPUTE_CAPABILITY_MINOR),
     )
-    cuda.cuDeviceGetAttribute(
-        ctypes.byref(minor), _CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, handle
-    )
-    return (major.value, minor.value)
 
 
 @functools.cache
@@ -99,7 +84,12 @@ def _stream_context(stream: int) -> ctypes.c_void_p:
     Cached on the handle -- a mojo stream keeps its vendor handle for life,
     the assumption `cuda_interop._external_stream` already makes."""
     ctx = ctypes.c_void_p()
-    if _libcuda().cuStreamGetCtx(ctypes.c_void_p(stream), ctypes.byref(ctx)) != 0:
+    if (
+        _cuda_driver.libcuda().cuStreamGetCtx(
+            ctypes.c_void_p(stream), ctypes.byref(ctx)
+        )
+        != 0
+    ):
         raise RuntimeError("cuStreamGetCtx failed for the mojo stream")
     return ctx
 
@@ -111,7 +101,7 @@ def _push_stream_context(stream: int) -> ctypes.c_void_p | None:
     HIP streams are not bound to a context, so this is CUDA only."""
     if stream == 0 or accelerator_api() != "cuda":
         return None
-    cuda = _libcuda()
+    cuda = _cuda_driver.libcuda()
     wanted = _stream_context(stream)
     previous = ctypes.c_void_p()
     if cuda.cuCtxGetCurrent(ctypes.byref(previous)) != 0:
@@ -134,7 +124,7 @@ def _pop_context(previous: ctypes.c_void_p | None):
     """Undo a `_push_*_context`. A NULL `previous` is the "no context current"
     state, and is restored as faithfully as any other."""
     if previous is not None:
-        _libcuda().cuCtxSetCurrent(previous)
+        _cuda_driver.libcuda().cuCtxSetCurrent(previous)
 
 
 @functools.cache

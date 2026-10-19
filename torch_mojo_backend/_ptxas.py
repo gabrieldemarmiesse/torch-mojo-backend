@@ -21,6 +21,8 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
+from torch_mojo_backend import _cuda_driver
+
 ENV_VAR = "MODULAR_NVPTX_COMPILER_PATH"
 TRITON_ENV_VAR = "TRITON_PTXAS_PATH"
 CHECK_ENV_VAR = "TORCH_MOJO_BACKEND_PTXAS_CHECK"
@@ -448,16 +450,13 @@ def device_arches() -> tuple[tuple[int, str], ...]:
         if lib.cuDeviceGet(ctypes.byref(device), index) != 0:
             continue
         major, minor = ctypes.c_int(), ctypes.c_int()
-        # 75 and 76 are CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_{MAJOR,MINOR}
-        if lib.cuDeviceGetAttribute(ctypes.byref(major), 75, device) != 0:
+        cc_major = _cuda_driver.COMPUTE_CAPABILITY_MAJOR
+        cc_minor = _cuda_driver.COMPUTE_CAPABILITY_MINOR
+        if lib.cuDeviceGetAttribute(ctypes.byref(major), cc_major, device) != 0:
             continue
-        if lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, device) != 0:
+        if lib.cuDeviceGetAttribute(ctypes.byref(minor), cc_minor, device) != 0:
             continue
-        name = ctypes.create_string_buffer(256)
-        lib.cuDeviceGetName(name, 256, device)
-        found.append(
-            (major.value * 10 + minor.value, name.value.decode(errors="replace"))
-        )
+        found.append((major.value * 10 + minor.value, _cuda_driver.name(device, lib)))
     _arches = tuple(found)
     return _arches
 
