@@ -7,7 +7,6 @@ public API only; `CallChecker` (or `native.op_count` for the ops with no
 `aten_functions` twin) asserts the native op actually ran.
 """
 
-import contextlib
 import functools
 import itertools
 import json
@@ -22,21 +21,12 @@ import torch
 from tests.native.conftest import (
     flush_subnormals_on_metal,
     is_metal,
+    ran,
     require_stock_cuda,
+    skip_float64_on_metal,
     skip_if_metal,
 )
-from torch_mojo_backend import aten_functions, get_accelerators, native
-
-
-@contextlib.contextmanager
-def native_ran(*op_names: str):
-    """Assert at least one of `op_names` ran as a native boxed kernel."""
-    native.op_counting(True)
-    before = {name: native.op_count(name) for name in op_names}
-    yield
-    assert any(native.op_count(name) > before[name] for name in op_names), (
-        f"none of {op_names} ran natively"
-    )
+from torch_mojo_backend import aten_functions, native
 
 
 def _both(shape, dtype, device, *, low=1, high=9):
@@ -73,11 +63,11 @@ def test_div_float(mojo_device, call_checker):
 def test_div_int_promotes_to_float(mojo_device):
     a_cpu, a = _both((6,), torch.int64, mojo_device)
     b_cpu, b = _both((6,), torch.int64, mojo_device)
-    with native_ran("aten::div.Tensor"):
+    with ran("aten::div.Tensor"):
         out = a / b
     assert out.dtype == torch.float32
     torch.testing.assert_close(out.cpu(), a_cpu / b_cpu)
-    with native_ran("aten::div.Tensor"):
+    with ran("aten::div.Tensor"):
         out_scalar = a / 2
     torch.testing.assert_close(out_scalar.cpu(), a_cpu / 2)
 
@@ -90,7 +80,7 @@ def test_div_int_by_float_takes_the_denominator_dtype(mojo_gpu, denominator_dtyp
     true division promotes to a float, but to the RIGHT float."""
     a_cpu, a = _both((6,), torch.int64, mojo_gpu)
     b_cpu, b = _both((6,), denominator_dtype, mojo_gpu)
-    with native_ran("aten::div.Tensor"):
+    with ran("aten::div.Tensor"):
         out = a / b
     assert out.dtype == torch.result_type(a_cpu, b_cpu) == denominator_dtype
     torch.testing.assert_close(out.cpu(), a_cpu / b_cpu, atol=1e-2, rtol=1e-2)
@@ -98,7 +88,7 @@ def test_div_int_by_float_takes_the_denominator_dtype(mojo_gpu, denominator_dtyp
 
 def test_div_int_by_float_scalar_uses_the_default_dtype(mojo_gpu):
     a_cpu, a = _both((6,), torch.int32, mojo_gpu)
-    with native_ran("aten::div.Tensor"):
+    with ran("aten::div.Tensor"):
         out = a / 2.5
     assert out.dtype == torch.get_default_dtype()
     torch.testing.assert_close(out.cpu(), a_cpu / 2.5)
@@ -469,7 +459,7 @@ def test_scalar_operands(mojo_device):
     """`x + 2` reaches the backend as add.Tensor with a wrapped 0-d CPU
     tensor; the scalar routes have to recognise it."""
     a_cpu, a = _both((5,), torch.float32, mojo_device)
-    with native_ran("aten::add.Tensor"):
+    with ran("aten::add.Tensor"):
         torch.testing.assert_close((a + 2).cpu(), a_cpu + 2)
     torch.testing.assert_close((2 + a).cpu(), 2 + a_cpu)
     torch.testing.assert_close((a * 1.5).cpu(), a_cpu * 1.5)
@@ -480,7 +470,7 @@ def test_scalar_operands(mojo_device):
 
 def test_int_scalar_operands(mojo_device):
     a_cpu, a = _both((5,), torch.int64, mojo_device)
-    with native_ran("aten::add.Tensor"):
+    with ran("aten::add.Tensor"):
         torch.testing.assert_close((a + 3).cpu(), a_cpu + 3)
     torch.testing.assert_close((a * 3).cpu(), a_cpu * 3)
     torch.testing.assert_close((a - 3).cpu(), a_cpu - 3)
@@ -489,7 +479,7 @@ def test_int_scalar_operands(mojo_device):
 def test_broadcasting(mojo_device):
     a_cpu, a = _both((3, 1, 5), torch.float32, mojo_device)
     b_cpu, b = _both((4, 5), torch.float32, mojo_device)
-    with native_ran("aten::mul.Tensor"):
+    with ran("aten::mul.Tensor"):
         out = a * b
     assert tuple(out.shape) == (3, 4, 5)
     torch.testing.assert_close(out.cpu(), a_cpu * b_cpu)
@@ -498,7 +488,7 @@ def test_broadcasting(mojo_device):
 def test_strided_operands(mojo_device):
     a_cpu, a = _both((4, 6), torch.float32, mojo_device)
     b_cpu, b = _both((6, 4), torch.float32, mojo_device)
-    with native_ran("aten::add.Tensor"):
+    with ran("aten::add.Tensor"):
         out = a + b.t()
     torch.testing.assert_close(out.cpu(), a_cpu + b_cpu.t())
 
@@ -507,7 +497,7 @@ def test_rank5_equal_shapes(mojo_device):
     """Above rank 4 the kernel takes a flat pass: equal shapes, contiguous."""
     a_cpu, a = _both((2, 2, 2, 2, 3), torch.float32, mojo_device)
     b_cpu, b = _both((2, 2, 2, 2, 3), torch.float32, mojo_device)
-    with native_ran("aten::mul.Tensor"):
+    with ran("aten::mul.Tensor"):
         out = a * b
     torch.testing.assert_close(out.cpu(), a_cpu * b_cpu)
 
@@ -515,7 +505,7 @@ def test_rank5_equal_shapes(mojo_device):
 def test_mixed_dtype_promotion(mojo_device):
     a_cpu, a = _both((4, 4), torch.float32, mojo_device)
     b_cpu, b = _both((4, 4), torch.bfloat16, mojo_device)
-    with native_ran("aten::add.Tensor"):
+    with ran("aten::add.Tensor"):
         out = a + b
     assert out.dtype == torch.float32
     torch.testing.assert_close(out.cpu(), a_cpu + b_cpu)
@@ -563,15 +553,15 @@ def test_shape_mismatch_raises(mojo_device):
 def test_inplace_tensor(mojo_device):
     a_cpu, a = _both((4, 5), torch.float32, mojo_device)
     b_cpu, b = _both((4, 5), torch.float32, mojo_device)
-    with native_ran("aten::add_.Tensor"):
+    with ran("aten::add_.Tensor"):
         a.add_(b)
     a_cpu.add_(b_cpu)
     torch.testing.assert_close(a.cpu(), a_cpu)
-    with native_ran("aten::mul_.Tensor"):
+    with ran("aten::mul_.Tensor"):
         a.mul_(b)
     a_cpu.mul_(b_cpu)
     torch.testing.assert_close(a.cpu(), a_cpu)
-    with native_ran("aten::sub_.Tensor"):
+    with ran("aten::sub_.Tensor"):
         a.sub_(b)
     a_cpu.sub_(b_cpu)
     torch.testing.assert_close(a.cpu(), a_cpu)
@@ -579,7 +569,7 @@ def test_inplace_tensor(mojo_device):
 
 def test_inplace_scalar(mojo_device):
     a_cpu, a = _both((7,), torch.float32, mojo_device)
-    with native_ran("aten::add_.Tensor"):
+    with ran("aten::add_.Tensor"):
         a.add_(1.5)
     a_cpu.add_(1.5)
     torch.testing.assert_close(a.cpu(), a_cpu)
@@ -612,16 +602,16 @@ def test_out_variants(mojo_device):
     a_cpu, a = _both((3, 4), torch.float32, mojo_device)
     b_cpu, b = _both((3, 4), torch.float32, mojo_device)
     dest = torch.empty((3, 4), device=mojo_device)
-    with native_ran("aten::add.out"):
+    with ran("aten::add.out"):
         torch.add(a, b, out=dest)
     torch.testing.assert_close(dest.cpu(), a_cpu + b_cpu)
-    with native_ran("aten::mul.out"):
+    with ran("aten::mul.out"):
         torch.mul(a, b, out=dest)
     torch.testing.assert_close(dest.cpu(), a_cpu * b_cpu)
-    with native_ran("aten::sub.out"):
+    with ran("aten::sub.out"):
         torch.sub(a, b, out=dest)
     torch.testing.assert_close(dest.cpu(), a_cpu - b_cpu)
-    with native_ran("aten::div.out"):
+    with ran("aten::div.out"):
         torch.div(a, b, out=dest)
     torch.testing.assert_close(dest.cpu(), a_cpu / b_cpu)
 
@@ -646,7 +636,7 @@ def test_scalar_mul_out_into_bucket_view(mojo_device, dtype, n, in_offset, out_o
     src_cpu, src = _both((n + 16,), dtype, mojo_device)
     grad_cpu, grad = src_cpu[in_offset : in_offset + n], src[in_offset : in_offset + n]
     bucket = torch.zeros(n + 16, dtype=dtype, device=mojo_device)
-    with native_ran("aten::mul.out"):
+    with ran("aten::mul.out"):
         torch.mul(grad, 1.0 / 16, out=bucket[out_offset : out_offset + n])
     expected = torch.zeros(n + 16, dtype=dtype)
     expected[out_offset : out_offset + n] = grad_cpu * (1.0 / 16)
@@ -658,7 +648,7 @@ def test_scalar_mul_out_aliasing_self(mojo_device, dtype):
     """`torch.mul(x, s, out=x)`: the exact alias the direct-write route must
     accept (a flat elementwise loop reads each element before writing it)."""
     x_cpu, x = _both((16000,), dtype, mojo_device)
-    with native_ran("aten::mul.out"):
+    with ran("aten::mul.out"):
         torch.mul(x, 0.5, out=x)
     torch.testing.assert_close(x.cpu(), x_cpu * 0.5)
 
@@ -921,7 +911,7 @@ def test_div_out_mode(mojo_device):
     a_cpu, a = _both((6,), torch.float32, mojo_device)
     b_cpu, b = _both((6,), torch.float32, mojo_device)
     dest = torch.empty((6,), device=mojo_device)
-    with native_ran("aten::div.out_mode"):
+    with ran("aten::div.out_mode"):
         torch.div(a, b, rounding_mode="floor", out=dest)
     torch.testing.assert_close(
         dest.cpu(), torch.div(a_cpu, b_cpu, rounding_mode="floor")
@@ -938,7 +928,7 @@ def test_div_out_mode(mojo_device):
 def test_div_rounding_modes(mojo_device, mode, dtype):
     a_cpu, a = _both((8,), dtype, mojo_device, low=-9, high=9)
     b_cpu, b = _both((8,), dtype, mojo_device, low=1, high=5)
-    with native_ran("aten::div.Tensor_mode"):
+    with ran("aten::div.Tensor_mode"):
         out = torch.div(a, b, rounding_mode=mode)
     assert out.dtype == dtype
     torch.testing.assert_close(out.cpu(), torch.div(a_cpu, b_cpu, rounding_mode=mode))
@@ -947,10 +937,10 @@ def test_div_rounding_modes(mojo_device, mode, dtype):
 def test_floor_divide(mojo_device):
     a_cpu, a = _both((8,), torch.int64, mojo_device, low=-9, high=9)
     b_cpu, b = _both((8,), torch.int64, mojo_device, low=1, high=5)
-    with native_ran("aten::floor_divide"):
+    with ran("aten::floor_divide"):
         out = a // b
     torch.testing.assert_close(out.cpu(), a_cpu // b_cpu)
-    with native_ran("aten::floor_divide", "aten::floor_divide.Scalar"):
+    with ran("aten::floor_divide", "aten::floor_divide.Scalar"):
         out_scalar = a // 3
     torch.testing.assert_close(out_scalar.cpu(), a_cpu // 3)
 
@@ -975,7 +965,7 @@ def test_div_rounding_narrow_float_scalar_divisor(mojo_device, mode, dtype, divi
             b_cpu = torch.tensor(value if divisor != "one_element" else [value])
             b_cpu = b_cpu.to(dtype)
             b = b_cpu if divisor == "cpu_zero_dim" else b_cpu.to(mojo_device)
-        with native_ran("aten::div.Tensor_mode"):
+        with ran("aten::div.Tensor_mode"):
             out = torch.div(a, b, rounding_mode=mode)
         assert out.dtype == dtype
         torch.testing.assert_close(
@@ -996,7 +986,7 @@ def test_div_trunc_narrow_float_tensor_divisor_native_precision(mojo_device):
 
 def test_floor_divide_narrow_float_scalar(mojo_device):
     a_cpu = torch.tensor([3.0, -3.0, 5.0, 7.0], dtype=torch.bfloat16)
-    with native_ran("aten::floor_divide", "aten::floor_divide.Scalar"):
+    with ran("aten::floor_divide", "aten::floor_divide.Scalar"):
         out = a_cpu.to(mojo_device) // 1.0001
     torch.testing.assert_close(out.cpu(), a_cpu // 1.0001, rtol=0, atol=0)
 
@@ -1024,7 +1014,7 @@ def test_div_int_by_zero_tensor_gives_zero(mojo_device, dtype):
     a = torch.tensor([1, -1, -7, 7], dtype=dtype).to(mojo_device)
     b = torch.tensor([0, 0, 2, -2], dtype=dtype).to(mojo_device)
     for mode, rest in (("floor", [-4, -4]), ("trunc", [-3, -3])):
-        with native_ran("aten::div.Tensor_mode"):
+        with ran("aten::div.Tensor_mode"):
             out = torch.div(a, b, rounding_mode=mode)
         assert out.cpu().tolist() == [0, 0, *rest]
 
@@ -1034,14 +1024,13 @@ def test_div_int_by_zero_tensor_gives_zero(mojo_device, dtype):
 def test_div_out_mode_cast_outside_cast_dtypes(mojo_device, mode, out_dtype):
     """div.out_mode accepts any `out` dtype torch's can_cast allows, not only
     the device cast kernel's dtypes: int32 into float64 / int16 / int8."""
-    if out_dtype == torch.float64:
-        skip_if_metal(mojo_device, "float64 is not supported on Apple GPU")
+    skip_float64_on_metal(mojo_device, out_dtype)
     a_cpu = torch.tensor([7, -7, 9], dtype=torch.int32)
     b_cpu = torch.tensor([2, 2, -4], dtype=torch.int32)
     expected = torch.empty(3, dtype=out_dtype)
     torch.div(a_cpu, b_cpu, rounding_mode=mode, out=expected)
     dest = torch.empty(3, dtype=out_dtype, device=mojo_device)
-    with native_ran("aten::div.out_mode"):
+    with ran("aten::div.out_mode"):
         torch.div(
             a_cpu.to(mojo_device), b_cpu.to(mojo_device), rounding_mode=mode, out=dest
         )
@@ -1072,7 +1061,7 @@ def test_pow(mojo_device, call_checker):
     a = a_cpu.to(mojo_device)
     torch.testing.assert_close(torch.pow(a, 2.0).cpu(), torch.pow(a_cpu, 2.0))
     e_cpu, e = _both((5,), torch.float32, mojo_device)
-    with native_ran("aten::pow.Tensor_Tensor"):
+    with ran("aten::pow.Tensor_Tensor"):
         out = torch.pow(a, e)
     torch.testing.assert_close(out.cpu(), torch.pow(a_cpu, e_cpu))
 
@@ -1103,11 +1092,11 @@ def test_div_and_pow_float64(mojo_device, request):
     torch.testing.assert_close(got.cpu(), base_cpu / other_cpu)
     torch.testing.assert_close((base / 2.5).cpu(), base_cpu / 2.5)
 
-    with native_ran("aten::pow.Tensor_Tensor"):
+    with ran("aten::pow.Tensor_Tensor"):
         out = torch.pow(base, other)
     assert out.dtype == torch.float64
     torch.testing.assert_close(out.cpu(), torch.pow(base_cpu, other_cpu))
-    with native_ran("aten::pow.Tensor_Scalar"):
+    with ran("aten::pow.Tensor_Scalar"):
         scalar = torch.pow(base, 7.3)
     assert scalar.dtype == torch.float64
     torch.testing.assert_close(scalar.cpu(), torch.pow(base_cpu, 7.3))
@@ -1165,7 +1154,7 @@ def test_elementwise_tensor_routes_match_cpu(mojo_device, dtype, shape, layout):
     b_cpu, b = _fast_operands(shape, dtype, mojo_device, layout)
     for op in ("add", "sub", "mul"):
         want = getattr(torch, op)(a_cpu, b_cpu)
-        with native_ran(f"aten::{op}.Tensor"):
+        with ran(f"aten::{op}.Tensor"):
             got = getattr(torch, op)(a, b)
         torch.testing.assert_close(got.cpu(), want)
         if layout == "dense":
@@ -1189,7 +1178,7 @@ def test_elementwise_tensor_routes_match_cpu(mojo_device, dtype, shape, layout):
             )
             torch.testing.assert_close(alias.cpu(), alias_cpu)
         inplace_cpu, inplace = a_cpu.clone(), a.clone()
-        with native_ran(f"aten::{op}_.Tensor"):
+        with ran(f"aten::{op}_.Tensor"):
             assert getattr(inplace, op + "_")(b) is inplace
         getattr(inplace_cpu, op + "_")(b_cpu)
         torch.testing.assert_close(inplace.cpu(), inplace_cpu)
@@ -1220,7 +1209,7 @@ def test_inplace_binary_broadcast_operands(mojo_device, dtype, other):
     for op in ("mul", "add", "sub"):
         got_cpu, got = a_cpu.clone(), a.clone()
         version = got._version
-        with native_ran(f"aten::{op}_.Tensor"):
+        with ran(f"aten::{op}_.Tensor"):
             assert getattr(got, op + "_")(b) is got
         assert got._version == version + 1
         getattr(got_cpu, op + "_")(b_cpu)
@@ -1310,12 +1299,12 @@ def test_addcmul_addcdiv(mojo_device, call_checker):
         torch.addcdiv(a_cpu, b_cpu, c_cpu, value=2.0),
     )
     dest = torch.empty((3, 4), device=mojo_device)
-    with native_ran("aten::addcmul.out"):
+    with ran("aten::addcmul.out"):
         torch.addcmul(a, b, c, value=0.5, out=dest)
     torch.testing.assert_close(
         dest.cpu(), torch.addcmul(a_cpu, b_cpu, c_cpu, value=0.5)
     )
-    with native_ran("aten::addcdiv.out"):
+    with ran("aten::addcdiv.out"):
         torch.addcdiv(a, b, c, value=2.0, out=dest)
     torch.testing.assert_close(
         dest.cpu(), torch.addcdiv(a_cpu, b_cpu, c_cpu, value=2.0)
@@ -1326,7 +1315,7 @@ def test_addcmul_broadcast(mojo_device):
     a_cpu, a = _both((3, 4), torch.float32, mojo_device)
     b_cpu, b = _both((3, 1), torch.float32, mojo_device)
     c_cpu, c = _both((1, 4), torch.float32, mojo_device)
-    with native_ran("aten::addcmul"):
+    with ran("aten::addcmul"):
         out = torch.addcmul(a, b, c, value=-1.0)
     torch.testing.assert_close(
         out.cpu(), torch.addcmul(a_cpu, b_cpu, c_cpu, value=-1.0)
@@ -1347,7 +1336,7 @@ def test_optimizer_inplace_offset_storage(mojo_gpu, operation, shape, value):
     b, c = b_cpu.to(mojo_gpu), c_cpu.to(mojo_gpu)
     version = a._version
     native_name = "aten::lerp_.Scalar" if operation == "lerp" else f"aten::{operation}_"
-    with native_ran(native_name):
+    with ran(native_name):
         if operation == "lerp":
             result = a.lerp_(b, value)
             a_cpu.lerp_(b_cpu, value)
@@ -1466,11 +1455,11 @@ def test_addc_out_contiguous(mojo_gpu, operation, dtype, alias):
 def test_lerp(mojo_device, weight):
     a_cpu, a = _both((6,), torch.float32, mojo_device)
     b_cpu, b = _both((6,), torch.float32, mojo_device)
-    with native_ran("aten::lerp.Scalar"):
+    with ran("aten::lerp.Scalar"):
         out = torch.lerp(a, b, weight)
     torch.testing.assert_close(out.cpu(), torch.lerp(a_cpu, b_cpu, weight))
     dest = torch.empty((6,), device=mojo_device)
-    with native_ran("aten::lerp.Scalar_out"):
+    with ran("aten::lerp.Scalar_out"):
         torch.lerp(a, b, weight, out=dest)
     torch.testing.assert_close(dest.cpu(), torch.lerp(a_cpu, b_cpu, weight))
 
@@ -1497,7 +1486,7 @@ def test_logical_mixed_dtypes(mojo_device):
     a_cpu = torch.tensor([0.0, 1.5, 0.0, -2.0])
     b_cpu = torch.tensor([1, 0, 0, 7], dtype=torch.int64)
     a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
-    with native_ran("aten::logical_and"):
+    with ran("aten::logical_and"):
         out = torch.logical_and(a, b)
     torch.testing.assert_close(out.cpu(), torch.logical_and(a_cpu, b_cpu))
 
@@ -1520,7 +1509,7 @@ def test_bitwise(mojo_device, dtype, call_checker):
 def test_bitwise_scalar(mojo_device):
     a_cpu = torch.tensor([1, 2, 3, 12], dtype=torch.int64)
     a = a_cpu.to(mojo_device)
-    with native_ran("aten::bitwise_and.Scalar"):
+    with ran("aten::bitwise_and.Scalar"):
         out = a & 3
     torch.testing.assert_close(out.cpu(), a_cpu & 3)
 
@@ -1534,7 +1523,7 @@ def test_add_f32_bf16_fused_route(mojo_gpu):
     """FP32 + BF16 -> FP32 in one launch, no materialized BF16 operand."""
     a_cpu, a = _both((64, 32), torch.float32, mojo_gpu)
     b_cpu, b = _both((64, 32), torch.bfloat16, mojo_gpu)
-    with native_ran("aten::add.Tensor"):
+    with ran("aten::add.Tensor"):
         out = a + b
     assert out.dtype == torch.float32
     torch.testing.assert_close(out.cpu(), a_cpu + b_cpu)
@@ -1620,8 +1609,7 @@ def test_floor_divide_subnormal_quotient_underflow(mojo_device):
 def test_floor_divide_wide_float_quotient_underflow(mojo_device, dtype, tiny, huge):
     """ATen floors a finite nonzero numerator over an opposite-sign divisor to
     -1 in every float dtype, even when the quotient underflows to -0."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_device, "float64 is not supported on Apple GPU")
+    skip_float64_on_metal(mojo_device, dtype)
     a_cpu = torch.tensor([tiny, -tiny, tiny, 0.0, 1.0, -1.0], dtype=dtype)
     b_cpu = torch.tensor(
         [-huge, huge, huge, -huge, -float("inf"), float("inf")], dtype=dtype
@@ -1657,8 +1645,7 @@ def test_div_trunc_mode_keeps_the_narrow_quotient(mojo_device, dtype):
 def test_div_rounding_mode_negative_divisor(mojo_device, mode, dtype):
     """floor and trunc only disagree when the quotient is negative, so a
     positive-divisor test cannot tell them apart."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_device, "float64 is not supported on Apple GPU")
+    skip_float64_on_metal(mojo_device, dtype)
     a_cpu = torch.tensor([7, -7, 7, -7, 8, -8, 6, -6], dtype=dtype)
     b_cpu = torch.tensor([2, 2, -2, -2, 3, 3, -3, -3], dtype=dtype)
     a, b = a_cpu.to(mojo_device), b_cpu.to(mojo_device)
@@ -1819,7 +1806,7 @@ def test_binary_out_variants(mojo_device, name, fn, dtype, layout):
         out = out_cpu.to(mojo_device).t()
     else:
         out = torch.empty(expected.shape, dtype=expected.dtype, device=mojo_device)
-    with native_ran(
+    with ran(
         f"aten::{name}.out",
         f"aten::{name}.Tensor_out",
         f"aten::{name}.Tensor_Tensor_out",
@@ -1848,21 +1835,21 @@ def test_binary_scalar_out_variants(mojo_device):
         out = torch.empty(7, dtype=torch.int64, device=mojo_device)
         # The Scalar_out registration itself, not the CompositeImplicit
         # fallback that wraps the scalar and calls Tensor_out.
-        with native_ran(f"aten::{fn.__name__}.Scalar_out"):
+        with ran(f"aten::{fn.__name__}.Scalar_out"):
             fn(a, 5, out=out)
         torch.testing.assert_close(out.cpu(), fn(a_cpu, 5))
     f_cpu, f = _both((7,), torch.float32, mojo_device)
     out = torch.empty(7, device=mojo_device)
-    with native_ran("aten::remainder.Scalar_out"):
+    with ran("aten::remainder.Scalar_out"):
         torch.remainder(f, 0.75, out=out)
     torch.testing.assert_close(out.cpu(), torch.remainder(f_cpu, 0.75))
     out = torch.empty(7, device=mojo_device)
-    with native_ran("aten::pow.Tensor_Scalar_out"):
+    with ran("aten::pow.Tensor_Scalar_out"):
         torch.pow(f.abs(), 1.5, out=out)
     torch.testing.assert_close(out.cpu(), torch.pow(f_cpu.abs(), 1.5))
     # The scalar-base overload: pow(Scalar self, Tensor exponent, *, out).
     out = torch.empty(7, device=mojo_device)
-    with native_ran("aten::pow.Scalar_out"):
+    with ran("aten::pow.Scalar_out"):
         torch.pow(2.0, f, out=out)
     torch.testing.assert_close(out.cpu(), torch.pow(2.0, f_cpu))
 
@@ -1961,13 +1948,13 @@ def test_clamp_min_max(mojo_device, dtype):
     a_cpu, a = _both((5, 3), dtype, mojo_device, low=-9, high=9)
     lo_cpu, lo = _both((3,), dtype, mojo_device, low=-3, high=0)
     hi_cpu, hi = _both((5, 1), dtype, mojo_device, low=0, high=3)
-    with native_ran("aten::clamp_min"):
+    with ran("aten::clamp_min"):
         torch.testing.assert_close(a.clamp_min(0).cpu(), a_cpu.clamp_min(0))
-    with native_ran("aten::clamp_max"):
+    with ran("aten::clamp_max"):
         torch.testing.assert_close(a.clamp_max(1).cpu(), a_cpu.clamp_max(1))
-    with native_ran("aten::clamp_min.Tensor"):
+    with ran("aten::clamp_min.Tensor"):
         torch.testing.assert_close(a.clamp_min(lo).cpu(), a_cpu.clamp_min(lo_cpu))
-    with native_ran("aten::clamp_max.Tensor"):
+    with ran("aten::clamp_max.Tensor"):
         torch.testing.assert_close(a.clamp_max(hi).cpu(), a_cpu.clamp_max(hi_cpu))
     out = torch.empty_like(a)
     torch.clamp(a, min=-1, max=1, out=out)
@@ -2267,14 +2254,13 @@ _POW_SPECIAL = [
     "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
 )
 def test_pow_tensor_tensor_special_values(mojo_gpu, dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     base, exp = zip(*[(x, y) for x in _POW_SPECIAL for y in _POW_SPECIAL])
     x_cpu = torch.tensor(base, dtype=torch.float64).to(dtype)
     y_cpu = torch.tensor(exp, dtype=torch.float64).to(dtype)
     # Reference in float64 (CPU half pow widens the same way), rounded once.
     want = torch.pow(x_cpu.double(), y_cpu.double()).to(dtype)
-    with native_ran("aten::pow.Tensor_Tensor"):
+    with ran("aten::pow.Tensor_Tensor"):
         got = torch.pow(x_cpu.to(mojo_gpu), y_cpu.to(mojo_gpu))
     torch.testing.assert_close(got.cpu(), want, equal_nan=True, rtol=1e-6, atol=0)
     # Large integral and non-integral exponents: no int32 wrap-around.
@@ -2293,8 +2279,7 @@ def test_pow_tensor_tensor_special_values(mojo_gpu, dtype):
 def test_pow_tensor_scalar_special_values(mojo_gpu, dtype, exponent):
     x_cpu = torch.tensor(_POW_SPECIAL, dtype=torch.float64).to(dtype)
     want = torch.pow(x_cpu.double(), exponent).to(dtype)
-    accelerators = list(get_accelerators())
-    if accelerators[int(mojo_gpu.rsplit(":", 1)[-1])].api == "metal":
+    if is_metal(mojo_gpu):
         # 1e30 ** -1.5 is a float32 subnormal, which Apple GPUs flush to
         # zero (torch MPS's Metal pow too).
         keep = ~((want != 0) & (want.abs() < torch.finfo(dtype).tiny))
@@ -2317,8 +2302,7 @@ def test_remainder_is_exact_at_large_ratios(mojo_gpu, dtype):
     """BinaryRemainderKernel.cu: ::fmod, then the divisor added when the
     signs differ. fmod is exact, so the float64 remainder of the same
     operands, rounded, is the answer; `a - b * floor(a / b)` loses it."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     a = torch.tensor([16.875, 23456.0, -23456.0, 1e30, -7.5, 5.0], dtype=dtype)
     b = torch.tensor([4.70197740329e-38, 1e-30, 1e-30, 3.3, 2.0, -3.0], dtype=dtype)
     got = torch.remainder(a.to(mojo_gpu), b.to(mojo_gpu)).cpu()
@@ -2344,7 +2328,7 @@ def test_pow_float64_special_exponents(mojo_gpu):
         (-2.0, 1.0 / (x * x)),
         (-1.0, 1.0 / x),
     ):
-        with native_ran("aten::pow.Tensor_Scalar"):
+        with ran("aten::pow.Tensor_Scalar"):
             got = torch.pow(xd, e)
         torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)
     # sqrt: the GPU's double sqrt, an ulp from CPU torch's on a few elements

@@ -7,7 +7,7 @@ round differently)."""
 import pytest
 import torch
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import ran, skip_float64_on_metal, skip_if_metal
 from torch_mojo_backend import get_accelerators
 
 # ---------------------------------------------------------------------------
@@ -122,8 +122,7 @@ def test_mode_row_length_picks_cudas_tie_rule(mojo_gpu):
     ("bins", "lo", "hi"), [(10, 0, 0), (7, -3, 4), (1, -1, 1), (100, 0, 0)]
 )
 def test_histc_matches_cpu(mojo_gpu, dtype, bins, lo, hi):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     x = (torch.randn(2000) * 5).to(dtype)
     with ran("aten::histc"):
         got = torch.histc(x.to(mojo_gpu), bins, lo, hi)

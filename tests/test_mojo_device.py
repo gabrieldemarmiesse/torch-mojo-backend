@@ -16,7 +16,6 @@ import gc
 import io
 import math
 import multiprocessing
-import os
 import subprocess
 import sys
 import textwrap
@@ -38,6 +37,7 @@ from torch.optim.optimizer import _default_to_fused_or_foreach
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.utils.data.dataloader import _MultiProcessingDataLoaderIter
 
+from tests.conftest import python_env, run_python
 from tests.native.conftest import is_metal, side_stream_or_skip, skip_if_metal
 from torch_mojo_backend import (
     get_accelerators,
@@ -1349,19 +1349,7 @@ def test_first_pinned_factory_query_after_registration(
         """
     )
     # MAX's Python interop sets these to its own prefix in the parent.
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
-    proc = subprocess.run(
-        [sys.executable, "-c", script, mojo_device, entry, str(cuda_first)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    run_python("-c", script, mojo_device, entry, str(cuda_first), timeout=900)
 
 
 @pytest.mark.parametrize("size", [0, 8])
@@ -1993,19 +1981,7 @@ def test_pinned_python_threads_allocate_disjoint_live_blocks(
                 assert block.is_pinned()
                 assert torch.equal(block, torch.arange(257) + worker * 10000 + i * 300)
     """)
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
-    proc = subprocess.run(
-        [sys.executable, "-c", script, mojo_device, entry],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    run_python("-c", script, mojo_device, entry, timeout=120)
 
 
 @pytest.mark.parametrize("kind", ["negative-size", "overflow", "overflow-strides"])
@@ -2146,20 +2122,9 @@ def test_pinned_factories_without_runtime_cuda(
     """)
     if any(device.api == "metal" for device in get_accelerators()):
         pytest.skip("CUDA/HIP visibility variables cannot hide a Metal accelerator")
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
+    env = python_env()
     env.update(CUDA_VISIBLE_DEVICES="", HIP_VISIBLE_DEVICES="", ROCR_VISIBLE_DEVICES="")
-    proc = subprocess.run(
-        [sys.executable, "-c", script, str(pin_allocator_probe.path), entry],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    run_python("-c", script, str(pin_allocator_probe.path), entry, timeout=120, env=env)
 
 
 def _cuda_pinned_allocation_device(tensor: torch.Tensor) -> int | None:
@@ -2283,29 +2248,16 @@ def test_pinned_allocation_failure_preserves_source_and_recovers(
                 assert recovered.is_pinned()
             print('allocation failure recovered', flush=True)
     """)
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
-    env["LD_PRELOAD"] = str(pinned_host_failure_preload) + (
-        ":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else ""
-    )
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            script,
-            mojo_device,
-            entry,
-            str(pinned_host_failure_preload),
-        ],
-        env=env,
-        capture_output=True,
-        text=True,
+    env = python_env(preload=pinned_host_failure_preload)
+    proc = run_python(
+        "-c",
+        script,
+        mojo_device,
+        entry,
+        str(pinned_host_failure_preload),
         timeout=120,
+        env=env,
     )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "allocation failure recovered" in proc.stdout
 
 
@@ -2376,22 +2328,15 @@ def test_non_blocking_download_falls_back_after_pinned_allocation_failure(
                     os.environ.pop('TMB_TEST_FAIL_HOST_BUFFER', None)
             print('download allocation fallback recovered', flush=True)
     """)
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
-    env["LD_PRELOAD"] = str(pinned_host_failure_preload) + (
-        ":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else ""
-    )
-    proc = subprocess.run(
-        [sys.executable, "-c", script, mojo_device, str(pinned_host_failure_preload)],
-        env=env,
-        capture_output=True,
-        text=True,
+    env = python_env(preload=pinned_host_failure_preload)
+    proc = run_python(
+        "-c",
+        script,
+        mojo_device,
+        str(pinned_host_failure_preload),
         timeout=120,
+        env=env,
     )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "download allocation fallback recovered" in proc.stdout
 
 
@@ -2614,22 +2559,16 @@ def test_pinned_allocations_are_released(
         _check_pinned_allocations_are_released(sys.argv[1], sys.argv[2] == '1', probe)
         print('pinned allocations released', flush=True)
     """)
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
-    env["LD_PRELOAD"] = str(preload) + (
-        ":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else ""
-    )
-    proc = subprocess.run(
-        [sys.executable, "-c", script, mojo_device, str(int(async_use)), str(preload)],
-        env=env,
-        capture_output=True,
-        text=True,
+    env = python_env(preload=preload)
+    proc = run_python(
+        "-c",
+        script,
+        mojo_device,
+        str(int(async_use)),
+        str(preload),
         timeout=120,
+        env=env,
     )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "pinned allocations released" in proc.stdout
 
 

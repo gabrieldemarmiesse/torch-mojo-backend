@@ -98,11 +98,11 @@ def require_stock_cuda():
     pytest.skip("needs stock CUDA torch")
 
 
-def skip_float64_on_metal(device: str, dtype: torch.dtype):
-    """Skip a float64 case on an Apple GPU, which has no float64. `device`
-    is any device string (a `Conf.device` too): only a mojo device on Metal
-    skips."""
-    if dtype == torch.float64 and device.startswith("mojo:"):
+def skip_float64_on_metal(device: str, *dtypes: torch.dtype | None):
+    """Skip a case involving float64 on an Apple GPU, which has no float64.
+    `device` is any device string (a `Conf.device` too): only a mojo device
+    on Metal skips."""
+    if torch.float64 in dtypes and device.startswith("mojo:"):
         skip_if_metal(device, "Apple GPUs have no float64")
 
 
@@ -119,3 +119,26 @@ def ran(*op_names: str):
     assert any(native.op_count(name) > before[name] for name in op_names), (
         f"none of {op_names} ran natively"
     )
+
+
+@contextlib.contextmanager
+def ran_all(*op_names: str):
+    """Assert that each of `op_names` ran as a native boxed kernel."""
+    native.op_counting(True)
+    before = native.op_counts()
+    yield
+    after = native.op_counts()
+    for name in op_names:
+        assert after.get(name, 0) > before.get(name, 0), (
+            f"{name} did not run natively (counted: {sorted(after)})"
+        )
+
+
+def native_count(name: str) -> int:
+    """How many times `aten::<name>` ran natively since the last reset."""
+    return native.op_count(f"aten::{name}")
+
+
+def reset_op_counts():
+    native.op_counting(True)
+    native.op_counts_reset()

@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.native.conftest import native_count
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
 aten = torch.ops.aten
@@ -29,10 +30,6 @@ _GFX942_ONLY = "the fused MFMA flash kernels are compiled for gfx942"
 def _grad(t: torch.Tensor) -> torch.Tensor:
     assert t.grad is not None
     return t.grad
-
-
-def _counted(name: str) -> int:
-    return native.op_count(f"aten::{name}")
 
 
 @pytest.fixture
@@ -102,7 +99,7 @@ def test_flash_attention_forward(mojo_gpu, counting, dtype, head_dim):
         pytest.skip(_HOPPER_ONLY)
     qr, kr, vr, q, k, v = _qkv(mojo_gpu, dtype, 2, 3, 256, 256, head_dim)
     out, lse = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True)[:2]
-    assert _counted("_scaled_dot_product_flash_attention") == 1
+    assert native_count("_scaled_dot_product_flash_attention") == 1
     expected = F.scaled_dot_product_attention(qr, kr, vr, is_causal=True)
     torch.testing.assert_close(
         out.contiguous().cpu().float(), expected, atol=_tol(dtype), rtol=_tol(dtype)
@@ -123,7 +120,7 @@ def test_flash_attention_partial_tail_block(mojo_gpu, counting):
         pytest.skip(_HOPPER_ONLY)
     qr, kr, vr, q, k, v = _qkv(mojo_gpu, torch.bfloat16, 1, 2, 200, 200, 64)
     out = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True)[0]
-    assert _counted("_scaled_dot_product_flash_attention") == 1
+    assert native_count("_scaled_dot_product_flash_attention") == 1
     torch.testing.assert_close(
         out.contiguous().cpu().float(),
         F.scaled_dot_product_attention(qr, kr, vr, is_causal=True),
@@ -144,7 +141,7 @@ def test_flash_attention_strided_qkv(mojo_gpu, counting):
     q, k, v = (dev[:, :, i].transpose(1, 2) for i in range(3))
     assert not q.is_contiguous()
     out = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True)[0]
-    assert _counted("_scaled_dot_product_flash_attention") == 1
+    assert native_count("_scaled_dot_product_flash_attention") == 1
     torch.testing.assert_close(
         out.contiguous().cpu().float(),
         F.scaled_dot_product_attention(ref[0], ref[1], ref[2], is_causal=True),
@@ -167,7 +164,7 @@ def test_flash_attention_backward(mojo_gpu, counting, head_dim):
     out = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, True)[0]
     grad = torch.ones_like(out)
     out.backward(grad)
-    assert _counted("_scaled_dot_product_flash_attention_backward") == 1
+    assert native_count("_scaled_dot_product_flash_attention_backward") == 1
     F.scaled_dot_product_attention(qr, kr, vr, is_causal=True).backward(
         torch.ones_like(qr)
     )
@@ -237,7 +234,7 @@ def test_fused_flash_backward_partial_tail_gfx942(
         t.requires_grad_()
     out = aten._scaled_dot_product_flash_attention(q, k, v, 0.0, is_causal)[0]
     out.backward(torch.ones_like(out))
-    assert _counted("_scaled_dot_product_flash_attention_backward") == 1
+    assert native_count("_scaled_dot_product_flash_attention_backward") == 1
     F.scaled_dot_product_attention(qr, kr, vr, is_causal=is_causal).backward(
         torch.ones_like(qr)
     )
@@ -262,7 +259,7 @@ def test_efficient_attention_decode_step(mojo_gpu, counting, dtype):
         out = aten._scaled_dot_product_efficient_attention(
             q, k, v, None, False, 0.0, False
         )[0]
-    assert _counted("_scaled_dot_product_efficient_attention") == 1
+    assert native_count("_scaled_dot_product_efficient_attention") == 1
     torch.testing.assert_close(
         out.contiguous().cpu().float(),
         F.scaled_dot_product_attention(qr, kr, vr),
@@ -280,7 +277,7 @@ def test_efficient_attention_math(mojo_device, counting, dtype, is_causal):
         out = aten._scaled_dot_product_efficient_attention(
             q, k, v, None, False, 0.0, is_causal
         )[0]
-    assert _counted("_scaled_dot_product_efficient_attention") == 1
+    assert native_count("_scaled_dot_product_efficient_attention") == 1
     torch.testing.assert_close(
         out.contiguous().cpu().float(),
         F.scaled_dot_product_attention(qr, kr, vr, is_causal=is_causal),
@@ -315,7 +312,7 @@ def test_efficient_attention_trains(mojo_gpu, counting):
             q, k, v, None, compute_lse, 0.0, True
         )[0]
         out.sum().backward()
-    assert _counted("_scaled_dot_product_efficient_attention_backward") == 2
+    assert native_count("_scaled_dot_product_efficient_attention_backward") == 2
     F.scaled_dot_product_attention(qr, kr, vr, is_causal=True).sum().backward()
     for got, want in ((q, qr), (k, kr), (v, vr)):
         torch.testing.assert_close(
@@ -429,8 +426,8 @@ def test_sdpa_enable_gqa_inference(
             q, k, v, is_causal=is_causal, enable_gqa=True
         )
     if kv_heads != q_heads:
-        assert _counted("_scaled_dot_product_efficient_attention") == 1
-    assert _counted("clone") == 0  # no ATen repeat_interleave
+        assert native_count("_scaled_dot_product_efficient_attention") == 1
+    assert native_count("clone") == 0  # no ATen repeat_interleave
     expected = F.scaled_dot_product_attention(
         qr, kr, vr, is_causal=is_causal, enable_gqa=True
     )
@@ -444,7 +441,7 @@ def test_sdpa_enable_gqa_decode_step(mojo_gpu, counting, q_heads, kv_heads):
     qr, kr, vr, q, k, v = _gqa_qkv(mojo_gpu, torch.float32, q_heads, kv_heads, 1, 130)
     with torch.no_grad():
         out = F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
-    assert _counted("_scaled_dot_product_efficient_attention") == 1
+    assert native_count("_scaled_dot_product_efficient_attention") == 1
     torch.testing.assert_close(
         out.cpu(),
         F.scaled_dot_product_attention(qr, kr, vr, enable_gqa=True),
@@ -510,7 +507,7 @@ def test_fused_sdp_choice_flash(mojo_gpu, counting):
         pytest.skip(_HOPPER_ONLY)
     _, _, _, q, k, v = _qkv(mojo_gpu, torch.bfloat16, 1, 2, 128, 128, 64)
     assert aten._fused_sdp_choice(q, k, v, None, 0.0, True) == FLASH
-    assert _counted("_fused_sdp_choice") == 1
+    assert native_count("_fused_sdp_choice") == 1
 
 
 def test_fused_sdp_choice_efficient_for_inference(mojo_gpu, counting):
@@ -647,7 +644,7 @@ def test_flash_attention_forward_bshd(mojo_gpu, counting, dtype, is_causal, leng
     )
     g = torch.randn(want.shape, generator=torch.Generator().manual_seed(9))
     out.backward(g.transpose(1, 2).to(dtype).to(mojo_gpu))
-    assert _counted("_flash_attention_backward") == 1
+    assert native_count("_flash_attention_backward") == 1
     want.backward(g.double())
     gt = _grad_tol(dtype)
     for got, ref in ((q, qr), (k, kr), (v, vr)):
@@ -724,7 +721,7 @@ def test_efficient_attention_forward_bmhk(
     )
     g = torch.randn(want.shape, generator=torch.Generator().manual_seed(8))
     out.backward(g.transpose(1, 2).to(dtype).to(mojo_gpu))
-    assert _counted("_efficient_attention_backward") == 1
+    assert native_count("_efficient_attention_backward") == 1
     want.backward(g.double())
     gt = _grad_tol(dtype)
     pairs = [(q, qr), (k, kr), (v, vr)] + ([(b, br)] if with_bias else [])
@@ -754,7 +751,7 @@ def test_cudnn_attention(mojo_gpu, counting, dtype, is_causal):
     torch.testing.assert_close(out.cpu().double(), want, atol=tol, rtol=tol)
     torch.testing.assert_close(lse[..., 0].cpu().double(), want_lse, atol=tol, rtol=tol)
     out.backward(torch.ones_like(out))
-    assert _counted("_scaled_dot_product_cudnn_attention_backward") == 1
+    assert native_count("_scaled_dot_product_cudnn_attention_backward") == 1
     want.backward(torch.ones_like(want))
     gt = _grad_tol(dtype)
     for got, ref in ((q, qr), (k, kr), (v, vr)):

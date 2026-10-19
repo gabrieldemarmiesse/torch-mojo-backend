@@ -5,7 +5,7 @@ compared against CPU torch."""
 import pytest
 import torch
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import ran, skip_float64_on_metal, skip_if_metal
 
 
 def _round(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
@@ -540,8 +540,7 @@ _F32_NEG_ZERO_GAP = pytest.mark.xfail(
 )
 def test_cumsum_1d_keeps_leading_negative_zero(mojo_gpu, dtype):
     """cub seeds the scan with the first item: CUDA gives [-0, -0, 1]."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     x = torch.tensor([-0.0, -0.0, 1.0], dtype=dtype)
     got = torch.cumsum(x.to(mojo_gpu), 0).cpu()
     _assert_bitwise(got, torch.tensor([-0.0, -0.0, 1.0], dtype=dtype))
@@ -555,8 +554,7 @@ def test_cumsum_1d_negative_zero_multi_tile(mojo_gpu, dtype, n):
     pass): bit-exact and sign-exact against the model of each (float64
     takes the same cub route, sign-checked only; float32 does not, see
     _F32_NEG_ZERO_GAP)."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(n)
     x = torch.randn(n).to(dtype)
     x[torch.rand(n) < 0.3] = 0.0

@@ -14,7 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import ran, skip_float64_on_metal
 from torch_mojo_backend import aten_functions
 from torch_mojo_backend.testing import CallChecker
 
@@ -30,11 +30,6 @@ def _tol(dtype: torch.dtype) -> tuple[float, float]:
     if dtype == torch.bfloat16:
         return (1.6e-2, 1.6e-2)
     return (2e-3, 2e-3)
-
-
-def _skip_f64(device: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(device, "Apple GPUs have no float64")
 
 
 def _close(got: torch.Tensor, want: torch.Tensor, dtype: torch.dtype):
@@ -92,7 +87,7 @@ def test_max_pool2d(
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_max_pool2d_dtypes_layouts(mojo_device, dtype):
     """Every float dtype; an unbatched (C, H, W) input; a channels_last one."""
-    _skip_f64(mojo_device, dtype)
+    skip_float64_on_metal(mojo_device, dtype)
     x = torch.randn(2, 5, 12, 7).to(dtype)
     for inp in (x, x[0], x.to(memory_format=torch.channels_last)):
         want, want_idx = F.max_pool2d(inp, 3, 2, 1, return_indices=True)
@@ -131,7 +126,7 @@ def test_max_pool_nan_wins(mojo_device):
     ],
 )
 def test_max_pool3d(mojo_device, dtype, kernel, stride, padding, dilation, ceil_mode):
-    _skip_f64(mojo_device, dtype)
+    skip_float64_on_metal(mojo_device, dtype)
     x = torch.randn(2, 3, 5, 7, 6).to(dtype)
     args = (kernel, stride, padding, dilation)
     with ran("aten::max_pool3d_with_indices"):
@@ -269,7 +264,7 @@ def test_avg_pool2d(
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_avg_pool_dtypes_unbatched_1d(mojo_device, dtype):
-    _skip_f64(mojo_device, dtype)
+    skip_float64_on_metal(mojo_device, dtype)
     x = torch.randn(3, 9, 11).to(dtype)
     _close(
         F.avg_pool2d(x.to(mojo_device), 3, 2, 1, ceil_mode=True),
@@ -366,7 +361,7 @@ def test_adaptive_avg_pool2d(mojo_device, call_checker: CallChecker, output_size
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 @pytest.mark.parametrize("output_size", [(2, 3, 4), (5, 1, 7), (6, 7, 8)])
 def test_adaptive_avg_pool3d(mojo_device, dtype, output_size):
-    _skip_f64(mojo_device, dtype)
+    skip_float64_on_metal(mojo_device, dtype)
     x = torch.randn(2, 3, 5, 6, 7).to(dtype)
     with ran("aten::_adaptive_avg_pool3d"):
         got = torch.ops.aten._adaptive_avg_pool3d(x.to(mojo_device), list(output_size))
@@ -389,7 +384,7 @@ def test_adaptive_avg_pool3d(mojo_device, dtype, output_size):
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 @pytest.mark.parametrize("output_size", [(1, 1), (3, 4), (5, 9)])
 def test_adaptive_max_pool2d(mojo_device, dtype, output_size):
-    _skip_f64(mojo_device, dtype)
+    skip_float64_on_metal(mojo_device, dtype)
     x = torch.randn(2, 3, 7, 9).to(dtype)
     with ran("aten::adaptive_max_pool2d"):
         got, got_idx = F.adaptive_max_pool2d(
@@ -478,7 +473,7 @@ _FRAC_CASES = [
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 @pytest.mark.parametrize(("n", "shape", "kernel", "out"), _FRAC_CASES)
 def test_fractional_max_pool(mojo_device, dtype, n, shape, kernel, out):
-    _skip_f64(mojo_device, dtype)
+    skip_float64_on_metal(mojo_device, dtype)
     torch.manual_seed(0)
     x = torch.randn(shape).to(dtype)
     batch = shape[0] if len(shape) == n + 2 else 1
@@ -668,7 +663,7 @@ def test_max_pool2d_backward_without_indices(
 ):
     """aten::max_pool2d_backward (an MPS-only kernel upstream) recomputes the
     argmax from `self`: the same gradient as the indexed backward."""
-    _skip_f64(mojo_device, dtype)
+    skip_float64_on_metal(mojo_device, dtype)
     as2 = lambda v: [v, v] if isinstance(v, int) else list(v)  # noqa: E731
     args = (
         as2(kernel),
@@ -701,7 +696,7 @@ def test_max_pool2d_backward_without_indices(
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
 def test_max_unpool2d(mojo_device, dtype):
-    _skip_f64(mojo_device, dtype)
+    skip_float64_on_metal(mojo_device, dtype)
     x = torch.randn(2, 3, 9, 8)
     pooled, idx = F.max_pool2d(x, 3, 2, 1, return_indices=True)
     pooled = pooled.to(dtype)
@@ -770,7 +765,7 @@ def test_max_unpool_rejects_bad_indices_shape(mojo_device):
     [(2, 1, 0, 1), ((3, 2), (1, 2), (1, 0), (2, 1)), (3, 2, 2, 3)],
 )
 def test_unfold_fold(mojo_device, dtype, kernel, dilation, padding, stride):
-    _skip_f64(mojo_device, dtype)
+    skip_float64_on_metal(mojo_device, dtype)
     x = torch.randn(2, 3, 9, 10)
     x = (x > 0) if dtype == torch.bool else x.to(dtype)
     args = (kernel, dilation, padding, stride)

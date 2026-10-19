@@ -33,7 +33,8 @@ from typing import Any, NoReturn
 import pytest
 import torch
 
-from torch_mojo_backend import get_accelerators, native
+from tests.native.conftest import is_metal
+from torch_mojo_backend import native
 
 # The elementwise overloads writing one caller-supplied output.
 OUT_OVERLOADS = [
@@ -336,12 +337,6 @@ def _registered_or_skip(name: str):
         pytest.skip(f"aten::{name} is not registered on the mojo device")
 
 
-def _metal(device: str) -> bool:
-    idx = int(device.rsplit(":", 1)[-1])
-    accelerators = list(get_accelerators())
-    return idx < len(accelerators) and accelerators[idx].api == "metal"
-
-
 @contextlib.contextmanager
 def _ran(name: str) -> Iterator[None]:
     """The registration of `name` itself ran (whether or not it raised)."""
@@ -536,7 +531,7 @@ def test_out_dtype_follows_torch(mojo_gpu, name, out_dtype):
     casts it (`canCast`, or an op's own exact-dtype rule), and refused where
     torch refuses it."""
     _registered_or_skip(name)
-    if out_dtype == torch.float64 and _metal(mojo_gpu):
+    if out_dtype == torch.float64 and is_metal(mojo_gpu):
         pytest.skip("Apple GPUs have no float64")
     if out_dtype == torch.float64 and name == "gelu_backward.grad_input":
         pytest.skip("CPU torch's oneDNN gelu_backward has no float64 output")
@@ -730,7 +725,7 @@ def test_result_type_matches_torch(mojo_gpu, name, shapes):
     if not torch._C._dispatch_has_kernel_for_dispatch_key(key, "PrivateUse1"):
         pytest.skip(f"{key} is not registered on the mojo device")
     op = _op(name)
-    metal = _metal(mojo_gpu)
+    metal = is_metal(mojo_gpu)
     wrong = []
     for a_dtype in _PROMO_DTYPES:
         for b_dtype in _PROMO_DTYPES:
@@ -815,7 +810,7 @@ def test_lerp_promotes_a_0dim_weight(mojo_gpu, weight_dtype):
     the result then casts into `out`; a dimensioned one must match."""
     if not _registered("aten::lerp.Tensor_out"):
         pytest.skip("lerp.Tensor is not registered on the mojo device")
-    if weight_dtype == torch.float64 and _metal(mojo_gpu):
+    if weight_dtype == torch.float64 and is_metal(mojo_gpu):
         pytest.skip("Apple GPUs have no float64")
     a, b = torch.rand(2, 3), torch.rand(2, 3)
     w = torch.tensor(0.3, dtype=weight_dtype)

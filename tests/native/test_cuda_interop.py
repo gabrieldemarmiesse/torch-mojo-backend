@@ -13,7 +13,6 @@ validation test also runs on CPU-only CI.
 """
 
 import inspect
-import os
 import subprocess
 import sys
 
@@ -21,6 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.conftest import python_env
 from torch_mojo_backend import cuda_interop
 
 # `torch.mojo` itself: registered at run time, so it is spelled through
@@ -348,21 +348,12 @@ def test_enable_cuda_fallback_lasts_for_the_process(gpu, tmp_path):
         "torch.nn.functional.conv2d(a, w, padding=1).sum().backward()\n"
         "print('FALLBACK OK')\n"
     )
-    # PYTHONHOME / PYTHONEXECUTABLE: MAX's Python interop sets them in this
-    # process, and inherited they point a fresh interpreter at the wrong
-    # prefix ("No module named 'encodings'"). `loader.mojo` unsets them around
-    # its own subprocesses for the same reason.
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
     r = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
         timeout=900,
-        env=env,
+        env=python_env(),
     )
     assert "FALLBACK OK" in r.stdout, r.stdout + r.stderr
 

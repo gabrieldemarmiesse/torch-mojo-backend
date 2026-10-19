@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import ran, skip_float64_on_metal
 
 FLOAT_DTYPES = [torch.float32, torch.float16, torch.bfloat16, torch.float64]
 
@@ -43,8 +43,7 @@ def _case(dtype: torch.dtype, seed: int = 0) -> tuple[torch.Tensor, ...]:
 def test_embedding_bag_forward_and_backward(
     mojo_device, dtype, mode, include_last_offset, padding_idx
 ):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_device, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_device, dtype)
     weight, indices, offsets, _ = _case(dtype)
     if include_last_offset:
         offsets = torch.cat([offsets, torch.tensor([indices.numel()])])

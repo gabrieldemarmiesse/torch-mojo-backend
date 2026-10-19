@@ -8,18 +8,13 @@ the absolute values."""
 import pytest
 import torch
 
-from tests.native.conftest import is_metal, ran, skip_if_metal
+from tests.native.conftest import is_metal, ran, skip_float64_on_metal, skip_if_metal
 
 DTYPES = (torch.float32, torch.float64)
 
 
 def _tol(dtype: torch.dtype) -> float:
     return 1e-4 if dtype == torch.float32 else 1e-10
-
-
-def _dtype_or_skip(device: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(device, "Apple GPUs have no float64")
 
 
 def _close(actual, expected, dtype):
@@ -50,7 +45,7 @@ def _sym(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
 @pytest.mark.parametrize("upper", [False, True])
 @pytest.mark.parametrize("shape", [(5, 5), (3, 4, 4), (2, 1, 7, 7), (0, 3, 3), (0, 0)])
 def test_cholesky(mojo_gpu: str, dtype: torch.dtype, upper: bool, shape):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(0)
     a = _spd(*shape, dtype=dtype)
     with ran("aten::linalg_cholesky_ex"):
@@ -132,7 +127,7 @@ def test_cholesky_inverse_and_solve(mojo_gpu: str, upper: bool):
     "shape", [(5, 5), (4, 7), (7, 4), (3, 6, 6), (0, 4, 4), (0, 0)]
 )
 def test_lu_factor_matches_lapack(mojo_gpu: str, dtype: torch.dtype, shape):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(3)
     a = torch.randn(*shape, dtype=dtype)
     with ran("aten::linalg_lu_factor_ex"):
@@ -197,7 +192,7 @@ def test_lu_solve(mojo_gpu: str, left: bool, adjoint: bool):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_inv_det_slogdet(mojo_gpu: str, dtype: torch.dtype):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(6)
     a = torch.randn(3, 5, 5, dtype=dtype)
     a_t = a.mT  # non-contiguous
@@ -293,7 +288,7 @@ def test_triangular_solve(mojo_gpu: str, transpose: bool, upper: bool):
     "shape", [(5, 3), (3, 5), (4, 4), (2, 6, 2), (0, 3, 3), (3, 0)]
 )
 def test_qr(mojo_gpu: str, dtype: torch.dtype, shape):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(11)
     a = torch.randn(*shape, dtype=dtype)
     _close(torch.geqrf(a.to(mojo_gpu)), torch.geqrf(a), dtype)
@@ -330,7 +325,7 @@ def test_householder_product_and_ormqr(mojo_gpu: str, left: bool, transpose: boo
 @pytest.mark.parametrize("uplo", ["L", "U"])
 @pytest.mark.parametrize("shape", [(6, 6), (3, 5, 5), (1, 1), (33, 33), (0, 4, 4)])
 def test_eigh(mojo_gpu: str, dtype: torch.dtype, uplo: str, shape):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(13)
     a = _sym(*shape, dtype=dtype)
     # garbage in the triangle UPLO does not name
@@ -363,7 +358,7 @@ def test_eigh_repeated_eigenvalues(mojo_gpu: str):
     "shape", [(5, 3), (3, 5), (4, 4), (2, 7, 3), (0, 3), (3, 0), (2, 0, 0)]
 )
 def test_svd(mojo_gpu: str, dtype: torch.dtype, full: bool, shape):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(14)
     a = torch.randn(*shape, dtype=dtype)
     U, S, Vh = torch.linalg.svd(a.to(mojo_gpu), full_matrices=full)
@@ -406,7 +401,7 @@ def test_svd_rank_deficient(mojo_gpu: str):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_ldl(mojo_gpu: str, dtype: torch.dtype):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(16)
     a = _sym(3, 6, 6, dtype=dtype)
     a[1, 0, 0] = 0  # forces a 2x2 pivot at the start
@@ -459,7 +454,7 @@ def test_lstsq_out_dtype_checked(mojo_gpu: str):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("scale", [1e-9, 1e-3, 0.3, 1.0, 20.0])
 def test_matrix_exp(mojo_gpu: str, dtype: torch.dtype, scale: float):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     if dtype == torch.float64:
         # composed of bmm, which has no float64 route on the device yet
         with pytest.raises(NotImplementedError):
@@ -678,7 +673,7 @@ def test_matrix_exp_huge_norm_scaling(mojo_gpu: str):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_svd_converges_on_exactly_rank_deficient(mojo_gpu: str, dtype: torch.dtype):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     shapes = [(m, n) for m in (1, 2, 5, 12, 23, 37, 70) for n in (1, 3, 12, 22, 33)]
     for m, n in shapes:
         a = torch.ones(m, n, dtype=dtype)
@@ -763,7 +758,7 @@ def test_svd_outer_products_converge(
 ):
     """Rank-1/2 outer products: n - rank singular values are rounding noise,
     which must not keep the sweeps going."""
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     for seed in range(3):
         torch.manual_seed(seed)
         a = torch.randn(n, rank, dtype=dtype) @ torch.randn(rank, n, dtype=dtype)
