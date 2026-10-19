@@ -1956,7 +1956,7 @@ def op_bmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var b = v_tensor(args[unsafe_offset=1])
     var dims = _bmm_dims(a, b)
-    expect_scalar_type(a, b)
+    expect_scalar_type(b, a)
     _check_same_device([a.copy(), b.copy()])
     _blas_out(
         rets,
@@ -1978,7 +1978,7 @@ def op_bmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor(args[unsafe_offset=2])
     var dims = _bmm_dims(a, b)
     _check_dest(dest, b.stype, b)  # common_checks: `batch2.options()`
-    expect_scalar_type(a, b)
+    expect_scalar_type(b, a)
     _check_same_device([dest.copy(), a.copy(), b.copy()])
     _blas_out(
         rets,
@@ -2355,7 +2355,7 @@ def _baddbmm_run(
 ) raises:
     """baddbmm_out_cuda_impl: alpha and beta as opmath (the k == 0 shortcut
     multiplies by the unrounded beta, unlike addmm's)."""
-    expect_scalar_type(b1, b2)
+    expect_scalar_type(b2, b1)
     var ts = List[T]()
     if dest:
         ts.append(dest.value().copy())
