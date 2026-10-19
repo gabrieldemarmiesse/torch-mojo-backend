@@ -67,6 +67,8 @@ def test_cpu_model_converts_in_place(holder):
     del keep
 
 
+# Needs no mojo device, but a CUDA one only the GPU runners have.
+@pytest.mark.gpu
 @pytest.mark.parametrize("holder", [_with_weakrefs, _with_live_graph])
 def test_cuda_model_converts_in_place(cuda, holder):
     m = _mlp().to(cuda)
@@ -208,9 +210,11 @@ def test_meta_to_empty_on_mojo(mojo_gpu):
     """`to_empty` from Meta replaces the Parameters, as for CUDA."""
     with torch.device("meta"):
         m = _mlp()
+    before = list(m.parameters())
     m.to_empty(device=mojo_gpu)
-    for p in m.parameters():
+    for p, old in zip(m.parameters(), before):
         assert isinstance(p, nn.Parameter) and p.device.type == "mojo"
+        assert p is not old
 
 
 def test_mojo_and_cuda_interplay(mojo_gpu, cuda):
