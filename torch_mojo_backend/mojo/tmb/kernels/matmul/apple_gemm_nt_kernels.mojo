@@ -60,39 +60,19 @@ from max.gpu.host import DeviceContext
 from std.memory import AddressSpace
 from std.math import ceildiv
 from std.memory import stack_allocation
-from std.sys import llvm_intrinsic
 
 from tmb.kernels.common.op_utils import _enqueue_cached, _make_ptr
+from tmb.kernels.common.apple_mma8 import (
+    FRAG8,
+    MMA8_DIM,
+    _frag8_layout,
+    _mma8x8,
+)
 
-comptime NT_MMA8_DIM = 8
-comptime NT_FRAG8 = 2  # 8x8 = 64 elems / 32 lanes = 2 per lane
 
 # Blocks-in-flight target for the split-K heuristic (Apple's 8-40 core GPUs
 # saturate early; each shard costs an m*n partials round-trip).
 comptime NT_TARGET_BLOCKS = 80
-
-
-@always_inline
-def _nt_frag8_layout(lane: Int) -> Tuple[Int, Int]:
-    """Apple 8x8 simdgroup-matrix per-lane layout: lane owns
-    (row, col_base) and (row, col_base + 1)."""
-    return (
-        ((lane & 6) >> 1) + ((lane & 16) >> 2),
-        ((lane & 1) << 1) + ((lane & 8) >> 1),
-    )
-
-
-@always_inline
-def _nt_mma8x8(
-    a: SIMD[DType.float32, NT_FRAG8],
-    b: SIMD[DType.float32, NT_FRAG8],
-    c: SIMD[DType.float32, NT_FRAG8],
-) -> SIMD[DType.float32, NT_FRAG8]:
-    """One 8x8x8 simdgroup-matrix multiply-accumulate: D = A @ B + C."""
-    return llvm_intrinsic[
-        "llvm.air.simdgroup_matrix_8x8_multiply_accumulate",
-        SIMD[DType.float32, NT_FRAG8],
-    ](a, b, c)
 
 
 def _nt_ksplit_reduce_kernel(
@@ -184,14 +164,14 @@ def _apple8_nt_smem_kernel[
     comptime NBUF = 2 if DOUBLE else 1
     comptime SG_M = BM // SGR
     comptime SG_N = BN // SGC
-    comptime NT_M = SG_M // NT_MMA8_DIM
-    comptime NT_N = SG_N // NT_MMA8_DIM
+    comptime NT_M = SG_M // MMA8_DIM
+    comptime NT_N = SG_N // MMA8_DIM
     comptime KV = BK // 4  # float4 chunks per k-row (both operands)
     comptime AV = (BM * BK) // (THREADS * 4)  # float4 fills per thread
     comptime BV = (BK * BN) // (THREADS * 4)
     comptime assert AV * THREADS * 4 == BM * BK, "A stage must tile evenly"
     comptime assert BV * THREADS * 4 == BK * BN, "B stage must tile evenly"
-    comptime assert BK % NT_MMA8_DIM == 0, "BK must be whole 8-slabs"
+    comptime assert BK % MMA8_DIM == 0, "BK must be whole 8-slabs"
 
     var bz = Int(block_idx.z) // ksplits
     var ks = Int(block_idx.z) % ksplits
@@ -238,15 +218,15 @@ def _apple8_nt_smem_kernel[
     ]()
 
     var lane = Int(lane_id())
-    var fl = _nt_frag8_layout(lane)
+    var fl = _frag8_layout(lane)
     var frow = fl[0]
     var fcol = fl[1]
     var sg = Int(warp_id())
     var sgm = (sg // SGC) * SG_M
     var sgn = (sg % SGC) * SG_N
 
-    var accum = Array[SIMD[DType.float32, NT_FRAG8], NT_M * NT_N](
-        fill=SIMD[DType.float32, NT_FRAG8](0)
+    var accum = Array[SIMD[DType.float32, FRAG8], NT_M * NT_N](
+        fill=SIMD[DType.float32, FRAG8](0)
     )
 
     # Device -> register fill for one BK stage at k-offset kt (OOB -> 0).
@@ -322,7 +302,7 @@ def _apple8_nt_smem_kernel[
     @__parameter
     def _compute(
         buf: Int,
-        mut acc: Array[SIMD[DType.float32, NT_FRAG8], NT_M * NT_N],
+        mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N],
     ):
         var a_src = a_smem.unsafe_offset(
             buf * BM * LDA + (sgm + frow) * LDA + fcol
@@ -330,28 +310,24 @@ def _apple8_nt_smem_kernel[
         var b_src = b_smem.unsafe_offset(
             buf * BK * LDB + frow * LDB + sgn + fcol
         )
-        comptime for kc in range(BK // NT_MMA8_DIM):
-            var afrag = Array[SIMD[DType.float32, NT_FRAG8], NT_M](
+        comptime for kc in range(BK // MMA8_DIM):
+            var afrag = Array[SIMD[DType.float32, FRAG8], NT_M](
                 uninitialized=True
             )
             comptime for mi in range(NT_M):
                 afrag[mi] = (
-                    a_src.unsafe_offset(
-                        mi * NT_MMA8_DIM * LDA + kc * NT_MMA8_DIM
-                    )
-                ).unsafe_load[width=NT_FRAG8]()
-            var bfrag = Array[SIMD[DType.float32, NT_FRAG8], NT_N](
+                    a_src.unsafe_offset(mi * MMA8_DIM * LDA + kc * MMA8_DIM)
+                ).unsafe_load[width=FRAG8]()
+            var bfrag = Array[SIMD[DType.float32, FRAG8], NT_N](
                 uninitialized=True
             )
             comptime for ni in range(NT_N):
                 bfrag[ni] = (
-                    b_src.unsafe_offset(
-                        kc * NT_MMA8_DIM * LDB + ni * NT_MMA8_DIM
-                    )
-                ).unsafe_load[width=NT_FRAG8]()
+                    b_src.unsafe_offset(kc * MMA8_DIM * LDB + ni * MMA8_DIM)
+                ).unsafe_load[width=FRAG8]()
             comptime for mi in range(NT_M):
                 comptime for ni in range(NT_N):
-                    acc[mi * NT_N + ni] = _nt_mma8x8(
+                    acc[mi * NT_N + ni] = _mma8x8(
                         afrag[mi], bfrag[ni], acc[mi * NT_N + ni]
                     )
 
@@ -384,12 +360,12 @@ def _apple8_nt_smem_kernel[
             _compute(0, accum)
 
     comptime for mi in range(NT_M):
-        var grow = bm + sgm + mi * NT_MMA8_DIM + frow
+        var grow = bm + sgm + mi * MMA8_DIM + frow
         if grow < m:
             comptime for ni in range(NT_N):
-                var gcol = bn + sgn + ni * NT_MMA8_DIM + fcol
+                var gcol = bn + sgn + ni * MMA8_DIM + fcol
                 var frag = accum[mi * NT_N + ni]
-                if gcol + NT_FRAG8 <= n:
+                if gcol + FRAG8 <= n:
                     c_ptr.unsafe_store(grow * n + gcol, frag)
                 elif gcol < n:
                     c_ptr[unsafe_offset=grow * n + gcol] = frag[0]
@@ -531,13 +507,13 @@ def _apple8_nt_direct_kernel[
 
     comptime SG_M = BM // SGR
     comptime SG_N = BN // SGC
-    comptime NT_M = SG_M // NT_MMA8_DIM
-    comptime NT_N = SG_N // NT_MMA8_DIM
+    comptime NT_M = SG_M // MMA8_DIM
+    comptime NT_N = SG_N // MMA8_DIM
 
     var bz = Int(block_idx.z) // ksplits
     var ks = Int(block_idx.z) % ksplits
     # Round the k-chunk to whole 8-slabs so only the last split sees a tail.
-    var kchunk = ceildiv(ceildiv(k, ksplits), NT_MMA8_DIM) * NT_MMA8_DIM
+    var kchunk = ceildiv(ceildiv(k, ksplits), MMA8_DIM) * MMA8_DIM
     var k_start = min(k, ks * kchunk)
     var k_end = min(k, k_start + kchunk)
 
@@ -562,7 +538,7 @@ def _apple8_nt_direct_kernel[
         by = Int(block_idx.y)
 
     var lane = Int(lane_id())
-    var fl = _nt_frag8_layout(lane)
+    var fl = _frag8_layout(lane)
     var frow = fl[0]
     var fcol = fl[1]
     var sg = Int(warp_id())
@@ -570,8 +546,8 @@ def _apple8_nt_direct_kernel[
     var col_base = bx * BN + (sg % SGC) * SG_N
     var interior = (row_base + SG_M <= m) and (col_base + SG_N <= n)
 
-    var accum = Array[SIMD[DType.float32, NT_FRAG8], NT_M * NT_N](
-        fill=SIMD[DType.float32, NT_FRAG8](0)
+    var accum = Array[SIMD[DType.float32, FRAG8], NT_M * NT_N](
+        fill=SIMD[DType.float32, FRAG8](0)
     )
 
     # One 8-slab with every bound checked: ragged M/N subtiles and the K
@@ -580,33 +556,29 @@ def _apple8_nt_direct_kernel[
     @__parameter
     def _slab_guarded(
         kk: Int,
-        mut acc: Array[SIMD[DType.float32, NT_FRAG8], NT_M * NT_N],
+        mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N],
     ):
-        var afrag = Array[SIMD[DType.float32, NT_FRAG8], NT_M](
-            uninitialized=True
-        )
+        var afrag = Array[SIMD[DType.float32, FRAG8], NT_M](uninitialized=True)
         comptime for mi in range(NT_M):
-            var grow = row_base + mi * NT_MMA8_DIM + frow
-            var af = SIMD[DType.float32, NT_FRAG8](0)
+            var grow = row_base + mi * MMA8_DIM + frow
+            var af = SIMD[DType.float32, FRAG8](0)
             if grow < m:
-                comptime for s in range(NT_FRAG8):
+                comptime for s in range(FRAG8):
                     if kk + fcol + s < k_end:
                         af[s] = a_ptr[unsafe_offset=grow * k + kk + fcol + s]
             afrag[mi] = af
-        var bfrag = Array[SIMD[DType.float32, NT_FRAG8], NT_N](
-            uninitialized=True
-        )
+        var bfrag = Array[SIMD[DType.float32, FRAG8], NT_N](uninitialized=True)
         comptime for ni in range(NT_N):
-            var bf = SIMD[DType.float32, NT_FRAG8](0)
+            var bf = SIMD[DType.float32, FRAG8](0)
             if kk + frow < k_end:
-                comptime for s in range(NT_FRAG8):
-                    var gj = col_base + ni * NT_MMA8_DIM + fcol + s
+                comptime for s in range(FRAG8):
+                    var gj = col_base + ni * MMA8_DIM + fcol + s
                     if gj < n:
                         bf[s] = b_ptr[unsafe_offset=gj * k + kk + frow]
             bfrag[ni] = bf
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):
-                acc[mi * NT_N + ni] = _nt_mma8x8(
+                acc[mi * NT_N + ni] = _mma8x8(
                     afrag[mi], bfrag[ni], acc[mi * NT_N + ni]
                 )
 
@@ -616,13 +588,11 @@ def _apple8_nt_direct_kernel[
     @__parameter
     def _load_a_fast(
         ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> Array[SIMD[DType.float32, NT_FRAG8], NT_M]:
-        var afrag = Array[SIMD[DType.float32, NT_FRAG8], NT_M](
-            uninitialized=True
-        )
+    ) -> Array[SIMD[DType.float32, FRAG8], NT_M]:
+        var afrag = Array[SIMD[DType.float32, FRAG8], NT_M](uninitialized=True)
         comptime for mi in range(NT_M):
-            afrag[mi] = (ap0.unsafe_offset(mi * NT_MMA8_DIM * k)).unsafe_load[
-                width=NT_FRAG8
+            afrag[mi] = (ap0.unsafe_offset(mi * MMA8_DIM * k)).unsafe_load[
+                width=FRAG8
             ]()
         return afrag^
 
@@ -630,14 +600,12 @@ def _apple8_nt_direct_kernel[
     @__parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> Array[SIMD[DType.float32, NT_FRAG8], NT_N]:
-        var bfrag = Array[SIMD[DType.float32, NT_FRAG8], NT_N](
-            uninitialized=True
-        )
+    ) -> Array[SIMD[DType.float32, FRAG8], NT_N]:
+        var bfrag = Array[SIMD[DType.float32, FRAG8], NT_N](uninitialized=True)
         comptime for ni in range(NT_N):
             # B is (N, K): the fragment's two slots differ in n-row.
-            var p = bp0.unsafe_offset(ni * NT_MMA8_DIM * k)
-            var bf = SIMD[DType.float32, NT_FRAG8](0)
+            var p = bp0.unsafe_offset(ni * MMA8_DIM * k)
+            var bf = SIMD[DType.float32, FRAG8](0)
             bf[0] = p[unsafe_offset=0]
             bf[1] = p[unsafe_offset=k]
             bfrag[ni] = bf
@@ -646,29 +614,29 @@ def _apple8_nt_direct_kernel[
     @always_inline
     @__parameter
     def _mma_block(
-        afrag: Array[SIMD[DType.float32, NT_FRAG8], NT_M],
-        bfrag: Array[SIMD[DType.float32, NT_FRAG8], NT_N],
-        mut acc: Array[SIMD[DType.float32, NT_FRAG8], NT_M * NT_N],
+        afrag: Array[SIMD[DType.float32, FRAG8], NT_M],
+        bfrag: Array[SIMD[DType.float32, FRAG8], NT_N],
+        mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N],
     ):
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):
-                acc[mi * NT_N + ni] = _nt_mma8x8(
+                acc[mi * NT_N + ni] = _mma8x8(
                     afrag[mi], bfrag[ni], acc[mi * NT_N + ni]
                 )
 
-    var full_end = k_start + ((k_end - k_start) // NT_MMA8_DIM) * NT_MMA8_DIM
+    var full_end = k_start + ((k_end - k_start) // MMA8_DIM) * MMA8_DIM
     if interior:
         # Software-pipelined pointer-increment loop: the next slab's
         # fragments are in flight while the current slab's mmas issue.
         var ap = a_ptr.unsafe_offset((row_base + frow) * k + fcol + k_start)
         var bp = b_ptr.unsafe_offset((col_base + fcol) * k + frow + k_start)
-        var nslabs = (k_end - k_start) // NT_MMA8_DIM
+        var nslabs = (k_end - k_start) // MMA8_DIM
         if nslabs > 0:
             var cura = _load_a_fast(ap)
             var curb = _load_b_fast(bp)
             for _ in range(nslabs - 1):
-                ap = ap.unsafe_offset(NT_MMA8_DIM)
-                bp = bp.unsafe_offset(NT_MMA8_DIM)
+                ap = ap.unsafe_offset(MMA8_DIM)
+                bp = bp.unsafe_offset(MMA8_DIM)
                 var nxta = _load_a_fast(ap)
                 var nxtb = _load_b_fast(bp)
                 _mma_block(cura, curb, accum)
@@ -681,15 +649,15 @@ def _apple8_nt_direct_kernel[
         var kk = k_start
         while kk < k_end:
             _slab_guarded(kk, accum)
-            kk += NT_MMA8_DIM
+            kk += MMA8_DIM
 
     comptime for mi in range(NT_M):
-        var grow = row_base + mi * NT_MMA8_DIM + frow
+        var grow = row_base + mi * MMA8_DIM + frow
         if grow < m:
             comptime for ni in range(NT_N):
-                var gcol = col_base + ni * NT_MMA8_DIM + fcol
+                var gcol = col_base + ni * MMA8_DIM + fcol
                 var frag = accum[mi * NT_N + ni]
-                if gcol + NT_FRAG8 <= n:
+                if gcol + FRAG8 <= n:
                     c_ptr.unsafe_store(grow * n + gcol, frag)
                 elif gcol < n:
                     c_ptr[unsafe_offset=grow * n + gcol] = frag[0]
@@ -722,7 +690,7 @@ def apple_nt_direct_enqueue[
         gx = gx * gy
         gy = 1
     var blocks = gx * gy * batch
-    var slabs = ceildiv(k, NT_MMA8_DIM)
+    var slabs = ceildiv(k, MMA8_DIM)
     var ksplits = 1
     if blocks < NT_TARGET_BLOCKS // 2:
         ksplits = min(min(ceildiv(NT_TARGET_BLOCKS, blocks), slabs), 8)

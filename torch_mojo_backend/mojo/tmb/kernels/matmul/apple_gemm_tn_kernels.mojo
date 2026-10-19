@@ -57,7 +57,7 @@
 # Fragment-load hardware intrinsics do not exist on M1-M4 (Metal only lowers
 # `llvm.air.simdgroup_matrix_8x8_multiply_accumulate`; the transpose-flag
 # form lowers to M5-only 16x16x16 intrinsics), so fragment staging stays
-# software: per-lane vec loads in the `_tn_frag8_layout` pattern.
+# software: per-lane vec loads in the `_frag8_layout` pattern.
 #
 # Measurement note: a per-launch synchronize costs ~0.24-0.30 ms on this
 # stack, which is more than several of these GEMMs take. Timings above are
@@ -68,12 +68,15 @@
 from max.gpu import block_idx, lane_id, thread_idx, warp_id
 from max.gpu.host import DeviceContext
 from std.math import ceildiv
-from std.sys import llvm_intrinsic
 
 from tmb.kernels.common.op_utils import _enqueue_cached, _make_ptr
+from tmb.kernels.common.apple_mma8 import (
+    FRAG8,
+    MMA8_DIM,
+    _frag8_layout,
+    _mma8x8,
+)
 
-comptime TN_MMA8_DIM = 8
-comptime TN_FRAG8 = 2  # 8x8 = 64 elems / 32 lanes = 2 per lane
 
 # Blocks-in-flight target for the split-K heuristic (Apple's 8-40 core GPUs
 # saturate early; each shard costs an m*n partials round-trip).
@@ -83,29 +86,6 @@ comptime TN_TARGET_BLOCKS = 80
 # B streaming outweighs its extra parallelism. See note 2 in the header.
 comptime TN_SHALLOW_K = 2048
 comptime TN_WIDE_GRID = 4 * TN_TARGET_BLOCKS
-
-
-@always_inline
-def _tn_frag8_layout(lane: Int) -> Tuple[Int, Int]:
-    """Apple 8x8 simdgroup-matrix per-lane layout: lane owns
-    (row, col_base) and (row, col_base + 1)."""
-    return (
-        ((lane & 6) >> 1) + ((lane & 16) >> 2),
-        ((lane & 1) << 1) + ((lane & 8) >> 1),
-    )
-
-
-@always_inline
-def _tn_mma8x8(
-    a: SIMD[DType.float32, TN_FRAG8],
-    b: SIMD[DType.float32, TN_FRAG8],
-    c: SIMD[DType.float32, TN_FRAG8],
-) -> SIMD[DType.float32, TN_FRAG8]:
-    """One 8x8x8 simdgroup-matrix multiply-accumulate: D = A @ B + C."""
-    return llvm_intrinsic[
-        "llvm.air.simdgroup_matrix_8x8_multiply_accumulate",
-        SIMD[DType.float32, TN_FRAG8],
-    ](a, b, c)
 
 
 def _tn_ksplit_reduce_kernel(
@@ -173,13 +153,13 @@ def _apple8_tn_kernel[
 
     comptime SG_M = BM // SGR
     comptime SG_N = BN // SGC
-    comptime NT_M = SG_M // TN_MMA8_DIM
-    comptime NT_N = SG_N // TN_MMA8_DIM
+    comptime NT_M = SG_M // MMA8_DIM
+    comptime NT_N = SG_N // MMA8_DIM
 
     var bz = Int(block_idx.z) // ksplits
     var ks = Int(block_idx.z) % ksplits
     # Round the k-chunk to whole 8-slabs so only the last split sees a tail.
-    var kchunk = ceildiv(ceildiv(k, ksplits), TN_MMA8_DIM) * TN_MMA8_DIM
+    var kchunk = ceildiv(ceildiv(k, ksplits), MMA8_DIM) * MMA8_DIM
     var k_start = min(k, ks * kchunk)
     var k_end = min(k, k_start + kchunk)
 
@@ -190,7 +170,7 @@ def _apple8_tn_kernel[
     var b_ptr = b_base.unsafe_offset(bz * k * n)
 
     var lane = Int(lane_id())
-    var fl = _tn_frag8_layout(lane)
+    var fl = _frag8_layout(lane)
     var frow = fl[0]
     var fcol = fl[1]
     var sg = Int(warp_id())
@@ -198,8 +178,8 @@ def _apple8_tn_kernel[
     var col_base = Int(block_idx.x) * BN + (sg % SGC) * SG_N
     var interior = (row_base + SG_M <= m) and (col_base + SG_N <= n)
 
-    var accum = Array[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N](
-        fill=SIMD[DType.float32, TN_FRAG8](0)
+    var accum = Array[SIMD[DType.float32, FRAG8], NT_M * NT_N](
+        fill=SIMD[DType.float32, FRAG8](0)
     )
 
     # One 8-slab with every bound checked: ragged M/N subtiles and the K
@@ -208,34 +188,30 @@ def _apple8_tn_kernel[
     @__parameter
     def _slab_guarded(
         kk: Int,
-        mut acc: Array[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N],
+        mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N],
     ):
-        var afrag = Array[SIMD[DType.float32, TN_FRAG8], NT_M](
-            uninitialized=True
-        )
+        var afrag = Array[SIMD[DType.float32, FRAG8], NT_M](uninitialized=True)
         comptime for mi in range(NT_M):
-            var grow = row_base + mi * TN_MMA8_DIM + frow
-            var af = SIMD[DType.float32, TN_FRAG8](0)
+            var grow = row_base + mi * MMA8_DIM + frow
+            var af = SIMD[DType.float32, FRAG8](0)
             if grow < m:
-                comptime for s in range(TN_FRAG8):
+                comptime for s in range(FRAG8):
                     if kk + fcol + s < k_end:
                         # A is (K, M): logical row = stored column.
                         af[s] = a_ptr[unsafe_offset=(kk + fcol + s) * m + grow]
             afrag[mi] = af
-        var bfrag = Array[SIMD[DType.float32, TN_FRAG8], NT_N](
-            uninitialized=True
-        )
+        var bfrag = Array[SIMD[DType.float32, FRAG8], NT_N](uninitialized=True)
         comptime for ni in range(NT_N):
-            var bf = SIMD[DType.float32, TN_FRAG8](0)
+            var bf = SIMD[DType.float32, FRAG8](0)
             if kk + frow < k_end:
-                comptime for s in range(TN_FRAG8):
-                    var gj = col_base + ni * TN_MMA8_DIM + fcol + s
+                comptime for s in range(FRAG8):
+                    var gj = col_base + ni * MMA8_DIM + fcol + s
                     if gj < n:
                         bf[s] = b_ptr[unsafe_offset=(kk + frow) * n + gj]
             bfrag[ni] = bf
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):
-                acc[mi * NT_N + ni] = _tn_mma8x8(
+                acc[mi * NT_N + ni] = _mma8x8(
                     afrag[mi], bfrag[ni], acc[mi * NT_N + ni]
                 )
 
@@ -246,13 +222,11 @@ def _apple8_tn_kernel[
     @__parameter
     def _load_a_fast(
         ap0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> Array[SIMD[DType.float32, TN_FRAG8], NT_M]:
-        var afrag = Array[SIMD[DType.float32, TN_FRAG8], NT_M](
-            uninitialized=True
-        )
+    ) -> Array[SIMD[DType.float32, FRAG8], NT_M]:
+        var afrag = Array[SIMD[DType.float32, FRAG8], NT_M](uninitialized=True)
         comptime for mi in range(NT_M):
-            var p = ap0.unsafe_offset(mi * TN_MMA8_DIM)
-            var af = SIMD[DType.float32, TN_FRAG8](0)
+            var p = ap0.unsafe_offset(mi * MMA8_DIM)
+            var af = SIMD[DType.float32, FRAG8](0)
             af[0] = p[unsafe_offset=0]
             af[1] = p[unsafe_offset=m]
             afrag[mi] = af
@@ -262,43 +236,41 @@ def _apple8_tn_kernel[
     @__parameter
     def _load_b_fast(
         bp0: Pointer[Scalar[DType.float32], ImmutAnyOrigin],
-    ) -> Array[SIMD[DType.float32, TN_FRAG8], NT_N]:
-        var bfrag = Array[SIMD[DType.float32, TN_FRAG8], NT_N](
-            uninitialized=True
-        )
+    ) -> Array[SIMD[DType.float32, FRAG8], NT_N]:
+        var bfrag = Array[SIMD[DType.float32, FRAG8], NT_N](uninitialized=True)
         comptime for ni in range(NT_N):
-            bfrag[ni] = (bp0.unsafe_offset(ni * TN_MMA8_DIM)).unsafe_load[
-                width=TN_FRAG8
+            bfrag[ni] = (bp0.unsafe_offset(ni * MMA8_DIM)).unsafe_load[
+                width=FRAG8
             ]()
         return bfrag^
 
     @always_inline
     @__parameter
     def _mma_block(
-        afrag: Array[SIMD[DType.float32, TN_FRAG8], NT_M],
-        bfrag: Array[SIMD[DType.float32, TN_FRAG8], NT_N],
-        mut acc: Array[SIMD[DType.float32, TN_FRAG8], NT_M * NT_N],
+        afrag: Array[SIMD[DType.float32, FRAG8], NT_M],
+        bfrag: Array[SIMD[DType.float32, FRAG8], NT_N],
+        mut acc: Array[SIMD[DType.float32, FRAG8], NT_M * NT_N],
     ):
         comptime for mi in range(NT_M):
             comptime for ni in range(NT_N):
-                acc[mi * NT_N + ni] = _tn_mma8x8(
+                acc[mi * NT_N + ni] = _mma8x8(
                     afrag[mi], bfrag[ni], acc[mi * NT_N + ni]
                 )
 
-    var full_end = k_start + ((k_end - k_start) // TN_MMA8_DIM) * TN_MMA8_DIM
+    var full_end = k_start + ((k_end - k_start) // MMA8_DIM) * MMA8_DIM
     if interior:
         # Software-pipelined pointer-increment loop: the next slab's
         # fragments are in flight while the current slab's mmas issue, so a
         # single simdgroup hides most of the device-load latency itself.
         var ap = a_ptr.unsafe_offset((k_start + fcol) * m + row_base + frow)
         var bp = b_ptr.unsafe_offset((k_start + frow) * n + col_base + fcol)
-        var nslabs = (k_end - k_start) // TN_MMA8_DIM
+        var nslabs = (k_end - k_start) // MMA8_DIM
         if nslabs > 0:
             var cura = _load_a_fast(ap)
             var curb = _load_b_fast(bp)
             for _ in range(nslabs - 1):
-                ap = ap.unsafe_offset(TN_MMA8_DIM * m)
-                bp = bp.unsafe_offset(TN_MMA8_DIM * n)
+                ap = ap.unsafe_offset(MMA8_DIM * m)
+                bp = bp.unsafe_offset(MMA8_DIM * n)
                 var nxta = _load_a_fast(ap)
                 var nxtb = _load_b_fast(bp)
                 _mma_block(cura, curb, accum)
@@ -311,15 +283,15 @@ def _apple8_tn_kernel[
         var kk = k_start
         while kk < k_end:
             _slab_guarded(kk, accum)
-            kk += TN_MMA8_DIM
+            kk += MMA8_DIM
 
     comptime for mi in range(NT_M):
-        var grow = row_base + mi * TN_MMA8_DIM + frow
+        var grow = row_base + mi * MMA8_DIM + frow
         if grow < m:
             comptime for ni in range(NT_N):
-                var gcol = col_base + ni * TN_MMA8_DIM + fcol
+                var gcol = col_base + ni * MMA8_DIM + fcol
                 var frag = accum[mi * NT_N + ni]
-                if gcol + TN_FRAG8 <= n:
+                if gcol + FRAG8 <= n:
                     c_ptr.unsafe_store(grow * n + gcol, frag)
                 elif gcol < n:
                     c_ptr[unsafe_offset=grow * n + gcol] = frag[0]
@@ -348,7 +320,7 @@ def apple_tn_enqueue[
     var gx = ceildiv(n, BN)
     var gy = ceildiv(m, BM)
     var blocks = gx * gy * batch
-    var slabs = ceildiv(k, TN_MMA8_DIM)
+    var slabs = ceildiv(k, MMA8_DIM)
     var ksplits = 1
     # Each shard costs an m*n partials round-trip plus a reduce launch.
     if blocks < TN_TARGET_BLOCKS // 2:
