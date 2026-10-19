@@ -54,6 +54,12 @@ def _round_away(x: Float32) -> Float32:
 
 
 @always_inline
+def _rint(x: Float32) -> Float32:
+    """llvm.nvvm.round.f (libdevice's rintf): nearest integer, ties to even."""
+    return llvm_intrinsic["llvm.roundeven", Float32, has_side_effect=False](x)
+
+
+@always_inline
 def _floor(x: Float32) -> Float32:
     return llvm_intrinsic["llvm.floor", Float32, has_side_effect=False](x)
 
@@ -766,7 +772,7 @@ def nv_erf(a: Float64) -> Float64:
     var tail = fma(p, x, x - t)
     var hi = -t
     var lo = -tail
-    var k = _round_away(hi.cast[DType.float32]() * _f(0x3FB8AA3B))
+    var k = _rint(hi.cast[DType.float32]() * _f(0x3FB8AA3B))
     var kd = k.cast[DType.float64]()
     var r = fma(-kd, Float64(from_bits=UInt64(0x3FE62E42FEFA39EF)), hi)
     comptime E = [
