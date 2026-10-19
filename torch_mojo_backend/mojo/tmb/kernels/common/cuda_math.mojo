@@ -1288,7 +1288,7 @@ def nv_lgammaf(a: Float32) -> Float32:
             return t
         return -nv_logf(x)
     # sin(pi x) by the sine kernel on a quadrant reduction of 2x.
-    var q = _round_away(x * Float32(2.0))
+    var q = _rint(x * Float32(2.0))
     var qi = q.cast[DType.int32]()
     var r = fma(-q, Float32(0.5), x) * _f(0x40490FDB)
     var s = _abs(_sin_poly(r, qi))
