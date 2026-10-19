@@ -98,6 +98,8 @@ from tmb.ops.common import (
     resize_out,
     sizes_str,
     scalar_type_name,
+    mat_shape,
+    padded_shape,
 )
 from tmb.ops.matmul import (
     _dense_2d,
@@ -140,13 +142,6 @@ def _cdiv(a: Int, b: Int) -> Int:
 
 def _round_up(a: Int, b: Int) -> Int:
     return _cdiv(a, b) * b
-
-
-def _shape2(r: Int, c: Int) -> IndexList[MAX_RANK]:
-    var s = IndexList[MAX_RANK](1)
-    s[MAX_RANK - 2] = r
-    s[MAX_RANK - 1] = c
-    return s
 
 
 def _strides2(r: Int, c: Int) -> IndexList[MAX_RANK]:
@@ -409,7 +404,7 @@ def _dq_none() -> _Dq:
 def _dequant(src: T, rows: Int, cols: Int, rs: Int, cs: Int) raises -> Owned:
     """A contiguous float32 `rows` x `cols` copy of the float8 matrix at
     `src` (element strides rs, cs): exact, unscaled."""
-    var out = own(new_tensor(_shape2(rows, cols), 2, ST_FLOAT32, src.device))
+    var out = own(new_tensor(mat_shape(rows, cols), 2, ST_FLOAT32, src.device))
     var ctx = ctx_for(src.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("scaled_mm", "Dequant")
@@ -431,7 +426,7 @@ def _gemm_f32(a32: T, bt32: T, exact_tf32: Bool) raises -> Owned:
     var k = a32.dim(1)
     var n = bt32.dim(0)
     var b = own(
-        view_strided(bt32, _shape2(k, n), _strides2(1, k), 2, bt32.offset)
+        view_strided(bt32, mat_shape(k, n), _strides2(1, k), 2, bt32.offset)
     )
     if exact_tf32 and _sm90_cuda(a32.device) and _tf32_available():
         var am = _dense_2d(a32)
@@ -492,7 +487,7 @@ def _scaled_gemm(
     if k == 0:
         # A grouped GEMM's empty-K group still runs its epilogue on a zero
         # accumulator (0 * inf scale is NaN there, as on CUDA).
-        p = own(new_tensor(_shape2(m, n), 2, ST_FLOAT32, dest.device))
+        p = own(new_tensor(mat_shape(m, n), 2, ST_FLOAT32, dest.device))
         fill_value(p.t, 0.0)
     elif dq_a.recipe != DQ_NONE or dq_b.recipe != DQ_NONE:
         p = _block_scaled_product(a, b, dq_a, dq_b)
@@ -556,14 +551,14 @@ def _block_scaled_product(a: T, b: T, dq_a: _Dq, dq_b: _Dq) raises -> Owned:
     var n = b.dim(1)
     var bk = 32 if dq_a.recipe == DQ_MX_SWIZZLED else 128
     var nkb = _cdiv(k, bk)
-    var acc = own(new_tensor(_shape2(m, n), 2, ST_FLOAT32, a.device))
+    var acc = own(new_tensor(mat_shape(m, n), 2, ST_FLOAT32, a.device))
     for kb in range(nkb):
         var k0 = kb * bk
         var kl = min(bk, k - k0)
         var av = own(
             view_strided(
                 a,
-                _shape2(m, kl),
+                mat_shape(m, kl),
                 _strides2(a.stride(0), a.stride(1)),
                 2,
                 a.offset + k0 * a.stride(1),
@@ -572,7 +567,7 @@ def _block_scaled_product(a: T, b: T, dq_a: _Dq, dq_b: _Dq) raises -> Owned:
         var bv = own(
             view_strided(
                 b,
-                _shape2(kl, n),
+                mat_shape(kl, n),
                 _strides2(b.stride(0), b.stride(1)),
                 2,
                 b.offset + k0 * b.stride(0),
@@ -804,7 +799,7 @@ def _scaled_mm_v1(
     if a.numel > 0 and b.numel > 0:
         # CUDA's output-dtype limits are cuBLAS's, past the empty early return.
         _check_out_dtype(dest.stype)
-    resize_out(dest, _shape2(a.dim(0), n), 2)
+    resize_out(dest, mat_shape(a.dim(0), n), 2)
     var sb = _sc(scale_b) if kinds[1] == BLOCK_1X32 else _sc_t(scale_b)
     # ScaledBlas.cpp hands scale_result to cuBLAS as the D scale only for a
     # float8 output (torch 2.14: test_float8_scale_result multiplies).
@@ -823,7 +818,7 @@ def op_scaled_mm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var has_dt = not v_is_none(args[unsafe_offset=6])
     var out_st = v_dtype_or(args[unsafe_offset=6], a.stype)
     _ = max_dtype(out_st)  # a dtype the device cannot hold declines here
-    var out = own(new_tensor(_shape2(0, 0), 2, out_st, a.device))
+    var out = own(new_tensor(mat_shape(0, 0), 2, out_st, a.device))
     _scaled_mm_v1(
         a,
         b,
@@ -881,7 +876,7 @@ def op_scaled_mm_out(
     var has_dt = not v_is_none(args[unsafe_offset=6])
     var out_st = v_dtype_or(args[unsafe_offset=6], dest.stype)
     if _aliases_any(dest, _arg_tensors(args, [0, 1, 2, 3, 4, 5])):
-        var tmp = own(new_tensor(_shape2(0, 0), 2, dest.stype, dest.device))
+        var tmp = own(new_tensor(mat_shape(0, 0), 2, dest.stype, dest.device))
         _scaled_mm_v1(
             a,
             b,
@@ -1270,7 +1265,7 @@ def _scaled_mm_v2(args: Values, mut dest: T) raises:
     var m = a.dim(0)
     var k = a.dim(1)
     var n = b.dim(1)
-    resize_out(dest, _shape2(m, n), 2)
+    resize_out(dest, mat_shape(m, n), 2)
     if m == 0 or k == 0 or n == 0:
         if k == 0:
             fill_value(dest, 0.0)
@@ -1392,7 +1387,7 @@ def op_scaled_mm_v2(
     var a = v_tensor(args[unsafe_offset=0])
     var out_st = v_dtype_or(args[unsafe_offset=9], a.stype)
     _ = max_dtype(out_st)
-    var out = own(new_tensor(_shape2(0, 0), 2, out_st, a.device))
+    var out = own(new_tensor(mat_shape(0, 0), 2, out_st, a.device))
     _scaled_mm_v2(args, out.t)
     ret_tensor(rets, 0, out.take())
 
@@ -1406,7 +1401,7 @@ def op_scaled_mm_v2_out(
     var out_st = v_dtype_or(args[unsafe_offset=9], a.stype)
     check_out_as(dest, out_st, a)
     if _aliases_any(dest, _arg_tensors(args, [0, 1, 2, 5, 8])):
-        var tmp = own(new_tensor(_shape2(0, 0), 2, out_st, a.device))
+        var tmp = own(new_tensor(mat_shape(0, 0), 2, out_st, a.device))
         _scaled_mm_v2(args, tmp.t)
         _land(dest, tmp.t)
         _ = tmp^
@@ -1576,7 +1571,7 @@ def _view2(
 ) raises -> Owned:
     return own(
         view_strided(
-            t, _shape2(r, c), _strides2(rs, cs), 2, t.offset + offset_elems
+            t, mat_shape(r, c), _strides2(rs, cs), 2, t.offset + offset_elems
         )
     )
 
@@ -1608,13 +1603,6 @@ def _grouped_dims(a: T, b: T, offs: Optional[T]) raises -> List[Int]:
             raise Error("batched dimension has to match")
         dims = [a.dim(0), a.dim(1), b.dim(2)]
     return dims^
-
-
-def _grouped_shape(dims: List[Int]) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    for i in range(len(dims)):
-        shape[MAX_RANK - len(dims) + i] = dims[i]
-    return shape
 
 
 def _grouped_out(a: T, b: T, offs: Optional[T]) raises -> Owned:
@@ -1943,7 +1931,7 @@ def op_scaled_grouped_mm_v2_out(
         _land(dest, tmp.t)
         _ = tmp^
     else:
-        resize_out(dest, _grouped_shape(dims), len(dims))
+        resize_out(dest, padded_shape(dims), len(dims))
         _grouped_rowwise(
             a,
             b,

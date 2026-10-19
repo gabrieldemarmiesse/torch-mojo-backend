@@ -16,12 +16,9 @@ from tmb.backend.device import copy_from_host, copy_to_host, ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.registry import Site, impl
-
-
-def _shape(n: Int) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 1] = n
-    return shape
+from tmb.ops.common import (
+    vec_shape,
+)
 
 
 # torchvision::nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor
@@ -58,13 +55,15 @@ def op_nms(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         unsupported("nms: requires a GPU supporting the input dtype")
     var n = boxes.dim(0)
     if n == 0:
-        var empty = own(new_tensor(_shape(0), 1, ST_INT64, boxes.device))
+        var empty = own(new_tensor(vec_shape(0), 1, ST_INT64, boxes.device))
         ret_owned(rets, 0, empty)
         return
     var columns = (n + 63) // 64
-    var order = own(new_tensor(_shape(n), 1, ST_INT64, boxes.device))
-    var temporary = own(new_tensor(_shape(n), 1, ST_INT64, boxes.device))
-    var mask = own(new_tensor(_shape(n * columns), 1, ST_INT64, boxes.device))
+    var order = own(new_tensor(vec_shape(n), 1, ST_INT64, boxes.device))
+    var temporary = own(new_tensor(vec_shape(n), 1, ST_INT64, boxes.device))
+    var mask = own(
+        new_tensor(vec_shape(n * columns), 1, ST_INT64, boxes.device)
+    )
     var call = KernelCall("nms", "NmsMask")
     call.arg_dtype(0, boxes.dtype)
     call.int(boxes.ptr)
@@ -76,7 +75,7 @@ def op_nms(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     call.f64(threshold)
     call.int(ctx_ptr(ctx))
     call.run()
-    var host_mask = own(cpu_empty(_shape(n * columns), 1, ST_INT64))
+    var host_mask = own(cpu_empty(vec_shape(n * columns), 1, ST_INT64))
     copy_to_host(ctx, mask.t.ptr, host_mask.t.ptr, n * columns * 8)
     var masks = Pointer[UInt64, MutUntrackedOrigin](
         unsafe_from_address=host_mask.t.ptr
@@ -84,7 +83,7 @@ def op_nms(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var removed = List[UInt64](capacity=columns)
     for _ in range(columns):
         removed.append(0)
-    var host_keep = own(cpu_empty(_shape(n), 1, ST_INT64))
+    var host_keep = own(cpu_empty(vec_shape(n), 1, ST_INT64))
     var kept = Pointer[Int64, MutUntrackedOrigin](
         unsafe_from_address=host_keep.t.ptr
     )
@@ -97,9 +96,9 @@ def op_nms(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         count += 1
         for j in range(word, columns):
             removed[j] |= masks[unsafe_offset=i * columns + j]
-    var keep = own(new_tensor(_shape(count), 1, ST_INT64, boxes.device))
+    var keep = own(new_tensor(vec_shape(count), 1, ST_INT64, boxes.device))
     copy_from_host(boxes.device, ctx, keep.t.ptr, host_keep.t.ptr, count * 8)
-    var out = own(new_tensor(_shape(count), 1, ST_INT64, boxes.device))
+    var out = own(new_tensor(vec_shape(count), 1, ST_INT64, boxes.device))
     var width = 1
     var odd = False
     while width < n:

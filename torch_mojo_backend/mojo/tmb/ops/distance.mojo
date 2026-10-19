@@ -46,6 +46,7 @@ from tmb.ops.common import (
     resize_out,
     scalar_type_name,
     expect_scalar_type,
+    int_prod,
 )
 from tmb.ops.composed import _dispatch, _tensor_value
 from tmb.backend.registry import Site, impl
@@ -151,13 +152,6 @@ def _batch_shape(x1: T, x2: T) raises -> List[Int]:
             )
         out.append(s2 if s1 == 1 else s1)
     return out^
-
-
-def _product(xs: List[Int]) -> Int:
-    var p = 1
-    for x in xs:
-        p *= x
-    return p
 
 
 def _shape_of(batch: List[Int], a: Int, b: Int) -> IndexList[MAX_RANK]:
@@ -274,7 +268,7 @@ def _cdist_forward(args: Values) raises -> Owned:
     var r1 = x1.dim(-2)
     var r2 = x2.dim(-2)
     var batch = _batch_shape(x1, x2)
-    var product = _product(batch)
+    var product = int_prod(batch)
     var out_rank = len(batch) + 2
     var out_shape = _shape_of(batch, r1, r2)
     if r1 == 0 or r2 == 0 or product == 0:
@@ -366,7 +360,7 @@ def _cdist_backward(args: Values) raises -> Owned:
     var r1 = x1.dim(-2)
     var r2 = x2.dim(-2)
     var batch = _batch_shape(x1, x2)
-    var product = _product(batch)
+    var product = int_prod(batch)
     if r1 == 0 or r2 == 0 or c1 == 0 or product == 0:
         # zeros_like(x1)
         var zeros = own(new_tensor(x1.shape, x1.rank, x1.stype, x1.device))

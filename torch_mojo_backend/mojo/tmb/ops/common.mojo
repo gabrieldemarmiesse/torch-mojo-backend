@@ -110,6 +110,37 @@ def _padded(shape: IndexList[MAX_RANK]) -> List[Int]:
     return out^
 
 
+def vec_shape(n: Int) -> IndexList[MAX_RANK]:
+    """`[n]`, leading-padded."""
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = n
+    return shape
+
+
+def mat_shape(rows: Int, cols: Int) -> IndexList[MAX_RANK]:
+    """`[rows, cols]`, leading-padded."""
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 2] = rows
+    shape[MAX_RANK - 1] = cols
+    return shape
+
+
+def padded_shape(dims: List[Int]) -> IndexList[MAX_RANK]:
+    """`dims` (at most MAX_RANK of them), leading-padded."""
+    var shape = IndexList[MAX_RANK](1)
+    var pad = MAX_RANK - len(dims)
+    for i in range(len(dims)):
+        shape[pad + i] = dims[i]
+    return shape
+
+
+def int_prod(xs: List[Int]) -> Int:
+    var p = 1
+    for x in xs:
+        p *= x
+    return p
+
+
 def shape_list_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
     """The last `rank` dims of a padded shape as torch prints an IntArrayRef:
     `[2, 3]`."""

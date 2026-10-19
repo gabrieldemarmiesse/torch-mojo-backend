@@ -83,6 +83,7 @@ from tmb.ops.common import (
     resize_storage_bytes,
     int_list_str,
     is_int_stype,
+    padded_shape,
 )
 
 
@@ -130,26 +131,11 @@ def _dims(t: T) -> List[Int]:
     return t.logical_shape()
 
 
-def _padded(dims: List[Int]) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    var r = len(dims)
-    for i in range(r):
-        shape[MAX_RANK - r + i] = dims[i]
-    return shape
-
-
 def _batch_dims(t: T) -> List[Int]:
     var out = List[Int]()
     for i in range(t.rank - 2):
         out.append(t.dim(i))
     return out^
-
-
-def _prod(dims: List[Int]) -> Int:
-    var p = 1
-    for d in dims:
-        p *= d
-    return p
 
 
 def _batch_count(t: T) -> Int:
@@ -174,7 +160,7 @@ def _fstrides(dims: List[Int]) -> IndexList[MAX_RANK]:
     """`batched_matrix_contiguous_strides(sizes, f_contig=True)`: C-ordered
     batches of column-major matrices."""
     var r = len(dims)
-    var shape = _padded(dims)
+    var shape = padded_shape(dims)
     var strides = contiguous_strides(shape, r)
     if r >= 2:
         strides[MAX_RANK - 1] = max(dims[r - 2], 1)
@@ -183,11 +169,13 @@ def _fstrides(dims: List[Int]) -> IndexList[MAX_RANK]:
 
 
 def _new_f(dims: List[Int], st: Int32, device: Int) raises -> T:
-    return new_strided(_padded(dims), _fstrides(dims), len(dims), st, device)
+    return new_strided(
+        padded_shape(dims), _fstrides(dims), len(dims), st, device
+    )
 
 
 def _new_c(dims: List[Int], st: Int32, device: Int) raises -> T:
-    return new_tensor(_padded(dims), len(dims), st, device)
+    return new_tensor(padded_shape(dims), len(dims), st, device)
 
 
 def _empty0(st: Int32, device: Int) raises -> T:
@@ -261,7 +249,7 @@ def _expand(t: T, dims: List[Int]) raises -> T:
                 ") at non-singleton dimension ",
                 i,
             )
-    return view_strided(t, _padded(dims), strides, r, t.offset)
+    return view_strided(t, padded_shape(dims), strides, r, t.offset)
 
 
 def _broadcast(a: List[Int], b: List[Int]) raises -> List[Int]:
@@ -1372,7 +1360,7 @@ def _unsqueeze_last(t: T) raises -> T:
     for i in range(t.rank):
         strides[MAX_RANK - (t.rank + 1) + i] = t.stride(i)
     strides[MAX_RANK - 1] = 1
-    return view_strided(t, _padded(d), strides, t.rank + 1, t.offset)
+    return view_strided(t, padded_shape(d), strides, t.rank + 1, t.offset)
 
 
 def _squeeze_last(t: T) raises -> T:
@@ -1381,7 +1369,7 @@ def _squeeze_last(t: T) raises -> T:
     var strides = IndexList[MAX_RANK](0)
     for i in range(t.rank - 1):
         strides[MAX_RANK - (t.rank - 1) + i] = t.stride(i)
-    return view_strided(t, _padded(d), strides, t.rank - 1, t.offset)
+    return view_strided(t, padded_shape(d), strides, t.rank - 1, t.offset)
 
 
 def _solve_ex(
@@ -2372,7 +2360,7 @@ def _unsqueeze_at_minus2(t: T) raises -> T:
         strides[MAX_RANK - (t.rank + 1) + i] = t.stride(i)
     strides[MAX_RANK - 2] = 0
     strides[MAX_RANK - 1] = t.stride(-1)
-    return view_strided(t, _padded(d), strides, t.rank + 1, t.offset)
+    return view_strided(t, padded_shape(d), strides, t.rank + 1, t.offset)
 
 
 def _svd(
@@ -2491,10 +2479,10 @@ def _cm_view(t: T, batch: List[Int], rows: Int, cols: Int) raises -> T:
     """A dense (*, cols, rows) row-major buffer seen as (*, rows, cols)
     column-major matrices."""
     var d = _with(batch.copy(), rows, cols)
-    var strides = contiguous_strides(_padded(d), len(d))
+    var strides = contiguous_strides(padded_shape(d), len(d))
     strides[MAX_RANK - 2] = 1
     strides[MAX_RANK - 1] = rows
-    return view_strided(t, _padded(d), strides, len(d), t.offset)
+    return view_strided(t, padded_shape(d), strides, len(d), t.offset)
 
 
 def _svd_args(args: Values) raises -> Tuple[T, Bool, Bool, Bool]:
@@ -3277,7 +3265,7 @@ def _view_b11(t: T) raises -> T:
     d.append(1)
     var strides = IndexList[MAX_RANK](0)
     strides[MAX_RANK - 3] = t.stride(0)
-    return view_strided(t, _padded(d), strides, 3, t.offset)
+    return view_strided(t, padded_shape(d), strides, 3, t.offset)
 
 
 def _matrix_exp(a: T) raises -> Owned:
@@ -3312,7 +3300,11 @@ def _matrix_exp(a: T) raises -> Owned:
     d3.append(n)
     var a3 = own(
         view_strided(
-            ac.t, _padded(d3), contiguous_strides(_padded(d3), 3), 3, 0
+            ac.t,
+            padded_shape(d3),
+            contiguous_strides(padded_shape(d3), 3),
+            3,
+            0,
         )
     )
     # operator_1_norm: abs().sum(-2).max(-1)

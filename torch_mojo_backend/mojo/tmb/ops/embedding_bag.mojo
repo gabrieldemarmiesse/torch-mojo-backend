@@ -72,6 +72,8 @@ from tmb.ops.common import (
     is_floating_dtype,
     scalar_type_name,
     expect_scalar_type,
+    vec_shape,
+    mat_shape,
 )
 from tmb.ops.unique import run_bounds, unique_flat
 
@@ -96,19 +98,6 @@ def _op(name: String, overload: String, var args: List[Value]) raises -> Owned:
     """One aten op through the dispatcher, its one Tensor result (owned)."""
     var r = call_op(name, overload, args^, 1)
     return own(r.take_tensor(0))
-
-
-def _vec(n: Int) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 1] = n
-    return shape
-
-
-def _mat(rows: Int, cols: Int) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 2] = rows
-    shape[MAX_RANK - 1] = cols
-    return shape
 
 
 def _zeros(
@@ -186,7 +175,7 @@ def _read_flags(flag: T) raises -> List[Bool]:
 
 def _read_int(t: T, i: Int) raises -> Int:
     """Element `i` of the contiguous int64 device tensor `t`."""
-    var host = own(cpu_empty(_vec(1), 1, ST_INT64))
+    var host = own(cpu_empty(vec_shape(1), 1, ST_INT64))
     var ctx = ctx_for(t.device)
     copy_to_host(ctx, t.ptr + i * 8, host.t.ptr, 8)
     _ = ctx
@@ -270,20 +259,21 @@ def op_embedding_bag(
     var offs = _as_int64(offsets)
     var device = weight.device
     var output = own(
-        new_tensor(_mat(num_bags, features), 2, weight.stype, device)
+        new_tensor(mat_shape(num_bags, features), 2, weight.stype, device)
     )
-    var offset2bag = _zeros(_vec(num_indices), 1, ST_INT64, device)
-    var bag_size = _zeros(_vec(offsets.dim(0)), 1, ST_INT64, device)
+    var offset2bag = _zeros(vec_shape(num_indices), 1, ST_INT64, device)
+    var bag_size = _zeros(vec_shape(offsets.dim(0)), 1, ST_INT64, device)
     var max_indices = own(
         new_tensor(
-            _mat(num_bags, features) if mode == _MODE_MAX else _vec(0),
+            mat_shape(num_bags, features) if mode
+            == _MODE_MAX else vec_shape(0),
             2 if mode == _MODE_MAX else 1,
             ST_INT64,
             device,
         )
     )
     if num_bags * features > 0:
-        var flag = _zeros(_vec(4), 1, ST_INT32, device)
+        var flag = _zeros(vec_shape(4), 1, ST_INT32, device)
         var ctx = ctx_for(device)
         var call = KernelCall("embedding_bag", "EmbeddingBagForward")
         call.arg_dtype(0, weight.dtype)
@@ -365,7 +355,7 @@ def op_embedding_bag(
 def _offset2bag(offsets: T, num_indices: Int, stype: Int32) raises -> Owned:
     """ATen's `make_offset2bag`: ones scattered at the offsets, minus one,
     cumulatively summed -- the bag of every index."""
-    var z = _zeros(_vec(num_indices + 1), 1, stype, offsets.device)
+    var z = _zeros(vec_shape(num_indices + 1), 1, stype, offsets.device)
     var ones = own(
         new_tensor(offsets.shape, offsets.rank, stype, offsets.device)
     )
@@ -483,7 +473,9 @@ def op_embedding_bag_dense_backward(
         alert_not_deterministic("embedding_bag_backward_cuda_max")
         # One spare row takes the empty bags (-1) and padding_idx, then is
         # dropped: no contribution is masked by a multiply (0 * inf).
-        var gw = _zeros(_mat(num_weights + 1, features), 2, grad.stype, device)
+        var gw = _zeros(
+            mat_shape(num_weights + 1, features), 2, grad.stype, device
+        )
         var neg = _op("aten::lt", "Scalar", [_t(max_indices), _scalar(0)])
         var mi = _op(
             "aten::masked_fill",
@@ -523,7 +515,9 @@ def op_embedding_bag_dense_backward(
         raise Error(
             "embedding_bag: per_sample_weights only supported with mode='sum'"
         )
-    var gw = own(new_tensor(_mat(num_weights, features), 2, grad.stype, device))
+    var gw = own(
+        new_tensor(mat_shape(num_weights, features), 2, grad.stype, device)
+    )
     if indices.numel == 0 or gw.t.numel == 0:
         fill_value(gw.t, 0.0)
         ret_owned(rets, 0, gw)
@@ -561,7 +555,7 @@ def op_embedding_bag_dense_backward(
     var perm = own(r.take_tensor(1))
     var runs = run_bounds(sorted.t)
     var partials = own(
-        new_tensor(_mat(n, features), 2, _acc_stype(grad), device)
+        new_tensor(mat_shape(n, features), 2, _acc_stype(grad), device)
     )
     for phase in range(2):
         var call = KernelCall("embedding_bag", "EmbeddingBagBackwardSorted")
@@ -628,7 +622,7 @@ def op_embedding_bag_per_sample_weights_backward(
     _check_bag_dtype(grad, "_embedding_bag_per_sample_weights_backward_cuda")
     var n = indices.numel
     if n == 0:
-        var e = own(new_tensor(_vec(0), 1, grad.stype, grad.device))
+        var e = own(new_tensor(vec_shape(0), 1, grad.stype, grad.device))
         ret_owned(rets, 0, e)
         return
     var acc = _acc_stype(grad)
@@ -733,7 +727,7 @@ def op_embedding_renorm_(
     var ctx = ctx_for(t.device)
     if t.dim(1) > 0:
         # The kernel's own bounds flag is a guard only: never set here.
-        var flag = _zeros(_vec(1), 1, ST_INT32, t.device)
+        var flag = _zeros(vec_shape(1), 1, ST_INT32, t.device)
         var call = KernelCall("embedding_bag", "EmbeddingRenorm")
         call.arg_dtype(0, t.dtype)
         call.int(t.ptr)

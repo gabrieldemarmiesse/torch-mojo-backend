@@ -52,17 +52,16 @@ from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import call_op, contiguous, decline_float8
-
-
-def _vec(n: Int) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 1] = n
-    return shape
+from tmb.ops.common import (
+    call_op,
+    contiguous,
+    decline_float8,
+    vec_shape,
+)
 
 
 def _empty(n: Int, stype: Int32, device: Int) raises -> Owned:
-    return own(new_tensor(_vec(n), 1, stype, device))
+    return own(new_tensor(vec_shape(n), 1, stype, device))
 
 
 def _op(name: String, overload: String, var args: List[Value]) raises -> Owned:
@@ -159,7 +158,9 @@ def _groups(
     var g = Groups()
     g.m = _read_last(gid.t) + 1
     if want_vals:
-        g.out_vals = own(new_tensor(_vec(g.m * inner), 1, data.stype, device))
+        g.out_vals = own(
+            new_tensor(vec_shape(g.m * inner), 1, data.stype, device)
+        )
     if want_rows:
         g.out_rows = _empty(g.m, ST_INT64, device)
     if want_inverse:
@@ -283,7 +284,9 @@ def _flat_view(t: T) raises -> Owned:
     """A contiguous 1-D tensor over every element of `t` (a copy when `t`
     is not contiguous)."""
     var c = own_if_new(contiguous(t), t)
-    var v = own(view_strided(c.t, _vec(c.t.numel), _vec(1), 1, c.t.offset))
+    var v = own(
+        view_strided(c.t, vec_shape(c.t.numel), vec_shape(1), 1, c.t.offset)
+    )
     _ = c^
     return v^
 

@@ -79,6 +79,7 @@ from tmb.ops.common import (
     scalar_to_float,
     scalar_to_int,
     scalar_type_name,
+    vec_shape,
 )
 from tmb.ops.reductions import (
     _cast_any,
@@ -165,12 +166,6 @@ def _zeros(
     return z^
 
 
-def _shape1(n: Int) -> IndexList[MAX_RANK]:
-    var s = IndexList[MAX_RANK](1)
-    s[MAX_RANK - 1] = n
-    return s
-
-
 def _view(t: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Owned:
     """A contiguous `t` viewed with another shape of the same element count."""
     return own(
@@ -239,8 +234,8 @@ def _mode_into(a: T, dim: Int, values: T, indices: T) raises:
         var dims = List[Int]()
         dims.append(dim)
         src = own(_permuted_contiguous(a, dims))
-    var sv = own(new_tensor(_shape1(rows * n), 1, a.stype, a.device))
-    var si = own(new_tensor(_shape1(rows * n), 1, ST_INT64, a.device))
+    var sv = own(new_tensor(vec_shape(rows * n), 1, a.stype, a.device))
+    var si = own(new_tensor(vec_shape(rows * n), 1, ST_INT64, a.device))
     _sort_rows_into(src.t, kdt, rows, n, n, False, False, sv.t, si.t)
     _ = src^  # alive past the sort
     var ctx = ctx_for(a.device)
@@ -366,11 +361,11 @@ def _histc_counts_float(
     """CUDA's `getBin` and atomic counts as a composition: elements in
     [lo, hi] (NaN never) land in `int((x - lo) * nbins / (hi - lo))` in the
     input's float type, the top edge folded into the last bin."""
-    var out = _zeros(_shape1(nbins), 1, a.stype, a.device)
+    var out = _zeros(vec_shape(nbins), 1, a.stype, a.device)
     if a.numel == 0:
         return out^
     var flat = own_if_new(contiguous(a), a)
-    var x = _view(flat.t, _shape1(a.numel), 1)
+    var x = _view(flat.t, vec_shape(a.numel), 1)
     var d = _call("aten::sub", "Scalar", [_t(x.t), _dbl(lo), _sint(1)])
     var p = _call("aten::mul", "Scalar", [_t(d.t), _sint(nbins)])
     var width: Float64
@@ -412,10 +407,10 @@ def _histc_counts_int(a: T, nbins: Int, lo: Int, hi: Int) raises -> Owned:
     bounds_t), never through a float, so bounds past 2**53 stay exact. The
     counts accumulate in int64 and convert to the input dtype at the end
     (CUDA adds into the narrow dtype directly; the wrap is the same)."""
-    var counts = _zeros(_shape1(nbins), 1, ST_INT64, a.device)
+    var counts = _zeros(vec_shape(nbins), 1, ST_INT64, a.device)
     if a.numel > 0:
         var flat = own_if_new(contiguous(a), a)
-        var x = _view(flat.t, _shape1(a.numel), 1)
+        var x = _view(flat.t, vec_shape(a.numel), 1)
         var xi = _cast(x.t, ST_INT64)
         var d = _call("aten::sub", "Scalar", [_t(xi.t), _sint(lo), _sint(1)])
         var p = _call("aten::mul", "Scalar", [_t(d.t), _sint(nbins)])
@@ -581,7 +576,7 @@ def op_bincount(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if minlength < 0:
         raise Error("minlength should be >= 0")
     if a.rank == 1 and a.numel == 0:
-        var z = _zeros(_shape1(minlength), 1, ST_INT64, a.device)
+        var z = _zeros(vec_shape(minlength), 1, ST_INT64, a.device)
         ret_owned(rets, 0, z)
         return
     if a.rank != 1:
@@ -600,7 +595,7 @@ def op_bincount(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if a.dtype != DType.uint8 and mm[0] < 0:
         raise Error("bincount only supports 1-d non-negative integral inputs.")
     var nbins = max(Int(mm[1]) + 1, minlength)
-    var out = _zeros(_shape1(nbins), 1, w_st, a.device)
+    var out = _zeros(vec_shape(nbins), 1, w_st, a.device)
     var idx = _cast(a, ST_INT64)
     var src: Owned
     if has_w:
@@ -655,7 +650,7 @@ def _column(x2d: T, d: Int) raises -> Owned:
     var strides = IndexList[MAX_RANK](0)
     strides[MAX_RANK - 1] = x2d.dim(1)
     return own(
-        view_strided(x2d, _shape1(x2d.dim(0)), strides, 1, x2d.offset + d)
+        view_strided(x2d, vec_shape(x2d.dim(0)), strides, 1, x2d.offset + d)
     )
 
 
@@ -741,7 +736,7 @@ def _hist_outer_edges(x2d: T, range_v: Value) raises -> List[Float64]:
 def _linspace_edges(
     lo: Float64, hi: Float64, bins: Int, like: T
 ) raises -> Owned:
-    var e = own(new_tensor(_shape1(bins + 1), 1, like.stype, like.device))
+    var e = own(new_tensor(vec_shape(bins + 1), 1, like.stype, like.device))
     _ = call_op(
         "aten::linspace",
         "out",
@@ -863,10 +858,10 @@ def _hist_counts(
             )
         shape[MAX_RANK - n + d] = nb
         total *= nb
-    var hist = _zeros(_shape1(total), 1, x2d.stype, x2d.device)
+    var hist = _zeros(vec_shape(total), 1, x2d.stype, x2d.device)
     if m > 0 and n > 0:
-        var flat = _zeros(_shape1(m), 1, ST_INT64, x2d.device)
-        var keep = own(new_tensor(_shape1(m), 1, ST_BOOL, x2d.device))
+        var flat = _zeros(vec_shape(m), 1, ST_INT64, x2d.device)
+        var keep = own(new_tensor(vec_shape(m), 1, ST_BOOL, x2d.device))
         fill_value(keep.t, 1.0)
         var stride = total
         for d in range(n):
@@ -922,10 +917,10 @@ def _hist_counts(
         var w: Owned
         if weight:
             var wd = own_if_new(contiguous(weight.value()), weight.value())
-            w = _view(wd.t, _shape1(m), 1)
+            w = _view(wd.t, vec_shape(m), 1)
             _ = wd^
         else:
-            w = own(new_tensor(_shape1(m), 1, x2d.stype, x2d.device))
+            w = own(new_tensor(vec_shape(m), 1, x2d.stype, x2d.device))
             fill_value(w.t, 1.0)
         var wk = _call(
             "aten::where", "ScalarOther", [_t(keep.t), _t(w.t), _dbl(0.0)]
@@ -955,9 +950,11 @@ def _hist_counts(
         var nb = edges[d].numel - 1
         var e = own_if_new(contiguous(edges[d]), edges[d])
         var hi = own(
-            view_strided(e.t, _shape1(nb), e.t.strides, 1, e.t.offset + 1)
+            view_strided(e.t, vec_shape(nb), e.t.strides, 1, e.t.offset + 1)
         )
-        var lo = own(view_strided(e.t, _shape1(nb), e.t.strides, 1, e.t.offset))
+        var lo = own(
+            view_strided(e.t, vec_shape(nb), e.t.strides, 1, e.t.offset)
+        )
         var widths = _sub(hi.t, lo.t)
         var wstrides = IndexList[MAX_RANK](0)
         wstrides[MAX_RANK - n + d] = 1
@@ -966,7 +963,7 @@ def _hist_counts(
         )
         var wfull = own(new_tensor(shape, n, widths.t.stype, widths.t.device))
         copy_strided_into(wfull.t, wexp.t)
-        var wflat = _view(wfull.t, _shape1(total), 1)
+        var wflat = _view(wfull.t, vec_shape(total), 1)
         var nn = _call("aten::div", "Tensor", [_t(normed.t), _t(wflat.t)])
         _ = normed^  # alive past the call that reads it
         normed = nn^
@@ -1012,7 +1009,7 @@ def _hist_flat_weight(w_v: Value) raises -> Tuple[Optional[Owned], Optional[T]]:
         return (Optional[Owned](None), Optional[T](None))
     var w = weight.value().copy()
     var wd = own_if_new(contiguous(w), w)
-    var wv = _view(wd.t, _shape1(w.numel), 1)
+    var wv = _view(wd.t, vec_shape(w.numel), 1)
     _ = wd^
     var t = wv.t.copy()
     return (Optional[Owned](wv^), Optional[T](t^))
@@ -1183,7 +1180,7 @@ def _dd_weight(
     if not weight:
         return (Optional[Owned](None), Optional[T](None))
     var wd = own_if_new(contiguous(weight.value()), weight.value())
-    var wv = _view(wd.t, _shape1(x2d.dim(0)), 1)
+    var wv = _view(wd.t, vec_shape(x2d.dim(0)), 1)
     _ = wd^
     var t = wv.t.copy()
     return (Optional[Owned](wv^), Optional[T](t^))

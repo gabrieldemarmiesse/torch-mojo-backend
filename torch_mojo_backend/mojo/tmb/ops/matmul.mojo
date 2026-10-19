@@ -104,6 +104,7 @@ from tmb.ops.common import (
     is_f32_f16_bf16,
     scalar_type_name,
     expect_scalar_type,
+    int_prod,
 )
 from tmb.ops.pointwise import _none_side, _p, _pw_run
 from tmb.ops.unary import _direct_unary_out, _gelu_spec, _unary_out
@@ -152,13 +153,6 @@ def _view(t: T, dims: List[Int]) raises -> T:
     return view_strided(
         t, shape, contiguous_strides(shape, len(dims)), len(dims), t.offset
     )
-
-
-def _prod(dims: List[Int]) -> Int:
-    var p = 1
-    for d in dims:
-        p *= d
-    return p
 
 
 def _leading_dims(t: T) -> List[Int]:
@@ -443,7 +437,7 @@ def _gemm_bridge(
         dims.append(n)
     else:
         dims = out_dims.copy()
-        if dims[len(dims) - 1] != n or _prod(dims) != m * n:
+        if dims[len(dims) - 1] != n or int_prod(dims) != m * n:
             return None
     # TT (both flags set) is launched directly rather than operand-swapped
     # into NN: the TT routes compute C straight into this contiguous row-major
@@ -600,7 +594,7 @@ def _try_gemm16_nt_bias_fused(
         dims.append(n)
     else:
         dims = out_dims.copy()
-        if dims[len(dims) - 1] != n or _prod(dims) != m * n:
+        if dims[len(dims) - 1] != n or int_prod(dims) != m * n:
             return None
     var out = own(_new(dims, stype, device))
     var ctx = ctx_for(device)
@@ -1532,7 +1526,7 @@ def _product(a: T, b: T, out_stype: Int32) raises -> T:
     and an empty reduction (k == 0: zeros) never reach a kernel."""
     var dims = _leading_dims(a)
     dims.append(b.dim(b.rank - 1))
-    if _prod(dims) == 0:
+    if int_prod(dims) == 0:
         return _new(dims, out_stype, a.device)
     if a.dim(a.rank - 1) == 0:
         return _zeros(dims, out_stype, a.device)
@@ -1759,7 +1753,7 @@ def _self_partial_overlap(dest: T, self: T, dims: List[Int]) raises:
     resized.rank = r
     resized.shape = _index_list(dims)
     resized.strides = contiguous_strides(resized.shape, r)
-    resized.numel = _prod(dims)
+    resized.numel = int_prod(dims)
     resized.contig = True
     assert_no_partial_overlap(resized, self)
 
@@ -2375,7 +2369,7 @@ def _baddbmm_run(
     var alpha = zero
     var beta = zero
     var k = b1.dim(2)
-    if _prod(dims) > 0:
+    if int_prod(dims) > 0:
         if k > 0:
             alpha = _coef(alpha_v, b1.stype)
             beta = _coef(beta_v, b1.stype)
@@ -3471,7 +3465,7 @@ def _linear_general(
     var k = a.dim(a.rank - 1)
     var n = w.dim(0)
     var lead = _leading_dims(a)
-    var rows = _prod(lead)
+    var rows = int_prod(lead)
     if w.dim(1) != k:
         raise Error(
             "mat1 and mat2 shapes cannot be multiplied (",
@@ -3649,7 +3643,7 @@ def op_linear_backward(
             _ret_undefined(rets, i)
         return
 
-    var rows = _prod(_leading_dims(input)) if input.rank > 1 else 1
+    var rows = int_prod(_leading_dims(input)) if input.rank > 1 else 1
     var in_features = input.dim(input.rank - 1)
     var out_features = w.dim(0)
     # PyTorch's registered Meta/MPS contract defines both parameter outputs

@@ -78,6 +78,7 @@ from tmb.ops.common import (
     shape_str,
     is_f32_f16_bf16,
     scalar_type_name,
+    padded_shape,
 )
 from tmb.ops.composed import _bool_list
 from tmb.backend.registry import Site, impl
@@ -99,14 +100,6 @@ comptime FUSED_FA_MAX_HEAD_DIM = 256
 # --- shapes, views, ownership -------------------------------------------------
 
 
-def _shape(dims: List[Int]) -> IndexList[MAX_RANK]:
-    var s = IndexList[MAX_RANK](1)
-    var pad = MAX_RANK - len(dims)
-    for i in range(len(dims)):
-        s[pad + i] = dims[i]
-    return s
-
-
 def _stride_list(vals: List[Int]) -> IndexList[MAX_RANK]:
     var s = IndexList[MAX_RANK](0)
     var pad = MAX_RANK - len(vals)
@@ -116,13 +109,13 @@ def _stride_list(vals: List[Int]) -> IndexList[MAX_RANK]:
 
 
 def _alloc(device: Int, stype: Int32, dims: List[Int]) raises -> T:
-    return new_tensor(_shape(dims), len(dims), stype, device)
+    return new_tensor(padded_shape(dims), len(dims), stype, device)
 
 
 def _view(base: T, dims: List[Int], strides: List[Int]) raises -> T:
     """A zero-copy view over `base`'s storage, at `base`'s storage offset."""
     return view_strided(
-        base, _shape(dims), _stride_list(strides), len(dims), base.offset
+        base, padded_shape(dims), _stride_list(strides), len(dims), base.offset
     )
 
 

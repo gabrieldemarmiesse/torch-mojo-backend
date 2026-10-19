@@ -88,6 +88,7 @@ from tmb.ops.common import (
     resize_out,
     same_view,
     expect_scalar_type,
+    vec_shape,
 )
 from tmb.ops.f8_iter import (
     f8_iter,
@@ -949,12 +950,6 @@ def _gn_dims3(a: Int, b: Int, c: Int) -> IndexList[MAX_RANK]:
     return shape
 
 
-def _gn_vector(n: Int) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 1] = n
-    return shape
-
-
 def _gn_grad_input(
     args: Values,
     gc: Owned,
@@ -1069,8 +1064,8 @@ def op_native_group_norm_backward(
         # Nothing to reduce: both affine gradients are zero over an empty
         # extent (ATen fills them with zeros too) and grad_input is empty.
         var gi = own(new_like(a))
-        var gw = _bn_zero_grad(_gn_vector(c), pst, a.device, mask[1])
-        var gb = _bn_zero_grad(_gn_vector(c), pst, a.device, mask[2])
+        var gw = _bn_zero_grad(vec_shape(c), pst, a.device, mask[1])
+        var gb = _bn_zero_grad(vec_shape(c), pst, a.device, mask[2])
         ret_owned(rets, 0, gi)
         ret_owned(rets, 1, gw)
         ret_owned(rets, 2, gb)
@@ -1110,7 +1105,7 @@ def op_native_group_norm_backward(
         var centered = _sub(s2g, shifted)
         var scaled = _mul(centered, rstd)
         var total = _dense(_sum_dims(scaled, batch, False))
-        var flat = _view_as(total, _gn_vector(c), 1)
+        var flat = _view_as(total, vec_shape(c), 1)
         var gw = _cast(flat, pst)
         ret_owned(rets, 1, gw)
     else:

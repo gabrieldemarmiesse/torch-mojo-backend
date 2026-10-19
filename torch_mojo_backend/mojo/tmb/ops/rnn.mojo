@@ -39,6 +39,7 @@ from tmb.ops.common import (
     shape_str,
     scalar_type_name,
     expect_scalar_type,
+    mat_shape,
 )
 
 
@@ -220,13 +221,6 @@ def _check_cell_sizes(
 # --- helpers -----------------------------------------------------------------
 
 
-def _shape2(a: Int, b: Int) -> IndexList[MAX_RANK]:
-    var s = IndexList[MAX_RANK](1)
-    s[MAX_RANK - 2] = a
-    s[MAX_RANK - 1] = b
-    return s
-
-
 def _dense(t: T) raises -> Owned:
     """`t` itself (borrowed) when contiguous, else an owned dense copy."""
     return own_if_new(contiguous(t), t)
@@ -275,8 +269,8 @@ def op_thnn_fused_lstm_cell(
     var hsz = cx.dim(1)
     var total = cx.numel
     var workspace = own(new_tensor(ig.shape, 2, ig.stype, ig.device))
-    var hy = own(new_tensor(_shape2(cx.dim(0), hsz), 2, cx.stype, cx.device))
-    var cy = own(new_tensor(_shape2(cx.dim(0), hsz), 2, cx.stype, cx.device))
+    var hy = own(new_tensor(mat_shape(cx.dim(0), hsz), 2, cx.stype, cx.device))
+    var cy = own(new_tensor(mat_shape(cx.dim(0), hsz), 2, cx.stype, cx.device))
     if total > 0:
         var igd = _dense(ig)
         var hgd = _dense(hg)
@@ -356,7 +350,7 @@ def op_thnn_fused_lstm_cell_backward_impl(
         expect_scalar_type(ws, gcy.value())
 
     var grad_gates = own(new_tensor(ws.shape, 2, ws.stype, ws.device))
-    var grad_cx = own(new_tensor(_shape2(n, hsz), 2, cx.stype, cx.device))
+    var grad_cx = own(new_tensor(mat_shape(n, hsz), 2, cx.stype, cx.device))
     var total = n * hsz
     if total > 0:
         var wsd = _dense(ws)
@@ -417,13 +411,13 @@ def op_thnn_fused_gru_cell(
     var total = hx.numel
     var workspace = own(
         new_tensor(
-            _shape2(hx.dim(0), hsz * GRU_WORKSPACE_MULTIPLIER),
+            mat_shape(hx.dim(0), hsz * GRU_WORKSPACE_MULTIPLIER),
             2,
             hx.stype,
             hx.device,
         )
     )
-    var hy = own(new_tensor(_shape2(hx.dim(0), hsz), 2, hx.stype, hx.device))
+    var hy = own(new_tensor(mat_shape(hx.dim(0), hsz), 2, hx.stype, hx.device))
     if total > 0:
         var igd = _dense(ig)
         var hgd = _dense(hg)
@@ -479,9 +473,9 @@ def op_thnn_fused_gru_cell_backward(
     expect_scalar_type(ghy, ws)
     var n = ws.dim(0)
     var hsz = ws.dim(1) // GRU_WORKSPACE_MULTIPLIER
-    var grad_ig = own(new_tensor(_shape2(n, hsz * 3), 2, ws.stype, ws.device))
-    var grad_hg = own(new_tensor(_shape2(n, hsz * 3), 2, ws.stype, ws.device))
-    var grad_hx = own(new_tensor(_shape2(n, hsz), 2, ghy.stype, ghy.device))
+    var grad_ig = own(new_tensor(mat_shape(n, hsz * 3), 2, ws.stype, ws.device))
+    var grad_hg = own(new_tensor(mat_shape(n, hsz * 3), 2, ws.stype, ws.device))
+    var grad_hx = own(new_tensor(mat_shape(n, hsz), 2, ghy.stype, ghy.device))
     var total = ghy.numel
     if total > 0:
         var ghyd = _dense(ghy)
