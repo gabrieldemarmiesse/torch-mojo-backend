@@ -78,6 +78,7 @@ from tmb.ops.common import (
     sizes_str,
     is_floating_dtype,
     scalar_type_name,
+    float_max,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
@@ -354,13 +355,8 @@ def _check_device_dtype(
 
 
 def _lowest_highest(dtype: DType) -> Tuple[Float64, Float64]:
-    if dtype == DType.float16:
-        return (-65504.0, 65504.0)
-    if dtype == DType.bfloat16:
-        return (-3.3895313892515355e38, 3.3895313892515355e38)
-    if dtype == DType.float64:
-        return (-1.7976931348623157e308, 1.7976931348623157e308)
-    return (-3.4028234663852886e38, 3.4028234663852886e38)
+    var m = float_max(dtype)
+    return (-m, m)
 
 
 # aten::uniform_(Tensor(a!) self, float from=0., float to=1., *, Generator? generator=None) -> Tensor(a!)

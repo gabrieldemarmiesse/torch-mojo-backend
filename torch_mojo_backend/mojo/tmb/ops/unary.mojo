@@ -67,6 +67,7 @@ from tmb.ops.common import (
     is_f32_f16_bf16,
     is_bitwise_dtype,
     scalar_type_name,
+    float_max,
 )
 from tmb.ops.f8_iter import (
     f8_iter,
@@ -1868,13 +1869,7 @@ def _nan_to_num_params(
     """The replacements, None resolved to 0 / the dtype's max / its lowest
     (all exact in float64, so the kernel's cast back to the dtype is too)."""
     _require_float_or_f64("nan_to_num", t)
-    var big = Float64(3.4028234663852886e38)
-    if t.dtype == DType.float16:
-        big = 65504.0
-    elif t.dtype == DType.bfloat16:
-        big = 3.3895313892515355e38
-    elif t.dtype == DType.float64:
-        big = 1.7976931348623157e308
+    var big = float_max(t.dtype)
     return (
         v_f64_or(nan, 0.0),
         big if v_is_none(posinf) else v_f64(posinf),

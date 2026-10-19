@@ -55,6 +55,7 @@ from tmb.ops.common import (
     fill_value,
     resize_out,
     scalar_type_name,
+    float_max,
 )
 from tmb.ops.data_movement import (
     _resolve_device,
@@ -432,17 +433,6 @@ def _overflow_error(dt: DType) -> Error:
     )
 
 
-def _float_limits(dt: DType) -> Float64:
-    """The largest finite value of the floating `dt`."""
-    if dt == DType.float16:
-        return 65504.0
-    if dt == DType.bfloat16:
-        return 3.3895313892515355e38
-    if dt == DType.float32:
-        return 3.4028234663852886e38
-    return 1.7976931348623157e308
-
-
 def _int_limits(dt: DType) -> Tuple[Int, Int]:
     if dt == DType.int8:
         return (-128, 127)
@@ -465,7 +455,7 @@ def _check_float_convertible(x: Float64, dt: DType) raises:
     if dt.is_floating_point():
         if x != x or not _is_finite(x):
             return
-        if abs(x) > _float_limits(dt):
+        if abs(x) > float_max(dt):
             raise _overflow_error(dt)
         return
     if x != x or not _is_finite(x):
@@ -488,7 +478,7 @@ def _check_convertible(v: Value, dt: DType) raises:
         return
     var x = v_int(v)
     if dt.is_floating_point():
-        if abs(Float64(x)) > _float_limits(dt):
+        if abs(Float64(x)) > float_max(dt):
             raise _overflow_error(dt)
         return
     var lim = _int_limits(dt)

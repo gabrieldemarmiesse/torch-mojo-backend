@@ -78,6 +78,7 @@ from tmb.ops.common import (
     scalar_type_name,
     store_generated_out,
     shape_list_str,
+    float_max,
 )
 
 # out= dtype rule of the op's TensorIterator (MODE_FN: no out, functional).
@@ -367,7 +368,7 @@ def softshrink_check(a: T, lam: Float64) raises:
     dtypes, then 0 <= lambd <= max of self's dtype (NaN fails)."""
     if not is_floating(a.stype):
         _refuse("softshrink_check", a.stype)
-    if not (lam >= 0 and lam <= _float_max(a.dtype)):
+    if not (lam >= 0 and lam <= float_max(a.dtype)):
         raise Error(
             "lambda must be in range [0, ",
             _float_max_str(a.dtype),
@@ -376,16 +377,6 @@ def softshrink_check(a: T, lam: Float64) raises:
             ", but found ",
             _fmt_g(lam),
         )
-
-
-def _float_max(dt: DType) -> Float64:
-    if dt == DType.float16:
-        return 65504.0
-    if dt == DType.bfloat16:
-        return 3.3895313892515355e38
-    if dt == DType.float32:
-        return 3.4028234663852886e38
-    return 1.7976931348623157e308
 
 
 def _float_max_str(dt: DType) -> String:

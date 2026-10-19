@@ -1672,17 +1672,6 @@ def _shrink_backward_p(args: Values) raises -> SIMD[DType.float64, 4]:
     return _lambd_p(args, 2, common)
 
 
-def _float_max(st: Int32) -> Float64:
-    """std::numeric_limits<scalar_t>::max() of a floating dtype."""
-    if st == ST_FLOAT16:
-        return 65504.0
-    if st == ST_BFLOAT16:
-        return 3.3895313892515355e38
-    if st == ST_FLOAT32:
-        return 3.4028234663852886e38
-    return 1.7976931348623157e308
-
-
 def _softshrink_check(args: Values) raises:
     """softshrink's meta (Activation.cpp's softshrink_check)."""
     softshrink_check(

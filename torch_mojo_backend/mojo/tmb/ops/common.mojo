@@ -659,6 +659,18 @@ def fill_value(t: T, value: Value) raises:
     _fill(t, s)
 
 
+def float_max(dt: DType) -> Float64:
+    """`std::numeric_limits<scalar_t>::max()` of half, bfloat16, float and
+    (anything else) double."""
+    if dt == DType.float16:
+        return 65504.0
+    if dt == DType.bfloat16:
+        return 3.3895313892515355e38
+    if dt == DType.float32:
+        return 3.4028234663852886e38
+    return 1.7976931348623157e308
+
+
 def _float8_max(dt: DType) -> Float64:
     """`std::numeric_limits<c10::Float8_*>::max()`."""
     if dt == DType.float8_e4m3fn:
