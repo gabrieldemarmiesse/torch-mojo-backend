@@ -1097,6 +1097,7 @@ def test_two_rank_watchdog_fault_then_destroy_report_mode(ccl: str):
     ), context
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.parametrize(
     "mode",
