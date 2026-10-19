@@ -20,6 +20,7 @@ from tmb.kernels.common.op_utils import (
     _raw_int,
     _raw_tuple_int,
     _raw_tuple_len,
+    _spec_dispatcher5,
 )
 
 from tmb.kernels.common.variant_gates import (
@@ -526,17 +527,6 @@ def _bias_add_chan_go(
         raise Error("unsupported dtype for fast bias add: " + String(dtype))
 
 
-def _bias_add_chan_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _bias_add_chan_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-    )
-
-
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -567,7 +557,7 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _im2col_dispatcher[_COL2IM, True](argv, argc)
             return 0
         comptime if _op_on["BiasAddChan"]():
-            _bias_add_chan_dispatcher(argv, argc)
+            _spec_dispatcher5[_bias_add_chan_go, "BiasAddChan"](argv, argc)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:

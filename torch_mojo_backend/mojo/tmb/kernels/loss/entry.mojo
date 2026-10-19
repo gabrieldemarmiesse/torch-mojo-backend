@@ -53,6 +53,7 @@ from tmb.kernels.common.op_utils import (
     _raw_int,
     _raw_tuple_int,
     _raw_tuple_len,
+    _spec_dispatcher9,
 )
 
 from tmb.kernels.common.variant_gates import (
@@ -620,36 +621,6 @@ def _nll_backward_go(
     )
 
 
-def _nll_forward_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _nll_forward_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
-
-
-def _nll_backward_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _nll_backward_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
-
-
 # ---------------------------------------------------------------------------
 # Generic NLL (every float dtype, weights, 1-D / 2-D / spatial)
 #
@@ -936,10 +907,12 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     """
     try:
         comptime if _op_on["NllLossForwardF32"]():
-            _nll_forward_dispatcher(argv, argc)
+            _spec_dispatcher9[_nll_forward_go, "NllLossForwardF32"](argv, argc)
             return 0
         comptime if _op_on["NllLossBackwardF32"]():
-            _nll_backward_dispatcher(argv, argc)
+            _spec_dispatcher9[_nll_backward_go, "NllLossBackwardF32"](
+                argv, argc
+            )
             return 0
         comptime if _op_on["Nll"]():
             _nll_dispatch[False](argv)

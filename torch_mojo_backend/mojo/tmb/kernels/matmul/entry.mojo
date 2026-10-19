@@ -6694,18 +6694,6 @@ def _bmm_causal_go(
         raise Error("BmmCausalF32 is Apple-GPU only")
 
 
-def _bmm_causal_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _bmm_causal_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
-
-
 # ---------------------------------------------------------------------------
 # In-place row-broadcast bias add: out[i] += bias[i % cols]. Used as the
 # addmm / conv-bias epilogue.
@@ -6884,35 +6872,6 @@ def _matmul_bias_launch[
         c_addr, a_addr, b_addr, 1, m, n, k, m * k, transpose_b, ctx
     )
     _bias_add_row[dt](c_addr, bias_addr, m * n, n, ctx)
-
-
-# METH_FASTCALL wrappers for the hot dispatchers (raw CPython unpack; the
-# internal Python callers guarantee argument types, and raise sites are
-# unsupported-dtype guards gated upstream).
-
-
-def _matmul_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _matmul_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
-
-
-def _bmm_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _bmm_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
 
 
 def _causal_bmm_go(
@@ -7538,13 +7497,13 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _spec_dispatcher3[_int_mm_spec_go, "IntMmSpec"](argv, argc)
             return 0
         comptime if _op_on["Matmul"]():
-            _matmul_dispatcher(argv, argc)
+            _spec_dispatcher6[_matmul_go, "Matmul"](argv, argc)
             return 0
         comptime if _op_on["Bmm"]():
-            _bmm_dispatcher(argv, argc)
+            _spec_dispatcher6[_bmm_go, "Bmm"](argv, argc)
             return 0
         comptime if _op_on["BmmCausalF32"]():
-            _bmm_causal_dispatcher(argv, argc)
+            _spec_dispatcher6[_bmm_causal_go, "BmmCausalF32"](argv, argc)
             return 0
         comptime if _op_on["CausalBmm"]():
             _spec_dispatcher6[_causal_bmm_go, "CausalBmm"](argv, argc)

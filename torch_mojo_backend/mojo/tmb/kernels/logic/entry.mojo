@@ -54,6 +54,9 @@ from tmb.kernels.common.op_utils import (
     _raw_int,
     _raw_tuple_int,
     _spec_dispatcher3,
+    _spec_dispatcher5,
+    _spec_dispatcher8,
+    _spec_dispatcher9,
     _spec_ptr,
     custom_remainder,
 )
@@ -900,17 +903,6 @@ def _bitwise_not_go(
         )
 
 
-def _bitwise_not_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _bitwise_not_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-    )
-
-
 # ---------------------------------------------------------------------------
 # isin: out[i] = (x[i] in test[0..n_test)) ^ invert. Integer dtypes only
 # (float equality-by-value is gated out on the Python side). The inner loop
@@ -993,20 +985,6 @@ def _isin_go(
                 handled = True
     if not handled:
         raise Error("unsupported dtype for fast isin: " + String(dtype_val))
-
-
-def _isin_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _isin_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1113,21 +1091,6 @@ def _clamp_scalar_go(
                 handled = True
     if not handled:
         raise Error("unsupported dtype for fast clamp: " + String(dtype_val))
-
-
-def _clamp_scalar_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _clamp_scalar_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1656,21 +1619,6 @@ def _addr_bcast_go(
         raise Error("unsupported dtype for fast addr op: " + String(dtype_val))
 
 
-def _addr_bcast_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _addr_bcast_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
-
-
 # ---------------------------------------------------------------------------
 # TensorSpec entries (agents_docs/tensor_spec_design.md): the whole binary-broadcast
 # op prologue — input checks, broadcast layout, output alloc, kernel launch —
@@ -1994,13 +1942,13 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             ](argv, argc)
             return 0
         comptime if _op_on["BitwiseNot"]():
-            _bitwise_not_dispatcher(argv, argc)
+            _spec_dispatcher5[_bitwise_not_go, "BitwiseNot"](argv, argc)
             return 0
         comptime if _op_on["IsIn"]():
-            _isin_dispatcher(argv, argc)
+            _spec_dispatcher8[_isin_go, "IsIn"](argv, argc)
             return 0
         comptime if _op_on["ClampScalar"]():
-            _clamp_scalar_dispatcher(argv, argc)
+            _spec_dispatcher9[_clamp_scalar_go, "ClampScalar"](argv, argc)
             return 0
         comptime if _op_on["AddcmulBcast"]():
             _ternary_bcast_dispatcher[TOP_ADDCMUL](argv, argc)
@@ -2012,7 +1960,7 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _cross_dispatcher(argv, argc)
             return 0
         comptime if _op_on["AddrBcast"]():
-            _addr_bcast_dispatcher(argv, argc)
+            _spec_dispatcher9[_addr_bcast_go, "AddrBcast"](argv, argc)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:
