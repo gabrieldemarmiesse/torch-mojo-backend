@@ -3029,14 +3029,8 @@ def test_every_mojo_device_is_a_real_accelerator():
 def function_equivalent_on_both_devices(
     func, device, *args, rtol=1e-4, atol=1e-4, **kwargs
 ):
-    # This helper checks forward values only. Keeping the first forward's
-    # autograd graph alive while the same closure-owned module moves back to
-    # CPU adds a legitimate TensorImpl reference, which PyTorch's required
-    # swap-on-conversion path rejects. Avoid manufacturing that unrelated
-    # lifetime condition in forward-equivalence tests.
-    with torch.no_grad():
-        out1 = func(*args, device=device, **kwargs)
-        out2 = func(*args, device="cpu", **kwargs)
+    out1 = func(*args, device=device, **kwargs)
+    out2 = func(*args, device="cpu", **kwargs)
     if isinstance(out1, list | tuple):
         assert type(out1) is type(out2)
     else:

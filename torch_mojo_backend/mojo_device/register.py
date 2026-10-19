@@ -44,11 +44,6 @@ def register_mojo_devices():
         # mismatch only shows up as CUDA_ERROR_INVALID_IMAGE at the first op.
         _ptxas.check()
         if not _torch_registered:
-            # Module._apply otherwise replaces a shared CPU Parameter
-            # independently in each child module; swapping preserves tied
-            # weights (GPT-2's token embedding and lm_head) as one Parameter
-            # and one allocation.
-            torch.__future__.set_swap_module_params_on_conversion(True)
             torch.utils.rename_privateuse1_backend("mojo")
             torch._register_device_module("mojo", device_module)
             torch.utils.generate_methods_for_privateuse1_backend()

@@ -48,6 +48,8 @@ from tmb.backend.abi import (
     TAG_BOOL,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
+    TAG_TENSOR,
+    TAG_TENSOR_REF,
     IntList,
     Owned,
     StorageArg,
@@ -3822,6 +3824,45 @@ def op_is_set_to(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_bool(rets, 0, same)
 
 
+def _on_dense_backend(v: Value) raises -> Bool:
+    """On one of `TensorImpl::has_compatible_shallow_copy_type`'s dense
+    backends (CPU, CUDA, HIP, XPU, MPS, HPU, MTIA) or on PrivateUse1. Reads
+    the device type alone, not a `T`, so a parameter of any rank passes."""
+    if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
+        raise Error("expected a Tensor argument, got record tag ", v.tag)
+    var d = Int(external_call["tmb_tensor_device_type", Int32](Int(v.a)))
+    return (
+        d == DEVICE_TYPE_CPU
+        or d == DEVICE_TYPE_PRIVATEUSE1
+        or d == 1  # CUDA
+        or d == 6  # HIP
+        or d == 12  # XPU
+        or d == 13  # MPS
+        or d == 15  # HPU
+        or d == 19  # MTIA
+    )
+
+
+# aten::_has_compatible_shallow_copy_type(Tensor self, Tensor from) -> bool
+def op_has_compatible_shallow_copy_type(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """Whether `self.data = from` may shallow-copy `from` into `self`'s
+    TensorImpl. `Module._apply` keeps a Parameter object (tied weights,
+    optimizer state, weakrefs) only when it may; upstream's default leaves
+    PrivateUse1 out of its dense backends and has backends override this op
+    instead (pytorch#172564, as OpenReg does). A sparse or Meta argument
+    outranks PrivateUse1 in dispatch and keeps torch's default kernel, so
+    only dense tensors reach this one and the device types decide, as for
+    CPU <-> CUDA."""
+    ret_bool(
+        rets,
+        0,
+        _on_dense_backend(args[unsafe_offset=0])
+        and _on_dense_backend(args[unsafe_offset=1]),
+    )
+
+
 comptime _INT64_MAX = 9223372036854775807
 
 
@@ -4129,6 +4170,10 @@ def register_data_movement(site: Site) raises:
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
     impl[op_set_, "set_"](site)
     impl[op_is_set_to, "is_set_to"](site)
+    impl[
+        op_has_compatible_shallow_copy_type,
+        "_has_compatible_shallow_copy_type",
+    ](site)
     impl[op_resize_, "resize_"](site)
     impl[op_from_file, "from_file"](site)
     impl[op_set_source_storage, "set_.source_Storage"](site)

@@ -26,12 +26,9 @@ def test_module_to_mojo_preserves_tied_parameters(mojo_device):
 
     module.to(mojo_device)
 
-    # `set_swap_module_params_on_conversion` (turned on by `register_mojo_devices`)
-    # swaps a shared Parameter's storage once rather than duplicating it per
-    # module, so identity -- and therefore the underlying allocation -- stays
-    # shared after `.to()`. Real native tensors carry no extra attributes to
-    # inspect directly; `data_ptr()` is the public way to confirm one
-    # allocation is shared.
+    # The mojo `_has_compatible_shallow_copy_type` kernel lets `Module._apply`
+    # move a shared Parameter in place (`.data =`), as for CUDA, so identity
+    # -- and therefore the underlying allocation -- stays shared after `.to()`.
     assert module.embedding.weight is module.projection.weight
     embedding_weight = module.embedding.weight
     projection_weight = module.projection.weight
