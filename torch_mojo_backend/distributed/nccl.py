@@ -113,9 +113,8 @@ def _candidate_librccl_paths() -> list[str]:
     runtime_dir = hip_peer.runtime_dir()
     if runtime_dir is not None:
         candidates.append(str(runtime_dir / "librccl.so.1"))
-    for root in (os.environ.get("ROCM_PATH"), "/opt/rocm"):
-        if root:
-            candidates.append(str(Path(root) / "lib" / "librccl.so.1"))
+    for root in hip_peer.rocm_roots():
+        candidates.append(str(root / "lib" / "librccl.so.1"))
     candidates += ["librccl.so.1", "librccl.so"]
     return candidates
 

@@ -40,7 +40,7 @@ _SONAMES = ("libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so")
 HIP_SUCCESS = 0
 
 
-def _rocm_roots() -> list[Path]:
+def rocm_roots() -> list[Path]:
     """Where MAX looks for its HIP runtime, in its order: $ROCM_PATH, then
     /opt/rocm ($HIP_PATH is the older spelling of the first)."""
     roots = []
@@ -79,7 +79,7 @@ def _mapped_runtime_path() -> Path | None:
     ROCm install MAX resolves its runtime from over any other.
     """
     mapped = _mapped_runtime_paths()
-    for root in _rocm_roots():
+    for root in rocm_roots():
         for path in mapped:
             if root.resolve() in path.resolve().parents:
                 return path
@@ -93,7 +93,7 @@ def _candidate_runtime_paths() -> list[str]:
         candidates.append(str(mapped))
     # The install MAX will use comes before whatever LD_LIBRARY_PATH resolves
     # a bare soname to, so a pre-MAX call cannot bind a different runtime.
-    for root in _rocm_roots():
+    for root in rocm_roots():
         candidates.extend(str(root / "lib" / name) for name in _SONAMES)
     candidates.extend(_SONAMES)
     return candidates
