@@ -22,9 +22,11 @@ def test_asinh_matches_cuda(cuda_oracle: CudaOracle):
 ```
 
 - `assert_bitwise_equal(fn, *args, kwargs=None, ...)` copies every tensor of
-  `args`/`kwargs` to each device, calls `fn`, and compares the result **and the
-  inputs after the call** (so in-place ops and `out=` are covered). `.to()`
-  makes views dense: build strided operands inside `fn`.
+  `args`/`kwargs` to each device (one copy per tensor object: `x` passed twice
+  stays one tensor; a view arrives as a dense copy, so build strided or
+  overlapping operands inside `fn`), calls `fn`, and compares the result
+  **and the inputs after the call**, raised or not (so in-place ops, `out=`
+  and validation order are covered).
 - `assert_bitwise_equal_by_device(fn, ...)` calls `fn(device)` on both.
 - `run_by_device(fn, seed=None)` returns `(ours, cuda)` for a custom
   comparison; `assert_bits_equal(ours, cuda, ...)` and `tensor_mismatch(...)`
@@ -37,7 +39,7 @@ def test_asinh_matches_cuda(cuda_oracle: CudaOracle):
     same exception type; `True` also compares the first line, with device
     names folded to `DEV`.
   - `seed=`: `torch.manual_seed(seed)` before each side, and the device
-    generator's state after the call must match too.
+    generator's state after the call must match too (raised or not).
 - Outputs can be tensors of any dtype (bool, ints incl. unsigned, fp16, bf16,
   float8, complex by parts) or scalars, nested in tuples/lists/dicts. A
   failure prints the mismatch count and the first indices with both bit
@@ -46,7 +48,8 @@ def test_asinh_matches_cuda(cuda_oracle: CudaOracle):
 The `cuda_oracle` fixture skips off NVIDIA and without a CUDA torch whose
 driver initializes; on a CI runner with an NVIDIA GPU it fails instead, so the
 parity tests cannot silently stop running. It is a GPU fixture (root
-`conftest.py`), so its tests land in CI's mojo-device GPU job.
+`conftest.py`), so its tests land in CI's mojo-device GPU job, and it marks
+them `cuda_oracle` (`pytest -m cuda_oracle` selects them all).
 
 ## What does not work with both devices in one process
 
@@ -79,8 +82,7 @@ them up too, and the mojo device works unchanged):
 ```bash
 srun -p kyutai_shell -c 10 --mem=30G --gres=gpu:1 bash -c '
   export LD_LIBRARY_PATH=$HOME/ddp_work/cuda_oracle/compat_x/usr/local/cuda-13.0/compat
-  uv run --no-sync pytest tests/native/test_cuda_oracle.py tests/native/test_random_parity.py \
-    tests/native/test_unary.py -k "cuda" tests/native/test_binary.py tests/native/test_float8.py'
+  uv run --no-sync pytest tests/native -m cuda_oracle'
 ```
 
 Consumer GPUs have no forward compatibility: use a driver >= 580, or a venv

@@ -2191,12 +2191,13 @@ def _out_order_ops(dev):
 @pytest.mark.parametrize("odt", _OUT_ORDER_DTYPES)
 @pytest.mark.parametrize("op", list(_out_order_ops("cpu")))
 def test_float8_out_order_matches_cuda(cuda_oracle: CudaOracle, op, odt):
-    def run(dev: str) -> tuple[str, torch.Tensor]:
+    def run(dev: str) -> tuple[str, torch.Tensor | tuple[int, ...]]:
         out = torch.empty(0, dtype=getattr(torch, odt), device=dev)
         try:
             _out_order_ops(dev)[op](out)
         except (RuntimeError, NotImplementedError) as e:
-            return f"{type(e).__name__}: {error_message(e)}", out
+            # a resized out holds uninitialized memory: its shape only
+            return f"{type(e).__name__}: {error_message(e)}", tuple(out.shape)
         return "ok", out
 
     ours, cuda = cuda_oracle.run_by_device(run)

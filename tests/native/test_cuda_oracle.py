@@ -58,6 +58,7 @@ def test_complex_names_the_part():
     report = tensor_mismatch(a, b)
     assert report is not None and "[1].imag: ours 0x40800000 (4.0)" in report
     assert tensor_mismatch(a.conj(), a.conj().resolve_conj()) is None
+    assert tensor_mismatch(a.conj(), a.conj(), nan="any", signed_zero=False) is None
 
 
 def test_dtype_shape_and_stride():
@@ -97,3 +98,27 @@ def test_round_trip_on_both_devices(cuda_oracle: CudaOracle):
         cuda_oracle.assert_bitwise_equal_by_device(
             lambda d: torch.neg(x.to(d)) if d.startswith("cuda") else x.to(d)
         )
+
+
+def test_inputs_alias_and_errors_keep_state(cuda_oracle: CudaOracle):
+    x = torch.arange(4.0)
+    # one tensor passed twice is one tensor on each device
+    cuda_oracle.assert_bitwise_equal(lambda a, b: a.add_(1) is b, x, x)
+
+    # both raise, but only the mojo side wrote its input first
+    def wrote(t: torch.Tensor):
+        if t.device.type == "mojo":
+            t.zero_()
+        raise RuntimeError("same")
+
+    with pytest.raises(AssertionError, match="3 of 4 elements differ"):
+        cuda_oracle.assert_bitwise_equal(wrote, x)
+
+    # and a draw before the raise moves only the mojo generator
+    def draw_then_raise(d: str):
+        if d.startswith("mojo"):
+            torch.rand(4, device=d)
+        raise RuntimeError("same")
+
+    with pytest.raises(AssertionError, match="differ"):
+        cuda_oracle.assert_bitwise_equal_by_device(draw_then_raise, seed=1)

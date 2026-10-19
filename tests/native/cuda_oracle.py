@@ -116,9 +116,12 @@ def tensor_mismatch(
     if (ours.is_floating_point() or ours.is_complex()) and (
         nan == "any" or not signed_zero
     ):
-        real = torch.view_as_real if ours.is_complex() else (lambda t: t)
-        x = real(ours.detach().cpu()).to(torch.float64)
-        y = real(cuda.detach().cpu()).to(torch.float64)
+
+        def real(t: torch.Tensor) -> torch.Tensor:
+            t = t.detach().resolve_conj().resolve_neg().cpu()
+            return (torch.view_as_real(t) if t.is_complex() else t).to(torch.float64)
+
+        x, y = real(ours), real(cuda)
         if nan == "any":
             same |= x.isnan() & y.isnan()
         if not signed_zero:
@@ -145,14 +148,28 @@ def _scalar_bits(v: float) -> int:
     return struct.unpack("<Q", struct.pack("<d", v))[0]
 
 
+def _raised_mismatch(ours: object, cuda: object, check_message: bool) -> str | None:
+    a = ours.summary(check_message) if isinstance(ours, Raised) else None
+    b = cuda.summary(check_message) if isinstance(cuda, Raised) else None
+    if a == b:
+        return None
+    return (
+        f"ours {a or f'returned {_describe(ours)}'},"
+        f" CUDA {b or f'returned {_describe(cuda)}'}"
+    )
+
+
 def _leaf_mismatch(
     ours: object,
     cuda: object,
     nan: NanPolicy,
     signed_zero: bool,
     check_stride: bool,
+    check_message: bool,
     inputs: Sequence[torch.Tensor],
 ) -> str | None:
+    if isinstance(ours, Raised) or isinstance(cuda, Raised):
+        return _raised_mismatch(ours, cuda, check_message)
     if isinstance(ours, torch.Tensor) and isinstance(cuda, torch.Tensor):
         return tensor_mismatch(
             ours,
@@ -179,6 +196,18 @@ def _leaf_mismatch(
     return None if ours == cuda else f"ours {ours!r}, CUDA {cuda!r}"
 
 
+def _describe(value: object) -> str:
+    """`value` with each tensor as its dtype and shape."""
+    return repr(
+        tree_map(
+            lambda v: (
+                f"<{v.dtype} {tuple(v.shape)}>" if isinstance(v, torch.Tensor) else v
+            ),
+            value,
+        )
+    )
+
+
 def assert_bits_equal(
     ours: object,
     cuda: object,
@@ -196,21 +225,18 @@ def assert_bits_equal(
     float by its bits). An exception on one side matches the same exception
     type on the other (and its first line too with `check_message`)."""
     prefix = f"{what}: " if what else ""
-    if isinstance(ours, Raised) or isinstance(cuda, Raised):
-        a = ours.summary(check_message) if isinstance(ours, Raised) else None
-        b = cuda.summary(check_message) if isinstance(cuda, Raised) else None
-        if a != b:
-            raise AssertionError(
-                f"{prefix}ours {a or f'returned {ours!r}'}, CUDA"
-                f" {b or f'returned {cuda!r}'}"
-            )
-        return
     ours_leaves, ours_spec = tree_flatten(ours)
     cuda_leaves, cuda_spec = tree_flatten(cuda)
     if ours_spec != cuda_spec:
+        if any(isinstance(v, Raised) for v in ours_leaves + cuda_leaves):
+            raise AssertionError(
+                f"{prefix}{_raised_mismatch(ours, cuda, check_message)}"
+            )
         raise AssertionError(f"{prefix}structure: ours {ours_spec}, CUDA {cuda_spec}")
     for k, (a, b) in enumerate(zip(ours_leaves, cuda_leaves, strict=True)):
-        why = _leaf_mismatch(a, b, nan, signed_zero, check_stride, inputs)
+        why = _leaf_mismatch(
+            a, b, nan, signed_zero, check_stride, check_message, inputs
+        )
         if why is not None:
             leaf = f"output {k}: " if len(ours_leaves) > 1 else ""
             raise AssertionError(f"{prefix}{leaf}{why}")
@@ -242,10 +268,7 @@ class CudaOracle:
         for device in (self.mojo, self.cuda):
             if seed is not None:
                 torch.manual_seed(seed)
-            try:
-                results.append(fn(device))
-            except Exception as error:  # noqa: BLE001 -- compared, not raised
-                results.append(Raised(error))
+            results.append(_call(fn, device))
         return results[0], results[1]
 
     def assert_bitwise_equal_by_device(
@@ -262,10 +285,11 @@ class CudaOracle:
     ):
         """`fn(device)` must give the same bits on both devices. With `seed`,
         each side starts from `torch.manual_seed(seed)` and must also leave
-        the device generator in the same state."""
+        the device generator in the same state, whether `fn` returned or
+        raised."""
 
         def with_state(device: str) -> object:
-            out = fn(device)
+            out = _call(fn, device)
             return (out, self.rng_state(device)) if seed is not None else out
 
         ours, cuda = self.run_by_device(with_state, seed=seed)
@@ -294,19 +318,27 @@ class CudaOracle:
     ):
         """`fn(*args, **kwargs)` must give the same bits on both devices.
         Every tensor in `args` / `kwargs` (nested too) is copied to the
-        device first (`.to(device)`: a view arrives dense, so build strided
-        operands inside `fn`); the inputs are compared after the call too,
-        which covers in-place ops and `out=`."""
+        device first, one copy per distinct tensor object (passing `x` twice
+        aliases the two; a view arrives as a dense copy that aliases nothing,
+        so build strided or overlapping operands inside `fn`). The inputs are
+        compared after the call too, raised or not, which covers in-place ops
+        and `out=`."""
         flat_inputs = [
             t for t in tree_flatten((args, kwargs))[0] if isinstance(t, torch.Tensor)
         ]
 
         def call(device: str) -> object:
-            moved = tree_map(
-                lambda v: v.to(device) if isinstance(v, torch.Tensor) else v,
-                (args, kwargs or {}),
-            )
-            out = fn(*moved[0], **moved[1])
+            copies: dict[int, torch.Tensor] = {}
+
+            def copy(v: object) -> object:
+                if not isinstance(v, torch.Tensor):
+                    return v
+                if id(v) not in copies:
+                    copies[id(v)] = v.to(device, copy=True)
+                return copies[id(v)]
+
+            moved = tree_map(copy, (args, kwargs or {}))
+            out = _call(lambda _: fn(*moved[0], **moved[1]), device)
             return {"result": out, "inputs_after": moved}
 
         self.assert_bitwise_equal_by_device(
@@ -319,6 +351,13 @@ class CudaOracle:
             inputs=flat_inputs,
             what=what,
         )
+
+
+def _call(fn: Callable[[str], object], device: str) -> object:
+    try:
+        return fn(device)
+    except Exception as error:  # noqa: BLE001 -- compared, not raised
+        return Raised(error)
 
 
 def cuda_oracle_for(mojo_gpu: str) -> CudaOracle:
