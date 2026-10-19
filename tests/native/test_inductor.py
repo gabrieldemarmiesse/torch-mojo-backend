@@ -4,16 +4,25 @@ and stream, and every result is checked against the same function on CPU."""
 
 import pytest
 import torch
+import torch._dynamo.exc
 import torch._inductor.metrics
 import torch._inductor.utils
+import torch.utils._triton
 
 pytest.importorskip("triton")
 
+import triton.backends  # noqa: E402
+
 from torch_mojo_backend import monkeypatching  # noqa: E402
-from torch_mojo_backend.inductor import enable_inductor, get_raw_stream  # noqa: E402
+from torch_mojo_backend.inductor import (  # noqa: E402
+    MojoInterface,
+    enable_inductor,
+    get_raw_stream,
+)
 from torch_mojo_backend.native import (
     device_module,  # noqa: E402 -- `torch.mojo` itself, under a name ty can resolve
 )
+from torch_mojo_backend.triton_driver import accelerator_api  # noqa: E402
 
 pytestmark = pytest.mark.cpu_torch
 
@@ -146,3 +155,22 @@ def test_launch_follows_the_current_mojo_stream(mojo_inductor):
     assert get_raw_stream(0) != device_module.stream_native_handle(s)
     s.synchronize()
     assert float(out.sum().cpu()) == 14.0 * (1 << 22)
+
+
+def test_has_triton_is_false_when_triton_lacks_the_vendor_backend(
+    mojo_inductor, monkeypatch
+):
+    """torch >= 2.14's has_triton() asks MojoInterface, and reads only
+    TritonUnavailableError as "no": any other error escapes has_triton()."""
+    vendor = "amd" if accelerator_api() == "hip" else "nvidia"
+    monkeypatch.delitem(triton.backends.backends, vendor)
+    unavailable = getattr(torch._dynamo.exc, "TritonUnavailableError", RuntimeError)
+    with pytest.raises(unavailable, match="not built"):
+        MojoInterface.raise_if_triton_unavailable()
+    if monkeypatching._TORCH_BELOW_2_14:
+        return  # our has_triton patch does not ask the interface
+    torch.utils._triton.has_triton.cache_clear()
+    try:
+        assert not torch.utils._triton.has_triton()
+    finally:
+        torch.utils._triton.has_triton.cache_clear()
