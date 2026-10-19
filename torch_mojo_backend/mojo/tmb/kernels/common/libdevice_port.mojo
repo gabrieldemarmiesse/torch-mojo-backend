@@ -1516,41 +1516,7 @@ def nv_erfc(a: Float64) -> Float64:
             return Float64(2.0) if hi < Int32(0) else Float64(0.0)
         return a + a
     var x = _i2d(alo, ahi)
-    var r = _rcp_d(x + Float64(4.0))
-    var q = (x - Float64(4.0)) * r
-    var f = fma(Float64(-4.0), _add_rn_d(q, Float64(1.0)), x)
-    f = fma(-q, x, f)
-    var z = fma(r, f, q)
-    var p = _poly[
-        0xBDF8774AD4E0BFD7,
-        0xBE44E1C6FD03D328,
-        0xBE4330149F7A56B6,
-        0x3E7BEDDED8376273,
-        0x3E6F9254C3ABF22B,
-        0xBEAB9068C2148CF0,
-        0x3E94C6454DB34009,
-        0x3ED7F1C378F2311D,
-        0xBEE78E051C6D5C58,
-        0xBEF995B4EAD14A90,
-        0x3F23BE27CF0A29B2,
-        0xBF2A1DEF3E81672E,
-        0xBF48D4ABE68C1713,
-        0x3F749C67210DD6B4,
-        0xBF9096238568E357,
-        0x3FA3079EDF8C2DC9,
-        0xBFB0FB06DFF601FC,
-        0x3FB7FEE004DFBCDC,
-        0xBFB9DDB23C3DB8C6,
-        0x3FB16ECEFCFA5FDA,
-        0x3F8F7F5DF66FB6D6,
-        0xBFC1DF1AD154A29D,
-        0x3FF3BA5916E9FD7F,
-    ](z)
-    # p / (1 + 2x), refined
-    var rd = _rcp_d(fma(Float64(2.0), x, Float64(1.0)))
-    var g = p * rd
-    var h = _sub_rn_d(fma(x, Float64(-2.0) * g, p), g)
-    var y = fma(h, rd, g)
+    var y = _erfcx_kernel(x)
     # exp(-x^2) as __nv_exp, the rounding of x^2 corrected
     var mx2 = (-x) * x
     var kk = fma(mx2, _d(0x3FF71547652B82FE), _d(0x4338000000000000))
@@ -1925,3 +1891,79 @@ def nv_acos(a: Float64) -> Float64:
             _d(0x400921FB54442D18), _add_rn_d(t, _d(0xBCA1A62633145C07))
         )
     return t
+
+
+# --------------------------------------------------------------------------- #
+# __nv_erfcx
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _erfcx_kernel(x: Float64) -> Float64:
+    """erfcx(x) for 0 <= x < 32: the rational kernel of `__nv_erfc`."""
+    var r = _rcp_d(x + Float64(4.0))
+    var q = (x - Float64(4.0)) * r
+    var f = fma(Float64(-4.0), _add_rn_d(q, Float64(1.0)), x)
+    f = fma(-q, x, f)
+    var z = fma(r, f, q)
+    var p = _poly[
+        0xBDF8774AD4E0BFD7,
+        0xBE44E1C6FD03D328,
+        0xBE4330149F7A56B6,
+        0x3E7BEDDED8376273,
+        0x3E6F9254C3ABF22B,
+        0xBEAB9068C2148CF0,
+        0x3E94C6454DB34009,
+        0x3ED7F1C378F2311D,
+        0xBEE78E051C6D5C58,
+        0xBEF995B4EAD14A90,
+        0x3F23BE27CF0A29B2,
+        0xBF2A1DEF3E81672E,
+        0xBF48D4ABE68C1713,
+        0x3F749C67210DD6B4,
+        0xBF9096238568E357,
+        0x3FA3079EDF8C2DC9,
+        0xBFB0FB06DFF601FC,
+        0x3FB7FEE004DFBCDC,
+        0xBFB9DDB23C3DB8C6,
+        0x3FB16ECEFCFA5FDA,
+        0x3F8F7F5DF66FB6D6,
+        0xBFC1DF1AD154A29D,
+        0x3FF3BA5916E9FD7F,
+    ](z)
+    var rd = _rcp_d(fma(Float64(2.0), x, Float64(1.0)))
+    var g = p * rd
+    var h = _sub_rn_d(fma(x, Float64(-2.0) * g, p), g)
+    return fma(h, rd, g)
+
+
+@always_inline
+def nv_erfcx(a: Float64) -> Float64:
+    """`__nv_erfcx` of CUDA 13's libdevice: `__nv_erfc`'s rational kernel
+    below |a| = 32, an asymptotic series in 1/a above; for a < 0,
+    2 exp(a^2) (the rounding of a^2 folded back in) minus that."""
+    var hi = _hi(a)
+    var t1: Float64
+    if _fabs_f(_fr(hi)) < _fr(Int32(0x40400000)):  # |a| < 32
+        t1 = _erfcx_kernel(_i2d(_lo(a), hi & Int32(0x7FFFFFFF)))
+    else:
+        var r = Float64(1.0) / a
+        var r2 = r * r
+        var p = _poly[
+            0xC03D880000000000,
+            0x401A400000000000,
+            0xBFFE000000000000,
+            0x3FE8000000000000,
+            0xBFE0000000000000,
+            0x3FF0000000000000,
+        ](r2)
+        t1 = _mul_rn_d(p, r * _d(0x3FE20DD750429B6D))  # 1/sqrt(pi)
+    if hi >= Int32(0):
+        return t1
+    var x2 = a * a
+    var x2lo = fma(a, a, -x2)
+    var ex = nv_exp(x2)
+    var e2 = _add_rn_d(ex, ex)
+    if e2 == _F64_INF:
+        return e2
+    return _sub_rn_d(fma(e2, x2lo, e2), t1)
