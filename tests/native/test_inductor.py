@@ -4,8 +4,8 @@ and stream, and every result is checked against the same function on CPU."""
 
 import pytest
 import torch
-import torch._inductor.metrics
 import torch._dynamo.exc
+import torch._inductor.metrics
 import torch._inductor.utils
 import torch.utils._triton
 
