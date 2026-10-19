@@ -27,6 +27,7 @@ from std.sys import llvm_intrinsic
 from std.sys._assembly import inlined_assembly
 from std.sys.info import is_amd_gpu
 
+from tmb.kernels.common.cuda_math import _abs, _copysign
 from tmb.kernels.common.libdevice_port import _trig_reduction_slowpath_f
 
 comptime _INF = Float32(from_bits=UInt32(0x7F800000))
@@ -36,19 +37,6 @@ comptime _NAN = Float32(from_bits=UInt32(0x7FC00000))
 @always_inline
 def _hex(bits: UInt32) -> Float32:
     return Float32(from_bits=bits)
-
-
-@always_inline
-def _abs(x: Float32) -> Float32:
-    return llvm_intrinsic["llvm.fabs", Float32, has_side_effect=False](x)
-
-
-@always_inline
-def _copysign(mag: Float32, sgn: Float32) -> Float32:
-    return Float32(
-        from_bits=(mag.to_bits[DType.uint32]() & UInt32(0x7FFFFFFF))
-        | (sgn.to_bits[DType.uint32]() & UInt32(0x80000000))
-    )
 
 
 @always_inline

@@ -7,6 +7,18 @@ from max.gpu.host import DeviceContext, FuncAttribute
 from max.gpu.host.device_context import _DumpPath
 from std.memory import OpaquePointer
 from std.memory.alloc import unsafe_alloc
+from std.sys import get_defined_string
+
+comptime MOJO_DUMP_PTX: StaticString = get_defined_string["MOJO_DUMP_PTX", ""]()
+
+
+def dump_ptx_path() -> _DumpPath:
+    """`-D MOJO_DUMP_PTX=<path>` writes the kernel's PTX to <path> when it is
+    first compiled; a `%` in the path expands to the kernel module name."""
+    comptime if MOJO_DUMP_PTX == StaticString(""):
+        return _DumpPath(False)
+    else:
+        return _DumpPath(MOJO_DUMP_PTX)
 
 
 @always_inline

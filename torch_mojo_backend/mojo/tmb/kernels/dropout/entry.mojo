@@ -3,19 +3,17 @@
 # the host or synchronized.
 
 from tmb.kernels.random.dropout_kernels import (
-    I64x8,
     enqueue_mem_eff_dropout_mask,
     enqueue_native_dropout,
     enqueue_native_dropout_backward,
 )
+from tmb.kernels.random.rng_metadata import _join_u64, _tuple_i64x8
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
     _raw_ctx,
     _raw_f64,
     _raw_int,
-    _raw_tuple_int,
-    _raw_tuple_len,
     _spec_dispatcher5,
     _spec_dispatcher6,
     _spec_dispatcher16,
@@ -35,20 +33,6 @@ comptime DROPOUT_DTYPES = [
     DType.bfloat16,
     DType.float64,
 ]
-
-
-@always_inline
-def _join_u64(lo: Int, hi: Int) -> UInt64:
-    return UInt64(lo) | (UInt64(hi) << 32)
-
-
-@always_inline
-def _tuple_i64x8(t: Arg) -> I64x8:
-    var out = I64x8(fill=Int64(0))
-    var n = _raw_tuple_len(t)
-    for i in range(min(n, 8)):
-        out[i] = Int64(_raw_tuple_int(t, i))
-    return out^
 
 
 def _native_dropout_go(
