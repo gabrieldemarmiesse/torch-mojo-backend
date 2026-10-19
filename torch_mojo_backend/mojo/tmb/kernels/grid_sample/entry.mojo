@@ -35,15 +35,14 @@ from max.gpu import block_idx, grid_dim, thread_idx
 from std.atomic import Atomic, Ordering
 from std.math import ceildiv, floor, fma
 from std.sys import (
-    is_amd_gpu,
     is_apple_gpu,
-    is_nvidia_gpu,
     llvm_intrinsic,
 )
 
 from tmb.kernels.common.mps_math import rint_even
 from tmb.kernels.common.op_utils import (
     Argv,
+    _device_scope,
     _device_sm_count,
     _enqueue_cached,
     _fmod_f64_exact_scalar,
@@ -730,16 +729,6 @@ def _storage_dtype[dt: DType]() -> DType:
 
 
 @always_inline
-def _scope() -> StaticString:
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
-
-
-@always_inline
 def _scatter[
     dt: DType
 ](
@@ -756,14 +745,14 @@ def _scatter[
             var desired = (
                 (expected + rebind[Scalar[S]](value)).cast[dt]().cast[S]()
             )
-            if Atomic[Scalar[S], scope=_scope()].compare_exchange[
+            if Atomic[Scalar[S], scope=_device_scope()].compare_exchange[
                 success_ordering=Ordering.RELAXED,
                 failure_ordering=Ordering.RELAXED,
                 weak=True,
             ](ptr, expected, desired):
                 break
     else:
-        _ = Atomic[Scalar[S], scope=_scope()].fetch_add[
+        _ = Atomic[Scalar[S], scope=_device_scope()].fetch_add[
             ordering=Ordering.RELAXED
         ](ptr, rebind[Scalar[S]](value))
 

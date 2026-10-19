@@ -57,10 +57,14 @@ from max.gpu.host import DeviceAttribute, DeviceContext
 from std.math import ceildiv
 from std.memory import AddressSpace, stack_allocation
 from std.memory.alloc import unsafe_alloc
-from std.sys import inlined_assembly, is_amd_gpu, is_nvidia_gpu
+from std.sys import inlined_assembly, is_nvidia_gpu
 from std.sys.info import _is_sm_9x_or_newer, has_apple_gpu_accelerator
 
-from tmb.kernels.common.op_utils import _enqueue_cached, _enqueue_cached_2d
+from tmb.kernels.common.op_utils import (
+    _device_scope,
+    _enqueue_cached,
+    _enqueue_cached_2d,
+)
 
 comptime _BLOCK = 256
 comptime _VEC = 4
@@ -108,18 +112,6 @@ def _cached_max_grid(ctx: DeviceContext) raises -> Int:
         StringSlice(name), cached.unsafe_bitcast[NoneType]()
     )
     return value
-
-
-@always_inline
-def _device_scope() -> StaticString:
-    # Device-scope atomics skip system-scope ordering cost on the discrete
-    # targets; every other accelerator keeps the portable default scope.
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
 
 
 @always_inline

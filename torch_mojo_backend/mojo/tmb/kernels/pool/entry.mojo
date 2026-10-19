@@ -33,7 +33,7 @@
 from max.gpu.host import DeviceContext
 from std.atomic import Atomic, Ordering
 from std.memory import bitcast
-from std.sys import is_amd_gpu, is_nvidia_gpu, size_of
+from std.sys import size_of
 from std.sys.info import has_apple_gpu_accelerator
 from std.utils.coord import Coord
 from std.utils.index import IndexList
@@ -45,6 +45,7 @@ from tmb.kernels.common.dtype_arithmetic import cast_rounded, wide_dtype
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
+    _device_scope,
     _enqueue_cached,
     _make_ptr,
     _parallel_for_dt,
@@ -406,16 +407,6 @@ def _fractional_max_pool[
 
 
 @always_inline
-def _scope() -> StaticString:
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
-
-
-@always_inline
 def _atomic_add[
     dtype: DType
 ](ptr: Pointer[Scalar[dtype], MutAnyOrigin], value: Scalar[dtype]):
@@ -439,14 +430,14 @@ def _atomic_add[
             var desired = (expected & ~(UInt32(0xFFFF) << shift)) | (
                 UInt32(bitcast[DType.uint16](sum)) << shift
             )
-            if Atomic[UInt32, scope=_scope()].compare_exchange[
+            if Atomic[UInt32, scope=_device_scope()].compare_exchange[
                 success_ordering=Ordering.RELAXED,
                 failure_ordering=Ordering.RELAXED,
                 weak=True,
             ](word, expected, desired):
                 return
     else:
-        _ = Atomic[Scalar[dtype], scope=_scope()].fetch_add[
+        _ = Atomic[Scalar[dtype], scope=_device_scope()].fetch_add[
             ordering=Ordering.RELAXED
         ](ptr, value)
 

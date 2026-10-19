@@ -22,7 +22,7 @@ from std.collections import Array
 from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
-from std.sys import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
+from std.sys import is_apple_gpu, is_nvidia_gpu
 from std.sys.defines import get_defined_int
 from std.sys.info import (
     has_accelerator,
@@ -48,6 +48,7 @@ from tmb.kernels.common.op_utils import (
     _T2D_ROWS,
     _bw_blocks,
     _bw_flat_blocks,
+    _device_scope,
     _device_sm_count,
     _enqueue_cached,
     _enqueue_cached_2d,
@@ -125,16 +126,6 @@ def _atomic_add_ok[dt: DType]() -> Bool:
 
 
 @always_inline
-def _atomic_scope() -> StaticString:
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
-
-
-@always_inline
 def _atomic_add[
     dtype: DType
 ](ptr: Pointer[Scalar[dtype], MutUntrackedOrigin], value: Scalar[dtype]):
@@ -176,7 +167,7 @@ def _atomic_add[
             ](word, expected, desired):
                 break
     else:
-        _ = Atomic[Scalar[dtype], scope=_atomic_scope()].fetch_add[
+        _ = Atomic[Scalar[dtype], scope=_device_scope()].fetch_add[
             ordering=Ordering.RELAXED
         ](ptr, value)
 
@@ -273,7 +264,7 @@ def _atomic_rmw[
             if desired == expected:
                 break
             if Atomic[
-                Scalar[DType.uint32], scope=_atomic_scope()
+                Scalar[DType.uint32], scope=_device_scope()
             ].compare_exchange[
                 success_ordering=Ordering.RELAXED,
                 failure_ordering=Ordering.RELAXED,
@@ -292,7 +283,7 @@ def _atomic_rmw[
             )
             if desired == expected:
                 break
-            if Atomic[Scalar[U], scope=_atomic_scope()].compare_exchange[
+            if Atomic[Scalar[U], scope=_device_scope()].compare_exchange[
                 success_ordering=Ordering.RELAXED,
                 failure_ordering=Ordering.RELAXED,
                 weak=True,
