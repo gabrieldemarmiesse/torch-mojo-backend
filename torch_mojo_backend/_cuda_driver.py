@@ -16,9 +16,11 @@ MAX_REGISTERS_PER_MULTIPROCESSOR = 82
 
 @functools.cache
 def libcuda() -> ctypes.CDLL:
-    """libcuda with `cuInit` done. Raises OSError when there is no driver."""
+    """libcuda with `cuInit` done. Raises (and caches nothing) when there is
+    no driver or it fails to initialize."""
     cuda = ctypes.CDLL("libcuda.so.1")
-    cuda.cuInit(0)
+    if cuda.cuInit(0) != 0:
+        raise RuntimeError("cuInit failed")
     return cuda
 
 
