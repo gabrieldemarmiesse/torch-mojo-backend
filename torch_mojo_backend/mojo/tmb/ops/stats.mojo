@@ -81,10 +81,10 @@ from tmb.ops.common import (
     scalar_to_int,
     scalar_type_name,
     vec_shape,
+    wrap_dim,
 )
 from tmb.ops.reductions import (
     _cast_any,
-    _norm_dim,
     _order_stat_shape,
     _permuted_contiguous,
     _sort_kernel_dtype,
@@ -267,7 +267,7 @@ def _mode_dim(a: T, dim_in: Int) raises -> Int:
     """`maybe_wrap_dim` plus `get_zero_numel_tensor_size`'s check."""
     if not a.on_mojo():
         raise Error("expected a tensor on the mojo device")
-    var dim = _norm_dim(dim_in, a.rank)
+    var dim = wrap_dim(dim_in, a.rank)
     if a.numel == 0:
         _zero_numel_check(a, dim, "mode()")
     return dim
@@ -1267,7 +1267,7 @@ def _renorm(a: T, p_v: Value, dim_in: Int, maxnorm_v: Value) raises -> Owned:
             a.rank,
             " dimensions",
         )
-    var dim = _norm_dim(dim_in, a.rank)
+    var dim = wrap_dim(dim_in, a.rank)
     var dims = List[Int64]()
     for d in range(a.rank):
         if d != dim:
@@ -1409,7 +1409,7 @@ def op__weight_norm_interface(
 ) raises:
     var v = v_tensor(args[unsafe_offset=0])
     var g = v_tensor(args[unsafe_offset=1])
-    var dim = _norm_dim(v_int_or(args[unsafe_offset=2], 0), v.rank)
+    var dim = wrap_dim(v_int_or(args[unsafe_offset=2], 0), v.rank)
     if not v.dtype.is_floating_point():
         raise Error(
             '"weight_norm_fwd_first_dim_kernel" not implemented for \'',
@@ -1484,7 +1484,7 @@ def op__weight_norm_interface_backward(
     var v = v_tensor(args[unsafe_offset=1])
     var g = v_tensor(args[unsafe_offset=2])
     var norms = v_tensor(args[unsafe_offset=3])
-    var dim = _norm_dim(v_int(args[unsafe_offset=4]), v.rank)
+    var dim = wrap_dim(v_int(args[unsafe_offset=4]), v.rank)
     if not v.contig:
         raise Error("saved_v must be contiguous")
     if not g.contig:
@@ -1956,7 +1956,7 @@ def op_segment_reduce(
     var lengths_v = args[unsafe_offset=2].copy()
     var indices_v = args[unsafe_offset=3].copy()
     var offsets_v = args[unsafe_offset=4].copy()
-    var axis = _norm_dim(v_int_or(args[unsafe_offset=5], 0), data.rank)
+    var axis = wrap_dim(v_int_or(args[unsafe_offset=5], 0), data.rank)
     var unsafe_ = v_bool_or(args[unsafe_offset=6], False)
     if not v_is_none(indices_v):
         raise Error(
@@ -2052,7 +2052,7 @@ def op__segment_reduce_backward(
     var reduction = _reduction_enum(v_string(args[unsafe_offset=3]))
     var lengths_v = args[unsafe_offset=4].copy()
     var offsets_v = args[unsafe_offset=5].copy()
-    var axis = _norm_dim(v_int_or(args[unsafe_offset=6], 0), data.rank)
+    var axis = wrap_dim(v_int_or(args[unsafe_offset=6], 0), data.rank)
     if v_is_none(lengths_v) and v_is_none(offsets_v):
         raise Error(
             "segment_reduce(): Either lengths or offsets must be defined."

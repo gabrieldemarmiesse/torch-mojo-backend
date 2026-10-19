@@ -137,6 +137,7 @@ from tmb.ops.common import (
     check_expands_to,
     store_out,
     sizes_str,
+    wrap_dim,
 )
 
 
@@ -1063,25 +1064,8 @@ def _dims_of(v: Value, rank: Int) raises -> List[Int]:
         return out^
     for i in range(len(dims)):
         var d = dims[i]
-        out.append(_wrap_dim(d, rank))
+        out.append(wrap_dim(d, rank))
     return out^
-
-
-def _wrap_dim(d: Int, rank: Int) raises -> Int:
-    """`c10::maybe_wrap_dim` on the COMPLEX tensor's rank (a 0-d tensor
-    takes 0 / -1, both the tensor itself): an IndexError, as ATen raises."""
-    var lim = max(rank, 1)
-    if d < -lim or d >= lim:
-        index_error(
-            "Dimension out of range (expected to be in range of ["
-            + String(-lim)
-            + ", "
-            + String(lim - 1)
-            + "], but got "
-            + String(d)
-            + ")"
-        )
-    return d + lim if d < 0 else d
 
 
 def _common_complex(ts: List[T]) raises -> Int32:
@@ -1165,7 +1149,7 @@ def _cat(args: Values, stack: Bool, out_st: Int32 = -1) raises -> Owned:
     var rvs = _real_views(ts, st, keep)
     var c = _Call("aten::stack" if stack else "aten::cat")
     _tensor_list_arg(c, rvs)
-    c.i(_wrap_dim(dim, rank + 1 if stack else rank))
+    c.i(wrap_dim(dim, rank + 1 if stack else rank))
     var r = c.one()
     keep.clear()
     var cv = as_complex(r.t)
@@ -1348,7 +1332,7 @@ def _dim_args(
     var rv = as_real(x)
     var c = _Call(op, overload)
     c.t(rv.t)
-    c.i(_wrap_dim(Int(args[unsafe_offset=dim_at].a), x.rank))
+    c.i(wrap_dim(Int(args[unsafe_offset=dim_at].a), x.rank))
     c.v(args[unsafe_offset=2])
     var r = c.one()
     _ = rv^
@@ -1364,7 +1348,7 @@ def _index_select(args: Values) raises -> Owned:
         return _dim_args("aten::index_select", "", args, 1)
     # A 0-d self: its real view's only dim is the pair. Select from it as a
     # one-element vector (ATen's own range check on the index included).
-    _ = _wrap_dim(Int(args[unsafe_offset=1].a), 0)
+    _ = wrap_dim(Int(args[unsafe_offset=1].a), 0)
     var index = v_tensor_c(args[unsafe_offset=2])
     var one = IndexList[MAX_RANK](1)
     var vec = own(view_strided(x, one, IndexList[MAX_RANK](0), 1, x.offset))
@@ -1422,7 +1406,7 @@ def _int_list_dims(v: Value, rank: Int) raises -> List[Int]:
     var dims = IntList(v)
     var out = List[Int]()
     for i in range(len(dims)):
-        out.append(_wrap_dim(dims[i], rank))
+        out.append(wrap_dim(dims[i], rank))
     return out^
 
 
@@ -2438,7 +2422,7 @@ def _gather(args: Values) raises -> Owned:
     var x = v_tensor_c(args[unsafe_offset=0])
     var index = v_tensor_c(args[unsafe_offset=2])
     _require_same_device(index, x.device, "index")
-    _ = _wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
+    _ = wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
     var parts = List[Owned]()
     for which in range(2):
         var p = _part(x, which)
@@ -2573,7 +2557,7 @@ def _index_into(op: StaticString, target: T, args: Values, n_args: Int) raises:
     var index = v_tensor_c(args[unsafe_offset=2])
     _require_same_device(index, target.device, "index")
     _require_same_device(source, target.device, "source")
-    _ = _wrap_dim(Int(args[unsafe_offset=1].a), target.rank)
+    _ = wrap_dim(Int(args[unsafe_offset=1].a), target.rank)
     var src = own(source.copy())
     src.live = False
     if n_args > 4:

@@ -37,7 +37,6 @@ from tmb.backend.abi import (
     cpu_empty,
     dtype_code,
     call_op,
-    index_error,
     int_arg,
     contiguous_strides,
     dense_strides_like,
@@ -79,6 +78,7 @@ from tmb.ops.common import (
     is_floating_dtype,
     scalar_type_name,
     float_max,
+    wrap_dim,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
@@ -1522,14 +1522,7 @@ def op_fill_mem_eff_dropout_mask_(
             " got false.  (Could this error message be improved?  If so,"
             " please report an enhancement request to PyTorch.)"
         )
-    if t.rank < 4:
-        index_error(
-            "Dimension out of range (expected to be in range of ["
-            + String(-max(t.rank, 1))
-            + ", "
-            + String(max(t.rank, 1) - 1)
-            + "], but got 3)"
-        )
+    _ = wrap_dim(3, t.rank)
     var seed = v_int(args[unsafe_offset=2])
     var offset = v_int(args[unsafe_offset=3])
     if t.numel > 0:

@@ -96,6 +96,7 @@ from tmb.ops.common import (
     is_f32_f16_bf16,
     is_floating_dtype,
     scalar_type_name,
+    wrap_dim,
 )
 from tmb.ops.core import cast_for_copy
 from tmb.backend.registry import Site, impl
@@ -268,31 +269,6 @@ def _promote(mut op: Operand, stype: Int32) raises:
 # ---------------------------------------------------------------------------
 
 
-def _dim_range_message(d: Int, ndim: Int) -> String:
-    """torch's own wording, verbatim (`maybe_wrap_dim_slow`, WrapDimMinimal.cpp).
-    """
-    return (
-        "Dimension out of range (expected to be in range of ["
-        + String(-ndim)
-        + ", "
-        + String(ndim - 1)
-        + "], but got "
-        + String(d)
-        + ")"
-    )
-
-
-def _norm_dim(d: Int, rank: Int) raises -> Int:
-    """torch's `maybe_wrap_dim`, including its 0-d exception: a rank-0
-    operand is wrapped as if it were a 1-d tensor of size 1, so dim 0 / -1
-    are valid (and normalize to 0) while anything else is out of range.
-    Raises IndexError, matching stock CUDA (`TORCH_CHECK_INDEX`)."""
-    var ndim = max(rank, 1)
-    if d < -ndim or d >= ndim:
-        index_error(_dim_range_message(d, ndim))
-    return d + ndim if d < 0 else d
-
-
 def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
     """Sorted, unique, normalized reduce dims (aten_fast._norm_reduce_dims).
 
@@ -300,7 +276,7 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
     sum/mean/amax/amin/var, and nothing for any.dims/all.dims. A duplicate or
     out-of-range dim is declined. A rank-0 operand has no dim to mark (its
     single element is already the whole reduction) so it always returns
-    empty, once every given dim has been validated against `_norm_dim`'s 0-d
+    empty, once every given dim has been validated against `wrap_dim`'s 0-d
     exception ({-1, 0}) -- `empty_is_all` makes no difference there, since
     "reduce everything" and "reduce nothing" coincide when there is nothing
     to reduce over.
@@ -311,7 +287,7 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
             dims.append(d)
         return dims^
     if v.tag == TAG_INT or v.tag == TAG_SCALAR_INT:
-        var d = _norm_dim(v_int(v), rank)
+        var d = wrap_dim(v_int(v), rank)
         if rank > 0:
             dims.append(d)
         return dims^
@@ -329,14 +305,14 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
         # (plain RuntimeError, matching `dim_list_to_bitset`'s TORCH_CHECK).
         var seen0 = False
         for i in range(len(given)):
-            _ = _norm_dim(given[i], rank)
+            _ = wrap_dim(given[i], rank)
             if seen0:
                 raise Error("dim 0 appears multiple times in the list of dims")
             seen0 = True
         return dims^
     var seen = Array[Bool, MAX_RANK](fill=False)
     for i in range(len(given)):
-        var d = _norm_dim(given[i], rank)
+        var d = wrap_dim(given[i], rank)
         if seen[d]:
             raise Error(
                 "dim "
@@ -352,8 +328,8 @@ def _reduce_dims(v: Value, rank: Int, empty_is_all: Bool) raises -> List[Int]:
 
 def _reduce_dim_single(d: Int, rank: Int) raises -> List[Int]:
     """One explicit reduce dim (min.dim, prod.dim_int/.int_out) as a dims
-    list: empty for a rank-0 operand once `_norm_dim` has validated it."""
-    var norm = _norm_dim(d, rank)
+    list: empty for a rank-0 operand once `wrap_dim` has validated it."""
+    var norm = wrap_dim(d, rank)
     var dims = List[Int]()
     if rank > 0:
         dims.append(norm)
@@ -1484,7 +1460,7 @@ def _minmax_dim(
 ) raises:
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a)
-    var d = _norm_dim(v_int(args[unsafe_offset=1]), a.rank)
+    var d = wrap_dim(v_int(args[unsafe_offset=1]), a.rank)
     _zero_numel_check(a, d, what)
     var keepdim = v_bool_or(args[unsafe_offset=2], False)
     var dims = List[Int]()
@@ -1512,7 +1488,7 @@ def _minmax_dim_out(
     var out_v = v_tensor(args[unsafe_offset=3])
     var out_i = v_tensor(args[unsafe_offset=4])
     _require_mojo(a)
-    var d = _norm_dim(v_int(args[unsafe_offset=1]), a.rank)
+    var d = wrap_dim(v_int(args[unsafe_offset=1]), a.rank)
     _zero_numel_check(a, d, what)
     check_out(out_v, a)
     _check_index_out(out_i, a)
@@ -1582,7 +1558,7 @@ def _argreduce_prep(a: T, dim_v: Value, what: StaticString) raises -> List[Int]:
                 + " == 0."
             )
         return _reduce_dims(dim_v, a.rank, True)
-    var d = _norm_dim(v_int(dim_v), a.rank)
+    var d = wrap_dim(v_int(dim_v), a.rank)
     _zero_numel_check(a, d, what)
     var dims = List[Int]()
     if a.rank > 0:
@@ -2285,7 +2261,7 @@ def _aminmax_prep(
         dims = _trailing_dims(a.rank, a.rank)
         rank = a.rank if keepdim else 0
         return (dims^, shape, rank)
-    var d = _norm_dim(v_int(dim_v), a.rank)
+    var d = wrap_dim(v_int(dim_v), a.rank)
     _zero_numel_check(a, d, "aminmax")
     if a.rank > 0:
         dims.append(d)
@@ -2432,7 +2408,7 @@ def _hash_tensor_prep(a: T, dim_v: Value) raises -> List[Int]:
                 " argument."
             )
         for i in range(len(given)):
-            var d = _norm_dim(given[i], a.rank)
+            var d = wrap_dim(given[i], a.rank)
             _zero_numel_check(a, d, "hash_tensor")
     return _reduce_dims(dim_v, a.rank, True)
 
@@ -3023,7 +2999,7 @@ def _sort_kernel_dtype(a: T, op: StaticString) raises -> DType:
 
 def _sort_dim(a: T, dim: Int) raises -> Int:
     """ATen's `maybe_wrap_dim` for sort/topk: a 0-d tensor has one dim."""
-    return _norm_dim(dim, a.rank)
+    return wrap_dim(dim, a.rank)
 
 
 def _selected_shape(a: T, dim: Int, k: Int) -> IndexList[MAX_RANK]:

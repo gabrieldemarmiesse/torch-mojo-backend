@@ -90,6 +90,7 @@ from tmb.ops.common import (
     same_view,
     expect_scalar_type,
     vec_shape,
+    wrap_dim,
 )
 from tmb.ops.f8_iter import (
     f8_iter,
@@ -1337,17 +1338,7 @@ def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
             + String(dim)
             + " but tensor has no dimensions"
         )
-    if dim < -x.rank or dim >= x.rank:
-        index_error(
-            String("Dimension out of range (expected to be in range of [")
-            + String(-x.rank)
-            + ", "
-            + String(x.rank - 1)
-            + "], but got "
-            + String(dim)
-            + ")"
-        )
-    var d = dim + x.rank if dim < 0 else dim
+    var d = wrap_dim(dim, x.rank)
     if x.dim(d) != 3 or y.dim(d) != 3:
         raise Error(
             "linalg.cross: inputs dimension ",

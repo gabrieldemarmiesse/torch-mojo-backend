@@ -57,6 +57,7 @@ from tmb.ops.common import (
     contiguous,
     decline_float8,
     vec_shape,
+    wrap_dim,
 )
 
 
@@ -346,21 +347,6 @@ def unique_flat(
     return (g.out_vals.take(), inv^, counts^)
 
 
-def _wrap_dim(dim: Int, rank: Int) raises -> Int:
-    var r = max(rank, 1)
-    if dim < -r or dim >= r:
-        index_error(
-            "Dimension out of range (expected to be in range of ["
-            + String(-r)
-            + ", "
-            + String(r - 1)
-            + "], but got "
-            + String(dim)
-            + ")"
-        )
-    return dim + r if dim < 0 else dim
-
-
 def unique_rows(
     t: T,
     dim_in: Int,
@@ -376,7 +362,7 @@ def unique_rows(
             + String(dim_in)
             + " but tensor has no dimensions"
         )
-    var dim = _wrap_dim(dim_in, t.rank)
+    var dim = wrap_dim(dim_in, t.rank)
     var zero_dims = 0
     for d in range(t.rank):
         if t.dim(d) == 0:

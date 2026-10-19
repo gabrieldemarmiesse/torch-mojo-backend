@@ -46,8 +46,11 @@ from tmb.ops.common import (
     contiguous,
     copy_strided_into,
     resize_out,
+    wrap_dim,
 )
-from tmb.ops.reductions import _cast_any, _norm_dim
+from tmb.ops.reductions import (
+    _cast_any,
+)
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
     routed,
@@ -172,7 +175,7 @@ def _cum_result(
 ) raises -> Owned:
     """`impl_func_cum_ops`: the scan of `a.to(res_st)` along `dim_in` as a
     fresh contiguous tensor of `a`'s shape and dtype `res_st`."""
-    var dim = _norm_dim(dim_in, a.rank)
+    var dim = wrap_dim(dim_in, a.rank)
     var rdt = max_dtype(res_st)
     if a.numel == 0:
         return own(new_tensor(a.shape, a.rank, res_st, a.device))
@@ -321,7 +324,7 @@ def op_cumprod_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def _logcumsumexp_result(a: T, dim_in: Int) raises -> Owned:
     """`_logcumsumexp_out_cuda`: a 0-d operand is copied, an empty one has
     nothing to scan; CUDA dispatches floating dtypes only."""
-    var dim = _norm_dim(dim_in, a.rank)
+    var dim = wrap_dim(dim_in, a.rank)
     var out = own(new_tensor(a.shape, a.rank, a.stype, a.device))
     # CUDA's shortcuts run before its floating-dtype dispatch: a 0-d operand
     # is copied (`fill_(self)`) and an empty one zeroed, whatever its dtype.
@@ -399,7 +402,7 @@ def _cum_extremum_helper(args: Values, op: StaticString) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var values = v_tensor(args[unsafe_offset=1])
     var indices = v_tensor(args[unsafe_offset=2])
-    var dim = _norm_dim(v_int(args[unsafe_offset=3]), a.rank)
+    var dim = wrap_dim(v_int(args[unsafe_offset=3]), a.rank)
     check_out(values, a)
     check_out_as(indices, ST_INT64, a)
     if not values.same_shape(a) or not indices.same_shape(a):

@@ -27,7 +27,6 @@ from tmb.backend.abi import (
     Values,
     bool_arg,
     f64_bits,
-    index_error,
     _channels_last_strides,
     max_dtype,
     new_strided,
@@ -62,6 +61,7 @@ from tmb.ops.common import (
     sizes_str,
     scalar_type_name,
     expect_scalar_type,
+    wrap_dim,
 )
 from tmb.ops.loss import (
     Dense,
@@ -261,14 +261,7 @@ struct Planes(Movable):
     var hxw: Int
 
     def __init__(out self, t: T) raises:
-        if t.rank < 2:
-            index_error(
-                String("Dimension out of range (expected to be in range of [")
-                + String(-max(t.rank, 1))
-                + ", "
-                + String(max(t.rank, 1) - 1)
-                + "], but got 1)"
-            )
+        _ = wrap_dim(1, t.rank)
         self.cl = is_channels_last_layout(t)
         if self.cl:
             self.dense = Dense(t, True)

@@ -39,7 +39,6 @@ from tmb.ops.complex import (
     _check_cast,
     _tensor_or_scalar,
     _unary,
-    _wrap_dim,
     as_complex,
     as_real,
     cx_unary_out,
@@ -65,6 +64,7 @@ from tmb.ops.common import (
     copy_strided_into,
     cx_launch,
     fill_complex,
+    wrap_dim,
 )
 from tmb.backend.abi import (
     OpFn,
@@ -1308,7 +1308,7 @@ def _cumsum(args: Values, out_st: Int32 = -1) raises -> Owned:
     var x = v_tensor_c(args[unsafe_offset=0])
     var dtype_v = args[unsafe_offset=2].copy()
     # CUDA's order: the dim, then the out's dtype against dtype=
-    var dim = _wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
+    var dim = wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
     var want = v_dtype_or(dtype_v, out_st if out_st >= 0 else x.stype)
     if out_st >= 0 and want != out_st:
         raise Error(

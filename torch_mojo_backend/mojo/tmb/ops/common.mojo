@@ -84,6 +84,7 @@ from tmb.backend.abi import (
     v_int,
     v_complex,
     is_floating,
+    index_error,
 )
 from tmb.backend.device import (
     copy_from_host,
@@ -902,6 +903,23 @@ def cast_to(t: T, stype: Int32, saturate: Bool = True) raises -> T:
     cast_into(out.t, src.t, saturate)
     _ = src^  # alive past the launch (its last use above is the pointer read)
     return out.take()
+
+
+def wrap_dim(d: Int, rank: Int) raises -> Int:
+    """`c10::maybe_wrap_dim`: a 0-d tensor wraps as 1-d (dim 0 / -1). Out of
+    range is an IndexError in torch's wording (`TORCH_CHECK_INDEX`)."""
+    var lim = max(rank, 1)
+    if d < -lim or d >= lim:
+        index_error(
+            "Dimension out of range (expected to be in range of ["
+            + String(-lim)
+            + ", "
+            + String(lim - 1)
+            + "], but got "
+            + String(d)
+            + ")"
+        )
+    return d + lim if d < 0 else d
 
 
 def one_device(a: T, b: T) raises:
