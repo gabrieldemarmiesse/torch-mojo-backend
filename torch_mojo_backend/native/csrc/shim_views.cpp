@@ -80,7 +80,7 @@ at::Tensor view_as_complex_pu1(const at::Tensor& self) {
 }  // namespace
 
 extern "C" int32_t tmb_library_impl_aten_view(TmbLibrary lib, const char* name) {
-  try {
+  return tmb_guarded([&] {
     auto& m = *reinterpret_cast<torch::Library*>(lib);
     const std::string which(name ? name : "");
     if (which == "view") {
@@ -100,10 +100,7 @@ extern "C" int32_t tmb_library_impl_aten_view(TmbLibrary lib, const char* name) 
       return 1;
     }
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 // `_copy_from` writes into its `dst` argument, but its schema does not mark

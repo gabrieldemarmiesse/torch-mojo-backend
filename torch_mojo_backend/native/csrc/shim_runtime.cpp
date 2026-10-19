@@ -570,19 +570,16 @@ extern "C" {
 
 int32_t tmb_device_properties(int32_t device, int64_t* out, int32_t n,
                               char* text, int32_t text_cap) {
-  try {
+  return tmb_guarded([&] {
     REQUIRE_READY();
     Lock g(tmb_mutex);
     tmb_thread_error().clear();
     return H.device_props(device, out, n, text, text_cap);
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_backend_register(const TmbBackendHooks* hooks) {
-  try {
+  return tmb_guarded([&] {
     TORCH_CHECK(hooks && hooks->size >= sizeof(TmbBackendHooks), "mojo backend: hook table too small");
     TORCH_CHECK(!tmb_ready, "mojo backend: already registered");
     std::memcpy(&tmb_hooks, hooks, sizeof(TmbBackendHooks));
@@ -596,10 +593,7 @@ int32_t tmb_backend_register(const TmbBackendHooks* hooks) {
     // init() is a no-op; flip Context's guard so the first is_pinned reaches us.
     at::globalContext().lazyInitDevice(c10::DeviceType::PrivateUse1);
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 void tmb_tensor_info(TmbTensor t, int64_t* out) { fill_info(T(t), out); }
@@ -648,7 +642,7 @@ void tmb_tensor_release(TmbTensor t) { delete reinterpret_cast<at::Tensor*>(t); 
 
 int32_t tmb_empty_strided(int64_t ndim, const int64_t* sizes, const int64_t* strides, int32_t dtype,
                           int32_t device, TmbTensor* ret, int64_t* info) {
-  try {
+  return tmb_guarded([&] {
     AllocDeviceScope scope(device);
     auto t = at::detail::empty_strided_generic(c10::IntArrayRef(sizes, ndim), c10::IntArrayRef(strides, ndim),
                                                &g_allocator, c10::DispatchKeySet(c10::DispatchKey::PrivateUse1),
@@ -657,10 +651,7 @@ int32_t tmb_empty_strided(int64_t ndim, const int64_t* sizes, const int64_t* str
     if (info) fill_info(*box, info);
     *ret = box;
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 // The view must stay inside its storage (at::native::checkInBoundsForStorage).
@@ -681,7 +672,7 @@ void check_in_bounds(const c10::Storage& storage, int64_t ndim, const int64_t* s
 
 int32_t tmb_as_strided(TmbTensor base, int64_t ndim, const int64_t* sizes, const int64_t* strides,
                        int64_t storage_offset, TmbTensor* ret, int64_t* info) {
-  try {
+  return tmb_guarded([&] {
     const at::Tensor& b = T(base);
     check_in_bounds(b.storage(), ndim, sizes, strides, storage_offset, b.itemsize());
     auto t = at::detail::make_tensor<c10::TensorImpl>(c10::TensorImpl::VIEW, c10::Storage(b.storage()),
@@ -692,79 +683,58 @@ int32_t tmb_as_strided(TmbTensor base, int64_t ndim, const int64_t* sizes, const
     if (info) fill_info(*box, info);
     *ret = box;
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_tensor_set_sizes_strides(TmbTensor t, int64_t ndim, const int64_t* sizes, const int64_t* strides,
                                      int64_t storage_offset) {
-  try {
+  return tmb_guarded([&] {
     check_in_bounds(T(t).storage(), ndim, sizes, strides, storage_offset, T(t).itemsize());
     T(t).unsafeGetTensorImpl()->set_sizes_and_strides(c10::IntArrayRef(sizes, ndim), c10::IntArrayRef(strides, ndim),
                                                       storage_offset);
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_tensor_set_storage(TmbTensor t, TmbTensor source) {
-  try {
+  return tmb_guarded([&] {
     T(t).unsafeGetTensorImpl()->set_storage_keep_dtype(T(source).storage());
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_tensor_set_storage_object(TmbTensor t, void* storage) {
-  try {
+  return tmb_guarded([&] {
     T(t).unsafeGetTensorImpl()->set_storage_keep_dtype(*static_cast<c10::Storage*>(storage));
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_storage_resize(TmbTensor t, int64_t nbytes) {
-  try {
+  return tmb_guarded([&] {
     g_hooks_iface.resizePrivateUse1Bytes(T(t).storage(), static_cast<size_t>(nbytes));
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_cpu_empty(int64_t ndim, const int64_t* sizes, int32_t dtype, TmbTensor* ret) {
-  try {
+  return tmb_guarded([&] {
     *ret = new at::Tensor(at::detail::empty_cpu(c10::IntArrayRef(sizes, ndim), static_cast<c10::ScalarType>(dtype)));
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_cpu_empty_pinned(int64_t ndim, const int64_t* sizes, int32_t dtype, int32_t device, TmbTensor* ret) {
-  try {
+  return tmb_guarded([&] {
     AllocDeviceScope scope(device);
     *ret = new at::Tensor(at::detail::empty_generic(c10::IntArrayRef(sizes, ndim), &g_pinned_allocator,
         c10::DispatchKeySet(c10::DispatchKey::CPU), static_cast<c10::ScalarType>(dtype), std::nullopt));
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_philox_reserve(TmbGenerator gen, int32_t device, uint64_t increment, uint64_t* seed, uint64_t* offset) {
-  try {
+  return tmb_guarded([&] {
     at::Generator g = gen ? *reinterpret_cast<at::Generator*>(gen) : default_generator(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(g.mutex());
     auto* impl = mojo_impl(g);
@@ -775,14 +745,11 @@ int32_t tmb_philox_reserve(TmbGenerator gen, int32_t device, uint64_t increment,
     TORCH_CHECK(increment <= UINT64_MAX - impl->offset_, "mojo backend: Philox counter reservation would wrap");
     impl->offset_ += increment;
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_rng_manual_seed(int32_t device, uint64_t seed) {
-  try {
+  return tmb_guarded([&] {
     const int32_t n = H.device_count();
     for (int32_t i = 0; i < n; ++i) {
       if (device >= 0 && i != device) continue;
@@ -791,28 +758,22 @@ int32_t tmb_rng_manual_seed(int32_t device, uint64_t seed) {
       g.set_current_seed(seed);
     }
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_rng_get_state(int32_t device, uint8_t* out16) {
-  try {
+  return tmb_guarded([&] {
     auto g = default_generator(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(g.mutex());
     auto* impl = mojo_impl(g);
     std::memcpy(out16, &impl->seed_, 8);
     std::memcpy(out16 + 8, &impl->offset_, 8);
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16) {
-  try {
+  return tmb_guarded([&] {
     auto g = default_generator(static_cast<c10::DeviceIndex>(device));
     std::lock_guard<std::mutex> lock(g.mutex());
     auto* impl = mojo_impl(g);
@@ -822,10 +783,7 @@ int32_t tmb_rng_set_state(int32_t device, const uint8_t* in16) {
     std::memcpy(&impl->seed_, in16, 8);
     impl->offset_ = offset;
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 int32_t tmb_deterministic_fill_uninitialized(void) {
@@ -835,13 +793,10 @@ int32_t tmb_deterministic_fill_uninitialized(void) {
 int32_t tmb_default_dtype(void) { return static_cast<int32_t>(c10::typeMetaToScalarType(c10::get_default_dtype())); }
 
 int32_t tmb_alert_not_deterministic(const char* caller) {
-  try {
+  return tmb_guarded([&] {
     at::globalContext().alertNotDeterministic(caller);
     return 0;
-  } catch (const std::exception& e) {
-    tmb_set_error(e.what());
-    return 1;
-  }
+  });
 }
 
 }  // extern "C"
