@@ -48,8 +48,11 @@ from tmb.ops.attention import (
     _ret_undefined,
     _swap_last,
 )
-from tmb.ops.common import copy_strided_into, shape_str
-from tmb.ops.data_movement import _scalar_type_name
+from tmb.ops.common import (
+    copy_strided_into,
+    shape_str,
+    scalar_type_name,
+)
 
 
 def _view_at(
@@ -98,7 +101,7 @@ def _float_input(t: T, what: StaticString) raises:
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
 
@@ -189,9 +192,9 @@ def _transform_bias_rescale(qkv: T, bias: T, num_head: Int) raises -> Owned:
     if bias.stype != qkv.stype:
         raise Error(
             "expected scalar type ",
-            _scalar_type_name(qkv.dtype),
+            scalar_type_name(qkv.dtype),
             " but found ",
-            _scalar_type_name(bias.dtype),
+            scalar_type_name(bias.dtype),
         )
     _float_input(qkv, W)
     var dh = d // num_head

@@ -71,8 +71,8 @@ from tmb.ops.common import (
     shares_storage,
     store_out,
     sizes_str,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 
 
@@ -118,7 +118,7 @@ def _loss_float(t: T) raises:
         and t.dtype != DType.bfloat16
     ):
         raise Error(
-            '"loss" not implemented for \'', _scalar_type_name(t.dtype), "'"
+            '"loss" not implemented for \'', scalar_type_name(t.dtype), "'"
         )
 
 
@@ -141,9 +141,9 @@ def _expect_dtype(t: T, like: T) raises:
     if t.stype != like.stype:
         raise Error(
             "expected scalar type ",
-            _scalar_type_name(like.dtype),
+            scalar_type_name(like.dtype),
             " but found ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
 
 
@@ -264,7 +264,7 @@ def _nll_checks(args: Values, self_i: Int, spatial: Bool) raises -> NllArgs:
         if target.stype != ST_INT64:
             raise Error(
                 "expected scalar type Long but found ",
-                _scalar_type_name(target.dtype),
+                scalar_type_name(target.dtype),
             )
     else:
         if input.rank < 1 or input.rank > 2:
@@ -276,7 +276,7 @@ def _nll_checks(args: Values, self_i: Int, spatial: Bool) raises -> NllArgs:
         if target.stype != ST_INT64 and target.stype != ST_UINT8:
             raise Error(
                 "expected target dtype to be Long or Byte, but got ",
-                _scalar_type_name(target.dtype),
+                scalar_type_name(target.dtype),
             )
     _loss_float(input)
     _same_device(input, target)
@@ -922,7 +922,7 @@ def _multi_margin_forward(args: Values) raises -> Owned:
     if target.stype != ST_INT64:
         raise Error(
             "expected scalar type Long but found ",
-            _scalar_type_name(target.dtype),
+            scalar_type_name(target.dtype),
         )
     var margin = scalar_to_float(args[unsafe_offset=3], input.stype)
     var weight = _optional_dense(args, 4, input)
@@ -1014,7 +1014,7 @@ def _multi_margin_backward(args: Values) raises -> Owned:
     if target.stype != ST_INT64:
         raise Error(
             "expected scalar type Long but found ",
-            _scalar_type_name(target.dtype),
+            scalar_type_name(target.dtype),
         )
     _expect_dtype(grad, input)
     var margin = scalar_to_float(args[unsafe_offset=4], input.stype)
@@ -1118,7 +1118,7 @@ def _multilabel_forward(args: Values) raises -> OwnedPair:
     if target.stype != ST_INT64:
         raise Error(
             "expected scalar type Long but found ",
-            _scalar_type_name(target.dtype),
+            scalar_type_name(target.dtype),
         )
     var x = Dense(input)
     var tg = Dense(target)
@@ -1228,7 +1228,7 @@ def _multilabel_backward(args: Values) raises -> Owned:
     if target.stype != ST_INT64:
         raise Error(
             "expected scalar type Long but found ",
-            _scalar_type_name(target.dtype),
+            scalar_type_name(target.dtype),
         )
     _expect_dtype(grad, input)
     _expect_dtype(is_target, input)
@@ -1304,7 +1304,7 @@ def _ctc_while() -> String:
 
 def _tensor_type_name(t: T) -> String:
     """`Tensor::toString()` as CUDA's checks print it, for this device."""
-    return String("torch.mojo.") + _scalar_type_name(t.dtype) + "Tensor"
+    return String("torch.mojo.") + scalar_type_name(t.dtype) + "Tensor"
 
 
 def _upload_lengths(lengths: List[Int], device: Int) raises -> Owned:
@@ -1398,7 +1398,7 @@ def _ctc_dtypes(log_probs: T, targets: T) raises:
     if log_probs.dtype != DType.float32 and log_probs.dtype != DType.float64:
         unsupported(
             String('"ctc_loss_cuda" not implemented for \'')
-            + _scalar_type_name(log_probs.dtype)
+            + scalar_type_name(log_probs.dtype)
             + "'"
         )
     if (

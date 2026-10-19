@@ -75,13 +75,10 @@ from tmb.ops.common import (
     store_out,
     one_device,
     sizes_str,
+    is_f32_f16_bf16,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
-
-
-def _is_float(dt: DType) -> Bool:
-    return dt == DType.float32 or dt == DType.bfloat16 or dt == DType.float16
 
 
 def _on_gpu(t: T) raises -> Bool:
@@ -257,7 +254,7 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
         # `softmax(x, d, dtype=torch.float64)` casts before it gets here.
         if dev(self.device)[].api == "metal":
             unsupported("softmax float64 is unavailable on Apple GPUs")
-    elif not _is_float(self.dtype):
+    elif not is_f32_f16_bf16(self.dtype):
         unsupported("softmax of dtype " + String(self.dtype))
     var work_stype = self.stype
     if half_to_float:
@@ -388,7 +385,7 @@ def op_log_softmax_backward_data(
             "_log_softmax_backward_data: grad and output must match in shape,"
             " dtype and device"
         )
-    if not _is_float(grad.dtype):
+    if not is_f32_f16_bf16(grad.dtype):
         unsupported("_log_softmax_backward_data of dtype " + String(grad.dtype))
     if target != grad.stype:
         # f32 grad -> f16 input_dtype went through the composed
@@ -533,12 +530,12 @@ def op_log_softmax_backward_data_out(
 
 def _masked_float(t: T, what: StaticString) raises:
     """AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, ...)."""
-    if not _is_float(t.dtype) and t.dtype != DType.float64:
+    if not is_f32_f16_bf16(t.dtype) and t.dtype != DType.float64:
         raise Error(
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
 
@@ -740,7 +737,7 @@ def op_masked_softmax_backward(
     # acc_type `tmp - output * sum(tmp over the unmasked positions)`, the
     # masked positions written as 0.
     var tmp = _op1("aten::mul", "Tensor", [tensor_arg(g.t), tensor_arg(o.t)])
-    var acc = ST_FLOAT32 if _is_float(grad.dtype) else grad.stype
+    var acc = ST_FLOAT32 if is_f32_f16_bf16(grad.dtype) else grad.stype
     var tmp_a = _nn_cast(tmp, acc)
     var o_a = _nn_cast(_nn_hold(o.t), acc)
     var tmp_m = _op1(
@@ -805,7 +802,7 @@ def op_native_layer_norm(
     var has_b = not v_is_none(args[unsafe_offset=3])
     var eps = v_f64(args[unsafe_offset=4])
     _require_mojo(a, "native_layer_norm")
-    if a.numel == 0 or not _is_float(a.dtype):
+    if a.numel == 0 or not is_f32_f16_bf16(a.dtype):
         unsupported("native_layer_norm of dtype " + String(a.dtype))
     var k = len(ns)
     if k < 1 or a.rank < k:
@@ -1094,7 +1091,7 @@ def _bn_param(t: T, a: T, channels: Int, what: StaticString) raises:
         or not t.contig
         or t.rank != 1
         or t.dim(0) != channels
-        or not _is_float(t.dtype)
+        or not is_f32_f16_bf16(t.dtype)
     ):
         unsupported(
             String(what) + " must be a contiguous float[C] on the same device"
@@ -1254,7 +1251,7 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     two saved statistics torch's CUDA path fills (Normalization.cu:454)."""
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a, "batch norm")
-    if not _is_float(a.dtype):
+    if not is_f32_f16_bf16(a.dtype):
         unsupported("batch norm of dtype " + String(a.dtype))
     var channels = _bn_channels(a)
     if v_is_none(args[unsafe_offset=base]) or v_is_none(
@@ -1436,7 +1433,7 @@ def _bn_training(args: Values, rets: Values) raises:
     over N*HxW, ATen's running-stat update, then the elementwise pass."""
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a, "batch norm")
-    if not _is_float(a.dtype):
+    if not is_f32_f16_bf16(a.dtype):
         unsupported("training batch norm of dtype " + String(a.dtype))
     var channels = _bn_channels(a)
     var has_w = not v_is_none(args[unsafe_offset=1])
@@ -1567,7 +1564,7 @@ def op_native_group_norm(
     var group = v_int(args[unsafe_offset=6])
     var eps = v_f64(args[unsafe_offset=7])
     _require_mojo(a, "native_group_norm")
-    if a.numel == 0 or not _is_float(a.dtype):
+    if a.numel == 0 or not is_f32_f16_bf16(a.dtype):
         unsupported("native_group_norm of dtype " + String(a.dtype))
     if group <= 0 or c % group != 0 or a.numel != n * c * hxw:
         unsupported("native_group_norm: bad group geometry")
@@ -1667,7 +1664,7 @@ def op_embedding(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         )
     if (
         table.device != idx.device
-        or not _is_float(table.dtype)
+        or not is_f32_f16_bf16(table.dtype)
         or table.rank != 2
         or (idx.dtype != DType.int32 and idx.dtype != DType.int64)
     ):

@@ -66,6 +66,7 @@ from tmb.backend.abi import (
     v_string,
     v_tensor,
     view_strided,
+    is_floating,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
@@ -81,6 +82,7 @@ from tmb.ops.common import (
     fill_value,
     resize_storage_bytes,
     int_list_str,
+    is_int_stype,
 )
 
 
@@ -122,15 +124,6 @@ def _st_name(st: Int32) -> String:
 
 def _is_complex(st: Int32) -> Bool:
     return st == ST_COMPLEX32 or st == ST_COMPLEX64 or st == ST_COMPLEX128
-
-
-def _is_float(st: Int32) -> Bool:
-    return (
-        st == ST_FLOAT32
-        or st == ST_FLOAT64
-        or st == ST_FLOAT16
-        or st == ST_BFLOAT16
-    )
 
 
 def _dims(t: T) -> List[Int]:
@@ -331,7 +324,7 @@ def _is_metal(t: T) raises -> Bool:
 def _check_float(t: T, name: String, allow_low: Bool = True) raises:
     """`checkFloatingOrComplex`, then what this device computes in: real
     float32 / float64 (float64 not on Metal)."""
-    if not _is_float(t.stype) and not _is_complex(t.stype):
+    if not is_floating(t.stype) and not _is_complex(t.stype):
         raise Error(
             name,
             ": Expected a floating point or complex tensor as input. Got ",
@@ -821,7 +814,7 @@ def _check_linalg_out(fname: String, dest: T, input: T, name: String) raises:
             " and input on ",
             device_str(input),
         )
-    var ok = _is_float(dest.stype) or _is_complex(dest.stype)
+    var ok = is_floating(dest.stype) or _is_complex(dest.stype)
     if _is_complex(input.stype) and not _is_complex(dest.stype):
         ok = False
     if not ok:
@@ -2612,16 +2605,6 @@ def op_linalg_ldl_factor_ex_out(
     ret_ref(rets, 2, info_out)
 
 
-def _is_int_st(st: Int32) -> Bool:
-    return (
-        st == ST_INT64
-        or st == ST_INT32
-        or st == ST_INT16
-        or st == ST_INT8
-        or st == ST_UINT8
-    )
-
-
 def _ldl_solve(LD: T, piv: T, B: T, hermitian: Bool) raises -> Owned:
     _check_square(LD, "torch.linalg.ldl_solve")
     _check_float(LD, "torch.linalg.ldl_solve")
@@ -2652,7 +2635,7 @@ def _ldl_solve(LD: T, piv: T, B: T, hermitian: Bool) raises -> Owned:
             int_list_str(got),
             " instead",
         )
-    if not _is_int_st(piv.stype):
+    if not is_int_stype(piv.stype):
         raise Error(
             "torch.linalg.ldl_solve: Expected pivots to be integers. Got ",
             _st_name(piv.stype),
@@ -3299,7 +3282,7 @@ def _view_b11(t: T) raises -> T:
 
 def _matrix_exp(a: T) raises -> Owned:
     _check_square(a, "linalg.matrix_exp")
-    if not _is_float(a.stype) and not _is_complex(a.stype):
+    if not is_floating(a.stype) and not _is_complex(a.stype):
         raise Error(
             (
                 "linalg.matrix_exp: Expected a floating point or complex tensor"

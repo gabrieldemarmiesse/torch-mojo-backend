@@ -54,8 +54,11 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     resize_out,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _resolve_device, _scalar_type_name
+from tmb.ops.data_movement import (
+    _resolve_device,
+)
 from tmb.backend.registry import Site, impl
 
 
@@ -562,7 +565,7 @@ def _range_out(
                 '"',
                 name,
                 "_cuda\" not implemented for '",
-                _scalar_type_name(out_t.dtype),
+                scalar_type_name(out_t.dtype),
                 "'",
             )
         unsupported(name + ".out of dtype " + String(out_t.dtype))
@@ -767,7 +770,7 @@ def op_range_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # range_cuda_out dispatches ALL_TYPES and Half: no bool, no bfloat16.
         raise Error(
             '"range_cuda" not implemented for \'',
-            _scalar_type_name(out_t.dtype),
+            scalar_type_name(out_t.dtype),
             "'",
         )
     var size = _range_size(start_v, end_v, step_v, out_t.dtype)
@@ -834,7 +837,7 @@ def op_randperm_generator_out(
     if out_t.dtype == DType.bfloat16 or out_t.dtype == DType.bool:
         raise Error(
             '"randperm_out_cuda" not implemented for \'',
-            _scalar_type_name(out_t.dtype),
+            scalar_type_name(out_t.dtype),
             "'",
         )
     var shape = IndexList[MAX_RANK](1)

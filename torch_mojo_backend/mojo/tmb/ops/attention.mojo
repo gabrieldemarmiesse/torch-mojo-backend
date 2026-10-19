@@ -76,10 +76,14 @@ from tmb.ops.common import (
     fill_value,
     release_if_new,
     shape_str,
+    is_f32_f16_bf16,
+    scalar_type_name,
 )
 from tmb.ops.composed import _bool_list
 from tmb.backend.registry import Site, impl
-from tmb.ops.data_movement import _batched_copy_run, _scalar_type_name
+from tmb.ops.data_movement import (
+    _batched_copy_run,
+)
 from tmb.ops.foreach import _batch_copy_dtype, _batched_copy_device
 
 # at::SDPBackend (ATen/SDPBackend.h): what `_fused_sdp_choice` returns.
@@ -173,14 +177,6 @@ def _same_device(q: T, k: T, v: T) -> Bool:
         and v.on_mojo()
         and q.device == k.device
         and q.device == v.device
-    )
-
-
-def _is_float(t: T) -> Bool:
-    return (
-        t.dtype == DType.float32
-        or t.dtype == DType.bfloat16
-        or t.dtype == DType.float16
     )
 
 
@@ -600,7 +596,7 @@ def _fused_fa_plan(
         return no
     if _api(q.device) != "hip" or _arch(q.device) != "gfx942":
         return no
-    if not _is_float(q) or k.stype != q.stype or v.stype != q.stype:
+    if not is_f32_f16_bf16(q.dtype) or k.stype != q.stype or v.stype != q.stype:
         return no
     if q.rank != 4 or k.rank != 4 or v.rank != 4:
         return no
@@ -795,7 +791,7 @@ def _math_plan(
         return no
     if not _same_device(q, k, v):
         return no
-    if not _is_float(q) or k.stype != q.stype or v.stype != q.stype:
+    if not is_f32_f16_bf16(q.dtype) or k.stype != q.stype or v.stype != q.stype:
         return no
     if q.rank != 4 or not k.same_shape(v):
         return no
@@ -1438,11 +1434,11 @@ def _math_check(q: T, k: T, v: T, what: StaticString) raises:
             what,
             ": expected query, key and value to have the same dtype",
         )
-    if not _is_float(q) and q.dtype != DType.float64:
+    if not is_f32_f16_bf16(q.dtype) and q.dtype != DType.float64:
         raise Error(
             what,
             ": expected a floating point query, got ",
-            _scalar_type_name(q.dtype),
+            scalar_type_name(q.dtype),
         )
     if q.dtype == DType.float64 and _api(q.device) == "metal":
         unsupported(String(what, " in float64: Apple GPUs have no float64"))
@@ -1628,7 +1624,7 @@ def _cudnn_dtype(q: T) raises:
     if q.dtype != DType.float16 and q.dtype != DType.bfloat16:
         raise Error(
             "cuDNN attention only supports float16 and bfloat16, got ",
-            _scalar_type_name(q.dtype),
+            scalar_type_name(q.dtype),
         )
 
 
@@ -1672,7 +1668,7 @@ def op_fused_sdp_choice(
             and not has_mask
             and dropout_p == 0.0
             and _same_device(q, k, v)
-            and _is_float(q)
+            and is_f32_f16_bf16(q.dtype)
             and k.stype == q.stype
             and v.stype == q.stype
             and q.numel > 0

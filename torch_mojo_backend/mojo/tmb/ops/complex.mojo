@@ -98,6 +98,7 @@ from tmb.backend.abi import (
     v_opt_tensor_list_present,
     view_strided,
     IntList,
+    is_floating,
 )
 from tmb.backend.device import current_device
 from tmb.backend.registry import Site, impl
@@ -107,7 +108,6 @@ from tmb.ops.common import (
     can_cast,
     combine_categories,
     int_to_component,
-    is_float_stype,
     refuse_masked_fill_dtype,
     scalar_type_name,
     scalar_parts,
@@ -693,7 +693,7 @@ def _operand(v: Value, like: T) raises -> _Operand:
                 rk = _RANK_WRAPPED
                 if is_complex_stype(st):
                     st = default_complex_dtype()
-                elif is_float_stype(st):
+                elif is_floating(st):
                     st = default_dtype()
             var o = _Operand(like, hv[0], hv[1], st, rk)
             var kind = _host_int_kind(t)

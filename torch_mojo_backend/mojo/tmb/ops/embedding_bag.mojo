@@ -64,8 +64,14 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import call_op, cast_to, contiguous, fill_value
-from tmb.ops.data_movement import _scalar_type_name
+from tmb.ops.common import (
+    call_op,
+    cast_to,
+    contiguous,
+    fill_value,
+    is_floating_dtype,
+    scalar_type_name,
+)
 from tmb.ops.unique import run_bounds, unique_flat
 
 comptime _MODE_SUM = 0
@@ -121,7 +127,7 @@ def _check_index_dtype(t: T, name: String, arg: Int, what: String) raises:
             " '",
             name,
             "' to have one of the following scalar types: Long, Int; but got ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             " instead (while checking arguments for ",
             what,
             ")",
@@ -150,22 +156,13 @@ def _acc_stype(t: T) -> Int32:
     return ST_FLOAT64 if t.dtype == DType.float64 else ST_FLOAT32
 
 
-def _is_bag_dtype(dt: DType) -> Bool:
-    return (
-        dt == DType.float32
-        or dt == DType.float16
-        or dt == DType.bfloat16
-        or dt == DType.float64
-    )
-
-
 def _check_bag_dtype(t: T, what: String) raises:
-    if not _is_bag_dtype(t.dtype):
+    if not is_floating_dtype(t.dtype):
         raise Error(
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
     if t.dtype == DType.float64 and ctx_for(t.device).api() == "metal":
@@ -260,9 +257,9 @@ def op_embedding_bag(
         if p.dtype != weight.dtype:
             raise Error(
                 "expected scalar type ",
-                _scalar_type_name(weight.dtype),
+                scalar_type_name(weight.dtype),
                 " but found ",
-                _scalar_type_name(p.dtype),
+                scalar_type_name(p.dtype),
             )
         if p.rank != 1 or p.numel != num_indices or p.device != weight.device:
             raise Error(
@@ -547,9 +544,9 @@ def op_embedding_bag_dense_backward(
         if psw.value().dtype != grad.dtype:
             raise Error(
                 "expected scalar type ",
-                _scalar_type_name(grad.dtype),
+                scalar_type_name(grad.dtype),
                 " but found ",
-                _scalar_type_name(psw.value().dtype),
+                scalar_type_name(psw.value().dtype),
             )
         psw_ptr = psw.value().ptr
         psw_stride = psw.value().stride(0)

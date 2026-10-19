@@ -83,6 +83,7 @@ from tmb.backend.abi import (
     TAG_SCALAR_INT,
     v_int,
     v_complex,
+    is_floating,
 )
 from tmb.backend.device import (
     copy_from_host,
@@ -982,12 +983,26 @@ def scalar_embed(v: Value, dtype: DType) raises -> Float64:
 comptime ST_UNDEFINED = Int32(-1)
 
 
-def is_float_stype(st: Int32) -> Bool:
+def is_f32_f16_bf16(dt: DType) -> Bool:
+    """op_utils.FLOAT_DTYPES: what most float kernels are specialized for."""
+    return dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16
+
+
+def is_floating_dtype(dt: DType) -> Bool:
+    """`is_f32_f16_bf16` plus float64 (`is_floating` keyed by DType)."""
+    return is_f32_f16_bf16(dt) or dt == DType.float64
+
+
+def is_bitwise_dtype(dt: DType) -> Bool:
+    """bool and the signed / uint8 integers (AT_DISPATCH_INTEGRAL_TYPES_AND
+    (kBool))."""
     return (
-        st == ST_FLOAT32
-        or st == ST_FLOAT16
-        or st == ST_BFLOAT16
-        or st == ST_FLOAT64
+        dt == DType.bool
+        or dt == DType.uint8
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
     )
 
 
@@ -1083,7 +1098,7 @@ def scalar_to_float(v: Value, st: Int32) raises -> Float64:
 
 
 def known_stype(st: Int32) -> Bool:
-    return is_float_stype(st) or is_int_stype(st) or st == ST_BOOL
+    return is_floating(st) or is_int_stype(st) or st == ST_BOOL
 
 
 def _pw_int_rank(st: Int32) -> Int:
@@ -1133,15 +1148,15 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
         return b
     if b == ST_BOOL:
         return a
-    if is_float_stype(a) and is_float_stype(b):
+    if is_floating(a) and is_floating(b):
         if (a == ST_FLOAT16 and b == ST_BFLOAT16) or (
             a == ST_BFLOAT16 and b == ST_FLOAT16
         ):
             return ST_FLOAT32
         return a if _pw_float_rank(a) > _pw_float_rank(b) else b
-    if is_float_stype(a):
+    if is_floating(a):
         return a
-    if is_float_stype(b):
+    if is_floating(b):
         return b
     # both integral
     if a == ST_UINT8 or b == ST_UINT8:
@@ -1164,12 +1179,12 @@ def combine_categories(higher: Int32, lower: Int32) raises -> Int32:
             raise Error(
                 "Unknown Complex ScalarType for ", scalar_type_name(higher)
             )
-        if is_float_stype(higher):
+        if is_floating(higher):
             return complex_of(higher)
         return lower
-    if is_float_stype(higher) or is_float8_stype(higher):
+    if is_floating(higher) or is_float8_stype(higher):
         return higher
-    if higher == ST_BOOL or is_float_stype(lower) or is_float8_stype(lower):
+    if higher == ST_BOOL or is_floating(lower) or is_float8_stype(lower):
         return promote_types(higher, lower)
     if higher != ST_UNDEFINED:
         return higher
@@ -1183,7 +1198,7 @@ def dtype_category(st: Int32) -> Int:
         return 0
     if is_complex_stype(st):
         return 3
-    if is_float_stype(st) or is_float8_stype(st):
+    if is_floating(st) or is_float8_stype(st):
         return 2
     return 1
 

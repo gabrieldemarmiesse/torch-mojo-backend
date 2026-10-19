@@ -64,6 +64,7 @@ from tmb.backend.abi import (
     v_string,
     v_tensor,
     view_strided,
+    is_floating as _pw_is_float,
 )
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
@@ -151,7 +152,6 @@ from tmb.ops.common import (
     combine_categories as _pw_combine_known,
     contiguous,
     copy_strided_into,
-    is_float_stype as _pw_is_float,
     is_int_stype as _pw_is_int,
     known_stype as _pw_known,
     cast_to,
@@ -162,7 +162,6 @@ from tmb.ops.common import (
     shape_list_str,
 )
 from tmb.ops.random import _draw, _sample, _sampler_dtype_check
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.core import cast_for_copy
 from tmb.ops.distance import store_autogen_out
 from tmb.ops.reductions import _scalar_reduction
@@ -2161,9 +2160,9 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
         # one dtype (check_all_same_dtype); no promotion.
         raise Error(
             "Found dtype ",
-            _scalar_type_name(grad.dtype),
+            scalar_type_name(grad.dtype),
             " but expected ",
-            _scalar_type_name(self.dtype),
+            scalar_type_name(self.dtype),
         )
     # glu_backward_cuda_out returns before its dtype dispatch when the
     # iterator is empty: an empty integer input is not an error (every
@@ -2209,9 +2208,9 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
         if gi.stype != compute:
             raise Error(
                 "Found dtype ",
-                _scalar_type_name(gi.dtype),
+                scalar_type_name(gi.dtype),
                 " but expected ",
-                _scalar_type_name(self.dtype),
+                scalar_type_name(self.dtype),
             )
         assert_no_internal_overlap(gi)
         if not gi.same_shape(self):
@@ -2335,16 +2334,16 @@ def _glu_jvp(args: Values) raises -> Owned:
         if t.stype != glu.stype:
             raise Error(
                 "Found dtype ",
-                _scalar_type_name(t.dtype),
+                scalar_type_name(t.dtype),
                 " but expected ",
-                _scalar_type_name(glu.dtype),
+                scalar_type_name(glu.dtype),
             )
     # The result takes the broadcast shape of glu, b, da and db, as the
     # TensorIterator over `empty_like(glu)` resizes its output to.
     if not _pw_is_float(glu.stype):
         raise Error(
             '"glu_cuda" not implemented for \'',
-            _scalar_type_name(glu.dtype),
+            scalar_type_name(glu.dtype),
             "'",
         )
     var opmath = ST_FLOAT64 if glu.stype == ST_FLOAT64 else ST_FLOAT32
@@ -3861,9 +3860,9 @@ def _pw_same_dtypes(args: Values, n: Int) raises -> Int32:
         if st != first:
             raise Error(
                 "Found dtype ",
-                _scalar_type_name(max_dtype(st)),
+                scalar_type_name(max_dtype(st)),
                 " but expected ",
-                _scalar_type_name(max_dtype(first)),
+                scalar_type_name(max_dtype(first)),
             )
     return first
 
@@ -3878,7 +3877,7 @@ def _pw_floating_dispatch(name: StaticString, st: Int32, half_ok: Bool) raises:
             '"',
             name,
             "\" not implemented for '",
-            _scalar_type_name(max_dtype(st)),
+            scalar_type_name(max_dtype(st)),
             "'",
         )
 
@@ -3946,7 +3945,7 @@ def _add_relu_check(self_st: Int32, common: Int32) raises:
     if common == ST_FLOAT16 or common == ST_BFLOAT16 or common == ST_BOOL:
         raise Error(
             '"add_clamp_cpu" not implemented for \'',
-            _scalar_type_name(max_dtype(common)),
+            scalar_type_name(max_dtype(common)),
             "'",
         )
 
@@ -4055,9 +4054,9 @@ def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var other_st = _pw_side_stype(b)
     if st != other_st:
         raise Error(
-            _scalar_type_name(max_dtype(st)),
+            scalar_type_name(max_dtype(st)),
             " did not match ",
-            _scalar_type_name(max_dtype(other_st)),
+            scalar_type_name(max_dtype(other_st)),
         )
     var rtol = v_f64(args[unsafe_offset=2])
     var atol = v_f64(args[unsafe_offset=3])

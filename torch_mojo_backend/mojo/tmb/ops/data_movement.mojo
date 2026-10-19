@@ -1349,11 +1349,6 @@ def _can_cast(src: DType, dst: DType) -> Bool:
     return src == DType.bool or dst != DType.bool
 
 
-def _scalar_type_name(dt: DType) -> String:
-    """How torch names a ScalarType in an error message."""
-    return scalar_type_name(dt)
-
-
 def _cat_out_batched(ins: List[T], dim: Int, out_t: T) raises -> Bool:
     """Write the concatenation straight into an existing contiguous `out` of
     the result shape with one batched rectangle copy (converting when the
@@ -1467,7 +1462,7 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not _can_cast(result.t.dtype, out.dtype):
         raise Error(
             "torch.cat(): input types can't be cast to the desired output type "
-            + _scalar_type_name(out.dtype)
+            + scalar_type_name(out.dtype)
         )
     if not out.on_mojo() or out.device != result.t.device:
         raise Error("cat.out: out must be on the inputs' mojo device")
@@ -1946,7 +1941,7 @@ def _scatter_launch(
                 '"'
                 + kernel
                 + "\" not implemented for '"
-                + _scalar_type_name(dest.dtype)
+                + scalar_type_name(dest.dtype)
                 + "'"
             )
         kdt = DType.uint8
@@ -2149,7 +2144,7 @@ def _scatter_validate(
         # copy of self, as below.)
         unsupported(
             '"cuda_scatter_gather_base_kernel_func" not implemented for \''
-            + _scalar_type_name(a.dtype)
+            + scalar_type_name(a.dtype)
             + "'"
         )
     # A float8 scatter (CUDA dispatches AT_FLOAT8_TYPES) is a byte move.
@@ -2413,9 +2408,9 @@ def _out_target(
         raise Error(
             what,
             ": Expected out tensor to have dtype ",
-            _scalar_type_name(like.dtype),
+            scalar_type_name(like.dtype),
             ", but got ",
-            _scalar_type_name(out.dtype),
+            scalar_type_name(out.dtype),
             " instead",
         )
     if not out.on_mojo() or out.device != like.device:
@@ -2791,9 +2786,9 @@ def _index_add_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
     if source.dtype != a.dtype:
         raise Error(
             "index_add_(): self (",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             ") and source (",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
             ") must have the same scalar type",
         )
     if a.rank > 4 or max(source.rank, 1) != rank:
@@ -3130,9 +3125,9 @@ def _overlaps_contiguous_target(target: T, source: T) -> Bool:
 def _index_put_dtype_error(target: T, values: T) raises:
     raise Error(
         "Index put requires the source and destination dtypes match, got ",
-        _scalar_type_name(target.dtype),
+        scalar_type_name(target.dtype),
         " for the destination and ",
-        _scalar_type_name(values.dtype),
+        scalar_type_name(values.dtype),
         " for the source.",
     )
 
@@ -3565,7 +3560,7 @@ def op_nonzero(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if is_float8(t.dtype):
         unsupported(
             '"nonzero_cuda" not implemented for \''
-            + _scalar_type_name(t.dtype)
+            + scalar_type_name(t.dtype)
             + "'"
         )
     # A 0-d tensor has one element and no coordinates: ATen scans it like a
@@ -3665,12 +3660,12 @@ def _masked_select(a: T, mask: T) raises -> Owned:
     if mask.dtype != DType.bool:
         raise Error(
             "masked_select: expected BoolTensor for mask, got ",
-            _scalar_type_name(mask.dtype),
+            scalar_type_name(mask.dtype),
         )
     if not a.on_mojo() or not mask.on_mojo() or a.device != mask.device:
         unsupported("masked_select: self and mask must be on the same mojo GPU")
     if a.itemsize > 8:
-        unsupported("masked_select: dtype " + _scalar_type_name(a.dtype))
+        unsupported("masked_select: dtype " + scalar_type_name(a.dtype))
     var rank = max(a.rank, mask.rank)
     var shape = broadcast_shape(a, mask)
     var src = _broadcast_dense(a, shape, rank)

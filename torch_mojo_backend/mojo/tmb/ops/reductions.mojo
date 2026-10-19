@@ -93,9 +93,11 @@ from tmb.ops.common import (
     is_cast_dtype_on,
     one_device,
     resize_out,
+    is_f32_f16_bf16,
+    is_floating_dtype,
+    scalar_type_name,
 )
 from tmb.ops.core import cast_for_copy
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
     cx_via_bool,
@@ -130,15 +132,10 @@ comptime BOOL_FULL_REDUCE_MAX = 1 << 22
 # ---------------------------------------------------------------------------
 
 
-def _is_float3(dt: DType) -> Bool:
-    """reduce_skeleton FLOAT_ONLY_DTYPES: mean, var, the L2 norm."""
-    return dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16
-
-
 def _is_row_reduce(dt: DType) -> Bool:
     """reduce_skeleton SCALAR_DTYPES: sum, amax/amin, max/min, the
     arg-reductions."""
-    return _is_float3(dt) or dt == DType.int64 or dt == DType.int32
+    return is_f32_f16_bf16(dt) or dt == DType.int64 or dt == DType.int32
 
 
 def _check_extremum_dtype(a: T, op: StaticString) raises:
@@ -164,13 +161,6 @@ def _is_truthy(dt: DType) -> Bool:
     )
 
 
-def _is_float_or_double(dt: DType) -> Bool:
-    """_is_float3 plus float64: mean's and the vector-norm's dtype gate, NOT
-    var's (its separate moments kernel, entry.mojo's FLOAT_DTYPES, has no
-    float64 specialization)."""
-    return _is_float3(dt) or dt == DType.float64
-
-
 def _is_castable(dt: DType, t: T) raises -> Bool:
     """aten_fast._CAST_DTYPES: what the cast kernel dispatches on, and so the
     dtype pairs a promotion can go through -- exactly `is_cast_dtype_on`
@@ -183,7 +173,7 @@ def _is_castable(dt: DType, t: T) raises -> Bool:
 def _is_sum_dtype(dt: DType) -> Bool:
     """What `fast_aten_sum` accumulates in (int32 is promoted to int64 by
     torch before it gets here, and an explicit `dtype=int32` was declined)."""
-    return _is_float3(dt) or dt == DType.float64 or dt == DType.int64
+    return is_f32_f16_bf16(dt) or dt == DType.float64 or dt == DType.int64
 
 
 def _decline_metal_float64(t: T, op: StaticString) raises:
@@ -1080,10 +1070,10 @@ def _mean(
     var src = _borrow(a)
     var want = _opt_dtype(dtype_v)
     if want >= 0:
-        if not _is_float_or_double(max_dtype(want)):
+        if not is_floating_dtype(max_dtype(want)):
             unsupported("mean with dtype=" + String(max_dtype(want)))
         _promote(src, want)
-    if not _is_float_or_double(src.t.dtype):
+    if not is_floating_dtype(src.t.dtype):
         unsupported("mean of dtype " + String(src.t.dtype))
     _decline_metal_float64(src.t, "mean")
     var dims = _reduce_dims(dim_v, src.t.rank, True)
@@ -1132,12 +1122,12 @@ def _mean_out(
     _require_mojo(dst)
     var src = _borrow(a)
     var target = _out_reduce_dtype(dtype_v, dst, op_name)
-    if _opt_dtype(dtype_v) < 0 and not _is_float_or_double(src.t.dtype):
+    if _opt_dtype(dtype_v) < 0 and not is_floating_dtype(src.t.dtype):
         # No explicit dtype=: torch requires self itself to be float/complex.
         # An explicit dtype= bypasses this -- self is cast to it below, so an
         # int64 self with dtype=torch.float32 is valid.
         unsupported("mean of dtype " + String(src.t.dtype))
-    if not _is_float_or_double(target):
+    if not is_floating_dtype(target):
         unsupported("mean with dtype=" + String(target))
     _promote_for_out_reduction(src, target, op_name)
     var dims = _reduce_dims(dim_v, src.t.rank, True)
@@ -2074,7 +2064,7 @@ def _moments_into(
     once after the root, as CUDA's Welford `project(take_sqrt)` does. An
     empty operand gives NaN (ATen's trivial reduction)."""
     var rdt = max_dtype(res_st)
-    if not _is_float3(rdt) and rdt != DType.float64:
+    if not is_f32_f16_bf16(rdt) and rdt != DType.float64:
         unsupported("std/var into dtype " + String(rdt))
     if a.numel == 0:
         var var_e = own(new_tensor(shape, rank, res_st, a.device))
@@ -2193,9 +2183,9 @@ def _std_var_out(args: Values, rets: Values, take_sqrt: Bool) raises:
     if not out.dtype.is_floating_point():
         raise Error(
             "result type ",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " can't be cast to the desired output type ",
-            _scalar_type_name(out.dtype),
+            scalar_type_name(out.dtype),
         )
     var sr = _std_var_shape(a, dims, keepdim)
     var res = _moments_into(
@@ -2456,7 +2446,7 @@ def _hash_tensor_compute(
     if not _is_hash_dtype(a.dtype):
         raise Error(
             '"xor_sum_cuda" not implemented for \'',
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             "'",
         )
     _decline_metal_float64(a, "hash_tensor")
@@ -2496,7 +2486,7 @@ def op_hash_tensor_out(
     if out.stype != ST_UINT64:
         raise Error(
             "Expected result to be of dtype uint64, but got ",
-            _scalar_type_name(out.dtype),
+            scalar_type_name(out.dtype),
         )
     var dims = _hash_tensor_prep(a, args[unsafe_offset=1])
     check_out_as(out, ST_UINT64, a)
@@ -2567,12 +2557,12 @@ def _vector_norm_operand(
     promotion order, so it is a valid target from any of the other three
     floats but never a valid source down to float32.
     """
-    if not _is_float_or_double(src.t.dtype):
+    if not is_floating_dtype(src.t.dtype):
         unsupported(String(op_label) + " of dtype " + String(src.t.dtype))
     var want = _opt_dtype(dtype_v)
     if want >= 0:
         var target = max_dtype(want)
-        if not _is_float_or_double(target):
+        if not is_floating_dtype(target):
             unsupported(String(op_label) + " with dtype=" + String(target))
         var is_widen = (
             target == src.t.dtype

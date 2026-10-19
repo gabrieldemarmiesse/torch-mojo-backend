@@ -123,7 +123,6 @@ from tmb.ops.data_movement import (
     _is_scatter_add_dtype,
     _is_scatter_dtype,
     _norm_dim,
-    _scalar_type_name,
     _materialize_contiguous,
     _scatter_into,
     _scatter_launch,
@@ -596,7 +595,7 @@ def _take_checks(a: T, index: T, dest: T) raises:
     if index.dtype != DType.int64:
         raise Error(
             "take(): Expected a long tensor for index, but got ",
-            _scalar_type_name(index.dtype),
+            scalar_type_name(index.dtype),
         )
     if a.stype != dest.stype:
         raise Error(
@@ -604,9 +603,9 @@ def _take_checks(a: T, index: T, dest: T) raises:
                 "take(): self and out expected to have the same dtype, but got"
                 " self.dtype = "
             ),
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and dest.dtype = ",
-            _scalar_type_name(dest.dtype),
+            scalar_type_name(dest.dtype),
         )
     if not _same_device(a, dest) or not _same_device(a, index):
         raise Error(
@@ -686,7 +685,7 @@ def op_put_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if index.dtype != DType.int64:
         raise Error(
             "put_(): Expected a long tensor for index, but got ",
-            _scalar_type_name(index.dtype),
+            scalar_type_name(index.dtype),
         )
     if a.stype != source.stype:
         raise Error(
@@ -694,9 +693,9 @@ def op_put_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
                 "put_(): self and source expected to have the same dtype, but"
                 " got self.dtype = "
             ),
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and source.dtype = ",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
         )
     if not _same_device(a, source) or not _same_device(a, index):
         raise Error(
@@ -923,7 +922,7 @@ def _index_copy_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
     if index.dtype != DType.int64:
         raise Error(
             "index_copy_(): Expected a long tensor for index, but got ",
-            _scalar_type_name(index.dtype),
+            scalar_type_name(index.dtype),
         )
     if a.stype != source.stype:
         raise Error(
@@ -931,9 +930,9 @@ def _index_copy_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
                 "index_copy_(): self and source expected to have the same"
                 " dtype, but got (self) "
             ),
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and (source) ",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
         )
     if not _same_device(a, source) or not _same_device(a, index):
         raise Error(
@@ -1112,9 +1111,9 @@ def op_masked_scatter_(
                 "masked_scatter_: expected self and source to have same dtypes"
                 " but got "
             ),
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and ",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
         )
     if mask.dtype != DType.bool:
         raise Error(
@@ -1122,7 +1121,7 @@ def op_masked_scatter_(
                 "masked_scatter_ only supports boolean masks, but got mask with"
                 " dtype "
             ),
-            _scalar_type_name(mask.dtype),
+            scalar_type_name(mask.dtype),
         )
     if not _same_device(a, mask) or not _same_device(a, source):
         unsupported("masked_scatter_ with operands on different devices")
@@ -1362,7 +1361,7 @@ def _reduce_dtype_check(a: T, red: Int, what: String) raises:
             return
         unsupported(
             '"cuda_scatter_gather_base_kernel_func" not implemented for \''
-            + _scalar_type_name(a.dtype)
+            + scalar_type_name(a.dtype)
             + "'"
         )
     if not _is_scatter_add_dtype(a.dtype):
@@ -1838,14 +1837,14 @@ def _index_reduce_check(
     if index.dtype != DType.int64 and index.dtype != DType.int32:
         raise Error(
             "index_reduce_(): Expected dtype int32/int64 for index but got: ",
-            _scalar_type_name(index.dtype),
+            scalar_type_name(index.dtype),
         )
     if source.dtype != a.dtype:
         raise Error(
             "index_reduce_(): self (",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             ") and source (",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
             ") must have the same scalar type",
         )
     if not (dim == 0 or dim < source.rank):
@@ -1963,7 +1962,7 @@ def _index_reduce_op(
             '"'
             + kernel
             + "\" not implemented for '"
-            + _scalar_type_name(a.dtype)
+            + scalar_type_name(a.dtype)
             + "'"
         )
     var dim = checked[0]
@@ -2048,11 +2047,11 @@ def _nonzero_out_checks(t: T, dest: T, what: String) raises:
                     "nonzero_static: Expected out tensor to have scalar type"
                     " Long but got "
                 ),
-                _scalar_type_name(dest.dtype),
+                scalar_type_name(dest.dtype),
             )
         raise Error(
             "Expected object of scalar type Long as out, but got ",
-            _scalar_type_name(dest.dtype),
+            scalar_type_name(dest.dtype),
         )
     if dest.device_type != t.device_type or dest.device != t.device:
         raise Error(

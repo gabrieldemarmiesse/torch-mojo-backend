@@ -44,9 +44,9 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     resize_out,
+    scalar_type_name,
 )
 from tmb.ops.composed import _dispatch, _tensor_value
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 
 # The `dists<scalar_t>` member a launch runs (kernels/distance/entry.mojo).
@@ -102,7 +102,7 @@ def _kernel_dtype(t: T, what: StaticString) raises:
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
     if t.dtype == DType.float64 and dev(t.device)[].api == "metal":
@@ -114,9 +114,9 @@ def _same_dtype(t: T, like: T) raises:
     if t.dtype != like.dtype:
         raise Error(
             "expected scalar type ",
-            _scalar_type_name(like.dtype),
+            scalar_type_name(like.dtype),
             " but found ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
 
 
@@ -269,12 +269,12 @@ def _cdist_forward(args: Values) raises -> Owned:
     if not x1.dtype.is_floating_point():
         raise Error(
             "cdist only supports floating-point dtypes, X1 got: ",
-            _scalar_type_name(x1.dtype),
+            scalar_type_name(x1.dtype),
         )
     if not x2.dtype.is_floating_point():
         raise Error(
             "cdist only supports floating-point dtypes, X2 got: ",
-            _scalar_type_name(x2.dtype),
+            scalar_type_name(x2.dtype),
         )
     if not (p >= 0):
         raise Error("cdist only supports non-negative p values")

@@ -68,6 +68,7 @@ from tmb.backend.abi import (
     v_is_none,
     v_string,
     v_tensor,
+    is_floating,
 )
 from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
@@ -191,16 +192,6 @@ def _b_bcast_dtype(st: Int32) -> Bool:
 def _b_fillable(st: Int32) -> Bool:
     """elementwise SPEC_FILL_DTYPES (the old `_FILL_DTYPES`)."""
     return _b_bcast_dtype(st) or st == ST_BOOL
-
-
-def _b_int_dtype(st: Int32) -> Bool:
-    return (
-        st == ST_INT8
-        or st == ST_INT16
-        or st == ST_INT32
-        or st == ST_INT64
-        or st == ST_UINT8
-    )
 
 
 def _b_category(st: Int32) -> Int:
@@ -2050,10 +2041,6 @@ def op_mul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def _b_is_floating(st: Int32) -> Bool:
-    return _b_float3(st) or st == ST_FLOAT64
-
-
 def _b_true_div_dtype(a: T, rhs: Side) raises -> Int32:
     """`torch.result_type` for TRUE division.
 
@@ -2068,8 +2055,8 @@ def _b_true_div_dtype(a: T, rhs: Side) raises -> Int32:
     var common = a_stype
     if rhs.is_t:
         var b_stype = rhs.t.value().stype
-        var a_float = _b_is_floating(a_stype)
-        var b_float = _b_is_floating(b_stype)
+        var a_float = is_floating(a_stype)
+        var b_float = is_floating(b_stype)
         if a_float and not b_float:
             common = a_stype
         elif b_float and not a_float:
@@ -2085,9 +2072,9 @@ def _b_true_div_dtype(a: T, rhs: Side) raises -> Int32:
                 )
         else:
             return default_dtype()
-    elif not rhs.s.value().is_int and not _b_is_floating(a_stype):
+    elif not rhs.s.value().is_int and not is_floating(a_stype):
         return default_dtype()
-    if not _b_is_floating(common):
+    if not is_floating(common):
         return default_dtype()
     return common
 
@@ -2115,7 +2102,7 @@ def _b_rounding_div(
     if lhs.is_t and not rhs.is_t:
         var a = lhs.t.value().copy()
         var s = rhs.s.value().copy()
-        if not _b_is_floating(a.stype) and s.is_int and s.i == 0:
+        if not is_floating(a.stype) and s.is_int and s.i == 0:
             raise Error("ZeroDivisionError")
         if a.stype == ST_BFLOAT16 or a.stype == ST_FLOAT16:
             var op: StaticString = "TruncDivScalarSpec"
@@ -2156,7 +2143,7 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     var common = _b_true_div_dtype(a, rhs)
     # float64 included: DivSpec dispatches on logic SPEC_BCAST_DTYPES,
     # which has it, and the kernel only asks that the dtype be floating.
-    if not _b_is_floating(common):
+    if not is_floating(common):
         unsupported(
             "true division producing dtype "
             + String(common)
@@ -2242,7 +2229,7 @@ def _b_fast_div(args: Values, rets: Values, dest_h: Int) raises -> Bool:
             # declines it (`v_tensor`) where no complex route took it
             return False
         if b.on_mojo():
-            if a.stype != b.stype or not _b_is_floating(a.stype):
+            if a.stype != b.stype or not is_floating(a.stype):
                 return False
             return _b_fast_tt("DivSpec", a, b, rets, dest_h)
         if not _b_wrapped_number(b):
@@ -2365,7 +2352,7 @@ def _b_pow_float_base(lhs: Side, rhs: Side) raises:
     if lhs.is_t and is_float8(lhs.t.value().dtype):
         _ = _b_sides_result(lhs, rhs, rhs)  # c10's float8 promotion error
         decline_float8(lhs.t.value().dtype, "pow_cuda")
-    if not lhs.is_t or not _b_is_floating(lhs.t.value().stype):
+    if not lhs.is_t or not is_floating(lhs.t.value().stype):
         unsupported("pow.Tensor_Tensor on a tensor that is not float")
 
 
@@ -2757,7 +2744,7 @@ def _b_clamp_dtype(self_stype: Int32, lo: Value, hi: Value) -> Int32:
     var float_bound = (not v_is_none(lo) and not _b_scalar_is_int(lo)) or (
         not v_is_none(hi) and not _b_scalar_is_int(hi)
     )
-    if _b_is_floating(self_stype) or is_float8_stype(self_stype):
+    if is_floating(self_stype) or is_float8_stype(self_stype):
         return self_stype  # a wrapped Scalar never promotes a float tensor
     if float_bound:
         return default_dtype()
@@ -2870,7 +2857,7 @@ def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:
     """A clamp bound as `_b_clamp_launch`'s raw slot."""
     # `Scalar::to<scalar_t>()`: checked against the dtype (and exact for
     # an integral one).
-    if _b_is_floating(result_stype):
+    if is_floating(result_stype):
         return Int(f64_bits(scalar_to_float(v, result_stype)))
     return scalar_to_int(v, result_stype)
 
@@ -3050,7 +3037,7 @@ def _b_addc(
     decline_float8(
         a.dtype, "addcmul_cuda" if op == "AddcmulBcast" else "addcdiv_cuda"
     )
-    if not _b_float3(a.stype) and not (allow_int and _b_int_dtype(a.stype)):
+    if not _b_float3(a.stype) and not (allow_int and is_int_stype(a.stype)):
         unsupported("addc* of dtype " + String(a.stype))
     if a.rank > 4 or b.rank > 4 or c.rank > 4:
         unsupported("addc* operands of rank > 4")

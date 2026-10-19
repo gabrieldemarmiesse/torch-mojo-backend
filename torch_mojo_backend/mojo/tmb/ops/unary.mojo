@@ -64,6 +64,9 @@ from tmb.ops.common import (
     same_view,
     shares_storage,
     assert_no_partial_overlap,
+    is_f32_f16_bf16,
+    is_bitwise_dtype,
+    scalar_type_name,
 )
 from tmb.ops.f8_iter import (
     f8_iter,
@@ -119,7 +122,6 @@ from tmb.ops.complex_math import (
     cx_sqrt_out,
 )
 from tmb.ops.core import cast_for_copy
-from tmb.ops.data_movement import _scalar_type_name
 
 
 # ---------------------------------------------------------------------------
@@ -128,13 +130,9 @@ from tmb.ops.data_movement import _scalar_type_name
 # ---------------------------------------------------------------------------
 
 
-def _is_float_dtype(dt: DType) -> Bool:
-    return dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16
-
-
 def _is_spec_unary_dtype(dt: DType) -> Bool:
     return (
-        _is_float_dtype(dt)
+        is_f32_f16_bf16(dt)
         or dt == DType.float64
         or dt == DType.int8
         or dt == DType.int16
@@ -148,17 +146,6 @@ def _is_bool_spec_dtype(dt: DType) -> Bool:
     return _is_spec_unary_dtype(dt) or dt == DType.bool
 
 
-def _is_bitwise_dtype(dt: DType) -> Bool:
-    return (
-        dt == DType.bool
-        or dt == DType.uint8
-        or dt == DType.int8
-        or dt == DType.int16
-        or dt == DType.int32
-        or dt == DType.int64
-    )
-
-
 def _f8_refuse(op: String, dt: DType) raises:
     """CUDA's unary kernels dispatch no float8: `"<op>_cuda" not implemented
     for '<dtype>'`, the op named from its spec (`ExpSpec` -> exp_cuda)."""
@@ -168,7 +155,7 @@ def _f8_refuse(op: String, dt: DType) raises:
             '"'
             + name
             + "_cuda\" not implemented for '"
-            + _scalar_type_name(dt)
+            + scalar_type_name(dt)
             + "'"
         )
 
@@ -182,16 +169,16 @@ def _f8_out_refuse(op: String, t: T, mut dst: T, same_dtype: Bool) raises:
         if same_dtype and dst.stype != t.stype:
             raise Error(
                 "Found dtype ",
-                _scalar_type_name(dst.dtype),
+                scalar_type_name(dst.dtype),
                 " but expected ",
-                _scalar_type_name(t.dtype),
+                scalar_type_name(t.dtype),
             )
         if not same_dtype and not can_cast(t.stype, dst.stype):
             raise Error(
                 "result type ",
-                _scalar_type_name(t.dtype),
+                scalar_type_name(t.dtype),
                 " can't be cast to the desired output type ",
-                _scalar_type_name(dst.dtype),
+                scalar_type_name(dst.dtype),
             )
         if not dst.same_shape(t):
             resize_out(dst, t.shape, t.rank)
@@ -200,7 +187,7 @@ def _f8_out_refuse(op: String, t: T, mut dst: T, same_dtype: Bool) raises:
 
 def _require_float(op: String, dt: DType) raises:
     _f8_refuse(op, dt)
-    if not _is_float_dtype(dt):
+    if not is_f32_f16_bf16(dt):
         unsupported(
             op
             + ": dtype "
@@ -271,9 +258,9 @@ def _out_prologue(t_in: T, mut dst: T, result_stype: Int32) raises:
         # TensorIterator's check_dtype wording (stock CUDA, every dtype).
         raise Error(
             "Found dtype ",
-            _scalar_type_name(dst.dtype),
+            scalar_type_name(dst.dtype),
             " but expected ",
-            _scalar_type_name(max_dtype(result_stype)),
+            scalar_type_name(max_dtype(result_stype)),
         )
     if not dst.same_shape(t_in):
         resize_out(dst, t_in.shape, t_in.rank)
@@ -662,7 +649,7 @@ def _log2_input(t: T) raises -> Owned:
     if not t.on_mojo():
         unsupported("log2 requires an input on the mojo device")
     if (
-        not _is_float_dtype(t.dtype)
+        not is_f32_f16_bf16(t.dtype)
         and t.dtype != DType.float64
         and not _is_bool_spec_dtype(t.dtype)
     ):
@@ -1391,7 +1378,7 @@ def _float_or_f64_unary_out(
 def _promote(t: T) raises -> T:
     """unary_float_op: an integer or bool input computes in the default float
     dtype (a new tensor; the float input itself otherwise)."""
-    if _is_bitwise_dtype(t.dtype):
+    if is_bitwise_dtype(t.dtype):
         return cast_to(t, default_dtype())
     return t.copy()
 
@@ -1635,7 +1622,7 @@ def op_round_decimals(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var decimals = v_int(args[unsafe_offset=1])
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         unsupported("round.decimals: integer tensors are not supported")
     var p = _round_decimals_params(t, decimals)
     var out = own(_param_unary("RoundDecimalsSpec", t, p[0], p[1], p[2]))
@@ -1649,7 +1636,7 @@ def op_round_decimals_out(
     var t = v_tensor(args[unsafe_offset=0])
     var decimals = v_int(args[unsafe_offset=1])
     var dst = v_tensor(args[unsafe_offset=2])
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         unsupported("round.decimals: integer tensors are not supported")
     var p = _round_decimals_params(t, decimals)
     _param_unary_out("RoundDecimalsSpec", t, dst, p[0], p[1], p[2])
@@ -1662,7 +1649,7 @@ def op_round__decimals(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var decimals = v_int(args[unsafe_offset=1])
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         unsupported("round.decimals: integer tensors are not supported")
     var p = _round_decimals_params(t, decimals)
     var dst = t.copy()
@@ -1734,16 +1721,16 @@ def op_logit_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_logit_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var eps = _logit_eps(args[unsafe_offset=1])
-    if _is_bitwise_dtype(t.dtype):
+    if is_bitwise_dtype(t.dtype):
         # CUDA's order: the cast check on self fires before any dtype support
         # check of the promoted result (a float64 default dtype included), so
         # it runs before the promotion casts anything (Apple GPUs would
         # otherwise refuse the float64 cast first).
         raise Error(
             "result type ",
-            _scalar_type_name(max_dtype(default_dtype())),
+            scalar_type_name(max_dtype(default_dtype())),
             " can't be cast to the desired output type ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
     var src = own_if_new(_promote(t), t)
     _require_float("logit", src.t.dtype)
@@ -1898,7 +1885,7 @@ def _nan_to_num_params(
 # aten::nan_to_num(Tensor self, float? nan=None, float? posinf=None, float? neginf=None) -> Tensor
 def op_nan_to_num(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    if _is_bitwise_dtype(t.dtype):
+    if is_bitwise_dtype(t.dtype):
         # Integers and bool hold no NaN or infinity: a copy.
         var copy = own(_int_identity(t))
         ret_owned(rets, 0, copy)
@@ -1922,12 +1909,12 @@ def op_nan_to_num_out(
         if dst.stype != t.stype:
             raise Error(
                 "nan_to_num: dtype of out: ",
-                _scalar_type_name(dst.dtype),
+                scalar_type_name(dst.dtype),
                 " should be same as input: ",
-                _scalar_type_name(t.dtype),
+                scalar_type_name(t.dtype),
             )
         _f8_out_refuse("nan_to_num", t, dst, True)
-    if _is_bitwise_dtype(t.dtype):
+    if is_bitwise_dtype(t.dtype):
         _identity_into(t, dst)
         ret_ref(rets, 0, dst)
         return
@@ -1956,7 +1943,7 @@ def _int_identity(t: T) raises -> T:
 
 
 def _ceil_or_floor(op: String, t: T) raises -> T:
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         return _int_identity(t)
     _require_float_or_f64(op, t)
     return _unary("elementwise", op, t, t.dtype)
@@ -1969,7 +1956,7 @@ def _identity_into(t: T, mut dst: T) raises:
 
 
 def _ceil_or_floor_into(op: String, t: T, mut dst: T) raises:
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         _identity_into(t, dst)
         return
     _require_float_or_f64(op, t)
@@ -2270,7 +2257,7 @@ def _bitwise_not_kernel(src: T, dst: T) raises:
 def _bitwise_not(t_in: T) raises -> T:
     if t_in.dtype == DType.bool:
         return _bool_unary("LogicalNotSpec", t_in)
-    if not _is_bitwise_dtype(t_in.dtype):
+    if not is_bitwise_dtype(t_in.dtype):
         unsupported(
             "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
         )
@@ -2286,7 +2273,7 @@ def _bitwise_not_into(t_in: T, mut dst: T) raises:
     if t_in.dtype == DType.bool:
         _bool_unary_out("LogicalNotSpec", t_in, dst)
         return
-    if not _is_bitwise_dtype(t_in.dtype):
+    if not is_bitwise_dtype(t_in.dtype):
         unsupported(
             "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
         )

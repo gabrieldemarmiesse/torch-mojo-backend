@@ -88,7 +88,6 @@ from tmb.ops.common import (
     resize_out,
     same_view,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.f8_iter import (
     f8_iter,
     MODE_FN,
@@ -589,9 +588,9 @@ def op_where_self_out(
     if r.t.stype != out.stype:
         raise Error(
             "Expected out type to be ",
-            _scalar_type_name(r.t.dtype),
+            scalar_type_name(r.t.dtype),
             " but got ",
-            _scalar_type_name(out.dtype),
+            scalar_type_name(out.dtype),
         )
     # TensorIterator's memory-overlap checks on the out as given, against
     # the operands it reads unconverted
@@ -1421,9 +1420,9 @@ def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
     if y.stype != x.stype:
         raise Error(
             "Found dtype ",
-            _scalar_type_name(y.dtype),
+            scalar_type_name(y.dtype),
             " but expected ",
-            _scalar_type_name(x.dtype),
+            scalar_type_name(x.dtype),
         )
     if out.numel > 0:
         # AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND2(kHalf, kBFloat16), reached
@@ -1436,7 +1435,7 @@ def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
         ):
             unsupported(
                 '"cross_cuda" not implemented for \''
-                + _scalar_type_name(x.dtype)
+                + scalar_type_name(x.dtype)
                 + "'"
             )
         if x.dtype == DType.float64 and dev(x.device)[].api == "metal":
@@ -1512,7 +1511,7 @@ def _test_list_add[floating: Bool](values: T, addends: Value) raises -> Owned:
             "expected scalar type ",
             "Float" if floating else "Int",
             " but found ",
-            _scalar_type_name(values.dtype),
+            scalar_type_name(values.dtype),
         )
     var n = values.dim(0)
     var count = DoubleList(addends).n if floating else IntList(addends).n

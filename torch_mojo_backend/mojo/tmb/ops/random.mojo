@@ -76,8 +76,9 @@ from tmb.ops.common import (
     resize_out,
     shares_storage,
     sizes_str,
+    is_floating_dtype,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
     cx_normal_,
@@ -328,15 +329,6 @@ def _draw(
     _ = ctx
 
 
-def _is_floating(dt: DType) -> Bool:
-    return (
-        dt == DType.float32
-        or dt == DType.float16
-        or dt == DType.bfloat16
-        or dt == DType.float64
-    )
-
-
 def _is_wide_unsigned(dt: DType) -> Bool:
     return dt == DType.uint16 or dt == DType.uint32 or dt == DType.uint64
 
@@ -344,10 +336,10 @@ def _is_wide_unsigned(dt: DType) -> Bool:
 def _check_device_dtype(
     t: T, op: StaticString, floating_only: Bool, wide_unsigned: Bool = False
 ) raises:
-    if floating_only and not _is_floating(t.dtype):
+    if floating_only and not is_floating_dtype(t.dtype):
         unsupported(String(op) + " of dtype " + String(t.dtype))
     if not (
-        _is_floating(t.dtype)
+        is_floating_dtype(t.dtype)
         or t.dtype == DType.int64
         or t.dtype == DType.int32
         or t.dtype == DType.int16
@@ -650,7 +642,7 @@ def op_bernoulli_out(
     if not out.on_mojo() or out.device != p.device:
         raise Error("expected `out` on the probabilities' mojo device")
     _check_device_dtype(out, "bernoulli_", False)
-    if not _is_floating(p.dtype):
+    if not is_floating_dtype(p.dtype):
         raise Error(
             "expected probabilities tensor to have floating type, got ",
             String(p.dtype),
@@ -708,7 +700,7 @@ def _check_probabilities(p_in: T) raises:
 def _bernoulli_tensor_into(t: T, p_in: T, generator: Int) raises:
     """`t.bernoulli_(p_in)`: bernoulli_tensor_cuda_kernel's draw."""
     _check_device_dtype(t, "bernoulli_", False)
-    if not _is_floating(p_in.dtype):
+    if not is_floating_dtype(p_in.dtype):
         raise Error(
             "expected probabilities tensor to have floating type, got ",
             String(p_in.dtype),
@@ -908,7 +900,7 @@ def _int_lowest_highest(dtype: DType) -> Tuple[Int, Int]:
 
 
 def _check_from_to_in_range(from_: Int, to_inc: Int, dtype: DType) raises:
-    if _is_floating(dtype):
+    if is_floating_dtype(dtype):
         var b = _lowest_highest(dtype)
         if not (Float64(from_) >= b[0] and Float64(from_) <= b[1]):
             raise Error("from is out of bounds for ", String(dtype))
@@ -942,7 +934,7 @@ def _random_from_to_impl(t: T, from_: Int, to_v: Value, generator: Int) raises:
                 " >= to=",
                 to,
             )
-        if _is_floating(t.dtype):
+        if is_floating_dtype(t.dtype):
             lo = _update_from(t.dtype, lo)
             to = _update_to(t.dtype, to)
             if not lo < to:
@@ -964,7 +956,7 @@ def _random_from_to_impl(t: T, from_: Int, to_v: Value, generator: Int) raises:
         _random_from_to(t, range_, lo, generator)
     elif lo != INT64_MIN:
         var to_inc: Int
-        if _is_floating(t.dtype):
+        if is_floating_dtype(t.dtype):
             var d = _digits(t.dtype)
             to_inc = INT64_MAX if d >= 63 else (1 << d)
             lo = _update_from(t.dtype, lo)
@@ -1162,7 +1154,7 @@ def op_fused_dropout(
     if not _dropout_dtype_ok(a.dtype):
         raise Error(
             '"fused_dropout" not implemented for \'',
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             "'",
         )
     if a.dtype == DType.float64 and dev(a.device)[].api == "metal":
@@ -1246,14 +1238,14 @@ def op_native_dropout_backward(
     var scale = v_f64(args[unsafe_offset=2])
     if keep.dtype != DType.bool:
         raise Error(
-            "Mask should be Bool Scalar Type", _scalar_type_name(keep.dtype)
+            "Mask should be Bool Scalar Type", scalar_type_name(keep.dtype)
         )
     if not _dropout_dtype_ok(grad.dtype):
         # Dropout.cu's dropout_backward_cuda dispatches on the floating
         # types only (CPU's `grad * mask * scale` takes any dtype).
         raise Error(
             '"masked_scale" not implemented for \'',
-            _scalar_type_name(grad.dtype),
+            scalar_type_name(grad.dtype),
             "'",
         )
     if (
@@ -1364,10 +1356,10 @@ def _multinomial(
     """The int64 result, an owned handle."""
     if p_in.rank < 1 or p_in.rank > 2:
         raise Error("prob_dist must be 1 or 2 dim")
-    if not _is_floating(p_in.dtype):
+    if not is_floating_dtype(p_in.dtype):
         raise Error(
             "multinomial only supports floating-point dtypes for input, got: ",
-            _scalar_type_name(p_in.dtype),
+            scalar_type_name(p_in.dtype),
         )
     if n_sample <= 0:
         raise Error("cannot sample n_sample <= 0 samples")
@@ -1493,7 +1485,7 @@ def op_multinomial_out(
     if out.stype != ST_INT64:
         raise Error(
             "multinomial expects Long tensor out, got: ",
-            _scalar_type_name(out.dtype),
+            scalar_type_name(out.dtype),
         )
     var result = own(
         _multinomial(
@@ -1571,7 +1563,7 @@ def _sampler_dtype_check(name: StaticString, t: T) raises:
             '"',
             name,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
     if t.dtype == DType.float64 and dev(t.device)[].api == "metal":
@@ -1616,9 +1608,9 @@ def _sample(
         if bt.stype != a.stype:
             raise Error(
                 "Found dtype ",
-                _scalar_type_name(bt.dtype),
+                scalar_type_name(bt.dtype),
                 " but expected ",
-                _scalar_type_name(a.dtype),
+                scalar_type_name(a.dtype),
             )
         if not bt.on_mojo() or bt.device != a.device:
             raise Error("expected every operand on the same mojo device")
@@ -1698,15 +1690,15 @@ def op_binomial(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     a RuntimeError, so here the message matches and the class does not."""
     var count = v_tensor(args[unsafe_offset=0])
     var prob = v_tensor(args[unsafe_offset=1])
-    if not _is_floating(count.dtype):
+    if not is_floating_dtype(count.dtype):
         raise Error(
             "binomial only supports floating-point dtypes for count, got: ",
-            _scalar_type_name(count.dtype),
+            scalar_type_name(count.dtype),
         )
-    if not _is_floating(prob.dtype):
+    if not is_floating_dtype(prob.dtype):
         raise Error(
             "binomial only supports floating-point dtypes for prob, got: ",
-            _scalar_type_name(prob.dtype),
+            scalar_type_name(prob.dtype),
         )
     _sampler_dtype_check("binomial_cuda", count)
     var out = _sample(
@@ -1733,7 +1725,7 @@ def _philox_dtype_name(dt: DType) -> String:
         return "UInt32"
     if dt == DType.uint64:
         return "UInt64"
-    return _scalar_type_name(dt)
+    return scalar_type_name(dt)
 
 
 def _philox_key_check(key: T, what: StaticString) raises:

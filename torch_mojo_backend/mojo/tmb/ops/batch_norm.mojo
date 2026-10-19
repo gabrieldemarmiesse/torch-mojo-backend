@@ -59,8 +59,8 @@ from tmb.ops.common import (
     like_layout,
     store_out,
     sizes_str,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.loss import (
     Dense,
     OwnedPair,
@@ -422,9 +422,9 @@ def _expect_type(t: T, stype: Int32, name: StaticString) raises:
             "Expected ",
             name,
             " to have type ",
-            _scalar_type_name(max_dtype(stype)),
+            scalar_type_name(max_dtype(stype)),
             " but got ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
 
 
@@ -915,7 +915,7 @@ def op_batch_norm_backward_elemt(
     if count.stype != ST_INT32:
         raise Error(
             "expected scalar type Int but found ",
-            _scalar_type_name(count.dtype),
+            scalar_type_name(count.dtype),
         )
     var cnt = Dense(count)
     var w: Optional[Dense] = None
@@ -1017,9 +1017,9 @@ def _expect_scalar(t: T, stype: Int32) raises:
     if t.stype != stype:
         raise Error(
             "expected scalar type ",
-            _scalar_type_name(max_dtype(stype)),
+            scalar_type_name(max_dtype(stype)),
             " but found ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
 
 

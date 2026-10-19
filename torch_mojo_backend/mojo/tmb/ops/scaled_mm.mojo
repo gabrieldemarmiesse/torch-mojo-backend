@@ -97,8 +97,8 @@ from tmb.ops.common import (
     fill_value,
     resize_out,
     sizes_str,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.matmul import (
     _dense_2d,
     _spec_matmul,
@@ -302,33 +302,31 @@ def _stride_str(t: T) -> String:
     return s + "]"
 
 
-def _tname(t: T) -> String:
-    return _scalar_type_name(t.dtype)
-
-
 def _check_bias(bias: Optional[T], out_st: Int32) raises:
     """_scaled_mm_out_cuda's bias rules, in its order."""
     if not bias:
         return
     var b = bias.value().copy()
-    var out_name = _scalar_type_name(max_dtype(out_st))
+    var out_name = scalar_type_name(max_dtype(out_st))
     if out_st == ST_FLOAT32:
         raise Error("Bias is not supported when out_dtype is set to Float32")
     if b.stype != ST_BFLOAT16 and b.stype != ST_FLOAT16:
-        raise Error("Bias must be BFloat16 or Half, but got ", _tname(b))
+        raise Error(
+            "Bias must be BFloat16 or Half, but got ", scalar_type_name(b.dtype)
+        )
     if out_st == ST_BFLOAT16 and b.stype != ST_BFLOAT16:
         raise Error(
             "Bias must be BFloat16 to compute ",
             out_name,
             " output, but got ",
-            _tname(b),
+            scalar_type_name(b.dtype),
         )
     if out_st == ST_FLOAT16 and b.stype != ST_FLOAT16:
         raise Error(
             "Bias must be Float16 to compute ",
             out_name,
             " output, but got ",
-            _tname(b),
+            scalar_type_name(b.dtype),
         )
 
 
@@ -356,14 +354,14 @@ def _check_mat_dtypes(
             "Expected ",
             a_name,
             " to be Float8 or Float4_x2 matrix got ",
-            _tname(a),
+            scalar_type_name(a.dtype),
         )
     if not is_float8(b.dtype):
         raise Error(
             "Expected ",
             b_name,
             " to be Float8 or Float4_x2 matrix got ",
-            _tname(b),
+            scalar_type_name(b.dtype),
         )
     if a.stype == ST_FLOAT8_E5M2 and b.stype == ST_FLOAT8_E5M2:
         raise Error(
@@ -388,7 +386,7 @@ def _check_out_dtype(out_st: Int32) raises:
         or out_st == ST_FLOAT16
         or (is_float8(dt) and out_st != ST_FLOAT8_E8M0FNU)
     ):
-        unsupported("_scaled_mm with a " + _scalar_type_name(dt) + " output")
+        unsupported("_scaled_mm with a " + scalar_type_name(dt) + " output")
 
 
 # --- the computation ---------------------------------------------------------
@@ -702,17 +700,17 @@ def _invalid_scaling(a: T, b: T, sa: T, sb: T) raises:
         " elements and scale_b should have ",
         _round_up(n, 128) * _round_up(_cdiv(b.dim(0), 32), 4),
         " elements, and both should be contiguous.\nGot a.dtype()=",
-        _tname(a),
+        scalar_type_name(a.dtype),
         ", scale_a.dtype()=",
-        _tname(sa),
+        scalar_type_name(sa.dtype),
         ", scale_a.size()=",
         sizes_str(sa),
         ", scale_a.stride()=",
         _stride_str(sa),
         ", b.dtype()=",
-        _tname(b),
+        scalar_type_name(b.dtype),
         ", scale_b.dtype()=",
-        _tname(sb),
+        scalar_type_name(sb.dtype),
         ", scale_b.size()=",
         sizes_str(sb),
         " and scale_b.stride()=",
@@ -974,9 +972,9 @@ def _v2_validate(
     if not is_float8(a.dtype) or not is_float8(b.dtype):
         raise Error(
             "Expected both inputs to be fp8 or fp4 types but got mat_a.dtype=",
-            _tname(a),
+            scalar_type_name(a.dtype),
             " and mat_b.dtype=",
-            _tname(b),
+            scalar_type_name(b.dtype),
         )
     var m = a.dim(0)
     var k = a.dim(1)
@@ -1084,9 +1082,9 @@ def _v2_validate(
                 "Invalid scaling configuration for _scaled_mm_v2: unsupported"
                 " recipe(s). Got mat_a.dtype="
             ),
-            _tname(a),
+            scalar_type_name(a.dtype),
             ", mat_b.dtype=",
-            _tname(b),
+            scalar_type_name(b.dtype),
             ", recipe_a.size()=",
             len(recipe_a),
             ", recipe_b.size()=",
@@ -1136,17 +1134,17 @@ def _v2_invalid(a: T, b: T, sa: T, sb: T) raises:
             "), and both should be near-inner-dim-major (with 16-byte aligned"
             " strides).\nGot mat_a.dtype()="
         ),
-        _tname(a),
+        scalar_type_name(a.dtype),
         ", scale_a[0].dtype()=",
-        _tname(sa),
+        scalar_type_name(sa.dtype),
         ", scale_a[0].size()=",
         sizes_str(sa),
         ", scale_a[0].stride()=",
         _stride_str(sa),
         ", mat_b.dtype()=",
-        _tname(b),
+        scalar_type_name(b.dtype),
         ", scale_b[0].dtype()=",
-        _tname(sb),
+        scalar_type_name(sb.dtype),
         ", scale_b[0].size()=",
         sizes_str(sb),
         " and scale_b[0].stride()=",
@@ -1430,9 +1428,15 @@ def _check_grouped_e4m3(a: T, b: T) raises:
     """_f8_f8_bf16_rowwise_grouped_mm_cuda: both operands e4m3fn (CUDA
     raises ValueError; RuntimeError here, same text)."""
     if a.dtype != DType.float8_e4m3fn:
-        raise Error("Expected mat_a to be Float8_e4m3 matrix got ", _tname(a))
+        raise Error(
+            "Expected mat_a to be Float8_e4m3 matrix got ",
+            scalar_type_name(a.dtype),
+        )
     if b.dtype != DType.float8_e4m3fn:
-        raise Error("Expected mat_b to be Float8_e4m3 matrix got ", _tname(b))
+        raise Error(
+            "Expected mat_b to be Float8_e4m3 matrix got ",
+            scalar_type_name(b.dtype),
+        )
 
 
 def _valid_strides_transposed(m: T) raises -> Bool:

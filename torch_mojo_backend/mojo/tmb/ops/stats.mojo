@@ -78,8 +78,8 @@ from tmb.ops.common import (
     resize_out,
     scalar_to_float,
     scalar_to_int,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.reductions import (
     _cast_any,
     _norm_dim,
@@ -301,15 +301,15 @@ def op_mode_values(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if out_v.stype != a.stype:
         raise Error(
             "expected scalar type '",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             "' but got '",
-            _scalar_type_name(out_v.dtype),
+            scalar_type_name(out_v.dtype),
             "' for values output",
         )
     if out_i.stype != ST_INT64:
         raise Error(
             "expected scalar type 'Long' but got '",
-            _scalar_type_name(out_i.dtype),
+            scalar_type_name(out_i.dtype),
             "' for indices output",
         )
     check_out(out_v, a)
@@ -466,9 +466,7 @@ def _histc(a: T, nbins: Int, min_v: Value, max_v: Value) raises -> Owned:
         raise Error("HalfTensor is not supported")
     var dt = a.dtype
     if not (dt == DType.float32 or dt == DType.float64 or _is_index_int(dt)):
-        raise Error(
-            '"histc" not implemented for \'', _scalar_type_name(dt), "'"
-        )
+        raise Error('"histc" not implemented for \'', scalar_type_name(dt), "'")
     _decline_metal_f64(a, "histc")
     if dt.is_floating_point():
         alert_not_deterministic("_histc_cuda with floating point input")
@@ -577,7 +575,7 @@ def op_bincount(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not _is_index_int(a.dtype):
         raise Error(
             '"bincount_cuda" not implemented for \'',
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             "'",
         )
     if minlength < 0:
@@ -798,11 +796,11 @@ def _hist_check_inputs(x: T, edges: List[T], weight: Optional[T]) raises:
                     "torch.histogramdd: input tensor and bins tensors should"
                     " have the same dtype, but got input with dtype "
                 ),
-                _scalar_type_name(x.dtype),
+                scalar_type_name(x.dtype),
                 " and bins for dimension ",
                 d,
                 " with dtype ",
-                _scalar_type_name(edges[d].dtype),
+                scalar_type_name(edges[d].dtype),
             )
         if edges[d].rank != 1:
             raise Error(
@@ -1101,9 +1099,9 @@ def _hist_into_outs(
                 "torch.histogram: input tensor and hist tensor should have the"
                 " same dtype, but got input "
             ),
-            dtype_name_of(a),
+            scalar_type_name(a.dtype),
             " and hist ",
-            dtype_name_of(hist_out),
+            scalar_type_name(hist_out.dtype),
         )
     if edges_out.stype != a.stype:
         raise Error(
@@ -1111,9 +1109,9 @@ def _hist_into_outs(
                 "torch.histogram: input tensor and bin_edges tensor should have"
                 " the same dtype, but got input "
             ),
-            dtype_name_of(a),
+            scalar_type_name(a.dtype),
             " and bin_edges ",
-            dtype_name_of(edges_out),
+            scalar_type_name(edges_out.dtype),
             " for dimension 0",
         )
     if not hist_out.same_shape(res[0].t):
@@ -1124,10 +1122,6 @@ def _hist_into_outs(
     assert_no_internal_overlap(edges_out)
     copy_strided_into(hist_out, res[0].t)
     copy_strided_into(edges_out, res[1].t)
-
-
-def dtype_name_of(t: T) -> String:
-    return _scalar_type_name(t.dtype)
 
 
 # aten::histogram.bins_tensor_out(Tensor self, Tensor bins, *,
@@ -1421,7 +1415,7 @@ def op__weight_norm_interface(
     if not v.dtype.is_floating_point():
         raise Error(
             '"weight_norm_fwd_first_dim_kernel" not implemented for \'',
-            _scalar_type_name(v.dtype),
+            scalar_type_name(v.dtype),
             "'",
         )
     _decline_metal_f64(v, "_weight_norm_interface")
@@ -1864,7 +1858,7 @@ def _index_tensor(t: T, what: StaticString) raises -> Owned:
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
     var c = _cast(t, ST_INT64)
@@ -1931,7 +1925,7 @@ def _segment_dtype_check(t: T) raises:
     ):
         raise Error(
             '"segment_reduce_cuda" not implemented for \'',
-            _scalar_type_name(dt),
+            scalar_type_name(dt),
             "'",
         )
     _decline_metal_f64(t, "segment_reduce")

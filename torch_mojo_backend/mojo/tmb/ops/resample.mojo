@@ -79,8 +79,8 @@ from tmb.ops.common import (
     resize_out,
     sizes_str,
     int_list_str,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 
 comptime NEAREST = 0
@@ -1098,7 +1098,7 @@ def _grid_dtype_check(
                 '"',
                 name,
                 "_cuda\" not implemented for '",
-                _scalar_type_name(input.dtype),
+                scalar_type_name(input.dtype),
                 "'",
             )
         )
@@ -1110,9 +1110,9 @@ def _grid_dtype_check(
         if others[k].stype != input.stype:
             raise Error(
                 "expected scalar type ",
-                _scalar_type_name(input.dtype),
+                scalar_type_name(input.dtype),
                 " but found ",
-                _scalar_type_name(others[k].dtype),
+                scalar_type_name(others[k].dtype),
             )
 
 

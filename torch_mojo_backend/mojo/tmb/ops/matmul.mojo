@@ -69,6 +69,7 @@ from tmb.backend.abi import (
     v_scalar_is_integral,
     v_tensor,
     view_strided,
+    is_floating,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall, loader
@@ -90,7 +91,6 @@ from tmb.ops.common import (
     copy_strided_into,
     device_str,
     fill_value,
-    is_float_stype,
     is_int_stype,
     promote_types,
     resize_out,
@@ -101,8 +101,9 @@ from tmb.ops.common import (
     shares_storage,
     assert_no_partial_overlap,
     int_list_str,
+    is_f32_f16_bf16,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.pointwise import _none_side, _p, _pw_run
 from tmb.ops.unary import _direct_unary_out, _gelu_spec, _unary_out
 from tmb.backend.registry import Site, impl
@@ -165,11 +166,6 @@ def _leading_dims(t: T) -> List[Int]:
     for i in range(t.rank - 1):
         out.append(t.dim(i))
     return out^
-
-
-def _is_float(dt: DType) -> Bool:
-    """The dtypes every matmul-family kernel in this repo covers."""
-    return dt == DType.float32 or dt == DType.bfloat16 or dt == DType.float16
 
 
 struct Tmp(Movable):
@@ -958,7 +954,7 @@ def _spec_matmul(
     kernel does not need.
     """
     if a.stype != b.stype or (
-        not _is_float(a.dtype)
+        not is_f32_f16_bf16(a.dtype)
         and not (a.dtype == DType.float64 and op == "MatmulSpec")
     ):
         return None
@@ -1461,7 +1457,7 @@ def _mul_scalar(v: Value, st: Int32) raises -> _Coef:
         if not v_scalar_is_integral(v):
             raise Error(
                 "result type Float can't be cast to the desired output type ",
-                _scalar_type_name(max_dtype(st)),
+                scalar_type_name(max_dtype(st)),
             )
         return _Coef(0.0, v_int(v), True)
     return _Coef(v_f64(v), 0, False)
@@ -1574,7 +1570,7 @@ def _blas(
     var k = a.dim(a.rank - 1)
     var use_addend = Bool(addend) and not beta.zero()
     var compute = out_stype
-    if is_float_stype(out_stype) and out_stype != ST_FLOAT64:
+    if is_floating(out_stype) and out_stype != ST_FLOAT64:
         compute = ST_FLOAT32
     if not use_addend and (alpha.one() or k == 0):
         compute = out_stype  # the bare product: no epilogue
@@ -1964,9 +1960,9 @@ def _bmm_same_dtype(b1: T, b2: T) raises:
     if b1.stype != b2.stype:
         raise Error(
             "expected scalar type ",
-            _scalar_type_name(b1.dtype),
+            scalar_type_name(b1.dtype),
             " but found ",
-            _scalar_type_name(b2.dtype),
+            scalar_type_name(b2.dtype),
         )
 
 
@@ -2082,9 +2078,9 @@ def _addmm_meta(self: T, mat1: T, mat2: T, dtype_overload: Bool) raises:
     if not dtype_overload and self.stype != mat2.stype:
         raise Error(
             "self and mat2 must have the same dtype, but got ",
-            _scalar_type_name(self.dtype),
+            scalar_type_name(self.dtype),
             " and ",
-            _scalar_type_name(mat2.dtype),
+            scalar_type_name(mat2.dtype),
         )
     if mat1.rank != 2:
         raise Error("mat1 must be a matrix, got ", mat1.rank, "-D tensor")
@@ -2101,9 +2097,9 @@ def _addmm_meta(self: T, mat1: T, mat2: T, dtype_overload: Bool) raises:
     if mat1.stype != mat2.stype:
         raise Error(
             "mat1 and mat2 must have the same dtype, but got ",
-            _scalar_type_name(mat1.dtype),
+            scalar_type_name(mat1.dtype),
             " and ",
-            _scalar_type_name(mat2.dtype),
+            scalar_type_name(mat2.dtype),
         )
 
 
@@ -2154,7 +2150,7 @@ def _addmm_run(
         and beta.one()
         and out_stype == mat1.stype
         and self.stype == mat1.stype
-        and _is_float(mat1.dtype)
+        and is_f32_f16_bf16(mat1.dtype)
         and m > 0
         and n > 0
         and k > 0
@@ -2605,16 +2601,16 @@ def _addbmm_checks(self: T, b1: T, b2: T, result_st: Int32) raises -> List[Int]:
     if result_st != b2.stype:
         raise Error(
             "self and mat2 must have the same dtype, but got ",
-            _scalar_type_name(max_dtype(result_st)),
+            scalar_type_name(max_dtype(result_st)),
             " and ",
-            _scalar_type_name(b2.dtype),
+            scalar_type_name(b2.dtype),
         )
     if b1.stype != b2.stype:
         raise Error(
             "mat1 and mat2 must have the same dtype, but got ",
-            _scalar_type_name(b1.dtype),
+            scalar_type_name(b1.dtype),
             " and ",
-            _scalar_type_name(b2.dtype),
+            scalar_type_name(b2.dtype),
         )
     return dims^
 
@@ -2833,11 +2829,11 @@ def _addmv_meta(self: T, mat: T, vec: T) raises:
     if self.stype != mat.stype or mat.stype != vec.stype:
         raise Error(
             "addmv input tensors must have the same dtype, but got ",
-            _scalar_type_name(self.dtype),
+            scalar_type_name(self.dtype),
             ", ",
-            _scalar_type_name(mat.dtype),
+            scalar_type_name(mat.dtype),
             ", and ",
-            _scalar_type_name(vec.dtype),
+            scalar_type_name(vec.dtype),
         )
 
 
@@ -2880,7 +2876,7 @@ def _addmv_run(
         _dest_overlap(dest, sdims)
         var none = _none_side()
         var compute = self.stype
-        if is_float_stype(compute) and compute != ST_FLOAT64:
+        if is_floating(compute) and compute != ST_FLOAT64:
             compute = ST_FLOAT32
         var res = _pw_run(
             "blas_scale",
@@ -2979,9 +2975,9 @@ def _expect_dtype(t: T, stype: Int32) raises:
     if t.stype != stype:
         raise Error(
             "expected scalar type ",
-            _scalar_type_name(max_dtype(stype)),
+            scalar_type_name(max_dtype(stype)),
             " but found ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
 
 
@@ -3090,10 +3086,10 @@ def op_weight_int8pack_mm(
         raise Error("K dimension mismatch: x.size(1) != w.size(1)")
     if w.dim(0) != scales.dim(0):
         raise Error("Output dim mismatch: w.size(0) != scale.size(0)")
-    if not is_float_stype(x.stype):
+    if not is_floating(x.stype):
         raise Error("expected x to be f32/f16/bf16, got ", dtype_name(x.stype))
     _expect_dtype(w, ST_INT8)
-    if not is_float_stype(scales.stype):
+    if not is_floating(scales.stype):
         raise Error(
             "expected scales to be floating point, got ",
             dtype_name(scales.stype),
@@ -3252,7 +3248,7 @@ def op_weight_int4pack_mm(
         inner_k_tiles == 2 or inner_k_tiles == 4 or inner_k_tiles == 8,
         "B_innerKTiles == 2 || B_innerKTiles == 4 || B_innerKTiles == 8",
     )
-    if not is_float_stype(x.stype) or x.stype == ST_FLOAT64:
+    if not is_floating(x.stype) or x.stype == ST_FLOAT64:
         raise Error("expected x to be f32/f16/bf16, got ", dtype_name(x.stype))
     _torch_check(x.rank == 2, "A.dim() == 2")
     _torch_check(packed.stype == ST_INT32, "B.dtype() == at::kInt")
@@ -3512,9 +3508,9 @@ def _linear_general(
     if a.stype != w.stype:
         raise Error(
             "mat1 and mat2 must have the same dtype, but got ",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and ",
-            _scalar_type_name(w.dtype),
+            scalar_type_name(w.dtype),
         )
     var ts: List[T] = [a.copy(), w.copy()]
     var dims: List[Int] = [rows, n]
@@ -3525,9 +3521,9 @@ def _linear_general(
         if b.stype != w.stype:
             raise Error(
                 "self and mat2 must have the same dtype, but got ",
-                _scalar_type_name(b.dtype),
+                scalar_type_name(b.dtype),
                 " and ",
-                _scalar_type_name(w.dtype),
+                scalar_type_name(w.dtype),
             )
         _check_expand(b, dims, "addmm")
         ts.append(b.copy())
@@ -3562,9 +3558,9 @@ def _linear_general(
         if not can_cast(common, shaped.t.stype):
             raise Error(
                 "result type ",
-                _scalar_type_name(max_dtype(common)),
+                scalar_type_name(max_dtype(common)),
                 " can't be cast to the desired output type ",
-                _scalar_type_name(shaped.t.dtype),
+                scalar_type_name(shaped.t.dtype),
             )
         var acc = own_if_new(cast_to(shaped.t, common), shaped.t)
         # TensorIterator computes in `common`, the operands cast to it.
@@ -3649,7 +3645,7 @@ def op_linear_backward(
         len(mask) != 3
         or input.rank < 1
         or w.rank != 2
-        or not _is_float(input.dtype)
+        or not is_f32_f16_bf16(input.dtype)
         or grad.stype != input.stype
         or w.stype != input.stype
         or grad.device != input.device
@@ -3764,7 +3760,7 @@ def _addr_fast(
     var dt = vec1.dtype
     if self.stype != vec1.stype or vec2.stype != vec1.stype:
         return None
-    if not _is_float(dt):
+    if not is_f32_f16_bf16(dt):
         return None
     if vec1.rank != 1 or vec2.rank != 1 or self.rank > 2:
         return None
@@ -4426,7 +4422,7 @@ def _conv_runs_here(input: T, g: ConvGeom) -> Bool:
     """What the im2col + GEMM path computes: float operands on the mojo
     device, every extent positive (`_conv_empty` handles the rest)."""
     return (
-        _is_float(input.dtype)
+        is_f32_f16_bf16(input.dtype)
         and input.on_mojo()
         and g.n > 0
         and g.c > 0
@@ -4618,7 +4614,7 @@ def _run_conv(input: T, weight: T, bias: Optional[T], p: ConvArgs) raises -> T:
                 ": ",
                 int_list_str(out_shape),
             )
-    if not _is_float(input.dtype) or not input.on_mojo():
+    if not is_f32_f16_bf16(input.dtype) or not input.on_mojo():
         unsupported("convolution of " + dtype_name(input.stype) + " operands")
     if input.dim(0) == 0 or input.dim(1) == 0:
         # ATen's `ConvBackend::Empty`: no products at all. A zero-channel
@@ -4897,7 +4893,7 @@ def _conv_backward(
                 ", but got ",
                 int_list_str(grad.logical_shape()),
             )
-    if not _is_float(input.dtype) or not input.on_mojo():
+    if not is_f32_f16_bf16(input.dtype) or not input.on_mojo():
         unsupported(
             "convolution_backward of " + dtype_name(input.stype) + " operands"
         )

@@ -33,8 +33,12 @@ from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import call_op, contiguous, shape_str
-from tmb.ops.data_movement import _scalar_type_name
+from tmb.ops.common import (
+    call_op,
+    contiguous,
+    shape_str,
+    scalar_type_name,
+)
 
 
 # --- argument checks (ATen's TensorUtils, with its messages) ----------------
@@ -144,9 +148,9 @@ def _check_dtype(first: T, t: T) raises:
     if t.stype != first.stype:
         raise Error(
             "expected scalar type ",
-            _scalar_type_name(first.dtype),
+            scalar_type_name(first.dtype),
             " but found ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
 
 
@@ -162,7 +166,7 @@ def _float_dtype(t: T, what: StaticString) raises:
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
 
