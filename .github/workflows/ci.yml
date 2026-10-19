@@ -46,26 +46,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Modular directory
-        uses: actions/cache@v4
+      - uses: ./.github/actions/cpu-runner-setup
         with:
-          path: /tmp/modular/
-          key: modular-bench-bookkeeping-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            modular-bench-bookkeeping-
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          prune-cache: false
-
-      - name: Install dependencies
-        run: |
-          uv run echo hello
+          cache-key: modular-bench-bookkeeping
 
       - name: Reconcile benchmark coverage and recorded baselines
-        env:
-          MODULAR_HOME: /tmp/modular/
         run: |
           uv run pytest benchmarks/test_coverage.py -v
 
@@ -84,14 +69,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Modular directory
-        uses: actions/cache@v4
+      - uses: ./.github/actions/cpu-runner-setup
         with:
-          path: /tmp/modular/
-          key: modular-${{ matrix.test-index }}-${{ hashFiles('uv.lock') }}
-          restore-keys: |
-            modular-${{ matrix.test-index }}
-      
+          cache-key: modular-${{ matrix.test-index }}
+
       # The native backend compiles its shim, base library, op extensions and
       # kernel specializations on first use; keyed by their sources, so a run
       # that changes nothing native reuses the previous run's builds -- and by
@@ -109,18 +90,7 @@ jobs:
           restore-keys: |
             native-${{ steps.cpu.outputs.id }}-${{ matrix.test-index }}-
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          prune-cache: false
-      
-      - name: Install dependencies
-        run: |
-          uv run echo hello
-      
       - name: Run tests with pytest
-        env:
-          MODULAR_HOME: /tmp/modular/
         run: |
           uv run pytest tests/ -m "not gpu" -x -v --splits 18 --group ${{ matrix.test-index }}
 
