@@ -1287,6 +1287,28 @@ def scalar_type_name(dt: DType) -> String:
     return String(dt)
 
 
+def expect_scalar_type(t: T, like: T) raises:
+    """`data_ptr<scalar_t>()`'s check: `t` holds `like`'s dtype."""
+    if t.stype != like.stype:
+        raise Error(
+            "expected scalar type ",
+            scalar_type_name(like.dtype),
+            " but found ",
+            scalar_type_name(t.dtype),
+        )
+
+
+def expect_scalar_type(t: T, stype: Int32) raises:
+    """`data_ptr<scalar_t>()`'s check against a fixed dtype."""
+    if t.stype != stype:
+        raise Error(
+            "expected scalar type ",
+            scalar_type_name(stype),
+            " but found ",
+            scalar_type_name(t.dtype),
+        )
+
+
 def decline_float8(dt: DType, kernel: String) raises:
     """Refuse a float8 operand the way stock CUDA does, naming the CUDA
     kernel whose AT_DISPATCH has no float8 case (NotImplementedError)."""

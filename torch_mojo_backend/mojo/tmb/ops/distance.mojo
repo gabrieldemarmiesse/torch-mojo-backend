@@ -45,6 +45,7 @@ from tmb.ops.common import (
     fill_value,
     resize_out,
     scalar_type_name,
+    expect_scalar_type,
 )
 from tmb.ops.composed import _dispatch, _tensor_value
 from tmb.backend.registry import Site, impl
@@ -107,17 +108,6 @@ def _kernel_dtype(t: T, what: StaticString) raises:
         )
     if t.dtype == DType.float64 and dev(t.device)[].api == "metal":
         unsupported(String(what, ": float64 is unavailable on Apple GPUs"))
-
-
-def _same_dtype(t: T, like: T) raises:
-    """`const_data_ptr<scalar_t>()` on an operand of another dtype."""
-    if t.dtype != like.dtype:
-        raise Error(
-            "expected scalar type ",
-            scalar_type_name(like.dtype),
-            " but found ",
-            scalar_type_name(t.dtype),
-        )
 
 
 def _on_one_device(a: T, b: T) raises:
@@ -339,7 +329,7 @@ def _cdist_forward(args: Values) raises -> Owned:
         _ = dist^
         return shaped^
     _kernel_dtype(x1, "cdist_cuda")
-    _same_dtype(x2, x1)
+    expect_scalar_type(x2, x1)
     var e1 = _expanded_dense(x1, batch)
     var e2 = _expanded_dense(x2, batch)
     var out = own(new_tensor(out_shape, out_rank, x1.stype, x1.device))
@@ -402,9 +392,9 @@ def _cdist_backward(args: Values) raises -> Owned:
         fill_value(out.t, 0.0)
         return out^
     _kernel_dtype(x1, "cdist_cuda_backward")
-    _same_dtype(grad, x1)
-    _same_dtype(x2, x1)
-    _same_dtype(dist, x1)
+    expect_scalar_type(grad, x1)
+    expect_scalar_type(x2, x1)
+    expect_scalar_type(dist, x1)
     if grad.numel != product * r1 * r2 or dist.numel != grad.numel:
         raise Error(
             "_cdist_backward: grad and cdist must have ",
@@ -519,8 +509,8 @@ def _pdist_backward(args: Values) raises -> Owned:
     var n = x.dim(0)
     var m = x.dim(1)
     _kernel_dtype(x, "pdist_cuda_backward")
-    _same_dtype(grad, x)
-    _same_dtype(dist, x)
+    expect_scalar_type(grad, x)
+    expect_scalar_type(dist, x)
     if not grad.on_mojo() or grad.device != x.device:
         raise Error("_pdist_backward: grad must be on self's device")
     if not dist.on_mojo() or dist.device != x.device:

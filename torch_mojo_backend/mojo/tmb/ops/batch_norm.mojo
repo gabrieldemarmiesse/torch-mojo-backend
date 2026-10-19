@@ -60,11 +60,11 @@ from tmb.ops.common import (
     store_out,
     sizes_str,
     scalar_type_name,
+    expect_scalar_type,
 )
 from tmb.ops.loss import (
     Dense,
     OwnedPair,
-    _expect_dtype,
     _loss_float,
     _same_device,
 )
@@ -402,7 +402,7 @@ def op_batch_norm_update_stats(
         _loss_float(rm)
         _same_device(a, rm)
         _same_device(a, rv)
-        _expect_dtype(rv, rm)
+        expect_scalar_type(rv, rm)
         if not rm.contig or not rv.contig or rm.numel != p.c or rv.numel != p.c:
             raise Error(
                 "batch_norm_update_stats: running statistics must be"
@@ -744,7 +744,7 @@ def op_batch_norm_backward_reduce(
     var has_w = _opt(args, 4)
     _loss_float(a)
     _same_device(a, grad)
-    _expect_dtype(grad, a)
+    expect_scalar_type(grad, a)
     var p = Planes(a)
     if not grad.same_shape(a):
         raise Error(
@@ -787,8 +787,8 @@ def op_batch_norm_backward_reduce(
     else:
         # batch_norm_backward_reduce_cuda_channels_last_template reads both
         # statistics as `accscalar_t` pointers.
-        _expect_scalar(mean_t, _acc_of(a.stype))
-        _expect_scalar(invstd_t, _acc_of(a.stype))
+        expect_scalar_type(mean_t, _acc_of(a.stype))
+        expect_scalar_type(invstd_t, _acc_of(a.stype))
     var g = Planes(grad)
     var mean = _channel_vec(args, 2, a, p.c, "mean")
     var invstd = _as_stype(
@@ -874,7 +874,7 @@ def op_batch_norm_backward_elemt(
     _loss_float(a)
     _same_device(a, grad)
     _same_device(a, count)
-    _expect_dtype(grad, a)
+    expect_scalar_type(grad, a)
     var p = Planes(a)
     if not grad.same_shape(a):
         raise Error(
@@ -1012,17 +1012,6 @@ def _elemt_launch(
     _ = ctx
 
 
-def _expect_scalar(t: T, stype: Int32) raises:
-    """`const_data_ptr<scalar_t>()`'s check."""
-    if t.stype != stype:
-        raise Error(
-            "expected scalar type ",
-            scalar_type_name(max_dtype(stype)),
-            " but found ",
-            scalar_type_name(t.dtype),
-        )
-
-
 def _affine_checks(a: T, args: Values) raises:
     """batch_norm_elementwise's typed reads of weight and bias, per route:
     contiguous (`batch_norm_elemt_cuda_template`, `stat_scalar_t` the
@@ -1045,9 +1034,9 @@ def _affine_checks(a: T, args: Values) raises:
             _expect_type(v_tensor(args[unsafe_offset=2]), want, "bias")
     elif _uses_channels_last(a):
         if has_w:
-            _expect_scalar(v_tensor(args[unsafe_offset=1]), want)
+            expect_scalar_type(v_tensor(args[unsafe_offset=1]), want)
         if has_b:
-            _expect_scalar(v_tensor(args[unsafe_offset=2]), want)
+            expect_scalar_type(v_tensor(args[unsafe_offset=2]), want)
 
 
 def _invstd_of(rv: T, eps: Float64, acc: Int32) raises -> Owned:
@@ -1145,7 +1134,7 @@ def _bn_sync(
             _same_device(a, rm)
             _same_device(a, rv)
             _loss_float(rm)
-            _expect_dtype(rv, rm)
+            expect_scalar_type(rv, rm)
             if (
                 not rm.contig
                 or not rv.contig

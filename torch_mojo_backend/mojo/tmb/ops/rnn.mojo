@@ -38,6 +38,7 @@ from tmb.ops.common import (
     contiguous,
     shape_str,
     scalar_type_name,
+    expect_scalar_type,
 )
 
 
@@ -143,17 +144,6 @@ def _check_device(c: StaticString, first: T, t: T) raises:
         )
 
 
-def _check_dtype(first: T, t: T) raises:
-    """`data_ptr<scalar_t>()` on an operand of another dtype."""
-    if t.stype != first.stype:
-        raise Error(
-            "expected scalar type ",
-            scalar_type_name(first.dtype),
-            " but found ",
-            scalar_type_name(t.dtype),
-        )
-
-
 def _float_dtype(t: T, what: StaticString) raises:
     if (
         t.dtype != DType.float32
@@ -218,13 +208,13 @@ def _check_cell_sizes(
     _check_device(c, input_gates, input_gates)
     _check_device(c, input_gates, hidden_gates)
     _check_device(c, input_gates, prev_hidden)
-    _check_dtype(input_gates, hidden_gates)
-    _check_dtype(input_gates, prev_hidden)
+    expect_scalar_type(input_gates, hidden_gates)
+    expect_scalar_type(input_gates, prev_hidden)
     if input_bias:
         _check_device(c, input_gates, input_bias.value())
         _check_device(c, input_gates, hidden_bias.value())
-        _check_dtype(input_gates, input_bias.value())
-        _check_dtype(input_gates, hidden_bias.value())
+        expect_scalar_type(input_gates, input_bias.value())
+        expect_scalar_type(input_gates, hidden_bias.value())
 
 
 # --- helpers -----------------------------------------------------------------
@@ -358,12 +348,12 @@ def op_thnn_fused_lstm_cell_backward_impl(
     _check_device(C, ws, cx)
     _check_device(C, ws, cy)
     _check_device(C, ws, defined)
-    _check_dtype(ws, cx)
-    _check_dtype(ws, cy)
-    _check_dtype(ws, defined)
+    expect_scalar_type(ws, cx)
+    expect_scalar_type(ws, cy)
+    expect_scalar_type(ws, defined)
     if Bool(ghy) and Bool(gcy):
         _check_device(C, ws, gcy.value())
-        _check_dtype(ws, gcy.value())
+        expect_scalar_type(ws, gcy.value())
 
     var grad_gates = own(new_tensor(ws.shape, 2, ws.stype, ws.device))
     var grad_cx = own(new_tensor(_shape2(n, hsz), 2, cx.stype, cx.device))
@@ -486,7 +476,7 @@ def op_thnn_fused_gru_cell_backward(
     _float_dtype(ghy, "_thnn_fused_gru_cell_cuda_backward")
     _check_device(C, ghy, ghy)
     _check_device(C, ghy, ws)
-    _check_dtype(ghy, ws)
+    expect_scalar_type(ghy, ws)
     var n = ws.dim(0)
     var hsz = ws.dim(1) // GRU_WORKSPACE_MULTIPLIER
     var grad_ig = own(new_tensor(_shape2(n, hsz * 3), 2, ws.stype, ws.device))

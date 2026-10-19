@@ -72,6 +72,7 @@ from tmb.ops.common import (
     store_out,
     sizes_str,
     scalar_type_name,
+    expect_scalar_type,
 )
 from tmb.backend.registry import Site, impl
 
@@ -133,17 +134,6 @@ def _same_device(a: T, b: T) raises:
             " and ",
             device_str(b),
             "!",
-        )
-
-
-def _expect_dtype(t: T, like: T) raises:
-    """`Tensor::data_ptr<scalar_t>()`'s check on a second operand."""
-    if t.stype != like.stype:
-        raise Error(
-            "expected scalar type ",
-            scalar_type_name(like.dtype),
-            " but found ",
-            scalar_type_name(t.dtype),
         )
 
 
@@ -217,7 +207,7 @@ def _nll_weight(args: Values, i: Int, input: T) raises -> Optional[Dense]:
         return None
     var w = v_tensor(args[unsafe_offset=i])
     _same_device(input, w)
-    _expect_dtype(w, input)
+    expect_scalar_type(w, input)
     return Dense(w)
 
 
@@ -652,8 +642,8 @@ def _nll_backward_checks(args: Values, a: NllArgs, spatial: Bool) raises:
             )
     _same_device(input, grad)
     _same_device(input, tw)
-    _expect_dtype(grad, input)
-    _expect_dtype(tw, input)
+    expect_scalar_type(grad, input)
+    expect_scalar_type(tw, input)
 
 
 def _nll_backward(
@@ -891,7 +881,7 @@ def _optional_dense(args: Values, i: Int, like: T) raises -> Optional[Dense]:
         return None
     var t = v_tensor(args[unsafe_offset=i])
     _same_device(like, t)
-    _expect_dtype(t, like)
+    expect_scalar_type(t, like)
     return Dense(t)
 
 
@@ -1016,7 +1006,7 @@ def _multi_margin_backward(args: Values) raises -> Owned:
             "expected scalar type Long but found ",
             scalar_type_name(target.dtype),
         )
-    _expect_dtype(grad, input)
+    expect_scalar_type(grad, input)
     var margin = scalar_to_float(args[unsafe_offset=4], input.stype)
     var weight = _optional_dense(args, 5, input)
     var x = Dense(input)
@@ -1230,8 +1220,8 @@ def _multilabel_backward(args: Values) raises -> Owned:
             "expected scalar type Long but found ",
             scalar_type_name(target.dtype),
         )
-    _expect_dtype(grad, input)
-    _expect_dtype(is_target, input)
+    expect_scalar_type(grad, input)
+    expect_scalar_type(is_target, input)
     var reduce = reduction != 0
     var denom = g.nframe * g.dim if reduction == 1 else g.dim
     var x = Dense(input)
@@ -1597,9 +1587,9 @@ def _ctc_backward(
     _same_device(log_probs, nll_t)
     _same_device(log_probs, log_alpha)
     _ctc_dtypes(log_probs, targets)
-    _expect_dtype(grad, log_probs)
-    _expect_dtype(nll_t, log_probs)
-    _expect_dtype(log_alpha, log_probs)
+    expect_scalar_type(grad, log_probs)
+    expect_scalar_type(nll_t, log_probs)
+    expect_scalar_type(log_alpha, log_probs)
     if log_probs.rank != 3 or log_alpha.rank != 3:
         raise Error("ctc_loss_backward: log_probs and log_alpha must be 3-D")
     var batch = log_probs.dim(1)

@@ -103,6 +103,7 @@ from tmb.ops.common import (
     int_list_str,
     is_f32_f16_bf16,
     scalar_type_name,
+    expect_scalar_type,
 )
 from tmb.ops.pointwise import _none_side, _p, _pw_run
 from tmb.ops.unary import _direct_unary_out, _gelu_spec, _unary_out
@@ -1955,23 +1956,12 @@ def _bmm_dims(b1: T, b2: T) raises -> List[Int]:
     return [bs, b1.dim(1), b2.dim(2)]
 
 
-def _bmm_same_dtype(b1: T, b2: T) raises:
-    """baddbmm_out_cuda_impl reads batch2 as batch1's scalar_t."""
-    if b1.stype != b2.stype:
-        raise Error(
-            "expected scalar type ",
-            scalar_type_name(b1.dtype),
-            " but found ",
-            scalar_type_name(b2.dtype),
-        )
-
-
 # aten::bmm(Tensor self, Tensor mat2) -> Tensor
 def op_bmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var b = v_tensor(args[unsafe_offset=1])
     var dims = _bmm_dims(a, b)
-    _bmm_same_dtype(a, b)
+    expect_scalar_type(a, b)
     _check_same_device([a.copy(), b.copy()])
     _blas_out(
         rets,
@@ -1993,7 +1983,7 @@ def op_bmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor(args[unsafe_offset=2])
     var dims = _bmm_dims(a, b)
     _check_dest(dest, b.stype, b)  # common_checks: `batch2.options()`
-    _bmm_same_dtype(a, b)
+    expect_scalar_type(a, b)
     _check_same_device([dest.copy(), a.copy(), b.copy()])
     _blas_out(
         rets,
@@ -2370,7 +2360,7 @@ def _baddbmm_run(
 ) raises:
     """baddbmm_out_cuda_impl: alpha and beta as opmath (the k == 0 shortcut
     multiplies by the unrounded beta, unlike addmm's)."""
-    _bmm_same_dtype(b1, b2)
+    expect_scalar_type(b1, b2)
     var ts = List[T]()
     if dest:
         ts.append(dest.value().copy())
@@ -2970,17 +2960,6 @@ def op_addmv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # --- aten::_int_mm / aten::_weight_int8pack_mm --------------------------------
 
 
-def _expect_dtype(t: T, stype: Int32) raises:
-    """`Tensor::data_ptr<scalar_t>()`'s check."""
-    if t.stype != stype:
-        raise Error(
-            "expected scalar type ",
-            scalar_type_name(max_dtype(stype)),
-            " but found ",
-            scalar_type_name(t.dtype),
-        )
-
-
 def _int_mm_checks(a: T, b: T) raises:
     """_int_mm_out_cuda (cuda/Blas.cpp): cuBLASLt's int8 GEMM limits."""
     if a.rank != 2:
@@ -3014,8 +2993,8 @@ def _int_mm_checks(a: T, b: T) raises:
             ),
             b.dim(1),
         )
-    _expect_dtype(a, ST_INT8)
-    _expect_dtype(b, ST_INT8)
+    expect_scalar_type(a, ST_INT8)
+    expect_scalar_type(b, ST_INT8)
 
 
 # aten::_int_mm(Tensor self, Tensor mat2) -> Tensor
@@ -3088,7 +3067,7 @@ def op_weight_int8pack_mm(
         raise Error("Output dim mismatch: w.size(0) != scale.size(0)")
     if not is_floating(x.stype):
         raise Error("expected x to be f32/f16/bf16, got ", dtype_name(x.stype))
-    _expect_dtype(w, ST_INT8)
+    expect_scalar_type(w, ST_INT8)
     if not is_floating(scales.stype):
         raise Error(
             "expected scales to be floating point, got ",

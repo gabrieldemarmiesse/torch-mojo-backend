@@ -87,6 +87,7 @@ from tmb.ops.common import (
     like_layout,
     resize_out,
     same_view,
+    expect_scalar_type,
 )
 from tmb.ops.f8_iter import (
     f8_iter,
@@ -1506,13 +1507,7 @@ def _test_list_add[floating: Bool](values: T, addends: Value) raises -> Owned:
             " enhancement request to PyTorch.)"
         )
     comptime want = ST_FLOAT32 if floating else ST_INT32
-    if values.stype != want:
-        raise Error(
-            "expected scalar type ",
-            "Float" if floating else "Int",
-            " but found ",
-            scalar_type_name(values.dtype),
-        )
+    expect_scalar_type(values, want)
     var n = values.dim(0)
     var count = DoubleList(addends).n if floating else IntList(addends).n
     if n > count:

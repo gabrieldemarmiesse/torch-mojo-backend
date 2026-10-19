@@ -71,6 +71,7 @@ from tmb.ops.common import (
     fill_value,
     is_floating_dtype,
     scalar_type_name,
+    expect_scalar_type,
 )
 from tmb.ops.unique import run_bounds, unique_flat
 
@@ -254,13 +255,7 @@ def op_embedding_bag(
     var psw_stride = 0
     if psw and mode != _MODE_MAX:
         var p = psw.value().copy()
-        if p.dtype != weight.dtype:
-            raise Error(
-                "expected scalar type ",
-                scalar_type_name(weight.dtype),
-                " but found ",
-                scalar_type_name(p.dtype),
-            )
+        expect_scalar_type(p, weight)
         if p.rank != 1 or p.numel != num_indices or p.device != weight.device:
             raise Error(
                 "per_sample_weights must be a 1-D tensor with one weight per"
@@ -541,13 +536,7 @@ def op_embedding_bag_dense_backward(
     var psw_ptr = 0
     var psw_stride = 0
     if psw:
-        if psw.value().dtype != grad.dtype:
-            raise Error(
-                "expected scalar type ",
-                scalar_type_name(grad.dtype),
-                " but found ",
-                scalar_type_name(psw.value().dtype),
-            )
+        expect_scalar_type(psw.value(), grad)
         psw_ptr = psw.value().ptr
         psw_stride = psw.value().stride(0)
     var mean = 1 if mode == _MODE_MEAN else 0

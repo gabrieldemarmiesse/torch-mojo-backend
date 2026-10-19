@@ -52,6 +52,7 @@ from tmb.ops.common import (
     copy_strided_into,
     shape_str,
     scalar_type_name,
+    expect_scalar_type,
 )
 
 
@@ -189,13 +190,7 @@ def _transform_bias_rescale(qkv: T, bias: T, num_head: Int) raises -> Owned:
         )
     if not qkv.on_mojo() or not bias.on_mojo() or qkv.device != bias.device:
         raise Error(W, ": expected qkv and qkv_bias on the same device")
-    if bias.stype != qkv.stype:
-        raise Error(
-            "expected scalar type ",
-            scalar_type_name(qkv.dtype),
-            " but found ",
-            scalar_type_name(bias.dtype),
-        )
+    expect_scalar_type(bias, qkv)
     _float_input(qkv, W)
     var dh = d // num_head
     var acc = ST_FLOAT64 if qkv.dtype == DType.float64 else ST_FLOAT32

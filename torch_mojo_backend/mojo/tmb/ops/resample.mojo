@@ -80,6 +80,7 @@ from tmb.ops.common import (
     sizes_str,
     int_list_str,
     scalar_type_name,
+    expect_scalar_type,
 )
 from tmb.backend.registry import Site, impl
 
@@ -1107,13 +1108,7 @@ def _grid_dtype_check(
     if count == 0:
         return
     for k in range(len(others)):
-        if others[k].stype != input.stype:
-            raise Error(
-                "expected scalar type ",
-                scalar_type_name(input.dtype),
-                " but found ",
-                scalar_type_name(others[k].dtype),
-            )
+        expect_scalar_type(others[k], input)
 
 
 def _grid_geometry[
