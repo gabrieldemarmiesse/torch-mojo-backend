@@ -661,79 +661,70 @@ def _pw_math_inplace(
 # ---------------------------------------------------------------------------
 
 
+def _pw_math_op[
+    kind: StaticString, policy: Int, f64_ok: Bool, out_index: Int
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """A binary `_pw_math` op: functional (`out_index` -1) or `.out` (2)."""
+    _pw_math(kind, policy, f64_ok, 2, args, rets, out_index)
+
+
 # aten::atan2(Tensor self, Tensor other) -> Tensor
-def op_atan2(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("atan2", P_FLOAT, True, 2, args, rets, -1)
+comptime op_atan2 = _pw_math_op["atan2", P_FLOAT, True, -1]
 
 
 # aten::atan2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_atan2_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("atan2", P_FLOAT, True, 2, args, rets, 2)
+comptime op_atan2_out = _pw_math_op["atan2", P_FLOAT, True, 2]
 
 
 # aten::copysign.Tensor(Tensor self, Tensor other) -> Tensor
 # aten::copysign.Scalar(Tensor self, Scalar other) -> Tensor
-def op_copysign(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("copysign", P_FLOAT, True, 2, args, rets, -1)
+comptime op_copysign = _pw_math_op["copysign", P_FLOAT, True, -1]
 
 
 # aten::copysign.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_copysign_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("copysign", P_FLOAT, True, 2, args, rets, 2)
+comptime op_copysign_out = _pw_math_op["copysign", P_FLOAT, True, 2]
 
 
 # aten::fmax(Tensor self, Tensor other) -> Tensor
-def op_fmax(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmax", P_ALL, True, 2, args, rets, -1)
+comptime op_fmax = _pw_math_op["fmax", P_ALL, True, -1]
 
 
 # aten::fmax.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_fmax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmax", P_ALL, True, 2, args, rets, 2)
+comptime op_fmax_out = _pw_math_op["fmax", P_ALL, True, 2]
 
 
 # aten::fmin(Tensor self, Tensor other) -> Tensor
-def op_fmin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmin", P_ALL, True, 2, args, rets, -1)
+comptime op_fmin = _pw_math_op["fmin", P_ALL, True, -1]
 
 
 # aten::fmin.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_fmin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmin", P_ALL, True, 2, args, rets, 2)
+comptime op_fmin_out = _pw_math_op["fmin", P_ALL, True, 2]
 
 
 # aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor
 # aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor
-def op_fmod(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, -1)
+comptime op_fmod = _pw_math_op["fmod", P_NUMERIC, True, -1]
 
 
 # aten::fmod.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 # aten::fmod.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
-def op_fmod_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, 2)
+comptime op_fmod_out = _pw_math_op["fmod", P_NUMERIC, True, 2]
 
 
 # aten::gcd(Tensor self, Tensor other) -> Tensor
-def op_gcd(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("gcd", P_INT, True, 2, args, rets, -1)
+comptime op_gcd = _pw_math_op["gcd", P_INT, True, -1]
 
 
 # aten::gcd.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_gcd_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("gcd", P_INT, True, 2, args, rets, 2)
+comptime op_gcd_out = _pw_math_op["gcd", P_INT, True, 2]
 
 
 # aten::lcm(Tensor self, Tensor other) -> Tensor
-def op_lcm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("lcm", P_INT, True, 2, args, rets, -1)
+comptime op_lcm = _pw_math_op["lcm", P_INT, True, -1]
 
 
 # aten::lcm.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_lcm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("lcm", P_INT, True, 2, args, rets, 2)
+comptime op_lcm_out = _pw_math_op["lcm", P_INT, True, 2]
 
 
 def _pw_side_stype(side: Side) -> Int32:
@@ -775,107 +766,75 @@ def op_heaviside_out(
 
 
 # aten::hypot(Tensor self, Tensor other) -> Tensor
-def op_hypot(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("hypot", P_FLOAT_ONLY, True, 2, args, rets, -1)
+comptime op_hypot = _pw_math_op["hypot", P_FLOAT_ONLY, True, -1]
 
 
 # aten::hypot.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_hypot_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("hypot", P_FLOAT_ONLY, True, 2, args, rets, 2)
+comptime op_hypot_out = _pw_math_op["hypot", P_FLOAT_ONLY, True, 2]
 
 
 # aten::igamma(Tensor self, Tensor other) -> Tensor
-def op_igamma(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igamma", P_FLOAT, False, 2, args, rets, -1)
+comptime op_igamma = _pw_math_op["igamma", P_FLOAT, False, -1]
 
 
 # aten::igamma.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_igamma_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igamma", P_FLOAT, False, 2, args, rets, 2)
+comptime op_igamma_out = _pw_math_op["igamma", P_FLOAT, False, 2]
 
 
 # aten::igammac(Tensor self, Tensor other) -> Tensor
-def op_igammac(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igammac", P_FLOAT, False, 2, args, rets, -1)
+comptime op_igammac = _pw_math_op["igammac", P_FLOAT, False, -1]
 
 
 # aten::igammac.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_igammac_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igammac", P_FLOAT, False, 2, args, rets, 2)
+comptime op_igammac_out = _pw_math_op["igammac", P_FLOAT, False, 2]
 
 
 # aten::logaddexp(Tensor self, Tensor other) -> Tensor
-def op_logaddexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("logaddexp", P_FLOAT_ONLY, True, 2, args, rets, -1)
+comptime op_logaddexp = _pw_math_op["logaddexp", P_FLOAT_ONLY, True, -1]
 
 
 # aten::logaddexp.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_logaddexp_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("logaddexp", P_FLOAT_ONLY, True, 2, args, rets, 2)
+comptime op_logaddexp_out = _pw_math_op["logaddexp", P_FLOAT_ONLY, True, 2]
 
 
 # aten::logaddexp2(Tensor self, Tensor other) -> Tensor
-def op_logaddexp2(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("logaddexp2", P_FLOAT_ONLY, True, 2, args, rets, -1)
+comptime op_logaddexp2 = _pw_math_op["logaddexp2", P_FLOAT_ONLY, True, -1]
 
 
 # aten::logaddexp2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_logaddexp2_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("logaddexp2", P_FLOAT_ONLY, True, 2, args, rets, 2)
+comptime op_logaddexp2_out = _pw_math_op["logaddexp2", P_FLOAT_ONLY, True, 2]
 
 
 # aten::nextafter(Tensor self, Tensor other) -> Tensor
-def op_nextafter(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("nextafter", P_FLOAT_ONLY, True, 2, args, rets, -1)
+comptime op_nextafter = _pw_math_op["nextafter", P_FLOAT_ONLY, True, -1]
 
 
 # aten::nextafter.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_nextafter_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("nextafter", P_FLOAT_ONLY, True, 2, args, rets, 2)
+comptime op_nextafter_out = _pw_math_op["nextafter", P_FLOAT_ONLY, True, 2]
 
 
 # aten::xlogy.Tensor(Tensor self, Tensor other) -> Tensor
-def op_xlogy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("xlogy", P_FLOAT, True, 2, args, rets, -1)
+comptime op_xlogy = _pw_math_op["xlogy", P_FLOAT, True, -1]
 
 
 # aten::xlogy.OutTensor(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_xlogy_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("xlogy", P_FLOAT, True, 2, args, rets, 2)
+comptime op_xlogy_out = _pw_math_op["xlogy", P_FLOAT, True, 2]
 
 
 # aten::special_xlog1py(Tensor self, Tensor other) -> Tensor
-def op_special_xlog1py(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("xlog1py", P_FLOAT, True, 2, args, rets, -1)
+comptime op_special_xlog1py = _pw_math_op["xlog1py", P_FLOAT, True, -1]
 
 
 # aten::special_xlog1py.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_xlog1py_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("xlog1py", P_FLOAT, True, 2, args, rets, 2)
+comptime op_special_xlog1py_out = _pw_math_op["xlog1py", P_FLOAT, True, 2]
 
 
 # aten::special_zeta(Tensor self, Tensor other) -> Tensor
-def op_special_zeta(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("zeta", P_FLOAT, True, 2, args, rets, -1)
+comptime op_special_zeta = _pw_math_op["zeta", P_FLOAT, True, -1]
 
 
 # aten::special_zeta.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_zeta_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("zeta", P_FLOAT, True, 2, args, rets, 2)
+comptime op_special_zeta_out = _pw_math_op["zeta", P_FLOAT, True, 2]
 
 
 # The special polynomials: aten::special_<name>(Tensor x, Tensor n) -> Tensor

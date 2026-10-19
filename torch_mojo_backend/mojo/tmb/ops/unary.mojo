@@ -1003,359 +1003,193 @@ def op_sinc_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, dst)
 
 
-# aten::special_airy_ai(Tensor x) -> Tensor
-def op_special_airy_ai(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
+def _special[
+    spec: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """A `special_*` op: `spec` over its one input, promoted to float."""
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("AiryAiSpec", t))
+    var out = own(_promoting_unary(spec, t))
     ret_owned(rets, 0, out)
+
+
+def _special_out[
+    spec: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`_special`'s `.out` overload."""
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _promoting_unary_out(spec, t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::special_airy_ai(Tensor x) -> Tensor
+comptime op_special_airy_ai = _special["AiryAiSpec"]
 
 
 # aten::special_airy_ai.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_airy_ai_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("AiryAiSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_airy_ai_out = _special_out["AiryAiSpec"]
 
 
 # aten::special_bessel_j0(Tensor self) -> Tensor
-def op_special_bessel_j0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("BesselJ0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_bessel_j0 = _special["BesselJ0Spec"]
 
 
 # aten::special_bessel_j0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_bessel_j0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("BesselJ0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_bessel_j0_out = _special_out["BesselJ0Spec"]
 
 
 # aten::special_bessel_j1(Tensor self) -> Tensor
-def op_special_bessel_j1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("BesselJ1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_bessel_j1 = _special["BesselJ1Spec"]
 
 
 # aten::special_bessel_j1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_bessel_j1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("BesselJ1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_bessel_j1_out = _special_out["BesselJ1Spec"]
 
 
 # aten::special_bessel_y0(Tensor self) -> Tensor
-def op_special_bessel_y0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("BesselY0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_bessel_y0 = _special["BesselY0Spec"]
 
 
 # aten::special_bessel_y0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_bessel_y0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("BesselY0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_bessel_y0_out = _special_out["BesselY0Spec"]
 
 
 # aten::special_bessel_y1(Tensor self) -> Tensor
-def op_special_bessel_y1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("BesselY1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_bessel_y1 = _special["BesselY1Spec"]
 
 
 # aten::special_bessel_y1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_bessel_y1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("BesselY1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_bessel_y1_out = _special_out["BesselY1Spec"]
 
 
 # aten::special_entr(Tensor self) -> Tensor
-def op_special_entr(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("EntrSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_entr = _special["EntrSpec"]
 
 
 # aten::special_entr.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_entr_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("EntrSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_entr_out = _special_out["EntrSpec"]
 
 
 # aten::special_erfcx(Tensor self) -> Tensor
-def op_special_erfcx(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ErfcxSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_erfcx = _special["ErfcxSpec"]
 
 
 # aten::special_erfcx.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_erfcx_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ErfcxSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_erfcx_out = _special_out["ErfcxSpec"]
 
 
 # aten::special_i0e(Tensor self) -> Tensor
-def op_special_i0e(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("I0eSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_i0e = _special["I0eSpec"]
 
 
 # aten::special_i0e.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_i0e_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("I0eSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_i0e_out = _special_out["I0eSpec"]
 
 
 # aten::special_i1(Tensor self) -> Tensor
-def op_special_i1(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("I1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_i1 = _special["I1Spec"]
 
 
 # aten::special_i1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_i1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("I1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_i1_out = _special_out["I1Spec"]
 
 
 # aten::special_i1e(Tensor self) -> Tensor
-def op_special_i1e(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("I1eSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_i1e = _special["I1eSpec"]
 
 
 # aten::special_i1e.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_i1e_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("I1eSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_i1e_out = _special_out["I1eSpec"]
 
 
 # aten::special_log_ndtr(Tensor self) -> Tensor
-def op_special_log_ndtr(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("LogNdtrSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_log_ndtr = _special["LogNdtrSpec"]
 
 
 # aten::special_log_ndtr.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_log_ndtr_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("LogNdtrSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_log_ndtr_out = _special_out["LogNdtrSpec"]
 
 
 # aten::special_modified_bessel_i0(Tensor self) -> Tensor
-def op_special_modified_bessel_i0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ModifiedBesselI0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_modified_bessel_i0 = _special["ModifiedBesselI0Spec"]
 
 
 # aten::special_modified_bessel_i0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_modified_bessel_i0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ModifiedBesselI0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_modified_bessel_i0_out = _special_out[
+    "ModifiedBesselI0Spec"
+]
 
 
 # aten::special_modified_bessel_i1(Tensor self) -> Tensor
-def op_special_modified_bessel_i1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ModifiedBesselI1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_modified_bessel_i1 = _special["ModifiedBesselI1Spec"]
 
 
 # aten::special_modified_bessel_i1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_modified_bessel_i1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ModifiedBesselI1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_modified_bessel_i1_out = _special_out[
+    "ModifiedBesselI1Spec"
+]
 
 
 # aten::special_modified_bessel_k0(Tensor self) -> Tensor
-def op_special_modified_bessel_k0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ModifiedBesselK0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_modified_bessel_k0 = _special["ModifiedBesselK0Spec"]
 
 
 # aten::special_modified_bessel_k0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_modified_bessel_k0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ModifiedBesselK0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_modified_bessel_k0_out = _special_out[
+    "ModifiedBesselK0Spec"
+]
 
 
 # aten::special_modified_bessel_k1(Tensor self) -> Tensor
-def op_special_modified_bessel_k1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ModifiedBesselK1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_modified_bessel_k1 = _special["ModifiedBesselK1Spec"]
 
 
 # aten::special_modified_bessel_k1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_modified_bessel_k1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ModifiedBesselK1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_modified_bessel_k1_out = _special_out[
+    "ModifiedBesselK1Spec"
+]
 
 
 # aten::special_ndtri(Tensor self) -> Tensor
-def op_special_ndtri(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("NdtriSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_ndtri = _special["NdtriSpec"]
 
 
 # aten::special_ndtri.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_ndtri_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("NdtriSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_ndtri_out = _special_out["NdtriSpec"]
 
 
 # aten::special_scaled_modified_bessel_k0(Tensor x) -> Tensor
-def op_special_scaled_modified_bessel_k0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ScaledModifiedBesselK0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_scaled_modified_bessel_k0 = _special[
+    "ScaledModifiedBesselK0Spec"
+]
 
 
 # aten::special_scaled_modified_bessel_k0.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_scaled_modified_bessel_k0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ScaledModifiedBesselK0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_scaled_modified_bessel_k0_out = _special_out[
+    "ScaledModifiedBesselK0Spec"
+]
 
 
 # aten::special_scaled_modified_bessel_k1(Tensor x) -> Tensor
-def op_special_scaled_modified_bessel_k1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ScaledModifiedBesselK1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_scaled_modified_bessel_k1 = _special[
+    "ScaledModifiedBesselK1Spec"
+]
 
 
 # aten::special_scaled_modified_bessel_k1.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_scaled_modified_bessel_k1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ScaledModifiedBesselK1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_scaled_modified_bessel_k1_out = _special_out[
+    "ScaledModifiedBesselK1Spec"
+]
 
 
 # aten::special_spherical_bessel_j0(Tensor x) -> Tensor
-def op_special_spherical_bessel_j0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("SphericalBesselJ0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_spherical_bessel_j0 = _special["SphericalBesselJ0Spec"]
 
 
 # aten::special_spherical_bessel_j0.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_spherical_bessel_j0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("SphericalBesselJ0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_spherical_bessel_j0_out = _special_out[
+    "SphericalBesselJ0Spec"
+]
 
 
 # ---------------------------------------------------------------------------
