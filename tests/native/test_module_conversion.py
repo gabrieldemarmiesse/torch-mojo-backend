@@ -13,6 +13,7 @@ import weakref
 import pytest
 import torch
 from torch import nn
+from torch.nn.utils import parametrize
 
 
 @pytest.fixture
@@ -171,10 +172,59 @@ def test_mojo_load_state_dict_copies_into_parameters(mojo_gpu):
     src = _mlp()
     m = nn.Sequential(nn.Linear(4, 8), nn.Tanh(), nn.Linear(8, 3)).to(mojo_gpu)
     params = list(m.parameters())
+    ptrs = [p.data_ptr() for p in params]
+    # Swapping (the swap flag's route) refuses a parameter with a weakref.
+    keep = _with_weakrefs(m)
     m.load_state_dict(src.state_dict())
-    for p, q, s in zip(params, m.parameters(), src.parameters()):
+    del keep
+    for p, q, s, ptr in zip(params, m.parameters(), src.parameters(), ptrs):
         assert p is q and p.device.type == "mojo"
+        assert p.data_ptr() == ptr
         torch.testing.assert_close(p.detach().cpu(), s.detach(), rtol=0, atol=0)
+
+
+class _Symmetric(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.triu() + x.triu(1).transpose(-1, -2)
+
+    def right_inverse(self, a: torch.Tensor) -> torch.Tensor:
+        return a.triu()
+
+
+def _original_weight(module: nn.Module) -> nn.Parameter:
+    return module.get_parameter("parametrizations.weight.original")
+
+
+def test_mojo_parametrization_with_right_inverse(mojo_gpu):
+    """`register_parametrization` stores `right_inverse(weight)` into the
+    original Parameter with `set_` (swap_tensors under the swap flag)."""
+    torch.manual_seed(0)
+    ref = nn.Linear(4, 4)
+    m = nn.Linear(4, 4).to(mojo_gpu)
+    m.load_state_dict(ref.state_dict())
+    weight = m.weight
+    parametrize.register_parametrization(m, "weight", _Symmetric())
+    parametrize.register_parametrization(ref, "weight", _Symmetric())
+    assert _original_weight(m) is weight
+
+    x = torch.randn(3, 4)
+    out = m(x.to(mojo_gpu))
+    want = ref(x)
+    torch.testing.assert_close(out.cpu(), want, rtol=1e-5, atol=1e-5)
+    out.sum().backward()
+    want.sum().backward()
+    grad, want_grad = weight.grad, _original_weight(ref).grad
+    assert grad is not None and want_grad is not None
+    torch.testing.assert_close(grad.cpu(), want_grad, rtol=1e-5, atol=1e-5)
+
+    full = torch.arange(16.0).reshape(4, 4)
+    with torch.no_grad():
+        m.weight = full.to(mojo_gpu)
+    assert _original_weight(m) is weight
+    torch.testing.assert_close(weight.detach().cpu(), full.triu(), rtol=0, atol=0)
+    torch.testing.assert_close(
+        m.weight.detach().cpu(), _Symmetric()(full), rtol=0, atol=0
+    )
 
 
 def test_set_data_across_cpu_and_mojo(mojo_gpu):

@@ -26,7 +26,13 @@ from std.utils.numerics import nan
 
 from tmb.backend.abi import (
     DEVICE_TYPE_CPU,
+    DEVICE_TYPE_CUDA,
+    DEVICE_TYPE_HIP,
+    DEVICE_TYPE_HPU,
+    DEVICE_TYPE_MPS,
+    DEVICE_TYPE_MTIA,
     DEVICE_TYPE_PRIVATEUSE1,
+    DEVICE_TYPE_XPU,
     MEMORY_FORMAT_PRESERVE,
     ST_INT32,
     ST_INT64,
@@ -48,8 +54,6 @@ from tmb.backend.abi import (
     TAG_BOOL,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
-    TAG_TENSOR,
-    TAG_TENSOR_REF,
     IntList,
     Owned,
     StorageArg,
@@ -99,6 +103,7 @@ from tmb.backend.abi import (
     v_opt_tensor_list_present,
     v_tensor,
     v_tensor_c,
+    v_tensor_device_type,
     is_complex_stype,
     v_storage,
     v_tensor_list,
@@ -3826,20 +3831,17 @@ def op_is_set_to(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def _on_dense_backend(v: Value) raises -> Bool:
     """On one of `TensorImpl::has_compatible_shallow_copy_type`'s dense
-    backends (CPU, CUDA, HIP, XPU, MPS, HPU, MTIA) or on PrivateUse1. Reads
-    the device type alone, not a `T`, so a parameter of any rank passes."""
-    if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
-        raise Error("expected a Tensor argument, got record tag ", v.tag)
-    var d = Int(external_call["tmb_tensor_device_type", Int32](Int(v.a)))
+    backends, or on PrivateUse1."""
+    var d = v_tensor_device_type(v)
     return (
         d == DEVICE_TYPE_CPU
+        or d == DEVICE_TYPE_CUDA
+        or d == DEVICE_TYPE_HIP
+        or d == DEVICE_TYPE_XPU
+        or d == DEVICE_TYPE_MPS
+        or d == DEVICE_TYPE_HPU
+        or d == DEVICE_TYPE_MTIA
         or d == DEVICE_TYPE_PRIVATEUSE1
-        or d == 1  # CUDA
-        or d == 6  # HIP
-        or d == 12  # XPU
-        or d == 13  # MPS
-        or d == 15  # HPU
-        or d == 19  # MTIA
     )
 
 
