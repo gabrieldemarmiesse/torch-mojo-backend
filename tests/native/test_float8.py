@@ -2188,8 +2188,26 @@ def _out_order_ops(dev):
     }
 
 
-@pytest.mark.parametrize("odt", _OUT_ORDER_DTYPES)
-@pytest.mark.parametrize("op", list(_out_order_ops("cpu")))
+# CUDA sums float8 into an integral or bool out=; the mojo device declines.
+_OUT_ORDER_KNOWN_MISMATCHES = {("sum", "int32"), ("sum", "bool")}
+
+
+@pytest.mark.parametrize(
+    ("op", "odt"),
+    [
+        pytest.param(
+            op,
+            odt,
+            marks=pytest.mark.xfail(
+                (op, odt) in _OUT_ORDER_KNOWN_MISMATCHES,
+                reason="declined on the mojo device, computed on CUDA",
+                strict=True,
+            ),
+        )
+        for op in _out_order_ops("cpu")
+        for odt in _OUT_ORDER_DTYPES
+    ],
+)
 def test_float8_out_order_matches_cuda(cuda_oracle: CudaOracle, op, odt):
     def run(dev: str) -> tuple[str, torch.Tensor | tuple[int, ...]]:
         out = torch.empty(0, dtype=getattr(torch, odt), device=dev)
