@@ -6874,7 +6874,14 @@ def test_aten_logical_and_broadcasting_shapes(
 @pytest.mark.parametrize("keepdim", [True, False])
 @pytest.mark.parametrize("op", ["argmax", "argmin"])
 @pytest.mark.parametrize(
-    "shape,dim", [((1, 3, 4), 2), ((3, 1, 4), 0), ((2, 3, 4, 5), 0), ((2, 3, 4, 5), 1)]
+    "shape,dim",
+    [
+        ((1, 3, 4), 2),
+        ((3, 1, 4), 0),
+        ((2, 3, 4, 5), 0),
+        ((2, 3, 4, 5), 1),
+        ((2, 3, 4, 5), -3),
+    ],
 )
 def test_aten_arg_reduce_non_last_dim(
     device: str, call_checker: CallChecker, shape, dim, keepdim, op
