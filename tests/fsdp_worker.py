@@ -341,7 +341,8 @@ def main():
         check_fsdp_collectives_stress()
         dist.destroy_process_group()
         return
-    run_parity(compiled=len(sys.argv) > 1 and sys.argv[1] == "compiled")
+    mode = sys.argv[1] if len(sys.argv) > 1 else "parity"
+    run_parity(compiled=mode == "compiled", move_first=mode != "cpu_resident")
     dist.destroy_process_group()
 
 
@@ -359,12 +360,14 @@ class Block(torch.nn.Module):
         return torch.nn.functional.gelu(self.linear(self.norm(x)))
 
 
-def run_parity(compiled: bool):
+def run_parity(compiled: bool, move_first: bool = True):
     """Gradients and updates against an unsharded CPU model, three steps.
 
     `compiled` runs the forward through `mojo_backend`, with the default
     `reshard_after_forward=True`: the backward graphs read weights whose
     storage FSDP2 freed after forward and regrew for backward.
+    Without `move_first`, `fully_shard` gets the CPU model and moves it
+    itself, with `tensor.data = tensor.to(mesh device)`.
     """
     rank, world = dist.get_rank(), dist.get_world_size()
     torch.manual_seed(123)
@@ -377,7 +380,9 @@ def run_parity(compiled: bool):
         reference = torch.nn.Sequential(
             torch.nn.Linear(7, 13), torch.nn.GELU(), torch.nn.Linear(13, 5)
         )
-    model = copy.deepcopy(reference).to("mojo")
+    model = copy.deepcopy(reference)
+    if move_first:
+        model.to("mojo")
     mesh = init_device_mesh("mojo", (world,))
     for layer in model:
         if not isinstance(layer, torch.nn.GELU):

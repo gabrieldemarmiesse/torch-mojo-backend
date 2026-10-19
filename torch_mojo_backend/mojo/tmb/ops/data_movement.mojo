@@ -26,7 +26,13 @@ from std.utils.numerics import nan
 
 from tmb.backend.abi import (
     DEVICE_TYPE_CPU,
+    DEVICE_TYPE_CUDA,
+    DEVICE_TYPE_HIP,
+    DEVICE_TYPE_HPU,
+    DEVICE_TYPE_MPS,
+    DEVICE_TYPE_MTIA,
     DEVICE_TYPE_PRIVATEUSE1,
+    DEVICE_TYPE_XPU,
     MEMORY_FORMAT_PRESERVE,
     ST_INT32,
     ST_INT64,
@@ -97,6 +103,7 @@ from tmb.backend.abi import (
     v_opt_tensor_list_present,
     v_tensor,
     v_tensor_c,
+    v_tensor_device_type,
     is_complex_stype,
     v_storage,
     v_tensor_list,
@@ -3822,6 +3829,42 @@ def op_is_set_to(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_bool(rets, 0, same)
 
 
+def _on_dense_backend(v: Value) raises -> Bool:
+    """On one of `TensorImpl::has_compatible_shallow_copy_type`'s dense
+    backends, or on PrivateUse1."""
+    var d = v_tensor_device_type(v)
+    return (
+        d == DEVICE_TYPE_CPU
+        or d == DEVICE_TYPE_CUDA
+        or d == DEVICE_TYPE_HIP
+        or d == DEVICE_TYPE_XPU
+        or d == DEVICE_TYPE_MPS
+        or d == DEVICE_TYPE_HPU
+        or d == DEVICE_TYPE_MTIA
+        or d == DEVICE_TYPE_PRIVATEUSE1
+    )
+
+
+# aten::_has_compatible_shallow_copy_type(Tensor self, Tensor from) -> bool
+def op_has_compatible_shallow_copy_type(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """Whether `self.data = from` may shallow-copy `from` into `self`'s
+    TensorImpl. `Module._apply` keeps a Parameter object (tied weights,
+    optimizer state, weakrefs) only when it may; upstream's default leaves
+    PrivateUse1 out of its dense backends and has backends override this op
+    instead (pytorch#172564, as OpenReg does). A sparse or Meta argument
+    outranks PrivateUse1 in dispatch and keeps torch's default kernel, so
+    only dense tensors reach this one and the device types decide, as for
+    CPU <-> CUDA."""
+    ret_bool(
+        rets,
+        0,
+        _on_dense_backend(args[unsafe_offset=0])
+        and _on_dense_backend(args[unsafe_offset=1]),
+    )
+
+
 comptime _INT64_MAX = 9223372036854775807
 
 
@@ -4129,6 +4172,10 @@ def register_data_movement(site: Site) raises:
     impl[op_set_source_tensor, "set_.source_Tensor"](site)
     impl[op_set_, "set_"](site)
     impl[op_is_set_to, "is_set_to"](site)
+    impl[
+        op_has_compatible_shallow_copy_type,
+        "_has_compatible_shallow_copy_type",
+    ](site)
     impl[op_resize_, "resize_"](site)
     impl[op_from_file, "from_file"](site)
     impl[op_set_source_storage, "set_.source_Storage"](site)

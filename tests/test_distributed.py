@@ -1097,15 +1097,27 @@ def test_two_rank_watchdog_fault_then_destroy_report_mode(ccl: str):
     ), context
 
 
+@pytest.mark.gpu
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])
 @pytest.mark.parametrize(
-    "mode", ["parity", "compiled", "reduce_scatter", "fsdp_collectives_stress"]
+    "mode",
+    ["parity", "cpu_resident", "compiled", "reduce_scatter", "fsdp_collectives_stress"],
 )
 def test_two_rank_fsdp2(mode: str, ccl: str):
     if _gpu_count() < 2:
         pytest.skip("needs at least 2 GPUs")
     extra_env = {"TORCH_MOJO_BACKEND_CCL": ccl}
     _run_torchrun(2, mode, extra_env, Path(__file__).parent / "fsdp_worker.py")
+
+
+@pytest.mark.gpu
+def test_one_rank_fsdp2_shards_a_cpu_model():
+    """`fully_shard` on a model still on the CPU moves it to the mesh's
+    device itself, with `param.data = param.to(device)`: that takes the mojo
+    `_has_compatible_shallow_copy_type` kernel."""
+    if _gpu_count() < 1:
+        pytest.skip("needs a GPU")
+    _run_torchrun(1, "cpu_resident", None, Path(__file__).parent / "fsdp_worker.py")
 
 
 @pytest.mark.parametrize("ccl", ["vendor", "mojo"])

@@ -62,7 +62,14 @@ comptime ST_FLOAT8_E5M2FNUZ = Int32(25)
 comptime ST_FLOAT8_E4M3FNUZ = Int32(26)
 comptime ST_FLOAT8_E8M0FNU = Int32(44)
 
+# c10::DeviceType
 comptime DEVICE_TYPE_CPU = 0
+comptime DEVICE_TYPE_CUDA = 1
+comptime DEVICE_TYPE_HIP = 6
+comptime DEVICE_TYPE_XPU = 12
+comptime DEVICE_TYPE_MPS = 13
+comptime DEVICE_TYPE_HPU = 15
+comptime DEVICE_TYPE_MTIA = 19
 comptime DEVICE_TYPE_PRIVATEUSE1 = 20
 
 # --- tmb_tensor_info slots (tmb.h TmbTensorInfoSlot) ------------------------
@@ -930,6 +937,15 @@ def v_is_complex(v: Value) -> Bool:
     if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
         return False
     return is_complex_stype(external_call["tmb_tensor_dtype", Int32](Int(v.a)))
+
+
+def v_tensor_device_type(v: Value) raises -> Int:
+    """A tensor argument's c10::DeviceType, read without building a `T`
+    (whose rank limit a CPU tensor need not meet). `v_device_type` reads a
+    Device argument instead."""
+    if v.tag != TAG_TENSOR and v.tag != TAG_TENSOR_REF:
+        raise Error("expected a Tensor argument, got record tag ", v.tag)
+    return Int(external_call["tmb_tensor_device_type", Int32](Int(v.a)))
 
 
 def v_opt_tensor(v: Value) raises -> Optional[T]:

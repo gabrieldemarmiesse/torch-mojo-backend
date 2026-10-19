@@ -184,6 +184,9 @@ SKIPPED_OPS: dict[str, str] = {
         "its own"
     ),
     "aten::is_set_to": "compares storage identity and metadata: no kernel",
+    "aten::_has_compatible_shallow_copy_type": (
+        "compares two device types (Module._apply's `.data =` test): no kernel"
+    ),
     "aten::_copy_from_and_resize": (
         "resize_ then copy_ (the CPU-fallback write-back): the copies "
         "test_data_movement already measures"
