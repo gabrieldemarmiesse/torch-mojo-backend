@@ -1957,44 +1957,17 @@ def _arg_reduce(
             # Return scalar (0-dimensional tensor)
             result = F.squeeze(result, axis=0)
     else:
-        # Compute arg-reduction along specified dimension
-        # MAX only supports arg-reduction on innermost axis, so we need to transpose
         ndim = len(input.shape)
-
-        # Normalize negative axis
         if dim < 0:
             dim = ndim + dim
-
-        # If dim is not the last dimension, transpose to make it last
+        # MAX reduces the innermost axis only, and keeps it as size 1.
         if dim != ndim - 1:
-            # Swap target dimension with last dimension
-            transposed_input = F.transpose(input, dim, ndim - 1)
-
-            # Perform arg-reduction on last axis
-            result = reduce(transposed_input, axis=-1)
-
-            # Swap back if needed
-            if not keepdim:
-                # The result has one fewer dimension, so we need to be careful about indexing
-                result_ndim = ndim - 1
-                if dim < result_ndim:
-                    # Swap back: what was at position dim is now at position (result_ndim - 1)
-                    # We want to move it back to position dim
-                    result = F.transpose(result, dim, result_ndim - 1)
-            else:
-                # For keepdim=True, the result still has the same number of dimensions
-                # Swap the dimensions back
-                result = F.transpose(result, dim, ndim - 1)
+            moved = reduce(F.transpose(input, dim, ndim - 1), axis=-1)
+            result = F.transpose(moved, dim, ndim - 1)
         else:
-            # Target axis is already the last dimension
             result = reduce(input, axis=dim)
-
         if not keepdim:
-            # Find the dimension with size 1 and squeeze it
-            for i, size in enumerate(result.shape):
-                if size == 1:
-                    result = F.squeeze(result, axis=i)
-                    break
+            result = F.squeeze(result, axis=dim)
     return result
 
 
