@@ -19,7 +19,6 @@ from tmb.kernels.random.distribution_kernels import (
     DIST_RANDOM_FULL_64,
     DIST_UNIFORM,
     I64x8,
-    acc_dtype,
     enqueue_bernoulli_tensor,
     enqueue_distribution,
 )
@@ -68,6 +67,7 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 comptime ALL_DTYPES = [
     DType.float32,
@@ -135,7 +135,7 @@ def _launch[
     seed: UInt64,
     offset: UInt64,
 ) raises:
-    comptime ACC = acc_dtype[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     var p_out0 = Scalar[dtype]()
     var p_out1 = Scalar[dtype]()
     var p_acc0: Scalar[ACC]

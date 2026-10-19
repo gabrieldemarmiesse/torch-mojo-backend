@@ -5,6 +5,17 @@ from std.sys import inlined_assembly, llvm_intrinsic, is_nvidia_gpu, is_amd_gpu
 
 
 @always_inline
+def wide_dtype[dtype: DType]() -> DType:
+    """ATen's opmath type, = `acc_type<scalar_t, /*is_cuda=*/true>` for the
+    floating dtypes: float64 stays, the rest compute in float32 (integers too,
+    for the kinds that promote them)."""
+    comptime if dtype == DType.float64:
+        return DType.float64
+    else:
+        return DType.float32
+
+
+@always_inline
 def _product[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
     comptime if dt == DType.float16 and is_nvidia_gpu():
         # Explicit .rn also prevents ptxas from contracting c10::Half operators.

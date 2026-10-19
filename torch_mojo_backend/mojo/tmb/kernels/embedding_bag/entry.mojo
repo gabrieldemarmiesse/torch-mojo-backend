@@ -48,6 +48,7 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 comptime BAG_DTYPES = [
     DType.float32,
@@ -60,15 +61,6 @@ comptime BAG_DTYPES = [
 comptime MODE_SUM = 0
 comptime MODE_MEAN = 1
 comptime MODE_MAX = 2
-
-
-@always_inline
-def _acc_dtype[dtype: DType]() -> DType:
-    """ATen's `acc_type<scalar_t, true>`: float for the half types."""
-    comptime if dtype == DType.float64:
-        return DType.float64
-    else:
-        return DType.float32
 
 
 @__name(t"embedding_bag_fwd_{dtype}_t{GS_THREADS}")
@@ -99,7 +91,7 @@ def _embedding_bag_kernel[
     has_psw: Int64,
     num_offsets: Int64,
 ):
-    comptime acc_t = _acc_dtype[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var features = Int(feature_size)
     var total = Int(num_bags) * features
     var n = Int(num_indices)
@@ -279,10 +271,10 @@ def _embedding_renorm_kernel[
     dim: Int64,
     stride0: Int64,
     stride1: Int64,
-    max_norm: Scalar[_acc_dtype[dtype]()],
-    norm_type: Scalar[_acc_dtype[dtype]()],
+    max_norm: Scalar[wide_dtype[dtype]()],
+    norm_type: Scalar[wide_dtype[dtype]()],
 ):
-    comptime acc_t = _acc_dtype[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var step = Int(grid_dim.x) * Int(block_dim.x)
     while i < Int(num_rows):
@@ -354,7 +346,7 @@ def _embedding_renorm_go(
                 elif dt == DType.float64 and has_apple_gpu_accelerator():
                     raise Error("float64 is not supported on Apple GPU")
                 else:
-                    comptime acc_t = _acc_dtype[dt]()
+                    comptime acc_t = wide_dtype[dt]()
                     _enqueue_cached[_embedding_renorm_kernel[dt]](
                         ctx,
                         _gs_blocks(num_rows),
@@ -412,7 +404,7 @@ comptime NROWS_PER_THREAD = 10
 def _partials_kernel[
     dtype: DType
 ](
-    partials: Pointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
+    partials: Pointer[Scalar[wide_dtype[dtype]()], MutAnyOrigin],
     grad: Pointer[Scalar[dtype], MutAnyOrigin],
     perm: Pointer[Int64, MutAnyOrigin],
     gid: Pointer[Int64, MutAnyOrigin],
@@ -428,7 +420,7 @@ def _partials_kernel[
     psw_stride: Int64,
     scale_by_freq: Int64,
 ):
-    comptime acc_t = _acc_dtype[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var features = Int(feature_size)
     var total = Int(num_indices) * features
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
@@ -475,7 +467,7 @@ def _segment_sum_kernel[
     dtype: DType
 ](
     grad_weight: Pointer[Scalar[dtype], MutAnyOrigin],
-    partials: Pointer[Scalar[_acc_dtype[dtype]()], MutAnyOrigin],
+    partials: Pointer[Scalar[wide_dtype[dtype]()], MutAnyOrigin],
     sorted: Pointer[Int64, MutAnyOrigin],
     gid: Pointer[Int64, MutAnyOrigin],
     run_start: Pointer[Int64, MutAnyOrigin],
@@ -484,7 +476,7 @@ def _segment_sum_kernel[
     feature_size: Int64,
     padding_idx: Int64,
 ):
-    comptime acc_t = _acc_dtype[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var features = Int(feature_size)
     var total = Int(num_indices) * features
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
@@ -540,7 +532,7 @@ def _sorted_backward_go(
                 elif dt == DType.float64 and has_apple_gpu_accelerator():
                     raise Error("float64 is not supported on Apple GPU")
                 else:
-                    comptime acc_t = _acc_dtype[dt]()
+                    comptime acc_t = wide_dtype[dt]()
 
                     if phase == 0:
                         _enqueue_cached[_partials_kernel[dt]](

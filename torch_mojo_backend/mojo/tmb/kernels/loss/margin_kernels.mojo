@@ -28,14 +28,9 @@ from std.utils.numerics import nan
 
 from tmb.kernels.common.op_utils import _enqueue_cached, _make_ptr
 from tmb.kernels.common.block_reduce import block_sum
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 comptime MARGIN_THREADS = 128
-
-
-@always_inline
-def _acc[dtype: DType]() -> DType:
-    """torch's `acc_type<scalar_t, /*is_cuda=*/true>`."""
-    return DType.float64 if dtype == DType.float64 else DType.float32
 
 
 @__name(t"multi_margin_forward_{dtype}")
@@ -54,7 +49,7 @@ def _multi_margin_forward_kernel[
     margin: Scalar[dtype],
 ):
     """MultiMarginLoss_forward_kernel: one block per sample."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var buffer = stack_allocation[
         MARGIN_THREADS, acc_t, address_space=AddressSpace.SHARED
     ]()
@@ -110,7 +105,7 @@ def _multi_margin_backward_kernel[
     margin: Scalar[dtype],
 ):
     """MultiMarginLoss_backward_kernel: one block per sample."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var buffer = stack_allocation[
         MARGIN_THREADS, acc_t, address_space=AddressSpace.SHARED
     ]()
@@ -245,7 +240,7 @@ def _multilabel_forward_kernel[
 ):
     """multilabel_margin_loss_forward_kernel: one block per sample, also
     writing the sample's 0/1 `is_target` row."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var dim = Int(dim_arg)
     var k = Int(block_idx.x)
     var tid = Int(thread_idx.x)
@@ -302,7 +297,7 @@ def _multilabel_backward_kernel[
     """multilabel_margin_loss_backward_kernel: one block per sample; `g` is
     the gain `1 / (nframe * dim)` or `1 / dim`, rounded to the dtype on the
     host as CUDA's `static_cast<scalar_t>(1. / ...)` is."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var dim = Int(dim_arg)
     var k = Int(block_idx.x)
     var tid = Int(thread_idx.x)

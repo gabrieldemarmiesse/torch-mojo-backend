@@ -34,6 +34,7 @@ from max.gpu.sync import barrier
 
 from tmb.kernels.common.op_utils import _enqueue_cached, _make_ptr
 from tmb.kernels.random.philox import curand4, curand_ctr, curand_key
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 # Threads per row block, for both kernels.
 comptime MN_THREADS = 256
@@ -47,12 +48,6 @@ comptime MN_BAD_NONFINITE = 2
 comptime MN_BAD_SUM = 4
 
 comptime _TWO_POW_M24 = 5.9604644775390625e-08  # 2^-24
-
-
-@always_inline
-def mn_acc[dtype: DType]() -> DType:
-    """ATen's accumulation type for the row sums."""
-    return DType.float64 if dtype == DType.float64 else DType.float32
 
 
 @always_inline
@@ -81,7 +76,7 @@ def _check_kernel[
     rows_arg: Int64,
     n_arg: Int64,
 ):
-    comptime ACC = mn_acc[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     var rows = Int(rows_arg)
     var n = Int(n_arg)
     var s_sum = stack_allocation[
@@ -130,7 +125,7 @@ def _check_kernel[
 
 @always_inline
 def _positive[dtype: DType](v: Scalar[dtype]) -> Bool:
-    return v.cast[mn_acc[dtype]()]().gt(0)[0]
+    return v.cast[wide_dtype[dtype]()]().gt(0)[0]
 
 
 @__llvm_metadata(
@@ -141,7 +136,7 @@ def _draw_kernel[
     dtype: DType
 ](
     dst: Pointer[Scalar[DType.int64], MutAnyOrigin],
-    cdf: Pointer[Scalar[mn_acc[dtype]()], MutAnyOrigin],
+    cdf: Pointer[Scalar[wide_dtype[dtype]()], MutAnyOrigin],
     probs: Pointer[Scalar[dtype], ImmutAnyOrigin],
     rows_arg: Int64,
     n_arg: Int64,
@@ -149,7 +144,7 @@ def _draw_kernel[
     seed: UInt64,
     offset: UInt64,
 ):
-    comptime ACC = mn_acc[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     var rows = Int(rows_arg)
     var n = Int(n_arg)
     var n_sample = Int(n_sample_arg)
@@ -263,7 +258,7 @@ def enqueue_multinomial_draw[
             1,
             MN_THREADS,
             _make_ptr[DType.int64](dst).as_unsafe_any_origin(),
-            _make_ptr[mn_acc[dtype]()](cdf).as_unsafe_any_origin(),
+            _make_ptr[wide_dtype[dtype]()](cdf).as_unsafe_any_origin(),
             _make_ptr[dtype](probs).as_unsafe_any_origin().as_imm(),
             Int64(rows),
             Int64(n),

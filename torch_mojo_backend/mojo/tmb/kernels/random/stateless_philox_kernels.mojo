@@ -22,6 +22,7 @@ from tmb.kernels.common.libdevice_port import (
 )
 from tmb.kernels.common.op_utils import _enqueue_cached, _make_ptr, ieee_sqrt
 from tmb.kernels.random.philox import U32x2, U32x4, philox4x32_10
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 comptime BLOCK = 256
 comptime _MAX_GRID = 65535
@@ -102,14 +103,6 @@ def _key_fold_in_kernel(
 
 
 @always_inline
-def philox_acc[dtype: DType]() -> DType:
-    comptime if dtype == DType.float64:
-        return DType.float64
-    else:
-        return DType.float32
-
-
-@always_inline
 def philox_epc[dtype: DType]() -> Int:
     """Elements per Philox call: 2 for float64, 4 otherwise."""
     comptime if dtype == DType.float64:
@@ -164,12 +157,12 @@ def _box_muller_double(r: U32x4) -> SIMD[DType.float64, 2]:
 def philox_draw[
     dtype: DType, KIND: Int
 ](
-    r: U32x4, p0: Scalar[philox_acc[dtype]()], p1: Scalar[philox_acc[dtype]()]
+    r: U32x4, p0: Scalar[wide_dtype[dtype]()], p1: Scalar[wide_dtype[dtype]()]
 ) -> SIMD[dtype, philox_epc[dtype]()]:
     """One Philox block -> EPC outputs. Uniform: p0 = from, p1 = to - from
     (both already rounded through the output dtype, as ATen's scalar_t
     arithmetic does). Normal: p0 = mean, p1 = std."""
-    comptime ACC = philox_acc[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     comptime N = philox_epc[dtype]()
     comptime if KIND == PHILOX_UNIFORM:
         # transformation::uniform_real: (val & MASK) * 2^-digits, then
@@ -231,8 +224,8 @@ def _dist_kernel[
     keys: Pointer[UInt64, MutAnyOrigin],
     num_keys: Int64,
     elems_per_key: Int64,
-    p0: Scalar[philox_acc[dtype]()],
-    p1: Scalar[philox_acc[dtype]()],
+    p0: Scalar[wide_dtype[dtype]()],
+    p1: Scalar[wide_dtype[dtype]()],
 ):
     """One thread per (key, chunk); `dst` is contiguous, key `k` owns
     elements [k * elems_per_key, (k + 1) * elems_per_key)."""
@@ -337,7 +330,7 @@ def enqueue_stateless_dist[
             raise Error("no GPU accelerator available at compile time")
         else:
             comptime N = philox_epc[dtype]()
-            comptime ACC = philox_acc[dtype]()
+            comptime ACC = wide_dtype[dtype]()
             var chunks = (elems_per_key + N - 1) // N
             _enqueue_cached[_dist_kernel[dtype, KIND]](
                 ctx,

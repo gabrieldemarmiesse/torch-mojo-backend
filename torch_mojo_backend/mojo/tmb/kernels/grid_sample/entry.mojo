@@ -60,6 +60,7 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.kernels.common.dtype_arithmetic import wide_dtype as _acc
 
 comptime BLOCK = 256
 # Grid-stride cap; the per-thread work is a whole channel loop, so a few
@@ -95,12 +96,6 @@ comptime G_COUNT = 27
 comptime NG = 28
 
 comptime Geometry = Array[Int64, NG]
-
-
-@always_inline
-def _acc[dt: DType]() -> DType:
-    """at::opmath_type: float32 for the 16-bit floats."""
-    return DType.float64 if dt == DType.float64 else DType.float32
 
 
 @always_inline

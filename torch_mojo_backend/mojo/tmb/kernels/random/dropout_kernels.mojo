@@ -34,6 +34,7 @@ from tmb.kernels.common.op_utils import (
     FILL_THREADS,
 )
 from tmb.kernels.random.rng_metadata import I64x8
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 comptime BLOCK = 256
 
@@ -51,14 +52,6 @@ def _philox4x32_10(counter: UInt64, seed: UInt64) -> U32x4:
         ),
         curand_key(seed),
     )
-
-
-@always_inline
-def _acc[dtype: DType]() -> DType:
-    comptime if dtype == DType.float64:
-        return DType.float64
-    else:
-        return DType.float32
 
 
 @always_inline
@@ -91,11 +84,11 @@ def _dropout_vec_kernel[
     mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     inp: Pointer[Scalar[dtype], MutAnyOrigin],
     numel_arg: Int64,
-    p: Scalar[_acc[dtype]()],
+    p: Scalar[wide_dtype[dtype]()],
     seed: UInt64,
     offset: UInt64,
 ):
-    comptime ACC = _acc[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     comptime RAND_SIZE = (VEC + 3) // 4
     var numel = Int(numel_arg)
     var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
@@ -136,11 +129,11 @@ def _dropout_strided_kernel[
     sizes: I64x8,
     in_strides: I64x8,
     out_strides: I64x8,
-    p: Scalar[_acc[dtype]()],
+    p: Scalar[wide_dtype[dtype]()],
     seed: UInt64,
     offset: UInt64,
 ):
-    comptime ACC = _acc[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     var numel = Int(numel_arg)
     var ndim = Int(ndim_arg)
     var total = Int(grid_dim.x) * Int(block_dim.x)
@@ -176,9 +169,9 @@ def _dropout_backward_kernel[
     grad: Pointer[Scalar[dtype], MutAnyOrigin],
     mask: Pointer[Scalar[DType.bool], MutAnyOrigin],
     numel_arg: Int64,
-    scale: Scalar[_acc[dtype]()],
+    scale: Scalar[wide_dtype[dtype]()],
 ):
-    comptime ACC = _acc[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     var numel = Int(numel_arg)
     var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
     var stride = Int(grid_dim.x) * Int(block_dim.x)
@@ -207,7 +200,7 @@ def enqueue_native_dropout[
     seed: UInt64,
     offset: UInt64,
 ) raises:
-    comptime ACC = _acc[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     if numel <= 0:
         return
     comptime if dtype == DType.float64 and has_apple_gpu_accelerator():
@@ -296,7 +289,7 @@ def enqueue_native_dropout_backward[
     numel: Int,
     scale: Float64,
 ) raises:
-    comptime ACC = _acc[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     if numel <= 0:
         return
     comptime if dtype == DType.float64 and has_apple_gpu_accelerator():

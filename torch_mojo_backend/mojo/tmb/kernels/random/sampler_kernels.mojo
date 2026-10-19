@@ -42,6 +42,7 @@ from tmb.kernels.random.philox import (
     curand_ctr,
     curand_key,
 )
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 comptime SAMPLE_POISSON = 0
 comptime SAMPLE_GAMMA = 1
@@ -50,15 +51,6 @@ comptime SAMPLE_BINOMIAL = 2
 comptime BLOCK = 256
 # Rejection rounds before a sampler gives up (see the module docstring).
 comptime MAX_ROUNDS = 4096
-
-
-@always_inline
-def acc_of[dtype: DType]() -> DType:
-    """ATen's `acc_type<scalar_t, /*is_cuda=*/true>`."""
-    comptime if dtype == DType.float64:
-        return DType.float64
-    else:
-        return DType.float32
 
 
 @always_inline
@@ -254,7 +246,7 @@ def _gamma[
 ](alpha_in: Scalar[dtype], mut s: _Stream) -> Scalar[dtype]:
     """Distributions.h's `sample_gamma` as gamma_cuda_kernel runs it, then
     the kernel's clamp to the dtype's smallest normal."""
-    comptime w = acc_of[dtype]()
+    comptime w = wide_dtype[dtype]()
     comptime V = Scalar[w]
     var alpha = alpha_in.cast[w]()
     if isnan(alpha):
@@ -342,7 +334,7 @@ def _stirling_approx_tail[w: DType](k: Scalar[w]) -> Scalar[w]:
 def _binomial_inversion[
     dtype: DType
 ](count: Scalar[dtype], prob: Scalar[dtype], mut s: _Stream) -> Scalar[dtype]:
-    comptime w = acc_of[dtype]()
+    comptime w = wide_dtype[dtype]()
     var geom_sum = Scalar[w](0)
     var num_geom = Scalar[dtype](0)
     var logprob = _log1p(-prob.cast[w]())
@@ -362,7 +354,7 @@ def _btrs[
 ](count_in: Scalar[dtype], prob_in: Scalar[dtype], mut s: _Stream) -> Scalar[
     dtype
 ]:
-    comptime w = acc_of[dtype]()
+    comptime w = wide_dtype[dtype]()
     comptime V = Scalar[w]
     var count = count_in.cast[w]()
     var prob = prob_in.cast[w]()
@@ -403,6 +395,7 @@ def _binomial[
     dtype: DType
 ](count: Scalar[dtype], prob: Scalar[dtype], mut s: _Stream) -> Scalar[dtype]:
     """Distributions.h's `sample_binomial`."""
+    comptime w = wide_dtype[dtype]()
     # The deterministic boundaries first, with C++'s NaN comparisons (false):
     # (count = 0, prob = NaN) and (count = NaN, prob = 0) are 0, (NaN, 1)
     # is NaN.
@@ -415,11 +408,11 @@ def _binomial[
     if isinf(count):
         return count
     if prob <= Scalar[dtype](0.5):
-        if count.cast[acc_of[dtype]()]() * prob.cast[acc_of[dtype]()]() >= 10:
+        if count.cast[w]() * prob.cast[w]() >= 10:
             return _btrs(count, prob, s)
         return _binomial_inversion(count, prob, s)
     var qprob = Scalar[dtype](1.0) - prob
-    if count.cast[acc_of[dtype]()]() * qprob.cast[acc_of[dtype]()]() >= 10:
+    if count.cast[w]() * qprob.cast[w]() >= 10:
         return count - _btrs(count, qprob, s)
     return count - _binomial_inversion(count, qprob, s)
 

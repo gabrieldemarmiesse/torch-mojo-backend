@@ -42,18 +42,13 @@ from tmb.kernels.common.op_utils import (
     _make_ptr,
     _parallel_for_dt,
 )
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 # Shared-memory capacity of the one-block reduction: `nll_loss_threads` is
 # clamped to [32, 1024].
 comptime NLL_MAX_THREADS = 1024
 # ATen's CUDA_NUM_THREADS (ATen/cuda/detail/KernelUtils.h).
 comptime NLL2D_THREADS = 128
-
-
-@always_inline
-def _acc[dtype: DType]() -> DType:
-    """torch's `acc_type<scalar_t, /*is_cuda=*/true>`."""
-    return DType.float64 if dtype == DType.float64 else DType.float32
 
 
 # Params tuple of the NLL ops (tmb/ops/loss.mojo fills it in this order).
@@ -157,7 +152,7 @@ def _nll_reduce_kernel[
     err_ptr: Pointer[Scalar[DType.int64], MutAnyOrigin],
 ):
     """Loss.cu nll_loss_forward_reduce_cuda_kernel_{1d,2d}: one block."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var has_w = Int(has_w_arg) != 0
     var nframe = Int(nframe_arg)
     var classes = Int(classes_arg)
@@ -285,7 +280,7 @@ def _nll2d_partial_kernel[
     """NLLLoss2d.cu nll_loss2d_forward_kernel up to its block reduction; the
     two block sums go to `scratch[2 * block]` rounded to the input dtype
     instead of into CUDA's atomics."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var has_w = Int(has_w_arg) != 0
     var classes = Int(classes_arg)
     var map = Int(map_arg)
