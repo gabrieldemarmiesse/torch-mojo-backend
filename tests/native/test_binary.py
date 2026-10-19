@@ -8,23 +8,15 @@ public API only; `CallChecker` (or `native.op_count` for the ops with no
 """
 
 import contextlib
-import functools
 import itertools
-import json
 import math
-import pathlib
-import sys
 from typing import TypeAlias
 
 import pytest
 import torch
 
-from tests.native.conftest import (
-    flush_subnormals_on_metal,
-    is_metal,
-    require_stock_cuda,
-    skip_if_metal,
-)
+from tests.native.conftest import flush_subnormals_on_metal, is_metal, skip_if_metal
+from tests.native.cuda_oracle import CudaOracle
 from torch_mojo_backend import aten_functions, get_accelerators, native
 
 
@@ -245,20 +237,15 @@ def test_bool_add_alpha_checks(mojo_gpu):
 
 
 # add / sub / rsub with an alpha into an output of another dtype, against
-# stock CUDA (torch 2.11, H100; binary_alpha_cuda.json next to this file):
+# stock CUDA (the live oracle, tests/native/cuda_oracle.py):
 # CUDA's alpha_check reads the iterator's OUTPUT dtype (the out=, or self in
 # place), after compute_types' canCast of the common dtype into it, and the
 # kernel then converts alpha into the computation dtype (a float truncated,
 # a bool from nonzero, -alpha for sub, range-checked). CPU torch shares the
 # meta, but a same-dtype out cannot show the difference.
 #
-# The JSON maps a case id, "op/variant/input-dtype[->out-dtype]/alpha=<repr>",
-# to its outcome: {"dtype", "values"} or {"error", "message"}, one case per
-# line in generation order. To rewrite it, on a machine with stock CUDA
-# torch:
-#   uv run python -c "from tests.native.test_binary import write_alpha_cuda_json; write_alpha_cuda_json()"
-_ALPHA_JSON = pathlib.Path(__file__).parent / "binary_alpha_cuda.json"
-# one case's outcome: {"dtype", "values"} or {"error", "message"}
+# A case id, "op/variant/input-dtype[->out-dtype]/alpha=<repr>", maps to its
+# outcome: {"dtype", "values"} or {"error", "message"}.
 _Outcome: TypeAlias = dict[
     str,
     str
@@ -307,9 +294,9 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-def _json_number(v: float) -> float | str:
-    """A value JSON holds and `==` compares: NaN and the infinities as
-    "nan", "inf", "-inf"."""
+def _comparable(v: float) -> float | str:
+    """A value `==` compares: NaN and the infinities as "nan", "inf",
+    "-inf"."""
     return v if math.isfinite(v) else str(v)
 
 
@@ -321,9 +308,9 @@ def _alpha_outcome(fn) -> _Outcome:
         return {"error": type(error).__name__, "message": message}
     values = t.cpu().tolist()
     if t.is_complex():  # JSON has no complex: [re, im]
-        values = [[_json_number(v.real), _json_number(v.imag)] for v in values]
+        values = [[_comparable(v.real), _comparable(v.imag)] for v in values]
     elif t.dtype.is_floating_point:
-        values = [_json_number(v) for v in values]
+        values = [_comparable(v) for v in values]
     return {"dtype": _dtype_name(t.dtype), "values": values}
 
 
@@ -369,59 +356,14 @@ _ALPHA_GROUPS = [
 ]
 
 
-def _all_alpha_cases(device: str) -> dict[str, _Outcome]:
-    cases = {}
-    for op, variant in _ALPHA_GROUPS:
-        cases.update(_alpha_cases(device, op, variant))
-    return cases
-
-
-def write_alpha_cuda_json():
-    """Rewrite binary_alpha_cuda.json from stock CUDA torch (see above)."""
-    assert torch.version.cuda is not None and torch.cuda.is_available(), (
-        "needs stock CUDA torch"
-    )
-    cases = _all_alpha_cases("cuda")
-    # one case per line, so a diff names the cases that changed
-    lines = [f" {json.dumps(k)}: {json.dumps(v)}" for k, v in cases.items()]
-    _ALPHA_JSON.write_text("{\n" + ",\n".join(lines) + "\n}\n")
-
-
-@functools.cache
-def _alpha_cuda() -> dict[str, _Outcome]:
-    return json.loads(_ALPHA_JSON.read_text())
-
-
-# The C++ type names in CUDA's messages are the host compiler's (Linux
-# GCC); the mojo device prints the names of the host it runs on.
-_MACOS_TYPE_NAMES = [
-    ("long unsigned int", "unsigned long long"),
-    ("short unsigned int", "unsigned short"),
-    ("long int", "long long"),
-    ("short int", "short"),
-]
-
-
-def _as_on_this_host(outcome: _Outcome) -> _Outcome:
-    if sys.platform != "darwin" or "message" not in outcome:
-        return outcome
-    message = outcome["message"]
-    for linux, macos in _MACOS_TYPE_NAMES:
-        message = message.replace(linux, macos)
-    return {**outcome, "message": message}
-
-
 @pytest.mark.parametrize(
     ("op", "variant"), _ALPHA_GROUPS, ids=[f"{o}/{v}" for o, v in _ALPHA_GROUPS]
 )
-def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(mojo_gpu, op, variant):
-    got = _alpha_cases(mojo_gpu, op, variant)
-    recorded = _alpha_cuda()
-    want = {
-        key: _as_on_this_host(recorded[key])
-        for key in recorded
-        if key.startswith(f"{op}/{variant}/")
-    }
+def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(
+    cuda_oracle: CudaOracle, op, variant
+):
+    got = _alpha_cases(cuda_oracle.mojo, op, variant)
+    want = _alpha_cases(cuda_oracle.cuda, op, variant)
     assert got.keys() == want.keys()
     mismatches = {
         key: {"got": got[key], "want": want[key]}
@@ -429,15 +371,6 @@ def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(mojo_gpu, op, v
         if got[key] != want[key]
     }
     assert mismatches == {}
-
-
-@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
-def test_add_sub_alpha_data_regenerates_on_stock_cuda():
-    require_stock_cuda()
-    got = _all_alpha_cases("cuda")
-    want = _alpha_cuda()
-    assert list(got) == list(want)
-    assert {k: v for k, v in got.items() if v != want[k]} == {}
 
 
 def test_inplace_add_rejects_partial_overlap(mojo_gpu):

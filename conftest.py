@@ -51,7 +51,7 @@ _GPU_FIXTURES = frozenset(
         "mojo_pair",
         "two_gpus",
         "mojo_h100",
-        "cuda_device",
+        "cuda_oracle",
     }
 )
 

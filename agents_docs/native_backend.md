@@ -597,8 +597,8 @@ the same `torch.rand` / `randn` / `randint` / `bernoulli` / dropout values on
 the mojo device (NVIDIA; on AMD and Apple the float transforms fall back to
 std.math and only the integer draws are bit-exact) and on a CUDA device of
 the same model, and
-`tests/native/test_random_parity.py` holds it to that against recorded CUDA
-digests (`rng_golden.json`, refreshed with `rng_parity_dump.py`). Not covered:
+`tests/native/test_random_parity.py` holds it to that against stock CUDA on the
+same GPU, live (`cuda_oracle.md`). Not covered:
 `multinomial`, `randperm`, `poisson`, `rrelu_with_noise` (unregistered).
 
 ## Distributed

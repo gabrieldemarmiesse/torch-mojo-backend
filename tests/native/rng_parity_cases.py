@@ -1,12 +1,10 @@
 """The RNG parity cases: one function per draw, run on CUDA and on the mojo
-device from the same seed, compared bit for bit (`test_random_parity.py`,
-`rng_parity_dump.py`).
+device from the same seed, compared bit for bit (`test_random_parity.py`).
 
-`golden` marks the cases whose result does not depend on the GPU model: below
-the grid cap (`sm_count * max_threads_per_sm / 256` blocks of 256 threads,
-270 336 elements on an H100 SXM) ATen's launch is the same on every card, so
-their digests are checked into `rng_golden.json`; the others are compared live
-or against a dump from the same GPU model.
+Below the grid cap (`sm_count * max_threads_per_sm / 256` blocks of 256
+threads, 270 336 elements on an H100 SXM) ATen's launch is the same on every
+card; above it (the 300 000+ element cases) the draw depends on the GPU
+model, which the live oracle shares.
 """
 
 import torch
@@ -358,26 +356,10 @@ CASES = {
     "sequence": _sequence,
 }
 
-# Above the grid cap, or a byte extent past INT32_MAX: same GPU model only.
-DEVICE_DEPENDENT = {
-    "rand_f32_300000",
-    "rand_f32_2000000",
-    "rand_f16_2000000",
-    "rand_f64_2000000",
-    "randn_f32_300000",
-    "randn_f32_2000000",
-    "bernoulli_tensor_big",
-    "dropout_f32_big",
-    "dropout_f16_big",
-    "dropout_f32_big_vec2",
-    "dropout_f32_big_strided",
-}
-
 # 2 GB + 4 bytes: crosses TensorIterator's 32-bit indexing limit and splits.
-# Device-dependent too; opt in with TMB_RNG_BIG=1 (needs ~5 GB of device memory).
+# Above the grid cap too; opt in with TMB_RNG_BIG=1 (~5 GB of device memory
+# per side, ~10 GB on the one GPU).
 BIG_CASES = {
     "rand_f32_split_2gb": lambda d: torch.rand(2**29 + 1, device=d),
     "randn_f32_split_2gb": lambda d: torch.randn(2**29 + 1, device=d),
 }
-
-GOLDEN = [name for name in CASES if name not in DEVICE_DEPENDENT]

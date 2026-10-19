@@ -11,11 +11,8 @@ it differs (`_stock_cast`), and, for the GEMMs, a float64 product of the
 dequantized operands.
 """
 
-import functools
 import itertools
-import json
 import math
-import pathlib
 import re
 from typing import Any
 
@@ -23,7 +20,8 @@ import pytest
 import torch
 from torch.nn.functional import ScalingType, SwizzleType
 
-from tests.native.conftest import is_metal, require_stock_cuda
+from tests.native.conftest import is_metal
+from tests.native.cuda_oracle import CudaOracle, assert_bits_equal, error_message
 from torch_mojo_backend.native import device_module
 
 FP8 = [
@@ -1394,64 +1392,19 @@ def test_float8_refusals_name_cuda_kernels(mojo_device, op, kernel):
         op(x)
 
 
-# Measured on stock CUDA (torch 2.11 / H100): same-device float8 -> integer
-# conversions of _CONV_SOURCES, which go through float32 and PTX's
-# saturating cvt (NaN is 0 for int32 / uint32, INT64_MIN for int64 and the
-# types narrowed from it, 2**63 for uint64).
-_CONV_SOURCES = [
-    float("inf"), float("-inf"), float("nan"), -1.0, -3.5, 300.0, 70000.0,
-    1e9, 3.5, 0.0, -0.0, 57344.0,
-]  # fmt: skip
-_CUDA_FLOAT8_TO_INT = {
-    ("float8_e4m3fn", "uint8"): [0, 0, 0, 255, 253, 32, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fn", "uint16"): [0, 0, 0, 0, 0, 288, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fn", "uint32"): [0, 0, 0, 0, 0, 288, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fn", "uint64"): [9223372036854775808, 9223372036854775808, 9223372036854775808, 0, 0, 288, 9223372036854775808, 9223372036854775808, 3, 0, 0, 9223372036854775808],
-    ("float8_e4m3fn", "int8"): [0, 0, 0, -1, -3, 32, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fn", "int16"): [0, 0, 0, -1, -3, 288, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fn", "int32"): [0, 0, 0, -1, -3, 288, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fn", "int64"): [-9223372036854775808, -9223372036854775808, -9223372036854775808, -1, -3, 288, -9223372036854775808, -9223372036854775808, 3, 0, 0, -9223372036854775808],
-    ("float8_e5m2", "uint8"): [255, 0, 0, 255, 253, 64, 255, 255, 3, 0, 0, 0],
-    ("float8_e5m2", "uint16"): [65535, 0, 0, 0, 0, 320, 65535, 65535, 3, 0, 0, 57344],
-    ("float8_e5m2", "uint32"): [4294967295, 0, 0, 0, 0, 320, 4294967295, 4294967295, 3, 0, 0, 57344],
-    ("float8_e5m2", "uint64"): [18446744073709551615, 0, 9223372036854775808, 0, 0, 320, 18446744073709551615, 18446744073709551615, 3, 0, 0, 57344],
-    ("float8_e5m2", "int8"): [-1, 0, 0, -1, -3, 64, -1, -1, 3, 0, 0, 0],
-    ("float8_e5m2", "int16"): [-1, 0, 0, -1, -3, 320, -1, -1, 3, 0, 0, -8192],
-    ("float8_e5m2", "int32"): [2147483647, -2147483648, 0, -1, -3, 320, 2147483647, 2147483647, 3, 0, 0, 57344],
-    ("float8_e5m2", "int64"): [9223372036854775807, -9223372036854775808, -9223372036854775808, -1, -3, 320, 9223372036854775807, 9223372036854775807, 3, 0, 0, 57344],
-    ("float8_e4m3fnuz", "uint8"): [0, 0, 0, 255, 253, 0, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fnuz", "uint16"): [0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fnuz", "uint32"): [0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fnuz", "uint64"): [9223372036854775808, 9223372036854775808, 9223372036854775808, 0, 0, 9223372036854775808, 9223372036854775808, 9223372036854775808, 3, 0, 0, 9223372036854775808],
-    ("float8_e4m3fnuz", "int8"): [0, 0, 0, -1, -3, 0, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fnuz", "int16"): [0, 0, 0, -1, -3, 0, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fnuz", "int32"): [0, 0, 0, -1, -3, 0, 0, 0, 3, 0, 0, 0],
-    ("float8_e4m3fnuz", "int64"): [-9223372036854775808, -9223372036854775808, -9223372036854775808, -1, -3, -9223372036854775808, -9223372036854775808, -9223372036854775808, 3, 0, 0, -9223372036854775808],
-    ("float8_e5m2fnuz", "uint8"): [0, 0, 0, 255, 253, 64, 0, 0, 3, 0, 0, 0],
-    ("float8_e5m2fnuz", "uint16"): [0, 0, 0, 0, 0, 320, 0, 0, 3, 0, 0, 57344],
-    ("float8_e5m2fnuz", "uint32"): [0, 0, 0, 0, 0, 320, 0, 0, 3, 0, 0, 57344],
-    ("float8_e5m2fnuz", "uint64"): [9223372036854775808, 9223372036854775808, 9223372036854775808, 0, 0, 320, 9223372036854775808, 9223372036854775808, 3, 0, 0, 57344],
-    ("float8_e5m2fnuz", "int8"): [0, 0, 0, -1, -3, 64, 0, 0, 3, 0, 0, 0],
-    ("float8_e5m2fnuz", "int16"): [0, 0, 0, -1, -3, 320, 0, 0, 3, 0, 0, -8192],
-    ("float8_e5m2fnuz", "int32"): [0, 0, 0, -1, -3, 320, 0, 0, 3, 0, 0, 57344],
-    ("float8_e5m2fnuz", "int64"): [-9223372036854775808, -9223372036854775808, -9223372036854775808, -1, -3, 320, -9223372036854775808, -9223372036854775808, 3, 0, 0, 57344],
-    ("float8_e8m0fnu", "uint8"): [0, 0, 0, 1, 4, 0, 0, 0, 4, 0, 0, 0],
-    ("float8_e8m0fnu", "uint16"): [0, 0, 0, 1, 4, 256, 0, 0, 4, 0, 0, 0],
-    ("float8_e8m0fnu", "uint32"): [0, 0, 0, 1, 4, 256, 65536, 1073741824, 4, 0, 0, 65536],
-    ("float8_e8m0fnu", "uint64"): [9223372036854775808, 9223372036854775808, 9223372036854775808, 1, 4, 256, 65536, 1073741824, 4, 0, 0, 65536],
-    ("float8_e8m0fnu", "int8"): [0, 0, 0, 1, 4, 0, 0, 0, 4, 0, 0, 0],
-    ("float8_e8m0fnu", "int16"): [0, 0, 0, 1, 4, 256, 0, 0, 4, 0, 0, 0],
-    ("float8_e8m0fnu", "int32"): [0, 0, 0, 1, 4, 256, 65536, 1073741824, 4, 0, 0, 65536],
-    ("float8_e8m0fnu", "int64"): [-9223372036854775808, -9223372036854775808, -9223372036854775808, 1, 4, 256, 65536, 1073741824, 4, 0, 0, 65536],
-}  # fmt: skip
+_INTS = ["int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"]
 
 
-@pytest.mark.parametrize("key", list(_CUDA_FLOAT8_TO_INT), ids=lambda k: "-".join(k))
-def test_float8_to_int_on_device_matches_stock_cuda(mojo_device, key):
-    f8 = getattr(torch, key[0])
-    dt = getattr(torch, key[1])
-    x = torch.tensor(_CONV_SOURCES).to(f8).to(mojo_device)
-    assert x.to(dt).cpu().tolist() == _CUDA_FLOAT8_TO_INT[key]
+# Same-device float8 -> integer conversions go through float32 and PTX's
+# saturating cvt on stock CUDA (NaN is 0 for int32 / uint32, INT64_MIN for
+# int64 and the types narrowed from it, 2**63 for uint64): `_cuda_f2i`
+# models it on every backend, and the live oracle checks the model's
+# source.
+@pytest.mark.parametrize("dt", _INTS)
+@pytest.mark.parametrize("src", FP8, ids=FP8_IDS)
+def test_float8_all_codes_to_int_match_live_cuda(cuda_oracle: CudaOracle, src, dt):
+    convert = getattr(torch, dt)
+    cuda_oracle.assert_bitwise_equal(lambda x: x.to(convert), _all_codes(src))
 
 
 def test_mask_assign_device_value_checks(mojo_device):
@@ -1515,9 +1468,6 @@ def _cuda_f2i(f: float, dt: str) -> int:
         return 2**63 if nan else sat(0, 2**64 - 1)
     r = -(2**63) if nan else sat(-(2**63), 2**63 - 1)
     return r if dt == "int64" else r & 0xFF
-
-
-_INTS = ["int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"]
 
 
 @pytest.mark.parametrize("dt", _INTS)
@@ -2190,181 +2140,10 @@ def test_float8_foreach_copy_empty_any_strides_refused(mojo_device, strides):
     assert d._version == v0
 
 
-# Measured on stock CUDA (torch 2.11 / H100): TensorIterator's order for an
-# out= of a float8 computation -- (1) the out dtype check raises
-# RuntimeError with out untouched, (2) out is resized, (3) the kernel
-# dispatch raises NotImplementedError. (op, out dtype, outcome, message or
-# values, out's shape afterwards.)
-_OUT_ORDER_CUDA = [
-    ('neg', 'float8_e4m3fn', 'NotImplementedError', '"neg_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('neg', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
-    ('neg', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
-    ('neg', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
-    ('neg', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
-    ('abs', 'float8_e4m3fn', 'NotImplementedError', '"abs_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('abs', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
-    ('abs', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
-    ('abs', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
-    ('abs', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
-    ('exp', 'float8_e4m3fn', 'NotImplementedError', '"exp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('exp', 'float32', 'NotImplementedError', '"exp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('exp', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('exp', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('exp', 'float16', 'NotImplementedError', '"exp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sqrt', 'float8_e4m3fn', 'NotImplementedError', '"sqrt_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sqrt', 'float32', 'NotImplementedError', '"sqrt_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sqrt', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('sqrt', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('sqrt', 'float16', 'NotImplementedError', '"sqrt_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sigmoid', 'float8_e4m3fn', 'NotImplementedError', '"sigmoid_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sigmoid', 'float32', 'NotImplementedError', '"sigmoid_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sigmoid', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('sigmoid', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('sigmoid', 'float16', 'NotImplementedError', '"sigmoid_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sign', 'float8_e4m3fn', 'NotImplementedError', '"sign_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sign', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
-    ('sign', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
-    ('sign', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
-    ('sign', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
-    ('add', 'float8_e4m3fn', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('add', 'float32', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('add', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('add', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('add', 'float16', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('add_s', 'float8_e4m3fn', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('add_s', 'float32', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('add_s', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('add_s', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('add_s', 'float16', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('mul', 'float8_e4m3fn', 'NotImplementedError', '"mul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('mul', 'float32', 'NotImplementedError', '"mul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('mul', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('mul', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('mul', 'float16', 'NotImplementedError', '"mul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('div', 'float8_e4m3fn', 'NotImplementedError', '"div_true_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('div', 'float32', 'NotImplementedError', '"div_true_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('div', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('div', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('div', 'float16', 'NotImplementedError', '"div_true_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sub', 'float8_e4m3fn', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sub', 'float32', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sub', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('sub', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('sub', 'float16', 'NotImplementedError', '"ufunc_add_CUDA" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('maximum', 'float8_e4m3fn', 'NotImplementedError', '"max_elementwise_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('maximum', 'float32', 'ok', [1.0, 1.0], (2,)),
-    ('maximum', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('maximum', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('maximum', 'float16', 'ok', [1.0, 1.0], (2,)),
-    ('bitand', 'float8_e4m3fn', 'NotImplementedError', '"bitwise_and_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('bitand', 'float32', 'NotImplementedError', '"bitwise_and_cuda" not implemented for \'Float\'', (2,)),
-    ('bitand', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('bitand', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('bitand', 'float16', 'NotImplementedError', '"bitwise_and_cuda" not implemented for \'Half\'', (2,)),
-    ('copysign', 'float8_e4m3fn', 'NotImplementedError', '"copysign_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('copysign', 'float32', 'NotImplementedError', '"copysign_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('copysign', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('copysign', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('copysign', 'float16', 'NotImplementedError', '"copysign_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('atan2', 'float8_e4m3fn', 'NotImplementedError', '"atan2_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('atan2', 'float32', 'NotImplementedError', '"atan2_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('atan2', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('atan2', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('atan2', 'float16', 'NotImplementedError', '"atan2_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('fmod', 'float8_e4m3fn', 'NotImplementedError', '"fmod_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('fmod', 'float32', 'NotImplementedError', '"fmod_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('fmod', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('fmod', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('fmod', 'float16', 'NotImplementedError', '"fmod_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('addcmul', 'float8_e4m3fn', 'NotImplementedError', '"addcmul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('addcmul', 'float32', 'NotImplementedError', '"addcmul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('addcmul', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('addcmul', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('addcmul', 'float16', 'NotImplementedError', '"addcmul_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('lerp', 'float8_e4m3fn', 'NotImplementedError', '"lerp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('lerp', 'float32', 'NotImplementedError', '"lerp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('lerp', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('lerp', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('lerp', 'float16', 'NotImplementedError', '"lerp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('clamp_s', 'float8_e4m3fn', 'NotImplementedError', '"clamp_scalar_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('clamp_s', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
-    ('clamp_s', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
-    ('clamp_s', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
-    ('clamp_s', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
-    ('clamp_nan', 'float8_e4m3fn', 'ok', [127, 127], (2,)),
-    ('clamp_nan', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
-    ('clamp_nan', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
-    ('clamp_nan', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
-    ('clamp_nan', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
-    ('clamp_min_nan', 'float8_e4m3fn', 'ok', [127, 127], (2,)),
-    ('clamp_min_nan', 'float32', 'RuntimeError', 'Found dtype Float but expected Float8_e4m3fn', (0,)),
-    ('clamp_min_nan', 'int32', 'RuntimeError', 'Found dtype Int but expected Float8_e4m3fn', (0,)),
-    ('clamp_min_nan', 'bool', 'RuntimeError', 'Found dtype Bool but expected Float8_e4m3fn', (0,)),
-    ('clamp_min_nan', 'float16', 'RuntimeError', 'Found dtype Half but expected Float8_e4m3fn', (0,)),
-    ('clamp_t', 'float8_e4m3fn', 'NotImplementedError', '"clamp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('clamp_t', 'float32', 'NotImplementedError', '"clamp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('clamp_t', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('clamp_t', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('clamp_t', 'float16', 'NotImplementedError', '"clamp_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('clamp_tmin', 'float8_e4m3fn', 'NotImplementedError', '"max_elementwise_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('clamp_tmin', 'float32', 'ok', [1.0, 1.0], (2,)),
-    ('clamp_tmin', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('clamp_tmin', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('clamp_tmin', 'float16', 'ok', [1.0, 1.0], (2,)),
-    ('clamp_tmax', 'float8_e4m3fn', 'NotImplementedError', '"min_elementwise_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('clamp_tmax', 'float32', 'ok', [1.0, 1.0], (2,)),
-    ('clamp_tmax', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('clamp_tmax', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('clamp_tmax', 'float16', 'ok', [1.0, 1.0], (2,)),
-    ('pow0', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
-    ('pow0', 'float32', 'ok', [1.0, 1.0], (2,)),
-    ('pow0', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('pow0', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('pow0', 'float16', 'ok', [1.0, 1.0], (2,)),
-    ('pow1', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
-    ('pow1', 'float32', 'ok', [1.0, 1.0], (2,)),
-    ('pow1', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('pow1', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('pow1', 'float16', 'ok', [1.0, 1.0], (2,)),
-    ('pow2', 'float8_e4m3fn', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('pow2', 'float32', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('pow2', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (0,)),
-    ('pow2', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (0,)),
-    ('pow2', 'float16', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('rpow1', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
-    ('rpow1', 'float32', 'ok', [1.0, 1.0], (2,)),
-    ('rpow1', 'int32', 'ok', [1, 1], (2,)),
-    ('rpow1', 'bool', 'ok', [True, True], (2,)),
-    ('rpow1', 'float16', 'ok', [1.0, 1.0], (2,)),
-    ('rpow2', 'float8_e4m3fn', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('rpow2', 'float32', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('rpow2', 'int32', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Int", (2,)),
-    ('rpow2', 'bool', 'RuntimeError', "result type Float8_e4m3fn can't be cast to the desired output type Bool", (2,)),
-    ('rpow2', 'float16', 'NotImplementedError', '"pow_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('sum', 'float8_e4m3fn', 'NotImplementedError', '"sum_cuda" not implemented for \'Float8_e4m3fn\'', ()),
-    ('sum', 'float32', 'ok', 2.0, ()),
-    ('sum', 'float16', 'ok', 2.0, ()),
-    ('eq', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
-    ('eq', 'float32', 'ok', [1.0, 1.0], (2,)),
-    ('eq', 'int32', 'ok', [1, 1], (2,)),
-    ('eq', 'bool', 'ok', [True, True], (2,)),
-    ('eq', 'float16', 'ok', [1.0, 1.0], (2,)),
-    ('ne_s', 'float8_e4m3fn', 'ok', [0, 0], (2,)),
-    ('ne_s', 'float32', 'ok', [0.0, 0.0], (2,)),
-    ('ne_s', 'int32', 'ok', [0, 0], (2,)),
-    ('ne_s', 'bool', 'ok', [False, False], (2,)),
-    ('ne_s', 'float16', 'ok', [0.0, 0.0], (2,)),
-    ('nan_to_num', 'float8_e4m3fn', 'NotImplementedError', '"nan_to_num_cuda" not implemented for \'Float8_e4m3fn\'', (2,)),
-    ('nan_to_num', 'float32', 'RuntimeError', 'nan_to_num: dtype of out: Float should be same as input: Float8_e4m3fn', (0,)),
-    ('nan_to_num', 'int32', 'RuntimeError', 'nan_to_num: dtype of out: Int should be same as input: Float8_e4m3fn', (0,)),
-    ('nan_to_num', 'bool', 'RuntimeError', 'nan_to_num: dtype of out: Bool should be same as input: Float8_e4m3fn', (0,)),
-    ('nan_to_num', 'float16', 'RuntimeError', 'nan_to_num: dtype of out: Half should be same as input: Float8_e4m3fn', (0,)),
-    ('where', 'float8_e4m3fn', 'ok', [56, 56], (2,)),
-    ('where', 'float32', 'RuntimeError', 'Expected out type to be Float8_e4m3fn but got Float', (0,)),
-    ('where', 'int32', 'RuntimeError', 'Expected out type to be Float8_e4m3fn but got Int', (0,)),
-    ('where', 'bool', 'RuntimeError', 'Expected out type to be Float8_e4m3fn but got Bool', (0,)),
-    ('where', 'float16', 'RuntimeError', 'Expected out type to be Float8_e4m3fn but got Half', (0,)),
-]  # fmt: skip
+# TensorIterator's order for an out= of a float8 computation, against stock
+# CUDA: (1) the out dtype check raises RuntimeError with out untouched, (2)
+# out is resized, (3) the kernel dispatch raises NotImplementedError.
+_OUT_ORDER_DTYPES = ["float8_e4m3fn", "float32", "int32", "bool", "float16"]
 
 
 def _out_order_ops(dev):
@@ -2409,22 +2188,19 @@ def _out_order_ops(dev):
     }
 
 
-@pytest.mark.parametrize("case", _OUT_ORDER_CUDA, ids=lambda c: f"{c[0]}-{c[1]}")
-def test_float8_out_order_matches_cuda(mojo_device, case):
-    op, odt, outcome, want, shape = case
-    out = torch.empty(0, dtype=getattr(torch, odt), device=mojo_device)
-    fn = _out_order_ops(mojo_device)[op]
-    if outcome == "ok":
-        fn(out)
-        got = out.view(torch.uint8) if out.dtype in FP8 else out
-        assert got.cpu().tolist() == want
-    else:
-        exc = NotImplementedError if outcome == "NotImplementedError" else RuntimeError
-        with pytest.raises(exc) as info:
-            fn(out)
-        assert type(info.value) is exc
-        assert str(info.value).startswith(want)
-    assert tuple(out.shape) == shape
+@pytest.mark.parametrize("odt", _OUT_ORDER_DTYPES)
+@pytest.mark.parametrize("op", list(_out_order_ops("cpu")))
+def test_float8_out_order_matches_cuda(cuda_oracle: CudaOracle, op, odt):
+    def run(dev: str) -> tuple[str, torch.Tensor]:
+        out = torch.empty(0, dtype=getattr(torch, odt), device=dev)
+        try:
+            _out_order_ops(dev)[op](out)
+        except (RuntimeError, NotImplementedError) as e:
+            return f"{type(e).__name__}: {error_message(e)}", out
+        return "ok", out
+
+    ours, cuda = cuda_oracle.run_by_device(run)
+    assert_bits_equal(ours, cuda)
 
 
 def test_float8_cpu_0d_operands_match_cuda(mojo_device):
@@ -2455,48 +2231,157 @@ def test_float8_cpu_0d_operands_match_cuda(mojo_device):
 
 
 # ---------------------------------------------------------------------------
-# Stock-CUDA fixtures. TensorIterator's pre-dispatch sequence
+# Stock-CUDA parity. TensorIterator's pre-dispatch sequence
 # (tmb/ops/f8_iter.mojo) and the per-op rules around it, case by case
-# against stock CUDA: float8_elementwise_cuda.json holds every unary /
-# binary / comparison / logical op in each float8 situation (float8 self /
-# other / out, 0-d and CPU 0-d operands, fresh / empty / wrong-dtype /
-# partially and internally overlapping outs), one group per op;
-# float8_iter_cuda.json the per-op dtype rules, the backward ops, the
-# activations, ldexp, threshold, rsub / pow / alpha and out= validation,
-# one group per topic (`_ITER_GROUPS`).
+# against stock CUDA on the same GPU (the live oracle,
+# tests/native/cuda_oracle.py): every unary / binary / comparison / logical
+# op in each float8 situation (float8 self / other / out, 0-d and CPU 0-d
+# operands, fresh / empty / wrong-dtype / partially and internally
+# overlapping outs), one group per op (`_ew_cases`); the per-op dtype rules,
+# the backward ops, the activations, ldexp, threshold, rsub / pow / alpha
+# and out= validation, one group per topic (`_ITER_GROUPS`).
 #
-# Both files are what the generators below produce on stock CUDA torch
-# (2.11, H100), as
-#   "cases": {group: {case id: outcome}}. A case id names the op, its
-#     variant, operands, scalars and out= ("rsub/x8/S2/alpha=1",
-#     "threshold_backward/fn/f8_0d,f32"). An outcome is the result,
-#     {"dtype", "shape", "values"} ("bytes", the bit patterns, for a float8
-#     result; a non-finite float as "nan" / "inf" / "-inf", a complex as
-#     [re, im]), or the error, {"error", "message"} (its first line, cut
-#     short), plus what else the case records: "out", the out= tensor's
-#     dtype and shape after the call (for out_validation, also where its
-#     storage lives, "host" / "dev", and the tensor it is a view of), and
-#     "mutated", a watched input that changed, as it ended.
-#   "known_differences": {case id: {"mojo": outcome, "reason": why}}, where
+# A case id names the op, its variant, operands, scalars and out=
+# ("rsub/x8/S2/alpha=1", "threshold_backward/fn/f8_0d,f32"). An outcome is
+# the result, {"dtype", "shape", "values"} ("bytes", the bit patterns, for a
+# float8 result; a non-finite float as "nan" / "inf" / "-inf", a complex as
+# [re, im]), or the error, {"error", "message"} (its first line, cut short),
+# plus what else the case records: "out", the out= tensor's dtype and shape
+# after the call (for out_validation, also where its storage lives, "host" /
+# "dev", and the tensor it is a view of), and "mutated", a watched input that
+# changed, as it ended. Each test builds one group on both devices and
+# asserts that the dict of mismatching case ids, {id: {"got": ..., "want":
+# ...}}, is empty, except for:
+#   `_KNOWN_DIFFERENCES` {case id: {"mojo": outcome, "reason": why}}, where
 #     the mojo device differs from stock CUDA for a reason that is not
 #     float8's (each reproduces with float32 operands); the mojo device is
 #     held to the recorded mojo outcome there.
-#   "torch_2_14_overrides": {case id: outcome}, where torch 2.14's source
+#   `_TORCH_2_14_OVERRIDES` {case id: outcome}, where torch 2.14's source
 #     changes what the installed 2.11 prints; the mojo device follows 2.14.
-# Each test builds one group on the mojo device and asserts that the dict of
-# mismatching case ids, {id: {"got": ..., "want": ...}}, is empty.
-#
-# To rewrite both files from stock CUDA torch (the "cases" only: the other
-# two sections are kept as they are), on a machine with an NVIDIA GPU:
-#   uv run python -c "from tests.native.test_float8 import write_float8_cuda_json; write_float8_cuda_json()"
-# The *_regenerates_on_stock_cuda tests check that the files still match.
+# An entry of either that CUDA's outcome already matches is stale and fails.
 # ---------------------------------------------------------------------------
 
 # a case's outcome, and a group's cases, as JSON
 Outcome = dict[str, Any]
 Cases = dict[str, Outcome]
-_EW_JSON = pathlib.Path(__file__).parent / "float8_elementwise_cuda.json"
-_ITER_JSON = pathlib.Path(__file__).parent / "float8_iter_cuda.json"
+_KNOWN_DIFFERENCES: dict[str, dict[str, Any]] = {
+    "nextafter/fn/f8_cpu0d8": {
+        "mojo": {
+            "error": "NotImplementedError",
+            "message": "\"nextafter_cuda\" not implemented for 'Float8_e4m3fn'",
+        },
+        "reason": "stock CUDA's dispatcher wrapper rejects a CPU operand of this op first (float32 too); the mojo device has no such check and refuses float8",
+    },
+    "logaddexp/fn/f8_cpu0d8": {
+        "mojo": {
+            "error": "NotImplementedError",
+            "message": "\"logaddexp_cuda\" not implemented for 'Float8_e4m3fn'",
+        },
+        "reason": "stock CUDA's dispatcher wrapper rejects a CPU operand of this op first (float32 too); the mojo device has no such check and refuses float8",
+    },
+    "logaddexp2/fn/f8_cpu0d8": {
+        "mojo": {
+            "error": "NotImplementedError",
+            "message": "\"logaddexp2_cuda\" not implemented for 'Float8_e4m3fn'",
+        },
+        "reason": "stock CUDA's dispatcher wrapper rejects a CPU operand of this op first (float32 too); the mojo device has no such check and refuses float8",
+    },
+    "igamma/fn/f8_cpu0d8": {
+        "mojo": {
+            "error": "NotImplementedError",
+            "message": "\"igamma_cuda\" not implemented for 'Float8_e4m3fn'",
+        },
+        "reason": "stock CUDA's dispatcher wrapper rejects a CPU operand of this op first (float32 too); the mojo device has no such check and refuses float8",
+    },
+    "sigmoid_backward/out/f32,f32/int32": {
+        "mojo": {
+            "error": "RuntimeError",
+            "message": "aten::mul: result type Float can't be cast to the desired output type Int",
+            "out": {"dtype": "int32", "shape": [0]},
+        },
+        "reason": "the decomposed backward op's cast error carries the decomposition's 'aten::mul:' prefix on the mojo device",
+    },
+    "tanh_backward/out/f32,f32/int32": {
+        "mojo": {
+            "error": "RuntimeError",
+            "message": "aten::mul: result type Float can't be cast to the desired output type Int",
+            "out": {"dtype": "int32", "shape": [0]},
+        },
+        "reason": "the decomposed backward op's cast error carries the decomposition's 'aten::mul:' prefix on the mojo device",
+    },
+    "silu/out/cpu/f8": {
+        "mojo": {
+            "error": "RuntimeError",
+            "message": "Expected all tensors to be on the same device, but found at least two devices, DEV and cpu!",
+            "out": {"dtype": "float8_e4m3fn", "shape": [0]},
+        },
+        "reason": "a CPU out=: stock CUDA's dispatcher wrapper names the operand; the mojo device reports TensorIterator's generic two-device error",
+    },
+    "mish/out/cpu/f8": {
+        "mojo": {
+            "error": "RuntimeError",
+            "message": "Expected all tensors to be on the same device, but found at least two devices, DEV and cpu!",
+            "out": {"dtype": "float8_e4m3fn", "shape": [0]},
+        },
+        "reason": "a CPU out=: stock CUDA's dispatcher wrapper names the operand; the mojo device reports TensorIterator's generic two-device error",
+    },
+    "glu/out/cpu/f8": {
+        "mojo": {
+            "error": "RuntimeError",
+            "message": "Expected all tensors to be on the same device, but found at least two devices, DEV and cpu!",
+            "out": {"dtype": "float8_e4m3fn", "shape": [0]},
+        },
+        "reason": "a CPU out=: stock CUDA's dispatcher wrapper names the operand; the mojo device reports TensorIterator's generic two-device error",
+    },
+    "hardtanh_backward/cpu0d_f8,f8": {
+        "mojo": {
+            "error": "NotImplementedError",
+            "message": "\"hardtanh_backward_cuda\" not implemented for 'Float8_e4m3fn'",
+        },
+        "reason": "stock CUDA's dispatcher wrapper rejects a CPU operand of this op first (float32 too); the mojo device has no such check and refuses float8",
+    },
+    "softshrink_backward/cpu0d_f8,f8": {
+        "mojo": {
+            "error": "NotImplementedError",
+            "message": "\"shrink_backward_cuda\" not implemented for 'Float8_e4m3fn'",
+        },
+        "reason": "stock CUDA's dispatcher wrapper rejects a CPU operand of this op first (float32 too); the mojo device has no such check and refuses float8",
+    },
+    "logaddexp/f8,cpu0d_f8": {
+        "mojo": {
+            "error": "NotImplementedError",
+            "message": "\"logaddexp_cuda\" not implemented for 'Float8_e4m3fn'",
+        },
+        "reason": "stock CUDA's dispatcher wrapper rejects a CPU operand of this op first (float32 too); the mojo device has no such check and refuses float8",
+    },
+}
+_TORCH_2_14_OVERRIDES: Cases = {
+    "ldexp/f8,i32/out=float32": {
+        "error": "RuntimeError",
+        "message": "Promotion for Float8 Types is not supported, attempted to promote Int and Float8_e4m3fn",
+        "out": {"dtype": "float32", "shape": [0]},
+    },
+    "ldexp/f8,i64/out=float32": {
+        "error": "RuntimeError",
+        "message": "Promotion for Float8 Types is not supported, attempted to promote Long and Float8_e4m3fn",
+        "out": {"dtype": "float32", "shape": [0]},
+    },
+    "ldexp/f8,bool/out=float32": {
+        "error": "RuntimeError",
+        "message": "Promotion for Float8 Types is not supported, attempted to promote Bool and Float8_e4m3fn",
+        "out": {"dtype": "float32", "shape": [0]},
+    },
+    "ldexp/f8,i32/out=float16": {
+        "error": "RuntimeError",
+        "message": "Promotion for Float8 Types is not supported, attempted to promote Int and Float8_e4m3fn",
+        "out": {"dtype": "float16", "shape": [0]},
+    },
+    "ldexp/e5,i32/out=float8_e4m3fn": {
+        "error": "RuntimeError",
+        "message": "Promotion for Float8 Types is not supported, attempted to promote Int and Float8_e5m2",
+        "out": {"dtype": "float8_e4m3fn", "shape": [0]},
+    },
+}
 _EW_UNARY = (
     "abs", "neg", "sign", "exp", "exp2", "expm1", "log", "log2", "log10", "log1p",
     "sqrt", "rsqrt", "sin", "cos", "tan", "sinh", "cosh", "tanh", "asin", "acos",
@@ -2581,16 +2466,15 @@ def _collect(pairs) -> Cases:
 _FLOAT_LIT = re.compile(r"-?\d+\.\d+(?:e[+-]?\d+)?|-?\d+e[+-]?\d+")
 
 
-def _hw_free(v):
+def _ulp_free(v):
     """An outcome with its non-float8 float values (and the float literals of
     its messages) rounded to 5 significant digits and signed zeros folded:
-    transcendental results (and the sign of a zero computed as a difference)
-    may differ in the last ulp between GPU generations (H100 vs L4). float8
-    values compare exactly, as bytes."""
+    these groups pin float8 dispatch, not the last ulp of float32 math (the
+    bit-exact tests do). float8 values compare exactly, as bytes."""
     if isinstance(v, dict):
-        return {k: _hw_free(x) for k, x in v.items()}
+        return {k: _ulp_free(x) for k, x in v.items()}
     if isinstance(v, list):
-        return [_hw_free(x) for x in v]
+        return [_ulp_free(x) for x in v]
     if isinstance(v, float):
         return float(format(v + 0.0, ".5g"))
     if isinstance(v, str):
@@ -2598,58 +2482,26 @@ def _hw_free(v):
     return v
 
 
-_NO_F64 = "float64 is not supported on Apple GPU"
-
-
-def _metal_lacks_f64(device: str | None, got: Outcome, want: Outcome) -> bool:
-    """A case whose stock CUDA outcome is a float64 tensor (or names
-    float64), declined on an Apple GPU for want of float64 (an explicit
-    capability decline, not a difference)."""
-    return (
-        device is not None
-        and is_metal(device)
-        and _NO_F64 in got.get("message", "")
-        and (want.get("dtype") == "float64" or "float64" in want.get("message", ""))
-    )
-
-
-def _mismatches(
-    got: Cases, want: Cases, fixture: dict[str, Any], device: str | None = None
-) -> dict[str, dict[str, Outcome]]:
+def _mismatches(got: Cases, want: Cases) -> dict[str, dict[str, Outcome]]:
     """{case id: {"got", "want"}} for every case of `got` (the mojo device)
-    that differs from `want` (stock CUDA), with the fixture's known
-    differences and torch-2.14 overrides applied. Neither may be empty: a
-    generator that yields nothing must not pass."""
+    that differs from `want` (stock CUDA), with the known differences and
+    torch-2.14 overrides applied (one CUDA already matches is reported as
+    stale). Neither may be empty: a generator that yields nothing must not
+    pass."""
     assert want, "an empty group compares nothing"
     assert list(got) == list(want)
-    known = fixture.get("known_differences", {})
-    v214 = fixture.get("torch_2_14_overrides", {})
     bad = {}
     for key, w in want.items():
-        w = known[key]["mojo"] if key in known else v214.get(key, w)
-        g = got[key]
-        if not _metal_lacks_f64(device, g, w) and _hw_free(g) != _hw_free(w):
-            bad[key] = {"got": g, "want": w}
+        if key in _KNOWN_DIFFERENCES or key in _TORCH_2_14_OVERRIDES:
+            fixed = _KNOWN_DIFFERENCES.get(key, {}).get("mojo")
+            fixed = _TORCH_2_14_OVERRIDES.get(key, fixed)
+            if _ulp_free(fixed) == _ulp_free(w):
+                bad[key] = {"stale exception": fixed, "want": w}
+                continue
+            w = fixed
+        if _ulp_free(got[key]) != _ulp_free(w):
+            bad[key] = {"got": got[key], "want": w}
     return bad
-
-
-def _regenerated_mismatches(got: Cases, want: Cases) -> dict[str, dict[str, Outcome]]:
-    """{case id: {"got", "want"}} for every case stock CUDA (`got`) no longer
-    produces as recorded (`want`), up to the last-ulp rounding of
-    `_hw_free` (the recording is an H100's; CI's GPUs are L4s). Neither may
-    be empty."""
-    assert got, "the generator yields no case"
-    assert list(got) == list(want)
-    return {
-        key: {"got": got[key], "want": w}
-        for key, w in want.items()
-        if _hw_free(got[key]) != _hw_free(w)
-    }
-
-
-@functools.cache
-def _fixture(path: pathlib.Path) -> dict[str, Any]:
-    return json.loads(path.read_text())
 
 
 def _ew_unary(name, dev):
@@ -2717,10 +2569,9 @@ def _ew_cases(op: str, dev: str) -> Cases:
 
 
 @pytest.mark.parametrize("op", _EW_UNARY + _EW_BINARY)
-def test_float8_elementwise_matches_stock_cuda(mojo_device, op):
-    fixture = _fixture(_EW_JSON)
-    want = fixture["cases"][op]
-    assert _mismatches(_ew_cases(op, mojo_device), want, fixture, mojo_device) == {}
+def test_float8_elementwise_matches_stock_cuda(cuda_oracle: CudaOracle, op):
+    got = _ew_cases(op, cuda_oracle.mojo)
+    assert _mismatches(got, _ew_cases(op, cuda_oracle.cuda)) == {}
 
 
 def _out_dtype_dispatch_cases(dev):
@@ -4329,8 +4180,7 @@ def _alpha_conversion_cases(dev):
         )
 
 
-# float8_iter_cuda.json's groups, by topic: each is one test on the mojo
-# device and one regeneration check on stock CUDA.
+# The iterator groups, by topic: each is one test against stock CUDA.
 _ITER_GROUPS = {
     "operand_dtype_rules": _operand_dtype_rule_cases,
     "out_dtype_dispatch": _out_dtype_dispatch_cases,
@@ -4351,91 +4201,20 @@ _ITER_GROUPS = {
 
 
 @pytest.mark.parametrize("group", list(_ITER_GROUPS))
-def test_float8_iter_matches_stock_cuda(mojo_device, group):
-    fixture = _fixture(_ITER_JSON)
-    got = _collect(_ITER_GROUPS[group](mojo_device))
-    assert _mismatches(got, fixture["cases"][group], fixture, mojo_device) == {}
+def test_float8_iter_matches_stock_cuda(cuda_oracle: CudaOracle, group):
+    got = _collect(_ITER_GROUPS[group](cuda_oracle.mojo))
+    want = _collect(_ITER_GROUPS[group](cuda_oracle.cuda))
+    assert _mismatches(got, want) == {}
 
 
-def test_float8_cuda_fixtures_are_consistent():
-    """The fixture files hold exactly the generators' groups, none empty,
-    every case id once across a file, and every known difference / torch-2.14 override
-    names a recorded case it really changes."""
-    for path, groups in (
-        (_EW_JSON, _EW_UNARY + _EW_BINARY),
-        (_ITER_JSON, tuple(_ITER_GROUPS)),
-    ):
-        fixture = _fixture(path)
-        assert tuple(fixture["cases"]) == groups
-        recorded = {}
-        for group, cases in fixture["cases"].items():
-            assert cases, f"{group} records no case"
-            assert not recorded.keys() & cases.keys()
-            recorded.update(cases)
-        for key, known in fixture.get("known_differences", {}).items():
-            assert set(known) == {"mojo", "reason"}
-            assert _hw_free(known["mojo"]) != _hw_free(recorded[key]), key
-        for key, outcome in fixture.get("torch_2_14_overrides", {}).items():
-            assert _hw_free(outcome) != _hw_free(recorded[key]), key
-
-
-@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
-def test_float8_elementwise_data_regenerates_on_stock_cuda():
-    """float8_elementwise_cuda.json is what its generators produce on stock
-    CUDA (torch.cuda), so the comparisons above test against the real
-    thing."""
-    require_stock_cuda()
-    recorded = _fixture(_EW_JSON)["cases"]
-    bad = {}
-    for op, want in recorded.items():
-        bad.update(_regenerated_mismatches(_ew_cases(op, "cuda"), want))
-    assert bad == {}
-
-
-@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
-@pytest.mark.parametrize("group", list(_ITER_GROUPS))
-def test_float8_iter_data_regenerates_on_stock_cuda(group):
-    require_stock_cuda()
-    got = _collect(_ITER_GROUPS[group]("cuda"))
-    want = _fixture(_ITER_JSON)["cases"][group]
-    assert _regenerated_mismatches(got, want) == {}
-
-
-def _json_block(obj, levels: int, indent: str = "") -> str:
-    """`obj` as JSON with its first `levels` levels of keys one per line and
-    everything below on that line, so a diff names the cases it changes."""
-    if levels == 0 or not isinstance(obj, dict) or not obj:
-        return json.dumps(obj)
-    inner = indent + " "
-    items = [
-        f"{inner}{json.dumps(k)}: {_json_block(v, levels - 1, inner)}"
-        for k, v in obj.items()
-    ]
-    return "{\n" + ",\n".join(items) + "\n" + indent + "}"
-
-
-def write_float8_cuda_json():
-    """Rewrite the "cases" of float8_elementwise_cuda.json and
-    float8_iter_cuda.json from stock CUDA torch (see "Stock-CUDA fixtures"
-    above), keeping their known differences and torch-2.14 overrides."""
-    assert torch.cuda.is_available() and torch.version.cuda, "needs stock CUDA torch"
-    for path, groups in (
-        (
-            _EW_JSON,
-            {op: functools.partial(_ew_cases, op) for op in _EW_UNARY + _EW_BINARY},
-        ),
-        (
-            _ITER_JSON,
-            {g: lambda dev, g=g: _collect(_ITER_GROUPS[g](dev)) for g in _ITER_GROUPS},
-        ),
-    ):
-        old = json.loads(path.read_text()) if path.exists() else {}
-        fixture = {k: v for k, v in old.items() if k != "cases"}
-        fixture["cases"] = {group: gen("cuda") for group, gen in groups.items()}
-        levels = {"cases": 2}
-        body = ",\n".join(
-            f" {json.dumps(k)}: {_json_block(v, levels.get(k, 1), ' ')}"
-            for k, v in fixture.items()
-        )
-        path.write_text("{\n" + body + "\n}\n")
-        _fixture.cache_clear()
+def test_float8_exceptions_name_real_cases():
+    """Every known difference and torch-2.14 override names a case some
+    generator yields (on the CPU: only the ids are read)."""
+    ids = set()
+    for op in _EW_UNARY + _EW_BINARY:
+        ids.update(_ew_cases(op, "cpu"))
+    for gen in _ITER_GROUPS.values():
+        ids.update(_collect(gen("cpu")))
+    for key, known in _KNOWN_DIFFERENCES.items():
+        assert set(known) == {"mojo", "reason"}, key
+    assert set(_KNOWN_DIFFERENCES) | set(_TORCH_2_14_OVERRIDES) <= ids
