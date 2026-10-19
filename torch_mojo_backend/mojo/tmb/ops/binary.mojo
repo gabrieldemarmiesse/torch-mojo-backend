@@ -636,8 +636,17 @@ def _one_device(a: T, b: T) raises:
         raise Error("expected every operand on the same mojo device")
 
 
-def _b_binary_spec(op: StaticString, a: T, b: T, dst: T) raises:
-    """logic broadcast binary into a caller-allocated contiguous output."""
+def _b_binary_spec(
+    op: StaticString,
+    a: T,
+    b: T,
+    dst: T,
+    alpha: Float64 = 1.0,
+    scalar_side: Int = 0,
+) raises:
+    """logic broadcast binary into a caller-allocated contiguous output.
+    `alpha` is add / sub's for float dtypes; `scalar_side` 1 / 2: `a` / `b`
+    holds a CPU scalar (stock CUDA returns its float64 NaN first)."""
     _one_device(a, dst)
     _one_device(b, dst)
     var ctx = ctx_for(dst.device)
@@ -649,12 +658,18 @@ def _b_binary_spec(op: StaticString, a: T, b: T, dst: T) raises:
     call.spec(a.spec(cp))
     call.spec(b.spec(cp))
     call.spec(dst.spec(cp))
+    if alpha != 1.0 or scalar_side != 0:
+        call.f64(alpha)
+        call.int(scalar_side)
     call.run()
     _ = ctx
 
 
-def _b_scalar_spec(op: StaticString, a: T, value: Float64, dst: T) raises:
-    """elementwise contiguous tensor-with-float-scalar."""
+def _b_scalar_spec(
+    op: StaticString, a: T, value: Float64, dst: T, alpha: Float64 = 1.0
+) raises:
+    """elementwise contiguous tensor-with-float-scalar (`alpha`: add's and
+    rsub's, see `_scalar_elementwise`)."""
     _one_device(a, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
@@ -664,6 +679,8 @@ def _b_scalar_spec(op: StaticString, a: T, value: Float64, dst: T) raises:
     call.spec(a.spec(cp))
     call.f64(value)
     call.spec(dst.spec(cp))
+    if alpha != 1.0:
+        call.f64(alpha)
     call.run()
     _ = ctx
 
@@ -683,7 +700,9 @@ def _b_int_scalar_spec(op: StaticString, a: T, value: Int, dst: T) raises:
     _ = ctx
 
 
-def _b_scalar_inplace(op: StaticString, a: T, value: Float64) raises:
+def _b_scalar_inplace(
+    op: StaticString, a: T, value: Float64, alpha: Float64 = 1.0
+) raises:
     """`a op= scalar`: no output buffer, no copy back."""
     var ctx = ctx_for(a.device)
     var cp = ctx_ptr(ctx)
@@ -692,6 +711,8 @@ def _b_scalar_inplace(op: StaticString, a: T, value: Float64) raises:
     call.out_dtype(a.dtype)
     call.spec(a.spec(cp))
     call.f64(value)
+    if alpha != 1.0:
+        call.f64(alpha)
     call.run()
     _ = ctx
 
@@ -1076,6 +1097,7 @@ def _b_binary(
     rhs: Side,
     out_stype: Int32,
     dst: Optional[T],
+    alpha: Float64 = 1.0,
 ) raises -> Res:
     """The old `_try_spec_binary`: promotion, scalar embedding, rank>4
     pre-materialization, output allocation and one logic launch.
@@ -1092,6 +1114,7 @@ def _b_binary(
     var b_h: Held
     var device: Int
     var dtype: Int32
+    var scalar_side = 0 if lhs.is_t and rhs.is_t else (2 if lhs.is_t else 1)
     if lhs.is_t and rhs.is_t:
         var a = lhs.t.value().copy()
         var b = rhs.t.value().copy()
@@ -1148,19 +1171,24 @@ def _b_binary(
         ):
             # Nothing broadcast and everything dense: writing out[i] from
             # a[i]/b[i] stays exact even when `out` aliases an operand.
-            _b_binary_spec(kop, a_h.t, b_h.t, o)
+            _b_binary_spec(kop, a_h.t, b_h.t, o, alpha, scalar_side)
             _ = a_h
             _ = b_h
             return Res(o^, False)
     var out = own(new_tensor(shape, rank, result_stype, device))
-    _b_binary_spec(kop, a_h.t, b_h.t, out.t)
+    _b_binary_spec(kop, a_h.t, b_h.t, out.t, alpha, scalar_side)
     _ = a_h
     _ = b_h
     return Res(out.take(), True)
 
 
 def _b_try_scalar(
-    op: StaticString, lhs: Side, rhs: Side, negate: Bool, dst: Optional[T]
+    op: StaticString,
+    lhs: Side,
+    rhs: Side,
+    negate: Bool,
+    dst: Optional[T],
+    alpha: Float64 = 1.0,
 ) raises -> Optional[Res]:
     """The old `_try_spec_scalar`: contiguous float tensor with a numeric
     scalar in one elementwise launch.
@@ -1194,11 +1222,11 @@ def _b_try_scalar(
             and d.device == src.t.device
             and d.same_shape(src.t)
         ):
-            _b_scalar_spec(op, src.t, value, d)
+            _b_scalar_spec(op, src.t, value, d, alpha)
             _ = src
             return Res(d^, False)
     var out = own(new_like(src.t))
-    _b_scalar_spec(op, src.t, value, out.t)
+    _b_scalar_spec(op, src.t, value, out.t, alpha)
     _ = src
     return Res(out.take(), True)
 
@@ -1592,17 +1620,22 @@ def _b_self(v: Value, what: StaticString) raises -> T:
 # ---------------------------------------------------------------------------
 
 
-def _b_add_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
-    var r = _b_try_add_f32_bf16(lhs, rhs)
+def _b_add_routes(
+    lhs: Side, rhs: Side, dst: Optional[T], alpha: Float64 = 1.0
+) raises -> Res:
+    """`alpha` only for a floating result (the kernels' fma)."""
+    if alpha == 1.0:
+        var r = _b_try_add_f32_bf16(lhs, rhs)
+        if r.__bool__():
+            return r.value().copy()
+    var r = _b_try_scalar("AddScalarSpec", lhs, rhs, False, dst, alpha)
     if r.__bool__():
         return r.value().copy()
-    r = _b_try_scalar("AddScalarSpec", lhs, rhs, False, dst)
-    if r.__bool__():
-        return r.value().copy()
-    r = _b_try_int_scalar("AddScalarIntSpec", lhs, rhs, False)
-    if r.__bool__():
-        return r.value().copy()
-    return _b_binary("AddSpec", lhs, rhs, Int32(-1), dst)
+    if alpha == 1.0:
+        r = _b_try_int_scalar("AddScalarIntSpec", lhs, rhs, False)
+        if r.__bool__():
+            return r.value().copy()
+    return _b_binary("AddSpec", lhs, rhs, Int32(-1), dst, alpha)
 
 
 def _b_common(lhs: Side, rhs: Side) raises -> Int32:
@@ -1738,6 +1771,10 @@ def _b_add(
         var metal = _b_try_apple_add(lhs, rhs, alpha)
         if metal.__bool__():
             return metal.value().copy()
+    if _b_is_floating(common):
+        # CUDA's add takes alpha into its kernel, converted straight to
+        # opmath: one fma.
+        return _b_add_routes(lhs, rhs, dst, v_f64(alpha_v))
     if alpha == 1.0:
         return _b_add_routes(lhs, rhs, dst)
     if not rhs.is_t:
@@ -1768,15 +1805,18 @@ def _b_scale_promoted(
     return _b_scale(promoted.t, alpha, alpha_i)
 
 
-def _b_sub_routes(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
+def _b_sub_routes(
+    lhs: Side, rhs: Side, dst: Optional[T], alpha: Float64 = 1.0
+) raises -> Res:
     # sub-by-scalar reuses the AddScalar specs with a negated scalar.
-    var r = _b_try_scalar("AddScalarSpec", lhs, rhs, True, dst)
+    var r = _b_try_scalar("AddScalarSpec", lhs, rhs, True, dst, alpha)
     if r.__bool__():
         return r.value().copy()
-    r = _b_try_int_scalar("AddScalarIntSpec", lhs, rhs, True)
-    if r.__bool__():
-        return r.value().copy()
-    return _b_binary("SubSpec", lhs, rhs, Int32(-1), dst)
+    if alpha == 1.0:
+        r = _b_try_int_scalar("AddScalarIntSpec", lhs, rhs, True)
+        if r.__bool__():
+            return r.value().copy()
+    return _b_binary("SubSpec", lhs, rhs, Int32(-1), dst, alpha)
 
 
 def _b_sub(
@@ -1791,6 +1831,9 @@ def _b_sub(
     var pro = _b_alpha_prologue(lhs, rhs, alpha_in, out_st, True)
     var common = pro[0]
     var alpha_v = pro[1].copy()
+    if _b_is_floating(common):
+        # CUDA's sub is its add kernel with -alpha: one fma in opmath.
+        return _b_sub_routes(lhs, rhs, dst, v_f64(alpha_v))
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     if alpha == 1.0:
         return _b_sub_routes(lhs, rhs, dst)
@@ -1898,6 +1941,7 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             and self.stype == b.stype
             and self.device == b.device
             and _b_bcast_dtype(self.stype)
+            and self.stype != ST_FLOAT64  # elementwise `Add` has none
             and _b_fits(self, b.shape)
         ):
             _b_raw_add(self, self, b)
@@ -1911,7 +1955,7 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # no output buffer and no copy back.
         var s = rhs.s.value().copy()
         if not s.is_bool:
-            _b_scalar_inplace("AddScalarInplace", self, s.f * alpha)
+            _b_scalar_inplace("AddScalarInplace", self, s.f, alpha)
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
@@ -1983,7 +2027,7 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not rhs.is_t and self.contig and _b_float3(self.stype):
         var s = rhs.s.value().copy()
         if not s.is_bool:
-            _b_scalar_inplace("AddScalarInplace", self, -(s.f * alpha))
+            _b_scalar_inplace("AddScalarInplace", self, -s.f, alpha)
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
@@ -2028,12 +2072,16 @@ def op_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     is this (the scalar form embeds `other` in the one sub launch)."""
     var lhs = _b_side(args[unsafe_offset=1])
     var rhs = _b_side(args[unsafe_offset=0])
-    if v_f64(args[unsafe_offset=2]) == 1.0:
-        # `other - self` for a float tensor and a number: one launch.
-        var fast = _b_try_scalar("RsubScalarSpec", rhs, lhs, False, None)
-        if fast.__bool__():
-            _b_ret(rets, fast.value().copy())
-            return
+    if not _b_alpha_is_one(args[unsafe_offset=2]):
+        _b_sub_check(lhs, rhs)
+        _ = _b_alpha_prologue(lhs, rhs, args[unsafe_offset=2], -1, True)
+    # `other - alpha * self` for a float tensor and a number: one launch.
+    var fast = _b_try_scalar(
+        "RsubScalarSpec", rhs, lhs, False, None, v_f64(args[unsafe_offset=2])
+    )
+    if fast.__bool__():
+        _b_ret(rets, fast.value().copy())
+        return
     var promoted = _rsub_promote(lhs, rhs)
     if promoted:
         rhs = _b_tside(promoted.value())
