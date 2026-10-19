@@ -70,6 +70,7 @@ from tmb.backend.abi import (
     v_tensor,
     view_strided,
     is_floating,
+    v_bool_list,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall, loader
@@ -3559,16 +3560,6 @@ def _linear_general(
 # --- aten::linear_backward ----------------------------------------------------
 
 
-def _bool_list(v: Value) raises -> List[Bool]:
-    if v.tag != TAG_BOOL_LIST:
-        raise Error("expected a bool[] argument, got record tag ", v.tag)
-    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
-    var out = List[Bool](capacity=Int(v.len))
-    for i in range(Int(v.len)):
-        out.append(p[unsafe_offset=i] != 0)
-    return out^
-
-
 def _sum_dims(a: T, dims: List[Int], out_len: Int) raises -> T:
     """`a.sum(dims)` of a contiguous matrix into a fresh 1-D tensor of the
     one dim left: `[0]` (a leading reduce interval) or `[1]` (trailing), both
@@ -3613,7 +3604,7 @@ def op_linear_backward(
     var input = v_tensor(args[unsafe_offset=0])
     var grad = v_tensor(args[unsafe_offset=1])
     var w = v_tensor(args[unsafe_offset=2])
-    var mask = _bool_list(args[unsafe_offset=3])
+    var mask = v_bool_list(args[unsafe_offset=3])
     if (
         len(mask) != 3
         or input.rank < 1
@@ -4955,7 +4946,7 @@ def op_convolution_backward(
     var grad = v_tensor(args[unsafe_offset=0])
     var input = v_tensor(args[unsafe_offset=1])
     var weight = v_tensor(args[unsafe_offset=2])
-    var mask = _bool_list(args[unsafe_offset=10])
+    var mask = v_bool_list(args[unsafe_offset=10])
     if len(mask) != 3:
         raise Error("convolution_backward: output_mask must have 3 entries")
     var p = _conv_args(
@@ -5495,7 +5486,7 @@ def _slow_conv2d_grads(
 def op_slow_conv2d_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var mask = _bool_list(args[unsafe_offset=6])
+    var mask = v_bool_list(args[unsafe_offset=6])
     if len(mask) != 3:
         raise Error("_slow_conv2d_backward: output_mask must have 3 entries")
     var input = v_tensor(args[unsafe_offset=1])

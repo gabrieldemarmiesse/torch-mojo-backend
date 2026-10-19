@@ -56,6 +56,7 @@ from tmb.backend.abi import (
     v_is_none,
     v_tensor,
     view_strided,
+    v_bool_list,
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.device import (
@@ -541,19 +542,6 @@ def _sum_dims(x: Owned, dims: List[Int64], keepdim: Bool) raises -> Owned:
     )
 
 
-def _bool_list(v: Value) raises -> List[Bool]:
-    """A borrowed `bool[]` argument (uint8 per element in the call arena)."""
-    var out = List[Bool]()
-    if v.tag == TAG_NONE:
-        return out^
-    if v.tag != TAG_BOOL_LIST:
-        raise Error("expected a bool[] argument, got record tag ", v.tag)
-    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
-    for i in range(Int(v.len)):
-        out.append(p[unsafe_offset=i] != 0)
-    return out^
-
-
 def _empty_result(stype: Int32, device: Int) raises -> Owned:
     """The 0-element stand-in this ABI returns for a gradient autograd did
     not ask for; the same convention `native_layer_norm_backward` uses (there
@@ -858,7 +846,7 @@ def op_native_batch_norm_backward(
     var a = v_tensor(args[unsafe_offset=1])
     var train = v_bool(args[unsafe_offset=7])
     var eps = v_f64(args[unsafe_offset=8])
-    var mask = _bool_list(args[unsafe_offset=9])
+    var mask = v_bool_list(args[unsafe_offset=9])
     if len(mask) != 3:
         raise Error(
             "native_batch_norm_backward: output_mask must have 3 entries"
@@ -1019,7 +1007,7 @@ def op_native_group_norm_backward(
     var c = v_int(args[unsafe_offset=6])
     var hxw = v_int(args[unsafe_offset=7])
     var group = v_int(args[unsafe_offset=8])
-    var mask = _bool_list(args[unsafe_offset=9])
+    var mask = v_bool_list(args[unsafe_offset=9])
     if len(mask) != 3:
         raise Error(
             "native_group_norm_backward: output_mask must have 3 entries"

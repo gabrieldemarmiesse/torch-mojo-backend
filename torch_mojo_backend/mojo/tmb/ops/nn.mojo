@@ -58,6 +58,7 @@ from tmb.backend.abi import (
     v_int,
     v_is_none,
     v_tensor,
+    v_bool_list,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
@@ -103,19 +104,6 @@ def _swapped(
     out[pa] = src[pb]
     out[pb] = src[pa]
     return out
-
-
-def _bool_list(v: Value) raises -> List[Bool]:
-    """A borrowed `bool[]` argument (uint8 per element in the call arena)."""
-    var out = List[Bool]()
-    if v.tag == TAG_NONE:
-        return out^
-    if v.tag != TAG_BOOL_LIST:
-        raise Error("expected a bool[] argument, got record tag ", v.tag)
-    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
-    for i in range(Int(v.len)):
-        out.append(p[unsafe_offset=i] != 0)
-    return out^
 
 
 struct Held(Movable):
@@ -920,7 +908,7 @@ def op_native_layer_norm_backward(
     var saved_rstd = v_tensor(args[unsafe_offset=4])
     var has_w = not v_is_none(args[unsafe_offset=5])
     var has_b = not v_is_none(args[unsafe_offset=6])
-    var mask = _bool_list(args[unsafe_offset=7])
+    var mask = v_bool_list(args[unsafe_offset=7])
     if len(mask) != 3:
         raise Error(
             "native_layer_norm_backward: output_mask must have 3 entries"

@@ -44,6 +44,7 @@ from tmb.backend.abi import (
     v_int,
     v_is_none,
     v_tensor,
+    v_bool_list,
 )
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
@@ -69,7 +70,6 @@ from tmb.ops.loss import (
     _same_device,
 )
 from tmb.ops.nn import (
-    _bool_list,
     op_batch_norm_legit_no_training,
     op_native_batch_norm,
 )
@@ -235,7 +235,7 @@ def op_batch_norm_backward(
         forward_args(args, 10),
         3,
     )
-    var mask = _bool_list(args[unsafe_offset=9])
+    var mask = v_bool_list(args[unsafe_offset=9])
     for i in range(3):
         if i >= len(mask) or not mask[i] or r[i].tag != TAG_TENSOR:
             # An unrequested gradient is undefined, as on CUDA's native route.

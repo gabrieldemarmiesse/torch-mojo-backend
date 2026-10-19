@@ -64,6 +64,7 @@ from tmb.backend.abi import (
     v_tensor,
     v_tensor_list,
     view_strided,
+    v_bool_list,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev, read_bytes_sync
 from tmb.backend.kernel_call import KernelCall
@@ -1560,16 +1561,6 @@ def op__weight_norm_interface_backward(
 # ---------------------------------------------------------------------------
 
 
-def _bool_list(v: Value) raises -> List[Bool]:
-    var out = List[Bool]()
-    if v.tag == TAG_NONE:
-        return out^
-    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
-    for i in range(Int(v.len)):
-        out.append(p[unsafe_offset=i] != 0)
-    return out^
-
-
 def _empty_like_result(st: Int32, device: Int) raises -> Owned:
     """The 0-element stand-in for a gradient autograd did not ask for (the
     convention `native_layer_norm_backward` uses)."""
@@ -1587,7 +1578,7 @@ def op__fused_rms_norm_backward(
     var ns = IntList(args[unsafe_offset=2])
     var rstd = v_tensor(args[unsafe_offset=3])
     var has_w = not v_is_none(args[unsafe_offset=4])
-    var mask = _bool_list(args[unsafe_offset=5])
+    var mask = v_bool_list(args[unsafe_offset=5])
     var k = len(ns)
     if k == 0 or k > x.rank:
         raise Error(

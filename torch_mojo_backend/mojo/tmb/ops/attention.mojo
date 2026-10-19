@@ -65,6 +65,7 @@ from tmb.backend.abi import (
     TAG_NONE,
     TAG_SCALAR_DOUBLE,
     TAG_TENSOR,
+    v_bool_list,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
@@ -80,7 +81,6 @@ from tmb.ops.common import (
     scalar_type_name,
     padded_shape,
 )
-from tmb.ops.composed import _bool_list
 from tmb.backend.registry import Site, impl
 from tmb.ops.data_movement import (
     _batched_copy_run,
@@ -1906,7 +1906,7 @@ def op_efficient_attention_backward(
     var v = v_tensor(args[unsafe_offset=3])
     var bias = v_opt_tensor(args[unsafe_offset=4])
     var dropout_p = v_f64(args[unsafe_offset=9])
-    var mask = _bool_list(args[unsafe_offset=10])
+    var mask = v_bool_list(args[unsafe_offset=10])
     var is_causal = v_bool(args[unsafe_offset=11])
     if dropout_p != 0.0:
         unsupported("efficient attention backward with dropout")
