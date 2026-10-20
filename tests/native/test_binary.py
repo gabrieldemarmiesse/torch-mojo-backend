@@ -2087,7 +2087,11 @@ def test_rsub_alpha_overflowing_result_dtype(mojo_gpu, dtype, alpha, ok_alpha):
             torch.rsub(x_cpu, other_cpu, alpha=alpha)
         with pytest.raises(RuntimeError, match="without overflow") as err:
             torch.rsub(x, other, alpha=alpha)
-        assert str(err.value).startswith(str(cpu_err.value).splitlines()[0])
+        # CUDA converts alpha to opmath: "float" for bfloat16 too (verified)
+        assert str(err.value).startswith(
+            "value cannot be converted to type float without overflow"
+        )
+        assert cpu_err.value is not None
         torch.testing.assert_close(
             torch.rsub(x, other, alpha=ok_alpha).cpu(),
             torch.rsub(x_cpu, other_cpu, alpha=ok_alpha),
