@@ -49,6 +49,8 @@ from tmb.backend.abi import (
     v_is_none,
     v_string,
     v_tensor,
+    v_tensor_c,
+    no_complex,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
@@ -94,6 +96,40 @@ from tmb.ops.complex import (
     routed,
 )
 from tmb.ops.complex_math import (
+    cx_sin,
+    cx_sin_out,
+    cx_cos,
+    cx_cos_out,
+    cx_tan,
+    cx_tan_out,
+    cx_sinh,
+    cx_sinh_out,
+    cx_cosh,
+    cx_cosh_out,
+    cx_tanh,
+    cx_tanh_out,
+    cx_asin,
+    cx_asin_out,
+    cx_acos,
+    cx_acos_out,
+    cx_atan,
+    cx_atan_out,
+    cx_asinh,
+    cx_asinh_out,
+    cx_acosh,
+    cx_acosh_out,
+    cx_atanh,
+    cx_atanh_out,
+    cx_log10,
+    cx_log10_out,
+    cx_log2,
+    cx_log2_out,
+    cx_exp2,
+    cx_exp2_out,
+    cx_expm1,
+    cx_expm1_out,
+    cx_log1p,
+    cx_log1p_out,
     cx_abs,
     cx_abs_out,
     cx_angle,
@@ -148,6 +184,10 @@ def _is_bool_spec_dtype(dt: DType) -> Bool:
     return _is_spec_unary_dtype(dt) or dt == DType.bool
 
 
+def _is_wide_unsigned(dt: DType) -> Bool:
+    return dt == DType.uint16 or dt == DType.uint32 or dt == DType.uint64
+
+
 def _is_bitwise_dtype(dt: DType) -> Bool:
     return (
         dt == DType.bool
@@ -156,6 +196,9 @@ def _is_bitwise_dtype(dt: DType) -> Bool:
         or dt == DType.int16
         or dt == DType.int32
         or dt == DType.int64
+        or dt == DType.uint16
+        or dt == DType.uint32
+        or dt == DType.uint64
     )
 
 
@@ -446,9 +489,20 @@ def op_abs_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, dst)
 
 
+def _neg_check(t: T) raises:
+    """neg's meta function (UnaryOps.cpp)."""
+    if t.dtype == DType.bool:
+        raise Error(
+            "Negation, the `-` operator, on a bool tensor is not supported."
+            " If you are trying to invert a mask, use the `~` or"
+            " `logical_not()` operator instead."
+        )
+
+
 # aten::neg(Tensor self) -> Tensor
 def op_neg(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
+    _neg_check(t)
     var out = own(_direct_unary("NegSpec", t))
     ret_owned(rets, 0, out)
 
@@ -457,6 +511,7 @@ def op_neg(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_neg_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
+    _neg_check(t)
     _direct_unary_out("NegSpec", t, dst)
     ret_ref(rets, 0, dst)
 
@@ -476,6 +531,17 @@ def op_conj_physical_out(
         src = own(new_like(t))
         copy_strided_into(src.t, t)
     _out_prologue(t, dst, t.stype)
+    if (
+        t.dtype == DType.uint16
+        or t.dtype == DType.uint32
+        or t.dtype == DType.uint64
+    ):
+        # conj_kernel_cuda dispatches no barebones unsigned type.
+        unsupported(
+            '"conj_cuda" not implemented for \''
+            + _scalar_type_name(t.dtype)
+            + "'"
+        )
     if not same_view(dst, src.t):
         copy_strided_into(dst, src.t)
     _ = src^
@@ -707,6 +773,7 @@ def _log2_input(t: T) raises -> Owned:
         not _is_float_dtype(t.dtype)
         and t.dtype != DType.float64
         and not _is_bool_spec_dtype(t.dtype)
+        and not _is_wide_unsigned(t.dtype)
     ):
         unsupported(
             "log2 supports real floating point, integer, and bool inputs"
@@ -1438,11 +1505,55 @@ def _promote(t: T) raises -> T:
     return t.copy()
 
 
+def _nv_f64_op(op: String, t: T) raises -> Bool:
+    """A float64 input of an op whose kernel runs the libdevice port on NVIDIA
+    (`unary_math.is_nv_f64_port`); other GPUs decline float64 as before."""
+    return (
+        t.dtype == DType.float64
+        and dev(t.device)[].api == "cuda"
+        and (
+            op == "ExpSpec"
+            or op == "Exp2Spec"
+            or op == "Expm1Spec"
+            or op == "LogSpec"
+            or op == "Log10Spec"
+            or op == "Log1pSpec"
+            or op == "SqrtSpec"
+            or op == "RsqrtSpec"
+            or op == "SinSpec"
+            or op == "CosSpec"
+            or op == "TanSpec"
+            or op == "AsinSpec"
+            or op == "AcosSpec"
+            or op == "AtanSpec"
+            or op == "SinhSpec"
+            or op == "CoshSpec"
+            or op == "TanhSpec"
+            or op == "AsinhSpec"
+            or op == "AcoshSpec"
+            or op == "AtanhSpec"
+        )
+    )
+
+
+def _angle_half_refuse(t: T) raises:
+    """angle_kernel_cuda dispatches float and double only for a real input."""
+    if t.dtype == DType.float16 or t.dtype == DType.bfloat16:
+        unsupported(
+            '"angle_cuda" not implemented for \''
+            + _scalar_type_name(t.dtype)
+            + "'"
+        )
+
+
 def _promoting_unary(op: String, t: T) raises -> T:
     _f8_refuse(op, t.dtype)
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":  # the one op of these that takes float64
+        _angle_half_refuse(src.t)
         return _float_or_f64_unary(op, src.t)
+    if _nv_f64_op(op, src.t):
+        return _unary("elementwise", op, src.t, src.t.dtype)
     return _float_unary(op, src.t)
 
 
@@ -1451,7 +1562,13 @@ def _promoting_unary_out(op: String, t: T, mut dst: T) raises:
     _f8_out_refuse(op, t, dst, False)
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":
+        if src.t.dtype == DType.float16 or src.t.dtype == DType.bfloat16:
+            if not dst.same_shape(src.t):
+                resize_out(dst, src.t.shape, src.t.rank)
+            _angle_half_refuse(src.t)
         _float_or_f64_unary_out(op, src.t, dst, True)
+    elif _nv_f64_op(op, src.t):
+        _unary_out("elementwise", op, src.t, dst, src.t.dtype, True)
     else:
         _require_float(op, src.t.dtype)
         _unary_out("elementwise", op, src.t, dst, src.t.dtype, True)
@@ -1938,8 +2055,30 @@ def _nan_to_num_params(
 
 
 # aten::nan_to_num(Tensor self, float? nan=None, float? posinf=None, float? neginf=None) -> Tensor
+def _cx_nan_to_num(t: T, args: Values) raises -> T:
+    """nan_to_num_kernel_cuda of a complex tensor: each part replaced on its
+    own with the component type's values: the real kernel over the (re, im)
+    pairs."""
+    var src = own_if_new(contiguous(t), t)
+    var pr = src.t.pairs()
+    var p = _nan_to_num_params(
+        pr, args[unsafe_offset=1], args[unsafe_offset=2], args[unsafe_offset=3]
+    )
+    var out = own(new_like(src.t))
+    if t.numel > 0:
+        var outp = out.t.pairs()
+        _param_direct("NanToNumSpec", pr, outp, p[0], p[1], p[2])
+    _ = src^
+    return out.take()
+
+
 def op_nan_to_num(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
+    var t = v_tensor_c(args[unsafe_offset=0])
+    if t.is_complex():
+        var res = own(_cx_nan_to_num(t, args))
+        ret_owned(rets, 0, res)
+        return
+    no_complex(t)
     if _is_bitwise_dtype(t.dtype):
         # Integers and bool hold no NaN or infinity: a copy.
         var copy = own(_int_identity(t))
@@ -1956,8 +2095,8 @@ def op_nan_to_num(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_nan_to_num_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=4])
+    var t = v_tensor_c(args[unsafe_offset=0])
+    var dst = v_tensor_c(args[unsafe_offset=4])
     if is_float8(t.dtype):
         # nan_to_num_out's own dtype check, then the resize, then
         # nan_to_num_cuda's dispatch (no float8 case).
@@ -1969,6 +2108,22 @@ def op_nan_to_num_out(
                 _scalar_type_name(t.dtype),
             )
         _f8_out_refuse("nan_to_num", t, dst, True)
+    if t.is_complex():
+        if dst.stype != t.stype:
+            raise Error(
+                "nan_to_num: dtype of out: ",
+                _scalar_type_name(dst.dtype),
+                " should be same as input: ",
+                _scalar_type_name(t.dtype),
+            )
+        var res = own(_cx_nan_to_num(t, args))
+        _out_prologue(t, dst, t.stype)
+        copy_strided_into(dst, res.t)
+        _ = res^
+        ret_ref(rets, 0, dst)
+        return
+    no_complex(t)
+    no_complex(dst)
     if _is_bitwise_dtype(t.dtype):
         _identity_into(t, dst)
         ret_ref(rets, 0, dst)
@@ -2162,15 +2317,21 @@ def op_gelu_backward(
 
 
 # aten::isnan(Tensor self) -> Tensor
-def op_isnan(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
+def _isnan(t: T) raises -> T:
+    if _is_wide_unsigned(t.dtype):  # `self != self`: never
+        return _inf_predicate("IsInfSpec", t)
     # float8: ATen's isnan is `self != self`, which CUDA runs for float8;
     # its exact float32 copy has the same NaNs.
     var src = own_if_new(
         cast_to(t, ST_FLOAT32) if is_float8(t.dtype) else t.copy(), t
     )
-    var out = own(_bool_unary("IsNanSpec", src.t))
+    var out = _bool_unary("IsNanSpec", src.t)
     _ = src^
+    return out^
+
+
+def op_isnan(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var out = own(_isnan(v_tensor(args[unsafe_offset=0])))
     ret_owned(rets, 0, out)
 
 
@@ -2178,12 +2339,26 @@ def op_isnan(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_isnan_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    var src = own_if_new(
-        cast_to(t, ST_FLOAT32) if is_float8(t.dtype) else t.copy(), t
-    )
-    _bool_unary_out("IsNanSpec", src.t, dst)
-    _ = src^
+    var res = own(_isnan(t))
+    _generated_bool_out(dst, res^)
     ret_ref(rets, 0, dst)
+
+
+def _generated_bool_out(mut dst: T, var res: Owned) raises:
+    """The generated out= wrapper of a composite bool op (isnan, isinf):
+    the functional result, out resized to it, then copy_arg's dtype check,
+    then the copy."""
+    if not dst.same_shape(res.t):
+        resize_out(dst, res.t.shape, res.t.rank)
+    if dst.stype != torch_dtype(DType.bool):
+        raise Error(
+            "Expected out tensor to have dtype bool, but got ",
+            _scalar_type_name(dst.dtype),
+            " instead",
+        )
+    assert_no_internal_overlap(dst)
+    copy_strided_into(dst, res.t)
+    _ = res^
 
 
 # aten::isinf(Tensor self) -> Tensor
@@ -2197,7 +2372,8 @@ def op_isinf(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_isinf_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _inf_predicate_out("IsInfSpec", t, dst)
+    var res = own(_inf_predicate("IsInfSpec", t))
+    _generated_bool_out(dst, res^)
     ret_ref(rets, 0, dst)
 
 
@@ -2215,7 +2391,9 @@ def _inf_predicate(op: String, t: T) raises -> T:
     tensor; any other dtype (every integer width, unsigned ones included,
     and bool) is always finite and never infinite, so a fill without a
     kernel of its own -- as ATen's composites give for any dtype."""
-    if t.dtype.is_floating_point():
+    if t.dtype.is_floating_point() and not (
+        op == "IsFiniteSpec" and t.dtype == DType.float8_e8m0fnu
+    ):
         return _bool_unary(op, t)
     var out = own(
         new_tensor(t.shape, t.rank, torch_dtype(DType.bool), t.device)
@@ -2309,13 +2487,21 @@ def _bitwise_not_kernel(src: T, dst: T) raises:
     _ = ctx
 
 
+def _bitwise_not_refuse(t: T) raises:
+    """bitwise_not_kernel_cuda: AT_DISPATCH_INTEGRAL_TYPES (no barebones
+    unsigned type, no float)."""
+    unsupported(
+        '"bitwise_not_cuda" not implemented for \''
+        + _scalar_type_name(t.dtype)
+        + "'"
+    )
+
+
 def _bitwise_not(t_in: T) raises -> T:
     if t_in.dtype == DType.bool:
         return _bool_unary("LogicalNotSpec", t_in)
-    if not _is_bitwise_dtype(t_in.dtype):
-        unsupported(
-            "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
-        )
+    if not _is_bitwise_dtype(t_in.dtype) or _is_wide_unsigned(t_in.dtype):
+        _bitwise_not_refuse(t_in)
     var src = contiguous(t_in)
     var out = own(new_like(src))
     _bitwise_not_kernel(src, out.t)
@@ -2329,10 +2515,10 @@ def _bitwise_not_into(t_in: T, mut dst: T) raises:
         _bool_unary_out("LogicalNotSpec", t_in, dst)
         return
     if not _is_bitwise_dtype(t_in.dtype):
-        unsupported(
-            "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
-        )
+        _bitwise_not_refuse(t_in)
     _out_prologue(t_in, dst, t_in.stype)
+    if _is_wide_unsigned(t_in.dtype):
+        _bitwise_not_refuse(t_in)
     var src = contiguous(t_in)
     if dst.contig:
         _bitwise_not_kernel(src, dst)
@@ -2382,6 +2568,25 @@ comptime _relu_fn = f8_iter[
 ]
 
 
+def _isfinite_entry(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """isfinite: ATen's composite answers ones for float8_e8m0fnu (no
+    infinity) before any TensorIterator sees it."""
+    if v_tensor_c(args[unsafe_offset=0]).dtype == DType.float8_e8m0fnu:
+        op_isfinite(args, n_args, rets, n_rets)
+        return
+    f8_iter[
+        routed[op_isfinite, cx_isfinite, 1],
+        "isfinite",
+        1,
+        -1,
+        MODE_FN,
+        False,
+        PRE_NONE,
+    ](args, n_args, rets, n_rets)
+
+
 def register_unary(site: Site) raises:
     impl[
         f8_iter[
@@ -2408,19 +2613,51 @@ def register_unary(site: Site) raises:
         "abs.out",
     ](site)
     impl[
-        f8_iter[op_acos, "acos_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_acos, cx_acos, 1],
+            "acos_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "acos",
     ](site)
     impl[
-        f8_iter[op_acos_out, "acos_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_acos_out, cx_acos_out, 2],
+            "acos_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "acos.out",
     ](site)
     impl[
-        f8_iter[op_acosh, "acosh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_acosh, cx_acosh, 1],
+            "acosh_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "acosh",
     ](site)
     impl[
-        f8_iter[op_acosh_out, "acosh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_acosh_out, cx_acosh_out, 2],
+            "acosh_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "acosh.out",
     ](site)
     impl[
@@ -2448,35 +2685,99 @@ def register_unary(site: Site) raises:
         "angle.out",
     ](site)
     impl[
-        f8_iter[op_asin, "asin_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_asin, cx_asin, 1],
+            "asin_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "asin",
     ](site)
     impl[
-        f8_iter[op_asin_out, "asin_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_asin_out, cx_asin_out, 2],
+            "asin_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "asin.out",
     ](site)
     impl[
-        f8_iter[op_asinh, "asinh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_asinh, cx_asinh, 1],
+            "asinh_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "asinh",
     ](site)
     impl[
-        f8_iter[op_asinh_out, "asinh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_asinh_out, cx_asinh_out, 2],
+            "asinh_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "asinh.out",
     ](site)
     impl[
-        f8_iter[op_atan, "atan_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_atan, cx_atan, 1],
+            "atan_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "atan",
     ](site)
     impl[
-        f8_iter[op_atan_out, "atan_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_atan_out, cx_atan_out, 2],
+            "atan_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "atan.out",
     ](site)
     impl[
-        f8_iter[op_atanh, "atanh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_atanh, cx_atanh, 1],
+            "atanh_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "atanh",
     ](site)
     impl[
-        f8_iter[op_atanh_out, "atanh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_atanh_out, cx_atanh_out, 2],
+            "atanh_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "atanh.out",
     ](site)
     impl[
@@ -2506,19 +2807,51 @@ def register_unary(site: Site) raises:
         "ceil.out",
     ](site)
     impl[
-        f8_iter[op_cos, "cos_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_cos, cx_cos, 1],
+            "cos_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "cos",
     ](site)
     impl[
-        f8_iter[op_cos_out, "cos_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_cos_out, cx_cos_out, 2],
+            "cos_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "cos.out",
     ](site)
     impl[
-        f8_iter[op_cosh, "cosh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_cosh, cx_cosh, 1],
+            "cosh_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "cosh",
     ](site)
     impl[
-        f8_iter[op_cosh_out, "cosh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_cosh_out, cx_cosh_out, 2],
+            "cosh_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "cosh.out",
     ](site)
     impl[
@@ -2580,19 +2913,51 @@ def register_unary(site: Site) raises:
         "exp.out",
     ](site)
     impl[
-        f8_iter[op_exp2, "exp2_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_exp2, cx_exp2, 1],
+            "exp2_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "exp2",
     ](site)
     impl[
-        f8_iter[op_exp2_out, "exp2_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_exp2_out, cx_exp2_out, 2],
+            "exp2_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "exp2.out",
     ](site)
     impl[
-        f8_iter[op_expm1, "expm1_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_expm1, cx_expm1, 1],
+            "expm1_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "expm1",
     ](site)
     impl[
-        f8_iter[op_expm1_out, "expm1_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_expm1_out, cx_expm1_out, 2],
+            "expm1_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "expm1.out",
     ](site)
     impl[
@@ -2670,27 +3035,75 @@ def register_unary(site: Site) raises:
         "log.out",
     ](site)
     impl[
-        f8_iter[op_log10, "log10_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_log10, cx_log10, 1],
+            "log10_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "log10",
     ](site)
     impl[
-        f8_iter[op_log10_out, "log10_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_log10_out, cx_log10_out, 2],
+            "log10_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "log10.out",
     ](site)
     impl[
-        f8_iter[op_log1p, "log1p_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_log1p, cx_log1p, 1],
+            "log1p_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "log1p",
     ](site)
     impl[
-        f8_iter[op_log1p_out, "log1p_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_log1p_out, cx_log1p_out, 2],
+            "log1p_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "log1p.out",
     ](site)
     impl[
-        f8_iter[op_log2, "log2_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_log2, cx_log2, 1],
+            "log2_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "log2",
     ](site)
     impl[
-        f8_iter[op_log2_out, "log2_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_log2_out, cx_log2_out, 2],
+            "log2_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "log2.out",
     ](site)
     impl[
@@ -2923,11 +3336,27 @@ def register_unary(site: Site) raises:
         "silu.out",
     ](site)
     impl[
-        f8_iter[op_sin, "sin_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_sin, cx_sin, 1],
+            "sin_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "sin",
     ](site)
     impl[
-        f8_iter[op_sin_out, "sin_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_sin_out, cx_sin_out, 2],
+            "sin_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "sin.out",
     ](site)
     impl[
@@ -2939,11 +3368,27 @@ def register_unary(site: Site) raises:
         "sinc.out",
     ](site)
     impl[
-        f8_iter[op_sinh, "sinh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_sinh, cx_sinh, 1],
+            "sinh_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "sinh",
     ](site)
     impl[
-        f8_iter[op_sinh_out, "sinh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_sinh_out, cx_sinh_out, 2],
+            "sinh_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "sinh.out",
     ](site)
     impl[
@@ -3339,19 +3784,51 @@ def register_unary(site: Site) raises:
         "sqrt.out",
     ](site)
     impl[
-        f8_iter[op_tan, "tan_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_tan, cx_tan, 1],
+            "tan_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "tan",
     ](site)
     impl[
-        f8_iter[op_tan_out, "tan_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_tan_out, cx_tan_out, 2],
+            "tan_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "tan.out",
     ](site)
     impl[
-        f8_iter[op_tanh, "tanh_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_tanh, cx_tanh, 1],
+            "tanh_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "tanh",
     ](site)
     impl[
-        f8_iter[op_tanh_out, "tanh_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_tanh_out, cx_tanh_out, 2],
+            "tanh_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "tanh.out",
     ](site)
     impl[
@@ -3426,18 +3903,7 @@ def register_unary(site: Site) raises:
         ],
         "isinf.out",
     ](site)
-    impl[
-        f8_iter[
-            routed[op_isfinite, cx_isfinite, 1],
-            "isfinite",
-            1,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
-        ],
-        "isfinite",
-    ](site)
+    impl[_isfinite_entry, "isfinite"](site)
     impl[
         f8_iter[
             op_isposinf,

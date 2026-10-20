@@ -23,6 +23,10 @@ from tests.native.cuda_oracle import CudaOracle, assert_bits_equal
 from torch_mojo_backend import aten_functions, get_accelerators, mojo_backend, native
 
 
+def _is_nvidia(device: str) -> bool:
+    return list(get_accelerators())[int(device.rsplit(":", 1)[-1])].api == "cuda"
+
+
 def _native_count(name: str) -> int:
     return native.op_count(f"aten::{name}")
 
@@ -1241,8 +1245,8 @@ def test_sqrt_dtype_layout_fallback(mojo_gpu: str, dtype: torch.dtype, layout: s
         host, source = host.t(), source.t()
     elif layout == "strided":
         host, source = host[:, ::2], source[:, ::2]
-    if dtype == torch.float64:
-        # The pre-existing SqrtSpec contract supports f32/f16/bf16 only.
+    if dtype == torch.float64 and not _is_nvidia(mojo_gpu):
+        # float64 sqrt runs on NVIDIA only (the libdevice-port route).
         with pytest.raises(NotImplementedError, match="dtype float64 is not supported"):
             torch.sqrt(source)
         return

@@ -956,10 +956,16 @@ def op_irshift(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _pw_frexp(self: T) raises -> Tuple[Res, Res]:
+    if not _pw_is_float(self.stype) and not is_float8(self.dtype):
+        raise Error("torch.frexp() only supports floating-point dtypes")
     if not self.on_mojo():
         unsupported("frexp of a tensor outside the mojo device")
-    if not _pw_is_float(self.stype):
-        raise Error("torch.frexp() only supports floating-point dtypes")
+    if is_float8(self.dtype):
+        unsupported(
+            '"frexp_cuda" not implemented for \''
+            + scalar_type_name(self.dtype)
+            + "'"
+        )
     var a = _b_tside(self)
     var mant = _pw_run(
         "frexp_mantissa",
@@ -988,14 +994,14 @@ def _pw_frexp(self: T) raises -> Tuple[Res, Res]:
 
 # aten::frexp.Tensor(Tensor self) -> (Tensor mantissa, Tensor exponent)
 def op_frexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var r = _pw_frexp(v_tensor(args[unsafe_offset=0]))
+    var r = _pw_frexp(v_tensor_c(args[unsafe_offset=0]))
     ret_tensor(rets, 0, r[0].t)
     ret_tensor(rets, 1, r[1].t)
 
 
 # aten::frexp.Tensor_out(Tensor self, *, Tensor(a!) mantissa, Tensor(b!) exponent) -> (Tensor(a!) mantissa, Tensor(b!) exponent)
 def op_frexp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var self = v_tensor(args[unsafe_offset=0])
+    var self = v_tensor_c(args[unsafe_offset=0])
     var mant = v_tensor(args[unsafe_offset=1])
     var expo = v_tensor(args[unsafe_offset=2])
     if mant.stype != self.stype:
@@ -2834,33 +2840,55 @@ comptime M_PI_180 = 0.017453292519943295769236907684886127134428718885417
 comptime M_180_PI = 57.295779513082320876798154814105170332405472466564
 
 
+def _angle_conv_check(name: String, args: Values, in_place: Bool) raises:
+    """UnaryOps.cpp's deg2rad_out / rad2deg_out: no complex input; in place,
+    the float product cannot be cast back into an integer self (mul_out's
+    check)."""
+    var t = v_tensor_c(args[unsafe_offset=0])
+    if t.is_complex():
+        raise Error(name, " is not supported for complex tensors.")
+    if in_place and not _pw_is_float(t.stype):
+        raise Error(
+            "result type ",
+            scalar_type_name(max_dtype(default_dtype())),
+            " can't be cast to the desired output type ",
+            scalar_type_name(t.dtype),
+        )
+
+
 # aten::deg2rad(Tensor self) -> Tensor
 def op_deg2rad(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _angle_conv_check("deg2rad", args, False)
     _pw_math("scale", P_FLOAT, True, 1, args, rets, -1, _p(M_PI_180))
 
 
 # aten::deg2rad.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
 def op_deg2rad_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _angle_conv_check("deg2rad", args, False)
     _pw_math("scale", P_FLOAT, True, 1, args, rets, 1, _p(M_PI_180))
 
 
 # aten::deg2rad_(Tensor(a!) self) -> Tensor(a!)
 def op_deg2rad_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _angle_conv_check("deg2rad", args, True)
     _pw_act_inplace("scale", args, rets, _p(M_PI_180))
 
 
 # aten::rad2deg(Tensor self) -> Tensor
 def op_rad2deg(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _angle_conv_check("rad2deg", args, False)
     _pw_math("scale", P_FLOAT, True, 1, args, rets, -1, _p(M_180_PI))
 
 
 # aten::rad2deg.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
 def op_rad2deg_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _angle_conv_check("rad2deg", args, False)
     _pw_math("scale", P_FLOAT, True, 1, args, rets, 1, _p(M_180_PI))
 
 
 # aten::rad2deg_(Tensor(a!) self) -> Tensor(a!)
 def op_rad2deg_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _angle_conv_check("rad2deg", args, True)
     _pw_act_inplace("scale", args, rets, _p(M_180_PI))
 
 
