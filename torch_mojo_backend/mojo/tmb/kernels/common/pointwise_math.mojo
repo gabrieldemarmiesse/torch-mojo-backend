@@ -56,13 +56,16 @@ from tmb.kernels.common.libdevice_port import (
     nv_log1p,
     nv_log1pf,
     nv_logf,
+    nv_pow,
     nv_sin,
+    nv_tan,
+    nv_tanf,
 )
 from tmb.kernels.common.dtype_arithmetic import amd_opaque, cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
 from tmb.kernels.common.pow_math import pow_c99, torch_pow
-from tmb.kernels.common.special_math import igamma_f, igammac_f, jit_nan, zeta
+from tmb.kernels.common.special_math import igamma, igammac, jit_nan, zeta
 
 
 @always_inline
@@ -1563,16 +1566,17 @@ def _wide[
             r = a.eq(0).select(zero, r)
         return isnan(b).select(SIMD[w, n](nan[w]()), r)
     elif kind == "igamma" or kind == "igammac":
-        # IGammaKernel.cu calc_igamma / calc_igammac, float accscalar_t
-        # (special_math.mojo; stock torch has no float64 route to match here).
+        # IGammaKernel.cu calc_igamma / calc_igammac (special_math.mojo):
+        # accscalar_t is double for double, float otherwise.
+        comptime cw = DType.float64 if w == DType.float64 else DType.float32
         var r = SIMD[w, n]()
         comptime for i in range(n):
-            var ai = a[i].cast[DType.float32]()
-            var xi = b[i].cast[DType.float32]()
+            var ai = a[i].cast[cw]()
+            var xi = b[i].cast[cw]()
             comptime if kind == "igamma":
-                r[i] = igamma_f(ai, xi).cast[w]()
+                r[i] = igamma(ai, xi).cast[w]()
             else:
-                r[i] = igammac_f(ai, xi).cast[w]()
+                r[i] = igammac(ai, xi).cast[w]()
         return r
     elif kind == "zeta":
         # CUDA's zeta_string in the opmath type (the jiterator's T, on ROCm
@@ -2070,14 +2074,16 @@ def _isclose[
 
 @always_inline
 def _tan_w[w: DType](x: Scalar[w]) -> Scalar[w]:
-    """tan as sin / cos: libdevice's sinf / cosf on NVIDIA, fdlibm's for
-    float64, std.math elsewhere (digamma's reflection, negative x only)."""
-    comptime if w == DType.float64:
+    """CUDA's tanf / tan on NVIDIA; elsewhere sin / cos, fdlibm's for
+    float64 (digamma's reflection, negative x only)."""
+    comptime if is_nvidia_gpu():
+        comptime if w == DType.float64:
+            return nv_tan(x.cast[DType.float64]()).cast[w]()
+        else:
+            return nv_tanf(x.cast[DType.float32]()).cast[w]()
+    elif w == DType.float64:
         var sc = _sincos_f64(x.cast[DType.float64]())
         return (sc[0] / sc[1]).cast[w]()
-    elif is_nvidia_gpu():
-        var xf = x.cast[DType.float32]()
-        return (nv_sinf(xf) / nv_cosf(xf)).cast[w]()
     else:
         var xf = x.cast[DType.float32]()
         return (sin(xf) / cos(xf)).cast[w]()
@@ -2086,7 +2092,7 @@ def _tan_w[w: DType](x: Scalar[w]) -> Scalar[w]:
 @always_inline
 def _digamma_one[w: DType](x_in: Scalar[w]) -> Scalar[w]:
     """Distributions.h's `digamma_one` (Cephes), in the accumulate type."""
-    comptime PSI_10 = Scalar[w](2.25175258906672110764)
+    comptime PSI_10 = Float64(2.25175258906672110764).cast[w]()
     comptime PI = Scalar[w](3.14159265358979323846)
     var x = x_in
     if x == 0:
@@ -2107,7 +2113,7 @@ def _digamma_one[w: DType](x_in: Scalar[w]) -> Scalar[w]:
         x += 1
     if x == 10:
         return result + PSI_10 + additional_summand
-    comptime A = [
+    comptime A: Array[Float64, 7] = [
         8.33333333333333333333e-2,
         -2.10927960927960927961e-2,
         7.57575757575757575758e-3,
@@ -2117,17 +2123,29 @@ def _digamma_one[w: DType](x_in: Scalar[w]) -> Scalar[w]:
         8.33333333333333333333e-2,
     ]
     var y = Scalar[w](0)
-    if x < Scalar[w](1.0e17):
+    if x < Float32(1.0e17).cast[w]():
         var z = 1 / (x * x)
         comptime a0 = A[0]
-        var poly = Scalar[w](a0)
+        var poly = a0.cast[w]()
         comptime for i in range(1, 7):
             comptime ai = A[i]
-            poly = poly * z + Scalar[w](ai)
-        y = z * poly
+            poly = fma(poly, z, ai.cast[w]())
+        # rounded: nvcc keeps `- y` a separate subtraction
+        y = _mul_rn[w, 1](z, poly)
     return (
         result + _slog[w](x) - (Scalar[w](0.5) / x) - y + (additional_summand)
     )
+
+
+@always_inline
+def _cuda_pow[w: DType](x: Scalar[w], y: Scalar[w]) -> Scalar[w]:
+    """compat_pow: CUDA's powf / pow (libdevice's double pow on NVIDIA)."""
+    comptime if w == DType.float64 and is_nvidia_gpu():
+        return nv_pow(x.cast[DType.float64](), y.cast[DType.float64]()).cast[
+            w
+        ]()
+    else:
+        return pow_c99[w](x, y)
 
 
 @always_inline
@@ -2149,42 +2167,48 @@ def _standard_gamma_grad_one[
             denom += 1
             series1 += numer / denom
             series2 += numer / (denom * denom)
-        var pow_x_alpha = pow_c99[w](x, alpha)
-        var gamma_pdf = pow_c99[w](x, alpha - 1) * _sexp[w](-x)
+        var pow_x_alpha = _cuda_pow[w](x, alpha)
+        var gamma_pdf = _cuda_pow[w](x, alpha - 1) * _sexp[w](-x)
         var gamma_cdf = pow_x_alpha * series1
-        var gamma_cdf_alpha = (
-            _slog[w](x) - _digamma_one[w](alpha)
-        ) * gamma_cdf - pow_x_alpha * series2
+        # ptxas fuses the first product in the vectorized kernel (the
+        # elementwise_kernel instance fuses the second one instead)
+        var gamma_cdf_alpha = fma(
+            _slog[w](x) - _digamma_one[w](alpha),
+            gamma_cdf,
+            -_mul_rn[w, 1](pow_x_alpha, series2),
+        )
         var result = -gamma_cdf_alpha / gamma_pdf
         return Scalar[w](0) if isnan(result) else result
     if alpha > 8:
         # Rice saddle point expansion for large alpha.
         if Scalar[w](0.9) * alpha <= x and x <= Scalar[w](1.1) * alpha:
-            var numer_1 = 1 + 24 * alpha * (1 + 12 * alpha)
-            var numer_2 = (
-                1440 * (alpha * alpha)
-                + 6 * x * (53 - 120 * x)
-                - 65 * x * x / alpha
-                + alpha * (107 + 3600 * x)
+            comptime S = Scalar[w]
+            var numer_1 = fma(fma(alpha, S(12), S(1)), 24 * alpha, S(1))
+            var aa = alpha * alpha
+            var numer_2 = fma(
+                alpha,
+                fma(x, S(3600), S(107)),
+                fma(aa, S(1440), (6 * x) * fma(x, S(-120), S(53)))
+                - 65 * x * x / alpha,
             )
-            var denom = 1244160 * (alpha * alpha) * (alpha * alpha)
+            var denom = aa * (1244160 * aa)
             return numer_1 * numer_2 / denom
         var denom = ieee_sqrt(8 * alpha)
         var term2 = denom / (alpha - x)
-        var term3 = pow_c99[w](
-            x - alpha - alpha * _slog[w](x / alpha), Scalar[w](-1.5)
+        var term3 = _cuda_pow[w](
+            fma(-alpha, _slog[w](x / alpha), x - alpha), Scalar[w](-1.5)
         )
         var term23 = term2 - term3 if x < alpha else term2 + term3
-        var term1 = _slog[w](x / alpha) * term23 - ieee_sqrt(2 / alpha) * (
-            alpha + x
-        ) / ((alpha - x) * (alpha - x))
-        var stirling = 1 + 1 / (12 * alpha) * (1 + 1 / (24 * alpha))
+        var term1 = _mul_rn[w, 1](_slog[w](x / alpha), term23) - ieee_sqrt(
+            2 / alpha
+        ) * (alpha + x) / ((alpha - x) * (alpha - x))
+        var stirling = fma(1 + 1 / (24 * alpha), 1 / (12 * alpha), 1)
         var numer = x * term1
         return -stirling * numer / denom
     # Bivariate rational approximation to the reparameterized gradient.
     var u = _slog[w](x / alpha)
     var v = _slog[w](alpha)
-    comptime C = [
+    comptime C: Array[Array[Float64, 8], 3] = [
         [
             0.16009398,
             -0.094634809,
@@ -2221,9 +2245,9 @@ def _standard_gamma_grad_one[
         comptime c0 = C[0][i]
         comptime c1 = C[1][i]
         comptime c2 = C[2][i]
-        coef_v[i] = Scalar[w](c0) + u * (Scalar[w](c1) + u * Scalar[w](c2))
-    var pp = coef_v[0] + v * (coef_v[1] + v * (coef_v[2] + v * coef_v[3]))
-    var q = coef_v[4] + v * (coef_v[5] + v * (coef_v[6] + v * coef_v[7]))
+        coef_v[i] = fma(fma(u, c2.cast[w](), c1.cast[w]()), u, c0.cast[w]())
+    var pp = fma(v, fma(v, fma(v, coef_v[3], coef_v[2]), coef_v[1]), coef_v[0])
+    var q = fma(v, fma(v, fma(v, coef_v[7], coef_v[6]), coef_v[5]), coef_v[4])
     return _sexp[w](pp / q)
 
 

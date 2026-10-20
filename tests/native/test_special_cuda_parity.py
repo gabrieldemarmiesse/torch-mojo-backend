@@ -453,6 +453,25 @@ def test_binary_special_matches_cuda(
     cuda_oracle.assert_bitwise_equal(fn, a, b)
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64), ids=str)
+@pytest.mark.parametrize("fn", (torch.igamma, torch.igammac), ids=("igamma", "igammac"))
+def test_igamma_branch_points_match_cuda(
+    cuda_oracle: CudaOracle, fn: Callable[..., torch.Tensor], dtype: torch.dtype
+):
+    """x ~ a over a log-uniform a in (1, 1100) (the asymptotic series and
+    the Lanczos prefactor), and a < 6, x < 2.5 (the x = 0.5 / 1.1 cuts
+    between the two series)."""
+    g = _gen(3)
+    n = 1 << 15
+    a = torch.empty(n, dtype=torch.float64).uniform_(0, 7, generator=g).exp()
+    x = a * (1 + torch.empty(n, dtype=torch.float64).uniform_(-0.45, 0.45, generator=g))
+    a2 = torch.empty(n, dtype=torch.float64).uniform_(0, 6, generator=g)
+    x2 = torch.empty(n, dtype=torch.float64).uniform_(0, 2.5, generator=g)
+    cuda_oracle.assert_bitwise_equal(
+        fn, torch.cat([a, a2]).to(dtype), torch.cat([x, x2]).to(dtype)
+    )
+
+
 @pytest.mark.parametrize(
     ("name", "fn", "half_ok", "a_range", "b_range"), _BINARY, ids=_BINARY_IDS
 )
@@ -618,9 +637,47 @@ def test_polynomial_scalars_match_cuda(cuda_oracle: CudaOracle, name: str):
 # --------------------------------------------------------------------------
 
 
+# float32 (alpha, x) pairs whose small-x result depends on which product of
+# `(log x - digamma(alpha)) * cdf - pow(x, alpha) * series2` is rounded.
+_SGG_SENSITIVE = [
+    (0x40239F7C, 0x3B926571),
+    (0x37CAD36F, 0x2F391E82),
+    (0x394DEB88, 0x3D52C39C),
+    (0x30AAACDA, 0x2F0333D0),
+]
+
+
+def _sgg_sensitive() -> tuple[torch.Tensor, torch.Tensor]:
+    a, x = zip(*_SGG_SENSITIVE, strict=True)
+    return _from_bits(list(a), torch.float32), _from_bits(list(x), torch.float32)
+
+
 @pytest.mark.parametrize("dtype", (*_F, torch.int32), ids=str)
 def test_standard_gamma_grad_matches_cuda(cuda_oracle: CudaOracle, dtype: torch.dtype):
     alpha, x = pair_inputs(dtype, (0.0, 20.0), (0.0, 20.0))
+    sa, sx = _sgg_sensitive()
+    alpha, x = torch.cat([alpha, sa.to(dtype)]), torch.cat([x, sx.to(dtype)])
+    # Whole launch blocks only: see test_standard_gamma_grad_remainder_block.
+    pad = -alpha.numel() % 4096
+    alpha = torch.cat([alpha, torch.full((pad,), 3.0, dtype=dtype)])
+    x = torch.cat([x, torch.full((pad,), 0.5, dtype=dtype)])
+    cuda_oracle.assert_bitwise_equal(torch.ops.aten._standard_gamma_grad, alpha, x)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="stock CUDA's float32 result depends on the element's position: "
+    "the remainder block of its vectorized launch runs a second inlined copy "
+    "of the small-x expression, which ptxas fuses the other way",
+)
+def test_standard_gamma_grad_remainder_block_matches_cuda(cuda_oracle: CudaOracle):
+    """In whole 1024-element blocks CUDA rounds pow(x, alpha) * series2 and
+    fuses the other product (what the mojo device computes); the first 128
+    elements of a partial last block round the other product instead, so
+    the same (alpha, x) gives different bits there."""
+    sa, sx = _sgg_sensitive()
+    alpha = torch.cat([sa, torch.full((508,), 3.0)])
+    x = torch.cat([sx, torch.full((508,), 0.5)])
     cuda_oracle.assert_bitwise_equal(torch.ops.aten._standard_gamma_grad, alpha, x)
 
 

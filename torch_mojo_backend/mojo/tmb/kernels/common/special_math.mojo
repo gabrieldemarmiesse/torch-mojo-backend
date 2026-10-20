@@ -1245,37 +1245,68 @@ def airy_ai[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 # Regularized incomplete gamma functions (igamma / igammac)
 # --------------------------------------------------------------------------- #
 #
-# cuda/IGammaKernel.cu (`calc_igamma` / `calc_igammac`, Cephes and DLMF) with
-# accscalar_t = float. The C++ promotes a handful of steps to double through
-# a double literal (0.4 * |a|, the 0.5 of the Lanczos terms, 1.1, -0.4 / log x,
-# the asymptotic correction term, the final 1 - ...): those compute in double
-# here too, the rest in float. On Apple GPUs, which have no double, they are
+# cuda/IGammaKernel.cu (`calc_igamma` / `calc_igammac`, Cephes and DLMF), an
+# nvcc kernel, with accscalar_t = T. For T = float the C++ promotes a handful
+# of steps to double through a double literal (0.4 * |a|, 1.1, -0.4 / log x,
+# the large-argument Lanczos exponent, the asymptotic correction term): those
+# compute in double here too. On Apple GPUs, which have no double, they are
 # float, as in torch MPS's c10/metal/igamma.h (the same code with every
-# accscalar_t and literal in float).
-
-comptime _IGAM_MACHEP = Float32(5.9604644775390625e-8)
+# accscalar_t and literal in float). Which products ptxas fuses follows the
+# sm_90 SASS of torch's kernels; it differs between float and double.
 
 
 @always_inline
 def _igd() -> DType:
-    """The type of the C++ double-literal steps: float64, float32 on Apple."""
+    """The type of the double-literal steps for T = float: float64, float32
+    on Apple."""
     return DType.float32 if is_apple_gpu() else DType.float64
 
 
 @always_inline
-def _igd_exp(x: Scalar[_igd()]) -> Scalar[_igd()]:
-    comptime if _igd() == DType.float64:
-        return nv_exp(x.cast[DType.float64]()).cast[_igd()]()
-    else:
-        return nv_expf(x.cast[DType.float32]()).cast[_igd()]()
+def _igw[dt: DType]() -> DType:
+    """The type of the double-literal steps for T = dt."""
+    return F64 if dt == F64 else _igd()
 
 
 @always_inline
-def _lanczos_sum_expg_scaled(x: Float32) -> Float32:
+def _igam_machep[dt: DType]() -> Scalar[dt]:
+    comptime if dt == F64:
+        return Scalar[dt](1.11022302462515654042e-16)
+    else:
+        return Scalar[dt](5.9604644775390625e-8)
+
+
+@always_inline
+def _igam_nan[dt: DType]() -> Scalar[dt]:
+    """nvcc's quiet_NaN(), 0x7fc00000 (0x7ff8000000000000 as a double)."""
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](Float64(from_bits=UInt64(0x7FF8000000000000)))
+    else:
+        return rebind[Scalar[dt]](_NAN)
+
+
+@always_inline
+def _igam_log[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_log(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_logf(rebind[Float32](x)))
+
+
+@always_inline
+def _igam_exp[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_exp(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_expf(rebind[Float32](x)))
+
+
+@always_inline
+def _lanczos_sum_expg_scaled[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """`lanczos_sum_expg_scaled` through `ratevl` (M = N = 12, so the
     pow(x, N - M) factor is 1): the rational function in x, or in 1 / x
     (coefficients reversed) for |x| > 1."""
-    comptime NUM = [
+    comptime NUM: Array[Float64, 13] = [
         0.006061842346248906525783753964555936883222,
         0.5098416655656676188125178644804694509993,
         19.51992788247617482847860966235652136208,
@@ -1290,7 +1321,7 @@ def _lanczos_sum_expg_scaled(x: Float32) -> Float32:
         103794043.1163445451906271053616070238554,
         56906521.91347156388090791033559122686859,
     ]
-    comptime DEN = [
+    comptime DEN: Array[Float64, 13] = [
         1.0,
         66.0,
         1925.0,
@@ -1305,126 +1336,153 @@ def _lanczos_sum_expg_scaled(x: Float32) -> Float32:
         39916800.0,
         0.0,
     ]
-    var num: Float32
-    var den: Float32
-    if _abs(x) > Float32(1.0):
-        var y = Float32(1.0) / x
+    var num: Scalar[dt]
+    var den: Scalar[dt]
+    if _absg(x) > Scalar[dt](1.0):
+        var y = Scalar[dt](1.0) / x
         comptime n12 = NUM[12]
         comptime d12 = DEN[12]
-        num = Float32(n12)
-        den = Float32(d12)
+        num = n12.cast[dt]()
+        den = d12.cast[dt]()
         comptime for i in range(1, 13):
             comptime ni = NUM[12 - i]
             comptime di = DEN[12 - i]
-            num = fma(num, y, Float32(ni))
-            den = fma(den, y, Float32(di))
+            num = fma(num, y, ni.cast[dt]())
+            den = fma(den, y, di.cast[dt]())
     else:
         comptime n0 = NUM[0]
         comptime d0 = DEN[0]
-        num = Float32(n0)
-        den = Float32(d0)
+        num = n0.cast[dt]()
+        den = d0.cast[dt]()
         comptime for i in range(1, 13):
             comptime ni = NUM[i]
             comptime di = DEN[i]
-            num = fma(num, x, Float32(ni))
-            den = fma(den, x, Float32(di))
+            num = fma(num, x, ni.cast[dt]())
+            den = fma(den, x, di.cast[dt]())
     return num / den
 
 
 @always_inline
-def _igam_helper_fac(a: Float32, x: Float32) -> Float32:
+def _igam_helper_fac[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     """x^a exp(-x) / Gamma(a), Lanczos-scaled near a ~ x."""
+    comptime w = _igw[dt]()
+    var far = _absg(a - x).cast[w]() > Scalar[w](0.4) * _absg(a).cast[w]()
     comptime if is_nvidia_gpu():
         # Out-of-line calls on NVIDIA: inlined, the GPU build if-converts
         # the branch and evaluates both heavy forms (lgamma + log + exp,
         # and Lanczos + sqrt + exp + pow) for every element, which made
         # igamma / igammac 1.3x torch on coherent inputs.
-        if Float64(_abs(a - x)) > 0.4 * Float64(_abs(a)):
+        if far:
             return _igam_fac_log_call(a, x)
         return _igam_fac_lanczos_call(a, x)
     else:
-        comptime D = Scalar[_igd()]
-        if D(_abs(a - x)) > D(0.4) * D(_abs(a)):
+        if far:
             return _igam_fac_log(a, x)
         return _igam_fac_lanczos(a, x)
 
 
 @no_inline
-def _igam_fac_log_call(a: Float32, x: Float32) -> Float32:
+def _igam_fac_log_call[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     return _igam_fac_log(a, x)
 
 
 @no_inline
-def _igam_fac_lanczos_call(a: Float32, x: Float32) -> Float32:
+def _igam_fac_lanczos_call[
+    dt: DType
+](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     return _igam_fac_lanczos(a, x)
 
 
 @always_inline
-def _igam_fac_log(a: Float32, x: Float32) -> Float32:
-    comptime MAXLOG = Float32(88.72283905206835)
-    var ax = a * nv_logf(x) - x - nv_lgammaf(a)
-    if ax < -MAXLOG:
-        return Float32(0.0)
-    return nv_expf(ax)
+def _igam_fac_log[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
+    comptime MAXLOG = (
+        7.09782712893383996843e2 if dt == F64 else 88.72283905206835
+    )
+    var ax = fma(a, _igam_log(x), -x) - _lgamma(a)
+    if ax < -Float64(MAXLOG).cast[dt]():
+        return Scalar[dt](0.0)
+    return _igam_exp(ax)
 
 
 @always_inline
-def _igam_fac_lanczos(a: Float32, x: Float32) -> Float32:
-    comptime EXP1 = Float32(2.718281828459045)
-    comptime G = Float32(6.024680040776729583740234375)
-    comptime D = Scalar[_igd()]
-    var fac = Float32(D(a + G) - D(0.5))
-    var res = ieee_sqrtf(fac / EXP1) / _lanczos_sum_expg_scaled(a)
-    if a < Float32(200.0) and x < Float32(200.0):
-        res *= nv_expf(a - x) * _powf(x / fac, a)
+def _igam_fac_lanczos[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
+    comptime T = Scalar[dt]
+    comptime w = _igw[dt]()
+    comptime W = Scalar[w]
+    comptime EXP1 = Float64(2.718281828459045).cast[dt]()
+    comptime G = Float64(6.024680040776729583740234375).cast[dt]()
+    var fac = a + G - T(0.5)
+    var res = _sqrt(fac / EXP1) / _lanczos_sum_expg_scaled(a)
+    if a < T(200.0) and x < T(200.0):
+        return res * (_igam_exp(a - x) * _pow(x / fac, a))
+    var num = x - a - G + T(0.5)
+    var numfac = num / fac
+    # x (0.5 - lanczos_g) / fac in double, lanczos_g already rounded to T.
+    var tail = x.cast[w]() * (W(0.5) - G.cast[w]()) / fac.cast[w]()
+    comptime if dt == F64:
+        var arg = fma(a, _log1p(numfac) - numfac, rebind[T](tail))
+        return res * _igam_exp(arg)
     else:
-        var num = Float32(D(x - a - G) + D(0.5))
-        var numfac = num / fac
-        var arg = D(a * (nv_log1pf(numfac) - numfac)) + D(x) * (
-            D(0.5) - D(G)
-        ) / D(fac)
-        res = Float32(D(res) * _igd_exp(arg))
-    return res
+        var arg = (a * (_log1p(numfac) - numfac)).cast[w]() + tail
+        comptime if w == F64:
+            return (
+                res.cast[w]() * rebind[W](nv_exp(rebind[Float64](arg)))
+            ).cast[dt]()
+        else:
+            return (res.cast[w]() * _igam_exp(arg)).cast[dt]()
 
 
 @always_inline
-def _igam_helper_series(a: Float32, x: Float32) -> Float32:
+def _igam_helper_series[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     """DLMF 8.11.4."""
+    comptime T = Scalar[dt]
     var ax = _igam_helper_fac(a, x)
-    if ax == Float32(0.0):
-        return Float32(0.0)
+    if ax == T(0.0):
+        return T(0.0)
     var r = a
-    var c = Float32(1.0)
-    var ans = Float32(1.0)
+    var c = T(1.0)
+    var ans = T(1.0)
     for _ in range(2000):
-        r += Float32(1.0)
-        c *= x / r
+        r += T(1.0)
+        c = _mul_rn(c, x / r)
         ans += c
-        if c <= _IGAM_MACHEP * ans:
+        if c <= _igam_machep[dt]() * ans:
             break
     return ans * ax / a
 
 
 @always_inline
-def _igamc_helper_series(a: Float32, x: Float32) -> Float32:
+def _igamc_helper_series[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     """DLMF 8.7.3, rearranged against cancellation."""
-    var fac = Float32(1.0)
-    var sum = Float32(0.0)
+    comptime T = Scalar[dt]
+    var fac = T(1.0)
+    var sum = T(0.0)
     for n in range(1, 2000):
-        fac *= -x / Float32(n)
-        var term = fac / (a + Float32(n))
+        fac *= -x / T(n)
+        var term = fac / (a + T(n))
         sum += term
-        if _abs(term) <= _IGAM_MACHEP * _abs(sum):
+        if _absg(term) <= _igam_machep[dt]() * _absg(sum):
             break
-    var logx = nv_logf(x)
-    var term = -nv_expm1f(a * logx - nv_lgammaf(Float32(1.0) + a))
-    return term - nv_expf(a * logx - nv_lgammaf(a)) * sum
+    var logx = _igam_log(x)
+    var lg1 = _lgamma(T(1.0) + a)
+    var lg = _lgamma(a)
+    var em1: T
+    var e: T
+    comptime if dt == F64:
+        var p = _mul_rn(a, logx)
+        em1 = _expm1(p - lg1)
+        e = _igam_exp(p - lg)
+    else:
+        em1 = _expm1(fma(a, logx, -lg1))
+        e = _igam_exp(fma(a, logx, -lg))
+    # -expm1(..) - exp(..) * sum, one rounding.
+    return fma(-sum, e, -em1)
 
 
 @always_inline
-def _igam_helper_asymptotic_series(
-    a: Float32, x: Float32, igam: Bool
-) -> Float32:
+def _igam_helper_asymptotic_series[
+    dt: DType
+](a: Scalar[dt], x: Scalar[dt], igam: Bool) -> Scalar[dt]:
     """DLMF 8.12.3 / 8.12.4, the uniform expansion for large a ~ x."""
     comptime if is_nvidia_gpu():
         # The coefficient table by reference in global memory rather than
@@ -1435,7 +1493,7 @@ def _igam_helper_asymptotic_series(
         # through a comptime binary search: a materialized table becomes an
         # address-space-0 global, which Metal cannot link ("Undefined
         # symbols: global_constant").
-        return _igam_asymptotic[DType.float32, True](
+        return _igam_asymptotic[dt, DType.float32, True](
             Array[Float32, 625](uninitialized=True), a, x, igam
         )
     else:
@@ -1457,167 +1515,202 @@ def _igam_d_at[lo: Int, hi: Int](i: Int) -> Float32:
 
 @always_inline
 def _igam_asymptotic[
-    td: DType, tree: Bool = False
-](table: Array[Scalar[td], 625], a: Float32, x: Float32, igam: Bool) -> Float32:
-    comptime D = Scalar[_igd()]
-    var sgn = Float32(-1.0) if igam else Float32(1.0)
+    dt: DType, td: DType, tree: Bool = False
+](
+    table: Array[Scalar[td], 625], a: Scalar[dt], x: Scalar[dt], igam: Bool
+) -> Scalar[dt]:
+    comptime T = Scalar[dt]
+    comptime w = _igw[dt]()
+    comptime W = Scalar[w]
+    var machep = _igam_machep[dt]()
+    var sgn = T(-1.0) if igam else T(1.0)
     var lam = x / a
     var sigma = (x - a) / a
-    var eta = Float32(0.0)
-    if lam > Float32(1.0):
-        eta = ieee_sqrtf(Float32(-2.0) * (nv_log1pf(sigma) - sigma))
-    elif lam < Float32(1.0):
-        eta = -ieee_sqrtf(Float32(-2.0) * (nv_log1pf(sigma) - sigma))
-    var res = Float32(
-        D(0.5) * D(nv_erfcf(sgn * eta * ieee_sqrtf(a / Float32(2.0))))
-    )
-    var etapow = Array[Float32, 25](fill=Float32(0.0))
-    etapow[0] = Float32(1.0)
+    var eta = T(0.0)
+    if lam > T(1.0):
+        eta = _sqrt(T(-2.0) * (_log1p(sigma) - sigma))
+    elif lam < T(1.0):
+        eta = _neg(_sqrt(T(-2.0) * (_log1p(sigma) - sigma)))
+    var erfc_v = _erfc(sgn * eta * _sqrt(a / T(2.0)))
+    var etapow = Array[T, 25](fill=T(0.0))
+    etapow[0] = T(1.0)
     var maxpow = 0
-    var sum = Float32(0.0)
-    var afac = Float32(1.0)
-    var absoldterm = _INF
+    var sum = T(0.0)
+    var afac = T(1.0)
+    var absoldterm = _inf[dt]()
     for k in range(25):
-        var ck: Float32
+        var ck: T
         comptime if tree:
-            ck = _igam_d_at[0, 625](25 * k)
+            ck = _igam_d_at[0, 625](25 * k).cast[dt]()
         else:
-            ck = Float32(table[25 * k])
+            ck = table[25 * k].cast[dt]()
         for n in range(1, 25):
             if n > maxpow:
                 etapow[n] = eta * etapow[n - 1]
                 maxpow += 1
-            var dkn: Float32
+            var dkn: T
             comptime if tree:
-                dkn = _igam_d_at[0, 625](25 * k + n)
+                dkn = _igam_d_at[0, 625](25 * k + n).cast[dt]()
             else:
-                dkn = Float32(table[25 * k + n])
-            var ckterm = dkn * etapow[n]
-            ck += ckterm
-            if _abs(ckterm) < _IGAM_MACHEP * _abs(ck):
+                dkn = table[25 * k + n].cast[dt]()
+            if n == 24:
+                # the last term's break test is dead: ptxas fuses it
+                ck = fma(dkn, etapow[n], ck)
                 break
-        var term = ck * afac
-        var absterm = _abs(term)
+            var ckterm = _mul_rn(dkn, etapow[n])
+            ck += ckterm
+            if _absg(ckterm) < machep * _absg(ck):
+                break
+        var term = _mul_rn(ck, afac)
+        var absterm = _absg(term)
         if absterm > absoldterm:
             break
         sum += term
-        if absterm < _IGAM_MACHEP * _abs(sum):
+        if absterm < machep * _absg(sum):
             break
         absoldterm = absterm
         afac /= a
-    var ad = D(a)
-    var ed = D(eta)
+    var ad = a.cast[w]()
+    var ed = eta.cast[w]()
+    var ex: W
+    comptime if w == F64:
+        ex = rebind[W](nv_exp(rebind[Float64](W(-0.5) * ad * ed * ed)))
+    else:
+        ex = rebind[W](nv_expf(rebind[Float32](W(-0.5) * ad * ed * ed)))
     var corr = (
-        D(sgn)
-        * _igd_exp(D(-0.5) * ad * ed * ed)
-        * D(sum)
-        / llvm_intrinsic["llvm.sqrt", D, has_side_effect=False](
-            D(2) * D(3.1415926535) * ad
-        )
+        sgn.cast[w]() * ex * sum.cast[w]() / _sqrt(W(2) * W(3.1415926535) * ad)
     )
-    return Float32(D(res) + corr)
+    comptime if dt == F64:
+        return fma(erfc_v, T(0.5), rebind[T](corr))
+    else:
+        var res = (W(0.5) * erfc_v.cast[w]()).cast[dt]()
+        return (res.cast[w]() + corr).cast[dt]()
 
 
 @always_inline
-def _igamc_helper_continued_fraction(a: Float32, x: Float32) -> Float32:
+def _igamc_helper_continued_fraction[
+    dt: DType
+](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     """DLMF 8.9.2."""
-    comptime BIG = Float32(16777216.0)
-    comptime BIGINV = Float32(5.9604644775390625e-8)
+    comptime T = Scalar[dt]
+    comptime BIG = Float64(
+        4.503599627370496e15 if dt == F64 else 16777216.0
+    ).cast[dt]()
+    comptime BIGINV = Float64(
+        2.22044604925031308085e-16 if dt == F64 else 5.9604644775390625e-8
+    ).cast[dt]()
     var ax = _igam_helper_fac(a, x)
-    if ax == Float32(0.0):
-        return Float32(0.0)
-    var y = Float32(1.0) - a
-    var z = x + y + Float32(1.0)
-    var c = Float32(0.0)
-    var pkm2 = Float32(1.0)
+    if ax == T(0.0):
+        return T(0.0)
+    var y = T(1.0) - a
+    var z = x + y + T(1.0)
+    var c = T(0.0)
+    var pkm2 = T(1.0)
     var qkm2 = x
-    var pkm1 = x + Float32(1.0)
+    var pkm1 = x + T(1.0)
     var qkm1 = z * x
     var ans = pkm1 / qkm1
     for _ in range(2000):
-        c += Float32(1.0)
-        y += Float32(1.0)
-        z += Float32(2.0)
+        c += T(1.0)
+        y += T(1.0)
+        z += T(2.0)
         var yc = y * c
-        var pk = pkm1 * z - pkm2 * yc
-        var qk = qkm1 * z - qkm2 * yc
-        var t: Float32
-        if qk != Float32(0.0):
+        var pk = fma(pkm1, z, -_mul_rn(pkm2, yc))
+        var qk = fma(qkm1, z, -_mul_rn(qkm2, yc))
+        var t: T
+        if qk != T(0.0):
             var r = pk / qk
-            t = _abs((ans - r) / r)
+            t = _absg((ans - r) / r)
             ans = r
         else:
-            t = Float32(1.0)
+            t = T(1.0)
         pkm2 = pkm1
         pkm1 = pk
         qkm2 = qkm1
         qkm1 = qk
-        if _abs(pk) > BIG:
+        if _absg(pk) > BIG:
             pkm2 *= BIGINV
             pkm1 *= BIGINV
             qkm2 *= BIGINV
             qkm1 *= BIGINV
-        if t <= _IGAM_MACHEP:
+        if t <= _igam_machep[dt]():
             break
     return ans * ax
 
 
 @always_inline
-def _igam_asymptotic_regime(a: Float32, x: Float32) -> Bool:
-    var absxma_a = _abs(x - a) / a
-    if a > Float32(20.0) and a < Float32(200.0) and absxma_a < Float32(0.3):
+def _igam_asymptotic_regime[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Bool:
+    comptime T = Scalar[dt]
+    var absxma_a = _absg(x - a) / a
+    if a > T(20.0) and a < T(200.0) and absxma_a < T(0.3):
         return True
-    return a > Float32(200.0) and absxma_a < Float32(4.5) / ieee_sqrtf(a)
+    return a > T(200.0) and absxma_a < T(4.5) / _sqrt(a)
 
 
 @always_inline
-def igammac_f(a: Float32, x: Float32) -> Float32:
+def igammac[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     """`calc_igammac`: the regularized upper incomplete gamma Q(a, x)."""
-    if x < Float32(0.0) or a < Float32(0.0):
-        return _NAN
-    if a == Float32(0.0):
-        return Float32(0.0) if x > Float32(0.0) else _NAN
-    if x == Float32(0.0):
-        return Float32(1.0)
-    if _abs(a) == _INF:
-        return _NAN if _abs(x) == _INF else Float32(1.0)
-    if _abs(x) == _INF:
-        return Float32(0.0)
+    comptime T = Scalar[dt]
+    comptime w = _igw[dt]()
+    comptime W = Scalar[w]
+    if x < T(0.0) or a < T(0.0):
+        return _igam_nan[dt]()
+    if a == T(0.0):
+        return T(0.0) if x > T(0.0) else _igam_nan[dt]()
+    if x == T(0.0):
+        return T(1.0)
+    if _isinf(a):
+        return _igam_nan[dt]() if _isinf(x) else T(1.0)
+    if _isinf(x):
+        return T(0.0)
     if _igam_asymptotic_regime(a, x):
         return _igam_helper_asymptotic_series(a, x, False)
-    comptime D = Scalar[_igd()]
-    if D(x) > D(1.1):
+    if x.cast[w]() > W(1.1):
         if x < a:
-            return Float32(D(1.0) - D(_igam_helper_series(a, x)))
+            return (W(1.0) - _igam_helper_series(a, x).cast[w]()).cast[dt]()
         return _igamc_helper_continued_fraction(a, x)
-    if x <= Float32(0.5):
-        if D(-0.4) / D(nv_logf(x)) < D(a):
-            return Float32(D(1.0) - D(_igam_helper_series(a, x)))
+    if x <= T(0.5):
+        if W(-0.4) / _igam_log(x).cast[w]() < a.cast[w]():
+            return (W(1.0) - _igam_helper_series(a, x).cast[w]()).cast[dt]()
         return _igamc_helper_series(a, x)
-    if D(x) * D(1.1) < D(a):
-        return Float32(D(1.0) - D(_igam_helper_series(a, x)))
+    if x.cast[w]() * W(1.1) < a.cast[w]():
+        return (W(1.0) - _igam_helper_series(a, x).cast[w]()).cast[dt]()
     return _igamc_helper_series(a, x)
 
 
 @always_inline
-def igamma_f(a: Float32, x: Float32) -> Float32:
+def igamma[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     """`calc_igamma`: the regularized lower incomplete gamma P(a, x)."""
-    if x < Float32(0.0) or a < Float32(0.0):
-        return _NAN
-    if a == Float32(0.0):
-        return Float32(1.0) if x > Float32(0.0) else _NAN
-    if x == Float32(0.0):
-        return Float32(0.0)
-    if _abs(a) == _INF:
-        return _NAN if _abs(x) == _INF else Float32(0.0)
-    if _abs(x) == _INF:
-        return Float32(1.0)
+    comptime T = Scalar[dt]
+    comptime w = _igw[dt]()
+    comptime W = Scalar[w]
+    if x < T(0.0) or a < T(0.0):
+        return _igam_nan[dt]()
+    if a == T(0.0):
+        return T(1.0) if x > T(0.0) else _igam_nan[dt]()
+    if x == T(0.0):
+        return T(0.0)
+    if _isinf(a):
+        return _igam_nan[dt]() if _isinf(x) else T(0.0)
+    if _isinf(x):
+        return T(1.0)
     if _igam_asymptotic_regime(a, x):
         return _igam_helper_asymptotic_series(a, x, True)
-    if x > Float32(1.0) and x > a:
-        comptime D = Scalar[_igd()]
-        return Float32(D(1.0) - D(igammac_f(a, x)))
+    if x > T(1.0) and x > a:
+        var q: T
+        comptime if is_nvidia_gpu() and dt == F64:
+            # out of line, as CUDA's __noinline__ calc_igammac: inlined, the
+            # float64 kernel was 1.5x slower (float32: 5% faster inlined)
+            q = _igammac_call(a, x)
+        else:
+            q = igammac(a, x)
+        return (W(1.0) - q.cast[w]()).cast[dt]()
     return _igam_helper_series(a, x)
+
+
+@no_inline
+def _igammac_call[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
+    return igammac(a, x)
 
 
 # --------------------------------------------------------------------------- #

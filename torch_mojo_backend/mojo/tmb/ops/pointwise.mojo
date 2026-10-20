@@ -836,22 +836,22 @@ def op_hypot_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::igamma(Tensor self, Tensor other) -> Tensor
 def op_igamma(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igamma", P_FLOAT, False, 2, args, rets, -1)
+    _pw_math("igamma", P_FLOAT_ONLY, True, 2, args, rets, -1)
 
 
 # aten::igamma.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_igamma_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igamma", P_FLOAT, False, 2, args, rets, 2)
+    _pw_math("igamma", P_FLOAT_ONLY, True, 2, args, rets, 2)
 
 
 # aten::igammac(Tensor self, Tensor other) -> Tensor
 def op_igammac(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igammac", P_FLOAT, False, 2, args, rets, -1)
+    _pw_math("igammac", P_FLOAT_ONLY, True, 2, args, rets, -1)
 
 
 # aten::igammac.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_igammac_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igammac", P_FLOAT, False, 2, args, rets, 2)
+    _pw_math("igammac", P_FLOAT_ONLY, True, 2, args, rets, 2)
 
 
 # aten::logaddexp(Tensor self, Tensor other) -> Tensor
@@ -3923,12 +3923,13 @@ def _pw_floating_dispatch(name: StaticString, st: Int32, half_ok: Bool) raises:
     if half_ok:
         ok = ok or st == ST_FLOAT16 or st == ST_BFLOAT16
     if not ok:
-        raise Error(
-            '"',
-            name,
-            "\" not implemented for '",
-            _scalar_type_name(max_dtype(st)),
-            "'",
+        # AT_DISPATCH's refusal is a NotImplementedError
+        unsupported(
+            String('"')
+            + name
+            + "\" not implemented for '"
+            + _scalar_type_name(max_dtype(st))
+            + "'"
         )
 
 
