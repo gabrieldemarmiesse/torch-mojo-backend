@@ -70,7 +70,7 @@ from tmb.backend.abi import (
     v_tensor,
     view_strided,
 )
-from tmb.backend.device import ctx_for, ctx_ptr
+from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.f8_iter import (
     cuda_device_check,
@@ -1568,7 +1568,13 @@ def _pw_act(
     # out= (or an output made from self's options) of another floating
     # dtype is computed in, its operands converted to that dtype first.
     # log_sigmoid_backward dispatches on the common dtype.
-    if kind != "log_sigmoid_backward" and not _pw_out_exact(kind):
+    # CUDA only: the other devices keep the common-dtype policy.
+    if (
+        kind != "log_sigmoid_backward"
+        and not _pw_out_exact(kind)
+        and a.is_t
+        and dev(a.t.value().device)[].api == "cuda"
+    ):
         var target = dest.value().stype if dest else result_st
         if (
             target != compute
