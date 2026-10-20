@@ -343,6 +343,11 @@ def test_logit_eps_matches_cuda(
 def test_polygamma_matches_cuda(cuda_oracle: CudaOracle, n: int, dtype: torch.dtype):
     if dtype.is_floating_point:
         x = float_inputs(dtype, ((-20.0, 30.0), (0.0, 3.0)))
+        if dtype == torch.float64 and n >= 2:
+            # zeta(n + 1, q) of a negative non-integer q walks |q| terms on
+            # CUDA and here alike (4 s at -1e7, over 150 s at -1e9, hours near
+            # -2**52): cap the walk instead of timing both sides out.
+            x = x[(x > -1e7) | (x == x.floor()) | x.isnan()]
     else:
         x = int_inputs(dtype)
     cuda_oracle.assert_bitwise_equal(lambda t: torch.polygamma(n, t), x)

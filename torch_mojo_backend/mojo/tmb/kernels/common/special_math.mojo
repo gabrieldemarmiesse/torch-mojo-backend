@@ -568,7 +568,7 @@ def trigamma[dt: DType](x_in: Scalar[dt]) -> Scalar[dt]:
         + one / (T(2.0) * x)
         + ixx * (one / T(6.0) - ixx * (one / T(30.0) - ixx * (one / T(42.0))))
     ) / x
-    return sign * result
+    return _mul_rn(sign, result)  # a real mul: fneg would flip a NaN's sign
 
 
 @always_inline
