@@ -280,13 +280,13 @@ comptime _WIDE_MIN_NUMEL = 1 << 21
 
 def _rrelu_bits[kind: StaticString, dt: DType]() -> Bool:
     """The float32-lane parameter encoding of `_rrelu` (kernels/common/
-    pointwise_math.mojo): rrelu on a float32 or half operand off Apple,
-    whose parameter lanes carry the bits of two doubles. Every other kind
-    and dtype keeps the parameter channel it always had."""
+    pointwise_math.mojo): rrelu on a float32 or half operand on NVIDIA,
+    whose parameter lanes carry the bits of two doubles. Every other kind,
+    dtype and target keeps the parameter channel it always had."""
     return (
         (kind == "rrelu_train" or kind == "rrelu_noise")
         and (dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16)
-        and not has_apple_gpu_accelerator()
+        and has_nvidia_gpu_accelerator()
     )
 
 

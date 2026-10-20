@@ -2077,19 +2077,23 @@ def _rrelu[
         # (lower, span) as doubles: the parameter lanes hold their bits
         # (kernels/pointwise/entry.mojo, `_rrelu_bits`) for a float32 or
         # half draw, and the double itself for float64.
-        # RreluWithNoise.cu: `scalar_t r = static_cast<scalar_t>(draw)`, so
-        # a half draw is rounded to the half type before the slope.
-        comptime if out_dtype == DType.float16 or out_dtype == DType.bfloat16:
-            u = u.cast[out_dtype]().cast[dtype]()
         var lower: Float64
         var span: Float64
-        comptime if dtype == DType.float64:
-            lower = p[0].cast[DType.float64]()
-            span = p[1].cast[DType.float64]()
-        else:
-            var pw = bitcast[DType.float64, 2](p.cast[DType.float32]())
+        comptime if is_nvidia_gpu() and dtype != DType.float64:
+            # RreluWithNoise.cu: `scalar_t r = static_cast<scalar_t>(draw)`,
+            # so a half draw is rounded to the half type before the slope.
+            comptime if out_dtype == DType.float16 or out_dtype == DType.bfloat16:
+                u = u.cast[out_dtype]().cast[dtype]()
+            # (lower, span) as doubles: the parameter lanes hold their bits
+            # (kernels/pointwise/entry.mojo, `_rrelu_bits`).
+            var pw = bitcast[DType.float64, 2](
+                rebind[SIMD[DType.float32, 4]](p)
+            )
             lower = pw[0]
             span = pw[1]
+        else:
+            lower = p[0].cast[DType.float64]() + p[2].cast[DType.float64]()
+            span = p[1].cast[DType.float64]() + p[3].cast[DType.float64]()
         var rd = u.cast[DType.float64]().fma(
             SIMD[DType.float64, n](span), SIMD[DType.float64, n](lower)
         )
