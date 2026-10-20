@@ -1714,6 +1714,377 @@ def _igammac_call[dt: DType](a: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
 
 
 # --------------------------------------------------------------------------- #
+# Float32-only igamma / igammac for AMD and Apple GPUs
+# --------------------------------------------------------------------------- #
+#
+# The code those targets ran before the NVIDIA bit-exact port above; kept
+# byte-for-byte equivalent so their kernels do not move until they get a
+# port of their own (each name carries a _legacy suffix).
+
+#
+# cuda/IGammaKernel.cu (`calc_igamma` / `calc_igammac`, Cephes and DLMF) with
+# accscalar_t = float. The C++ promotes a handful of steps to double through
+# a double literal (0.4 * |a|, the 0.5 of the Lanczos terms, 1.1, -0.4 / log x,
+# the asymptotic correction term, the final 1 - ...): those compute in double
+# here too, the rest in float. On Apple GPUs, which have no double, they are
+# float, as in torch MPS's c10/metal/igamma.h (the same code with every
+# accscalar_t and literal in float).
+
+comptime _IGAM_MACHEP_legacy = Float32(5.9604644775390625e-8)
+
+
+@always_inline
+def _igd_legacy() -> DType:
+    """The type of the C++ double-literal steps: float64, float32 on Apple."""
+    return DType.float32 if is_apple_gpu() else DType.float64
+
+
+@always_inline
+def _igd_exp_legacy(x: Scalar[_igd_legacy()]) -> Scalar[_igd_legacy()]:
+    comptime if _igd_legacy() == DType.float64:
+        return nv_exp(x.cast[DType.float64]()).cast[_igd_legacy()]()
+    else:
+        return nv_expf(x.cast[DType.float32]()).cast[_igd_legacy()]()
+
+
+@always_inline
+def _lanczos_sum_expg_scaled_legacy(x: Float32) -> Float32:
+    """`lanczos_sum_expg_scaled` through `ratevl` (M = N = 12, so the
+    pow(x, N - M) factor is 1): the rational function in x, or in 1 / x
+    (coefficients reversed) for |x| > 1."""
+    comptime NUM = [
+        0.006061842346248906525783753964555936883222,
+        0.5098416655656676188125178644804694509993,
+        19.51992788247617482847860966235652136208,
+        449.9445569063168119446858607650988409623,
+        6955.999602515376140356310115515198987526,
+        75999.29304014542649875303443598909137092,
+        601859.6171681098786670226533699352302507,
+        3481712.15498064590882071018964774556468,
+        14605578.08768506808414169982791359218571,
+        43338889.32467613834773723740590533316085,
+        86363131.28813859145546927288977868422342,
+        103794043.1163445451906271053616070238554,
+        56906521.91347156388090791033559122686859,
+    ]
+    comptime DEN = [
+        1.0,
+        66.0,
+        1925.0,
+        32670.0,
+        357423.0,
+        2637558.0,
+        13339535.0,
+        45995730.0,
+        105258076.0,
+        150917976.0,
+        120543840.0,
+        39916800.0,
+        0.0,
+    ]
+    var num: Float32
+    var den: Float32
+    if _abs(x) > Float32(1.0):
+        var y = Float32(1.0) / x
+        comptime n12 = NUM[12]
+        comptime d12 = DEN[12]
+        num = Float32(n12)
+        den = Float32(d12)
+        comptime for i in range(1, 13):
+            comptime ni = NUM[12 - i]
+            comptime di = DEN[12 - i]
+            num = fma(num, y, Float32(ni))
+            den = fma(den, y, Float32(di))
+    else:
+        comptime n0 = NUM[0]
+        comptime d0 = DEN[0]
+        num = Float32(n0)
+        den = Float32(d0)
+        comptime for i in range(1, 13):
+            comptime ni = NUM[i]
+            comptime di = DEN[i]
+            num = fma(num, x, Float32(ni))
+            den = fma(den, x, Float32(di))
+    return num / den
+
+
+@always_inline
+def _igam_helper_fac_legacy(a: Float32, x: Float32) -> Float32:
+    """x^a exp(-x) / Gamma(a), Lanczos-scaled near a ~ x."""
+    comptime if is_nvidia_gpu():
+        # Out-of-line calls on NVIDIA: inlined, the GPU build if-converts
+        # the branch and evaluates both heavy forms (lgamma + log + exp,
+        # and Lanczos + sqrt + exp + pow) for every element, which made
+        # igamma / igammac 1.3x torch on coherent inputs.
+        if Float64(_abs(a - x)) > 0.4 * Float64(_abs(a)):
+            return _igam_fac_log_call_legacy(a, x)
+        return _igam_fac_lanczos_call_legacy(a, x)
+    else:
+        comptime D = Scalar[_igd_legacy()]
+        if D(_abs(a - x)) > D(0.4) * D(_abs(a)):
+            return _igam_fac_log_legacy(a, x)
+        return _igam_fac_lanczos_legacy(a, x)
+
+
+@no_inline
+def _igam_fac_log_call_legacy(a: Float32, x: Float32) -> Float32:
+    return _igam_fac_log_legacy(a, x)
+
+
+@no_inline
+def _igam_fac_lanczos_call_legacy(a: Float32, x: Float32) -> Float32:
+    return _igam_fac_lanczos_legacy(a, x)
+
+
+@always_inline
+def _igam_fac_log_legacy(a: Float32, x: Float32) -> Float32:
+    comptime MAXLOG = Float32(88.72283905206835)
+    var ax = a * nv_logf(x) - x - nv_lgammaf(a)
+    if ax < -MAXLOG:
+        return Float32(0.0)
+    return nv_expf(ax)
+
+
+@always_inline
+def _igam_fac_lanczos_legacy(a: Float32, x: Float32) -> Float32:
+    comptime EXP1 = Float32(2.718281828459045)
+    comptime G = Float32(6.024680040776729583740234375)
+    comptime D = Scalar[_igd_legacy()]
+    var fac = Float32(D(a + G) - D(0.5))
+    var res = ieee_sqrtf(fac / EXP1) / _lanczos_sum_expg_scaled_legacy(a)
+    if a < Float32(200.0) and x < Float32(200.0):
+        res *= nv_expf(a - x) * _powf(x / fac, a)
+    else:
+        var num = Float32(D(x - a - G) + D(0.5))
+        var numfac = num / fac
+        var arg = D(a * (nv_log1pf(numfac) - numfac)) + D(x) * (
+            D(0.5) - D(G)
+        ) / D(fac)
+        res = Float32(D(res) * _igd_exp_legacy(arg))
+    return res
+
+
+@always_inline
+def _igam_helper_series_legacy(a: Float32, x: Float32) -> Float32:
+    """DLMF 8.11.4."""
+    var ax = _igam_helper_fac_legacy(a, x)
+    if ax == Float32(0.0):
+        return Float32(0.0)
+    var r = a
+    var c = Float32(1.0)
+    var ans = Float32(1.0)
+    for _ in range(2000):
+        r += Float32(1.0)
+        c *= x / r
+        ans += c
+        if c <= _IGAM_MACHEP_legacy * ans:
+            break
+    return ans * ax / a
+
+
+@always_inline
+def _igamc_helper_series_legacy(a: Float32, x: Float32) -> Float32:
+    """DLMF 8.7.3, rearranged against cancellation."""
+    var fac = Float32(1.0)
+    var sum = Float32(0.0)
+    for n in range(1, 2000):
+        fac *= -x / Float32(n)
+        var term = fac / (a + Float32(n))
+        sum += term
+        if _abs(term) <= _IGAM_MACHEP_legacy * _abs(sum):
+            break
+    var logx = nv_logf(x)
+    var term = -nv_expm1f(a * logx - nv_lgammaf(Float32(1.0) + a))
+    return term - nv_expf(a * logx - nv_lgammaf(a)) * sum
+
+
+@always_inline
+def _igam_helper_asymptotic_series_legacy(
+    a: Float32, x: Float32, igam: Bool
+) -> Float32:
+    """DLMF 8.12.3 / 8.12.4, the uniform expansion for large a ~ x."""
+    comptime if is_nvidia_gpu():
+        # The coefficient table by reference in global memory rather than
+        # materialized per thread.
+        return _igam_asymptotic_legacy(global_constant[_IGAM_D](), a, x, igam)
+    elif is_apple_gpu():
+        # float coefficients, as MPS's `const accscalar_t d[25][25]`, read
+        # through a comptime binary search: a materialized table becomes an
+        # address-space-0 global, which Metal cannot link ("Undefined
+        # symbols: global_constant").
+        return _igam_asymptotic_legacy[DType.float32, True](
+            Array[Float32, 625](uninitialized=True), a, x, igam
+        )
+    else:
+        return _igam_asymptotic_legacy(materialize[_IGAM_D](), a, x, igam)
+
+
+@always_inline
+def _igam_asymptotic_legacy[
+    td: DType, tree: Bool = False
+](table: Array[Scalar[td], 625], a: Float32, x: Float32, igam: Bool) -> Float32:
+    comptime D = Scalar[_igd_legacy()]
+    var sgn = Float32(-1.0) if igam else Float32(1.0)
+    var lam = x / a
+    var sigma = (x - a) / a
+    var eta = Float32(0.0)
+    if lam > Float32(1.0):
+        eta = ieee_sqrtf(Float32(-2.0) * (nv_log1pf(sigma) - sigma))
+    elif lam < Float32(1.0):
+        eta = -ieee_sqrtf(Float32(-2.0) * (nv_log1pf(sigma) - sigma))
+    var res = Float32(
+        D(0.5) * D(nv_erfcf(sgn * eta * ieee_sqrtf(a / Float32(2.0))))
+    )
+    var etapow = Array[Float32, 25](fill=Float32(0.0))
+    etapow[0] = Float32(1.0)
+    var maxpow = 0
+    var sum = Float32(0.0)
+    var afac = Float32(1.0)
+    var absoldterm = _INF
+    for k in range(25):
+        var ck: Float32
+        comptime if tree:
+            ck = _igam_d_at[0, 625](25 * k)
+        else:
+            ck = Float32(table[25 * k])
+        for n in range(1, 25):
+            if n > maxpow:
+                etapow[n] = eta * etapow[n - 1]
+                maxpow += 1
+            var dkn: Float32
+            comptime if tree:
+                dkn = _igam_d_at[0, 625](25 * k + n)
+            else:
+                dkn = Float32(table[25 * k + n])
+            var ckterm = dkn * etapow[n]
+            ck += ckterm
+            if _abs(ckterm) < _IGAM_MACHEP_legacy * _abs(ck):
+                break
+        var term = ck * afac
+        var absterm = _abs(term)
+        if absterm > absoldterm:
+            break
+        sum += term
+        if absterm < _IGAM_MACHEP_legacy * _abs(sum):
+            break
+        absoldterm = absterm
+        afac /= a
+    var ad = D(a)
+    var ed = D(eta)
+    var corr = (
+        D(sgn)
+        * _igd_exp_legacy(D(-0.5) * ad * ed * ed)
+        * D(sum)
+        / llvm_intrinsic["llvm.sqrt", D, has_side_effect=False](
+            D(2) * D(3.1415926535) * ad
+        )
+    )
+    return Float32(D(res) + corr)
+
+
+@always_inline
+def _igamc_helper_continued_fraction_legacy(a: Float32, x: Float32) -> Float32:
+    """DLMF 8.9.2."""
+    comptime BIG = Float32(16777216.0)
+    comptime BIGINV = Float32(5.9604644775390625e-8)
+    var ax = _igam_helper_fac_legacy(a, x)
+    if ax == Float32(0.0):
+        return Float32(0.0)
+    var y = Float32(1.0) - a
+    var z = x + y + Float32(1.0)
+    var c = Float32(0.0)
+    var pkm2 = Float32(1.0)
+    var qkm2 = x
+    var pkm1 = x + Float32(1.0)
+    var qkm1 = z * x
+    var ans = pkm1 / qkm1
+    for _ in range(2000):
+        c += Float32(1.0)
+        y += Float32(1.0)
+        z += Float32(2.0)
+        var yc = y * c
+        var pk = pkm1 * z - pkm2 * yc
+        var qk = qkm1 * z - qkm2 * yc
+        var t: Float32
+        if qk != Float32(0.0):
+            var r = pk / qk
+            t = _abs((ans - r) / r)
+            ans = r
+        else:
+            t = Float32(1.0)
+        pkm2 = pkm1
+        pkm1 = pk
+        qkm2 = qkm1
+        qkm1 = qk
+        if _abs(pk) > BIG:
+            pkm2 *= BIGINV
+            pkm1 *= BIGINV
+            qkm2 *= BIGINV
+            qkm1 *= BIGINV
+        if t <= _IGAM_MACHEP_legacy:
+            break
+    return ans * ax
+
+
+@always_inline
+def _igam_asymptotic_regime_legacy(a: Float32, x: Float32) -> Bool:
+    var absxma_a = _abs(x - a) / a
+    if a > Float32(20.0) and a < Float32(200.0) and absxma_a < Float32(0.3):
+        return True
+    return a > Float32(200.0) and absxma_a < Float32(4.5) / ieee_sqrtf(a)
+
+
+@always_inline
+def igammac_f_legacy(a: Float32, x: Float32) -> Float32:
+    """`calc_igammac`: the regularized upper incomplete gamma Q(a, x)."""
+    if x < Float32(0.0) or a < Float32(0.0):
+        return _NAN
+    if a == Float32(0.0):
+        return Float32(0.0) if x > Float32(0.0) else _NAN
+    if x == Float32(0.0):
+        return Float32(1.0)
+    if _abs(a) == _INF:
+        return _NAN if _abs(x) == _INF else Float32(1.0)
+    if _abs(x) == _INF:
+        return Float32(0.0)
+    if _igam_asymptotic_regime_legacy(a, x):
+        return _igam_helper_asymptotic_series_legacy(a, x, False)
+    comptime D = Scalar[_igd_legacy()]
+    if D(x) > D(1.1):
+        if x < a:
+            return Float32(D(1.0) - D(_igam_helper_series_legacy(a, x)))
+        return _igamc_helper_continued_fraction_legacy(a, x)
+    if x <= Float32(0.5):
+        if D(-0.4) / D(nv_logf(x)) < D(a):
+            return Float32(D(1.0) - D(_igam_helper_series_legacy(a, x)))
+        return _igamc_helper_series_legacy(a, x)
+    if D(x) * D(1.1) < D(a):
+        return Float32(D(1.0) - D(_igam_helper_series_legacy(a, x)))
+    return _igamc_helper_series_legacy(a, x)
+
+
+@always_inline
+def igamma_f_legacy(a: Float32, x: Float32) -> Float32:
+    """`calc_igamma`: the regularized lower incomplete gamma P(a, x)."""
+    if x < Float32(0.0) or a < Float32(0.0):
+        return _NAN
+    if a == Float32(0.0):
+        return Float32(1.0) if x > Float32(0.0) else _NAN
+    if x == Float32(0.0):
+        return Float32(0.0)
+    if _abs(a) == _INF:
+        return _NAN if _abs(x) == _INF else Float32(0.0)
+    if _abs(x) == _INF:
+        return Float32(1.0)
+    if _igam_asymptotic_regime_legacy(a, x):
+        return _igam_helper_asymptotic_series_legacy(a, x, True)
+    if x > Float32(1.0) and x > a:
+        comptime D = Scalar[_igd_legacy()]
+        return Float32(D(1.0) - D(igammac_f_legacy(a, x)))
+    return _igam_helper_series_legacy(a, x)
+
+
+# --------------------------------------------------------------------------- #
 # Modified Bessel functions of the first kind (i0, i0e, i1, i1e)
 # --------------------------------------------------------------------------- #
 

@@ -65,7 +65,14 @@ from tmb.kernels.common.dtype_arithmetic import amd_opaque, cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
 from tmb.kernels.common.pow_math import pow_c99, torch_pow
-from tmb.kernels.common.special_math import igamma, igammac, jit_nan, zeta
+from tmb.kernels.common.special_math import (
+    igamma,
+    igamma_f_legacy,
+    igammac,
+    igammac_f_legacy,
+    jit_nan,
+    zeta,
+)
 
 
 @always_inline
@@ -1571,12 +1578,21 @@ def _wide[
         comptime cw = DType.float64 if w == DType.float64 else DType.float32
         var r = SIMD[w, n]()
         comptime for i in range(n):
-            var ai = a[i].cast[cw]()
-            var xi = b[i].cast[cw]()
-            comptime if kind == "igamma":
-                r[i] = igamma(ai, xi).cast[w]()
+            comptime if is_nvidia_gpu():
+                var ai = a[i].cast[cw]()
+                var xi = b[i].cast[cw]()
+                comptime if kind == "igamma":
+                    r[i] = igamma(ai, xi).cast[w]()
+                else:
+                    r[i] = igammac(ai, xi).cast[w]()
             else:
-                r[i] = igammac(ai, xi).cast[w]()
+                # AMD / Apple keep their float-only form (not ported yet).
+                var ai = a[i].cast[DType.float32]()
+                var xi = b[i].cast[DType.float32]()
+                comptime if kind == "igamma":
+                    r[i] = igamma_f_legacy(ai, xi).cast[w]()
+                else:
+                    r[i] = igammac_f_legacy(ai, xi).cast[w]()
         return r
     elif kind == "zeta":
         # CUDA's zeta_string in the opmath type (the jiterator's T, on ROCm
@@ -2212,6 +2228,104 @@ def _cuda_pow[w: DType](x: Scalar[w], y: Scalar[w]) -> Scalar[w]:
 
 
 @always_inline
+# AMD / Apple form of _standard_gamma_grad_one, from before its CUDA-exact port.
+def _standard_gamma_grad_one_legacy[
+    w: DType
+](alpha: Scalar[w], x: Scalar[w]) -> Scalar[w]:
+    """AMD / Apple: the float-only form before the CUDA-exact port (below). Distributions.h's `standard_gamma_grad_one`: the reparameterized
+    gradient -(d/dalpha cdf(x; alpha)) / pdf(x; alpha), in the accumulate
+    type."""
+    comptime V = SIMD[w, 1]
+    if x < Scalar[w](0.8):
+        # Taylor series expansion for small x.
+        var numer = Scalar[w](1)
+        var denom = alpha
+        var series1 = numer / denom
+        var series2 = numer / (denom * denom)
+        comptime for i in range(1, 6):
+            numer *= -x / Scalar[w](i)
+            denom += 1
+            series1 += numer / denom
+            series2 += numer / (denom * denom)
+        var pow_x_alpha = pow_c99[w](x, alpha)
+        var gamma_pdf = pow_c99[w](x, alpha - 1) * _sexp[w](-x)
+        var gamma_cdf = pow_x_alpha * series1
+        var gamma_cdf_alpha = (
+            _slog[w](x) - _digamma_one[w](alpha)
+        ) * gamma_cdf - pow_x_alpha * series2
+        var result = -gamma_cdf_alpha / gamma_pdf
+        return Scalar[w](0) if isnan(result) else result
+    if alpha > 8:
+        # Rice saddle point expansion for large alpha.
+        if Scalar[w](0.9) * alpha <= x and x <= Scalar[w](1.1) * alpha:
+            var numer_1 = 1 + 24 * alpha * (1 + 12 * alpha)
+            var numer_2 = (
+                1440 * (alpha * alpha)
+                + 6 * x * (53 - 120 * x)
+                - 65 * x * x / alpha
+                + alpha * (107 + 3600 * x)
+            )
+            var denom = 1244160 * (alpha * alpha) * (alpha * alpha)
+            return numer_1 * numer_2 / denom
+        var denom = ieee_sqrt(8 * alpha)
+        var term2 = denom / (alpha - x)
+        var term3 = pow_c99[w](
+            x - alpha - alpha * _slog[w](x / alpha), Scalar[w](-1.5)
+        )
+        var term23 = term2 - term3 if x < alpha else term2 + term3
+        var term1 = _slog[w](x / alpha) * term23 - ieee_sqrt(2 / alpha) * (
+            alpha + x
+        ) / ((alpha - x) * (alpha - x))
+        var stirling = 1 + 1 / (12 * alpha) * (1 + 1 / (24 * alpha))
+        var numer = x * term1
+        return -stirling * numer / denom
+    # Bivariate rational approximation to the reparameterized gradient.
+    var u = _slog[w](x / alpha)
+    var v = _slog[w](alpha)
+    comptime C = [
+        [
+            0.16009398,
+            -0.094634809,
+            0.025146376,
+            -0.0030648343,
+            1.0,
+            0.32668115,
+            0.10406089,
+            0.0014179084,
+        ],
+        [
+            0.53487893,
+            0.1298071,
+            0.065735949,
+            -0.0015649758,
+            0.16639465,
+            0.020070113,
+            -0.0035938915,
+            -0.00058392623,
+        ],
+        [
+            0.040121004,
+            -0.0065914022,
+            -0.0026286047,
+            -0.0013441777,
+            0.017050642,
+            -0.0021309326,
+            0.00085092367,
+            -1.5247877e-07,
+        ],
+    ]
+    var coef_v = SIMD[w, 8]()
+    comptime for i in range(8):
+        comptime c0 = C[0][i]
+        comptime c1 = C[1][i]
+        comptime c2 = C[2][i]
+        coef_v[i] = Scalar[w](c0) + u * (Scalar[w](c1) + u * Scalar[w](c2))
+    var pp = coef_v[0] + v * (coef_v[1] + v * (coef_v[2] + v * coef_v[3]))
+    var q = coef_v[4] + v * (coef_v[5] + v * (coef_v[6] + v * coef_v[7]))
+    return _sexp[w](pp / q)
+
+
+@always_inline
 def _standard_gamma_grad_one[
     w: DType
 ](alpha: Scalar[w], x: Scalar[w]) -> Scalar[w]:
@@ -2566,9 +2680,15 @@ def _gamma_grads[
     var r = SIMD[dtype, n]()
     comptime for i in range(n):
         comptime if kind == "standard_gamma_grad":
-            r[i] = _standard_gamma_grad_one[w](
-                a[i].cast[w](), b[i].cast[w]()
-            ).cast[dtype]()
+            comptime if is_nvidia_gpu():
+                r[i] = _standard_gamma_grad_one[w](
+                    a[i].cast[w](), b[i].cast[w]()
+                ).cast[dtype]()
+            else:
+                # AMD / Apple keep their pre-port form.
+                r[i] = _standard_gamma_grad_one_legacy[w](
+                    a[i].cast[w](), b[i].cast[w]()
+                ).cast[dtype]()
         else:
             r[i] = _dirichlet_grad_one[w](
                 a[i].cast[w](), b[i].cast[w](), c[i].cast[w]()
