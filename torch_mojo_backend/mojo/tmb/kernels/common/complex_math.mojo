@@ -28,8 +28,10 @@ tests that survive the fast-math flags) rather than a comparison.
 """
 
 from std.memory import bitcast
+from std.sys.info import is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
+from tmb.kernels.common.libdevice_port import nv_atan2
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pointwise_math import (
     _exp,
@@ -124,6 +126,12 @@ def chypot[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def catan2[dt: DType](y: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     """`arg(x + yi)` = atan2(y, x), the device's torch.atan2."""
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        # thrust's atan2 is libdevice's (a NaN operand: the generic path).
+        if not isnan(x) and not isnan(y):
+            return rebind[Scalar[dt]](
+                nv_atan2(rebind[Float64](y), rebind[Float64](x))
+            )
     var z = Scalar[dt](0)
     return pointwise["atan2", dt, dt, 1](y, x, z, SIMD[param_dtype[dt](), 4](0))
 

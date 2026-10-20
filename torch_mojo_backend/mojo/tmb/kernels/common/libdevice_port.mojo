@@ -1925,3 +1925,58 @@ def nv_acos(a: Float64) -> Float64:
             _d(0x400921FB54442D18), _add_rn_d(t, _d(0xBCA1A62633145C07))
         )
     return t
+
+
+@always_inline
+def nv_atan2(a: Float64, b: Float64) -> Float64:
+    """`__nv_atan2(a, b)` (atan2 of y = a, x = b): t = min / max of the
+    magnitudes by IEEE division, one odd polynomial, the octant fixed up
+    from b's sign, then the zero and |a| == |b| cases. Non-NaN operands
+    only: libdevice returns |b| + |a| for a NaN, whose kept NaN depends on
+    the add's operand slots (the caller's choice)."""
+    var ab = abs(b)
+    var aa = abs(a)
+    var swap = aa > ab
+    var mx = aa if swap else ab
+    var mn = ab if swap else aa
+    var t = mn / mx
+    var s = t * t
+    var p = fma(
+        Float64(from_bits=UInt64(0xBEF53E1D2A25FF7E)),
+        s,
+        Float64(from_bits=UInt64(0x3F2D3B63DBB65B49)),
+    )
+    p = fma(p, s, Float64(from_bits=UInt64(0xBF5312788DDE082E)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3F6F9690C8249315)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBF82CF5AABC7CF0D)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3F9162B0B2A3BFDE)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBF9A7256FEB6FC6B)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FA171560CE4A489)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFA4F44D841450E4)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FA7EE3D3F36BB95)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFAAD32AE04A9FD1)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FAE17813D66954F)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFB11089CA9A5BCD)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FB3B12B2DB51738)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFB745D022F8DC5C)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FBC71C709DFE927)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFC2492491FA1744)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FC99999999840D2)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFD555555555544C)))
+    var r = fma(p * s, t, t)
+    comptime PIO2 = Float64(from_bits=UInt64(0x3FF921FB54442D18))
+    comptime PI = Float64(from_bits=UInt64(0x400921FB54442D18))
+    var bneg = _hi(b) < 0
+    if swap:
+        r = (PIO2 + r) if bneg else (PIO2 - r)
+    elif bneg:
+        r = PI - r
+    if mx == 0.0:
+        r = PI if bneg else Float64(0.0)
+    elif ab == aa:
+        r = Float64(from_bits=UInt64(0x4002D97C7F3321D2)) if bneg else Float64(
+            from_bits=UInt64(0x3FE921FB54442D18)
+        )
+    return _i2d(
+        _lo(r), (_hi(r) & Int32(0x7FFFFFFF)) | (_hi(a) & Int32(-2147483648))
+    )
