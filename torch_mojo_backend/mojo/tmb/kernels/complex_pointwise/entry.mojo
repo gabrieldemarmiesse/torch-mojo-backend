@@ -234,10 +234,8 @@ def _logaddexp[dt: DType](x: Cx[dt], y: Cx[dt], special: Bool) -> Cx[dt]:
 @always_inline
 def _ternary[
     kind: StaticString, dt: DType
-](a: Cx[dt], b: Cx[dt], c: Cx[dt], p: Cx[dt], special: Bool, alt: Bool) -> Cx[
-    dt
-]:
-    var fuse_f32 = special and dt == DType.float32
+](a: Cx[dt], b: Cx[dt], c: Cx[dt], p: Cx[dt], copy: Int, alt: Bool) -> Cx[dt]:
+    var fuse_f32 = copy == 0 and dt == DType.float32
     comptime if kind == "cx_lerp_scalar":
         return _lerp(a, b, p, fuse_f32, fuse_f32)
     elif kind == "cx_lerp":
@@ -245,17 +243,15 @@ def _ternary[
     elif kind == "cx_logaddexp":
         return _logaddexp(a, b, alt)
     elif kind == "cx_addcmul":
-        # a + alpha * (b * c): the first inlined copy of the jiterated
-        # function (`special`) contracts the inner product, and in complex64
-        # the outer one too
-        comptime if dt == DType.float64:
-            return _add(a, cmul_jit(p, cmul_jit(b, c, special)))
-        else:
-            return _add(a, cmul_jit(p, cmul_jit(b, c, special), special))
+        # a + alpha * (b * c). The unrolled copies of the jiterated function
+        # (`copy`, the 128-element slice of 1024) contract it differently:
+        # the first both products, the second (complex64 only) the inner one
+        var inner = copy == 0 or (dt == DType.float32 and copy == 1)
+        return _add(a, cmul_jit(p, cmul_jit(b, c, inner), copy == 0))
     else:
         comptime assert kind == "cx_addcdiv", "unknown complex ternary kind"
         # a + alpha * (b / c)
-        return _add(a, cmul_jit(p, cdiv_jit(b, c)))
+        return _add(a, cmul_jit(p, cdiv_jit[dt, True](b, c), copy == 0))
 
 
 @always_inline
@@ -290,8 +286,8 @@ def _launch[
     # operand dense and of the result's dtype: the last partial block of
     # 1024 runs its scalar tail) or a scalar one (complex128, or a 0-d /
     # strided / broadcast / dynamically cast operand), whose first inlined
-    # copy of the function (the first 128 of every 1024 elements) ptxas
-    # contracts differently (`special`).
+    # copies of the function (128 elements each, eight per 1024) ptxas
+    # contracts differently (`copy`).
     var scalar_kernel = (modes >> 6) & 1 != 0
     var tail_start = (numel >> 10) << 10
 
@@ -331,12 +327,13 @@ def _launch[
             var k = 2 * i if mode_c == MODE_FULL else 0
             c = Cx[dt](c_ptr[unsafe_offset=k], c_ptr[unsafe_offset=k + 1])
         var scalar_path = dt == DType.float64 or scalar_kernel
-        # the first inlined copy of the jiterated function of a scalar kernel
-        var special = scalar_path and (i & 1023) < 128
+        # which inlined copy of the jiterated function of a scalar kernel
+        # (128 elements each, 8 per block) runs this element: 8 = none
+        var copy = ((i & 1023) >> 7) if scalar_path else 8
         # complex logaddexp's finite path: its fma association in every copy
         # of a scalar kernel and in the vectorized one's scalar tail
         var alt = scalar_path or i >= tail_start
-        var r = _ternary[kind, dt](a, b, c, Cx[dt](hp_re, hp_im), special, alt)
+        var r = _ternary[kind, dt](a, b, c, Cx[dt](hp_re, hp_im), copy, alt)
         out_ptr[unsafe_offset=2 * i] = r.re
         out_ptr[unsafe_offset=2 * i + 1] = r.im
 

@@ -106,10 +106,8 @@ _BF16_TIE = 1 + 2**-8 + 2**-40
 @pytest.mark.parametrize(("op", "fn", "inplace"), _BINARY, ids=_BINARY_IDS)
 def test_tensor_tensor(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
     if op == "ldexp" and dtype == torch.complex128:
-        # a NaN exponent: test_ldexp_complex128_signaling_nan_exponent
-        a, b = bp.pairs(dtype)
-        keep = ~torch.view_as_real(b).isnan().any(-1)
-        a, b = a[keep], b[keep]
+        # self * pow(2, other): a NaN in both is two NaNs in the product
+        a, b = _pairs(dtype)
 
         def with_out(x, y):
             o = torch.empty(0, dtype=dtype, device=x.device)
@@ -125,13 +123,6 @@ def test_tensor_tensor(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
     bp.check_all(cuda_oracle, cases)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ldexp(complex128, complex128) with a signaling-NaN real exponent"
-    " part: CUDA's tensor-tensor complex pow (pow_ = thrust::pow, exp(log(2) *"
-    " z)) returns the quieted payload, the mojo device's cx pow (the complex"
-    " group's) a default NaN; pow(2.0, z), the Scalar-base kernel, agrees",
-)
 def test_ldexp_complex128_signaling_nan_exponent(cuda_oracle: CudaOracle):
     nan = bp.from_bits([0x7FF0000000000001], torch.float64).item()
     x = torch.ones(1, dtype=torch.complex128)
@@ -250,7 +241,8 @@ def test_mixed_dtypes(cuda_oracle: CudaOracle, op, fn, inplace, da, db):
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
     if op == "ldexp" and db == torch.complex128:
-        # a NaN exponent: test_ldexp_complex128_signaling_nan_exponent
+        # self * pow(2, other): a NaN exponent meets a NaN self (the tensor's
+        # or the 0-d one's) in the product: two NaNs
         keep = ~torch.view_as_real(b).isnan().any(-1)
         a, b = a[keep], b[keep]
     if torch.promote_types(da, db) == torch.float64:
@@ -651,6 +643,9 @@ def test_addc_mixed_dtypes(cuda_oracle: CudaOracle, op, dtypes):
             | bp.two_distinct_nans(a.double(), c.double())
             | bp.two_distinct_nans(b.double(), c.double())
         )
+        if op == "addcdiv":
+            # self NaN meets the NaN that inf / inf or 0 / 0 makes: two NaNs
+            keep &= ~(a.double().isnan() & (b.double() / c.double()).isnan())
         a, b, c = a[keep], b[keep], c[keep]
 
     def with_out(x, y, z, dt):

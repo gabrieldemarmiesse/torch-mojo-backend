@@ -28,8 +28,10 @@ tests that survive the fast-math flags) rather than a comparison.
 """
 
 from std.memory import bitcast
+from std.sys import is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
+from tmb.kernels.common.libdevice_port import nv_ldexp, nv_ldexpf
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pointwise_math import (
     _mul_rn,
@@ -441,6 +443,13 @@ def _logb[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 def _scalbn[dt: DType](x: Scalar[dt], n: Int) -> Scalar[dt]:
     """x * 2^n, exact (in up to three in-range power-of-two steps)."""
     # Modified from libc++ scalbn (libc++ <complex> helper, llvm_complex.cpp) (PyTorch v2.11.0; LLVM licence).
+    comptime if is_nvidia_gpu():
+        # CUDA's scalbn is libdevice's ldexp: one rounding, even into the
+        # subnormals (chunks of 2^-31 products, only the last one inexact)
+        comptime if dt == DType.float64:
+            return nv_ldexp(x.cast[DType.float64](), Int32(n)).cast[dt]()
+        else:
+            return nv_ldexpf(x.cast[DType.float32](), Int32(n)).cast[dt]()
     var r = x
     var k = n
     comptime lim = 1000 if dt == DType.float64 else 120
@@ -463,7 +472,7 @@ def _pow2[dt: DType](k: Int) -> Scalar[dt]:
 
 
 @always_inline
-def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+def cdiv_jit[dt: DType, contract: Bool = False](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
     """libc++'s operator/(complex, complex): scaled by the larger exponent
     of the divisor (logb / scalbn), Annex G recovery."""
     # Modified from libc++ operator/(const complex&, const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
@@ -482,9 +491,20 @@ def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
         ilogbw = Int(logbw)
         c = _scalbn(c, -ilogbw)
         d = _scalbn(d, -ilogbw)
-    var denom = c * c + d * d
-    var x = _scalbn((a * c + b * d) / denom, -ilogbw)
-    var y = _scalbn((b * c - a * d) / denom, -ilogbw)
+    var denom: Scalar[dt]
+    var x: Scalar[dt]
+    var y: Scalar[dt]
+    if contract and not (isnan(a) or isnan(b) or isnan(c) or isnan(d)):
+        # addcdiv's jiterated kernel: ptxas contracts the three sums in every
+        # inlined copy (SASS, and measured on complex64 and complex128):
+        # fma(c, c, d d), fma(a, c, b d), fma(b, c, -(a d))
+        denom = c.fma(c, _mul_rn[dt, 1](d, d))
+        x = _scalbn(a.fma(c, _mul_rn[dt, 1](b, d)) / denom, -ilogbw)
+        y = _scalbn(b.fma(c, -_mul_rn[dt, 1](a, d)) / denom, -ilogbw)
+    else:
+        denom = c * c + d * d
+        x = _scalbn((a * c + b * d) / denom, -ilogbw)
+        y = _scalbn((b * c - a * d) / denom, -ilogbw)
     if isnan(x) and isnan(y):
         if _is_zero(denom) and (not isnan(a) or not isnan(b)):
             var s = _copysign(_inf[dt](), c)
@@ -640,11 +660,14 @@ def cmul_jit[dt: DType](z: Cx[dt], w: Cx[dt], fused: Bool = False) -> Cx[dt]:
     var bc = _mul_rn[dt, 1](b, c)
     var x = ac - bd
     var y = ad + bc
-    if fused:
+    if fused and not (isnan(a) or isnan(b) or isnan(c) or isnan(d)):
         # ptxas contracts the product of some inlined copies of the jiterated
-        # function (ac - bd as fma(a, c, -bd), ad + bc as fma(a, d, bc))
+        # function: ac - bd as fma(a, c, -(b d)), ad + bc as fma(b, c, a d).
+        # (A NaN operand keeps the plain products: which NaN a contracted
+        # DFMA returns depends on the slots ptxas gave it, and the plain
+        # form is what measured exact for those.)
         x = a.fma(c, -bd)
-        y = a.fma(d, bc)
+        y = b.fma(c, ad)
     if isnan(x) and isnan(y):
         var recalc = False
         if isinf(a) or isinf(b):
