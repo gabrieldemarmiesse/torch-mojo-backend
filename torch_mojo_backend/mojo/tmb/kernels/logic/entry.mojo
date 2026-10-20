@@ -34,7 +34,14 @@ from std.utils.coord import Coord
 from std.utils import IndexList
 
 from tmb.kernels.common.cuda_math import _add_rn, _mul_rn
-from tmb.kernels.common.div_math import floor_div, trunc_div
+from tmb.kernels.common.cuda_div_math import (
+    cuda_floor_div,
+    cuda_floor_div_by_scalar,
+    cuda_mul_by_inverse,
+    cuda_remainder,
+    cuda_trunc_div,
+    cuda_trunc_div_by_scalar,
+)
 from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.nan_order import nan_first2, nan_first3
 from tmb.kernels.common.pow_math import torch_pow
@@ -56,7 +63,6 @@ from tmb.kernels.common.op_utils import (
     _raw_tuple_int,
     _spec_dispatcher3,
     _spec_ptr,
-    custom_remainder,
 )
 
 from tmb.kernels.common.variant_gates import (
@@ -101,9 +107,12 @@ comptime BOP_REMAINDER = 9
 comptime BOP_FLOORDIV = 10
 comptime BOP_POW = 11
 comptime BOP_TRUNCDIV = 12
-# BOP_TRUNCDIV of a bf16/fp16 tensor by a ONE-ELEMENT tensor, divided in
-# float32 (see there).
-comptime BOP_TRUNCDIV_OPMATH = 13
+# True / trunc / floor division by a CPU scalar, stock CUDA's own route for
+# it: `alpha` carries the double reciprocal (div) or the divisor (trunc,
+# floor); the `b` operand is not read.
+comptime BOP_DIV_BY_SCALAR = 13
+comptime BOP_TRUNCDIV_BY_SCALAR = 14
+comptime BOP_FLOORDIV_BY_SCALAR = 15
 
 comptime COP_EQ = 0
 comptime COP_NE = 1
@@ -170,8 +179,12 @@ def _op_token[op_code: Int, is_cmp: Bool]() -> StaticString:
             return "pow"
         comptime if op_code == BOP_TRUNCDIV:
             return "trunc_divide"
-        comptime if op_code == BOP_TRUNCDIV_OPMATH:
-            return "trunc_divide_opmath"
+        comptime if op_code == BOP_DIV_BY_SCALAR:
+            return "div_by_scalar"
+        comptime if op_code == BOP_TRUNCDIV_BY_SCALAR:
+            return "trunc_divide_by_scalar"
+        comptime if op_code == BOP_FLOORDIV_BY_SCALAR:
+            return "floor_divide_by_scalar"
     return "binop"
 
 
@@ -453,28 +466,32 @@ def _bin_vec_op[
             comptime if not dtype.is_floating_point():
                 return (a ^ b).cast[out_dtype]()
         comptime if op_code == BOP_REMAINDER:
-            # NOT Mojo's `%`: that one has the right (divisor's) sign, but
-            # loses the answer outright on bf16/fp16 operands.
-            # `op_utils.custom_remainder` routes those two through a bit-exact
-            # fp32 fmod and explains why.
-            return custom_remainder(a, b).cast[out_dtype]()
-        comptime if op_code == BOP_FLOORDIV:
-            return floor_div(a, b).cast[out_dtype]()
-        comptime if op_code == BOP_TRUNCDIV:
-            # Native precision for floats: the ops layer sends ATen's
-            # float32 scalar-divisor path to TruncDivScalarSpec and
-            # BOP_TRUNCDIV_OPMATH.
-            return trunc_div(a, b).cast[out_dtype]()
-        comptime if op_code == BOP_TRUNCDIV_OPMATH:
-            # ATen's div_trunc_kernel for a reduced-float operand over a
-            # one-element tensor (`iter.is_scalar(2)`): divided in float32,
-            # rounded to bf16/fp16 once at the end.
-            comptime if dtype == DType.bfloat16 or dtype == DType.float16:
-                return trunc_div(
-                    a.cast[DType.float32](), b.cast[DType.float32]()
+            # A CPU scalar's float64 NaN first (__nv_fmod; between two
+            # tensor NaNs the payload depends on the launch).
+            comptime if dtype.is_floating_point():
+                return _scalar_nan_first(
+                    cuda_remainder(a, b), a, b, scalar_side
                 ).cast[out_dtype]()
             else:
-                return trunc_div(a, b).cast[out_dtype]()
+                return cuda_remainder(a, b).cast[out_dtype]()
+        comptime if op_code == BOP_FLOORDIV:
+            return cuda_floor_div(a, b).cast[out_dtype]()
+        comptime if op_code == BOP_TRUNCDIV:
+            return cuda_trunc_div(a, b).cast[out_dtype]()
+        comptime if dtype.is_floating_point():
+            comptime om = _opmath[dtype]()
+            comptime if op_code == BOP_DIV_BY_SCALAR:
+                return cuda_mul_by_inverse(a, alpha).cast[out_dtype]()
+            comptime if op_code == BOP_TRUNCDIV_BY_SCALAR:
+                var inv = Scalar[om](1) / alpha.cast[om]()
+                return cuda_trunc_div_by_scalar[dtype](a.cast[om](), inv).cast[
+                    out_dtype
+                ]()
+            comptime if op_code == BOP_FLOORDIV_BY_SCALAR:
+                var bs = alpha.cast[om]()
+                return cuda_floor_div_by_scalar[dtype](
+                    a.cast[om](), bs, Scalar[om](1) / bs
+                ).cast[out_dtype]()
         comptime if op_code == BOP_POW:
             # Float only (gated at the launcher). pow_math.torch_pow: C's
             # special cases (infinite / NaN exponents, signed zeros, negative
@@ -2011,8 +2028,14 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
         comptime if _op_on["TruncDivSpec"]():
             _binary_dispatcher[BOP_TRUNCDIV, False](argv, argc)
             return 0
-        comptime if _op_on["TruncDivOpmathSpec"]():
-            _binary_dispatcher[BOP_TRUNCDIV_OPMATH, False](argv, argc)
+        comptime if _op_on["DivByScalarSpec"]():
+            _binary_dispatcher[BOP_DIV_BY_SCALAR, False](argv, argc)
+            return 0
+        comptime if _op_on["TruncDivByScalarSpec"]():
+            _binary_dispatcher[BOP_TRUNCDIV_BY_SCALAR, False](argv, argc)
+            return 0
+        comptime if _op_on["FloorDivByScalarSpec"]():
+            _binary_dispatcher[BOP_FLOORDIV_BY_SCALAR, False](argv, argc)
             return 0
         comptime if _op_on["BitwiseAndSpec"]():
             _binary_dispatcher[BOP_AND, False](argv, argc)

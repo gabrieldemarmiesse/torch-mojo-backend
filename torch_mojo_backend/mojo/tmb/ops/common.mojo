@@ -1086,6 +1086,10 @@ def _pw_float_rank(st: Int32) -> Int:
     return 3
 
 
+def _wide_unsigned_stype(st: Int32) -> Bool:
+    return st == ST_UINT16 or st == ST_UINT32 or st == ST_UINT64
+
+
 def promote_types(a: Int32, b: Int32) raises -> Int32:
     """c10::promoteTypes over the dtypes the mojo device computes on,
     complex included."""
@@ -1107,6 +1111,10 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
         # the complex type of the promoted value types (complex64 + float64
         # is complex128)
         return complex_of(promote_types(real_of(a), real_of(b)))
+    if is_float_stype(a) and _wide_unsigned_stype(b):
+        return a  # c10: a uint16 / 32 / 64 meets a float as any integer
+    if is_float_stype(b) and _wide_unsigned_stype(a):
+        return b
     if not known_stype(a) or not known_stype(b):
         unsupported(
             "type promotion of dtypes " + String(a) + " and " + String(b)

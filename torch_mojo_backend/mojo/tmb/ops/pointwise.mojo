@@ -709,13 +709,18 @@ def op_fmin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor
 # aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor
 def op_fmod(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, -1)
+    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, -1, _fmod_params(args))
+
+
+def _fmod_params(args: Values) raises -> SIMD[DType.float64, 4]:
+    """p0 = 2 when the divisor is a CPU scalar (its float64 NaN first)."""
+    return _p(2.0 if not _b_side(args[unsafe_offset=1]).is_t else 0.0)
 
 
 # aten::fmod.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 # aten::fmod.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
 def op_fmod_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, 2)
+    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, 2, _fmod_params(args))
 
 
 # aten::gcd(Tensor self, Tensor other) -> Tensor

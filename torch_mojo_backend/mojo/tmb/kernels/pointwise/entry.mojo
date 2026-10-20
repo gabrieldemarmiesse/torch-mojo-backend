@@ -33,6 +33,7 @@ from std.utils.coord import Coord
 from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.op_utils import (
     Argv,
+    _fill_bits,
     _make_ptr,
     _raw_ctx,
     _raw_f64,
@@ -300,7 +301,10 @@ def _host_value[dt: DType](v: Float64) -> Scalar[dt]:
     holds the int64's bits (the ops layer's `_pw_flat`; a bool travels as
     the byte type here), narrowed with two's complement wrap as torch
     narrows a wrapped number."""
-    comptime if dt.is_floating_point():
+    comptime if dt == DType.bfloat16 or dt == DType.float16:
+        # c10's Half / BFloat16 from a double: through float, subnormals kept
+        return bitcast[dt](_fill_bits[dt, DType.uint16](v))
+    elif dt.is_floating_point():
         return v.cast[dt]()
     elif dt.is_integral():
         return bitcast[DType.int64](v).cast[dt]()

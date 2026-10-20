@@ -57,7 +57,8 @@ from tmb.kernels.common.libdevice_port import (
 )
 from tmb.kernels.common.dtype_arithmetic import amd_opaque, cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
-from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
+from tmb.kernels.common.cuda_div_math import cuda_fmod_op
+from tmb.kernels.common.nan_order import nan_first2
 from tmb.kernels.common.pow_math import pow_c99, torch_pow
 from tmb.kernels.common.special_math import igamma_f, igammac_f, zeta_f
 
@@ -1190,33 +1191,10 @@ def _native[
                 r = isnan(b).select(a, r)
             return r
     elif kind == "fmod":
-        # BinaryRemainderKernel.cu: C's fmod (the dividend's sign), exact:
-        # libdevice's fmodf on NVIDIA (its approximate-quotient fast path
-        # beats the bit-at-a-time long division: fmod bf16 4096^2 was 3.2x
-        # torch before), the exact long division elsewhere (Metal's fmod,
-        # ROCm's ocml fmod are exact too); float64 by musl's exact fmod.
-        comptime if dtype.is_floating_point():
-            var r = SIMD[dtype, n]()
-            comptime for i in range(n):
-                comptime if dtype == DType.float64:
-                    r[i] = _fmod_f64_exact_scalar(
-                        a[i].cast[DType.float64](), b[i].cast[DType.float64]()
-                    ).cast[dtype]()
-                else:
-                    r[i] = _fmod_float32(
-                        a[i].cast[DType.float32](), b[i].cast[DType.float32]()
-                    ).cast[dtype]()
-            return r
-        else:
-            # C's %, truncating (Mojo's `%` floors: move a remainder whose
-            # sign differs from the dividend's back by one divisor); 0 for
-            # a zero divisor (CPU raises, CUDA leaves it undefined).
-            var safe = b.eq(0).select(SIMD[dtype, n](1), b)
-            var r = a % safe
-            comptime if dtype.is_signed():
-                var fix = r.ne(0) & (r.lt(0) ^ a.lt(0))
-                r = fix.select(r - safe, r)
-            return b.eq(0).select(SIMD[dtype, n](0), r)
+        # BinaryRemainderKernel.cu's fmod_kernel_cuda (cuda_div_math): C's
+        # fmod for floats (exact; libdevice's on NVIDIA), C's % for ints.
+        # (Reached from `pointwise_binary`, which orders a CPU scalar's NaN.)
+        return cuda_fmod_op(a, b)
     elif kind == "gcd" or kind == "lcm":
         var r = SIMD[dtype, n]()
         comptime for i in range(n):
@@ -2723,6 +2701,14 @@ def pointwise[
     elif kind == "standard_gamma_grad" or kind == "dirichlet_grad":
         comptime assert dtype.is_floating_point(), "gamma grads take floats"
         return _gamma_grads[kind](a, b, c).cast[out_dtype]()
+    elif kind == "fmod":
+        var r = cuda_fmod_op(a, b)
+        comptime if dtype == DType.float64:
+            # p0 = 2: `b` was a CPU scalar, whose NaN __nv_fmod returns
+            # first (a uniform operand); two tensor NaNs depend on the launch
+            if p[0].cast[DType.float64]() == 2.0:
+                r = nan_first2(r, b, a)
+        return r.cast[out_dtype]()
     elif is_native_kind[kind]():
         return _native[kind](a, b, c).cast[out_dtype]()
     elif is_scalar_t_kind[kind]():
