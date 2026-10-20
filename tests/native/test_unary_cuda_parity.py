@@ -37,24 +37,24 @@ def _dtype_id(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-# complex64 neg and conj_physical on a NaN imaginary part: stock CUDA flips
-# the sign bit of the NaN for some tensor sizes and returns the canonical NaN
-# for others; this port does not reproduce that. Those inputs are open in
+# complex64 neg and conj_physical on a NaN component: stock CUDA flips the
+# sign bit of the NaN for some tensor sizes and returns the canonical NaN for
+# others; this port does not reproduce that. Those elements are open in
 # test_complex64_nan_imag (strict xfail); every other element is mandatory.
 _NAN_IMAG_OPS = ("neg", "conj_physical")
 _NAN_IMAG_REASON = (
-    "complex64 neg/conj_physical of a NaN imaginary part: CUDA's sign and "
+    "complex64 neg/conj_physical of a NaN component: CUDA's sign and "
     "payload depend on the tensor size; not reproduced yet"
 )
 
 
 def _values_for(op: str, dtype: torch.dtype) -> torch.Tensor:
     """The inputs of `op`: every value of `dtype`, except that the open NaN
-    imaginary parts of complex64 neg and conj_physical are finite here."""
+    components of complex64 neg and conj_physical are finite here."""
     x = _values(dtype)
     if dtype == torch.complex64 and op in _NAN_IMAG_OPS:
-        imag = torch.view_as_real(x)[..., 1]
-        imag[imag.isnan()] = 0.5
+        parts = torch.view_as_real(x)
+        parts[parts.isnan()] = 0.5
     return x
 
 
@@ -404,10 +404,10 @@ def test_unary_layouts(cuda_oracle: CudaOracle, op: str, dtype: torch.dtype):
 
 @pytest.mark.parametrize("op", _NAN_IMAG_OPS)
 def test_complex64_nan_imag(request, cuda_oracle: CudaOracle, op: str):
-    """The open case: only the NaN imaginary parts of complex64 `op`."""
+    """The open case: only the complex64 `op` inputs with a NaN component."""
     request.applymarker(pytest.mark.xfail(strict=True, reason=_NAN_IMAG_REASON))
     x = _values(torch.complex64)
-    x = x[torch.view_as_real(x)[..., 1].isnan()]
+    x = x[torch.view_as_real(x).isnan().any(-1)]
     cuda_oracle.assert_bitwise_equal(_functional(op), x)
 
 
