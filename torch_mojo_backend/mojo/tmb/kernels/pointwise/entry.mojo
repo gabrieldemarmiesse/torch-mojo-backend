@@ -21,6 +21,7 @@
 
 from max.gpu.host import DeviceContext
 from std.memory import bitcast
+from std.sys import is_nvidia_gpu
 from std.sys.info import (
     has_accelerator,
     has_amd_gpu_accelerator,
@@ -34,6 +35,7 @@ from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.host_float import c10_half, f32_bits_of
 from tmb.kernels.common.op_utils import (
     Argv,
+    _fill_bits,
     _make_ptr,
     _raw_ctx,
     _raw_f64,

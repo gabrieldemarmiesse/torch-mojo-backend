@@ -83,6 +83,10 @@ from tmb.kernels.common.variant_gates import (
     _tmb_entry_error,
 )
 from tmb.kernels.common.div_math import floor_div, trunc_div
+from tmb.kernels.common.cuda_div_math import (
+    cuda_floor_div_by_scalar,
+    cuda_trunc_div_by_scalar,
+)
 from tmb.kernels.common.dtype_arithmetic import cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pow_math import powf_c99, torch_pow
@@ -1097,13 +1101,10 @@ def _unary_bool[
 comptime SOP_ADD = 0
 comptime SOP_MUL = 1
 comptime SOP_POW = 2
-# Rounding divisions by a scalar, for bf16/fp16 tensors: ATen's CPU
-# div_floor_kernel / div_trunc_kernel take a separate path when the divisor
-# is a scalar (`iter.is_scalar(2)`) and the dtype is a reduced float, and
-# divide in float32 by the scalar's ORIGINAL value (`original_scalar_value
-# <opmath_t>`, a Python number never rounded to bf16). That is this family's
-# float32 body exactly; the logic family's broadcast route would round the
-# scalar to the tensor's dtype first, and trunc there divides in bf16.
+# Rounding divisions by a CPU scalar: stock CUDA's div_trunc / div_floor
+# kernels read it as a float (never rounded to the half dtype) and multiply
+# by its float reciprocal (cuda_div_math). A zero divisor of floor is the
+# ops layer's (true division).
 comptime SOP_FLOORDIV = 3
 comptime SOP_TRUNCDIV = 4
 # `scalar + alpha * self` in opmath, one rounding: CUDA's add functor with
@@ -1226,6 +1227,8 @@ def _scalar_elementwise[
         # (ROCm runs the same source). torch MPS passes it as a float
         # (UnaryKernel.mm `pow_tensor_scalar_kernel`), unrounded.
         var sv = scalar
+        # acc(1) / acc(b), on the host as CUDA does
+        var inv = Float32(1) / scalar
         comptime if (
             op_code == SOP_POW
             and not has_apple_gpu_accelerator()
@@ -1238,7 +1241,7 @@ def _scalar_elementwise[
         # kernels stay the ones that were measured.
         @always_inline
         @__parameter
-        @__copy_capture(out_ptr, in_ptr, sv, alpha)
+        @__copy_capture(out_ptr, in_ptr, sv, alpha, inv)
         def body_exact[width: Int, al: Int, pk: Int](i: Int):
             var a = in_ptr.unsafe_load[width=width, alignment=al](i).cast[
                 DType.float32
@@ -1257,11 +1260,11 @@ def _scalar_elementwise[
                 )
             comptime if op_code == SOP_FLOORDIV:
                 out_ptr.unsafe_store[width=width, alignment=al](
-                    i, floor_div(a, s).cast[dtype]()
+                    i, cuda_floor_div_by_scalar[dtype](a, sv, inv)
                 )
             comptime if op_code == SOP_TRUNCDIV:
                 out_ptr.unsafe_store[width=width, alignment=al](
-                    i, trunc_div(a, s).cast[dtype]()
+                    i, cuda_trunc_div_by_scalar[dtype](a, inv, sv)
                 )
             comptime if op_code == SOP_POW:
                 out_ptr.unsafe_store[width=width, alignment=al](

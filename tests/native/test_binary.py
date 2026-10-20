@@ -933,12 +933,43 @@ def test_floor_divide(mojo_device):
 @pytest.mark.parametrize(
     "divisor", ["number", "one_element", "zero_dim", "cpu_zero_dim"]
 )
-def test_div_rounding_narrow_float_scalar_divisor(mojo_device, mode, dtype, divisor):
+def test_div_rounding_narrow_float_scalar_divisor(cuda_oracle, mode, dtype, divisor):
+    """A CPU-scalar divisor (a number, a CPU 0-d tensor) takes CUDA's scalar
+    route: read as a float and multiplied by its float reciprocal. A device
+    divisor, one element or not, is an ordinary tensor: the quotient rounds
+    to bf16 before the trunc (-6.3125 / -1.0547 is 6)."""
+    a = torch.tensor([-6.3125, 7.0, 3.0, -3.0, 0.5, -1e-3], dtype=dtype)
+    for value in (-1.0547, 1.0001, -2.5):
+
+        def fn(x, value=value):
+            if divisor == "number":
+                b = value
+            elif divisor == "one_element":
+                b = torch.tensor([value], dtype=dtype, device=x.device)
+            elif divisor == "zero_dim":
+                b = torch.tensor(value, dtype=dtype, device=x.device)
+            else:
+                b = torch.tensor(value, dtype=dtype)
+            return torch.div(x, b, rounding_mode=mode)
+
+        cuda_oracle.assert_bitwise_equal(fn, a)
+
+
+@pytest.mark.parametrize("mode", ["floor", "trunc"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "divisor", ["number", "one_element", "zero_dim", "cpu_zero_dim"]
+)
+def test_div_rounding_narrow_float_scalar_divisor_non_cuda(
+    mojo_device, mode, dtype, divisor
+):
     """ATen divides a bf16/fp16 tensor by a scalar-shaped divisor in float32
     (`iter.is_scalar(2)`): -6.3125 / -1.0547 is 5.985, which rounds to 6.0 in
     bf16 before a native-precision trunc but truncates to 5 in float32. And
     a Python number keeps its own value: 3 / 1.0001 floors to 2, while
     1.0001 rounded to bf16 is 1.0 and gives 3."""
+    if is_cuda(str(mojo_device)):
+        pytest.skip("CUDA semantics: the cuda_oracle twin of this test")
     a_cpu = torch.tensor([-6.3125, 7.0, 3.0, -3.0, 0.5, -1e-3], dtype=dtype)
     a = a_cpu.to(mojo_device)
     for value in (-1.0547, 1.0001, -2.5):
@@ -956,18 +987,9 @@ def test_div_rounding_narrow_float_scalar_divisor(mojo_device, mode, dtype, divi
         )
 
 
-def test_div_trunc_narrow_float_tensor_divisor_native_precision(mojo_device):
-    """A multi-element divisor is ATen's general trunc loop: the quotient is
-    rounded to bf16 before the trunc (6.0 here, not the scalar path's 5)."""
-    a_cpu = torch.tensor([-6.3125, -6.3125], dtype=torch.bfloat16)
-    b_cpu = torch.tensor([-1.0547, -1.0547], dtype=torch.bfloat16)
-    expected = torch.div(a_cpu, b_cpu, rounding_mode="trunc")
-    assert expected.tolist() == [6.0, 6.0]
-    out = torch.div(a_cpu.to(mojo_device), b_cpu.to(mojo_device), rounding_mode="trunc")
-    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
-
-
-def test_floor_divide_narrow_float_scalar(mojo_device):
+def test_floor_divide_narrow_float_scalar_non_cuda(mojo_device):
+    if is_cuda(str(mojo_device)):
+        pytest.skip("CUDA semantics: the cuda_oracle twin of this test")
     a_cpu = torch.tensor([3.0, -3.0, 5.0, 7.0], dtype=torch.bfloat16)
     with native_ran("aten::floor_divide", "aten::floor_divide.Scalar"):
         out = a_cpu.to(mojo_device) // 1.0001
@@ -975,9 +997,11 @@ def test_floor_divide_narrow_float_scalar(mojo_device):
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.uint8])
-def test_div_int_by_zero_host_scalar_raises(mojo_device, dtype):
+def test_div_int_by_zero_host_scalar_raises_non_cuda(mojo_device, dtype):
     """CPU torch raises for an integer quotient by zero. A host-scalar zero is
     known without touching the device, so the mojo device raises too."""
+    if is_cuda(str(mojo_device)):
+        pytest.skip("CUDA semantics: the cuda_oracle twin of this test")
     a = torch.tensor([1, 5, 0], dtype=dtype).to(mojo_device)
     for mode in ("floor", "trunc"):
         with pytest.raises(RuntimeError, match="ZeroDivisionError"):
@@ -989,17 +1013,52 @@ def test_div_int_by_zero_host_scalar_raises(mojo_device, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_div_int_by_zero_tensor_gives_zero(mojo_device, dtype):
+def test_div_int_by_zero_tensor_gives_zero_non_cuda(mojo_device, dtype):
     """A zero element of a DEVICE divisor cannot raise without a sync; floor
     and trunc both give 0 for it (ATen's `div_floor_integer` value), and
     trunc's sign fixup no longer turns that into 1 for a negative
     numerator."""
+    if is_cuda(str(mojo_device)):
+        pytest.skip("CUDA semantics: the cuda_oracle twin of this test")
     a = torch.tensor([1, -1, -7, 7], dtype=dtype).to(mojo_device)
     b = torch.tensor([0, 0, 2, -2], dtype=dtype).to(mojo_device)
     for mode, rest in (("floor", [-4, -4]), ("trunc", [-3, -3])):
         with native_ran("aten::div.Tensor_mode"):
             out = torch.div(a, b, rounding_mode=mode)
         assert out.cpu().tolist() == [0, 0, *rest]
+
+
+def test_div_trunc_narrow_float_tensor_divisor_native_precision(mojo_device):
+    """A tensor divisor: the quotient is rounded to bf16 before the trunc
+    (6.0 here, not the scalar route's 5)."""
+    a_cpu = torch.tensor([-6.3125, -6.3125], dtype=torch.bfloat16)
+    b_cpu = torch.tensor([-1.0547, -1.0547], dtype=torch.bfloat16)
+    expected = torch.div(a_cpu, b_cpu, rounding_mode="trunc")
+    assert expected.tolist() == [6.0, 6.0]
+    out = torch.div(a_cpu.to(mojo_device), b_cpu.to(mojo_device), rounding_mode="trunc")
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_floor_divide_narrow_float_scalar(cuda_oracle):
+    a = torch.tensor([3.0, -3.0, 5.0, 7.0], dtype=torch.bfloat16)
+    cuda_oracle.assert_bitwise_equal(lambda x: x // 1.0001, a)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.uint8])
+def test_div_int_by_zero_does_not_raise(cuda_oracle, dtype):
+    """Stock CUDA does not raise for an integer quotient by zero (CPU torch
+    does): it returns what the GPU's division sequence gives, by a number,
+    a CPU 0-d tensor or a device tensor alike."""
+    a = torch.tensor([1, 5, 0, 7, 100], dtype=dtype)
+    for mode in ("floor", "trunc"):
+        cuda_oracle.assert_bitwise_equal(
+            lambda x, mode=mode: torch.div(x, 0, rounding_mode=mode), a
+        )
+    cuda_oracle.assert_bitwise_equal(lambda x: x // 0, a)
+    cuda_oracle.assert_bitwise_equal(
+        lambda x: torch.floor_divide(x, torch.tensor(0)), a
+    )
+    cuda_oracle.assert_bitwise_equal(lambda x: x // torch.zeros_like(x), a)
 
 
 @pytest.mark.parametrize("mode", ["floor", "trunc"])
@@ -2407,8 +2466,15 @@ def test_floor_divide_out_errors(mojo_gpu):
     a = torch.ones(3, device=mojo_gpu)
     with pytest.raises(RuntimeError, match="can't be cast"):
         torch.floor_divide(a, a, out=torch.empty(3, dtype=torch.long, device=mojo_gpu))
-    with pytest.raises(RuntimeError, match="ZeroDivisionError"):
-        torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
+    if is_cuda(mojo_gpu):
+        # CUDA does not raise on an integer division by zero: the GPU's
+        # division sequence gives 2**32 - 1 for these int64 operands
+        # (test_divmod_cuda_parity)
+        z = torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
+        assert z.cpu().tolist() == [2**32 - 1] * 3
+    else:
+        with pytest.raises(RuntimeError, match="ZeroDivisionError"):
+            torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
     with pytest.raises(RuntimeError):
         a.clone().floor_divide_(torch.ones(2, 3, device=mojo_gpu))
 

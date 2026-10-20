@@ -1141,6 +1141,10 @@ def _pw_float_rank(st: Int32) -> Int:
     return 3
 
 
+def _wide_unsigned_stype(st: Int32) -> Bool:
+    return st == ST_UINT16 or st == ST_UINT32 or st == ST_UINT64
+
+
 def promote_types(a: Int32, b: Int32) raises -> Int32:
     """c10::promoteTypes over the dtypes the mojo device computes on,
     complex included."""
