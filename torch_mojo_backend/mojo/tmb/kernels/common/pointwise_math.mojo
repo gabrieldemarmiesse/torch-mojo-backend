@@ -1581,8 +1581,8 @@ def _scalar_t[
         res = _st_round[dtype](x * _st_round[dtype](one - y, fence), fence) * y
     elif kind == "tanh_backward":
         # a * (1 - b * b) in scalar_t; nvcc fuses float / double into
-        # a * fma(-b, b, 1).
-        comptime if dtype == w:
+        # a * fma(-b, b, 1) on NVIDIA. Other targets keep the unfused form.
+        comptime if dtype == w and is_nvidia_gpu():
             res = x * (-y).fma(y, one)
         else:
             res = x * _st_round[dtype](

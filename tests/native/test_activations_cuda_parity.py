@@ -919,3 +919,19 @@ def test_bce_general_path_does_not_leak(mojo_gpu: str):
         once()
     torch.accelerator.synchronize()
     assert torch.accelerator.memory_allocated() == before
+
+
+def test_out_dtype_policy_matches_cuda(cuda_oracle: CudaOracle):
+    """CUDA dispatches on the out= dtype: float16 out= of float32 operands is
+    computed in float16, where `1 - 2**-24` rounds to 1 (so it is not below
+    the upper bound). Off CUDA the common dtype keeps the float32 result."""
+    x = torch.tensor([1 - 2**-24, -1.0, 1.0, 0.5], dtype=torch.float32)
+    g = torch.ones(4, dtype=torch.float32)
+
+    def fn(d: str) -> torch.Tensor:
+        out = torch.empty(0, dtype=torch.float16, device=d)
+        return A.hardtanh_backward.grad_input(
+            g.to(d), x.to(d), -1.0, 1.0, grad_input=out
+        )
+
+    cuda_oracle.assert_bitwise_equal_by_device(fn)
