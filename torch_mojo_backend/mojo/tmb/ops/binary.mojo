@@ -75,6 +75,7 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    check_broadcastable,
     device_str,
     is_wide_unsigned,
     can_cast,
@@ -1163,6 +1164,7 @@ def _b_binary(
         var b = rhs.t.value().copy()
         if a.device != b.device:
             raise Error("expected both operands on the same mojo device")
+        check_broadcastable([a.copy(), b.copy()])
         device = a.device
         var promoted = _b_promote(a, b)
         if promoted < 0:

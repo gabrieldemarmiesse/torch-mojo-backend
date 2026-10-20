@@ -1132,17 +1132,31 @@ def _clamp_scalar[
         lo_s = Scalar[dtype](lo)
         hi_s = Scalar[dtype](hi)
 
+    var lo_f = _raw_f64(lo).cast[DType.float32]()
+    var hi_f = _raw_f64(hi).cast[DType.float32]()
+
     @always_inline
     @__parameter
-    @__copy_capture(out_ptr, in_ptr, lo_s, hi_s, has_min, has_max)
+    @__copy_capture(out_ptr, in_ptr, lo_s, hi_s, lo_f, hi_f, has_min, has_max)
     def func[width: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
         var x = in_ptr[unsafe_offset=i]
         var v = x
-        if has_min != 0:
-            v = max(v, lo_s)
-        if has_max != 0:
-            v = min(v, hi_s)
+        comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+            # ClampLimits in opmath: compared and bounded as float32 (a
+            # bound below the 16-bit type's subnormals still rounds into
+            # it), one rounding to the type at the end.
+            var vf = x.cast[DType.float32]()
+            if has_min != 0:
+                vf = max(vf, lo_f)
+            if has_max != 0:
+                vf = min(vf, hi_f)
+            v = vf.cast[dtype]()
+        else:
+            if has_min != 0:
+                v = max(v, lo_s)
+            if has_max != 0:
+                v = min(v, hi_s)
         comptime if dtype.is_floating_point():
             # clamp_scalar_kernel_impl returns a NaN value as is (max/min
             # may drop it under the GPU build's fast-math flags; the

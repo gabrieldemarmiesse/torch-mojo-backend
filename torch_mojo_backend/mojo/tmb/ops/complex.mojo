@@ -104,6 +104,8 @@ from tmb.backend.device import current_device
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    cast_any,
+    is_wide_unsigned,
     fill_value,
     resize_any,
     can_cast,
@@ -2040,6 +2042,11 @@ def cx_via_bool[
     var keep = List[Owned]()
     var vals = List[Value]()
     var cx_out = False
+    var any_cx = False
+    for i in range(k):
+        var v = args[unsafe_offset=i].copy()
+        if (v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF) and v_is_complex(v):
+            any_cx = True
     var out_idx = n_args - 1
     comptime is_out = overload.endswith("out")
     comptime logical = op.startswith("logical_")
@@ -2056,11 +2063,13 @@ def cx_via_bool[
             ):
                 var t = v_tensor_c(v)
                 var c = v_tensor_c(w)
+                # (a CPU self meets the device check first: comparison_op)
                 if (
                     t.stype == ST_FLOAT16
                     and t.rank > 0
                     and c.is_complex()
                     and c.rank == 0
+                    and v_tensor_c(args[unsafe_offset=0]).on_mojo()
                 ):
                     unsupported(
                         '"' + op + "_cuda\" not implemented for 'ComplexHalf'"
@@ -2115,6 +2124,18 @@ def cx_via_bool[
             and v_is_complex(v)
         ):
             var b = own(cast_complex(v_tensor_c(v), ST_BOOL))
+            vals.append(Value(TAG_TENSOR, 0, Int64(b.t.h), 0))
+            keep.append(b^)
+        elif (
+            logical
+            and any_cx
+            and i < k
+            and (v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF)
+            and is_wide_unsigned(v_tensor_c(v).stype)
+        ):
+            # the other operand of a complex one: the kernel runs in the
+            # complex dtype, which has these; its truth is all that counts
+            var b = own(cast_any(v_tensor_c(v), ST_BOOL))
             vals.append(Value(TAG_TENSOR, 0, Int64(b.t.h), 0))
             keep.append(b^)
         else:

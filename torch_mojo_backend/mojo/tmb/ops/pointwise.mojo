@@ -138,6 +138,7 @@ from tmb.ops.binary import (
     op_rsub,
 )
 from tmb.ops.common import (
+    check_broadcastable,
     device_str,
     is_wide_unsigned,
     threshold_into_overlapping,
@@ -623,6 +624,11 @@ def _pw_math(
     var a = _b_side(args[unsafe_offset=0])
     var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
     var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
+    var operands = List[T]()
+    for side in [a.copy(), b.copy(), c.copy()]:
+        if side.is_t:
+            operands.append(side.t.value().copy())
+    check_broadcastable(operands)
     var common = _pw_result_type(a, b, c, arity)
     var dest = Optional[T]()
     if out_index >= 0:
@@ -637,6 +643,15 @@ def _pw_math(
                 " can't be cast to the desired output type ",
                 scalar_type_name(dest.value().stype),
             )
+    if (
+        dest
+        and (kind == "fmax" or kind == "fmin")
+        and is_wide_unsigned(common)
+        and can_cast(common, dest.value().stype)
+    ):
+        # No uint16 / uint32 / uint64 kernel: the maximum runs in the wider
+        # out's dtype (monotone, so the same values CUDA stores).
+        common = dest.value().stype
     var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     _pw_finish(
         rets,
@@ -4182,22 +4197,32 @@ def _pw_isclose_composite(args: Values, rets: Values) raises:
         close = _pw_call1(
             "aten::logical_or", "", [tensor_arg(close.t), tensor_arg(both.t)]
         )
+        _ = na^  # alive past the calls: the argument records only borrow
+        _ = nb^
+        _ = both^
     if rtol == 0 and atol == 0:
         ret_owned(rets, 0, close)
         return
     var other = Optional[Owned]()
     var other_v = bv.copy()
+    var selfc = Optional[Owned]()
+    var self_v = av.copy()
     if not is_complex_stype(st):
-        # an integral other: `other.to(default dtype)`
-        var cv = List[Value]()
-        cv.append(bv.copy())
-        cv.append(Value(TAG_DTYPE, 0, Int64(default_dtype()), 0))
-        for _ in range(3):  # layout, device, pin_memory
-            cv.append(Value(TAG_NONE, 0, 0, 0))
-        cv.append(Value(TAG_BOOL, 0, 0, 0))  # non_blocking
-        cv.append(Value(TAG_NONE, 0, 0, 0))  # memory_format
-        other = _pw_call1("aten::_to_copy", "", cv^)
-        other_v = tensor_arg(other.value().t)
+        # an integral tensor: both sides to the default dtype first
+        for k in range(2):
+            var cv = List[Value]()
+            cv.append(bv.copy() if k == 0 else av.copy())
+            cv.append(Value(TAG_DTYPE, 0, Int64(default_dtype()), 0))
+            for _ in range(3):  # layout, device, pin_memory
+                cv.append(Value(TAG_NONE, 0, 0, 0))
+            cv.append(Value(TAG_BOOL, 0, 0, 0))  # non_blocking
+            cv.append(Value(TAG_NONE, 0, 0, 0))  # memory_format
+            if k == 0:
+                other = _pw_call1("aten::_to_copy", "", cv^)
+                other_v = tensor_arg(other.value().t)
+            else:
+                selfc = _pw_call1("aten::_to_copy", "", cv^)
+                self_v = tensor_arg(selfc.value().t)
     var scaled = _pw_call1(
         "aten::mul",
         "Scalar",
@@ -4216,7 +4241,7 @@ def _pw_isclose_composite(args: Values, rets: Values) raises:
     var diff = _pw_call1(
         "aten::sub",
         "Tensor",
-        [av.copy(), other_v.copy(), Value(TAG_SCALAR_INT, 0, 1, 0)],
+        [self_v.copy(), other_v.copy(), Value(TAG_SCALAR_INT, 0, 1, 0)],
     )
     var actual = _pw_call1("aten::abs", "", [tensor_arg(diff.t)])
     var fin = _pw_call1("aten::isfinite", "", [tensor_arg(actual.t)])
@@ -4229,8 +4254,18 @@ def _pw_isclose_composite(args: Values, rets: Values) raises:
     var res = _pw_call1(
         "aten::logical_or", "", [tensor_arg(close.t), tensor_arg(ok.t)]
     )
+    _ = scaled^  # alive past the calls: the argument records only borrow
+    _ = mag^
+    _ = allowed^
+    _ = diff^
+    _ = actual^
+    _ = fin^
+    _ = within^
+    _ = ok^
+    _ = close^
     ret_owned(rets, 0, res)
     _ = other^
+    _ = selfc^
 
 
 def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:

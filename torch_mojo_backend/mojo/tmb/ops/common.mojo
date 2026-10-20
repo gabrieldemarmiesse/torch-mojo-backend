@@ -188,6 +188,28 @@ def broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
     return shape
 
 
+def check_broadcastable(ts: List[T]) raises:
+    """TensorIterator's compute_shape over `ts` in operand order: infer_size's
+    error, trailing dims first, raised before any dtype or device check."""
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    for n in range(len(ts)):
+        rank = max(rank, ts[n].rank)
+        for j in range(MAX_RANK):
+            var k = MAX_RANK - 1 - j
+            if shape[k] == 1:
+                shape[k] = ts[n].shape[k]
+            elif ts[n].shape[k] != 1 and ts[n].shape[k] != shape[k]:
+                raise Error(
+                    "The size of tensor a (",
+                    shape[k],
+                    ") must match the size of tensor b (",
+                    ts[n].shape[k],
+                    ") at non-singleton dimension ",
+                    k - (MAX_RANK - rank),
+                )
+
+
 def _sizes_str(t: T) -> String:
     var s = String("[")
     for i in range(t.rank):
