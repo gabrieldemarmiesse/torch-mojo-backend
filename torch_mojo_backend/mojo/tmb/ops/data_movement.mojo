@@ -152,6 +152,8 @@ from tmb.ops.common import (
     release_if_new,
     resize_out,
     resize_storage_bytes,
+    int_list_str,
+    wrap_dim,
 )
 from tmb.backend.registry import Site, impl
 from tmb.ops.complex import (
@@ -1243,16 +1245,6 @@ def _split_resize_out(mut out: T, src: T) raises:
         out = T(out.h)
 
 
-def _sizes_str(sizes: IntList) raises -> String:
-    """`split_sizes` the way TORCH_CHECK prints an IntArrayRef."""
-    var s = String("[")
-    for i in range(len(sizes)):
-        if i:
-            s += ", "
-        s += String(sizes[i])
-    return s + "]"
-
-
 # aten::split_with_sizes_copy.out(Tensor self, SymInt[] split_sizes, int dim=0, *, Tensor(a!)[] out) -> ()
 def op_split_with_sizes_copy_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
@@ -1265,17 +1257,7 @@ def op_split_with_sizes_copy_out(
         raise Error("split expects at least a 1-dimensional tensor")
     # Every message below is ATen's own text: this op is registered, so its
     # composite kernel no longer runs and these are the only ones a user sees.
-    if dim_in < -src.rank or dim_in >= src.rank:
-        raise Error(
-            "Dimension out of range (expected to be in range of [",
-            -src.rank,
-            ", ",
-            src.rank - 1,
-            "], but got ",
-            dim_in,
-            ")",
-        )
-    var dim = dim_in + src.rank if dim_in < 0 else dim_in
+    var dim = wrap_dim(dim_in, src.rank)
     var total = 0
     for i in range(len(sizes)):
         if sizes[i] < 0:
@@ -1284,7 +1266,7 @@ def op_split_with_sizes_copy_out(
                     "split_with_sizes expects split_sizes have only"
                     " non-negative entries, but got split_sizes="
                 ),
-                _sizes_str(sizes),
+                int_list_str(sizes.to_list()),
             )
         total += sizes[i]
     if total != src.dim(dim):
@@ -1294,7 +1276,7 @@ def op_split_with_sizes_copy_out(
             " (input tensor's size at dimension ",
             dim,
             "), but got split_sizes=",
-            _sizes_str(sizes),
+            int_list_str(sizes.to_list()),
         )
     if len(outs) != len(sizes):
         raise Error(
@@ -1363,11 +1345,6 @@ def _can_cast(src: DType, dst: DType) -> Bool:
     if src.is_floating_point() and not dst.is_floating_point():
         return False
     return src == DType.bool or dst != DType.bool
-
-
-def _scalar_type_name(dt: DType) -> String:
-    """How torch names a ScalarType in an error message."""
-    return scalar_type_name(dt)
 
 
 def _cat_out_batched(ins: List[T], dim: Int, out_t: T) raises -> Bool:
@@ -1483,7 +1460,7 @@ def op_cat_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not _can_cast(result.t.dtype, out.dtype):
         raise Error(
             "torch.cat(): input types can't be cast to the desired output type "
-            + _scalar_type_name(out.dtype)
+            + scalar_type_name(out.dtype)
         )
     if not out.on_mojo() or out.device != result.t.device:
         raise Error("cat.out: out must be on the inputs' mojo device")
@@ -1962,7 +1939,7 @@ def _scatter_launch(
                 '"'
                 + kernel
                 + "\" not implemented for '"
-                + _scalar_type_name(dest.dtype)
+                + scalar_type_name(dest.dtype)
                 + "'"
             )
         kdt = DType.uint8
@@ -2165,7 +2142,7 @@ def _scatter_validate(
         # copy of self, as below.)
         unsupported(
             '"cuda_scatter_gather_base_kernel_func" not implemented for \''
-            + _scalar_type_name(a.dtype)
+            + scalar_type_name(a.dtype)
             + "'"
         )
     # A float8 scatter (CUDA dispatches AT_FLOAT8_TYPES) is a byte move.
@@ -2403,23 +2380,6 @@ def op_scatter_value(
 # ---------------------------------------------------------------------------
 
 
-def _norm_dim(dim_in: Int, rank: Int, what: String) raises -> Int:
-    var r = max(rank, 1)
-    var dim = dim_in + r if dim_in < 0 else dim_in
-    if dim < 0 or dim >= r:
-        raise Error(
-            what,
-            ": Dimension out of range (expected to be in range of [",
-            -r,
-            ", ",
-            r - 1,
-            "], but got ",
-            dim_in,
-            ")",
-        )
-    return dim
-
-
 def _out_target(
     mut out: T, shape: IndexList[MAX_RANK], rank: Int, like: T, what: String
 ) raises:
@@ -2429,9 +2389,9 @@ def _out_target(
         raise Error(
             what,
             ": Expected out tensor to have dtype ",
-            _scalar_type_name(like.dtype),
+            scalar_type_name(like.dtype),
             ", but got ",
-            _scalar_type_name(out.dtype),
+            scalar_type_name(out.dtype),
             " instead",
         )
     if not out.on_mojo() or out.device != like.device:
@@ -2486,7 +2446,7 @@ def _check_index(index: T, like: T, what: String) raises:
 
 
 def _gather_into(dst: T, a: T, dim_in: Int, index: T, what: String) raises:
-    var dim = _norm_dim(dim_in, a.rank, what)
+    var dim = wrap_dim(dim_in, a.rank)
     if dst.numel == 0:
         return
     if _dim_or1(a, dim) == 0:
@@ -2509,7 +2469,7 @@ def _gather_check(a: T, dim_in: Int, index: T) raises -> IndexList[MAX_RANK]:
     check); a 0-d operand counts as 1-d."""
     if a.rank > 4:
         unsupported("aten::gather of rank greater than 4")
-    var dim = _norm_dim(dim_in, a.rank, "gather")
+    var dim = wrap_dim(dim_in, a.rank)
     if index.numel == 0:
         return index.shape
     _check_index(index, a, "gather")
@@ -2571,7 +2531,7 @@ def _index_select_shape(
     _check_index(index, a, "index_select")
     if index.rank > 1:
         raise Error("index_select(): Index is supposed to be a vector")
-    var dim = _norm_dim(dim_in, a.rank, "index_select")
+    var dim = wrap_dim(dim_in, a.rank)
     var shape = a.shape
     if a.rank == 0:
         if index.numel != 1:
@@ -2586,7 +2546,7 @@ def _index_select_shape(
 
 
 def _index_select_into(dst: T, a: T, dim_in: Int, index: T) raises:
-    var dim = _norm_dim(dim_in, a.rank, "index_select")
+    var dim = wrap_dim(dim_in, a.rank)
     if dst.numel == 0:
         return
     if _dim_or1(a, dim) == 0:
@@ -2685,7 +2645,7 @@ def op_index_select_out(
     if shares_storage(out, a2) and index2.numel <= 16 and index2.numel > 1:
         # CUDA's small-index kernel (<= 16 indices) walks the indices in
         # order: a slice read after an earlier one was written sees it.
-        var d = _norm_dim(dim, a2.rank, "index_select")
+        var d = wrap_dim(dim, a2.rank)
         for i in range(index2.numel):
             var ish = IndexList[MAX_RANK](1)
             var ist = IndexList[MAX_RANK](0)
@@ -2799,7 +2759,7 @@ def op_scatter_add_out(
 def _index_add_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
     """index_add's argument checks (index_func_meta_impl's), before any
     overlap check or write; returns the normalized dim."""
-    var dim = _norm_dim(dim_in, a.rank, "index_add")
+    var dim = wrap_dim(dim_in, a.rank)
     var rank = max(a.rank, 1)
     _check_index(index, a, "index_add")
     if index.rank > 1:
@@ -2807,9 +2767,9 @@ def _index_add_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
     if source.dtype != a.dtype:
         raise Error(
             "index_add_(): self (",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             ") and source (",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
             ") must have the same scalar type",
         )
     if a.rank > 4 or max(source.rank, 1) != rank:
@@ -3146,9 +3106,9 @@ def _overlaps_contiguous_target(target: T, source: T) -> Bool:
 def _index_put_dtype_error(target: T, values: T) raises:
     raise Error(
         "Index put requires the source and destination dtypes match, got ",
-        _scalar_type_name(target.dtype),
+        scalar_type_name(target.dtype),
         " for the destination and ",
-        _scalar_type_name(values.dtype),
+        scalar_type_name(values.dtype),
         " for the source.",
     )
 
@@ -3581,7 +3541,7 @@ def op_nonzero(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if is_float8(t.dtype):
         unsupported(
             '"nonzero_cuda" not implemented for \''
-            + _scalar_type_name(t.dtype)
+            + scalar_type_name(t.dtype)
             + "'"
         )
     # A 0-d tensor has one element and no coordinates: ATen scans it like a
@@ -3681,12 +3641,12 @@ def _masked_select(a: T, mask: T) raises -> Owned:
     if mask.dtype != DType.bool:
         raise Error(
             "masked_select: expected BoolTensor for mask, got ",
-            _scalar_type_name(mask.dtype),
+            scalar_type_name(mask.dtype),
         )
     if not a.on_mojo() or not mask.on_mojo() or a.device != mask.device:
         unsupported("masked_select: self and mask must be on the same mojo GPU")
     if a.itemsize > 8:
-        unsupported("masked_select: dtype " + _scalar_type_name(a.dtype))
+        unsupported("masked_select: dtype " + scalar_type_name(a.dtype))
     var rank = max(a.rank, mask.rank)
     var shape = broadcast_shape(a, mask)
     var src = _broadcast_dense(a, shape, rank)
@@ -3903,7 +3863,8 @@ def op_resize_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         raise Error("numel: integer multiplication overflow")
     if not has_zero and numel > (_INT64_MAX // self_t.itemsize) - offset:
         raise Error(
-            "Storage size calculation overflowed with sizes=", _sizes_str(sizes)
+            "Storage size calculation overflowed with sizes=",
+            int_list_str(sizes.to_list()),
         )
     var t = self_t.copy()
     resize_out(t, shape, rank)

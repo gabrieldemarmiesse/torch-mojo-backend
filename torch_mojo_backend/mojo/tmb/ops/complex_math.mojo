@@ -39,7 +39,6 @@ from tmb.ops.complex import (
     _check_cast,
     _tensor_or_scalar,
     _unary,
-    _wrap_dim,
     as_complex,
     as_real,
     cx_unary_out,
@@ -50,7 +49,6 @@ from tmb.ops.common import (
     can_cast,
     check_real_scalar_fits,
     sub_check,
-    is_float_stype,
     scalar_type_name,
     scalar_parts,
     scalar_type_token,
@@ -66,6 +64,7 @@ from tmb.ops.common import (
     copy_strided_into,
     cx_launch,
     fill_complex,
+    wrap_dim,
 )
 from tmb.backend.abi import (
     OpFn,
@@ -109,6 +108,7 @@ from tmb.backend.abi import (
     v_tensor_c,
     view_strided,
     ret_ref,
+    is_floating,
 )
 
 
@@ -407,7 +407,7 @@ def _real_alpha_args(args: Values, negate: Bool) raises -> List[Value]:
             var opmath = common
             if common == ST_FLOAT16 or common == ST_BFLOAT16:
                 opmath = ST_FLOAT32
-            if parts[1] != 0.0 or is_float_stype(opmath):
+            if parts[1] != 0.0 or is_floating(opmath):
                 check_real_scalar_fits(opmath, alpha)
             alpha = Value(TAG_SCALAR_DOUBLE, 0, alpha.a, 0)  # the real part
     var out = List[Value](capacity=4)
@@ -1039,7 +1039,7 @@ def _reduce(
     if (
         name == "mean"
         and dtype_v.tag == TAG_NONE
-        and not is_float_stype(x.stype)
+        and not is_floating(x.stype)
         and not is_float8_stype(x.stype)
         and not x.is_complex()
     ):
@@ -1054,7 +1054,7 @@ def _reduce(
     if name == "mean" and dtype_v.tag != TAG_NONE:
         var asked = v_dtype_or(dtype_v, x.stype)
         if (
-            not is_float_stype(asked)
+            not is_floating(asked)
             and not is_float8_stype(asked)
             and not is_complex_stype(asked)
         ):
@@ -1100,7 +1100,7 @@ def _reduce(
                 + scalar_type_name(want)
                 + "'"
             )
-        if not is_float_stype(want):
+        if not is_floating(want):
             # a complex reduction into a bool / integer dtype or out: not
             # emulated (declined after CUDA's own checks, before the out is
             # touched)
@@ -1308,7 +1308,7 @@ def _cumsum(args: Values, out_st: Int32 = -1) raises -> Owned:
     var x = v_tensor_c(args[unsafe_offset=0])
     var dtype_v = args[unsafe_offset=2].copy()
     # CUDA's order: the dim, then the out's dtype against dtype=
-    var dim = _wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
+    var dim = wrap_dim(Int(args[unsafe_offset=1].a), x.rank)
     var want = v_dtype_or(dtype_v, out_st if out_st >= 0 else x.stype)
     if out_st >= 0 and want != out_st:
         raise Error(
@@ -1324,7 +1324,7 @@ def _cumsum(args: Values, out_st: Int32 = -1) raises -> Owned:
             + scalar_type_name(want)
             + "'"
         )
-    if not is_complex_stype(want) and not is_float_stype(want):
+    if not is_complex_stype(want) and not is_floating(want):
         # a complex scan into a bool / integer dtype or out: not emulated
         # (declined before the out is touched)
         unsupported(

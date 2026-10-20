@@ -58,6 +58,7 @@ from tmb.backend.abi import (
     v_f64,
     v_is_none,
     v_string,
+    is_floating,
 )
 from std.utils import IndexList
 from tmb.kernels.common.op_utils import MAX_RANK
@@ -71,12 +72,13 @@ from tmb.ops.common import (
     cast_to,
     combine_categories,
     device_str,
-    is_float_stype,
     is_wide_unsigned,
     promote_types,
     resize_out,
     scalar_type_name,
     store_generated_out,
+    shape_list_str,
+    float_max,
 )
 
 # out= dtype rule of the op's TensorIterator (MODE_FN: no out, functional).
@@ -125,12 +127,10 @@ def _f8_rec(v: Value) -> Bool:
     return is_float8_stype(external_call["tmb_tensor_dtype", Int32](Int(v.a)))
 
 
-def _tname(st: Int32) raises -> String:
-    return scalar_type_name(st)
-
-
 def _refuse(kernel: String, st: Int32) raises:
-    unsupported('"' + kernel + "\" not implemented for '" + _tname(st) + "'")
+    unsupported(
+        '"' + kernel + "\" not implemented for '" + scalar_type_name(st) + "'"
+    )
 
 
 @fieldwise_init
@@ -201,7 +201,7 @@ def _common_of(args: Values, ins: Int, rev: Bool = False) raises -> Int32:
                 var st = t.stype
                 if is_complex_stype(st):
                     st = default_complex_dtype()
-                elif is_float_stype(st):
+                elif is_floating(st):
                     st = default_dtype()
                 wrapped = promote_types(wrapped, st)
             else:
@@ -231,7 +231,7 @@ def _alpha_check(dt: Int32, a: Value) raises:
     var is_bool = a.tag == TAG_SCALAR_BOOL or a.tag == TAG_BOOL
     if is_bool and dt != ST_BOOL:
         raise Error("Boolean alpha only supported for Boolean results.")
-    var floating = is_float_stype(dt) or is_float8_stype(dt)
+    var floating = is_floating(dt) or is_float8_stype(dt)
     var cplx = is_complex_stype(dt)
     # alpha.isIntegral(true) is false for a double and for a complex alpha:
     # on an integral result both get this message, before the complex one
@@ -264,7 +264,7 @@ def _kernel_alpha(dt: Int32, a: Value, negate: Bool) raises -> Value:
     truncated (bool: nonzero). sub / rsub hand the add kernel `-alpha`
     (`negate`): that is the value checked. A floating `dt` gets alpha as
     given."""
-    if is_float_stype(dt) or is_float8_stype(dt) or is_complex_stype(dt):
+    if is_floating(dt) or is_float8_stype(dt) or is_complex_stype(dt):
         return a.copy()
     var is_double = a.tag == TAG_SCALAR_DOUBLE or a.tag == TAG_DOUBLE
     var is_int = a.tag == TAG_SCALAR_INT or a.tag == TAG_INT
@@ -366,27 +366,17 @@ def _device_error(a: String, b: String) raises:
 def softshrink_check(a: T, lam: Float64) raises:
     """Activation.cpp's softshrink_check: an AT_DISPATCH over the floating
     dtypes, then 0 <= lambd <= max of self's dtype (NaN fails)."""
-    if not is_float_stype(a.stype):
+    if not is_floating(a.stype):
         _refuse("softshrink_check", a.stype)
-    if not (lam >= 0 and lam <= _float_max(a.dtype)):
+    if not (lam >= 0 and lam <= float_max(a.dtype)):
         raise Error(
             "lambda must be in range [0, ",
             _float_max_str(a.dtype),
             "] for input dtype ",
-            _tname(a.stype),
+            scalar_type_name(a.stype),
             ", but found ",
             _fmt_g(lam),
         )
-
-
-def _float_max(dt: DType) -> Float64:
-    if dt == DType.float16:
-        return 65504.0
-    if dt == DType.bfloat16:
-        return 3.3895313892515355e38
-    if dt == DType.float32:
-        return 3.4028234663852886e38
-    return 1.7976931348623157e308
 
 
 def _float_max_str(dt: DType) -> String:
@@ -413,15 +403,6 @@ def _fmt_g(x: Float64) -> String:
         return String(Int(x))
     var s = String(x)
     return s
-
-
-def _shape_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
-    var s = String("[")
-    for i in range(rank):
-        if i > 0:
-            s += ", "
-        s += String(shape[MAX_RANK - rank + i])
-    return s + "]"
 
 
 @fieldwise_init
@@ -531,9 +512,9 @@ def _pre[
             if o.stype != a.stype:
                 raise Error(
                     "nan_to_num: dtype of out: ",
-                    _tname(o.stype),
+                    scalar_type_name(o.stype),
                     " should be same as input: ",
-                    _tname(a.stype),
+                    scalar_type_name(a.stype),
                 )
     elif pre == PRE_LDEXP:
         # BinaryOps.cpp: ldexp_out rejects an integral out, then computes
@@ -544,12 +525,12 @@ def _pre[
         var b = T(Int(args[unsafe_offset=1].a))
         comptime if out_idx >= 0:
             var o = T(Int(args[unsafe_offset=out_idx].a))
-            if not is_float_stype(o.stype) and not is_float8_stype(o.stype):
+            if not is_floating(o.stype) and not is_float8_stype(o.stype):
                 raise Error(
                     "ldexp can't be cast to the desired output type ",
-                    _tname(o.stype),
+                    scalar_type_name(o.stype),
                 )
-        var b_float = is_float_stype(b.stype) or is_float8_stype(b.stype)
+        var b_float = is_floating(b.stype) or is_float8_stype(b.stype)
         var fast = not b_float and is_float8_stype(a.stype)
         comptime if out_idx >= 0:
             # torch 2.14's fast path also wants out to hold self's dtype.
@@ -565,7 +546,7 @@ def _pre[
             # broadcast and must share a device.
             return _Pre(-1, 1, False, "ldexp_cuda", ins, False)
         var pdt: Int32
-        if not (is_float_stype(a.stype) or is_float8_stype(a.stype)) or (
+        if not (is_floating(a.stype) or is_float8_stype(a.stype)) or (
             a.dtype == DType.float32
         ):
             pdt = b.stype if b_float else ST_FLOAT32
@@ -581,9 +562,9 @@ def _pre[
             if it.shape_ok and not _shape_is(a, it.shape, it.rank):
                 raise Error(
                     "output with shape ",
-                    _shape_str(a.shape, a.rank),
+                    shape_list_str(a.shape, a.rank),
                     " doesn't match the broadcast shape ",
-                    _shape_str(it.shape, it.rank),
+                    shape_list_str(it.shape, it.rank),
                 )
         if a.rank > 0 and b.rank > 0:
             _ = promote_types(a.stype, pdt)
@@ -630,16 +611,16 @@ def _pre[
             if o.stype != a.stype:
                 raise Error(
                     "Found dtype ",
-                    _tname(o.stype),
+                    scalar_type_name(o.stype),
                     " but expected ",
-                    _tname(a.stype),
+                    scalar_type_name(a.stype),
                 )
         if g.stype != a.stype:
             raise Error(
                 "Found dtype ",
-                _tname(g.stype),
+                scalar_type_name(g.stype),
                 " but expected ",
-                _tname(a.stype),
+                scalar_type_name(a.stype),
             )
     elif pre == PRE_SOFTSHRINK:
         # softshrink_check: an AT_DISPATCH over self's dtype, before the
@@ -681,7 +662,7 @@ def f8_cx_scalar[
         if args[unsafe_offset=1 - i].tag == TAG_COMPLEX and _f8_rec(t):
             raise Error(
                 "Unknown Complex ScalarType for ",
-                _tname(T(Int(t.a)).stype),
+                scalar_type_name(T(Int(t.a)).stype),
             )
     op(args, n_args, rets, n_rets)
 
@@ -761,9 +742,9 @@ def f8_iter[
         if read_write and not _shape_is(o, it.shape, it.rank):
             raise Error(
                 "output with shape ",
-                _shape_str(o.shape, o.rank),
+                shape_list_str(o.shape, o.rank),
                 " doesn't match the broadcast shape ",
-                _shape_str(it.shape, it.rank),
+                shape_list_str(it.shape, it.rank),
             )
         # (a) + (c), with the device check where TensorIterator's
         # compute_types makes it: after an exact-dtype out's check, before
@@ -773,9 +754,9 @@ def f8_iter[
             if o.stype != common:
                 raise Error(
                     "Found dtype ",
-                    _tname(o.stype),
+                    scalar_type_name(o.stype),
                     " but expected ",
-                    _tname(common),
+                    scalar_type_name(common),
                 )
         var cdev = _common_device(args, p.shape_ins, o)
         if device_str(o) != cdev:
@@ -784,9 +765,9 @@ def f8_iter[
             if not can_cast(common, o.stype):
                 raise Error(
                     "result type ",
-                    _tname(common),
+                    scalar_type_name(common),
                     " can't be cast to the desired output type ",
-                    _tname(o.stype),
+                    scalar_type_name(o.stype),
                 )
         _inputs_on_device(args, p.shape_ins, cdev, p.cpu_scalars)
         # (d)
@@ -839,7 +820,7 @@ def f8_iter[
     if is_float8_stype(compute):
         _refuse(k, compute)
     comptime if int_only:
-        if is_float_stype(compute):
+        if is_floating(compute):
             _refuse(k, compute)
     # A float8 operand of a wider computation: converted exactly first. A
     # kernel dispatched on the out dtype computes in it: every operand is

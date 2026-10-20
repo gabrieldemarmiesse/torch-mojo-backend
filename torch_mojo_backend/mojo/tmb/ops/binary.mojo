@@ -68,6 +68,7 @@ from tmb.backend.abi import (
     v_is_none,
     v_string,
     v_tensor,
+    is_floating,
 )
 from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
@@ -94,6 +95,9 @@ from tmb.ops.common import (
     scalar_to_float,
     scalar_to_int,
     sub_check,
+    assert_no_partial_overlap,
+    one_device,
+    shape_list_str,
 )
 from tmb.ops.core import cast_for_copy
 from tmb.ops.f8_iter import (
@@ -188,16 +192,6 @@ def _b_bcast_dtype(st: Int32) -> Bool:
 def _b_fillable(st: Int32) -> Bool:
     """elementwise SPEC_FILL_DTYPES (the old `_FILL_DTYPES`)."""
     return _b_bcast_dtype(st) or st == ST_BOOL
-
-
-def _b_int_dtype(st: Int32) -> Bool:
-    return (
-        st == ST_INT8
-        or st == ST_INT16
-        or st == ST_INT32
-        or st == ST_INT64
-        or st == ST_UINT8
-    )
 
 
 def _b_category(st: Int32) -> Int:
@@ -623,23 +617,10 @@ def _b_fits(t: T, shape: IndexList[MAX_RANK]) -> Bool:
 # ---------------------------------------------------------------------------
 
 
-def _one_device(a: T, b: T) raises:
-    """Both operands of a raw-pointer launch on the same mojo device.
-
-    A kernel gets bare pointers and one stream: a pointer belonging to
-    another device -- or to no mojo device at all -- would be dereferenced
-    against the wrong context. The fields are cached on `T`, so this costs
-    nothing. Private to this file until the port is merged; it belongs in
-    tmb/ops/common.mojo.
-    """
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
-        raise Error("expected every operand on the same mojo device")
-
-
 def _b_binary_spec(op: StaticString, a: T, b: T, dst: T) raises:
     """logic broadcast binary into a caller-allocated contiguous output."""
-    _one_device(a, dst)
-    _one_device(b, dst)
+    one_device(a, dst)
+    one_device(b, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("logic", String(op))
@@ -655,7 +636,7 @@ def _b_binary_spec(op: StaticString, a: T, b: T, dst: T) raises:
 
 def _b_scalar_spec(op: StaticString, a: T, value: Float64, dst: T) raises:
     """elementwise contiguous tensor-with-float-scalar."""
-    _one_device(a, dst)
+    one_device(a, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("elementwise", String(op))
@@ -670,7 +651,7 @@ def _b_scalar_spec(op: StaticString, a: T, value: Float64, dst: T) raises:
 
 def _b_int_scalar_spec(op: StaticString, a: T, value: Int, dst: T) raises:
     """elementwise contiguous tensor-with-int-scalar."""
-    _one_device(a, dst)
+    one_device(a, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("elementwise", String(op))
@@ -700,8 +681,8 @@ def _b_raw_add(dst: T, a: T, b: T) raises:
     """elementwise `Add`: contiguous, equal shapes, one dtype. `dst` may
     be `a` — that is the in-place route, and the kernel is a flat elementwise
     loop, so aliasing the destination with an operand is exact."""
-    _one_device(a, dst)
-    _one_device(b, dst)
+    one_device(a, dst)
+    one_device(b, dst)
     if a.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -808,7 +789,7 @@ def _b_write_safe(dest: T, other: T) -> Bool:
     with `dest`. Both are contiguous on this path, so `numel * itemsize` is
     their exact span.
 
-    Weaker than `_b_no_partial_overlap`, which also passes non-dense views it
+    Weaker than `assert_no_partial_overlap`, which also passes non-dense views it
     cannot judge; those return False here and take the cascade, where that
     function decides.
     """
@@ -1377,9 +1358,9 @@ def _b_store_inplace(rets: Values, self: T, var res: Res) raises:
     if not self.same_shape(held.t):
         raise Error(
             "output with shape ",
-            _b_shape_list(self.shape, self.rank),
+            shape_list_str(self.shape, self.rank),
             " doesn't match the broadcast shape ",
-            _b_shape_list(held.t.shape, held.t.rank),
+            shape_list_str(held.t.shape, held.t.rank),
         )
     if held.t.stype == self.stype:
         _b_copy_into(self, held.t)
@@ -1416,56 +1397,9 @@ def _b_device_of(lhs: Side, rhs: Side) raises -> Int:
     return 0
 
 
-def _b_dense_enough(t: T) -> Bool:
-    """`TensorImpl::is_non_overlapping_and_dense`: only then is the view's
-    memory exactly `[ptr, ptr + numel * itemsize)`. Anything else -- a
-    broadcast (stride 0) or a strided view such as `x[::2]` -- is what
-    ATen's overlap check calls `TooHard` and lets through, so disjoint
-    interleaved views (`x[::2] >>= x[1::2]`) are accepted as in torch."""
-    return t.contig or is_dense(t.shape, t.strides, t.rank)
-
-
-def _b_no_partial_overlap(written: T, other: T) raises:
-    """`at::assert_no_partial_overlap` (c10/core/MemOverlap.cpp).
-
-    An in-place or `out=` op whose input shares storage with the tensor being
-    written, WITHOUT being the same view of it, is a read/write race: the
-    kernel reads and writes the same bytes from different threads in an order
-    nothing fixes. `x[1:].add_(x[:-1])` is the canonical case. The same view
-    (identical span AND identical strides) is fine -- element i is written
-    from element i -- and that is how `x.add_(x)` works.
-    """
-    if written.h == other.h or written.numel == 0 or other.numel == 0:
-        return
-    var storage = written.storage_ptr()
-    if storage == 0 or storage != other.storage_ptr():
-        return
-    if not _b_dense_enough(written) or not _b_dense_enough(other):
-        return
-    var a_begin = written.ptr
-    var a_end = a_begin + written.numel * written.itemsize
-    var b_begin = other.ptr
-    var b_end = b_begin + other.numel * other.itemsize
-    if a_begin == b_begin and a_end == b_end:
-        if written.rank == other.rank:
-            var same = True
-            for i in range(written.rank):
-                if written.stride(i) != other.stride(i):
-                    same = False
-            if same:
-                return
-    elif not (a_begin < b_end and b_begin < a_end):
-        return
-    raise Error(
-        "unsupported operation: some elements of the input tensor and the"
-        " written-to tensor refer to a single memory location. Please clone()"
-        " the tensor before performing the operation."
-    )
-
-
 def _b_no_overlap_side(written: T, side: Side) raises:
     if side.is_t:
-        _b_no_partial_overlap(written, side.t.value())
+        assert_no_partial_overlap(written, side.t.value())
 
 
 def _b_same_tensor(a: T, b: T) -> Bool:
@@ -1474,15 +1408,6 @@ def _b_same_tensor(a: T, b: T) -> Bool:
     The boxed call hands the two records separately, and pointer equality is
     no substitute: independent empty tensors share a null data pointer."""
     return a.h == b.h or a.impl() == b.impl()
-
-
-def _b_shape_list(shape: IndexList[MAX_RANK], rank: Int) -> String:
-    var s = String("[")
-    for i in range(rank):
-        if i:
-            s += ", "
-        s += String(shape[MAX_RANK - rank + i])
-    return s + "]"
 
 
 def _b_tname(st: Int32) raises -> String:
@@ -1534,7 +1459,7 @@ def _b_out_guard3(
         if not side.is_t:
             continue
         var t = side.t.value().copy()
-        _b_no_partial_overlap(dest, t)
+        assert_no_partial_overlap(dest, t)
         if _b_same_tensor(dest, t):
             read_write = True
         rank = max(rank, t.rank)
@@ -1574,9 +1499,9 @@ def _b_out_guard3(
     if not fits:
         raise Error(
             "output with shape ",
-            _b_shape_list(dest.shape, dest.rank),
+            shape_list_str(dest.shape, dest.rank),
             " doesn't match the broadcast shape ",
-            _b_shape_list(shape, rank),
+            shape_list_str(shape, rank),
         )
 
 
@@ -2116,10 +2041,6 @@ def op_mul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def _b_is_floating(st: Int32) -> Bool:
-    return _b_float3(st) or st == ST_FLOAT64
-
-
 def _b_true_div_dtype(a: T, rhs: Side) raises -> Int32:
     """`torch.result_type` for TRUE division.
 
@@ -2134,8 +2055,8 @@ def _b_true_div_dtype(a: T, rhs: Side) raises -> Int32:
     var common = a_stype
     if rhs.is_t:
         var b_stype = rhs.t.value().stype
-        var a_float = _b_is_floating(a_stype)
-        var b_float = _b_is_floating(b_stype)
+        var a_float = is_floating(a_stype)
+        var b_float = is_floating(b_stype)
         if a_float and not b_float:
             common = a_stype
         elif b_float and not a_float:
@@ -2151,9 +2072,9 @@ def _b_true_div_dtype(a: T, rhs: Side) raises -> Int32:
                 )
         else:
             return default_dtype()
-    elif not rhs.s.value().is_int and not _b_is_floating(a_stype):
+    elif not rhs.s.value().is_int and not is_floating(a_stype):
         return default_dtype()
-    if not _b_is_floating(common):
+    if not is_floating(common):
         return default_dtype()
     return common
 
@@ -2181,7 +2102,7 @@ def _b_rounding_div(
     if lhs.is_t and not rhs.is_t:
         var a = lhs.t.value().copy()
         var s = rhs.s.value().copy()
-        if not _b_is_floating(a.stype) and s.is_int and s.i == 0:
+        if not is_floating(a.stype) and s.is_int and s.i == 0:
             raise Error("ZeroDivisionError")
         if a.stype == ST_BFLOAT16 or a.stype == ST_FLOAT16:
             var op: StaticString = "TruncDivScalarSpec"
@@ -2222,7 +2143,7 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     var common = _b_true_div_dtype(a, rhs)
     # float64 included: DivSpec dispatches on logic SPEC_BCAST_DTYPES,
     # which has it, and the kernel only asks that the dtype be floating.
-    if not _b_is_floating(common):
+    if not is_floating(common):
         unsupported(
             "true division producing dtype "
             + String(common)
@@ -2308,7 +2229,7 @@ def _b_fast_div(args: Values, rets: Values, dest_h: Int) raises -> Bool:
             # declines it (`v_tensor`) where no complex route took it
             return False
         if b.on_mojo():
-            if a.stype != b.stype or not _b_is_floating(a.stype):
+            if a.stype != b.stype or not is_floating(a.stype):
                 return False
             return _b_fast_tt("DivSpec", a, b, rets, dest_h)
         if not _b_wrapped_number(b):
@@ -2431,7 +2352,7 @@ def _b_pow_float_base(lhs: Side, rhs: Side) raises:
     if lhs.is_t and is_float8(lhs.t.value().dtype):
         _ = _b_sides_result(lhs, rhs, rhs)  # c10's float8 promotion error
         decline_float8(lhs.t.value().dtype, "pow_cuda")
-    if not lhs.is_t or not _b_is_floating(lhs.t.value().stype):
+    if not lhs.is_t or not is_floating(lhs.t.value().stype):
         unsupported("pow.Tensor_Tensor on a tensor that is not float")
 
 
@@ -2823,7 +2744,7 @@ def _b_clamp_dtype(self_stype: Int32, lo: Value, hi: Value) -> Int32:
     var float_bound = (not v_is_none(lo) and not _b_scalar_is_int(lo)) or (
         not v_is_none(hi) and not _b_scalar_is_int(hi)
     )
-    if _b_is_floating(self_stype) or is_float8_stype(self_stype):
+    if is_floating(self_stype) or is_float8_stype(self_stype):
         return self_stype  # a wrapped Scalar never promotes a float tensor
     if float_bound:
         return default_dtype()
@@ -2936,7 +2857,7 @@ def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:
     """A clamp bound as `_b_clamp_launch`'s raw slot."""
     # `Scalar::to<scalar_t>()`: checked against the dtype (and exact for
     # an integral one).
-    if _b_is_floating(result_stype):
+    if is_floating(result_stype):
         return Int(f64_bits(scalar_to_float(v, result_stype)))
     return scalar_to_int(v, result_stype)
 
@@ -3116,7 +3037,7 @@ def _b_addc(
     decline_float8(
         a.dtype, "addcmul_cuda" if op == "AddcmulBcast" else "addcdiv_cuda"
     )
-    if not _b_float3(a.stype) and not (allow_int and _b_int_dtype(a.stype)):
+    if not _b_float3(a.stype) and not (allow_int and is_int_stype(a.stype)):
         unsupported("addc* of dtype " + String(a.stype))
     if a.rank > 4 or b.rank > 4 or c.rank > 4:
         unsupported("addc* operands of rank > 4")
@@ -3140,9 +3061,9 @@ def _b_addc(
             and a.same_shape(b)
             and a.same_shape(c)
         ):
-            _b_no_partial_overlap(dest, a)
-            _b_no_partial_overlap(dest, b)
-            _b_no_partial_overlap(dest, c)
+            assert_no_partial_overlap(dest, a)
+            assert_no_partial_overlap(dest, b)
+            assert_no_partial_overlap(dest, c)
             if _b_same_tensor(dest, a) and a.dtype == DType.float32:
                 foreach_addc_inplace(
                     dest, b, c, s.f, multiplies=op == "AddcmulBcast"
@@ -3177,7 +3098,7 @@ def _b_inplace_operand(dest: T, other: T) raises:
     if (dest.contig or is_dense(dest.shape, dest.strides, dest.rank)) and (
         other.contig or is_dense(other.shape, other.strides, other.rank)
     ):
-        _b_no_partial_overlap(dest, other)
+        assert_no_partial_overlap(dest, other)
 
 
 def _b_addc_inplace(
@@ -3311,7 +3232,7 @@ def _b_lerp(args: Values, dst: Optional[T] = None) raises -> Res:
             and dest.same_shape(start)
             and start.same_shape(finish)
         ):
-            _b_no_partial_overlap(dest, finish)
+            assert_no_partial_overlap(dest, finish)
             # The single-tensor in-place decomposition reaches Scalar_out.
             # Reuse the foreach multi-tensor apply for one tensor;
             # ADInplaceOrView handles this op's version increment itself.

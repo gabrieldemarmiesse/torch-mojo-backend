@@ -48,8 +48,12 @@ from tmb.ops.attention import (
     _ret_undefined,
     _swap_last,
 )
-from tmb.ops.common import copy_strided_into, shape_str
-from tmb.ops.data_movement import _scalar_type_name
+from tmb.ops.common import (
+    copy_strided_into,
+    shape_str,
+    scalar_type_name,
+    expect_scalar_type,
+)
 
 
 def _view_at(
@@ -98,7 +102,7 @@ def _float_input(t: T, what: StaticString) raises:
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
 
@@ -186,13 +190,7 @@ def _transform_bias_rescale(qkv: T, bias: T, num_head: Int) raises -> Owned:
         )
     if not qkv.on_mojo() or not bias.on_mojo() or qkv.device != bias.device:
         raise Error(W, ": expected qkv and qkv_bias on the same device")
-    if bias.stype != qkv.stype:
-        raise Error(
-            "expected scalar type ",
-            _scalar_type_name(qkv.dtype),
-            " but found ",
-            _scalar_type_name(bias.dtype),
-        )
+    expect_scalar_type(bias, qkv)
     _float_input(qkv, W)
     var dh = d // num_head
     var acc = ST_FLOAT64 if qkv.dtype == DType.float64 else ST_FLOAT32

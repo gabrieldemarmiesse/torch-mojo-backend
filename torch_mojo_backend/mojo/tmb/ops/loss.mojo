@@ -70,9 +70,11 @@ from tmb.ops.common import (
     scalar_to_int,
     shares_storage,
     store_out,
+    sizes_str,
+    scalar_type_name,
+    expect_scalar_type,
+    vec_shape,
 )
-from tmb.ops.data_movement import _scalar_type_name
-from tmb.ops.nn import sizes_str
 from tmb.backend.registry import Site, impl
 
 
@@ -118,7 +120,7 @@ def _loss_float(t: T) raises:
         and t.dtype != DType.bfloat16
     ):
         raise Error(
-            '"loss" not implemented for \'', _scalar_type_name(t.dtype), "'"
+            '"loss" not implemented for \'', scalar_type_name(t.dtype), "'"
         )
 
 
@@ -134,23 +136,6 @@ def _same_device(a: T, b: T) raises:
             device_str(b),
             "!",
         )
-
-
-def _expect_dtype(t: T, like: T) raises:
-    """`Tensor::data_ptr<scalar_t>()`'s check on a second operand."""
-    if t.stype != like.stype:
-        raise Error(
-            "expected scalar type ",
-            _scalar_type_name(like.dtype),
-            " but found ",
-            _scalar_type_name(t.dtype),
-        )
-
-
-def _shape1(n: Int) -> IndexList[MAX_RANK]:
-    var s = IndexList[MAX_RANK](1)
-    s[MAX_RANK - 1] = n
-    return s
 
 
 def _scalar(stype: Int32, device: Int) raises -> Owned:
@@ -217,7 +202,7 @@ def _nll_weight(args: Values, i: Int, input: T) raises -> Optional[Dense]:
         return None
     var w = v_tensor(args[unsafe_offset=i])
     _same_device(input, w)
-    _expect_dtype(w, input)
+    expect_scalar_type(w, input)
     return Dense(w)
 
 
@@ -264,7 +249,7 @@ def _nll_checks(args: Values, self_i: Int, spatial: Bool) raises -> NllArgs:
         if target.stype != ST_INT64:
             raise Error(
                 "expected scalar type Long but found ",
-                _scalar_type_name(target.dtype),
+                scalar_type_name(target.dtype),
             )
     else:
         if input.rank < 1 or input.rank > 2:
@@ -276,7 +261,7 @@ def _nll_checks(args: Values, self_i: Int, spatial: Bool) raises -> NllArgs:
         if target.stype != ST_INT64 and target.stype != ST_UINT8:
             raise Error(
                 "expected target dtype to be Long or Byte, but got ",
-                _scalar_type_name(target.dtype),
+                scalar_type_name(target.dtype),
             )
     _loss_float(input)
     _same_device(input, target)
@@ -446,7 +431,7 @@ struct Dest(Movable):
 def _err_flag(device: Int) raises -> Owned:
     """A zeroed int64[2] (flag, offending target) the generic NLL kernels
     raise for a target outside [0, classes)."""
-    var f = own(new_tensor(_shape1(2), 1, ST_INT64, device))
+    var f = own(new_tensor(vec_shape(2), 1, ST_INT64, device))
     fill_value(f.t, 0.0)
     return f^
 
@@ -454,7 +439,7 @@ def _err_flag(device: Int) raises -> Owned:
 def _raise_bad_target(flag: T) raises:
     """Read the flag back (a synchronizing 16-byte read) and raise like
     CPU torch for a bad target; CUDA's device assert has no message."""
-    var host = own(cpu_empty(_shape1(2), 1, ST_INT64))
+    var host = own(cpu_empty(vec_shape(2), 1, ST_INT64))
     copy_to_host(ctx_for(flag.device), flag.ptr, host.t.ptr, 16)
     var p = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=host.t.ptr)
     var bad = p[unsafe_offset=0] != 0
@@ -498,7 +483,7 @@ def _nll_forward(
             oshape[MAX_RANK - 1] = input.dim(3)
             orank = 3
         else:
-            oshape = _shape1(a.batch)
+            oshape = vec_shape(a.batch)
             orank = 1
     var ins = _nll_inputs(args, [0, 1, 2])
     var out = Dest(oshape, orank, input, out_o, ins)
@@ -541,14 +526,16 @@ def _nll_forward(
         call.int(ctx_ptr(ctx))
         call.run()
     else:
-        var scratch = own(new_tensor(_shape1(1), 1, input.stype, input.device))
+        var scratch = own(
+            new_tensor(vec_shape(1), 1, input.stype, input.device)
+        )
         if spatial and not none_mode:
             # NLLLoss2d.cu: GET_BLOCKS(map) / 128 blocks per sample, at least
             # 1 (nll2d_blocks_per_sample in kernels/loss/nll_kernels.mojo).
             var bps = max(1, ((a.map + 127) // 128) // 128)
             scratch = own(
                 new_tensor(
-                    _shape1(2 * bps * a.batch), 1, input.stype, input.device
+                    vec_shape(2 * bps * a.batch), 1, input.stype, input.device
                 )
             )
         var err = _err_flag(input.device)
@@ -652,8 +639,8 @@ def _nll_backward_checks(args: Values, a: NllArgs, spatial: Bool) raises:
             )
     _same_device(input, grad)
     _same_device(input, tw)
-    _expect_dtype(grad, input)
-    _expect_dtype(tw, input)
+    expect_scalar_type(grad, input)
+    expect_scalar_type(tw, input)
 
 
 def _nll_backward(
@@ -891,7 +878,7 @@ def _optional_dense(args: Values, i: Int, like: T) raises -> Optional[Dense]:
         return None
     var t = v_tensor(args[unsafe_offset=i])
     _same_device(like, t)
-    _expect_dtype(t, like)
+    expect_scalar_type(t, like)
     return Dense(t)
 
 
@@ -910,7 +897,7 @@ def _multi_margin_forward(args: Values) raises -> Owned:
     var reduction = _reduction(v_int(args[unsafe_offset=5]))
     var out: Owned
     if reduction == 0 and target.rank > 0:
-        out = own(new_tensor(_shape1(g.nframe), 1, input.stype, input.device))
+        out = own(new_tensor(vec_shape(g.nframe), 1, input.stype, input.device))
     else:
         out = _scalar(input.stype, input.device)
     if input.numel == 0:
@@ -922,7 +909,7 @@ def _multi_margin_forward(args: Values) raises -> Owned:
     if target.stype != ST_INT64:
         raise Error(
             "expected scalar type Long but found ",
-            _scalar_type_name(target.dtype),
+            scalar_type_name(target.dtype),
         )
     var margin = scalar_to_float(args[unsafe_offset=3], input.stype)
     var weight = _optional_dense(args, 4, input)
@@ -931,7 +918,7 @@ def _multi_margin_forward(args: Values) raises -> Owned:
     # 2-D with a reduction: per-sample values (already divided by
     # nframe * dim for the mean), then their sum, as CUDA's `at::sum_out`.
     var per_sample = input.rank == 2 and reduction != 0
-    var dst = own(new_tensor(_shape1(g.nframe), 1, input.stype, input.device))
+    var dst = own(new_tensor(vec_shape(g.nframe), 1, input.stype, input.device))
     var size_average = reduction == 1
     if input.rank == 2 and reduction == 0:
         size_average = False
@@ -1014,9 +1001,9 @@ def _multi_margin_backward(args: Values) raises -> Owned:
     if target.stype != ST_INT64:
         raise Error(
             "expected scalar type Long but found ",
-            _scalar_type_name(target.dtype),
+            scalar_type_name(target.dtype),
         )
-    _expect_dtype(grad, input)
+    expect_scalar_type(grad, input)
     var margin = scalar_to_float(args[unsafe_offset=4], input.stype)
     var weight = _optional_dense(args, 5, input)
     var x = Dense(input)
@@ -1110,22 +1097,22 @@ def _multilabel_forward(args: Values) raises -> OwnedPair:
     if input.numel == 0:
         # CUDA returns before resizing either `at::empty({0})` result.
         return OwnedPair(
-            own(new_tensor(_shape1(0), 1, input.stype, input.device)),
-            own(new_tensor(_shape1(0), 1, input.stype, input.device)),
+            own(new_tensor(vec_shape(0), 1, input.stype, input.device)),
+            own(new_tensor(vec_shape(0), 1, input.stype, input.device)),
         )
     _loss_float(input)
     _same_device(input, target)
     if target.stype != ST_INT64:
         raise Error(
             "expected scalar type Long but found ",
-            _scalar_type_name(target.dtype),
+            scalar_type_name(target.dtype),
         )
     var x = Dense(input)
     var tg = Dense(target)
     var is_target = own(
         new_tensor(target.shape, target.rank, input.stype, input.device)
     )
-    var per = own(new_tensor(_shape1(g.nframe), 1, input.stype, input.device))
+    var per = own(new_tensor(vec_shape(g.nframe), 1, input.stype, input.device))
     var ctx = ctx_for(input.device)
     var call = KernelCall("loss", "MultilabelMargin")
     call.arg_dtype(0, input.dtype)
@@ -1228,10 +1215,10 @@ def _multilabel_backward(args: Values) raises -> Owned:
     if target.stype != ST_INT64:
         raise Error(
             "expected scalar type Long but found ",
-            _scalar_type_name(target.dtype),
+            scalar_type_name(target.dtype),
         )
-    _expect_dtype(grad, input)
-    _expect_dtype(is_target, input)
+    expect_scalar_type(grad, input)
+    expect_scalar_type(is_target, input)
     var reduce = reduction != 0
     var denom = g.nframe * g.dim if reduction == 1 else g.dim
     var x = Dense(input)
@@ -1304,7 +1291,7 @@ def _ctc_while() -> String:
 
 def _tensor_type_name(t: T) -> String:
     """`Tensor::toString()` as CUDA's checks print it, for this device."""
-    return String("torch.mojo.") + _scalar_type_name(t.dtype) + "Tensor"
+    return String("torch.mojo.") + scalar_type_name(t.dtype) + "Tensor"
 
 
 def _upload_lengths(lengths: List[Int], device: Int) raises -> Owned:
@@ -1312,7 +1299,7 @@ def _upload_lengths(lengths: List[Int], device: Int) raises -> Owned:
     var host = List[Int64](capacity=max(len(lengths), 1))
     for v in lengths:
         host.append(Int64(v))
-    var out = own(new_tensor(_shape1(len(lengths)), 1, ST_INT64, device))
+    var out = own(new_tensor(vec_shape(len(lengths)), 1, ST_INT64, device))
     if len(lengths) > 0:
         copy_from_host(
             device,
@@ -1398,7 +1385,7 @@ def _ctc_dtypes(log_probs: T, targets: T) raises:
     if log_probs.dtype != DType.float32 and log_probs.dtype != DType.float64:
         unsupported(
             String('"ctc_loss_cuda" not implemented for \'')
-            + _scalar_type_name(log_probs.dtype)
+            + scalar_type_name(log_probs.dtype)
             + "'"
         )
     if (
@@ -1555,7 +1542,7 @@ def _ctc_forward(
     shape[MAX_RANK - 1] = 2 * g.max_target + 1
     var log_alpha = own(new_tensor(shape, 3, log_probs.stype, log_probs.device))
     var nll = own(
-        new_tensor(_shape1(g.batch), 1, log_probs.stype, log_probs.device)
+        new_tensor(vec_shape(g.batch), 1, log_probs.stype, log_probs.device)
     )
     if g.batch > 0:
         var ctx = ctx_for(log_probs.device)
@@ -1597,9 +1584,9 @@ def _ctc_backward(
     _same_device(log_probs, nll_t)
     _same_device(log_probs, log_alpha)
     _ctc_dtypes(log_probs, targets)
-    _expect_dtype(grad, log_probs)
-    _expect_dtype(nll_t, log_probs)
-    _expect_dtype(log_alpha, log_probs)
+    expect_scalar_type(grad, log_probs)
+    expect_scalar_type(nll_t, log_probs)
+    expect_scalar_type(log_alpha, log_probs)
     if log_probs.rank != 3 or log_alpha.rank != 3:
         raise Error("ctc_loss_backward: log_probs and log_alpha must be 3-D")
     var batch = log_probs.dim(1)

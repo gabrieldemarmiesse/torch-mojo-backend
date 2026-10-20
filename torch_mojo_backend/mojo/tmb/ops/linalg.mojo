@@ -66,6 +66,7 @@ from tmb.backend.abi import (
     v_string,
     v_tensor,
     view_strided,
+    is_floating,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
@@ -80,6 +81,9 @@ from tmb.ops.common import (
     device_str,
     fill_value,
     resize_storage_bytes,
+    int_list_str,
+    is_int_stype,
+    padded_shape,
 )
 
 
@@ -123,34 +127,8 @@ def _is_complex(st: Int32) -> Bool:
     return st == ST_COMPLEX32 or st == ST_COMPLEX64 or st == ST_COMPLEX128
 
 
-def _is_float(st: Int32) -> Bool:
-    return (
-        st == ST_FLOAT32
-        or st == ST_FLOAT64
-        or st == ST_FLOAT16
-        or st == ST_BFLOAT16
-    )
-
-
-def _sizes_str(dims: List[Int]) -> String:
-    var s = String("[")
-    for i in range(len(dims)):
-        if i:
-            s += ", "
-        s += String(dims[i])
-    return s + "]"
-
-
 def _dims(t: T) -> List[Int]:
     return t.logical_shape()
-
-
-def _padded(dims: List[Int]) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    var r = len(dims)
-    for i in range(r):
-        shape[MAX_RANK - r + i] = dims[i]
-    return shape
 
 
 def _batch_dims(t: T) -> List[Int]:
@@ -158,13 +136,6 @@ def _batch_dims(t: T) -> List[Int]:
     for i in range(t.rank - 2):
         out.append(t.dim(i))
     return out^
-
-
-def _prod(dims: List[Int]) -> Int:
-    var p = 1
-    for d in dims:
-        p *= d
-    return p
 
 
 def _batch_count(t: T) -> Int:
@@ -189,7 +160,7 @@ def _fstrides(dims: List[Int]) -> IndexList[MAX_RANK]:
     """`batched_matrix_contiguous_strides(sizes, f_contig=True)`: C-ordered
     batches of column-major matrices."""
     var r = len(dims)
-    var shape = _padded(dims)
+    var shape = padded_shape(dims)
     var strides = contiguous_strides(shape, r)
     if r >= 2:
         strides[MAX_RANK - 1] = max(dims[r - 2], 1)
@@ -198,11 +169,13 @@ def _fstrides(dims: List[Int]) -> IndexList[MAX_RANK]:
 
 
 def _new_f(dims: List[Int], st: Int32, device: Int) raises -> T:
-    return new_strided(_padded(dims), _fstrides(dims), len(dims), st, device)
+    return new_strided(
+        padded_shape(dims), _fstrides(dims), len(dims), st, device
+    )
 
 
 def _new_c(dims: List[Int], st: Int32, device: Int) raises -> T:
-    return new_tensor(_padded(dims), len(dims), st, device)
+    return new_tensor(padded_shape(dims), len(dims), st, device)
 
 
 def _empty0(st: Int32, device: Int) raises -> T:
@@ -276,7 +249,7 @@ def _expand(t: T, dims: List[Int]) raises -> T:
                 ") at non-singleton dimension ",
                 i,
             )
-    return view_strided(t, _padded(dims), strides, r, t.offset)
+    return view_strided(t, padded_shape(dims), strides, r, t.offset)
 
 
 def _broadcast(a: List[Int], b: List[Int]) raises -> List[Int]:
@@ -339,7 +312,7 @@ def _is_metal(t: T) raises -> Bool:
 def _check_float(t: T, name: String, allow_low: Bool = True) raises:
     """`checkFloatingOrComplex`, then what this device computes in: real
     float32 / float64 (float64 not on Metal)."""
-    if not _is_float(t.stype) and not _is_complex(t.stype):
+    if not is_floating(t.stype) and not _is_complex(t.stype):
         raise Error(
             name,
             ": Expected a floating point or complex tensor as input. Got ",
@@ -829,7 +802,7 @@ def _check_linalg_out(fname: String, dest: T, input: T, name: String) raises:
             " and input on ",
             device_str(input),
         )
-    var ok = _is_float(dest.stype) or _is_complex(dest.stype)
+    var ok = is_floating(dest.stype) or _is_complex(dest.stype)
     if _is_complex(input.stype) and not _is_complex(dest.stype):
         ok = False
     if not ok:
@@ -948,7 +921,7 @@ def _lu_factor(A: T, pivot: Bool) raises -> Tuple[Owned, Owned, Owned]:
                 "torch.lu_factor: Expected tensor with 2 or more dimensions."
                 " Got size: "
             ),
-            _sizes_str(_dims(A)),
+            int_list_str(_dims(A)),
             " instead",
         )
     _check_compute(A, "linalg.lu_factor")
@@ -1059,7 +1032,7 @@ def _lu_unpack(
                 "torch.lu_unpack: Expected tensor with 2 or more dimensions."
                 " Got size: "
             ),
-            _sizes_str(_dims(LU)),
+            int_list_str(_dims(LU)),
             " instead",
         )
     var m = LU.dim(-2)
@@ -1083,9 +1056,9 @@ def _lu_unpack(
         if not same:
             raise Error(
                 "Expected LU_pivots to have shape ",
-                _sizes_str(expected),
+                int_list_str(expected),
                 " but got ",
-                _sizes_str(got),
+                int_list_str(got),
                 " instead.",
             )
     if unpack_pivots:
@@ -1151,7 +1124,7 @@ def _linalg_lu(A: T, pivot: Bool) raises -> Tuple[Owned, Owned, Owned]:
     if A.rank < 2:
         raise Error(
             "linalg.lu: Expected tensor with 2 or more dimensions. Got size: ",
-            _sizes_str(_dims(A)),
+            int_list_str(_dims(A)),
             " instead",
         )
     var f = _lu_factor(A, pivot)
@@ -1259,7 +1232,7 @@ def _lu_solve(LU: T, piv: T, B: T, left: Bool, adjoint: Bool) raises -> Owned:
                 "linalg.lu_solve: Expected LU.shape[:-1] and pivots.shape to be"
                 " the same, but got pivots with shape "
             ),
-            _sizes_str(pd),
+            int_list_str(pd),
             " instead",
         )
     _all_on(LU, piv)
@@ -1387,7 +1360,7 @@ def _unsqueeze_last(t: T) raises -> T:
     for i in range(t.rank):
         strides[MAX_RANK - (t.rank + 1) + i] = t.stride(i)
     strides[MAX_RANK - 1] = 1
-    return view_strided(t, _padded(d), strides, t.rank + 1, t.offset)
+    return view_strided(t, padded_shape(d), strides, t.rank + 1, t.offset)
 
 
 def _squeeze_last(t: T) raises -> T:
@@ -1396,7 +1369,7 @@ def _squeeze_last(t: T) raises -> T:
     var strides = IndexList[MAX_RANK](0)
     for i in range(t.rank - 1):
         strides[MAX_RANK - (t.rank - 1) + i] = t.stride(i)
-    return view_strided(t, _padded(d), strides, t.rank - 1, t.offset)
+    return view_strided(t, padded_shape(d), strides, t.rank - 1, t.offset)
 
 
 def _solve_ex(
@@ -1927,7 +1900,7 @@ def _householder_product(input: T, tau: T) raises -> Owned:
                     " dimensions of tau to be equal to input.shape[:-2], but"
                     " got "
                 ),
-                _sizes_str(tb),
+                int_list_str(tb),
             )
     if tau.stype != input.stype:
         raise Error(
@@ -2033,7 +2006,7 @@ def _ormqr(
                     "torch.ormqr: Expected batch dimensions of tau to be equal"
                     " to input.shape[:-2], but got "
                 ),
-                _sizes_str(tb),
+                int_list_str(tb),
             )
         if not same_o:
             raise Error(
@@ -2041,7 +2014,7 @@ def _ormqr(
                     "torch.ormqr: Expected batch dimensions of other to be"
                     " equal to input.shape[:-2], but got "
                 ),
-                _sizes_str(ob),
+                int_list_str(ob),
             )
     if tau.stype != input.stype:
         raise Error(
@@ -2387,7 +2360,7 @@ def _unsqueeze_at_minus2(t: T) raises -> T:
         strides[MAX_RANK - (t.rank + 1) + i] = t.stride(i)
     strides[MAX_RANK - 2] = 0
     strides[MAX_RANK - 1] = t.stride(-1)
-    return view_strided(t, _padded(d), strides, t.rank + 1, t.offset)
+    return view_strided(t, padded_shape(d), strides, t.rank + 1, t.offset)
 
 
 def _svd(
@@ -2506,10 +2479,10 @@ def _cm_view(t: T, batch: List[Int], rows: Int, cols: Int) raises -> T:
     """A dense (*, cols, rows) row-major buffer seen as (*, rows, cols)
     column-major matrices."""
     var d = _with(batch.copy(), rows, cols)
-    var strides = contiguous_strides(_padded(d), len(d))
+    var strides = contiguous_strides(padded_shape(d), len(d))
     strides[MAX_RANK - 2] = 1
     strides[MAX_RANK - 1] = rows
-    return view_strided(t, _padded(d), strides, len(d), t.offset)
+    return view_strided(t, padded_shape(d), strides, len(d), t.offset)
 
 
 def _svd_args(args: Values) raises -> Tuple[T, Bool, Bool, Bool]:
@@ -2620,16 +2593,6 @@ def op_linalg_ldl_factor_ex_out(
     ret_ref(rets, 2, info_out)
 
 
-def _is_int_st(st: Int32) -> Bool:
-    return (
-        st == ST_INT64
-        or st == ST_INT32
-        or st == ST_INT16
-        or st == ST_INT8
-        or st == ST_UINT8
-    )
-
-
 def _ldl_solve(LD: T, piv: T, B: T, hermitian: Bool) raises -> Owned:
     _check_square(LD, "torch.linalg.ldl_solve")
     _check_float(LD, "torch.linalg.ldl_solve")
@@ -2657,10 +2620,10 @@ def _ldl_solve(LD: T, piv: T, B: T, hermitian: Bool) raises -> Owned:
                 "torch.linalg.ldl_solve: Expected LD.shape[:-1] and"
                 " pivots.shape to be the same, but got pivots with shape "
             ),
-            _sizes_str(got),
+            int_list_str(got),
             " instead",
         )
-    if not _is_int_st(piv.stype):
+    if not is_int_stype(piv.stype):
         raise Error(
             "torch.linalg.ldl_solve: Expected pivots to be integers. Got ",
             _st_name(piv.stype),
@@ -3302,12 +3265,12 @@ def _view_b11(t: T) raises -> T:
     d.append(1)
     var strides = IndexList[MAX_RANK](0)
     strides[MAX_RANK - 3] = t.stride(0)
-    return view_strided(t, _padded(d), strides, 3, t.offset)
+    return view_strided(t, padded_shape(d), strides, 3, t.offset)
 
 
 def _matrix_exp(a: T) raises -> Owned:
     _check_square(a, "linalg.matrix_exp")
-    if not _is_float(a.stype) and not _is_complex(a.stype):
+    if not is_floating(a.stype) and not _is_complex(a.stype):
         raise Error(
             (
                 "linalg.matrix_exp: Expected a floating point or complex tensor"
@@ -3337,7 +3300,11 @@ def _matrix_exp(a: T) raises -> Owned:
     d3.append(n)
     var a3 = own(
         view_strided(
-            ac.t, _padded(d3), contiguous_strides(_padded(d3), 3), 3, 0
+            ac.t,
+            padded_shape(d3),
+            contiguous_strides(padded_shape(d3), 3),
+            3,
+            0,
         )
     )
     # operator_1_norm: abs().sum(-2).max(-1)

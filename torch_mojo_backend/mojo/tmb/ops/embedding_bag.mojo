@@ -64,8 +64,17 @@ from tmb.backend.device import (
 from tmb.backend.kernel_call import KernelCall
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.common import call_op, cast_to, contiguous, fill_value
-from tmb.ops.data_movement import _scalar_type_name
+from tmb.ops.common import (
+    call_op,
+    cast_to,
+    contiguous,
+    fill_value,
+    is_floating_dtype,
+    scalar_type_name,
+    expect_scalar_type,
+    vec_shape,
+    mat_shape,
+)
 from tmb.ops.unique import run_bounds, unique_flat
 
 comptime _MODE_SUM = 0
@@ -91,19 +100,6 @@ def _op(name: String, overload: String, var args: List[Value]) raises -> Owned:
     return own(r.take_tensor(0))
 
 
-def _vec(n: Int) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 1] = n
-    return shape
-
-
-def _mat(rows: Int, cols: Int) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 2] = rows
-    shape[MAX_RANK - 1] = cols
-    return shape
-
-
 def _zeros(
     shape: IndexList[MAX_RANK], rank: Int, stype: Int32, device: Int
 ) raises -> Owned:
@@ -121,7 +117,7 @@ def _check_index_dtype(t: T, name: String, arg: Int, what: String) raises:
             " '",
             name,
             "' to have one of the following scalar types: Long, Int; but got ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             " instead (while checking arguments for ",
             what,
             ")",
@@ -150,22 +146,13 @@ def _acc_stype(t: T) -> Int32:
     return ST_FLOAT64 if t.dtype == DType.float64 else ST_FLOAT32
 
 
-def _is_bag_dtype(dt: DType) -> Bool:
-    return (
-        dt == DType.float32
-        or dt == DType.float16
-        or dt == DType.bfloat16
-        or dt == DType.float64
-    )
-
-
 def _check_bag_dtype(t: T, what: String) raises:
-    if not _is_bag_dtype(t.dtype):
+    if not is_floating_dtype(t.dtype):
         raise Error(
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
     if t.dtype == DType.float64 and ctx_for(t.device).api() == "metal":
@@ -188,7 +175,7 @@ def _read_flags(flag: T) raises -> List[Bool]:
 
 def _read_int(t: T, i: Int) raises -> Int:
     """Element `i` of the contiguous int64 device tensor `t`."""
-    var host = own(cpu_empty(_vec(1), 1, ST_INT64))
+    var host = own(cpu_empty(vec_shape(1), 1, ST_INT64))
     var ctx = ctx_for(t.device)
     copy_to_host(ctx, t.ptr + i * 8, host.t.ptr, 8)
     _ = ctx
@@ -257,13 +244,7 @@ def op_embedding_bag(
     var psw_stride = 0
     if psw and mode != _MODE_MAX:
         var p = psw.value().copy()
-        if p.dtype != weight.dtype:
-            raise Error(
-                "expected scalar type ",
-                _scalar_type_name(weight.dtype),
-                " but found ",
-                _scalar_type_name(p.dtype),
-            )
+        expect_scalar_type(p, weight)
         if p.rank != 1 or p.numel != num_indices or p.device != weight.device:
             raise Error(
                 "per_sample_weights must be a 1-D tensor with one weight per"
@@ -278,20 +259,21 @@ def op_embedding_bag(
     var offs = _as_int64(offsets)
     var device = weight.device
     var output = own(
-        new_tensor(_mat(num_bags, features), 2, weight.stype, device)
+        new_tensor(mat_shape(num_bags, features), 2, weight.stype, device)
     )
-    var offset2bag = _zeros(_vec(num_indices), 1, ST_INT64, device)
-    var bag_size = _zeros(_vec(offsets.dim(0)), 1, ST_INT64, device)
+    var offset2bag = _zeros(vec_shape(num_indices), 1, ST_INT64, device)
+    var bag_size = _zeros(vec_shape(offsets.dim(0)), 1, ST_INT64, device)
     var max_indices = own(
         new_tensor(
-            _mat(num_bags, features) if mode == _MODE_MAX else _vec(0),
+            mat_shape(num_bags, features) if mode
+            == _MODE_MAX else vec_shape(0),
             2 if mode == _MODE_MAX else 1,
             ST_INT64,
             device,
         )
     )
     if num_bags * features > 0:
-        var flag = _zeros(_vec(4), 1, ST_INT32, device)
+        var flag = _zeros(vec_shape(4), 1, ST_INT32, device)
         var ctx = ctx_for(device)
         var call = KernelCall("embedding_bag", "EmbeddingBagForward")
         call.arg_dtype(0, weight.dtype)
@@ -373,7 +355,7 @@ def op_embedding_bag(
 def _offset2bag(offsets: T, num_indices: Int, stype: Int32) raises -> Owned:
     """ATen's `make_offset2bag`: ones scattered at the offsets, minus one,
     cumulatively summed -- the bag of every index."""
-    var z = _zeros(_vec(num_indices + 1), 1, stype, offsets.device)
+    var z = _zeros(vec_shape(num_indices + 1), 1, stype, offsets.device)
     var ones = own(
         new_tensor(offsets.shape, offsets.rank, stype, offsets.device)
     )
@@ -491,7 +473,9 @@ def op_embedding_bag_dense_backward(
         alert_not_deterministic("embedding_bag_backward_cuda_max")
         # One spare row takes the empty bags (-1) and padding_idx, then is
         # dropped: no contribution is masked by a multiply (0 * inf).
-        var gw = _zeros(_mat(num_weights + 1, features), 2, grad.stype, device)
+        var gw = _zeros(
+            mat_shape(num_weights + 1, features), 2, grad.stype, device
+        )
         var neg = _op("aten::lt", "Scalar", [_t(max_indices), _scalar(0)])
         var mi = _op(
             "aten::masked_fill",
@@ -531,7 +515,9 @@ def op_embedding_bag_dense_backward(
         raise Error(
             "embedding_bag: per_sample_weights only supported with mode='sum'"
         )
-    var gw = own(new_tensor(_mat(num_weights, features), 2, grad.stype, device))
+    var gw = own(
+        new_tensor(mat_shape(num_weights, features), 2, grad.stype, device)
+    )
     if indices.numel == 0 or gw.t.numel == 0:
         fill_value(gw.t, 0.0)
         ret_owned(rets, 0, gw)
@@ -544,13 +530,7 @@ def op_embedding_bag_dense_backward(
     var psw_ptr = 0
     var psw_stride = 0
     if psw:
-        if psw.value().dtype != grad.dtype:
-            raise Error(
-                "expected scalar type ",
-                _scalar_type_name(grad.dtype),
-                " but found ",
-                _scalar_type_name(psw.value().dtype),
-            )
+        expect_scalar_type(psw.value(), grad)
         psw_ptr = psw.value().ptr
         psw_stride = psw.value().stride(0)
     var mean = 1 if mode == _MODE_MEAN else 0
@@ -575,7 +555,7 @@ def op_embedding_bag_dense_backward(
     var perm = own(r.take_tensor(1))
     var runs = run_bounds(sorted.t)
     var partials = own(
-        new_tensor(_mat(n, features), 2, _acc_stype(grad), device)
+        new_tensor(mat_shape(n, features), 2, _acc_stype(grad), device)
     )
     for phase in range(2):
         var call = KernelCall("embedding_bag", "EmbeddingBagBackwardSorted")
@@ -642,7 +622,7 @@ def op_embedding_bag_per_sample_weights_backward(
     _check_bag_dtype(grad, "_embedding_bag_per_sample_weights_backward_cuda")
     var n = indices.numel
     if n == 0:
-        var e = own(new_tensor(_vec(0), 1, grad.stype, grad.device))
+        var e = own(new_tensor(vec_shape(0), 1, grad.stype, grad.device))
         ret_owned(rets, 0, e)
         return
     var acc = _acc_stype(grad)
@@ -747,7 +727,7 @@ def op_embedding_renorm_(
     var ctx = ctx_for(t.device)
     if t.dim(1) > 0:
         # The kernel's own bounds flag is a guard only: never set here.
-        var flag = _zeros(_vec(1), 1, ST_INT32, t.device)
+        var flag = _zeros(vec_shape(1), 1, ST_INT32, t.device)
         var call = KernelCall("embedding_bag", "EmbeddingRenorm")
         call.arg_dtype(0, t.dtype)
         call.int(t.ptr)

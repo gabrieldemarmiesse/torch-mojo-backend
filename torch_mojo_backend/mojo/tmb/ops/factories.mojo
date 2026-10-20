@@ -54,8 +54,12 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     resize_out,
+    scalar_type_name,
+    float_max,
 )
-from tmb.ops.data_movement import _resolve_device, _scalar_type_name
+from tmb.ops.data_movement import (
+    _resolve_device,
+)
 from tmb.backend.registry import Site, impl
 
 
@@ -429,17 +433,6 @@ def _overflow_error(dt: DType) -> Error:
     )
 
 
-def _float_limits(dt: DType) -> Float64:
-    """The largest finite value of the floating `dt`."""
-    if dt == DType.float16:
-        return 65504.0
-    if dt == DType.bfloat16:
-        return 3.3895313892515355e38
-    if dt == DType.float32:
-        return 3.4028234663852886e38
-    return 1.7976931348623157e308
-
-
 def _int_limits(dt: DType) -> Tuple[Int, Int]:
     if dt == DType.int8:
         return (-128, 127)
@@ -462,7 +455,7 @@ def _check_float_convertible(x: Float64, dt: DType) raises:
     if dt.is_floating_point():
         if x != x or not _is_finite(x):
             return
-        if abs(x) > _float_limits(dt):
+        if abs(x) > float_max(dt):
             raise _overflow_error(dt)
         return
     if x != x or not _is_finite(x):
@@ -485,7 +478,7 @@ def _check_convertible(v: Value, dt: DType) raises:
         return
     var x = v_int(v)
     if dt.is_floating_point():
-        if abs(Float64(x)) > _float_limits(dt):
+        if abs(Float64(x)) > float_max(dt):
             raise _overflow_error(dt)
         return
     var lim = _int_limits(dt)
@@ -562,7 +555,7 @@ def _range_out(
                 '"',
                 name,
                 "_cuda\" not implemented for '",
-                _scalar_type_name(out_t.dtype),
+                scalar_type_name(out_t.dtype),
                 "'",
             )
         unsupported(name + ".out of dtype " + String(out_t.dtype))
@@ -767,7 +760,7 @@ def op_range_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # range_cuda_out dispatches ALL_TYPES and Half: no bool, no bfloat16.
         raise Error(
             '"range_cuda" not implemented for \'',
-            _scalar_type_name(out_t.dtype),
+            scalar_type_name(out_t.dtype),
             "'",
         )
     var size = _range_size(start_v, end_v, step_v, out_t.dtype)
@@ -834,7 +827,7 @@ def op_randperm_generator_out(
     if out_t.dtype == DType.bfloat16 or out_t.dtype == DType.bool:
         raise Error(
             '"randperm_out_cuda" not implemented for \'',
-            _scalar_type_name(out_t.dtype),
+            scalar_type_name(out_t.dtype),
             "'",
         )
     var shape = IndexList[MAX_RANK](1)

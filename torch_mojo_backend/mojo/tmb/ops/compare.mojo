@@ -64,7 +64,6 @@ from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import is_float8
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.common import (
     out_device_error,
     device_str,
@@ -91,6 +90,9 @@ from tmb.ops.common import (
     scalar_embed,
     scalar_to_float,
     scalar_to_int,
+    one_device,
+    is_bitwise_dtype,
+    scalar_type_name,
 )
 from tmb.ops.f8_iter import (
     f8_iter,
@@ -206,19 +208,6 @@ def _ensure_out_shape(
 # ---------------------------------------------------------------------------
 
 
-def _one_device(a: T, b: T) raises:
-    """Both operands of a raw-pointer launch on the same mojo device.
-
-    A kernel gets bare pointers and one stream: a pointer belonging to
-    another device -- or to no mojo device at all -- would be dereferenced
-    against the wrong context. The fields are cached on `T`, so this costs
-    nothing. Private to this file until the port is merged; it belongs in
-    tmb/ops/common.mojo.
-    """
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
-        raise Error("expected every operand on the same mojo device")
-
-
 def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
     if is_float8(a.dtype) or is_float8(b.dtype):
         # CUDA's compare_eq_ne_kernel takes AT_FLOAT8_TYPES (it compares the
@@ -228,7 +217,7 @@ def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
         if op != "EqSpec" and op != "NeSpec":
             unsupported(
                 '"compare_cuda" not implemented for \''
-                + _scalar_type_name(f8)
+                + scalar_type_name(f8)
                 + "'"
             )
         var fa = own_if_new(cast_to(a, ST_FLOAT32), a)
@@ -237,8 +226,8 @@ def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
         _ = fa^
         _ = fb^
         return
-    _one_device(a, dst)
-    _one_device(b, dst)
+    one_device(a, dst)
+    one_device(b, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("logic", String(op))
@@ -318,9 +307,9 @@ def _float8_common(a: T, b: T) raises -> DType:
     var second = a.dtype if a.rank == 0 and b.rank > 0 else b.dtype
     raise Error(
         "Promotion for Float8 Types is not supported, attempted to promote ",
-        _scalar_type_name(first),
+        scalar_type_name(first),
         " and ",
-        _scalar_type_name(second),
+        scalar_type_name(second),
     )
 
 
@@ -448,7 +437,7 @@ def _scalar_fill(a: T, v: Value) raises -> Owned:
         if v.tag == TAG_COMPLEX:
             # c10's promoteTypes (Float8, ComplexDouble).
             raise Error(
-                "Unknown Complex ScalarType for ", _scalar_type_name(a.dtype)
+                "Unknown Complex ScalarType for ", scalar_type_name(a.dtype)
             )
         # An integer rounds to float32 once (c10's int64 -> float ->
         # float8); through Float64 it would round twice.
@@ -693,8 +682,8 @@ def _isin_validate(el: T, te: T) raises -> Int32:
 
 
 def _isin_launch(el: T, te: T, invert: Bool, dst: T) raises:
-    _one_device(el, dst)
-    _one_device(te, dst)
+    one_device(el, dst)
+    one_device(te, dst)
     var elc = contiguous(el)
     var tec = contiguous(te)
     var ctx = ctx_for(el.device)
@@ -989,9 +978,9 @@ def _where_select(
 ) raises:
     """dst[i] = cond[i] ? a[i] : b[i], for rank<=4 operands (each stride
     array already the correct broadcast strides against dst's shape)."""
-    _one_device(cond, dst)
-    _one_device(a, dst)
-    _one_device(b, dst)
+    one_device(cond, dst)
+    one_device(a, dst)
+    one_device(b, dst)
     if dst.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -1112,8 +1101,8 @@ def _masked_fill_scalar_launch(
     """The fast path: `value` is baked into the launch (no separate Fill
     kernel first). Only float32/float16/bfloat16 `self` is wired to this;
     every other dtype goes through `_masked_fill_where` below."""
-    _one_device(mask, dst)
-    _one_device(self_t, dst)
+    one_device(mask, dst)
+    one_device(self_t, dst)
     var mask_s = _bcast_strides(mask, self_t.shape)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
@@ -1545,17 +1534,6 @@ def _ss_allowed(dt: DType) -> Bool:
     )
 
 
-def _ss_int_like(dt: DType) -> Bool:
-    return (
-        dt == DType.bool
-        or dt == DType.uint8
-        or dt == DType.int8
-        or dt == DType.int16
-        or dt == DType.int32
-        or dt == DType.int64
-    )
-
-
 def _ss_float_like(dt: DType) -> Bool:
     return (
         dt == DType.float16
@@ -1579,15 +1557,15 @@ def _searchsorted_dtype(a: DType, b: DType) raises -> DType:
         if a == DType.float64 or b == DType.float64:
             unsupported("searchsorted: float64 is not supported")
         return DType.float32  # float32/float16/bfloat16 all promote here
-    if _ss_float_like(a) and _ss_int_like(b):
+    if _ss_float_like(a) and is_bitwise_dtype(b):
         if a == DType.float64:
             unsupported("searchsorted: float64 is not supported")
         return a
-    if _ss_float_like(b) and _ss_int_like(a):
+    if _ss_float_like(b) and is_bitwise_dtype(a):
         if b == DType.float64:
             unsupported("searchsorted: float64 is not supported")
         return b
-    if _ss_int_like(a) and _ss_int_like(b):
+    if is_bitwise_dtype(a) and is_bitwise_dtype(b):
         if a == DType.int64 or b == DType.int64:
             return DType.int64
         if a == DType.int32 or b == DType.int32:

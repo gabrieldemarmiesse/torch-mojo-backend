@@ -58,6 +58,7 @@ from tmb.backend.abi import (
     v_int,
     v_is_none,
     v_tensor,
+    v_bool_list,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
@@ -73,13 +74,13 @@ from tmb.ops.common import (
     is_channels_last_layout,
     resize_out,
     store_out,
+    one_device,
+    sizes_str,
+    is_f32_f16_bf16,
+    scalar_type_name,
+    wrap_dim,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
-
-
-def _is_float(dt: DType) -> Bool:
-    return dt == DType.float32 or dt == DType.bfloat16 or dt == DType.float16
 
 
 def _on_gpu(t: T) raises -> Bool:
@@ -104,19 +105,6 @@ def _swapped(
     out[pa] = src[pb]
     out[pb] = src[pa]
     return out
-
-
-def _bool_list(v: Value) raises -> List[Bool]:
-    """A borrowed `bool[]` argument (uint8 per element in the call arena)."""
-    var out = List[Bool]()
-    if v.tag == TAG_NONE:
-        return out^
-    if v.tag != TAG_BOOL_LIST:
-        raise Error("expected a bool[] argument, got record tag ", v.tag)
-    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
-    for i in range(Int(v.len)):
-        out.append(p[unsafe_offset=i] != 0)
-    return out^
 
 
 struct Held(Movable):
@@ -202,21 +190,8 @@ def _stat_shape(t: T, k: Int) -> IndexList[MAX_RANK]:
 # ---------------------------------------------------------------------------
 
 
-def _one_device(a: T, b: T) raises:
-    """Both operands of a raw-pointer launch on the same mojo device.
-
-    A kernel gets bare pointers and one stream: a pointer belonging to
-    another device -- or to no mojo device at all -- would be dereferenced
-    against the wrong context. The fields are cached on `T`, so this costs
-    nothing. Private to this file until the port is merged; it belongs in
-    tmb/ops/common.mojo.
-    """
-    if not a.on_mojo() or not b.on_mojo() or a.device != b.device:
-        raise Error("expected every operand on the same mojo device")
-
-
 def _spec_unary(family: String, op: String, src: T, dst: T) raises:
-    _one_device(src, dst)
+    one_device(src, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall(family, op)
@@ -236,7 +211,7 @@ def _softmax_launch(
     if op != "SoftmaxF64Spec":
         _spec_unary(family, op, src, dst)
         return
-    _one_device(src, dst)
+    one_device(src, dst)
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall(family, op)
@@ -268,7 +243,7 @@ def _softmax_family(args: Values, rets: Values, log_variant: Bool) raises:
         # `softmax(x, d, dtype=torch.float64)` casts before it gets here.
         if dev(self.device)[].api == "metal":
             unsupported("softmax float64 is unavailable on Apple GPUs")
-    elif not _is_float(self.dtype):
+    elif not is_f32_f16_bf16(self.dtype):
         unsupported("softmax of dtype " + String(self.dtype))
     var work_stype = self.stype
     if half_to_float:
@@ -357,8 +332,8 @@ def op_log_softmax(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _lsm_backward(dst: T, grad: T, output: T, rows: Int, cols: Int) raises:
-    _one_device(grad, dst)
-    _one_device(output, dst)
+    one_device(grad, dst)
+    one_device(output, dst)
     var ctx = ctx_for(dst.device)
     var call = KernelCall("softmax_backward", "LogSoftmaxBackwardData")
     call.arg_dtype(0, grad.dtype)
@@ -399,7 +374,7 @@ def op_log_softmax_backward_data(
             "_log_softmax_backward_data: grad and output must match in shape,"
             " dtype and device"
         )
-    if not _is_float(grad.dtype):
+    if not is_f32_f16_bf16(grad.dtype):
         unsupported("_log_softmax_backward_data of dtype " + String(grad.dtype))
     if target != grad.stype:
         # f32 grad -> f16 input_dtype went through the composed
@@ -488,16 +463,6 @@ def _check_rows(dst: T, cols: Int, numel: Int) raises:
 # ---------------------------------------------------------------------------
 
 
-def sizes_str(t: T) -> String:
-    """`IntArrayRef` as torch streams it into an error message: `[2, 3]`."""
-    var s = String("[")
-    for i in range(t.rank):
-        if i:
-            s += ", "
-        s += String(t.dim(i))
-    return s + "]"
-
-
 def _softmax_out(
     args: Values, rets: Values, name: StaticString, out_i: Int, stype: Int32
 ) raises:
@@ -554,12 +519,12 @@ def op_log_softmax_backward_data_out(
 
 def _masked_float(t: T, what: StaticString) raises:
     """AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16, ...)."""
-    if not _is_float(t.dtype) and t.dtype != DType.float64:
+    if not is_f32_f16_bf16(t.dtype) and t.dtype != DType.float64:
         raise Error(
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
 
@@ -711,19 +676,7 @@ def op_masked_softmax_backward(
     var rank = o.t.rank
     var dim = rank - 1
     if not v_is_none(args[unsafe_offset=3]):
-        dim = v_int(args[unsafe_offset=3])
-        if dim < -rank or dim >= rank:
-            raise Error(
-                "Dimension out of range (expected to be in range of [",
-                -rank,
-                ", ",
-                rank - 1,
-                "], but got ",
-                dim,
-                ")",
-            )
-        if dim < 0:
-            dim += rank
+        dim = wrap_dim(v_int(args[unsafe_offset=3]), rank)
     if dim < 0 or dim >= g.t.rank:
         raise Error("dim must be non-negative and less than input dimensions")
     if not g.t.same_shape(m.t):
@@ -761,7 +714,7 @@ def op_masked_softmax_backward(
     # acc_type `tmp - output * sum(tmp over the unmasked positions)`, the
     # masked positions written as 0.
     var tmp = _op1("aten::mul", "Tensor", [tensor_arg(g.t), tensor_arg(o.t)])
-    var acc = ST_FLOAT32 if _is_float(grad.dtype) else grad.stype
+    var acc = ST_FLOAT32 if is_f32_f16_bf16(grad.dtype) else grad.stype
     var tmp_a = _nn_cast(tmp, acc)
     var o_a = _nn_cast(_nn_hold(o.t), acc)
     var tmp_m = _op1(
@@ -826,7 +779,7 @@ def op_native_layer_norm(
     var has_b = not v_is_none(args[unsafe_offset=3])
     var eps = v_f64(args[unsafe_offset=4])
     _require_mojo(a, "native_layer_norm")
-    if a.numel == 0 or not _is_float(a.dtype):
+    if a.numel == 0 or not is_f32_f16_bf16(a.dtype):
         unsupported("native_layer_norm of dtype " + String(a.dtype))
     var k = len(ns)
     if k < 1 or a.rank < k:
@@ -944,7 +897,7 @@ def op_native_layer_norm_backward(
     var saved_rstd = v_tensor(args[unsafe_offset=4])
     var has_w = not v_is_none(args[unsafe_offset=5])
     var has_b = not v_is_none(args[unsafe_offset=6])
-    var mask = _bool_list(args[unsafe_offset=7])
+    var mask = v_bool_list(args[unsafe_offset=7])
     if len(mask) != 3:
         raise Error(
             "native_layer_norm_backward: output_mask must have 3 entries"
@@ -1115,7 +1068,7 @@ def _bn_param(t: T, a: T, channels: Int, what: StaticString) raises:
         or not t.contig
         or t.rank != 1
         or t.dim(0) != channels
-        or not _is_float(t.dtype)
+        or not is_f32_f16_bf16(t.dtype)
     ):
         unsupported(
             String(what) + " must be a contiguous float[C] on the same device"
@@ -1275,7 +1228,7 @@ def _bn_inference(args: Values, rets: Values, base: Int, eps_i: Int) raises:
     two saved statistics torch's CUDA path fills (Normalization.cu:454)."""
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a, "batch norm")
-    if not _is_float(a.dtype):
+    if not is_f32_f16_bf16(a.dtype):
         unsupported("batch norm of dtype " + String(a.dtype))
     var channels = _bn_channels(a)
     if v_is_none(args[unsafe_offset=base]) or v_is_none(
@@ -1457,7 +1410,7 @@ def _bn_training(args: Values, rets: Values) raises:
     over N*HxW, ATen's running-stat update, then the elementwise pass."""
     var a = v_tensor(args[unsafe_offset=0])
     _require_mojo(a, "batch norm")
-    if not _is_float(a.dtype):
+    if not is_f32_f16_bf16(a.dtype):
         unsupported("training batch norm of dtype " + String(a.dtype))
     var channels = _bn_channels(a)
     var has_w = not v_is_none(args[unsafe_offset=1])
@@ -1588,7 +1541,7 @@ def op_native_group_norm(
     var group = v_int(args[unsafe_offset=6])
     var eps = v_f64(args[unsafe_offset=7])
     _require_mojo(a, "native_group_norm")
-    if a.numel == 0 or not _is_float(a.dtype):
+    if a.numel == 0 or not is_f32_f16_bf16(a.dtype):
         unsupported("native_group_norm of dtype " + String(a.dtype))
     if group <= 0 or c % group != 0 or a.numel != n * c * hxw:
         unsupported("native_group_norm: bad group geometry")
@@ -1688,7 +1641,7 @@ def op_embedding(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         )
     if (
         table.device != idx.device
-        or not _is_float(table.dtype)
+        or not is_f32_f16_bf16(table.dtype)
         or table.rank != 2
         or (idx.dtype != DType.int32 and idx.dtype != DType.int64)
     ):

@@ -31,7 +31,6 @@ from tmb.backend.abi import (
     default_dtype,
     dtype_code,
     dtype_name,
-    is_dense,
     max_dtype,
     new_like,
     new_tensor,
@@ -64,6 +63,11 @@ from tmb.ops.common import (
     resize_out,
     same_view,
     shares_storage,
+    assert_no_partial_overlap,
+    is_f32_f16_bf16,
+    is_bitwise_dtype,
+    scalar_type_name,
+    float_max,
 )
 from tmb.ops.f8_iter import (
     f8_iter,
@@ -119,7 +123,6 @@ from tmb.ops.complex_math import (
     cx_sqrt_out,
 )
 from tmb.ops.core import cast_for_copy
-from tmb.ops.data_movement import _scalar_type_name
 
 
 # ---------------------------------------------------------------------------
@@ -128,13 +131,9 @@ from tmb.ops.data_movement import _scalar_type_name
 # ---------------------------------------------------------------------------
 
 
-def _is_float_dtype(dt: DType) -> Bool:
-    return dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16
-
-
 def _is_spec_unary_dtype(dt: DType) -> Bool:
     return (
-        _is_float_dtype(dt)
+        is_f32_f16_bf16(dt)
         or dt == DType.float64
         or dt == DType.int8
         or dt == DType.int16
@@ -148,17 +147,6 @@ def _is_bool_spec_dtype(dt: DType) -> Bool:
     return _is_spec_unary_dtype(dt) or dt == DType.bool
 
 
-def _is_bitwise_dtype(dt: DType) -> Bool:
-    return (
-        dt == DType.bool
-        or dt == DType.uint8
-        or dt == DType.int8
-        or dt == DType.int16
-        or dt == DType.int32
-        or dt == DType.int64
-    )
-
-
 def _f8_refuse(op: String, dt: DType) raises:
     """CUDA's unary kernels dispatch no float8: `"<op>_cuda" not implemented
     for '<dtype>'`, the op named from its spec (`ExpSpec` -> exp_cuda)."""
@@ -168,7 +156,7 @@ def _f8_refuse(op: String, dt: DType) raises:
             '"'
             + name
             + "_cuda\" not implemented for '"
-            + _scalar_type_name(dt)
+            + scalar_type_name(dt)
             + "'"
         )
 
@@ -182,16 +170,16 @@ def _f8_out_refuse(op: String, t: T, mut dst: T, same_dtype: Bool) raises:
         if same_dtype and dst.stype != t.stype:
             raise Error(
                 "Found dtype ",
-                _scalar_type_name(dst.dtype),
+                scalar_type_name(dst.dtype),
                 " but expected ",
-                _scalar_type_name(t.dtype),
+                scalar_type_name(t.dtype),
             )
         if not same_dtype and not can_cast(t.stype, dst.stype):
             raise Error(
                 "result type ",
-                _scalar_type_name(t.dtype),
+                scalar_type_name(t.dtype),
                 " can't be cast to the desired output type ",
-                _scalar_type_name(dst.dtype),
+                scalar_type_name(dst.dtype),
             )
         if not dst.same_shape(t):
             resize_out(dst, t.shape, t.rank)
@@ -200,7 +188,7 @@ def _f8_out_refuse(op: String, t: T, mut dst: T, same_dtype: Bool) raises:
 
 def _require_float(op: String, dt: DType) raises:
     _f8_refuse(op, dt)
-    if not _is_float_dtype(dt):
+    if not is_f32_f16_bf16(dt):
         unsupported(
             op
             + ": dtype "
@@ -238,48 +226,6 @@ def _require_bool_spec(op: String, dt: DType) raises:
 # ---------------------------------------------------------------------------
 
 
-def _dense_enough(t: T) -> Bool:
-    """`TensorImpl::is_non_overlapping_and_dense` (see binary.mojo's
-    `_b_dense_enough`): any other view is `TooHard` for ATen's check."""
-    return t.contig or is_dense(t.shape, t.strides, t.rank)
-
-
-def _no_partial_overlap(written: T, other: T) raises:
-    """`at::assert_no_partial_overlap`: an `out=` that shares storage with
-    the input without being the same view of it is a read/write race
-    (`torch.neg(x[:-1], out=x[1:])`). The identical view is fine -- that is
-    how the in-place variants reuse this path. Private to this file until the
-    port is merged; ops_binary.mojo has the same helper and both belong in
-    tmb/ops/common.mojo.
-    """
-    if written.h == other.h or written.numel == 0 or other.numel == 0:
-        return
-    var storage = written.storage_ptr()
-    if storage == 0 or storage != other.storage_ptr():
-        return
-    if not _dense_enough(written) or not _dense_enough(other):
-        return
-    var a_begin = written.ptr
-    var a_end = a_begin + written.numel * written.itemsize
-    var b_begin = other.ptr
-    var b_end = b_begin + other.numel * other.itemsize
-    if a_begin == b_begin and a_end == b_end:
-        if written.rank == other.rank:
-            var same = True
-            for i in range(written.rank):
-                if written.stride(i) != other.stride(i):
-                    same = False
-            if same:
-                return
-    elif not (a_begin < b_end and b_begin < a_end):
-        return
-    raise Error(
-        "unsupported operation: some elements of the input tensor and the"
-        " written-to tensor refer to a single memory location. Please clone()"
-        " the tensor before performing the operation."
-    )
-
-
 def _unary_direct(
     family: String, op: String, src_c: T, mut dst: T, out_dtype: DType
 ) raises:
@@ -308,14 +254,14 @@ def _out_prologue(t_in: T, mut dst: T, result_stype: Int32) raises:
     shaped `out` keeps its own strides and storage offset)."""
     one_device(t_in, dst)
     assert_no_internal_overlap(dst)
-    _no_partial_overlap(dst, t_in)
+    assert_no_partial_overlap(dst, t_in)
     if dst.stype != result_stype:
         # TensorIterator's check_dtype wording (stock CUDA, every dtype).
         raise Error(
             "Found dtype ",
-            _scalar_type_name(dst.dtype),
+            scalar_type_name(dst.dtype),
             " but expected ",
-            _scalar_type_name(max_dtype(result_stype)),
+            scalar_type_name(max_dtype(result_stype)),
         )
     if not dst.same_shape(t_in):
         resize_out(dst, t_in.shape, t_in.rank)
@@ -351,7 +297,7 @@ def _unary_out(
     ):
         one_device(t_in, dst)
         assert_no_internal_overlap(dst)
-        _no_partial_overlap(dst, t_in)
+        assert_no_partial_overlap(dst, t_in)
         if not dst.same_shape(t_in):
             resize_out(dst, t_in.shape, t_in.rank)
         var result = own(_unary(family, op, t_in, out_dtype))
@@ -704,7 +650,7 @@ def _log2_input(t: T) raises -> Owned:
     if not t.on_mojo():
         unsupported("log2 requires an input on the mojo device")
     if (
-        not _is_float_dtype(t.dtype)
+        not is_f32_f16_bf16(t.dtype)
         and t.dtype != DType.float64
         and not _is_bool_spec_dtype(t.dtype)
     ):
@@ -1057,359 +1003,193 @@ def op_sinc_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ret_ref(rets, 0, dst)
 
 
-# aten::special_airy_ai(Tensor x) -> Tensor
-def op_special_airy_ai(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
+def _special[
+    spec: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """A `special_*` op: `spec` over its one input, promoted to float."""
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("AiryAiSpec", t))
+    var out = own(_promoting_unary(spec, t))
     ret_owned(rets, 0, out)
+
+
+def _special_out[
+    spec: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`_special`'s `.out` overload."""
+    var t = v_tensor(args[unsafe_offset=0])
+    var dst = v_tensor(args[unsafe_offset=1])
+    _promoting_unary_out(spec, t, dst)
+    ret_ref(rets, 0, dst)
+
+
+# aten::special_airy_ai(Tensor x) -> Tensor
+comptime op_special_airy_ai = _special["AiryAiSpec"]
 
 
 # aten::special_airy_ai.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_airy_ai_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("AiryAiSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_airy_ai_out = _special_out["AiryAiSpec"]
 
 
 # aten::special_bessel_j0(Tensor self) -> Tensor
-def op_special_bessel_j0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("BesselJ0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_bessel_j0 = _special["BesselJ0Spec"]
 
 
 # aten::special_bessel_j0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_bessel_j0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("BesselJ0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_bessel_j0_out = _special_out["BesselJ0Spec"]
 
 
 # aten::special_bessel_j1(Tensor self) -> Tensor
-def op_special_bessel_j1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("BesselJ1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_bessel_j1 = _special["BesselJ1Spec"]
 
 
 # aten::special_bessel_j1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_bessel_j1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("BesselJ1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_bessel_j1_out = _special_out["BesselJ1Spec"]
 
 
 # aten::special_bessel_y0(Tensor self) -> Tensor
-def op_special_bessel_y0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("BesselY0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_bessel_y0 = _special["BesselY0Spec"]
 
 
 # aten::special_bessel_y0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_bessel_y0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("BesselY0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_bessel_y0_out = _special_out["BesselY0Spec"]
 
 
 # aten::special_bessel_y1(Tensor self) -> Tensor
-def op_special_bessel_y1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("BesselY1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_bessel_y1 = _special["BesselY1Spec"]
 
 
 # aten::special_bessel_y1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_bessel_y1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("BesselY1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_bessel_y1_out = _special_out["BesselY1Spec"]
 
 
 # aten::special_entr(Tensor self) -> Tensor
-def op_special_entr(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("EntrSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_entr = _special["EntrSpec"]
 
 
 # aten::special_entr.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_entr_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("EntrSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_entr_out = _special_out["EntrSpec"]
 
 
 # aten::special_erfcx(Tensor self) -> Tensor
-def op_special_erfcx(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ErfcxSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_erfcx = _special["ErfcxSpec"]
 
 
 # aten::special_erfcx.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_erfcx_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ErfcxSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_erfcx_out = _special_out["ErfcxSpec"]
 
 
 # aten::special_i0e(Tensor self) -> Tensor
-def op_special_i0e(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("I0eSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_i0e = _special["I0eSpec"]
 
 
 # aten::special_i0e.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_i0e_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("I0eSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_i0e_out = _special_out["I0eSpec"]
 
 
 # aten::special_i1(Tensor self) -> Tensor
-def op_special_i1(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("I1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_i1 = _special["I1Spec"]
 
 
 # aten::special_i1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_i1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("I1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_i1_out = _special_out["I1Spec"]
 
 
 # aten::special_i1e(Tensor self) -> Tensor
-def op_special_i1e(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("I1eSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_i1e = _special["I1eSpec"]
 
 
 # aten::special_i1e.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_i1e_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("I1eSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_i1e_out = _special_out["I1eSpec"]
 
 
 # aten::special_log_ndtr(Tensor self) -> Tensor
-def op_special_log_ndtr(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("LogNdtrSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_log_ndtr = _special["LogNdtrSpec"]
 
 
 # aten::special_log_ndtr.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_log_ndtr_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("LogNdtrSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_log_ndtr_out = _special_out["LogNdtrSpec"]
 
 
 # aten::special_modified_bessel_i0(Tensor self) -> Tensor
-def op_special_modified_bessel_i0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ModifiedBesselI0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_modified_bessel_i0 = _special["ModifiedBesselI0Spec"]
 
 
 # aten::special_modified_bessel_i0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_modified_bessel_i0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ModifiedBesselI0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_modified_bessel_i0_out = _special_out[
+    "ModifiedBesselI0Spec"
+]
 
 
 # aten::special_modified_bessel_i1(Tensor self) -> Tensor
-def op_special_modified_bessel_i1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ModifiedBesselI1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_modified_bessel_i1 = _special["ModifiedBesselI1Spec"]
 
 
 # aten::special_modified_bessel_i1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_modified_bessel_i1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ModifiedBesselI1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_modified_bessel_i1_out = _special_out[
+    "ModifiedBesselI1Spec"
+]
 
 
 # aten::special_modified_bessel_k0(Tensor self) -> Tensor
-def op_special_modified_bessel_k0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ModifiedBesselK0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_modified_bessel_k0 = _special["ModifiedBesselK0Spec"]
 
 
 # aten::special_modified_bessel_k0.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_modified_bessel_k0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ModifiedBesselK0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_modified_bessel_k0_out = _special_out[
+    "ModifiedBesselK0Spec"
+]
 
 
 # aten::special_modified_bessel_k1(Tensor self) -> Tensor
-def op_special_modified_bessel_k1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ModifiedBesselK1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_modified_bessel_k1 = _special["ModifiedBesselK1Spec"]
 
 
 # aten::special_modified_bessel_k1.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_modified_bessel_k1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ModifiedBesselK1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_modified_bessel_k1_out = _special_out[
+    "ModifiedBesselK1Spec"
+]
 
 
 # aten::special_ndtri(Tensor self) -> Tensor
-def op_special_ndtri(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("NdtriSpec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_ndtri = _special["NdtriSpec"]
 
 
 # aten::special_ndtri.out(Tensor self, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_ndtri_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("NdtriSpec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_ndtri_out = _special_out["NdtriSpec"]
 
 
 # aten::special_scaled_modified_bessel_k0(Tensor x) -> Tensor
-def op_special_scaled_modified_bessel_k0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ScaledModifiedBesselK0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_scaled_modified_bessel_k0 = _special[
+    "ScaledModifiedBesselK0Spec"
+]
 
 
 # aten::special_scaled_modified_bessel_k0.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_scaled_modified_bessel_k0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ScaledModifiedBesselK0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_scaled_modified_bessel_k0_out = _special_out[
+    "ScaledModifiedBesselK0Spec"
+]
 
 
 # aten::special_scaled_modified_bessel_k1(Tensor x) -> Tensor
-def op_special_scaled_modified_bessel_k1(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("ScaledModifiedBesselK1Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_scaled_modified_bessel_k1 = _special[
+    "ScaledModifiedBesselK1Spec"
+]
 
 
 # aten::special_scaled_modified_bessel_k1.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_scaled_modified_bessel_k1_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("ScaledModifiedBesselK1Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_scaled_modified_bessel_k1_out = _special_out[
+    "ScaledModifiedBesselK1Spec"
+]
 
 
 # aten::special_spherical_bessel_j0(Tensor x) -> Tensor
-def op_special_spherical_bessel_j0(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_promoting_unary("SphericalBesselJ0Spec", t))
-    ret_owned(rets, 0, out)
+comptime op_special_spherical_bessel_j0 = _special["SphericalBesselJ0Spec"]
 
 
 # aten::special_spherical_bessel_j0.out(Tensor x, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_spherical_bessel_j0_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var t = v_tensor(args[unsafe_offset=0])
-    var dst = v_tensor(args[unsafe_offset=1])
-    _promoting_unary_out("SphericalBesselJ0Spec", t, dst)
-    ret_ref(rets, 0, dst)
+comptime op_special_spherical_bessel_j0_out = _special_out[
+    "SphericalBesselJ0Spec"
+]
 
 
 # ---------------------------------------------------------------------------
@@ -1433,7 +1213,7 @@ def _float_or_f64_unary_out(
 def _promote(t: T) raises -> T:
     """unary_float_op: an integer or bool input computes in the default float
     dtype (a new tensor; the float input itself otherwise)."""
-    if _is_bitwise_dtype(t.dtype):
+    if is_bitwise_dtype(t.dtype):
         return cast_to(t, default_dtype())
     return t.copy()
 
@@ -1629,7 +1409,7 @@ def _param_unary_out(
             )
         one_device(t_in, dst)
         assert_no_internal_overlap(dst)
-        _no_partial_overlap(dst, t_in)
+        assert_no_partial_overlap(dst, t_in)
         if not dst.same_shape(t_in):
             resize_out(dst, t_in.shape, t_in.rank)
         var result = own(_param_unary(op, t_in, p0, p1, p2))
@@ -1677,7 +1457,7 @@ def op_round_decimals(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var decimals = v_int(args[unsafe_offset=1])
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         unsupported("round.decimals: integer tensors are not supported")
     var p = _round_decimals_params(t, decimals)
     var out = own(_param_unary("RoundDecimalsSpec", t, p[0], p[1], p[2]))
@@ -1691,7 +1471,7 @@ def op_round_decimals_out(
     var t = v_tensor(args[unsafe_offset=0])
     var decimals = v_int(args[unsafe_offset=1])
     var dst = v_tensor(args[unsafe_offset=2])
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         unsupported("round.decimals: integer tensors are not supported")
     var p = _round_decimals_params(t, decimals)
     _param_unary_out("RoundDecimalsSpec", t, dst, p[0], p[1], p[2])
@@ -1704,7 +1484,7 @@ def op_round__decimals(
 ) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var decimals = v_int(args[unsafe_offset=1])
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         unsupported("round.decimals: integer tensors are not supported")
     var p = _round_decimals_params(t, decimals)
     var dst = t.copy()
@@ -1776,16 +1556,16 @@ def op_logit_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_logit_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var eps = _logit_eps(args[unsafe_offset=1])
-    if _is_bitwise_dtype(t.dtype):
+    if is_bitwise_dtype(t.dtype):
         # CUDA's order: the cast check on self fires before any dtype support
         # check of the promoted result (a float64 default dtype included), so
         # it runs before the promotion casts anything (Apple GPUs would
         # otherwise refuse the float64 cast first).
         raise Error(
             "result type ",
-            _scalar_type_name(max_dtype(default_dtype())),
+            scalar_type_name(max_dtype(default_dtype())),
             " can't be cast to the desired output type ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
     var src = own_if_new(_promote(t), t)
     _require_float("logit", src.t.dtype)
@@ -1923,13 +1703,7 @@ def _nan_to_num_params(
     """The replacements, None resolved to 0 / the dtype's max / its lowest
     (all exact in float64, so the kernel's cast back to the dtype is too)."""
     _require_float_or_f64("nan_to_num", t)
-    var big = Float64(3.4028234663852886e38)
-    if t.dtype == DType.float16:
-        big = 65504.0
-    elif t.dtype == DType.bfloat16:
-        big = 3.3895313892515355e38
-    elif t.dtype == DType.float64:
-        big = 1.7976931348623157e308
+    var big = float_max(t.dtype)
     return (
         v_f64_or(nan, 0.0),
         big if v_is_none(posinf) else v_f64(posinf),
@@ -1940,7 +1714,7 @@ def _nan_to_num_params(
 # aten::nan_to_num(Tensor self, float? nan=None, float? posinf=None, float? neginf=None) -> Tensor
 def op_nan_to_num(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    if _is_bitwise_dtype(t.dtype):
+    if is_bitwise_dtype(t.dtype):
         # Integers and bool hold no NaN or infinity: a copy.
         var copy = own(_int_identity(t))
         ret_owned(rets, 0, copy)
@@ -1964,12 +1738,12 @@ def op_nan_to_num_out(
         if dst.stype != t.stype:
             raise Error(
                 "nan_to_num: dtype of out: ",
-                _scalar_type_name(dst.dtype),
+                scalar_type_name(dst.dtype),
                 " should be same as input: ",
-                _scalar_type_name(t.dtype),
+                scalar_type_name(t.dtype),
             )
         _f8_out_refuse("nan_to_num", t, dst, True)
-    if _is_bitwise_dtype(t.dtype):
+    if is_bitwise_dtype(t.dtype):
         _identity_into(t, dst)
         ret_ref(rets, 0, dst)
         return
@@ -1998,7 +1772,7 @@ def _int_identity(t: T) raises -> T:
 
 
 def _ceil_or_floor(op: String, t: T) raises -> T:
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         return _int_identity(t)
     _require_float_or_f64(op, t)
     return _unary("elementwise", op, t, t.dtype)
@@ -2011,7 +1785,7 @@ def _identity_into(t: T, mut dst: T) raises:
 
 
 def _ceil_or_floor_into(op: String, t: T, mut dst: T) raises:
-    if _is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
+    if is_bitwise_dtype(t.dtype) and t.dtype != DType.bool:
         _identity_into(t, dst)
         return
     _require_float_or_f64(op, t)
@@ -2312,7 +2086,7 @@ def _bitwise_not_kernel(src: T, dst: T) raises:
 def _bitwise_not(t_in: T) raises -> T:
     if t_in.dtype == DType.bool:
         return _bool_unary("LogicalNotSpec", t_in)
-    if not _is_bitwise_dtype(t_in.dtype):
+    if not is_bitwise_dtype(t_in.dtype):
         unsupported(
             "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
         )
@@ -2328,7 +2102,7 @@ def _bitwise_not_into(t_in: T, mut dst: T) raises:
     if t_in.dtype == DType.bool:
         _bool_unary_out("LogicalNotSpec", t_in, dst)
         return
-    if not _is_bitwise_dtype(t_in.dtype):
+    if not is_bitwise_dtype(t_in.dtype):
         unsupported(
             "bitwise_not: dtype " + String(t_in.dtype) + " is not supported"
         )

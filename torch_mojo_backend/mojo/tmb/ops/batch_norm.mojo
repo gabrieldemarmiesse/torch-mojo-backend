@@ -27,7 +27,6 @@ from tmb.backend.abi import (
     Values,
     bool_arg,
     f64_bits,
-    index_error,
     _channels_last_strides,
     max_dtype,
     new_strided,
@@ -44,6 +43,7 @@ from tmb.backend.abi import (
     v_int,
     v_is_none,
     v_tensor,
+    v_bool_list,
 )
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
@@ -58,20 +58,20 @@ from tmb.ops.common import (
     is_channels_last_layout,
     like_layout,
     store_out,
+    sizes_str,
+    scalar_type_name,
+    expect_scalar_type,
+    wrap_dim,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.loss import (
     Dense,
     OwnedPair,
-    _expect_dtype,
     _loss_float,
     _same_device,
 )
 from tmb.ops.nn import (
-    _bool_list,
     op_batch_norm_legit_no_training,
     op_native_batch_norm,
-    sizes_str,
 )
 from tmb.backend.registry import Site, impl
 
@@ -235,7 +235,7 @@ def op_batch_norm_backward(
         forward_args(args, 10),
         3,
     )
-    var mask = _bool_list(args[unsafe_offset=9])
+    var mask = v_bool_list(args[unsafe_offset=9])
     for i in range(3):
         if i >= len(mask) or not mask[i] or r[i].tag != TAG_TENSOR:
             # An unrequested gradient is undefined, as on CUDA's native route.
@@ -261,14 +261,7 @@ struct Planes(Movable):
     var hxw: Int
 
     def __init__(out self, t: T) raises:
-        if t.rank < 2:
-            index_error(
-                String("Dimension out of range (expected to be in range of [")
-                + String(-max(t.rank, 1))
-                + ", "
-                + String(max(t.rank, 1) - 1)
-                + "], but got 1)"
-            )
+        _ = wrap_dim(1, t.rank)
         self.cl = is_channels_last_layout(t)
         if self.cl:
             self.dense = Dense(t, True)
@@ -402,7 +395,7 @@ def op_batch_norm_update_stats(
         _loss_float(rm)
         _same_device(a, rm)
         _same_device(a, rv)
-        _expect_dtype(rv, rm)
+        expect_scalar_type(rv, rm)
         if not rm.contig or not rv.contig or rm.numel != p.c or rv.numel != p.c:
             raise Error(
                 "batch_norm_update_stats: running statistics must be"
@@ -422,9 +415,9 @@ def _expect_type(t: T, stype: Int32, name: StaticString) raises:
             "Expected ",
             name,
             " to have type ",
-            _scalar_type_name(max_dtype(stype)),
+            scalar_type_name(max_dtype(stype)),
             " but got ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
 
 
@@ -744,7 +737,7 @@ def op_batch_norm_backward_reduce(
     var has_w = _opt(args, 4)
     _loss_float(a)
     _same_device(a, grad)
-    _expect_dtype(grad, a)
+    expect_scalar_type(grad, a)
     var p = Planes(a)
     if not grad.same_shape(a):
         raise Error(
@@ -787,8 +780,8 @@ def op_batch_norm_backward_reduce(
     else:
         # batch_norm_backward_reduce_cuda_channels_last_template reads both
         # statistics as `accscalar_t` pointers.
-        _expect_scalar(mean_t, _acc_of(a.stype))
-        _expect_scalar(invstd_t, _acc_of(a.stype))
+        expect_scalar_type(mean_t, _acc_of(a.stype))
+        expect_scalar_type(invstd_t, _acc_of(a.stype))
     var g = Planes(grad)
     var mean = _channel_vec(args, 2, a, p.c, "mean")
     var invstd = _as_stype(
@@ -874,7 +867,7 @@ def op_batch_norm_backward_elemt(
     _loss_float(a)
     _same_device(a, grad)
     _same_device(a, count)
-    _expect_dtype(grad, a)
+    expect_scalar_type(grad, a)
     var p = Planes(a)
     if not grad.same_shape(a):
         raise Error(
@@ -915,7 +908,7 @@ def op_batch_norm_backward_elemt(
     if count.stype != ST_INT32:
         raise Error(
             "expected scalar type Int but found ",
-            _scalar_type_name(count.dtype),
+            scalar_type_name(count.dtype),
         )
     var cnt = Dense(count)
     var w: Optional[Dense] = None
@@ -1012,17 +1005,6 @@ def _elemt_launch(
     _ = ctx
 
 
-def _expect_scalar(t: T, stype: Int32) raises:
-    """`const_data_ptr<scalar_t>()`'s check."""
-    if t.stype != stype:
-        raise Error(
-            "expected scalar type ",
-            _scalar_type_name(max_dtype(stype)),
-            " but found ",
-            _scalar_type_name(t.dtype),
-        )
-
-
 def _affine_checks(a: T, args: Values) raises:
     """batch_norm_elementwise's typed reads of weight and bias, per route:
     contiguous (`batch_norm_elemt_cuda_template`, `stat_scalar_t` the
@@ -1045,9 +1027,9 @@ def _affine_checks(a: T, args: Values) raises:
             _expect_type(v_tensor(args[unsafe_offset=2]), want, "bias")
     elif _uses_channels_last(a):
         if has_w:
-            _expect_scalar(v_tensor(args[unsafe_offset=1]), want)
+            expect_scalar_type(v_tensor(args[unsafe_offset=1]), want)
         if has_b:
-            _expect_scalar(v_tensor(args[unsafe_offset=2]), want)
+            expect_scalar_type(v_tensor(args[unsafe_offset=2]), want)
 
 
 def _invstd_of(rv: T, eps: Float64, acc: Int32) raises -> Owned:
@@ -1145,7 +1127,7 @@ def _bn_sync(
             _same_device(a, rm)
             _same_device(a, rv)
             _loss_float(rm)
-            _expect_dtype(rv, rm)
+            expect_scalar_type(rv, rm)
             if (
                 not rm.contig
                 or not rv.contig

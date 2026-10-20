@@ -64,6 +64,7 @@ from tmb.backend.abi import (
     v_string,
     v_tensor,
     view_strided,
+    is_floating as _pw_is_float,
 )
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
@@ -118,10 +119,8 @@ from tmb.ops.binary import (
     _b_inplace_operand,
     _b_no_overlap_side,
     _b_out_guard3,
-    _b_no_partial_overlap,
     _b_ret,
     _b_self,
-    _b_shape_list,
     _b_side,
     _b_sside,
     _b_store_inplace,
@@ -153,7 +152,6 @@ from tmb.ops.common import (
     combine_categories as _pw_combine_known,
     contiguous,
     copy_strided_into,
-    is_float_stype as _pw_is_float,
     is_int_stype as _pw_is_int,
     known_stype as _pw_known,
     cast_to,
@@ -161,9 +159,10 @@ from tmb.ops.common import (
     resize_out,
     scalar_to_float,
     scalar_to_int,
+    shape_list_str,
+    wrap_dim,
 )
 from tmb.ops.random import _draw, _sample, _sampler_dtype_check
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.core import cast_for_copy
 from tmb.ops.distance import store_autogen_out
 from tmb.ops.reductions import _scalar_reduction
@@ -663,79 +662,70 @@ def _pw_math_inplace(
 # ---------------------------------------------------------------------------
 
 
+def _pw_math_op[
+    kind: StaticString, policy: Int, f64_ok: Bool, out_index: Int
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """A binary `_pw_math` op: functional (`out_index` -1) or `.out` (2)."""
+    _pw_math(kind, policy, f64_ok, 2, args, rets, out_index)
+
+
 # aten::atan2(Tensor self, Tensor other) -> Tensor
-def op_atan2(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("atan2", P_FLOAT, True, 2, args, rets, -1)
+comptime op_atan2 = _pw_math_op["atan2", P_FLOAT, True, -1]
 
 
 # aten::atan2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_atan2_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("atan2", P_FLOAT, True, 2, args, rets, 2)
+comptime op_atan2_out = _pw_math_op["atan2", P_FLOAT, True, 2]
 
 
 # aten::copysign.Tensor(Tensor self, Tensor other) -> Tensor
 # aten::copysign.Scalar(Tensor self, Scalar other) -> Tensor
-def op_copysign(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("copysign", P_FLOAT, True, 2, args, rets, -1)
+comptime op_copysign = _pw_math_op["copysign", P_FLOAT, True, -1]
 
 
 # aten::copysign.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_copysign_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("copysign", P_FLOAT, True, 2, args, rets, 2)
+comptime op_copysign_out = _pw_math_op["copysign", P_FLOAT, True, 2]
 
 
 # aten::fmax(Tensor self, Tensor other) -> Tensor
-def op_fmax(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmax", P_ALL, True, 2, args, rets, -1)
+comptime op_fmax = _pw_math_op["fmax", P_ALL, True, -1]
 
 
 # aten::fmax.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_fmax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmax", P_ALL, True, 2, args, rets, 2)
+comptime op_fmax_out = _pw_math_op["fmax", P_ALL, True, 2]
 
 
 # aten::fmin(Tensor self, Tensor other) -> Tensor
-def op_fmin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmin", P_ALL, True, 2, args, rets, -1)
+comptime op_fmin = _pw_math_op["fmin", P_ALL, True, -1]
 
 
 # aten::fmin.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_fmin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmin", P_ALL, True, 2, args, rets, 2)
+comptime op_fmin_out = _pw_math_op["fmin", P_ALL, True, 2]
 
 
 # aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor
 # aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor
-def op_fmod(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, -1)
+comptime op_fmod = _pw_math_op["fmod", P_NUMERIC, True, -1]
 
 
 # aten::fmod.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 # aten::fmod.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
-def op_fmod_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, 2)
+comptime op_fmod_out = _pw_math_op["fmod", P_NUMERIC, True, 2]
 
 
 # aten::gcd(Tensor self, Tensor other) -> Tensor
-def op_gcd(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("gcd", P_INT, True, 2, args, rets, -1)
+comptime op_gcd = _pw_math_op["gcd", P_INT, True, -1]
 
 
 # aten::gcd.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_gcd_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("gcd", P_INT, True, 2, args, rets, 2)
+comptime op_gcd_out = _pw_math_op["gcd", P_INT, True, 2]
 
 
 # aten::lcm(Tensor self, Tensor other) -> Tensor
-def op_lcm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("lcm", P_INT, True, 2, args, rets, -1)
+comptime op_lcm = _pw_math_op["lcm", P_INT, True, -1]
 
 
 # aten::lcm.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_lcm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("lcm", P_INT, True, 2, args, rets, 2)
+comptime op_lcm_out = _pw_math_op["lcm", P_INT, True, 2]
 
 
 def _pw_side_stype(side: Side) -> Int32:
@@ -777,107 +767,75 @@ def op_heaviside_out(
 
 
 # aten::hypot(Tensor self, Tensor other) -> Tensor
-def op_hypot(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("hypot", P_FLOAT_ONLY, True, 2, args, rets, -1)
+comptime op_hypot = _pw_math_op["hypot", P_FLOAT_ONLY, True, -1]
 
 
 # aten::hypot.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_hypot_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("hypot", P_FLOAT_ONLY, True, 2, args, rets, 2)
+comptime op_hypot_out = _pw_math_op["hypot", P_FLOAT_ONLY, True, 2]
 
 
 # aten::igamma(Tensor self, Tensor other) -> Tensor
-def op_igamma(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igamma", P_FLOAT, False, 2, args, rets, -1)
+comptime op_igamma = _pw_math_op["igamma", P_FLOAT, False, -1]
 
 
 # aten::igamma.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_igamma_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igamma", P_FLOAT, False, 2, args, rets, 2)
+comptime op_igamma_out = _pw_math_op["igamma", P_FLOAT, False, 2]
 
 
 # aten::igammac(Tensor self, Tensor other) -> Tensor
-def op_igammac(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igammac", P_FLOAT, False, 2, args, rets, -1)
+comptime op_igammac = _pw_math_op["igammac", P_FLOAT, False, -1]
 
 
 # aten::igammac.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_igammac_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igammac", P_FLOAT, False, 2, args, rets, 2)
+comptime op_igammac_out = _pw_math_op["igammac", P_FLOAT, False, 2]
 
 
 # aten::logaddexp(Tensor self, Tensor other) -> Tensor
-def op_logaddexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("logaddexp", P_FLOAT_ONLY, True, 2, args, rets, -1)
+comptime op_logaddexp = _pw_math_op["logaddexp", P_FLOAT_ONLY, True, -1]
 
 
 # aten::logaddexp.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_logaddexp_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("logaddexp", P_FLOAT_ONLY, True, 2, args, rets, 2)
+comptime op_logaddexp_out = _pw_math_op["logaddexp", P_FLOAT_ONLY, True, 2]
 
 
 # aten::logaddexp2(Tensor self, Tensor other) -> Tensor
-def op_logaddexp2(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("logaddexp2", P_FLOAT_ONLY, True, 2, args, rets, -1)
+comptime op_logaddexp2 = _pw_math_op["logaddexp2", P_FLOAT_ONLY, True, -1]
 
 
 # aten::logaddexp2.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_logaddexp2_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("logaddexp2", P_FLOAT_ONLY, True, 2, args, rets, 2)
+comptime op_logaddexp2_out = _pw_math_op["logaddexp2", P_FLOAT_ONLY, True, 2]
 
 
 # aten::nextafter(Tensor self, Tensor other) -> Tensor
-def op_nextafter(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("nextafter", P_FLOAT_ONLY, True, 2, args, rets, -1)
+comptime op_nextafter = _pw_math_op["nextafter", P_FLOAT_ONLY, True, -1]
 
 
 # aten::nextafter.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_nextafter_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("nextafter", P_FLOAT_ONLY, True, 2, args, rets, 2)
+comptime op_nextafter_out = _pw_math_op["nextafter", P_FLOAT_ONLY, True, 2]
 
 
 # aten::xlogy.Tensor(Tensor self, Tensor other) -> Tensor
-def op_xlogy(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("xlogy", P_FLOAT, True, 2, args, rets, -1)
+comptime op_xlogy = _pw_math_op["xlogy", P_FLOAT, True, -1]
 
 
 # aten::xlogy.OutTensor(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_xlogy_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("xlogy", P_FLOAT, True, 2, args, rets, 2)
+comptime op_xlogy_out = _pw_math_op["xlogy", P_FLOAT, True, 2]
 
 
 # aten::special_xlog1py(Tensor self, Tensor other) -> Tensor
-def op_special_xlog1py(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("xlog1py", P_FLOAT, True, 2, args, rets, -1)
+comptime op_special_xlog1py = _pw_math_op["xlog1py", P_FLOAT, True, -1]
 
 
 # aten::special_xlog1py.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_xlog1py_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("xlog1py", P_FLOAT, True, 2, args, rets, 2)
+comptime op_special_xlog1py_out = _pw_math_op["xlog1py", P_FLOAT, True, 2]
 
 
 # aten::special_zeta(Tensor self, Tensor other) -> Tensor
-def op_special_zeta(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("zeta", P_FLOAT, True, 2, args, rets, -1)
+comptime op_special_zeta = _pw_math_op["zeta", P_FLOAT, True, -1]
 
 
 # aten::special_zeta.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
-def op_special_zeta_out(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    _pw_math("zeta", P_FLOAT, True, 2, args, rets, 2)
+comptime op_special_zeta_out = _pw_math_op["zeta", P_FLOAT, True, 2]
 
 
 # The special polynomials: aten::special_<name>(Tensor x, Tensor n) -> Tensor
@@ -1005,8 +963,8 @@ def op_frexp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if expo.stype != ST_INT32:
         raise Error("torch.frexp() expects exponent to have int dtype")
     # TensorIterator's meta: an output that partially overlaps self raises.
-    _b_no_partial_overlap(mant, self)
-    _b_no_partial_overlap(expo, self)
+    assert_no_partial_overlap(mant, self)
+    assert_no_partial_overlap(expo, self)
     var r = _pw_frexp(self)
     _pw_store_slot(rets, 0, mant, r[0].copy())
     _pw_store_slot(rets, 1, expo, r[1].copy())
@@ -1674,17 +1632,6 @@ def _shrink_backward_p(args: Values) raises -> SIMD[DType.float64, 4]:
     return _lambd_p(args, 2, common)
 
 
-def _float_max(st: Int32) -> Float64:
-    """std::numeric_limits<scalar_t>::max() of a floating dtype."""
-    if st == ST_FLOAT16:
-        return 65504.0
-    if st == ST_BFLOAT16:
-        return 3.3895313892515355e38
-    if st == ST_FLOAT32:
-        return 3.4028234663852886e38
-    return 1.7976931348623157e308
-
-
 def _softshrink_check(args: Values) raises:
     """softshrink's meta (Activation.cpp's softshrink_check)."""
     softshrink_check(
@@ -2070,17 +2017,7 @@ def _glu_dim(t: T, dim: Int, scalar_msg: StaticString) raises -> Int:
     range, an even size to halve. The wrapped dim."""
     if t.rank == 0:
         raise Error(scalar_msg)
-    if dim < -t.rank or dim >= t.rank:
-        raise Error(
-            "Dimension out of range (expected to be in range of [",
-            -t.rank,
-            ", ",
-            t.rank - 1,
-            "], but got ",
-            dim,
-            ")",
-        )
-    var d = dim + t.rank if dim < 0 else dim
+    var d = wrap_dim(dim, t.rank)
     var n = t.shape[MAX_RANK - t.rank + d]
     if n % 2 != 0:
         raise Error(
@@ -2153,18 +2090,18 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
     if not grad.same_shape(a.t):
         raise Error(
             "glu_backward: grad_output of shape ",
-            _b_shape_list(grad.shape, grad.rank),
+            shape_list_str(grad.shape, grad.rank),
             " does not match the halved input shape ",
-            _b_shape_list(a.t.shape, a.t.rank),
+            shape_list_str(a.t.shape, a.t.rank),
         )
     if grad.stype != self.stype:
         # glu_backward_cuda_out's TensorIterator checks every operand has
         # one dtype (check_all_same_dtype); no promotion.
         raise Error(
             "Found dtype ",
-            _scalar_type_name(grad.dtype),
+            scalar_type_name(grad.dtype),
             " but expected ",
-            _scalar_type_name(self.dtype),
+            scalar_type_name(self.dtype),
         )
     # glu_backward_cuda_out returns before its dtype dispatch when the
     # iterator is empty: an empty integer input is not an error (every
@@ -2210,17 +2147,17 @@ def _glu_backward(args: Values, rets: Values, out_index: Int) raises:
         if gi.stype != compute:
             raise Error(
                 "Found dtype ",
-                _scalar_type_name(gi.dtype),
+                scalar_type_name(gi.dtype),
                 " but expected ",
-                _scalar_type_name(self.dtype),
+                scalar_type_name(self.dtype),
             )
         assert_no_internal_overlap(gi)
         if not gi.same_shape(self):
             resize_out(gi, self.shape, self.rank)
         # TensorIterator's at::assert_no_partial_overlap against both inputs
         # (`self=base[:8], grad_input=base[1:]` raises, as on CUDA).
-        _b_no_partial_overlap(gi, self)
-        _b_no_partial_overlap(gi, grad)
+        assert_no_partial_overlap(gi, self)
+        assert_no_partial_overlap(gi, grad)
     var held = own(gi.copy())
     held.live = fresh  # a caller's grad_input is not ours to release
     var gi_a = own(_glu_half(gi, d, False))
@@ -2262,22 +2199,6 @@ def op_glu_backward_grad_input(
     _glu_backward(args, rets, 3)
 
 
-def _glu_wrap_dim(dim: Int, rank: Int) raises -> Int:
-    """`maybe_wrap_dim(dim, rank)` (a 0-d tensor wraps as 1-d)."""
-    var r = max(rank, 1)
-    if dim < -r or dim >= r:
-        raise Error(
-            "Dimension out of range (expected to be in range of [",
-            -r,
-            ", ",
-            r - 1,
-            "], but got ",
-            dim,
-            ")",
-        )
-    return dim + r if dim < 0 else dim
-
-
 def _glu_narrow(t: T, d: Int, start: Int, length: Int) raises -> T:
     """`t.narrow(d, start, length)`: a view over t's storage."""
     if d >= t.rank:
@@ -2316,7 +2237,7 @@ def _glu_jvp(args: Values) raises -> Owned:
     var glu = v_tensor(args[unsafe_offset=0])
     var x = v_tensor(args[unsafe_offset=1])
     var dx = v_tensor(args[unsafe_offset=2])
-    var d = _glu_wrap_dim(v_int(args[unsafe_offset=3]), x.rank)
+    var d = wrap_dim(v_int(args[unsafe_offset=3]), x.rank)
     if d >= glu.rank:
         raise Error(
             "Dimension out of range (expected to be in range of [",
@@ -2336,16 +2257,16 @@ def _glu_jvp(args: Values) raises -> Owned:
         if t.stype != glu.stype:
             raise Error(
                 "Found dtype ",
-                _scalar_type_name(t.dtype),
+                scalar_type_name(t.dtype),
                 " but expected ",
-                _scalar_type_name(glu.dtype),
+                scalar_type_name(glu.dtype),
             )
     # The result takes the broadcast shape of glu, b, da and db, as the
     # TensorIterator over `empty_like(glu)` resizes its output to.
     if not _pw_is_float(glu.stype):
         raise Error(
             '"glu_cuda" not implemented for \'',
-            _scalar_type_name(glu.dtype),
+            scalar_type_name(glu.dtype),
             "'",
         )
     var opmath = ST_FLOAT64 if glu.stype == ST_FLOAT64 else ST_FLOAT32
@@ -2417,7 +2338,7 @@ def _glu_backward_jvp(args: Values) raises -> Owned:
     var x = v_tensor(args[unsafe_offset=2])
     var dgrad_glu = _glu_bjvp_view(v_tensor(args[unsafe_offset=3]))
     var dx = v_tensor(args[unsafe_offset=4])
-    var d = _glu_wrap_dim(v_int(args[unsafe_offset=5]), x.rank)
+    var d = wrap_dim(v_int(args[unsafe_offset=5]), x.rank)
     if d >= grad_glu.rank:
         raise Error(
             "Dimension out of range (expected to be in range of [",
@@ -3521,9 +3442,9 @@ def _loss_fits(
     if not same:
         raise Error(
             "output with shape ",
-            _b_shape_list(shape, rank),
+            shape_list_str(shape, rank),
             " doesn't match the broadcast shape ",
-            _b_shape_list(bs[0], bs[1]),
+            shape_list_str(bs[0], bs[1]),
         )
 
 
@@ -3615,7 +3536,7 @@ def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
         var d = v_tensor(out_v.value())
         var w = weight.value().copy()
         if d.storage_ptr() != 0 and d.storage_ptr() == w.storage_ptr():
-            _b_no_partial_overlap(d, w)
+            assert_no_partial_overlap(d, w)
             weight_is_out = _pw_same_view(d, w)
             if weight_is_out and reduction != REDUCTION_NONE:
                 unsupported(
@@ -3721,7 +3642,7 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
         if weight:
             # `grad_input.mul_(weight)`: its in-place meta refuses a weight
             # partially overlapping grad_input.
-            _b_no_partial_overlap(dest.value(), weight.value())
+            assert_no_partial_overlap(dest.value(), weight.value())
     # grad_input that IS the weight: ATen's `mul_(weight)` then reads the
     # gradient it just wrote there (grad^2).
     var weight_is_out = False
@@ -3862,9 +3783,9 @@ def _pw_same_dtypes(args: Values, n: Int) raises -> Int32:
         if st != first:
             raise Error(
                 "Found dtype ",
-                _scalar_type_name(max_dtype(st)),
+                scalar_type_name(max_dtype(st)),
                 " but expected ",
-                _scalar_type_name(max_dtype(first)),
+                scalar_type_name(max_dtype(first)),
             )
     return first
 
@@ -3879,7 +3800,7 @@ def _pw_floating_dispatch(name: StaticString, st: Int32, half_ok: Bool) raises:
             '"',
             name,
             "\" not implemented for '",
-            _scalar_type_name(max_dtype(st)),
+            scalar_type_name(max_dtype(st)),
             "'",
         )
 
@@ -3947,7 +3868,7 @@ def _add_relu_check(self_st: Int32, common: Int32) raises:
     if common == ST_FLOAT16 or common == ST_BFLOAT16 or common == ST_BOOL:
         raise Error(
             '"add_clamp_cpu" not implemented for \'',
-            _scalar_type_name(max_dtype(common)),
+            scalar_type_name(max_dtype(common)),
             "'",
         )
 
@@ -4056,9 +3977,9 @@ def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var other_st = _pw_side_stype(b)
     if st != other_st:
         raise Error(
-            _scalar_type_name(max_dtype(st)),
+            scalar_type_name(max_dtype(st)),
             " did not match ",
-            _scalar_type_name(max_dtype(other_st)),
+            scalar_type_name(max_dtype(other_st)),
         )
     var rtol = v_f64(args[unsafe_offset=2])
     var atol = v_f64(args[unsafe_offset=3])

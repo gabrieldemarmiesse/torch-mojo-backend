@@ -56,6 +56,7 @@ from tmb.backend.abi import (
     v_is_none,
     v_tensor,
     view_strided,
+    v_bool_list,
 )
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.backend.device import (
@@ -87,8 +88,10 @@ from tmb.ops.common import (
     like_layout,
     resize_out,
     same_view,
+    expect_scalar_type,
+    vec_shape,
+    wrap_dim,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.f8_iter import (
     f8_iter,
     MODE_FN,
@@ -540,19 +543,6 @@ def _sum_dims(x: Owned, dims: List[Int64], keepdim: Bool) raises -> Owned:
     )
 
 
-def _bool_list(v: Value) raises -> List[Bool]:
-    """A borrowed `bool[]` argument (uint8 per element in the call arena)."""
-    var out = List[Bool]()
-    if v.tag == TAG_NONE:
-        return out^
-    if v.tag != TAG_BOOL_LIST:
-        raise Error("expected a bool[] argument, got record tag ", v.tag)
-    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
-    for i in range(Int(v.len)):
-        out.append(p[unsafe_offset=i] != 0)
-    return out^
-
-
 def _empty_result(stype: Int32, device: Int) raises -> Owned:
     """The 0-element stand-in this ABI returns for a gradient autograd did
     not ask for; the same convention `native_layer_norm_backward` uses (there
@@ -589,9 +579,9 @@ def op_where_self_out(
     if r.t.stype != out.stype:
         raise Error(
             "Expected out type to be ",
-            _scalar_type_name(r.t.dtype),
+            scalar_type_name(r.t.dtype),
             " but got ",
-            _scalar_type_name(out.dtype),
+            scalar_type_name(out.dtype),
         )
     # TensorIterator's memory-overlap checks on the out as given, against
     # the operands it reads unconverted
@@ -857,7 +847,7 @@ def op_native_batch_norm_backward(
     var a = v_tensor(args[unsafe_offset=1])
     var train = v_bool(args[unsafe_offset=7])
     var eps = v_f64(args[unsafe_offset=8])
-    var mask = _bool_list(args[unsafe_offset=9])
+    var mask = v_bool_list(args[unsafe_offset=9])
     if len(mask) != 3:
         raise Error(
             "native_batch_norm_backward: output_mask must have 3 entries"
@@ -949,12 +939,6 @@ def _gn_dims3(a: Int, b: Int, c: Int) -> IndexList[MAX_RANK]:
     return shape
 
 
-def _gn_vector(n: Int) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    shape[MAX_RANK - 1] = n
-    return shape
-
-
 def _gn_grad_input(
     args: Values,
     gc: Owned,
@@ -1024,7 +1008,7 @@ def op_native_group_norm_backward(
     var c = v_int(args[unsafe_offset=6])
     var hxw = v_int(args[unsafe_offset=7])
     var group = v_int(args[unsafe_offset=8])
-    var mask = _bool_list(args[unsafe_offset=9])
+    var mask = v_bool_list(args[unsafe_offset=9])
     if len(mask) != 3:
         raise Error(
             "native_group_norm_backward: output_mask must have 3 entries"
@@ -1069,8 +1053,8 @@ def op_native_group_norm_backward(
         # Nothing to reduce: both affine gradients are zero over an empty
         # extent (ATen fills them with zeros too) and grad_input is empty.
         var gi = own(new_like(a))
-        var gw = _bn_zero_grad(_gn_vector(c), pst, a.device, mask[1])
-        var gb = _bn_zero_grad(_gn_vector(c), pst, a.device, mask[2])
+        var gw = _bn_zero_grad(vec_shape(c), pst, a.device, mask[1])
+        var gb = _bn_zero_grad(vec_shape(c), pst, a.device, mask[2])
         ret_owned(rets, 0, gi)
         ret_owned(rets, 1, gw)
         ret_owned(rets, 2, gb)
@@ -1110,7 +1094,7 @@ def op_native_group_norm_backward(
         var centered = _sub(s2g, shifted)
         var scaled = _mul(centered, rstd)
         var total = _dense(_sum_dims(scaled, batch, False))
-        var flat = _view_as(total, _gn_vector(c), 1)
+        var flat = _view_as(total, vec_shape(c), 1)
         var gw = _cast(flat, pst)
         ret_owned(rets, 1, gw)
     else:
@@ -1354,17 +1338,7 @@ def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
             + String(dim)
             + " but tensor has no dimensions"
         )
-    if dim < -x.rank or dim >= x.rank:
-        index_error(
-            String("Dimension out of range (expected to be in range of [")
-            + String(-x.rank)
-            + ", "
-            + String(x.rank - 1)
-            + "], but got "
-            + String(dim)
-            + ")"
-        )
-    var d = dim + x.rank if dim < 0 else dim
+    var d = wrap_dim(dim, x.rank)
     if x.dim(d) != 3 or y.dim(d) != 3:
         raise Error(
             "linalg.cross: inputs dimension ",
@@ -1421,9 +1395,9 @@ def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
     if y.stype != x.stype:
         raise Error(
             "Found dtype ",
-            _scalar_type_name(y.dtype),
+            scalar_type_name(y.dtype),
             " but expected ",
-            _scalar_type_name(x.dtype),
+            scalar_type_name(x.dtype),
         )
     if out.numel > 0:
         # AT_DISPATCH_ALL_TYPES_AND_COMPLEX_AND2(kHalf, kBFloat16), reached
@@ -1436,7 +1410,7 @@ def _linalg_cross(args: Values, rets: Values, has_out: Bool) raises:
         ):
             unsupported(
                 '"cross_cuda" not implemented for \''
-                + _scalar_type_name(x.dtype)
+                + scalar_type_name(x.dtype)
                 + "'"
             )
         if x.dtype == DType.float64 and dev(x.device)[].api == "metal":
@@ -1507,13 +1481,7 @@ def _test_list_add[floating: Bool](values: T, addends: Value) raises -> Owned:
             " enhancement request to PyTorch.)"
         )
     comptime want = ST_FLOAT32 if floating else ST_INT32
-    if values.stype != want:
-        raise Error(
-            "expected scalar type ",
-            "Float" if floating else "Int",
-            " but found ",
-            _scalar_type_name(values.dtype),
-        )
+    expect_scalar_type(values, want)
     var n = values.dim(0)
     var count = DoubleList(addends).n if floating else IntList(addends).n
     if n > count:

@@ -64,6 +64,7 @@ from tmb.backend.abi import (
     v_tensor,
     v_tensor_list,
     view_strided,
+    v_bool_list,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev, read_bytes_sync
 from tmb.backend.kernel_call import KernelCall
@@ -78,11 +79,12 @@ from tmb.ops.common import (
     resize_out,
     scalar_to_float,
     scalar_to_int,
+    scalar_type_name,
+    vec_shape,
+    wrap_dim,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.reductions import (
     _cast_any,
-    _norm_dim,
     _order_stat_shape,
     _permuted_contiguous,
     _sort_kernel_dtype,
@@ -165,12 +167,6 @@ def _zeros(
     return z^
 
 
-def _shape1(n: Int) -> IndexList[MAX_RANK]:
-    var s = IndexList[MAX_RANK](1)
-    s[MAX_RANK - 1] = n
-    return s
-
-
 def _view(t: T, shape: IndexList[MAX_RANK], rank: Int) raises -> Owned:
     """A contiguous `t` viewed with another shape of the same element count."""
     return own(
@@ -239,8 +235,8 @@ def _mode_into(a: T, dim: Int, values: T, indices: T) raises:
         var dims = List[Int]()
         dims.append(dim)
         src = own(_permuted_contiguous(a, dims))
-    var sv = own(new_tensor(_shape1(rows * n), 1, a.stype, a.device))
-    var si = own(new_tensor(_shape1(rows * n), 1, ST_INT64, a.device))
+    var sv = own(new_tensor(vec_shape(rows * n), 1, a.stype, a.device))
+    var si = own(new_tensor(vec_shape(rows * n), 1, ST_INT64, a.device))
     _sort_rows_into(src.t, kdt, rows, n, n, False, False, sv.t, si.t)
     _ = src^  # alive past the sort
     var ctx = ctx_for(a.device)
@@ -271,7 +267,7 @@ def _mode_dim(a: T, dim_in: Int) raises -> Int:
     """`maybe_wrap_dim` plus `get_zero_numel_tensor_size`'s check."""
     if not a.on_mojo():
         raise Error("expected a tensor on the mojo device")
-    var dim = _norm_dim(dim_in, a.rank)
+    var dim = wrap_dim(dim_in, a.rank)
     if a.numel == 0:
         _zero_numel_check(a, dim, "mode()")
     return dim
@@ -301,15 +297,15 @@ def op_mode_values(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if out_v.stype != a.stype:
         raise Error(
             "expected scalar type '",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             "' but got '",
-            _scalar_type_name(out_v.dtype),
+            scalar_type_name(out_v.dtype),
             "' for values output",
         )
     if out_i.stype != ST_INT64:
         raise Error(
             "expected scalar type 'Long' but got '",
-            _scalar_type_name(out_i.dtype),
+            scalar_type_name(out_i.dtype),
             "' for indices output",
         )
     check_out(out_v, a)
@@ -366,11 +362,11 @@ def _histc_counts_float(
     """CUDA's `getBin` and atomic counts as a composition: elements in
     [lo, hi] (NaN never) land in `int((x - lo) * nbins / (hi - lo))` in the
     input's float type, the top edge folded into the last bin."""
-    var out = _zeros(_shape1(nbins), 1, a.stype, a.device)
+    var out = _zeros(vec_shape(nbins), 1, a.stype, a.device)
     if a.numel == 0:
         return out^
     var flat = own_if_new(contiguous(a), a)
-    var x = _view(flat.t, _shape1(a.numel), 1)
+    var x = _view(flat.t, vec_shape(a.numel), 1)
     var d = _call("aten::sub", "Scalar", [_t(x.t), _dbl(lo), _sint(1)])
     var p = _call("aten::mul", "Scalar", [_t(d.t), _sint(nbins)])
     var width: Float64
@@ -412,10 +408,10 @@ def _histc_counts_int(a: T, nbins: Int, lo: Int, hi: Int) raises -> Owned:
     bounds_t), never through a float, so bounds past 2**53 stay exact. The
     counts accumulate in int64 and convert to the input dtype at the end
     (CUDA adds into the narrow dtype directly; the wrap is the same)."""
-    var counts = _zeros(_shape1(nbins), 1, ST_INT64, a.device)
+    var counts = _zeros(vec_shape(nbins), 1, ST_INT64, a.device)
     if a.numel > 0:
         var flat = own_if_new(contiguous(a), a)
-        var x = _view(flat.t, _shape1(a.numel), 1)
+        var x = _view(flat.t, vec_shape(a.numel), 1)
         var xi = _cast(x.t, ST_INT64)
         var d = _call("aten::sub", "Scalar", [_t(xi.t), _sint(lo), _sint(1)])
         var p = _call("aten::mul", "Scalar", [_t(d.t), _sint(nbins)])
@@ -466,9 +462,7 @@ def _histc(a: T, nbins: Int, min_v: Value, max_v: Value) raises -> Owned:
         raise Error("HalfTensor is not supported")
     var dt = a.dtype
     if not (dt == DType.float32 or dt == DType.float64 or _is_index_int(dt)):
-        raise Error(
-            '"histc" not implemented for \'', _scalar_type_name(dt), "'"
-        )
+        raise Error('"histc" not implemented for \'', scalar_type_name(dt), "'")
     _decline_metal_f64(a, "histc")
     if dt.is_floating_point():
         alert_not_deterministic("_histc_cuda with floating point input")
@@ -577,13 +571,13 @@ def op_bincount(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not _is_index_int(a.dtype):
         raise Error(
             '"bincount_cuda" not implemented for \'',
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             "'",
         )
     if minlength < 0:
         raise Error("minlength should be >= 0")
     if a.rank == 1 and a.numel == 0:
-        var z = _zeros(_shape1(minlength), 1, ST_INT64, a.device)
+        var z = _zeros(vec_shape(minlength), 1, ST_INT64, a.device)
         ret_owned(rets, 0, z)
         return
     if a.rank != 1:
@@ -602,7 +596,7 @@ def op_bincount(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if a.dtype != DType.uint8 and mm[0] < 0:
         raise Error("bincount only supports 1-d non-negative integral inputs.")
     var nbins = max(Int(mm[1]) + 1, minlength)
-    var out = _zeros(_shape1(nbins), 1, w_st, a.device)
+    var out = _zeros(vec_shape(nbins), 1, w_st, a.device)
     var idx = _cast(a, ST_INT64)
     var src: Owned
     if has_w:
@@ -657,7 +651,7 @@ def _column(x2d: T, d: Int) raises -> Owned:
     var strides = IndexList[MAX_RANK](0)
     strides[MAX_RANK - 1] = x2d.dim(1)
     return own(
-        view_strided(x2d, _shape1(x2d.dim(0)), strides, 1, x2d.offset + d)
+        view_strided(x2d, vec_shape(x2d.dim(0)), strides, 1, x2d.offset + d)
     )
 
 
@@ -743,7 +737,7 @@ def _hist_outer_edges(x2d: T, range_v: Value) raises -> List[Float64]:
 def _linspace_edges(
     lo: Float64, hi: Float64, bins: Int, like: T
 ) raises -> Owned:
-    var e = own(new_tensor(_shape1(bins + 1), 1, like.stype, like.device))
+    var e = own(new_tensor(vec_shape(bins + 1), 1, like.stype, like.device))
     _ = call_op(
         "aten::linspace",
         "out",
@@ -798,11 +792,11 @@ def _hist_check_inputs(x: T, edges: List[T], weight: Optional[T]) raises:
                     "torch.histogramdd: input tensor and bins tensors should"
                     " have the same dtype, but got input with dtype "
                 ),
-                _scalar_type_name(x.dtype),
+                scalar_type_name(x.dtype),
                 " and bins for dimension ",
                 d,
                 " with dtype ",
-                _scalar_type_name(edges[d].dtype),
+                scalar_type_name(edges[d].dtype),
             )
         if edges[d].rank != 1:
             raise Error(
@@ -865,10 +859,10 @@ def _hist_counts(
             )
         shape[MAX_RANK - n + d] = nb
         total *= nb
-    var hist = _zeros(_shape1(total), 1, x2d.stype, x2d.device)
+    var hist = _zeros(vec_shape(total), 1, x2d.stype, x2d.device)
     if m > 0 and n > 0:
-        var flat = _zeros(_shape1(m), 1, ST_INT64, x2d.device)
-        var keep = own(new_tensor(_shape1(m), 1, ST_BOOL, x2d.device))
+        var flat = _zeros(vec_shape(m), 1, ST_INT64, x2d.device)
+        var keep = own(new_tensor(vec_shape(m), 1, ST_BOOL, x2d.device))
         fill_value(keep.t, 1.0)
         var stride = total
         for d in range(n):
@@ -924,10 +918,10 @@ def _hist_counts(
         var w: Owned
         if weight:
             var wd = own_if_new(contiguous(weight.value()), weight.value())
-            w = _view(wd.t, _shape1(m), 1)
+            w = _view(wd.t, vec_shape(m), 1)
             _ = wd^
         else:
-            w = own(new_tensor(_shape1(m), 1, x2d.stype, x2d.device))
+            w = own(new_tensor(vec_shape(m), 1, x2d.stype, x2d.device))
             fill_value(w.t, 1.0)
         var wk = _call(
             "aten::where", "ScalarOther", [_t(keep.t), _t(w.t), _dbl(0.0)]
@@ -957,9 +951,11 @@ def _hist_counts(
         var nb = edges[d].numel - 1
         var e = own_if_new(contiguous(edges[d]), edges[d])
         var hi = own(
-            view_strided(e.t, _shape1(nb), e.t.strides, 1, e.t.offset + 1)
+            view_strided(e.t, vec_shape(nb), e.t.strides, 1, e.t.offset + 1)
         )
-        var lo = own(view_strided(e.t, _shape1(nb), e.t.strides, 1, e.t.offset))
+        var lo = own(
+            view_strided(e.t, vec_shape(nb), e.t.strides, 1, e.t.offset)
+        )
         var widths = _sub(hi.t, lo.t)
         var wstrides = IndexList[MAX_RANK](0)
         wstrides[MAX_RANK - n + d] = 1
@@ -968,7 +964,7 @@ def _hist_counts(
         )
         var wfull = own(new_tensor(shape, n, widths.t.stype, widths.t.device))
         copy_strided_into(wfull.t, wexp.t)
-        var wflat = _view(wfull.t, _shape1(total), 1)
+        var wflat = _view(wfull.t, vec_shape(total), 1)
         var nn = _call("aten::div", "Tensor", [_t(normed.t), _t(wflat.t)])
         _ = normed^  # alive past the call that reads it
         normed = nn^
@@ -1014,7 +1010,7 @@ def _hist_flat_weight(w_v: Value) raises -> Tuple[Optional[Owned], Optional[T]]:
         return (Optional[Owned](None), Optional[T](None))
     var w = weight.value().copy()
     var wd = own_if_new(contiguous(w), w)
-    var wv = _view(wd.t, _shape1(w.numel), 1)
+    var wv = _view(wd.t, vec_shape(w.numel), 1)
     _ = wd^
     var t = wv.t.copy()
     return (Optional[Owned](wv^), Optional[T](t^))
@@ -1101,9 +1097,9 @@ def _hist_into_outs(
                 "torch.histogram: input tensor and hist tensor should have the"
                 " same dtype, but got input "
             ),
-            dtype_name_of(a),
+            scalar_type_name(a.dtype),
             " and hist ",
-            dtype_name_of(hist_out),
+            scalar_type_name(hist_out.dtype),
         )
     if edges_out.stype != a.stype:
         raise Error(
@@ -1111,9 +1107,9 @@ def _hist_into_outs(
                 "torch.histogram: input tensor and bin_edges tensor should have"
                 " the same dtype, but got input "
             ),
-            dtype_name_of(a),
+            scalar_type_name(a.dtype),
             " and bin_edges ",
-            dtype_name_of(edges_out),
+            scalar_type_name(edges_out.dtype),
             " for dimension 0",
         )
     if not hist_out.same_shape(res[0].t):
@@ -1124,10 +1120,6 @@ def _hist_into_outs(
     assert_no_internal_overlap(edges_out)
     copy_strided_into(hist_out, res[0].t)
     copy_strided_into(edges_out, res[1].t)
-
-
-def dtype_name_of(t: T) -> String:
-    return _scalar_type_name(t.dtype)
 
 
 # aten::histogram.bins_tensor_out(Tensor self, Tensor bins, *,
@@ -1189,7 +1181,7 @@ def _dd_weight(
     if not weight:
         return (Optional[Owned](None), Optional[T](None))
     var wd = own_if_new(contiguous(weight.value()), weight.value())
-    var wv = _view(wd.t, _shape1(x2d.dim(0)), 1)
+    var wv = _view(wd.t, vec_shape(x2d.dim(0)), 1)
     _ = wd^
     var t = wv.t.copy()
     return (Optional[Owned](wv^), Optional[T](t^))
@@ -1275,7 +1267,7 @@ def _renorm(a: T, p_v: Value, dim_in: Int, maxnorm_v: Value) raises -> Owned:
             a.rank,
             " dimensions",
         )
-    var dim = _norm_dim(dim_in, a.rank)
+    var dim = wrap_dim(dim_in, a.rank)
     var dims = List[Int64]()
     for d in range(a.rank):
         if d != dim:
@@ -1417,11 +1409,11 @@ def op__weight_norm_interface(
 ) raises:
     var v = v_tensor(args[unsafe_offset=0])
     var g = v_tensor(args[unsafe_offset=1])
-    var dim = _norm_dim(v_int_or(args[unsafe_offset=2], 0), v.rank)
+    var dim = wrap_dim(v_int_or(args[unsafe_offset=2], 0), v.rank)
     if not v.dtype.is_floating_point():
         raise Error(
             '"weight_norm_fwd_first_dim_kernel" not implemented for \'',
-            _scalar_type_name(v.dtype),
+            scalar_type_name(v.dtype),
             "'",
         )
     _decline_metal_f64(v, "_weight_norm_interface")
@@ -1492,7 +1484,7 @@ def op__weight_norm_interface_backward(
     var v = v_tensor(args[unsafe_offset=1])
     var g = v_tensor(args[unsafe_offset=2])
     var norms = v_tensor(args[unsafe_offset=3])
-    var dim = _norm_dim(v_int(args[unsafe_offset=4]), v.rank)
+    var dim = wrap_dim(v_int(args[unsafe_offset=4]), v.rank)
     if not v.contig:
         raise Error("saved_v must be contiguous")
     if not g.contig:
@@ -1569,16 +1561,6 @@ def op__weight_norm_interface_backward(
 # ---------------------------------------------------------------------------
 
 
-def _bool_list(v: Value) raises -> List[Bool]:
-    var out = List[Bool]()
-    if v.tag == TAG_NONE:
-        return out^
-    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
-    for i in range(Int(v.len)):
-        out.append(p[unsafe_offset=i] != 0)
-    return out^
-
-
 def _empty_like_result(st: Int32, device: Int) raises -> Owned:
     """The 0-element stand-in for a gradient autograd did not ask for (the
     convention `native_layer_norm_backward` uses)."""
@@ -1596,7 +1578,7 @@ def op__fused_rms_norm_backward(
     var ns = IntList(args[unsafe_offset=2])
     var rstd = v_tensor(args[unsafe_offset=3])
     var has_w = not v_is_none(args[unsafe_offset=4])
-    var mask = _bool_list(args[unsafe_offset=5])
+    var mask = v_bool_list(args[unsafe_offset=5])
     var k = len(ns)
     if k == 0 or k > x.rank:
         raise Error(
@@ -1864,7 +1846,7 @@ def _index_tensor(t: T, what: StaticString) raises -> Owned:
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
     var c = _cast(t, ST_INT64)
@@ -1931,7 +1913,7 @@ def _segment_dtype_check(t: T) raises:
     ):
         raise Error(
             '"segment_reduce_cuda" not implemented for \'',
-            _scalar_type_name(dt),
+            scalar_type_name(dt),
             "'",
         )
     _decline_metal_f64(t, "segment_reduce")
@@ -1974,7 +1956,7 @@ def op_segment_reduce(
     var lengths_v = args[unsafe_offset=2].copy()
     var indices_v = args[unsafe_offset=3].copy()
     var offsets_v = args[unsafe_offset=4].copy()
-    var axis = _norm_dim(v_int_or(args[unsafe_offset=5], 0), data.rank)
+    var axis = wrap_dim(v_int_or(args[unsafe_offset=5], 0), data.rank)
     var unsafe_ = v_bool_or(args[unsafe_offset=6], False)
     if not v_is_none(indices_v):
         raise Error(
@@ -2070,7 +2052,7 @@ def op__segment_reduce_backward(
     var reduction = _reduction_enum(v_string(args[unsafe_offset=3]))
     var lengths_v = args[unsafe_offset=4].copy()
     var offsets_v = args[unsafe_offset=5].copy()
-    var axis = _norm_dim(v_int_or(args[unsafe_offset=6], 0), data.rank)
+    var axis = wrap_dim(v_int_or(args[unsafe_offset=6], 0), data.rank)
     if v_is_none(lengths_v) and v_is_none(offsets_v):
         raise Error(
             "segment_reduce(): Either lengths or offsets must be defined."

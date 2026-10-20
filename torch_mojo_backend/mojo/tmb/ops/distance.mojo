@@ -44,9 +44,11 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     resize_out,
+    scalar_type_name,
+    expect_scalar_type,
+    int_prod,
 )
 from tmb.ops.composed import _dispatch, _tensor_value
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 
 # The `dists<scalar_t>` member a launch runs (kernels/distance/entry.mojo).
@@ -102,22 +104,11 @@ def _kernel_dtype(t: T, what: StaticString) raises:
             '"',
             what,
             "\" not implemented for '",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
             "'",
         )
     if t.dtype == DType.float64 and dev(t.device)[].api == "metal":
         unsupported(String(what, ": float64 is unavailable on Apple GPUs"))
-
-
-def _same_dtype(t: T, like: T) raises:
-    """`const_data_ptr<scalar_t>()` on an operand of another dtype."""
-    if t.dtype != like.dtype:
-        raise Error(
-            "expected scalar type ",
-            _scalar_type_name(like.dtype),
-            " but found ",
-            _scalar_type_name(t.dtype),
-        )
 
 
 def _on_one_device(a: T, b: T) raises:
@@ -161,13 +152,6 @@ def _batch_shape(x1: T, x2: T) raises -> List[Int]:
             )
         out.append(s2 if s1 == 1 else s1)
     return out^
-
-
-def _product(xs: List[Int]) -> Int:
-    var p = 1
-    for x in xs:
-        p *= x
-    return p
 
 
 def _shape_of(batch: List[Int], a: Int, b: Int) -> IndexList[MAX_RANK]:
@@ -269,12 +253,12 @@ def _cdist_forward(args: Values) raises -> Owned:
     if not x1.dtype.is_floating_point():
         raise Error(
             "cdist only supports floating-point dtypes, X1 got: ",
-            _scalar_type_name(x1.dtype),
+            scalar_type_name(x1.dtype),
         )
     if not x2.dtype.is_floating_point():
         raise Error(
             "cdist only supports floating-point dtypes, X2 got: ",
-            _scalar_type_name(x2.dtype),
+            scalar_type_name(x2.dtype),
         )
     if not (p >= 0):
         raise Error("cdist only supports non-negative p values")
@@ -284,7 +268,7 @@ def _cdist_forward(args: Values) raises -> Owned:
     var r1 = x1.dim(-2)
     var r2 = x2.dim(-2)
     var batch = _batch_shape(x1, x2)
-    var product = _product(batch)
+    var product = int_prod(batch)
     var out_rank = len(batch) + 2
     var out_shape = _shape_of(batch, r1, r2)
     if r1 == 0 or r2 == 0 or product == 0:
@@ -339,7 +323,7 @@ def _cdist_forward(args: Values) raises -> Owned:
         _ = dist^
         return shaped^
     _kernel_dtype(x1, "cdist_cuda")
-    _same_dtype(x2, x1)
+    expect_scalar_type(x2, x1)
     var e1 = _expanded_dense(x1, batch)
     var e2 = _expanded_dense(x2, batch)
     var out = own(new_tensor(out_shape, out_rank, x1.stype, x1.device))
@@ -376,7 +360,7 @@ def _cdist_backward(args: Values) raises -> Owned:
     var r1 = x1.dim(-2)
     var r2 = x2.dim(-2)
     var batch = _batch_shape(x1, x2)
-    var product = _product(batch)
+    var product = int_prod(batch)
     if r1 == 0 or r2 == 0 or c1 == 0 or product == 0:
         # zeros_like(x1)
         var zeros = own(new_tensor(x1.shape, x1.rank, x1.stype, x1.device))
@@ -402,9 +386,9 @@ def _cdist_backward(args: Values) raises -> Owned:
         fill_value(out.t, 0.0)
         return out^
     _kernel_dtype(x1, "cdist_cuda_backward")
-    _same_dtype(grad, x1)
-    _same_dtype(x2, x1)
-    _same_dtype(dist, x1)
+    expect_scalar_type(grad, x1)
+    expect_scalar_type(x2, x1)
+    expect_scalar_type(dist, x1)
     if grad.numel != product * r1 * r2 or dist.numel != grad.numel:
         raise Error(
             "_cdist_backward: grad and cdist must have ",
@@ -519,8 +503,8 @@ def _pdist_backward(args: Values) raises -> Owned:
     var n = x.dim(0)
     var m = x.dim(1)
     _kernel_dtype(x, "pdist_cuda_backward")
-    _same_dtype(grad, x)
-    _same_dtype(dist, x)
+    expect_scalar_type(grad, x)
+    expect_scalar_type(dist, x)
     if not grad.on_mojo() or grad.device != x.device:
         raise Error("_pdist_backward: grad must be on self's device")
     if not dist.on_mojo() or dist.device != x.device:

@@ -112,6 +112,9 @@ from tmb.ops.common import (
     resize_out,
     same_view,
     shape_str,
+    int_list_str,
+    sizes_str,
+    wrap_dim,
 )
 from tmb.ops.compare import _where_select, scalar_as_fill
 from tmb.ops.data_movement import (
@@ -120,8 +123,6 @@ from tmb.ops.data_movement import (
     _gather_dim_launch,
     _is_scatter_add_dtype,
     _is_scatter_dtype,
-    _norm_dim,
-    _scalar_type_name,
     _materialize_contiguous,
     _scatter_into,
     _scatter_launch,
@@ -210,32 +211,6 @@ def _wrapped_index(index: T, n: Int) raises -> Owned:
     return c^
 
 
-def _wrap_dim(dim: Int, rank: Int) raises -> Int:
-    """`maybe_wrap_dim` (scalars wrap as rank 1)."""
-    if rank == 0 and dim != 0 and dim != -1:
-        raise Error(
-            (
-                "Dimension out of range (expected to be in range of [-1, 0],"
-                " but got "
-            ),
-            dim,
-            ")",
-        )
-    var r = max(rank, 1)
-    var d = dim + r if dim < 0 else dim
-    if d < 0 or d >= r:
-        raise Error(
-            "Dimension out of range (expected to be in range of [",
-            -r,
-            ", ",
-            r - 1,
-            "], but got ",
-            dim,
-            ")",
-        )
-    return d
-
-
 def _read_int_at(t: T, element: Int) raises -> Int:
     """Element `element` of the contiguous 1-D integer tensor `t`, read back
     to the host (one sync)."""
@@ -293,7 +268,7 @@ def op_flip(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     for _ in range(max(a.rank, 1)):
         flipped.append(False)
     for i in range(len(dims)):
-        var d = _wrap_dim(dims[i], a.rank)
+        var d = wrap_dim(dims[i], a.rank)
         if flipped[d]:
             raise Error(
                 "dim ", d, " appears multiple times in the list of dims"
@@ -386,7 +361,7 @@ def op_roll(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     for _ in range(a.rank):
         totals.append(0)
     for i in range(len(dims)):
-        var d = _wrap_dim(dims[i], a.rank)
+        var d = wrap_dim(dims[i], a.rank)
         totals[d] += shifts[i]
     var out = own(new_like(a))
     if a.numel > 0:
@@ -408,7 +383,7 @@ def op_roll(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::unfold(Tensor(a) self, int dimension, int size, int step) -> Tensor(a)
 def op_unfold(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
-    var d = _wrap_dim(v_int(args[unsafe_offset=1]), a.rank)
+    var d = wrap_dim(v_int(args[unsafe_offset=1]), a.rank)
     var size = v_int(args[unsafe_offset=2])
     var step = v_int(args[unsafe_offset=3])
     var max_size = 1 if a.rank == 0 else a.dim(d)
@@ -471,7 +446,7 @@ def op_unfold_backward(
             copy_strided_into(out.t, _raw_view(grad, [], [], 0))
         ret_owned(rets, 0, out)
         return
-    var d = _wrap_dim(v_int(args[unsafe_offset=2]), rank)
+    var d = wrap_dim(v_int(args[unsafe_offset=2]), rank)
     var windows = grad.dim(d)
     if grad.numel == 0 or windows == 0:
         ret_owned(rets, 0, out)
@@ -540,17 +515,12 @@ def op_channel_shuffle(
     var a = v_tensor(args[unsafe_offset=0])
     var groups = v_int(args[unsafe_offset=1])
     if a.rank <= 2:
-        var sizes = String("[")
-        for i in range(a.rank):
-            if i:
-                sizes += ", "
-            sizes += String(a.dim(i))
         raise Error(
             (
                 "channel_shuffle expects input to have at least 3 dimensions,"
                 " but got input with sizes "
             ),
-            sizes + "]",
+            sizes_str(a),
         )
     var c = a.dim(1)
     if groups <= 0:
@@ -599,7 +569,7 @@ def _take_checks(a: T, index: T, dest: T) raises:
     if index.dtype != DType.int64:
         raise Error(
             "take(): Expected a long tensor for index, but got ",
-            _scalar_type_name(index.dtype),
+            scalar_type_name(index.dtype),
         )
     if a.stype != dest.stype:
         raise Error(
@@ -607,9 +577,9 @@ def _take_checks(a: T, index: T, dest: T) raises:
                 "take(): self and out expected to have the same dtype, but got"
                 " self.dtype = "
             ),
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and dest.dtype = ",
-            _scalar_type_name(dest.dtype),
+            scalar_type_name(dest.dtype),
         )
     if not _same_device(a, dest) or not _same_device(a, index):
         raise Error(
@@ -689,7 +659,7 @@ def op_put_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if index.dtype != DType.int64:
         raise Error(
             "put_(): Expected a long tensor for index, but got ",
-            _scalar_type_name(index.dtype),
+            scalar_type_name(index.dtype),
         )
     if a.stype != source.stype:
         raise Error(
@@ -697,9 +667,9 @@ def op_put_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
                 "put_(): self and source expected to have the same dtype, but"
                 " got self.dtype = "
             ),
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and source.dtype = ",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
         )
     if not _same_device(a, source) or not _same_device(a, index):
         raise Error(
@@ -792,7 +762,7 @@ def _index_fill(a: T, dim_in: Int, index: T, value_v: Value) raises:
             "index_fill_(): Converting complex Scalar to non-complex type is"
             " not supported"
         )
-    var dim = _norm_dim(dim_in, a.rank, "index_fill_")
+    var dim = wrap_dim(dim_in, a.rank)
     if index.rank > 1:
         raise Error("Index has to be a vector/scalar")
     if not _same_device(a, index):
@@ -895,7 +865,7 @@ def op_index_fill__int_tensor(
 
 def _index_copy_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
     """ATen's `index_copy` meta function; returns the wrapped dim."""
-    var dim = _norm_dim(dim_in, a.rank, "index_copy_")
+    var dim = wrap_dim(dim_in, a.rank)
     if index.rank >= 2:
         raise Error(
             "index_copy_(): Index should have dimension 1 or 0 (got ",
@@ -926,7 +896,7 @@ def _index_copy_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
     if index.dtype != DType.int64:
         raise Error(
             "index_copy_(): Expected a long tensor for index, but got ",
-            _scalar_type_name(index.dtype),
+            scalar_type_name(index.dtype),
         )
     if a.stype != source.stype:
         raise Error(
@@ -934,9 +904,9 @@ def _index_copy_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
                 "index_copy_(): self and source expected to have the same"
                 " dtype, but got (self) "
             ),
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and (source) ",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
         )
     if not _same_device(a, source) or not _same_device(a, index):
         raise Error(
@@ -964,8 +934,10 @@ def _index_copy_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
             "index_copy_(): Source/destination tensor must have same slice"
             " shapes. Destination slice shape: "
         )
-        msg += _list_str(sa) + " at dimension " + String(dim)
-        msg += " and source slice shape: " + _list_str(ss) + " at dimension 0."
+        msg += int_list_str(sa) + " at dimension " + String(dim)
+        msg += (
+            " and source slice shape: " + int_list_str(ss) + " at dimension 0."
+        )
         raise Error(msg)
     if source.rank != 0 and num != source.dim(dim):
         raise Error(
@@ -976,15 +948,6 @@ def _index_copy_check(a: T, dim_in: Int, index: T, source: T) raises -> Int:
             ")",
         )
     return dim
-
-
-def _list_str(xs: List[Int]) -> String:
-    var s = String("[")
-    for i in range(len(xs)):
-        if i:
-            s += ", "
-        s += String(xs[i])
-    return s + "]"
 
 
 def _index_copy_into(dest: T, dim: Int, index: T, source: T) raises:
@@ -1122,9 +1085,9 @@ def op_masked_scatter_(
                 "masked_scatter_: expected self and source to have same dtypes"
                 " but got "
             ),
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and ",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
         )
     if mask.dtype != DType.bool:
         raise Error(
@@ -1132,7 +1095,7 @@ def op_masked_scatter_(
                 "masked_scatter_ only supports boolean masks, but got mask with"
                 " dtype "
             ),
-            _scalar_type_name(mask.dtype),
+            scalar_type_name(mask.dtype),
         )
     if not _same_device(a, mask) or not _same_device(a, source):
         unsupported("masked_scatter_ with operands on different devices")
@@ -1372,7 +1335,7 @@ def _reduce_dtype_check(a: T, red: Int, what: String) raises:
             return
         unsupported(
             '"cuda_scatter_gather_base_kernel_func" not implemented for \''
-            + _scalar_type_name(a.dtype)
+            + scalar_type_name(a.dtype)
             + "'"
         )
     if not _is_scatter_add_dtype(a.dtype):
@@ -1839,7 +1802,7 @@ def _index_reduce_check(
             reduce,
             ".",
         )
-    var dim = _norm_dim(dim_in, a.rank, "index_reduce")
+    var dim = wrap_dim(dim_in, a.rank)
     if index.rank > 1:
         index_error(
             "index_reduce_(): Index is supposed to be a vector, but got dim: "
@@ -1848,14 +1811,14 @@ def _index_reduce_check(
     if index.dtype != DType.int64 and index.dtype != DType.int32:
         raise Error(
             "index_reduce_(): Expected dtype int32/int64 for index but got: ",
-            _scalar_type_name(index.dtype),
+            scalar_type_name(index.dtype),
         )
     if source.dtype != a.dtype:
         raise Error(
             "index_reduce_(): self (",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             ") and source (",
-            _scalar_type_name(source.dtype),
+            scalar_type_name(source.dtype),
             ") must have the same scalar type",
         )
     if not (dim == 0 or dim < source.rank):
@@ -1973,7 +1936,7 @@ def _index_reduce_op(
             '"'
             + kernel
             + "\" not implemented for '"
-            + _scalar_type_name(a.dtype)
+            + scalar_type_name(a.dtype)
             + "'"
         )
     var dim = checked[0]
@@ -2058,11 +2021,11 @@ def _nonzero_out_checks(t: T, dest: T, what: String) raises:
                     "nonzero_static: Expected out tensor to have scalar type"
                     " Long but got "
                 ),
-                _scalar_type_name(dest.dtype),
+                scalar_type_name(dest.dtype),
             )
         raise Error(
             "Expected object of scalar type Long as out, but got ",
-            _scalar_type_name(dest.dtype),
+            scalar_type_name(dest.dtype),
         )
     if dest.device_type != t.device_type or dest.device != t.device:
         raise Error(

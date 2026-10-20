@@ -14,7 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import assert_dim_error_like_cpu, ran, skip_if_metal
 from torch_mojo_backend import aten_functions, register_mojo_devices
 from torch_mojo_backend.testing import CallChecker
 
@@ -240,6 +240,18 @@ def test_masked_softmax_backward_masked_inf_grad(mojo_gpu):
         grad.to(mojo_gpu), out.to(mojo_gpu), mask.to(mojo_gpu), -1
     )
     torch.testing.assert_close(got.cpu(), torch.tensor([[0.0, -0.1875, 0.1875]]))
+
+
+def test_masked_softmax_backward_dim_out_of_range_is_index_error(mojo_gpu):
+    assert_dim_error_like_cpu(
+        lambda to: torch.ops.aten._masked_softmax_backward(
+            to(torch.randn(2, 3)),
+            to(torch.randn(2, 3)),
+            to(torch.zeros(2, 3, dtype=torch.bool)),
+            5,
+        ),
+        mojo_gpu,
+    )
 
 
 def test_masked_softmax_odd_heads_noncontiguous_mask(mojo_device):

@@ -96,8 +96,11 @@ from tmb.ops.common import (
     device_str,
     fill_value,
     resize_out,
+    sizes_str,
+    scalar_type_name,
+    mat_shape,
+    padded_shape,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.matmul import (
     _dense_2d,
     _spec_matmul,
@@ -139,13 +142,6 @@ def _cdiv(a: Int, b: Int) -> Int:
 
 def _round_up(a: Int, b: Int) -> Int:
     return _cdiv(a, b) * b
-
-
-def _shape2(r: Int, c: Int) -> IndexList[MAX_RANK]:
-    var s = IndexList[MAX_RANK](1)
-    s[MAX_RANK - 2] = r
-    s[MAX_RANK - 1] = c
-    return s
 
 
 def _strides2(r: Int, c: Int) -> IndexList[MAX_RANK]:
@@ -292,15 +288,6 @@ def _mat_str(t: T) -> String:
     return String(t.dim(0)) + "x" + String(t.dim(1))
 
 
-def _shape_str(t: T) -> String:
-    var s = String("[")
-    for i in range(t.rank):
-        if i:
-            s += ", "
-        s += String(t.dim(i))
-    return s + "]"
-
-
 def _stride_str(t: T) -> String:
     var s = String("[")
     for i in range(t.rank):
@@ -310,33 +297,31 @@ def _stride_str(t: T) -> String:
     return s + "]"
 
 
-def _tname(t: T) -> String:
-    return _scalar_type_name(t.dtype)
-
-
 def _check_bias(bias: Optional[T], out_st: Int32) raises:
     """_scaled_mm_out_cuda's bias rules, in its order."""
     if not bias:
         return
     var b = bias.value().copy()
-    var out_name = _scalar_type_name(max_dtype(out_st))
+    var out_name = scalar_type_name(max_dtype(out_st))
     if out_st == ST_FLOAT32:
         raise Error("Bias is not supported when out_dtype is set to Float32")
     if b.stype != ST_BFLOAT16 and b.stype != ST_FLOAT16:
-        raise Error("Bias must be BFloat16 or Half, but got ", _tname(b))
+        raise Error(
+            "Bias must be BFloat16 or Half, but got ", scalar_type_name(b.dtype)
+        )
     if out_st == ST_BFLOAT16 and b.stype != ST_BFLOAT16:
         raise Error(
             "Bias must be BFloat16 to compute ",
             out_name,
             " output, but got ",
-            _tname(b),
+            scalar_type_name(b.dtype),
         )
     if out_st == ST_FLOAT16 and b.stype != ST_FLOAT16:
         raise Error(
             "Bias must be Float16 to compute ",
             out_name,
             " output, but got ",
-            _tname(b),
+            scalar_type_name(b.dtype),
         )
 
 
@@ -364,14 +349,14 @@ def _check_mat_dtypes(
             "Expected ",
             a_name,
             " to be Float8 or Float4_x2 matrix got ",
-            _tname(a),
+            scalar_type_name(a.dtype),
         )
     if not is_float8(b.dtype):
         raise Error(
             "Expected ",
             b_name,
             " to be Float8 or Float4_x2 matrix got ",
-            _tname(b),
+            scalar_type_name(b.dtype),
         )
     if a.stype == ST_FLOAT8_E5M2 and b.stype == ST_FLOAT8_E5M2:
         raise Error(
@@ -396,7 +381,7 @@ def _check_out_dtype(out_st: Int32) raises:
         or out_st == ST_FLOAT16
         or (is_float8(dt) and out_st != ST_FLOAT8_E8M0FNU)
     ):
-        unsupported("_scaled_mm with a " + _scalar_type_name(dt) + " output")
+        unsupported("_scaled_mm with a " + scalar_type_name(dt) + " output")
 
 
 # --- the computation ---------------------------------------------------------
@@ -419,7 +404,7 @@ def _dq_none() -> _Dq:
 def _dequant(src: T, rows: Int, cols: Int, rs: Int, cs: Int) raises -> Owned:
     """A contiguous float32 `rows` x `cols` copy of the float8 matrix at
     `src` (element strides rs, cs): exact, unscaled."""
-    var out = own(new_tensor(_shape2(rows, cols), 2, ST_FLOAT32, src.device))
+    var out = own(new_tensor(mat_shape(rows, cols), 2, ST_FLOAT32, src.device))
     var ctx = ctx_for(src.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("scaled_mm", "Dequant")
@@ -441,7 +426,7 @@ def _gemm_f32(a32: T, bt32: T, exact_tf32: Bool) raises -> Owned:
     var k = a32.dim(1)
     var n = bt32.dim(0)
     var b = own(
-        view_strided(bt32, _shape2(k, n), _strides2(1, k), 2, bt32.offset)
+        view_strided(bt32, mat_shape(k, n), _strides2(1, k), 2, bt32.offset)
     )
     if exact_tf32 and _sm90_cuda(a32.device) and _tf32_available():
         var am = _dense_2d(a32)
@@ -502,7 +487,7 @@ def _scaled_gemm(
     if k == 0:
         # A grouped GEMM's empty-K group still runs its epilogue on a zero
         # accumulator (0 * inf scale is NaN there, as on CUDA).
-        p = own(new_tensor(_shape2(m, n), 2, ST_FLOAT32, dest.device))
+        p = own(new_tensor(mat_shape(m, n), 2, ST_FLOAT32, dest.device))
         fill_value(p.t, 0.0)
     elif dq_a.recipe != DQ_NONE or dq_b.recipe != DQ_NONE:
         p = _block_scaled_product(a, b, dq_a, dq_b)
@@ -566,14 +551,14 @@ def _block_scaled_product(a: T, b: T, dq_a: _Dq, dq_b: _Dq) raises -> Owned:
     var n = b.dim(1)
     var bk = 32 if dq_a.recipe == DQ_MX_SWIZZLED else 128
     var nkb = _cdiv(k, bk)
-    var acc = own(new_tensor(_shape2(m, n), 2, ST_FLOAT32, a.device))
+    var acc = own(new_tensor(mat_shape(m, n), 2, ST_FLOAT32, a.device))
     for kb in range(nkb):
         var k0 = kb * bk
         var kl = min(bk, k - k0)
         var av = own(
             view_strided(
                 a,
-                _shape2(m, kl),
+                mat_shape(m, kl),
                 _strides2(a.stride(0), a.stride(1)),
                 2,
                 a.offset + k0 * a.stride(1),
@@ -582,7 +567,7 @@ def _block_scaled_product(a: T, b: T, dq_a: _Dq, dq_b: _Dq) raises -> Owned:
         var bv = own(
             view_strided(
                 b,
-                _shape2(kl, n),
+                mat_shape(kl, n),
                 _strides2(b.stride(0), b.stride(1)),
                 2,
                 b.offset + k0 * b.stride(0),
@@ -710,19 +695,19 @@ def _invalid_scaling(a: T, b: T, sa: T, sb: T) raises:
         " elements and scale_b should have ",
         _round_up(n, 128) * _round_up(_cdiv(b.dim(0), 32), 4),
         " elements, and both should be contiguous.\nGot a.dtype()=",
-        _tname(a),
+        scalar_type_name(a.dtype),
         ", scale_a.dtype()=",
-        _tname(sa),
+        scalar_type_name(sa.dtype),
         ", scale_a.size()=",
-        _shape_str(sa),
+        sizes_str(sa),
         ", scale_a.stride()=",
         _stride_str(sa),
         ", b.dtype()=",
-        _tname(b),
+        scalar_type_name(b.dtype),
         ", scale_b.dtype()=",
-        _tname(sb),
+        scalar_type_name(sb.dtype),
         ", scale_b.size()=",
-        _shape_str(sb),
+        sizes_str(sb),
         " and scale_b.stride()=",
         _stride_str(sb),
     )
@@ -814,7 +799,7 @@ def _scaled_mm_v1(
     if a.numel > 0 and b.numel > 0:
         # CUDA's output-dtype limits are cuBLAS's, past the empty early return.
         _check_out_dtype(dest.stype)
-    resize_out(dest, _shape2(a.dim(0), n), 2)
+    resize_out(dest, mat_shape(a.dim(0), n), 2)
     var sb = _sc(scale_b) if kinds[1] == BLOCK_1X32 else _sc_t(scale_b)
     # ScaledBlas.cpp hands scale_result to cuBLAS as the D scale only for a
     # float8 output (torch 2.14: test_float8_scale_result multiplies).
@@ -833,7 +818,7 @@ def op_scaled_mm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var has_dt = not v_is_none(args[unsafe_offset=6])
     var out_st = v_dtype_or(args[unsafe_offset=6], a.stype)
     _ = max_dtype(out_st)  # a dtype the device cannot hold declines here
-    var out = own(new_tensor(_shape2(0, 0), 2, out_st, a.device))
+    var out = own(new_tensor(mat_shape(0, 0), 2, out_st, a.device))
     _scaled_mm_v1(
         a,
         b,
@@ -891,7 +876,7 @@ def op_scaled_mm_out(
     var has_dt = not v_is_none(args[unsafe_offset=6])
     var out_st = v_dtype_or(args[unsafe_offset=6], dest.stype)
     if _aliases_any(dest, _arg_tensors(args, [0, 1, 2, 3, 4, 5])):
-        var tmp = own(new_tensor(_shape2(0, 0), 2, dest.stype, dest.device))
+        var tmp = own(new_tensor(mat_shape(0, 0), 2, dest.stype, dest.device))
         _scaled_mm_v1(
             a,
             b,
@@ -982,9 +967,9 @@ def _v2_validate(
     if not is_float8(a.dtype) or not is_float8(b.dtype):
         raise Error(
             "Expected both inputs to be fp8 or fp4 types but got mat_a.dtype=",
-            _tname(a),
+            scalar_type_name(a.dtype),
             " and mat_b.dtype=",
-            _tname(b),
+            scalar_type_name(b.dtype),
         )
     var m = a.dim(0)
     var k = a.dim(1)
@@ -1092,9 +1077,9 @@ def _v2_validate(
                 "Invalid scaling configuration for _scaled_mm_v2: unsupported"
                 " recipe(s). Got mat_a.dtype="
             ),
-            _tname(a),
+            scalar_type_name(a.dtype),
             ", mat_b.dtype=",
-            _tname(b),
+            scalar_type_name(b.dtype),
             ", recipe_a.size()=",
             len(recipe_a),
             ", recipe_b.size()=",
@@ -1144,19 +1129,19 @@ def _v2_invalid(a: T, b: T, sa: T, sb: T) raises:
             "), and both should be near-inner-dim-major (with 16-byte aligned"
             " strides).\nGot mat_a.dtype()="
         ),
-        _tname(a),
+        scalar_type_name(a.dtype),
         ", scale_a[0].dtype()=",
-        _tname(sa),
+        scalar_type_name(sa.dtype),
         ", scale_a[0].size()=",
-        _shape_str(sa),
+        sizes_str(sa),
         ", scale_a[0].stride()=",
         _stride_str(sa),
         ", mat_b.dtype()=",
-        _tname(b),
+        scalar_type_name(b.dtype),
         ", scale_b[0].dtype()=",
-        _tname(sb),
+        scalar_type_name(sb.dtype),
         ", scale_b[0].size()=",
-        _shape_str(sb),
+        sizes_str(sb),
         " and scale_b[0].stride()=",
         _stride_str(sb),
     )
@@ -1190,7 +1175,7 @@ def _v2_deepseek_checks(
                 " x ",
                 kb,
                 " Float elements, got ",
-                _shape_str(s),
+                sizes_str(s),
             )
         if not (
             s.stride(0) == 1
@@ -1216,7 +1201,7 @@ def _v2_deepseek_checks(
                 " x ",
                 ob,
                 " Float elements, got ",
-                _shape_str(s),
+                sizes_str(s),
             )
         if not (
             s.stride(0) == 1
@@ -1280,7 +1265,7 @@ def _scaled_mm_v2(args: Values, mut dest: T) raises:
     var m = a.dim(0)
     var k = a.dim(1)
     var n = b.dim(1)
-    resize_out(dest, _shape2(m, n), 2)
+    resize_out(dest, mat_shape(m, n), 2)
     if m == 0 or k == 0 or n == 0:
         if k == 0:
             fill_value(dest, 0.0)
@@ -1357,7 +1342,7 @@ def _scaled_mm_v2(args: Values, mut dest: T) raises:
                 "scale_a must have shape [",
                 m,
                 ", 1], got [",
-                _shape_str(sa),
+                sizes_str(sa),
                 "]",
             )
         if not (sa.stride(1) == 1 or sa.dim(1) == 1):
@@ -1402,7 +1387,7 @@ def op_scaled_mm_v2(
     var a = v_tensor(args[unsafe_offset=0])
     var out_st = v_dtype_or(args[unsafe_offset=9], a.stype)
     _ = max_dtype(out_st)
-    var out = own(new_tensor(_shape2(0, 0), 2, out_st, a.device))
+    var out = own(new_tensor(mat_shape(0, 0), 2, out_st, a.device))
     _scaled_mm_v2(args, out.t)
     ret_tensor(rets, 0, out.take())
 
@@ -1416,7 +1401,7 @@ def op_scaled_mm_v2_out(
     var out_st = v_dtype_or(args[unsafe_offset=9], a.stype)
     check_out_as(dest, out_st, a)
     if _aliases_any(dest, _arg_tensors(args, [0, 1, 2, 5, 8])):
-        var tmp = own(new_tensor(_shape2(0, 0), 2, out_st, a.device))
+        var tmp = own(new_tensor(mat_shape(0, 0), 2, out_st, a.device))
         _scaled_mm_v2(args, tmp.t)
         _land(dest, tmp.t)
         _ = tmp^
@@ -1438,9 +1423,15 @@ def _check_grouped_e4m3(a: T, b: T) raises:
     """_f8_f8_bf16_rowwise_grouped_mm_cuda: both operands e4m3fn (CUDA
     raises ValueError; RuntimeError here, same text)."""
     if a.dtype != DType.float8_e4m3fn:
-        raise Error("Expected mat_a to be Float8_e4m3 matrix got ", _tname(a))
+        raise Error(
+            "Expected mat_a to be Float8_e4m3 matrix got ",
+            scalar_type_name(a.dtype),
+        )
     if b.dtype != DType.float8_e4m3fn:
-        raise Error("Expected mat_b to be Float8_e4m3 matrix got ", _tname(b))
+        raise Error(
+            "Expected mat_b to be Float8_e4m3 matrix got ",
+            scalar_type_name(b.dtype),
+        )
 
 
 def _valid_strides_transposed(m: T) raises -> Bool:
@@ -1471,7 +1462,7 @@ def _valid_strides_transposed(m: T) raises -> Bool:
         "Invalid strides/sizes, got ",
         _stride_str(m),
         " for strides and ",
-        _shape_str(m),
+        sizes_str(m),
         " for sizes",
     )
 
@@ -1535,13 +1526,13 @@ def _grouped_common_checks(
                 "Expected trailing dimension of mat_a to be divisible by 16 but"
                 " got mat1 shape: ("
             ),
-            _shape_str(a),
+            sizes_str(a),
             ").",
         )
     if b.dim(b.rank - 2) % 16 != 0 or b.dim(b.rank - 1) % 16 != 0:
         raise Error(
             "Expected mat_b shape to be divisible by 16 but got mat_b shape: (",
-            _shape_str(b),
+            sizes_str(b),
             ").",
         )
     if has_bias:
@@ -1580,7 +1571,7 @@ def _view2(
 ) raises -> Owned:
     return own(
         view_strided(
-            t, _shape2(r, c), _strides2(rs, cs), 2, t.offset + offset_elems
+            t, mat_shape(r, c), _strides2(rs, cs), 2, t.offset + offset_elems
         )
     )
 
@@ -1612,13 +1603,6 @@ def _grouped_dims(a: T, b: T, offs: Optional[T]) raises -> List[Int]:
             raise Error("batched dimension has to match")
         dims = [a.dim(0), a.dim(1), b.dim(2)]
     return dims^
-
-
-def _grouped_shape(dims: List[Int]) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    for i in range(len(dims)):
-        shape[MAX_RANK - len(dims) + i] = dims[i]
-    return shape
 
 
 def _grouped_out(a: T, b: T, offs: Optional[T]) raises -> Owned:
@@ -1947,7 +1931,7 @@ def op_scaled_grouped_mm_v2_out(
         _land(dest, tmp.t)
         _ = tmp^
     else:
-        resize_out(dest, _grouped_shape(dims), len(dims))
+        resize_out(dest, padded_shape(dims), len(dims))
         _grouped_rowwise(
             a,
             b,

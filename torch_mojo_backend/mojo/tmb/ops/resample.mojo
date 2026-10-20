@@ -77,8 +77,12 @@ from tmb.ops.common import (
     contiguous,
     copy_strided_into,
     resize_out,
+    sizes_str,
+    int_list_str,
+    scalar_type_name,
+    expect_scalar_type,
+    padded_shape,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.backend.registry import Site, impl
 
 comptime NEAREST = 0
@@ -90,25 +94,6 @@ comptime BICUBIC_AA = 5
 comptime LANCZOS_AA = 6
 
 
-def _sizes_str(t: T) -> String:
-    """`IntArrayRef` as torch prints it: [2, 3, 4]."""
-    var s = String("[")
-    for i in range(t.rank):
-        if i:
-            s += ", "
-        s += String(t.dim(i))
-    return s + "]"
-
-
-def _list_str(l: List[Int]) -> String:
-    var s = String("[")
-    for i in range(len(l)):
-        if i:
-            s += ", "
-        s += String(l[i])
-    return s + "]"
-
-
 def _pick(i: Int, a: StaticString, b: StaticString, c: StaticString) -> String:
     """The i-th of three names (spatial axes D, H, W)."""
     if i == 0:
@@ -116,13 +101,6 @@ def _pick(i: Int, a: StaticString, b: StaticString, c: StaticString) -> String:
     if i == 1:
         return String(b)
     return String(c)
-
-
-def _shape(dims: List[Int]) -> IndexList[MAX_RANK]:
-    var shape = IndexList[MAX_RANK](1)
-    for i in range(len(dims)):
-        shape[MAX_RANK - len(dims) + i] = dims[i]
-    return shape
 
 
 def _require_mojo(t: T, what: String) raises:
@@ -154,7 +132,7 @@ def _dest(
     same values it would on CUDA."""
     var dst = v_tensor(args[unsafe_offset=i])
     check_out(dst, like)
-    var shape = _shape(dims)
+    var shape = padded_shape(dims)
     var post = resized_geometry(dst, shape, len(dims))
     if copy_shortcut:
         assert_no_internal_overlap(post)
@@ -481,7 +459,7 @@ def op_upsample[
             "Non-empty ",
             RANK + 2,
             "D data tensor expected but got a tensor with sizes ",
-            _sizes_str(a),
+            sizes_str(a),
         )
     if not _up_dtype_ok[MODE](a):
         unsupported(String(name, ": dtype ", a.dtype))
@@ -516,7 +494,9 @@ def op_upsample[
             _ = src^
         ret_ref(rets, 0, dst)
     else:
-        var dst = new_tensor(_shape(out_dims), RANK + 2, a.stype, a.device)
+        var dst = new_tensor(
+            padded_shape(out_dims), RANK + 2, a.stype, a.device
+        )
         if dst.numel > 0:
             var src = own_if_new(contiguous(a), a)
             _into[MODE, RANK, False](
@@ -673,7 +653,7 @@ def op_upsample_backward[
                 _ = src^
         ret_ref(rets, 0, dst)
     else:
-        var dst = new_tensor(_shape(in_dims), RANK + 2, g.stype, g.device)
+        var dst = new_tensor(padded_shape(in_dims), RANK + 2, g.stype, g.device)
         if dst.numel > 0:
             var src = own_if_new(contiguous(g), g)
             _into[MODE, RANK, True](
@@ -726,7 +706,7 @@ def _reflect_check[RANK: Int](t: T, padding: IntList) raises:
                 ") at dimension ",
                 lead + axis,
                 " of input ",
-                _sizes_str(t),
+                sizes_str(t),
             )
 
 
@@ -762,7 +742,7 @@ def _pad_geom[
                 "D (batch mode) tensor with possibly 0 batch size and other"
                 " non-zero dimensions for input, but got: "
             ),
-            _sizes_str(t),
+            sizes_str(t),
         )
     var lead = t.rank - RANK
     comptime if REFLECT:
@@ -816,7 +796,7 @@ def _pad_geom[
                 "Trying to create tensor with negative dimension ",
                 dims[k],
                 ": ",
-                _list_str(dims),
+                int_list_str(dims),
             )
     return dims^
 
@@ -919,7 +899,7 @@ def op_pad[
         _pad_into[REFLECT, RANK, False](dst, a, in_dims, out_dims, padding)
         ret_ref(rets, 0, dst)
     else:
-        var dst = new_tensor(_shape(out_dims), a.rank, a.stype, a.device)
+        var dst = new_tensor(padded_shape(out_dims), a.rank, a.stype, a.device)
         _pad_into[REFLECT, RANK, False](dst, a, in_dims, out_dims, padding)
         var o = own(dst^)
         ret_owned(rets, 0, o)
@@ -997,7 +977,7 @@ def op_pad_backward[
         _pad_into[REFLECT, RANK, True](dst, g, in_dims, out_dims, padding)
         ret_ref(rets, 0, dst)
     else:
-        var dst = new_tensor(_shape(in_dims), a.rank, g.stype, g.device)
+        var dst = new_tensor(padded_shape(in_dims), a.rank, g.stype, g.device)
         _pad_into[REFLECT, RANK, True](dst, g, in_dims, out_dims, padding)
         var o = own(dst^)
         ret_owned(rets, 0, o)
@@ -1051,16 +1031,16 @@ def _grid_check[
                 "grid_sampler(): expected grid and input to have same batch"
                 " size, but got input with sizes "
             ),
-            _sizes_str(input),
+            sizes_str(input),
             " and grid with sizes ",
-            _sizes_str(grid),
+            sizes_str(grid),
         )
     if grid.dim(-1) != input.rank - 2:
         raise Error(
             "grid_sampler(): expected grid to have size ",
             input.rank - 2,
             " in last dimension, but got grid with sizes ",
-            _sizes_str(grid),
+            sizes_str(grid),
         )
     for i in range(2, input.rank):
         if input.dim(i) <= 0:
@@ -1069,7 +1049,7 @@ def _grid_check[
                     "grid_sampler(): expected input to have non-empty spatial"
                     " dimensions, but input has sizes "
                 ),
-                _sizes_str(input),
+                sizes_str(input),
                 " with dimension ",
                 i,
                 " being empty",
@@ -1082,9 +1062,9 @@ def _grid_check[
                 "D input and grid with same number of dimensions, but got input"
                 " with sizes "
             ),
-            _sizes_str(input),
+            sizes_str(input),
             " and grid with sizes ",
-            _sizes_str(grid),
+            sizes_str(grid),
         )
     comptime if RANK == 3:
         if interp == 2:
@@ -1115,7 +1095,7 @@ def _grid_dtype_check(
                 '"',
                 name,
                 "_cuda\" not implemented for '",
-                _scalar_type_name(input.dtype),
+                scalar_type_name(input.dtype),
                 "'",
             )
         )
@@ -1124,13 +1104,7 @@ def _grid_dtype_check(
     if count == 0:
         return
     for k in range(len(others)):
-        if others[k].stype != input.stype:
-            raise Error(
-                "expected scalar type ",
-                _scalar_type_name(input.dtype),
-                " but found ",
-                _scalar_type_name(others[k].dtype),
-            )
+        expect_scalar_type(others[k], input)
 
 
 def _grid_geometry[
@@ -1204,7 +1178,7 @@ def _copy_to_out(mut dst: T, src: T, dims: List[Int], name: String) raises:
     check_out_as(dst, src.stype, src)
     # ATen's order: resize first (a wrongly shaped out gets a fresh layout),
     # then the overlap check on the final one.
-    resize_out(dst, _shape(dims), len(dims))
+    resize_out(dst, padded_shape(dims), len(dims))
     assert_no_internal_overlap(dst)
     if dst.numel == 0:
         return
@@ -1229,7 +1203,9 @@ def op_grid_sampler[
     for i in range(1, RANK + 1):
         count *= grid.dim(i)
     _grid_dtype_check(input, [grid.copy()], count, name)
-    var out = own(new_tensor(_shape(dims), RANK + 2, input.stype, input.device))
+    var out = own(
+        new_tensor(padded_shape(dims), RANK + 2, input.stype, input.device)
+    )
     if count > 0 and out.t.numel > 0:
         var geom = _grid_geometry[RANK](
             input, grid, out.t, interp, pad, align, False
@@ -1296,9 +1272,9 @@ def op_grid_sampler_backward[
     if not shape_ok:
         raise Error(
             "grid_sampler(): expected grad_output to have sizes ",
-            _list_str(expected),
+            int_list_str(expected),
             " but got grad_output with sizes ",
-            _sizes_str(grad),
+            sizes_str(grad),
         )
     if not grad.on_mojo() or grad.device != input.device:
         unsupported(name + ": grad_output must be on the input's mojo device")
@@ -1317,13 +1293,15 @@ def op_grid_sampler_backward[
         gg_dims.append(grid.dim(i))
     var gi = own(
         new_tensor(
-            _shape(gi_dims) if need_in else IndexList[MAX_RANK](0),
+            padded_shape(gi_dims) if need_in else IndexList[MAX_RANK](0),
             RANK + 2 if need_in else 1,
             input.stype,
             input.device,
         )
     )
-    var gg = own(new_tensor(_shape(gg_dims), RANK + 2, grid.stype, grid.device))
+    var gg = own(
+        new_tensor(padded_shape(gg_dims), RANK + 2, grid.stype, grid.device)
+    )
     if (need_in and gi.t.numel > 0) or gg.t.numel > 0:
         var geom = _grid_geometry[RANK](
             input, grid, grad, interp, pad, align, need_in

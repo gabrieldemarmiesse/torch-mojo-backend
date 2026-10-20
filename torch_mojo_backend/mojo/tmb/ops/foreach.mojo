@@ -82,6 +82,7 @@ from tmb.backend.abi import (
     TAG_SCALAR_INT,
     TAG_TENSOR,
     TAG_TENSOR_REF,
+    is_floating,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev, copy_d2d
 from tmb.kernels.optimizer.foreach_clip_contract import FOREACH_CHUNK_ELEMENTS
@@ -111,13 +112,12 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     device_str,
-    is_float_stype,
     known_stype,
     promote_types,
     scalar_to_float,
     scalar_to_int,
+    scalar_type_name,
 )
-from tmb.ops.data_movement import _scalar_type_name
 
 
 # --- the sequential per-tensor fallback ---------------------------------
@@ -1415,7 +1415,7 @@ def _foreach_copy_dtype_check(dt: DType) raises:
     ):
         unsupported(
             '"foreach_tensor_copy" not implemented for \''
-            + _scalar_type_name(dt)
+            + scalar_type_name(dt)
             + "'"
         )
 
@@ -1588,22 +1588,22 @@ def _check_norm_dtype(dtype_v: Value, self_stype: Int32, name: String) raises:
                 "ComplexFloat" if dt == ST_COMPLEX64 else "ComplexDouble"
             ),
         )
-    if not is_float_stype(dt):
+    if not is_floating(dt):
         raise Error(
             name,
             ": dtype should be floating point or complex, but got ",
-            _scalar_type_name(max_dtype(dt)),
+            scalar_type_name(max_dtype(dt)),
         )
     if promote_types(self_stype, dt) != dt:
         raise Error(
             name,
             ": the dtype of the input (",
-            _scalar_type_name(max_dtype(self_stype)),
+            scalar_type_name(max_dtype(self_stype)),
             (
                 ") should be convertible without narrowing to the specified"
                 " dtype ("
             ),
-            _scalar_type_name(max_dtype(dt)),
+            scalar_type_name(max_dtype(dt)),
             ")",
         )
 
@@ -1836,7 +1836,7 @@ def _lp_one(
                     "linalg.vector_norm: Expected a floating point or"
                     " complex tensor as input. Got "
                 ),
-                _scalar_type_name(t.dtype),
+                scalar_type_name(t.dtype),
             )
         if t.numel == 0 and (p < 0 or p == inf):
             raise Error(
@@ -1866,14 +1866,14 @@ def _lp_one(
             out_stype = ST_FLOAT32
         elif out_stype == ST_COMPLEX128:
             out_stype = ST_FLOAT64
-        if not is_float_stype(out_stype):
+        if not is_floating(out_stype):
             if t.numel == 0 and known_stype(out_stype):
                 var zero = new_scalar(out_stype, t.device)
                 fill_value(zero, 0.0)
                 return zero^
             unsupported(
                 '"powsum_cuda" not implemented for \''
-                + _scalar_type_name(max_dtype(out_stype))
+                + scalar_type_name(max_dtype(out_stype))
                 + "'"
             )
     if dev(t.device)[].api == "metal":
@@ -1975,7 +1975,7 @@ def op_foreach_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # type.
         unsupported(
             '"foreach_tensor_max_cuda_scalar_type" not implemented for \''
-            + _scalar_type_name(dt)
+            + scalar_type_name(dt)
             + "'"
         )
     if _reduce_on_route(self_list, False):
@@ -1996,7 +1996,7 @@ def op_foreach_max(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             # kernel either.
             unsupported(
                 '"max_all_cuda" not implemented for \''
-                + _scalar_type_name(t.dtype)
+                + scalar_type_name(t.dtype)
                 + "'"
             )
         var one = List[Value](capacity=1)
@@ -2232,7 +2232,7 @@ def _fused_check_device(
     if t.dtype != dtype:
         raise Error(
             "expected scalar type Float but found ",
-            _scalar_type_name(t.dtype),
+            scalar_type_name(t.dtype),
         )
     if t.numel < 1:
         raise Error(name, " must have at least one element")
@@ -2375,7 +2375,7 @@ def _fused_optimizer(
                     "float32 " if i < 2 else "bfloat16 ",
                     what[i],
                     ", got ",
-                    _scalar_type_name(got),
+                    scalar_type_name(got),
                 )
         state_dtype = DType.bfloat16
     elif (
@@ -2388,7 +2388,7 @@ def _fused_optimizer(
             '"',
             kernel_name,
             "\" not implemented for '",
-            _scalar_type_name(first.dtype),
+            scalar_type_name(first.dtype),
             "'",
         )
     if first.dtype == DType.float64 and dev(device)[].api == "metal":

@@ -83,6 +83,8 @@ from tmb.backend.abi import (
     TAG_SCALAR_INT,
     v_int,
     v_complex,
+    is_floating,
+    index_error,
 )
 from tmb.backend.device import (
     copy_from_host,
@@ -109,7 +111,40 @@ def _padded(shape: IndexList[MAX_RANK]) -> List[Int]:
     return out^
 
 
-def _shape_list_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
+def vec_shape(n: Int) -> IndexList[MAX_RANK]:
+    """`[n]`, leading-padded."""
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = n
+    return shape
+
+
+def mat_shape(rows: Int, cols: Int) -> IndexList[MAX_RANK]:
+    """`[rows, cols]`, leading-padded."""
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 2] = rows
+    shape[MAX_RANK - 1] = cols
+    return shape
+
+
+def padded_shape(dims: List[Int]) -> IndexList[MAX_RANK]:
+    """`dims` (at most MAX_RANK of them), leading-padded."""
+    var shape = IndexList[MAX_RANK](1)
+    var pad = MAX_RANK - len(dims)
+    for i in range(len(dims)):
+        shape[pad + i] = dims[i]
+    return shape
+
+
+def int_prod(xs: List[Int]) -> Int:
+    var p = 1
+    for x in xs:
+        p *= x
+    return p
+
+
+def shape_list_str(shape: IndexList[MAX_RANK], rank: Int) -> String:
+    """The last `rank` dims of a padded shape as torch prints an IntArrayRef:
+    `[2, 3]`."""
     var s = String("[")
     for i in range(rank):
         if i > 0:
@@ -185,12 +220,28 @@ def broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
     return shape
 
 
-def _sizes_str(t: T) -> String:
+def sizes_str(t: T) -> String:
+    """`t.sizes()` as torch streams an IntArrayRef into a message: `[2, 3]`."""
+    return sizes_str(t, t.rank)
+
+
+def sizes_str(t: T, n: Int) -> String:
+    """The first `n` sizes of `t`, as `sizes_str`."""
     var s = String("[")
-    for i in range(t.rank):
+    for i in range(n):
         if i > 0:
             s += ", "
         s += String(t.dim(i))
+    return s + "]"
+
+
+def int_list_str(xs: List[Int]) -> String:
+    """`[a, b, c]`, the way c10 streams an IntArrayRef."""
+    var s = String("[")
+    for i in range(len(xs)):
+        if i > 0:
+            s += ", "
+        s += String(xs[i])
     return s + "]"
 
 
@@ -203,9 +254,9 @@ def check_expands_to(t: T, target: T) raises:
             "expand(",
             scalar_type_name(t.stype),
             "Type{",
-            _sizes_str(t),
+            sizes_str(t),
             "}, size=",
-            _sizes_str(target),
+            sizes_str(target),
             "): the number of sizes provided (",
             target.rank,
             (
@@ -227,9 +278,9 @@ def check_expands_to(t: T, target: T) raises:
                 ") at non-singleton dimension ",
                 target.rank - i,
                 ".  Target sizes: ",
-                _sizes_str(target),
+                sizes_str(target),
                 ".  Tensor sizes: ",
-                _sizes_str(t),
+                sizes_str(t),
             )
 
 
@@ -290,7 +341,7 @@ def overlap_status(a: T, b: T) -> Int:
     non-overlapping-and-dense (a broadcast, a strided view such as `x[::2]`)
     is TOO_HARD; different storages are NO; otherwise the dense byte ranges
     decide FULL / PARTIAL / NO."""
-    if a.impl() == b.impl():
+    if a.h == b.h or a.impl() == b.impl():
         return OVERLAP_FULL
     if a.numel == 0 or b.numel == 0:
         return OVERLAP_NO
@@ -609,6 +660,18 @@ def fill_value(t: T, value: Value) raises:
     _fill(t, s)
 
 
+def float_max(dt: DType) -> Float64:
+    """`std::numeric_limits<scalar_t>::max()` of half, bfloat16, float and
+    (anything else) double."""
+    if dt == DType.float16:
+        return 65504.0
+    if dt == DType.bfloat16:
+        return 3.3895313892515355e38
+    if dt == DType.float32:
+        return 3.4028234663852886e38
+    return 1.7976931348623157e308
+
+
 def _float8_max(dt: DType) -> Float64:
     """`std::numeric_limits<c10::Float8_*>::max()`."""
     if dt == DType.float8_e4m3fn:
@@ -842,6 +905,23 @@ def cast_to(t: T, stype: Int32, saturate: Bool = True) raises -> T:
     return out.take()
 
 
+def wrap_dim(d: Int, rank: Int) raises -> Int:
+    """`c10::maybe_wrap_dim`: a 0-d tensor wraps as 1-d (dim 0 / -1). Out of
+    range is an IndexError in torch's wording (`TORCH_CHECK_INDEX`)."""
+    var lim = max(rank, 1)
+    if d < -lim or d >= lim:
+        index_error(
+            "Dimension out of range (expected to be in range of ["
+            + String(-lim)
+            + ", "
+            + String(lim - 1)
+            + "], but got "
+            + String(d)
+            + ")"
+        )
+    return d + lim if d < 0 else d
+
+
 def one_device(a: T, b: T) raises:
     """Both operands of a raw-pointer launch on the same mojo device. A
     pointer belonging to another device -- or to no mojo device at all --
@@ -964,12 +1044,26 @@ def scalar_embed(v: Value, dtype: DType) raises -> Float64:
 comptime ST_UNDEFINED = Int32(-1)
 
 
-def is_float_stype(st: Int32) -> Bool:
+def is_f32_f16_bf16(dt: DType) -> Bool:
+    """op_utils.FLOAT_DTYPES: what most float kernels are specialized for."""
+    return dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16
+
+
+def is_floating_dtype(dt: DType) -> Bool:
+    """`is_f32_f16_bf16` plus float64 (`is_floating` keyed by DType)."""
+    return is_f32_f16_bf16(dt) or dt == DType.float64
+
+
+def is_bitwise_dtype(dt: DType) -> Bool:
+    """bool and the signed / uint8 integers (AT_DISPATCH_INTEGRAL_TYPES_AND
+    (kBool))."""
     return (
-        st == ST_FLOAT32
-        or st == ST_FLOAT16
-        or st == ST_BFLOAT16
-        or st == ST_FLOAT64
+        dt == DType.bool
+        or dt == DType.uint8
+        or dt == DType.int8
+        or dt == DType.int16
+        or dt == DType.int32
+        or dt == DType.int64
     )
 
 
@@ -1065,7 +1159,7 @@ def scalar_to_float(v: Value, st: Int32) raises -> Float64:
 
 
 def known_stype(st: Int32) -> Bool:
-    return is_float_stype(st) or is_int_stype(st) or st == ST_BOOL
+    return is_floating(st) or is_int_stype(st) or st == ST_BOOL
 
 
 def _pw_int_rank(st: Int32) -> Int:
@@ -1115,15 +1209,15 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
         return b
     if b == ST_BOOL:
         return a
-    if is_float_stype(a) and is_float_stype(b):
+    if is_floating(a) and is_floating(b):
         if (a == ST_FLOAT16 and b == ST_BFLOAT16) or (
             a == ST_BFLOAT16 and b == ST_FLOAT16
         ):
             return ST_FLOAT32
         return a if _pw_float_rank(a) > _pw_float_rank(b) else b
-    if is_float_stype(a):
+    if is_floating(a):
         return a
-    if is_float_stype(b):
+    if is_floating(b):
         return b
     # both integral
     if a == ST_UINT8 or b == ST_UINT8:
@@ -1146,12 +1240,12 @@ def combine_categories(higher: Int32, lower: Int32) raises -> Int32:
             raise Error(
                 "Unknown Complex ScalarType for ", scalar_type_name(higher)
             )
-        if is_float_stype(higher):
+        if is_floating(higher):
             return complex_of(higher)
         return lower
-    if is_float_stype(higher) or is_float8_stype(higher):
+    if is_floating(higher) or is_float8_stype(higher):
         return higher
-    if higher == ST_BOOL or is_float_stype(lower) or is_float8_stype(lower):
+    if higher == ST_BOOL or is_floating(lower) or is_float8_stype(lower):
         return promote_types(higher, lower)
     if higher != ST_UNDEFINED:
         return higher
@@ -1165,7 +1259,7 @@ def dtype_category(st: Int32) -> Int:
         return 0
     if is_complex_stype(st):
         return 3
-    if is_float_stype(st) or is_float8_stype(st):
+    if is_floating(st) or is_float8_stype(st):
         return 2
     return 1
 
@@ -1252,6 +1346,28 @@ def scalar_type_name(dt: DType) -> String:
     if dt == DType.float8_e8m0fnu:
         return "Float8_e8m0fnu"
     return String(dt)
+
+
+def expect_scalar_type(t: T, like: T) raises:
+    """`data_ptr<scalar_t>()`'s check: `t` holds `like`'s dtype."""
+    if t.stype != like.stype:
+        raise Error(
+            "expected scalar type ",
+            scalar_type_name(like.dtype),
+            " but found ",
+            scalar_type_name(t.dtype),
+        )
+
+
+def expect_scalar_type(t: T, stype: Int32) raises:
+    """`data_ptr<scalar_t>()`'s check against a fixed dtype."""
+    if t.stype != stype:
+        raise Error(
+            "expected scalar type ",
+            scalar_type_name(stype),
+            " but found ",
+            scalar_type_name(t.dtype),
+        )
 
 
 def decline_float8(dt: DType, kernel: String) raises:
@@ -1728,9 +1844,9 @@ def threshold_into_overlapping(
         if aliased:
             raise Error(
                 "output with shape ",
-                _shape_list_str(dst.shape, dst.rank),
+                shape_list_str(dst.shape, dst.rank),
                 " doesn't match the broadcast shape ",
-                _shape_list_str(shape, rank),
+                shape_list_str(shape, rank),
             )
         resize_out(dst, shape, rank)
     # The kernel's dispatch on out's dtype (no bool), then its Scalar

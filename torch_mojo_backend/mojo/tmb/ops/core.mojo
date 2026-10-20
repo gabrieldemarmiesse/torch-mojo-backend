@@ -116,7 +116,6 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.ops.common import (
     real_fill_value,
-    is_float_stype,
     check_real_scalar_fits,
     check_scalar_fits,
     assert_no_internal_overlap,
@@ -658,7 +657,7 @@ def _copy_bits(input: T, dst: T, non_blocking: Bool) raises -> Bool:
         s_conj
         and s_neg
         and not dst.is_complex()
-        and not is_float_stype(dst.stype)
+        and not is_floating(dst.stype)
         and dst.stype != ST_BOOL
     ):
         # CUDA runs the fused neg+conj in the source dtype, then converts

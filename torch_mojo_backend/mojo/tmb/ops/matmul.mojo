@@ -69,11 +69,16 @@ from tmb.backend.abi import (
     v_scalar_is_integral,
     v_tensor,
     view_strided,
+    is_floating,
+    v_bool_list,
 )
 from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall, loader
 from tmb.kernels.common.op_utils import MAX_RANK
-from tmb.ops.binary import Res, _b_no_partial_overlap, _b_tside
+from tmb.ops.binary import (
+    Res,
+    _b_tside,
+)
 from tmb.ops.common import (
     assert_no_internal_overlap,
     assert_no_overlap,
@@ -87,7 +92,6 @@ from tmb.ops.common import (
     copy_strided_into,
     device_str,
     fill_value,
-    is_float_stype,
     is_int_stype,
     promote_types,
     resize_out,
@@ -96,8 +100,13 @@ from tmb.ops.common import (
     scalar_to_float,
     scalar_to_int,
     shares_storage,
+    assert_no_partial_overlap,
+    int_list_str,
+    is_f32_f16_bf16,
+    scalar_type_name,
+    expect_scalar_type,
+    int_prod,
 )
-from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.pointwise import _none_side, _p, _pw_run
 from tmb.ops.unary import _direct_unary_out, _gelu_spec, _unary_out
 from tmb.backend.registry import Site, impl
@@ -147,24 +156,12 @@ def _view(t: T, dims: List[Int]) raises -> T:
     )
 
 
-def _prod(dims: List[Int]) -> Int:
-    var p = 1
-    for d in dims:
-        p *= d
-    return p
-
-
 def _leading_dims(t: T) -> List[Int]:
     """t's logical shape without its last dimension."""
     var out = List[Int]()
     for i in range(t.rank - 1):
         out.append(t.dim(i))
     return out^
-
-
-def _is_float(dt: DType) -> Bool:
-    """The dtypes every matmul-family kernel in this repo covers."""
-    return dt == DType.float32 or dt == DType.bfloat16 or dt == DType.float16
 
 
 struct Tmp(Movable):
@@ -441,7 +438,7 @@ def _gemm_bridge(
         dims.append(n)
     else:
         dims = out_dims.copy()
-        if dims[len(dims) - 1] != n or _prod(dims) != m * n:
+        if dims[len(dims) - 1] != n or int_prod(dims) != m * n:
             return None
     # TT (both flags set) is launched directly rather than operand-swapped
     # into NN: the TT routes compute C straight into this contiguous row-major
@@ -598,7 +595,7 @@ def _try_gemm16_nt_bias_fused(
         dims.append(n)
     else:
         dims = out_dims.copy()
-        if dims[len(dims) - 1] != n or _prod(dims) != m * n:
+        if dims[len(dims) - 1] != n or int_prod(dims) != m * n:
             return None
     var out = own(_new(dims, stype, device))
     var ctx = ctx_for(device)
@@ -953,7 +950,7 @@ def _spec_matmul(
     kernel does not need.
     """
     if a.stype != b.stype or (
-        not _is_float(a.dtype)
+        not is_f32_f16_bf16(a.dtype)
         and not (a.dtype == DType.float64 and op == "MatmulSpec")
     ):
         return None
@@ -1313,15 +1310,6 @@ def _addmm_route(bias: T, mat1: T, mat2: T) raises -> Optional[T]:
 # accumulator (`IntMmSpec`); stock CUDA has no integer GEMM but these.
 
 
-def _dims_str(dims: List[Int]) -> String:
-    var s = String("[")
-    for i in range(len(dims)):
-        if i:
-            s += ", "
-        s += String(dims[i])
-    return s + "]"
-
-
 def _matrix_str(t: T) -> String:
     return String(t.dim(0), "x", t.dim(1))
 
@@ -1376,9 +1364,9 @@ def _check_expand(self: T, dims: List[Int], fname: StaticString) raises:
                 ") at non-singleton dimension ",
                 d,
                 ".  Target sizes: ",
-                _dims_str(dims),
+                int_list_str(dims),
                 ".  Tensor sizes: ",
-                _dims_str(self.logical_shape()),
+                int_list_str(self.logical_shape()),
             )
 
 
@@ -1392,9 +1380,9 @@ def _check_inplace(self: T, dims: List[Int]) raises:
     if not same:
         raise Error(
             "Bad in-place call: input tensor size ",
-            _dims_str(self.logical_shape()),
+            int_list_str(self.logical_shape()),
             " and output tensor size ",
-            _dims_str(dims),
+            int_list_str(dims),
             " should match",
         )
 
@@ -1465,7 +1453,7 @@ def _mul_scalar(v: Value, st: Int32) raises -> _Coef:
         if not v_scalar_is_integral(v):
             raise Error(
                 "result type Float can't be cast to the desired output type ",
-                _scalar_type_name(max_dtype(st)),
+                scalar_type_name(max_dtype(st)),
             )
         return _Coef(0.0, v_int(v), True)
     return _Coef(v_f64(v), 0, False)
@@ -1539,7 +1527,7 @@ def _product(a: T, b: T, out_stype: Int32) raises -> T:
     and an empty reduction (k == 0: zeros) never reach a kernel."""
     var dims = _leading_dims(a)
     dims.append(b.dim(b.rank - 1))
-    if _prod(dims) == 0:
+    if int_prod(dims) == 0:
         return _new(dims, out_stype, a.device)
     if a.dim(a.rank - 1) == 0:
         return _zeros(dims, out_stype, a.device)
@@ -1578,7 +1566,7 @@ def _blas(
     var k = a.dim(a.rank - 1)
     var use_addend = Bool(addend) and not beta.zero()
     var compute = out_stype
-    if is_float_stype(out_stype) and out_stype != ST_FLOAT64:
+    if is_floating(out_stype) and out_stype != ST_FLOAT64:
         compute = ST_FLOAT32
     if not use_addend and (alpha.one() or k == 0):
         compute = out_stype  # the bare product: no epilogue
@@ -1760,15 +1748,15 @@ def _self_partial_overlap(dest: T, self: T, dims: List[Int]) raises:
         if dims[i] > 1 and (d < 0 or self.dim(d) == 1):
             return
     if _has_dims(dest, dims):
-        _b_no_partial_overlap(dest, self)
+        assert_no_partial_overlap(dest, self)
         return
     var resized = dest.copy()
     resized.rank = r
     resized.shape = _index_list(dims)
     resized.strides = contiguous_strides(resized.shape, r)
-    resized.numel = _prod(dims)
+    resized.numel = int_prod(dims)
     resized.contig = True
-    _b_no_partial_overlap(resized, self)
+    assert_no_partial_overlap(resized, self)
 
 
 def _dest_overlap(dest: Optional[T], dims: List[Int]) raises:
@@ -1963,23 +1951,12 @@ def _bmm_dims(b1: T, b2: T) raises -> List[Int]:
     return [bs, b1.dim(1), b2.dim(2)]
 
 
-def _bmm_same_dtype(b1: T, b2: T) raises:
-    """baddbmm_out_cuda_impl reads batch2 as batch1's scalar_t."""
-    if b1.stype != b2.stype:
-        raise Error(
-            "expected scalar type ",
-            _scalar_type_name(b1.dtype),
-            " but found ",
-            _scalar_type_name(b2.dtype),
-        )
-
-
 # aten::bmm(Tensor self, Tensor mat2) -> Tensor
 def op_bmm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var a = v_tensor(args[unsafe_offset=0])
     var b = v_tensor(args[unsafe_offset=1])
     var dims = _bmm_dims(a, b)
-    _bmm_same_dtype(a, b)
+    expect_scalar_type(b, a)
     _check_same_device([a.copy(), b.copy()])
     _blas_out(
         rets,
@@ -2001,7 +1978,7 @@ def op_bmm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var dest = v_tensor(args[unsafe_offset=2])
     var dims = _bmm_dims(a, b)
     _check_dest(dest, b.stype, b)  # common_checks: `batch2.options()`
-    _bmm_same_dtype(a, b)
+    expect_scalar_type(b, a)
     _check_same_device([dest.copy(), a.copy(), b.copy()])
     _blas_out(
         rets,
@@ -2086,9 +2063,9 @@ def _addmm_meta(self: T, mat1: T, mat2: T, dtype_overload: Bool) raises:
     if not dtype_overload and self.stype != mat2.stype:
         raise Error(
             "self and mat2 must have the same dtype, but got ",
-            _scalar_type_name(self.dtype),
+            scalar_type_name(self.dtype),
             " and ",
-            _scalar_type_name(mat2.dtype),
+            scalar_type_name(mat2.dtype),
         )
     if mat1.rank != 2:
         raise Error("mat1 must be a matrix, got ", mat1.rank, "-D tensor")
@@ -2105,9 +2082,9 @@ def _addmm_meta(self: T, mat1: T, mat2: T, dtype_overload: Bool) raises:
     if mat1.stype != mat2.stype:
         raise Error(
             "mat1 and mat2 must have the same dtype, but got ",
-            _scalar_type_name(mat1.dtype),
+            scalar_type_name(mat1.dtype),
             " and ",
-            _scalar_type_name(mat2.dtype),
+            scalar_type_name(mat2.dtype),
         )
 
 
@@ -2158,7 +2135,7 @@ def _addmm_run(
         and beta.one()
         and out_stype == mat1.stype
         and self.stype == mat1.stype
-        and _is_float(mat1.dtype)
+        and is_f32_f16_bf16(mat1.dtype)
         and m > 0
         and n > 0
         and k > 0
@@ -2378,7 +2355,7 @@ def _baddbmm_run(
 ) raises:
     """baddbmm_out_cuda_impl: alpha and beta as opmath (the k == 0 shortcut
     multiplies by the unrounded beta, unlike addmm's)."""
-    _bmm_same_dtype(b1, b2)
+    expect_scalar_type(b2, b1)
     var ts = List[T]()
     if dest:
         ts.append(dest.value().copy())
@@ -2393,7 +2370,7 @@ def _baddbmm_run(
     var alpha = zero
     var beta = zero
     var k = b1.dim(2)
-    if _prod(dims) > 0:
+    if int_prod(dims) > 0:
         if k > 0:
             alpha = _coef(alpha_v, b1.stype)
             beta = _coef(beta_v, b1.stype)
@@ -2482,9 +2459,9 @@ def op_baddbmm_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not _has_dims(self, dims):
         raise Error(
             "Expected an output tensor with shape ",
-            _dims_str(dims),
+            int_list_str(dims),
             " but got shape ",
-            _dims_str(self.logical_shape()),
+            int_list_str(self.logical_shape()),
         )
     _baddbmm_run(
         rets,
@@ -2609,16 +2586,16 @@ def _addbmm_checks(self: T, b1: T, b2: T, result_st: Int32) raises -> List[Int]:
     if result_st != b2.stype:
         raise Error(
             "self and mat2 must have the same dtype, but got ",
-            _scalar_type_name(max_dtype(result_st)),
+            scalar_type_name(max_dtype(result_st)),
             " and ",
-            _scalar_type_name(b2.dtype),
+            scalar_type_name(b2.dtype),
         )
     if b1.stype != b2.stype:
         raise Error(
             "mat1 and mat2 must have the same dtype, but got ",
-            _scalar_type_name(b1.dtype),
+            scalar_type_name(b1.dtype),
             " and ",
-            _scalar_type_name(b2.dtype),
+            scalar_type_name(b2.dtype),
         )
     return dims^
 
@@ -2837,11 +2814,11 @@ def _addmv_meta(self: T, mat: T, vec: T) raises:
     if self.stype != mat.stype or mat.stype != vec.stype:
         raise Error(
             "addmv input tensors must have the same dtype, but got ",
-            _scalar_type_name(self.dtype),
+            scalar_type_name(self.dtype),
             ", ",
-            _scalar_type_name(mat.dtype),
+            scalar_type_name(mat.dtype),
             ", and ",
-            _scalar_type_name(vec.dtype),
+            scalar_type_name(vec.dtype),
         )
 
 
@@ -2884,7 +2861,7 @@ def _addmv_run(
         _dest_overlap(dest, sdims)
         var none = _none_side()
         var compute = self.stype
-        if is_float_stype(compute) and compute != ST_FLOAT64:
+        if is_floating(compute) and compute != ST_FLOAT64:
             compute = ST_FLOAT32
         var res = _pw_run(
             "blas_scale",
@@ -2978,17 +2955,6 @@ def op_addmv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # --- aten::_int_mm / aten::_weight_int8pack_mm --------------------------------
 
 
-def _expect_dtype(t: T, stype: Int32) raises:
-    """`Tensor::data_ptr<scalar_t>()`'s check."""
-    if t.stype != stype:
-        raise Error(
-            "expected scalar type ",
-            _scalar_type_name(max_dtype(stype)),
-            " but found ",
-            _scalar_type_name(t.dtype),
-        )
-
-
 def _int_mm_checks(a: T, b: T) raises:
     """_int_mm_out_cuda (cuda/Blas.cpp): cuBLASLt's int8 GEMM limits."""
     if a.rank != 2:
@@ -3022,8 +2988,8 @@ def _int_mm_checks(a: T, b: T) raises:
             ),
             b.dim(1),
         )
-    _expect_dtype(a, ST_INT8)
-    _expect_dtype(b, ST_INT8)
+    expect_scalar_type(a, ST_INT8)
+    expect_scalar_type(b, ST_INT8)
 
 
 # aten::_int_mm(Tensor self, Tensor mat2) -> Tensor
@@ -3094,10 +3060,10 @@ def op_weight_int8pack_mm(
         raise Error("K dimension mismatch: x.size(1) != w.size(1)")
     if w.dim(0) != scales.dim(0):
         raise Error("Output dim mismatch: w.size(0) != scale.size(0)")
-    if not is_float_stype(x.stype):
+    if not is_floating(x.stype):
         raise Error("expected x to be f32/f16/bf16, got ", dtype_name(x.stype))
-    _expect_dtype(w, ST_INT8)
-    if not is_float_stype(scales.stype):
+    expect_scalar_type(w, ST_INT8)
+    if not is_floating(scales.stype):
         raise Error(
             "expected scales to be floating point, got ",
             dtype_name(scales.stype),
@@ -3256,7 +3222,7 @@ def op_weight_int4pack_mm(
         inner_k_tiles == 2 or inner_k_tiles == 4 or inner_k_tiles == 8,
         "B_innerKTiles == 2 || B_innerKTiles == 4 || B_innerKTiles == 8",
     )
-    if not is_float_stype(x.stype) or x.stype == ST_FLOAT64:
+    if not is_floating(x.stype) or x.stype == ST_FLOAT64:
         raise Error("expected x to be f32/f16/bf16, got ", dtype_name(x.stype))
     _torch_check(x.rank == 2, "A.dim() == 2")
     _torch_check(packed.stype == ST_INT32, "B.dtype() == at::kInt")
@@ -3500,7 +3466,7 @@ def _linear_general(
     var k = a.dim(a.rank - 1)
     var n = w.dim(0)
     var lead = _leading_dims(a)
-    var rows = _prod(lead)
+    var rows = int_prod(lead)
     if w.dim(1) != k:
         raise Error(
             "mat1 and mat2 shapes cannot be multiplied (",
@@ -3516,9 +3482,9 @@ def _linear_general(
     if a.stype != w.stype:
         raise Error(
             "mat1 and mat2 must have the same dtype, but got ",
-            _scalar_type_name(a.dtype),
+            scalar_type_name(a.dtype),
             " and ",
-            _scalar_type_name(w.dtype),
+            scalar_type_name(w.dtype),
         )
     var ts: List[T] = [a.copy(), w.copy()]
     var dims: List[Int] = [rows, n]
@@ -3529,9 +3495,9 @@ def _linear_general(
         if b.stype != w.stype:
             raise Error(
                 "self and mat2 must have the same dtype, but got ",
-                _scalar_type_name(b.dtype),
+                scalar_type_name(b.dtype),
                 " and ",
-                _scalar_type_name(w.dtype),
+                scalar_type_name(w.dtype),
             )
         _check_expand(b, dims, "addmm")
         ts.append(b.copy())
@@ -3566,9 +3532,9 @@ def _linear_general(
         if not can_cast(common, shaped.t.stype):
             raise Error(
                 "result type ",
-                _scalar_type_name(max_dtype(common)),
+                scalar_type_name(max_dtype(common)),
                 " can't be cast to the desired output type ",
-                _scalar_type_name(shaped.t.dtype),
+                scalar_type_name(shaped.t.dtype),
             )
         var acc = own_if_new(cast_to(shaped.t, common), shaped.t)
         # TensorIterator computes in `common`, the operands cast to it.
@@ -3592,16 +3558,6 @@ def _linear_general(
 
 
 # --- aten::linear_backward ----------------------------------------------------
-
-
-def _bool_list(v: Value) raises -> List[Bool]:
-    if v.tag != TAG_BOOL_LIST:
-        raise Error("expected a bool[] argument, got record tag ", v.tag)
-    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
-    var out = List[Bool](capacity=Int(v.len))
-    for i in range(Int(v.len)):
-        out.append(p[unsafe_offset=i] != 0)
-    return out^
 
 
 def _sum_dims(a: T, dims: List[Int], out_len: Int) raises -> T:
@@ -3648,12 +3604,12 @@ def op_linear_backward(
     var input = v_tensor(args[unsafe_offset=0])
     var grad = v_tensor(args[unsafe_offset=1])
     var w = v_tensor(args[unsafe_offset=2])
-    var mask = _bool_list(args[unsafe_offset=3])
+    var mask = v_bool_list(args[unsafe_offset=3])
     if (
         len(mask) != 3
         or input.rank < 1
         or w.rank != 2
-        or not _is_float(input.dtype)
+        or not is_f32_f16_bf16(input.dtype)
         or grad.stype != input.stype
         or w.stype != input.stype
         or grad.device != input.device
@@ -3678,7 +3634,7 @@ def op_linear_backward(
             _ret_undefined(rets, i)
         return
 
-    var rows = _prod(_leading_dims(input)) if input.rank > 1 else 1
+    var rows = int_prod(_leading_dims(input)) if input.rank > 1 else 1
     var in_features = input.dim(input.rank - 1)
     var out_features = w.dim(0)
     # PyTorch's registered Meta/MPS contract defines both parameter outputs
@@ -3768,7 +3724,7 @@ def _addr_fast(
     var dt = vec1.dtype
     if self.stype != vec1.stype or vec2.stype != vec1.stype:
         return None
-    if not _is_float(dt):
+    if not is_f32_f16_bf16(dt):
         return None
     if vec1.rank != 1 or vec2.rank != 1 or self.rank > 2:
         return None
@@ -3899,16 +3855,6 @@ def op_addr(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # --- aten::convolution --------------------------------------------------------
 
 
-def _list_str(xs: List[Int]) -> String:
-    """`[a, b, c]`, the way c10 streams an IntArrayRef."""
-    var s = String("[")
-    for i in range(len(xs)):
-        if i:
-            s += ", "
-        s += String(xs[i])
-    return s + "]"
-
-
 def _expand_param(
     xs: List[Int], name: StaticString, dims: Int
 ) raises -> List[Int]:
@@ -3928,7 +3874,7 @@ def _expand_param(
             " values to match the convolution dimensions, but got ",
             name,
             "=",
-            _list_str(xs),
+            int_list_str(xs),
         )
     return xs.copy()
 
@@ -4216,11 +4162,11 @@ def _check_conv_shapes(
             "-dimensional input for ",
             weight.rank,
             "-dimensional weight ",
-            _list_str(w_sizes),
+            int_list_str(w_sizes),
             ", but got ",
             k,
             "-dimensional input of size ",
-            _list_str(in_sizes),
+            int_list_str(in_sizes),
             " instead",
         )
     if w_sizes[0] < groups:
@@ -4230,7 +4176,7 @@ def _check_conv_shapes(
             ", expected weight to be at least ",
             groups,
             " at dimension 0, but got weight of size ",
-            _list_str(w_sizes),
+            int_list_str(w_sizes),
             " instead",
         )
     if w_sizes[0] % groups != 0:
@@ -4240,7 +4186,7 @@ def _check_conv_shapes(
             ", expected weight to be divisible by ",
             groups,
             " at dimension 0, but got weight of size [",
-            _list_str(w_sizes),
+            int_list_str(w_sizes),
             "] instead",
         )
     if not p.transposed:
@@ -4249,9 +4195,9 @@ def _check_conv_shapes(
                 "Given groups=",
                 groups,
                 ", weight of size ",
-                _list_str(w_sizes),
+                int_list_str(w_sizes),
                 ", expected input",
-                _list_str(in_sizes),
+                int_list_str(in_sizes),
                 " to have ",
                 w_sizes[1] * groups,
                 " channels, but got ",
@@ -4263,11 +4209,11 @@ def _check_conv_shapes(
             if b.rank != 1 or b.dim(0) != w_sizes[0]:
                 raise Error(
                     "Given weight of size ",
-                    _list_str(w_sizes),
+                    int_list_str(w_sizes),
                     ", expected bias to be 1-dimensional with ",
                     w_sizes[0],
                     " elements, but got bias of size ",
-                    _list_str(b.logical_shape()),
+                    int_list_str(b.logical_shape()),
                     " instead",
                 )
         var fits = True
@@ -4295,9 +4241,9 @@ def _check_conv_shapes(
         if in_sizes[1] != w_sizes[0]:
             raise Error(
                 "Given transposed=1, weight of size ",
-                _list_str(w_sizes),
+                int_list_str(w_sizes),
                 ", expected input",
-                _list_str(in_sizes),
+                int_list_str(in_sizes),
                 " to have ",
                 w_sizes[0],
                 " channels, but got ",
@@ -4309,11 +4255,11 @@ def _check_conv_shapes(
             if b.rank != 1 or b.dim(0) != w_sizes[1] * groups:
                 raise Error(
                     "Given transposed=1, weight of size ",
-                    _list_str(w_sizes),
+                    int_list_str(w_sizes),
                     ", expected bias to be 1-dimensional with ",
                     w_sizes[1] * groups,
                     " elements, but got bias of size ",
-                    _list_str(b.logical_shape()),
+                    int_list_str(b.logical_shape()),
                     " instead",
                 )
     if input.stype != weight.stype or input.device != weight.device:
@@ -4440,7 +4386,7 @@ def _conv_runs_here(input: T, g: ConvGeom) -> Bool:
     """What the im2col + GEMM path computes: float operands on the mojo
     device, every extent positive (`_conv_empty` handles the rest)."""
     return (
-        _is_float(input.dtype)
+        is_f32_f16_bf16(input.dtype)
         and input.on_mojo()
         and g.n > 0
         and g.c > 0
@@ -4630,9 +4576,9 @@ def _run_conv(input: T, weight: T, bias: Optional[T], p: ConvArgs) raises -> T:
                 "Trying to create tensor with negative dimension ",
                 out_shape[i],
                 ": ",
-                _list_str(out_shape),
+                int_list_str(out_shape),
             )
-    if not _is_float(input.dtype) or not input.on_mojo():
+    if not is_f32_f16_bf16(input.dtype) or not input.on_mojo():
         unsupported("convolution of " + dtype_name(input.stype) + " operands")
     if input.dim(0) == 0 or input.dim(1) == 0:
         # ATen's `ConvBackend::Empty`: no products at all. A zero-channel
@@ -4647,7 +4593,7 @@ def _run_conv(input: T, weight: T, bias: Optional[T], p: ConvArgs) raises -> T:
                 "Only zero batch or zero channel inputs are supported, but got"
                 " input shape: "
             ),
-            _list_str(input.logical_shape()),
+            int_list_str(input.logical_shape()),
         )
     if not _conv_runs_here(input, g):
         # An empty output extent (a transposed conv of a degenerate size).
@@ -4907,11 +4853,11 @@ def _conv_backward(
         if grad.dim(i) != expected[i]:
             raise Error(
                 "Expected grad_output of size ",
-                _list_str(expected),
+                int_list_str(expected),
                 ", but got ",
-                _list_str(grad.logical_shape()),
+                int_list_str(grad.logical_shape()),
             )
-    if not _is_float(input.dtype) or not input.on_mojo():
+    if not is_f32_f16_bf16(input.dtype) or not input.on_mojo():
         unsupported(
             "convolution_backward of " + dtype_name(input.stype) + " operands"
         )
@@ -5000,7 +4946,7 @@ def op_convolution_backward(
     var grad = v_tensor(args[unsafe_offset=0])
     var input = v_tensor(args[unsafe_offset=1])
     var weight = v_tensor(args[unsafe_offset=2])
-    var mask = _bool_list(args[unsafe_offset=10])
+    var mask = v_bool_list(args[unsafe_offset=10])
     if len(mask) != 3:
         raise Error("convolution_backward: output_mask must have 3 entries")
     var p = _conv_args(
@@ -5059,15 +5005,15 @@ def _check_kernel_size(weight: T, kernel_size: List[Int], spatial: Int) raises:
             "expected kernel_size to have ",
             spatial,
             " elements, but got ",
-            _list_str(kernel_size),
+            int_list_str(kernel_size),
         )
     for i in range(spatial):
         if weight.rank != spatial + 2 or weight.dim(i + 2) != kernel_size[i]:
             raise Error(
                 "expected weight of kernel size ",
-                _list_str(kernel_size),
+                int_list_str(kernel_size),
                 ", but got weight of size ",
-                _list_str(weight.logical_shape()),
+                int_list_str(weight.logical_shape()),
             )
 
 
@@ -5210,7 +5156,7 @@ def _entry_conv(
             "Expected ",
             spatial + 2,
             "D input tensor, but got ",
-            _list_str(input.logical_shape()),
+            int_list_str(input.logical_shape()),
         )
     var unbatched = input.rank == spatial + 1
     if not unbatched and input.rank != spatial + 2:
@@ -5222,7 +5168,7 @@ def _entry_conv(
             "D (batched) input to ",
             name,
             ", but got input of size: ",
-            _list_str(input.logical_shape()),
+            int_list_str(input.logical_shape()),
         )
     var held = own(_empty_result(input.stype, input.device))
     var x = input.copy()
@@ -5525,7 +5471,7 @@ def _slow_conv2d_grads(
     if input.rank != 4:
         raise Error(
             "Expected 4D input tensor, but got ",
-            _list_str(input.logical_shape()),
+            int_list_str(input.logical_shape()),
         )
     _check_conv_shapes(input, weight, None, p)
     _check_conv_backend(input, p)
@@ -5540,7 +5486,7 @@ def _slow_conv2d_grads(
 def op_slow_conv2d_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var mask = _bool_list(args[unsafe_offset=6])
+    var mask = v_bool_list(args[unsafe_offset=6])
     if len(mask) != 3:
         raise Error("_slow_conv2d_backward: output_mask must have 3 entries")
     var input = v_tensor(args[unsafe_offset=1])

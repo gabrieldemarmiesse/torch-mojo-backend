@@ -663,6 +663,20 @@ def v_int_list_is_none(v: Value) -> Bool:
     return v.tag == TAG_NONE
 
 
+def v_bool_list(v: Value) raises -> List[Bool]:
+    """A borrowed `bool[]` argument (uint8 per element in the call arena);
+    None reads as empty."""
+    var out = List[Bool]()
+    if v.tag == TAG_NONE:
+        return out^
+    if v.tag != TAG_BOOL_LIST:
+        raise Error("expected a bool[] argument, got record tag ", v.tag)
+    var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=Int(v.a))
+    for i in range(Int(v.len)):
+        out.append(p[unsafe_offset=i] != 0)
+    return out^
+
+
 struct DoubleList(Copyable, Movable, Sized):
     var addr: Int
     var n: Int
