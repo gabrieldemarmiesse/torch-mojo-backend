@@ -14,10 +14,12 @@ fourth the dtypes the op does not compute in (CUDA's error type, or its bits).
 from __future__ import annotations
 
 import itertools
+import json
 import math
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 import torch
@@ -786,45 +788,51 @@ _OTHER_DTYPES = (
 )
 
 
-# Stock CUDA's jiterated complex128 sigmoid_backward / tanh_backward round
-# by element position: of 4000 random pairs, elements 0..127 match
-# `(a*c - b*d)` with the products fused into fmas and every later one the
-# separately rounded products (measured with exact rational arithmetic over
-# each contraction choice), so no single formula reproduces it; complex64
-# rounds every product everywhere and is exact here.
-_POSITION_DEPENDENT = pytest.mark.xfail(
-    strict=True,
-    reason="CUDA's jiterated complex128 kernel fuses its products only for"
-    " the first 128 elements",
+# Complex128 rows that stock CUDA rounds differently (its jiterated complex
+# exp in sigmoid / silu, and the backward products) are kept out of the
+# mandatory tests: the failing rows of each seeded input set are listed in
+# data/complex128_open_inputs.json, and every other row is mandatory.
+# test_complex128_open_inputs checks exactly those rows, as a strict xfail.
+_OPEN = json.loads(
+    (Path(__file__).parent / "data" / "complex128_open_inputs.json").read_text()
 )
+_COMPLEX_CASES = ["sigmoid", "silu", "sigmoid_backward", "tanh_backward"]
+_MIXED_KINDS = ["sigmoid_backward", "tanh_backward"]
+
+
+def _rows(n: int, key: str) -> torch.Tensor:
+    """The mandatory rows of an n-row input set: all but `key`'s open rows.
+    The whole set still runs: CUDA's rounding depends on the element position
+    (see the comment above), so the rows are selected from the output."""
+    keep = torch.ones(n, dtype=torch.bool)
+    keep[_OPEN.get(key, [])] = False
+    return keep.nonzero().flatten()
+
+
+def _check_rows(
+    cuda_oracle: CudaOracle,
+    fn: Callable[[str], object],
+    rows: torch.Tensor | None = None,
+) -> None:
+    """`fn(device)` bit-equal to CUDA's, on `rows` of the output when given."""
+    if rows is None:
+        cuda_oracle.assert_bitwise_equal_by_device(fn)  # also exception types
+        return
+    ours, cuda = cuda_oracle.run_by_device(fn)
+    assert isinstance(ours, torch.Tensor) and isinstance(cuda, torch.Tensor)
+    assert_bits_equal(ours.cpu()[rows], cuda.cpu()[rows])
 
 
 def _other_params() -> list[object]:
-    params = []
-    for dtype in _OTHER_DTYPES:
-        for case_id in CASES:
-            marks = ()
-            if dtype == torch.complex128 and case_id in (
-                "sigmoid_backward",
-                "tanh_backward",
-            ):
-                marks = (_POSITION_DEPENDENT,)
-            params.append(
-                pytest.param(
-                    case_id, dtype, marks=marks, id=f"{_dtype_id(dtype)}-{case_id}"
-                )
-            )
-    return params
+    return [
+        pytest.param(case_id, dtype, id=f"{_dtype_id(dtype)}-{case_id}")
+        for dtype in _OTHER_DTYPES
+        for case_id in CASES
+    ]
 
 
-@pytest.mark.parametrize(("case_id", "dtype"), _other_params())
-def test_other_dtypes_match_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
-    """Integer, bool and complex operands: CUDA's result bits, or its
-    exception type."""
-    case = CASES[case_id]
-    n_ops = len(case.roles)
-
-    def operand(k: int, device: str) -> torch.Tensor:
+def _other_operands(case: Case, dtype: torch.dtype, device: str) -> list[torch.Tensor]:
+    def operand(k: int) -> torch.Tensor:
         shape = (7, 2) if case.pairs and case.roles[k] != "g" else (7, 1)
         if not case.pairs:
             shape = (7,)
@@ -834,43 +842,24 @@ def test_other_dtypes_match_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
         v = torch.arange(-3, 4).add(k).reshape(7, 1).expand(7, shape[-1]).reshape(shape)
         return v.to(dtype).to(device)
 
-    cuda_oracle.assert_bitwise_equal_by_device(
-        lambda d: case.fn(*[operand(k, d) for k in range(n_ops)])
+    return [operand(k) for k in range(len(case.roles))]
+
+
+@pytest.mark.parametrize(("case_id", "dtype"), _other_params())
+def test_other_dtypes_match_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
+    """Integer, bool and complex operands: CUDA's result bits, or its
+    exception type (complex128: the mandatory rows, see above)."""
+    case = CASES[case_id]
+    key = f"other_dtypes/{case_id}-complex128"
+    keep = _rows(7, key) if dtype == torch.complex128 and _OPEN.get(key) else None
+
+    _check_rows(
+        cuda_oracle, lambda device: case.fn(*_other_operands(case, dtype, device)), keep
     )
 
 
-_COMPLEX_CASES = ["sigmoid", "silu", "sigmoid_backward", "tanh_backward"]
-# sigmoid and silu are built on complex exp, whose complex128 port (the unary
-# math group's) still differs from CUDA in 195 of these 4000 random values.
-_COMPLEX128_EXP = pytest.mark.xfail(
-    strict=True, reason="complex128 exp is not bit-exact against CUDA yet"
-)
-
-
-@pytest.mark.parametrize(
-    ("case_id", "dtype"),
-    [
-        pytest.param(
-            c,
-            d,
-            marks=(
-                (_POSITION_DEPENDENT,)
-                if c.endswith("_backward")
-                else (_COMPLEX128_EXP,)
-            )
-            if d == torch.complex128
-            else (),
-            id=f"{c}-{_dtype_id(d)}",
-        )
-        for c in _COMPLEX_CASES
-        for d in (torch.complex64, torch.complex128)
-    ],
-)
-def test_complex_matches_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
-    """The complex kernels (jiterated sigmoid / sigmoid_backward /
-    tanh_backward, c10::complex silu) over random values and every pair of
-    special components."""
-    case = CASES[case_id]
+def _complex_ops(case: Case, dtype: torch.dtype) -> list[torch.Tensor]:
+    """Random values, and every pair of special components, per operand."""
     real = torch.float32 if dtype == torch.complex64 else torch.float64
     sp = _specials(real, "x")
     grid = torch.cartesian_prod(sp, sp)
@@ -880,7 +869,27 @@ def test_complex_matches_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
     for k in range(len(case.roles)):
         rand = torch.randn(4000, generator=g, dtype=dtype) * 3
         ops.append(torch.cat((rand, special.roll(k * 5))))
-    cuda_oracle.assert_bitwise_equal(case.fn, *ops)
+    return ops
+
+
+@pytest.mark.parametrize(
+    ("case_id", "dtype"),
+    [
+        pytest.param(c, d, id=f"{c}-{_dtype_id(d)}")
+        for c in _COMPLEX_CASES
+        for d in (torch.complex64, torch.complex128)
+    ],
+)
+def test_complex_matches_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
+    """The complex kernels (jiterated sigmoid / sigmoid_backward /
+    tanh_backward, c10::complex silu) over random values and every pair of
+    special components (complex128: the mandatory rows, see above)."""
+    case = CASES[case_id]
+    ops = _complex_ops(case, dtype)
+    keep = None
+    if dtype == torch.complex128:
+        keep = _rows(ops[0].numel(), f"complex_matches/{case_id}-complex128")
+    _check_rows(cuda_oracle, lambda device: case.fn(*[o.to(device) for o in ops]), keep)
 
 
 @pytest.mark.parametrize("inplace", [False, True], ids=["functional", "inplace"])
@@ -935,3 +944,78 @@ def test_out_dtype_policy_matches_cuda(cuda_oracle: CudaOracle):
         )
 
     cuda_oracle.assert_bitwise_equal_by_device(fn)
+
+
+def _mixed_operands(in_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    g = torch.Generator().manual_seed(11)
+    grad = torch.randn(64, generator=g, dtype=in_dtype)
+    saved = torch.randn(64, generator=g, dtype=in_dtype)
+    return grad, saved
+
+
+@pytest.mark.parametrize("kind", _MIXED_KINDS)
+@pytest.mark.parametrize(
+    ("in_dtype", "out_dtype"),
+    [(torch.complex64, torch.complex128), (torch.complex64, torch.complex64)],
+    ids=["c64-in-c128-out", "c64-in-c64-out"],
+)
+def test_complex_backward_out_dtype_matches_cuda(
+    cuda_oracle: CudaOracle, kind: str, in_dtype, out_dtype
+):
+    """out= of another complex dtype than the inputs: CUDA computes in the
+    out dtype, converting the operands first (complex128 out: the mandatory
+    rows, see above)."""
+    grad, saved = _mixed_operands(in_dtype)
+    op = getattr(A, kind).grad_input
+    keep = (
+        _rows(64, f"mixed_c64_in_c128_out/{kind}")
+        if out_dtype == torch.complex128
+        else None
+    )
+
+    def fn(device: str) -> torch.Tensor:
+        return op(
+            grad.to(device),
+            saved.to(device),
+            grad_input=torch.empty(0, dtype=out_dtype, device=device),
+        )
+
+    _check_rows(cuda_oracle, fn, keep)
+
+
+@pytest.mark.parametrize("key", sorted(k for k, rows in _OPEN.items() if rows))
+@pytest.mark.xfail(
+    strict=True,
+    reason="complex128 rows that stock CUDA rounds differently (jiterated "
+    "complex exp / backward products); not reproduced yet",
+)
+def test_complex128_open_inputs(cuda_oracle: CudaOracle, key: str):
+    """The open complex128 rows only (data/complex128_open_inputs.json), of
+    the same full input sets as the mandatory tests."""
+    family, name = key.split("/", 1)
+    rows = torch.tensor(_OPEN[key], dtype=torch.long)
+    if family == "complex_matches":
+        case = CASES[name.rsplit("-", 1)[0]]
+        ops = _complex_ops(case, torch.complex128)
+        _check_rows(
+            cuda_oracle, lambda device: case.fn(*[o.to(device) for o in ops]), rows
+        )
+    elif family == "other_dtypes":
+        case = CASES[name.rsplit("-", 1)[0]]
+        _check_rows(
+            cuda_oracle,
+            lambda device: case.fn(*_other_operands(case, torch.complex128, device)),
+            rows,
+        )
+    else:
+        grad, saved = _mixed_operands(torch.complex64)
+        op = getattr(A, name).grad_input
+        _check_rows(
+            cuda_oracle,
+            lambda device: op(
+                grad.to(device),
+                saved.to(device),
+                grad_input=torch.empty(0, dtype=torch.complex128, device=device),
+            ),
+            rows,
+        )
