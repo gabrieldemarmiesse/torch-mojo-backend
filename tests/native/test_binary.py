@@ -116,31 +116,33 @@ def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_add_sub_alpha_reduced_precision_rounds_like_cpu(mojo_gpu, dtype):
-    """ATen's CPU add/sub kernel takes `alpha` as a scalar_t (rounded to the
-    half type) and its scalar loop computes `a + alpha * b` one rounding at a
-    time; that is the documented policy here, checked bit for bit. CPU torch
-    itself is not a bit-exact oracle: its vectorized loop fuses the multiply
-    and add into one rounding, so which loop a given element hits depends on
-    the tensor size and the CPU's vector width. The conformance suite is the
-    CPU-parity check, on the small samples where the two agree."""
+def test_add_sub_alpha_reduced_precision_is_one_float_fma(mojo_gpu, dtype):
+    """CUDA's add kernel computes `a + alpha * b` in float (opmath) with alpha
+    converted straight to float, as one fma, and rounds to the half type
+    once (sub: alpha negated); tests/native/test_binary_cuda_parity.py holds
+    it to stock CUDA bit for bit where CUDA runs."""
     a = (torch.arange(64, dtype=torch.float32) / 7.0 - 4.0).to(dtype)
     b = (torch.arange(64, dtype=torch.float32) / 3.0 - 10.0).to(dtype)
     alpha = 1.0 / 3.0
-    alpha_r = torch.tensor(alpha).to(dtype).float()  # alpha as a scalar_t
+    alpha32 = torch.tensor(alpha, dtype=torch.float32).double()
     ad, bd = a.to(mojo_gpu), b.to(mojo_gpu)
+
+    def fma(sign: float) -> torch.Tensor:
+        # exact in float64 (11-bit operands, a 24-bit alpha), one float
+        # rounding, then the half type
+        return (a.double() + sign * alpha32 * b.double()).float().to(dtype)
 
     got = torch.add(ad, bd, alpha=alpha)
     assert got.dtype == dtype
-    expect = (a.float() + (alpha_r * b.float()).to(dtype).float()).to(dtype)
-    torch.testing.assert_close(got.cpu(), expect, atol=0, rtol=0)
+    torch.testing.assert_close(got.cpu(), fma(1.0), atol=0, rtol=0)
     got_sub = torch.sub(ad, bd, alpha=alpha)
-    expect_sub = (a.float() - (alpha_r * b.float()).to(dtype).float()).to(dtype)
-    torch.testing.assert_close(got_sub.cpu(), expect_sub, atol=0, rtol=0)
-    # alpha kept in float32 gives a DIFFERENT tensor: without this the test
-    # would pass on the implementation it is meant to reject.
-    unrounded = (a.float() + (alpha * b.float()).to(dtype).float()).to(dtype)
-    assert not torch.equal(unrounded, got.cpu())
+    torch.testing.assert_close(got_sub.cpu(), fma(-1.0), atol=0, rtol=0)
+    # alpha rounded to the half type first (CPU torch's scalar loop) gives a
+    # DIFFERENT tensor: without this the test would pass on the
+    # implementation it is meant to reject.
+    alpha_r = torch.tensor(alpha).to(dtype).float()
+    rounded = (a.float() + (alpha_r * b.float()).to(dtype).float()).to(dtype)
+    assert not torch.equal(rounded, got.cpu())
 
 
 def _outcome(fn):
@@ -2070,15 +2072,13 @@ def test_rsub_checks_and_rank_promotion(mojo_gpu):
 
 @pytest.mark.parametrize(
     ("dtype", "alpha", "ok_alpha"),
-    [
-        (torch.float32, 1e100, 1e6),
-        (torch.float16, 7e4, 6e4),
-        (torch.bfloat16, 1e100, 1e6),
-    ],
+    [(torch.float32, 1e100, 1e6), (torch.bfloat16, 1e100, 1e6)],
 )
 def test_rsub_alpha_overflowing_result_dtype(mojo_gpu, dtype, alpha, ok_alpha):
     """A finite alpha past the result dtype's range raises, as CPU torch's
-    checked `alpha.to<scalar_t>()` does, instead of scaling by inf."""
+    checked `alpha.to<scalar_t>()` does, instead of scaling by inf. CUDA
+    raises the same for these dtypes (checked on stock CUDA); float16 is
+    the exception, see test_rsub_float16_alpha_is_float_opmath."""
     x_cpu = torch.tensor([1.0], dtype=dtype)
     x = x_cpu.to(mojo_gpu)
     for other_cpu in (3, x_cpu):
@@ -2092,6 +2092,25 @@ def test_rsub_alpha_overflowing_result_dtype(mojo_gpu, dtype, alpha, ok_alpha):
             torch.rsub(x, other, alpha=ok_alpha).cpu(),
             torch.rsub(x_cpu, other_cpu, alpha=ok_alpha),
         )
+
+
+def test_rsub_float16_alpha_is_float_opmath(mojo_gpu):
+    """CUDA converts alpha to opmath (float) and rounds the result to half
+    once, so a half-range alpha of 7e4 does not raise there (CPU torch
+    does): `3 - 7e4 * 1` is -inf in half. Verified on stock CUDA."""
+    x = torch.tensor([1.0], dtype=torch.float16).to(mojo_gpu)
+    for other_cpu in (
+        torch.tensor([3.0], dtype=torch.float16),
+        torch.tensor([-2.5], dtype=torch.float16),
+    ):
+        other = other_cpu.to(mojo_gpu)
+        for alpha in (7e4, 6e4):
+            expect = (other_cpu.float() - torch.tensor(alpha, dtype=torch.float32)).to(
+                torch.float16
+            )
+            torch.testing.assert_close(
+                torch.rsub(x, other, alpha=alpha).cpu(), expect, atol=0, rtol=0
+            )
 
 
 def test_rsub_integral_promotes_before_alpha(mojo_gpu):
