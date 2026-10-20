@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import is_metal, skip_if_metal
+from tests.native.conftest import is_cuda, is_metal, skip_if_metal
 from torch_mojo_backend import get_accelerators, native
 
 FLOATS = [torch.float32, torch.float16, torch.bfloat16]
@@ -1147,8 +1147,16 @@ def test_ldexp_int64_exponent_wraps_to_int(mojo_gpu):
         atol=0.0,
     )
     for v in (2**32, 2**32 + 3, -(2**33) - 1):
-        with pytest.raises(RuntimeError, match="same device"):
-            torch.ldexp(x.to(mojo_gpu), torch.tensor(v))
+        if is_cuda(mojo_gpu):
+            with pytest.raises(RuntimeError, match="same device"):
+                torch.ldexp(x.to(mojo_gpu), torch.tensor(v))
+        else:
+            _close(
+                torch.ldexp(x.to(mojo_gpu), torch.tensor(v)),
+                torch.ldexp(x, torch.tensor(v)),
+                rtol=0.0,
+                atol=0.0,
+            )
     y = x.to(mojo_gpu)
     y.ldexp_(e.to(mojo_gpu))
     _close(y, x.clone().ldexp_(e), rtol=0.0, atol=0.0)
@@ -1162,8 +1170,18 @@ def test_ldexp_inplace_cpu_scalar_exponent(mojo_gpu):
         x = x_cpu.to(mojo_gpu)
         x.ldexp_(e_cpu)
         _close(x, x_cpu.clone().ldexp_(e_cpu), rtol=0.0, atol=0.0)
-    with pytest.raises(RuntimeError, match="same device"):
-        torch.tensor([1.0], device=mojo_gpu).ldexp_(torch.tensor(3))
+    if is_cuda(mojo_gpu):
+        with pytest.raises(RuntimeError, match="same device"):
+            torch.tensor([1.0], device=mojo_gpu).ldexp_(torch.tensor(3))
+    else:
+        y = torch.tensor([1.0, 0.5, -3.0], device=mojo_gpu)
+        y.ldexp_(torch.tensor(3))
+        _close(
+            y.cpu(),
+            torch.ldexp(torch.tensor([1.0, 0.5, -3.0]), torch.tensor(3)),
+            rtol=0.0,
+            atol=0.0,
+        )
 
 
 def test_frexp_out_partially_overlapping_input(mojo_gpu):

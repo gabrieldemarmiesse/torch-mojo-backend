@@ -465,6 +465,11 @@ def _bin_vec_op[
                 # max/min may drop it.
                 r = isnan(b).select(b, r)
                 r = isnan(a).select(a, r)
+                comptime if is_nvidia_gpu():
+                    if scalar_side == 2:
+                        # the CPU scalar is the functor's first operand
+                        # (opmath_symmetric_gpu_kernel_with_scalars)
+                        r = isnan(b).select(b, r)
             return r.cast[out_dtype]()
         comptime if op_code == BOP_AND:
             comptime if not dtype.is_floating_point():
@@ -1433,14 +1438,22 @@ def _clamp_scalar[
     2**53 has no exact float64)."""
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
-    var lo_s: Scalar[dtype]
-    var hi_s: Scalar[dtype]
+    # The 16-bit floats clamp in float32 (ClampLimits in opmath: a bound below
+    # the type's subnormals still rounds into it), one rounding at the end.
+    # (Only the NVIDIA device code uses it: the other backends keep the native
+    # 16-bit max/min.)
+    comptime lim = DType.float32 if (
+        has_nvidia_gpu_accelerator()
+        and (dtype == DType.float16 or dtype == DType.bfloat16)
+    ) else dtype
+    var lo_s: Scalar[lim]
+    var hi_s: Scalar[lim]
     comptime if dtype.is_floating_point():
-        lo_s = _raw_f64(lo).cast[dtype]()
-        hi_s = _raw_f64(hi).cast[dtype]()
+        lo_s = _raw_f64(lo).cast[lim]()
+        hi_s = _raw_f64(hi).cast[lim]()
     else:
-        lo_s = Scalar[dtype](lo)
-        hi_s = Scalar[dtype](hi)
+        lo_s = Scalar[lim](lo)
+        hi_s = Scalar[lim](hi)
 
     @always_inline
     @__parameter
@@ -1449,10 +1462,18 @@ def _clamp_scalar[
         var i = Int(idx[0].value())
         var x = in_ptr[unsafe_offset=i]
         var v = x
-        if has_min != 0:
-            v = max(v, lo_s)
-        if has_max != 0:
-            v = min(v, hi_s)
+        comptime if lim != dtype:
+            var vf = x.cast[lim]()
+            if has_min != 0:
+                vf = max(vf, rebind[Scalar[lim]](lo_s))
+            if has_max != 0:
+                vf = min(vf, rebind[Scalar[lim]](hi_s))
+            v = vf.cast[dtype]()
+        else:
+            if has_min != 0:
+                v = max(v, rebind[Scalar[dtype]](lo_s))
+            if has_max != 0:
+                v = min(v, rebind[Scalar[dtype]](hi_s))
         comptime if dtype.is_floating_point():
             # clamp_scalar_kernel_impl returns a NaN value as is (max/min
             # may drop it under the GPU build's fast-math flags; the

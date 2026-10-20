@@ -76,6 +76,7 @@ from tmb.backend.abi import (
     default_dtype,
     dtype_name,
     f64_bits,
+    tensor_arg,
     is_complex_stype,
     new_tensor,
     own,
@@ -103,6 +104,9 @@ from tmb.backend.device import current_device
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    cast_any,
+    is_wide_unsigned,
+    fill_value,
     resize_any,
     can_cast,
     combine_categories,
@@ -732,6 +736,12 @@ def _operand(v: Value, like: T) raises -> _Operand:
         return _Operand(
             like, 1.0 if v.a != 0 else 0.0, 0.0, ST_BOOL, _RANK_WRAPPED
         )
+    if v.tag == TAG_SCALAR_INT and v.b == 1:
+        # a uint64 Scalar of 2**63 or more (bits in `a`): its float value
+        var u = Scalar[DType.int64](v.a).cast[DType.uint64]()
+        return _Operand(
+            like, u.cast[DType.float64](), 0.0, default_dtype(), _RANK_WRAPPED
+        )
     if v.tag == TAG_SCALAR_INT or v.tag == TAG_INT:
         var o = _Operand(like, Float64(v.a), 0.0, ST_INT64, _RANK_WRAPPED)
         o.ikind = 1
@@ -889,12 +899,49 @@ def _one_device(a: _Operand, b: _Operand) raises -> Int:
     return a.t.device if a.is_t else b.t.device
 
 
+def _half_vs_complex(x: _Operand, y: _Operand) -> Bool:
+    """A float16 tensor `x` and a complex host value `y` whose common dtype
+    is ComplexHalf."""
+    return (
+        x.is_t
+        and x.t.stype == ST_FLOAT16
+        and not y.is_t
+        and is_complex_stype(y.stype)
+        and (x.rank_kind == _RANK_DIM or y.rank_kind == _RANK_WRAPPED)
+    )
+
+
+def _complex_half_eq(kind: StaticString, x: T, s: _Operand) raises -> Owned:
+    """eq / ne of a float16 tensor with a complex host value: CUDA's
+    ComplexHalf comparison (`complex<Half>(x, 0) == complex<Half>(s)`, the
+    scalar's parts through float to half), which the device has no dtype
+    for. A nonzero imaginary part decides it; otherwise it is the real
+    comparison with the real part."""
+    var re = Float64(Float32(s.re).cast[DType.float16]())
+    var im = Float32(s.im).cast[DType.float16]()
+    if im != 0 or im != im:
+        var out = own(new_tensor(x.shape, x.rank, ST_BOOL, x.device))
+        fill_value(out.t, 0.0 if kind == "eq" else 1.0)
+        return out^
+    var r = call_op(
+        "aten::" + String(kind),
+        "Scalar",
+        [tensor_arg(x), Value(TAG_SCALAR_DOUBLE, 0, f64_bits(re), 0)],
+        1,
+    )
+    return own(r.take_tensor(0))
+
+
 def _binary(kind: StaticString, av: Value, bv: Value) raises -> Owned:
     """`kind(a, b)` (eq / ne) where one side is complex: promoted to the
     common complex dtype, broadcast, one launch of the complex family."""
     var like = _first_tensor(av, bv)
     var a = _operand(av, like)
     var b = _operand(bv, like)
+    if _half_vs_complex(a, b):
+        return _complex_half_eq(kind, a.t, b)
+    if _half_vs_complex(b, a):
+        return _complex_half_eq(kind, b.t, a)
     var st = _result_type(a, b)
     if not is_complex_stype(st):
         unsupported("a complex op whose result type is not complex")
@@ -1995,10 +2042,38 @@ def cx_via_bool[
     var keep = List[Owned]()
     var vals = List[Value]()
     var cx_out = False
+    var any_cx = False
+    for i in range(k):
+        var v = args[unsafe_offset=i].copy()
+        if (v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF) and v_is_complex(v):
+            any_cx = True
     var out_idx = n_args - 1
     comptime is_out = overload.endswith("out")
     comptime logical = op.startswith("logical_")
     comptime if logical:
+        # a float16 tensor meeting a 0-d complex one computes in
+        # ComplexHalf, which the kernel's dispatch refuses first
+        for i in range(k):
+            var v = args[unsafe_offset=i].copy()
+            var w = args[unsafe_offset=k - 1 - i].copy()
+            if (
+                (v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF)
+                and (w.tag == TAG_TENSOR or w.tag == TAG_TENSOR_REF)
+                and i != k - 1 - i
+            ):
+                var t = v_tensor_c(v)
+                var c = v_tensor_c(w)
+                # (a CPU self meets the device check first: comparison_op)
+                if (
+                    t.stype == ST_FLOAT16
+                    and t.rank > 0
+                    and c.is_complex()
+                    and c.rank == 0
+                    and v_tensor_c(args[unsafe_offset=0]).on_mojo()
+                ):
+                    unsupported(
+                        '"' + op + "_cuda\" not implemented for 'ComplexHalf'"
+                    )
         # TensorIterator's device check: no CPU operand, not even a 0-d one
         var dev = -1
         for i in range(k):
@@ -2049,6 +2124,18 @@ def cx_via_bool[
             and v_is_complex(v)
         ):
             var b = own(cast_complex(v_tensor_c(v), ST_BOOL))
+            vals.append(Value(TAG_TENSOR, 0, Int64(b.t.h), 0))
+            keep.append(b^)
+        elif (
+            logical
+            and any_cx
+            and i < k
+            and (v.tag == TAG_TENSOR or v.tag == TAG_TENSOR_REF)
+            and is_wide_unsigned(v_tensor_c(v).stype)
+        ):
+            # the other operand of a complex one: the kernel runs in the
+            # complex dtype, which has these; its truth is all that counts
+            var b = own(cast_any(v_tensor_c(v), ST_BOOL))
             vals.append(Value(TAG_TENSOR, 0, Int64(b.t.h), 0))
             keep.append(b^)
         else:

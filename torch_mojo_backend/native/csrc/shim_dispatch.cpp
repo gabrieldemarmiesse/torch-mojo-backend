@@ -68,7 +68,16 @@ inline double bits_double(int64_t b) { double d; std::memcpy(&d, &b, 8); return 
 
 void scalar_to_record(const c10::Scalar& s, TmbValue& out) {
   if (s.isBoolean()) { out.tag = TMB_SCALAR_BOOL; out.a = s.toBool(); }
-  else if (s.isIntegral(false)) { out.tag = TMB_SCALAR_INT; out.a = s.toLong(); }
+  else if (s.isIntegral(false)) {
+    out.tag = TMB_SCALAR_INT;
+    // A Python int in [2**63, 2**64) is a uint64 Scalar: its 64 bits in `a`,
+    // `b` = 1 marks it unsigned (toLong would throw).
+    if (s.type() == c10::ScalarType::UInt64 && s.toUInt64() > (uint64_t)INT64_MAX) {
+      out.a = (int64_t)s.toUInt64(); out.b = 1;
+    } else {
+      out.a = s.toLong(); out.b = 0;
+    }
+  }
   else if (s.isFloatingPoint()) { out.tag = TMB_SCALAR_DOUBLE; out.a = double_bits(s.toDouble()); }
   else { auto c = s.toComplexDouble(); out.tag = TMB_COMPLEX; out.a = double_bits(c.real()); out.b = double_bits(c.imag()); }
 }

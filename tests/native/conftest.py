@@ -36,6 +36,15 @@ def is_metal(device: str) -> bool:
     return idx < len(accelerators) and accelerators[idx].api == "metal"
 
 
+def is_cuda(device: str) -> bool:
+    """Whether `device` (a `mojo:<index>` string) is an NVIDIA GPU: where the
+    CUDA-exact policies (CUDA's errors, opmath alpha, ...) apply; other
+    backends keep the CPU-torch behaviour the older tests assert."""
+    idx = int(device.rsplit(":", 1)[-1])
+    accelerators = list(get_accelerators())
+    return idx < len(accelerators) and accelerators[idx].api == "cuda"
+
+
 def flush_subnormals_on_metal(
     t: torch.Tensor, device: str, dtype: torch.dtype | None = None
 ) -> torch.Tensor:
