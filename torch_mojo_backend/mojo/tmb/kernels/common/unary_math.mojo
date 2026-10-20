@@ -663,16 +663,17 @@ def elementwise_unary[
     kind: StaticString, dtype: DType, width: SIMDLength
 ](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
     comptime if kind == "relu":
-        comptime if is_nvidia_gpu() and dtype.is_floating_point():
+        comptime if is_nvidia_gpu() and dtype == DType.float32:
             # CUDA's relu is clamp_min(x, 0): NaN kept, fmaxf(-0.0, 0) = +0.
             # -0.0 is tested on the bits: a float `x <= 0` select becomes a
             # max.f32, which loses the NaN payload.
-            comptime u = DType.uint64 if dtype == DType.float64 else (
-                DType.uint32 if dtype == DType.float32 else DType.uint16
-            )
-            comptime sign = Scalar[u](1) << Scalar[u](bit_width_of[dtype]() - 1)
-            var neg_zero = bitcast[u](x).eq(sign)
+            comptime sign = Scalar[DType.uint32](1) << Scalar[DType.uint32](31)
+            var neg_zero = bitcast[DType.uint32](x).eq(sign)
             return (x.lt(0) | neg_zero).select(SIMD[dtype, width](0), x)
+        # NVIDIA half types: `x <= 0` keeps the NaN payload (the select stays
+        # a setp/selp, not a max), and sends -0.0 to +0.0 as CUDA does.
+        comptime if is_nvidia_gpu():
+            return x.le(0).select(SIMD[dtype, width](0), x)
         # Return the input for NaN and signed zero, as ATen relu does.
         return x.lt(0).select(SIMD[dtype, width](0), x)
     elif kind == "abs":
