@@ -27,7 +27,12 @@ from max.gpu.host import DeviceContext
 from std.math import ceildiv
 from std.memory import bitcast
 from std.utils.numerics import isnan
-from std.sys import is_amd_gpu, is_nvidia_gpu, llvm_intrinsic
+from std.sys import (
+    has_nvidia_gpu_accelerator,
+    is_amd_gpu,
+    is_nvidia_gpu,
+    llvm_intrinsic,
+)
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 
@@ -1126,9 +1131,11 @@ def _clamp_scalar[
     var in_ptr = _make_ptr[dtype](in_addr)
     # The 16-bit floats clamp in float32 (ClampLimits in opmath: a bound below
     # the type's subnormals still rounds into it), one rounding at the end.
-    # NVIDIA only: the other backends keep the native 16-bit max/min.
+    # (Only the NVIDIA device code uses it: the other backends keep the native
+    # 16-bit max/min.)
     comptime lim = DType.float32 if (
-        is_nvidia_gpu() and (dtype == DType.float16 or dtype == DType.bfloat16)
+        has_nvidia_gpu_accelerator()
+        and (dtype == DType.float16 or dtype == DType.bfloat16)
     ) else dtype
     var lo_s: Scalar[lim]
     var hi_s: Scalar[lim]
