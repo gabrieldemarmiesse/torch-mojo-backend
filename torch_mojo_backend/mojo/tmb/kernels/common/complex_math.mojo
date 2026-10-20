@@ -31,7 +31,7 @@ from std.memory import bitcast
 from std.sys.info import is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
-from tmb.kernels.common.libdevice_port import nv_atan2
+from tmb.kernels.common.libdevice_port import nv_atan2, nv_cos, nv_sin
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pointwise_math import (
     _exp,
@@ -101,7 +101,9 @@ def _rlog1p[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def _rcos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
-    comptime if dt == DType.float64:
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        return nv_cos(x.cast[DType.float64]()).cast[dt]()
+    elif dt == DType.float64:
         return _pcos[DType.float64](x.cast[DType.float64]()).cast[dt]()
     else:
         return _pcos[DType.float32](x.cast[DType.float32]()).cast[dt]()
@@ -109,7 +111,9 @@ def _rcos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def _rsin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
-    comptime if dt == DType.float64:
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        return nv_sin(x.cast[DType.float64]()).cast[dt]()
+    elif dt == DType.float64:
         return _psin[DType.float64](x.cast[DType.float64]()).cast[dt]()
     else:
         return _psin[DType.float32](x.cast[DType.float32]()).cast[dt]()
