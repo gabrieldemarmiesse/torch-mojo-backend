@@ -742,7 +742,15 @@ def neg_like_cuda[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def _jabs[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """fabs as CUDA's SASS computes it, an add with an |x| operand: a float
-    NaN comes out 0x7FFFFFFF, a double one quieted with its sign kept."""
+    NaN comes out 0x7FFFFFFF, a double one quieted with its sign kept
+    (NVIDIA only; elsewhere the plain bit mask)."""
+    comptime if not is_nvidia_gpu():
+        comptime if dt == DType.float64:
+            return bitcast[dt](bitcast[DType.uint64](x) & 0x7FFFFFFFFFFFFFFF)
+        else:
+            return bitcast[dt](
+                bitcast[DType.uint32](x.cast[DType.float32]()) & 0x7FFFFFFF
+            ).cast[dt]()
     comptime if dt == DType.float64:
         var b = bitcast[DType.uint64](x)
         if (b & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000:
@@ -902,6 +910,130 @@ def clog1p_c10[dt: DType](z: Cx[dt]) -> Cx[dt]:
             return Cx[dt](x, theta)
         return Cx[dt](Scalar[dt](0.5) * _rlog1p(r), theta)
     return Cx[dt](_rlog(chypot(x + Scalar[dt](1), y)), theta)
+
+
+@always_inline
+def _jsqr_plus[dt: DType](z: Cx[dt], c: Scalar[dt]) -> Cx[dt]:
+    """__sqr(z) + c: ((re - im)(re + im) + c, 2 re im), the product and the
+    add contracted into one fma, as NVRTC compiles it."""
+    return Cx[dt](
+        (z.re - z.im).fma(z.re + z.im, c), (Scalar[dt](2) * z.re) * z.im
+    )
+
+
+@always_inline
+def ctanh_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    if isinf(z.re):
+        if not _isfin(z.im):
+            return Cx[dt](_copysign(Scalar[dt](1), z.re), Scalar[dt](0))
+        return Cx[dt](
+            _copysign(Scalar[dt](1), z.re),
+            _copysign(Scalar[dt](0), _rsin(Scalar[dt](2) * z.im)),
+        )
+    if isnan(z.re) and _is_zero(z.im):
+        return z.copy()
+    var r2 = Scalar[dt](2) * z.re
+    var i2 = Scalar[dt](2) * z.im
+    var d = _nv_cosh(r2) + _rcos(i2)
+    var rsh = _nv_sinh(r2)
+    if isinf(rsh) and isinf(d):
+        return Cx[dt](
+            Scalar[dt](-1) if _signbit(rsh) else Scalar[dt](1),
+            Scalar[dt](0) if (
+                not isnan(i2) and not _signbit(i2) and not _is_zero(i2)
+            ) else neg_like_cuda(Scalar[dt](0)),
+        )
+    return Cx[dt](rsh / d, _rsin(i2) / d)
+
+
+@always_inline
+def ctan_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    return _rot_out(ctanh_jit(_rot_in(z)))
+
+
+@always_inline
+def casinh_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    var pi = _jpi[dt]()
+    if isinf(z.re):
+        if isnan(z.im):
+            return z.copy()
+        if isinf(z.im):
+            return Cx[dt](z.re, _copysign(pi * Scalar[dt](0.25), z.im))
+        return Cx[dt](z.re, _copysign(Scalar[dt](0), z.im))
+    if isnan(z.re):
+        if isinf(z.im):
+            return Cx[dt](z.im, z.re)
+        if _is_zero(z.im):
+            return z.copy()
+        return Cx[dt](z.re, z.re)
+    if isinf(z.im):
+        return Cx[dt](
+            _copysign(z.im, z.re), _copysign(pi / Scalar[dt](2), z.im)
+        )
+    var s = csqrt_jit(_jsqr_plus(z, Scalar[dt](1)))
+    var w = clog_jit(Cx[dt](z.re + s.re, z.im + s.im))
+    return Cx[dt](_copysign(w.re, z.re), _copysign(w.im, z.im))
+
+
+@always_inline
+def casin_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    return _rot_out(casinh_jit(_rot_in(z)))
+
+
+@always_inline
+def cacosh_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    var pi = _jpi[dt]()
+    if isinf(z.re):
+        if isnan(z.im):
+            return Cx[dt](_jabs(z.re), z.im)
+        if isinf(z.im):
+            if not _signbit(z.re):
+                return Cx[dt](z.re, _copysign(pi * Scalar[dt](0.25), z.im))
+            return Cx[dt](
+                neg_like_cuda(z.re), _copysign(pi * Scalar[dt](0.75), z.im)
+            )
+        if _signbit(z.re):
+            return Cx[dt](neg_like_cuda(z.re), _copysign(pi, z.im))
+        return Cx[dt](z.re, _copysign(Scalar[dt](0), z.im))
+    if isnan(z.re):
+        if isinf(z.im):
+            return Cx[dt](_jabs(z.im), z.re)
+        return Cx[dt](z.re, z.re)
+    if isinf(z.im):
+        return Cx[dt](_jabs(z.im), _copysign(pi / Scalar[dt](2), z.im))
+    var s = csqrt_jit(_jsqr_plus(z, Scalar[dt](-1)))
+    var w = clog_jit(Cx[dt](z.re + s.re, z.im + s.im))
+    return Cx[dt](_copysign(w.re, Scalar[dt](0)), _copysign(w.im, z.im))
+
+
+@always_inline
+def cacos_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    var pi = _jpi[dt]()
+    if isinf(z.re):
+        if isnan(z.im):
+            return Cx[dt](z.im, z.re)
+        if isinf(z.im):
+            if _signbit(z.re):
+                return Cx[dt](Scalar[dt](0.75) * pi, neg_like_cuda(z.im))
+            return Cx[dt](Scalar[dt](0.25) * pi, neg_like_cuda(z.im))
+        if _signbit(z.re):
+            return Cx[dt](pi, neg_like_cuda(z.re) if _signbit(z.im) else z.re)
+        return Cx[dt](
+            Scalar[dt](0), z.re if _signbit(z.im) else neg_like_cuda(z.re)
+        )
+    if isnan(z.re):
+        if isinf(z.im):
+            return Cx[dt](z.re, neg_like_cuda(z.im))
+        return Cx[dt](z.re, z.re)
+    if isinf(z.im):
+        return Cx[dt](pi / Scalar[dt](2), neg_like_cuda(z.im))
+    if _is_zero(z.re) and (_is_zero(z.im) or isnan(z.im)):
+        return Cx[dt](pi / Scalar[dt](2), neg_like_cuda(z.im))
+    var s = csqrt_jit(_jsqr_plus(z, Scalar[dt](-1)))
+    var w = clog_jit(Cx[dt](z.re + s.re, z.im + s.im))
+    if _signbit(z.im):
+        return Cx[dt](_jabs(w.im), _jabs(w.re))
+    return Cx[dt](_jabs(w.im), neg_like_cuda(_jabs(w.re)))
 
 
 # --------------------------------------------------------------------------- #

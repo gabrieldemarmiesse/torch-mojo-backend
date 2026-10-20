@@ -34,15 +34,24 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.host import DeviceContext
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    is_nvidia_gpu,
+    size_of,
+)
 from std.utils.coord import Coord
 from std.utils.numerics import isinf, isnan
 
 from tmb.kernels.common.complex_math import (
     Cx,
+    cacos_jit,
     cacos_thrust,
+    cacosh_jit,
     cacosh_thrust,
+    casin_jit,
     casin_thrust,
+    casinh_jit,
     casinh_thrust,
     catan2,
     catan_jit,
@@ -66,7 +75,9 @@ from tmb.kernels.common.complex_math import (
     csin_jit,
     csinh_jit,
     csqrt_jit,
+    ctan_jit,
     ctan_thrust,
+    ctanh_jit,
     ctanh_thrust,
     neg_like_cuda,
 )
@@ -150,23 +161,41 @@ def _unary_cx[kind: StaticString, dt: DType](z: Cx[dt]) -> Cx[dt]:
     elif kind == "cos":
         return ccos_jit(z)
     elif kind == "tan":
-        return ctan_thrust(z)
+        comptime if is_nvidia_gpu():
+            return ctan_thrust(z)
+        else:
+            return ctan_jit(z)
     elif kind == "sinh":
         return csinh_jit(z)
     elif kind == "cosh":
         return ccosh_jit(z)
     elif kind == "tanh":
-        return ctanh_thrust(z)
+        comptime if is_nvidia_gpu():
+            return ctanh_thrust(z)
+        else:
+            return ctanh_jit(z)
     elif kind == "asin":
-        return casin_thrust(z)
+        comptime if is_nvidia_gpu():
+            return casin_thrust(z)
+        else:
+            return casin_jit(z)
     elif kind == "acos":
-        return cacos_thrust(z)
+        comptime if is_nvidia_gpu():
+            return cacos_thrust(z)
+        else:
+            return cacos_jit(z)
     elif kind == "atan":
         return catan_jit(z)
     elif kind == "asinh":
-        return casinh_thrust(z)
+        comptime if is_nvidia_gpu():
+            return casinh_thrust(z)
+        else:
+            return casinh_jit(z)
     elif kind == "acosh":
-        return cacosh_thrust(z)
+        comptime if is_nvidia_gpu():
+            return cacosh_thrust(z)
+        else:
+            return cacosh_jit(z)
     elif kind == "atanh":
         return catanh_jit(z)
     elif kind == "log10":
