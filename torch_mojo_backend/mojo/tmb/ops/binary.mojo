@@ -22,6 +22,7 @@ from std.utils import IndexList
 from std.utils.numerics import nan
 
 from tmb.backend.abi import (
+    view_strided,
     is_float8_stype,
     max_dtype,
     DEVICE_TYPE_CPU,
@@ -1158,6 +1159,34 @@ def _b_binary(
         kop = _b_bool_add_as_or(op, dtype)
         _b_op_dtype_ok(kop, dtype, is_cmp)
         var fill = _b_scalar_fill(s, dtype, device)
+        if t.rank > 4:
+            # The spec entry's rank > 4 pass is flat: run the whole tensor
+            # as one dense 1-D span against the scalar, into a flat view of
+            # the full-shape output.
+            var dense = _b_ready(t, dtype, True)
+            var out_full = own(
+                new_tensor(
+                    dense.t.shape,
+                    dense.t.rank,
+                    out_stype if out_stype >= 0 else dtype,
+                    device,
+                )
+            )
+            var flat_in = own(_b_flat_view(dense.t))
+            var flat_out = own(_b_flat_view(out_full.t))
+            if lhs.is_t:
+                _b_binary_spec(
+                    kop, flat_in.t, fill.t, flat_out.t, alpha, scalar_side
+                )
+            else:
+                _b_binary_spec(
+                    kop, fill.t, flat_in.t, flat_out.t, alpha, scalar_side
+                )
+            _ = fill
+            _ = dense
+            _ = flat_in^
+            _ = flat_out^
+            return Res(out_full.take(), True)
         if lhs.is_t:
             a_h = _b_ready(t, dtype, False)
             b_h = fill^
@@ -1191,6 +1220,15 @@ def _b_binary(
     _ = a_h
     _ = b_h
     return Res(out.take(), True)
+
+
+def _b_flat_view(t: T) raises -> T:
+    """A 1-D view over a dense tensor's elements, in memory order."""
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = t.numel
+    var strides = IndexList[MAX_RANK](0)
+    strides[MAX_RANK - 1] = 1
+    return view_strided(t, shape, strides, 1, t.offset)
 
 
 def _b_exact_on(t: T) raises -> Bool:

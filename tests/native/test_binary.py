@@ -2357,3 +2357,24 @@ def test_floor_divide_out_errors(mojo_gpu):
         torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
     with pytest.raises(RuntimeError):
         a.clone().floor_divide_(torch.ones(2, 3, device=mojo_gpu))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int32])
+@pytest.mark.parametrize("fn", [torch.add, torch.sub, torch.mul, torch.rsub])
+def test_rank5_tensor_with_python_scalar(mojo_gpu, fn, dtype):
+    """Rank > 4 with a number used to raise "rank > 4 needs equal shapes"
+    (float64 add / sub / mul, int rsub): the number runs against the dense
+    tensor as one flat span."""
+    x_cpu = torch.arange(2 * 3 * 4 * 5 * 6).reshape(2, 3, 4, 5, 6).to(dtype)
+    x = x_cpu.to(mojo_gpu)
+    for scalar in (2, 3.5) if dtype.is_floating_point else (2,):
+        torch.testing.assert_close(
+            fn(x, scalar).cpu(), fn(x_cpu, scalar), rtol=0, atol=0
+        )
+        if fn is not torch.rsub:
+            torch.testing.assert_close(
+                fn(scalar, x).cpu() if fn is not torch.sub else (scalar - x).cpu(),
+                fn(scalar, x_cpu) if fn is not torch.sub else scalar - x_cpu,
+                rtol=0,
+                atol=0,
+            )

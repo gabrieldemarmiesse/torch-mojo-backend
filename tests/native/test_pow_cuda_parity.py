@@ -82,12 +82,6 @@ def test_tensor_scalar(cuda_oracle: CudaOracle, dtype):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the mojo device has no result type for uint16 / uint32 / uint64"
-    " with a floating Scalar ('type promotion of dtypes 27 and 6', the shared"
-    " promotion code in tmb/ops; add / mul fail the same way)",
-)
 @pytest.mark.parametrize("dtype", bp.UINTS, ids=bp.name)
 def test_uint_float_promotion(cuda_oracle: CudaOracle, dtype):
     bp.check_all(
@@ -221,12 +215,6 @@ def test_float_power_complex_dev0d_base(cuda_oracle: CudaOracle, dtype):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="float_power converts a float16 NaN to float64 with CastSpec, which"
-    " keeps its payload, where stock CUDA's cast goes through float32 (the"
-    " canonical 0x7fffffffe0000000); casts belong to another group",
-)
 def test_float_power_half_nan(cuda_oracle: CudaOracle):
     nans = bp.from_bits([0x7E00, 0xFE00, 0x7E01, 0x7C01], torch.float16)
     cuda_oracle.assert_bitwise_equal(torch.float_power, nans, 2.0)
