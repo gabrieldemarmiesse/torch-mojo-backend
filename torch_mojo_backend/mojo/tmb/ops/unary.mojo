@@ -115,6 +115,8 @@ from tmb.ops.complex_math import (
     cx_rsqrt_out,
     cx_sgn,
     cx_sgn_out,
+    cx_sinc,
+    cx_sinc_out,
     cx_sqrt,
     cx_sqrt_out,
 )
@@ -3013,11 +3015,27 @@ def register_unary(site: Site) raises:
         "sin.out",
     ](site)
     impl[
-        f8_iter[op_sinc, "sinc_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_sinc, cx_sinc, 1],
+            "sinc_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "sinc",
     ](site)
     impl[
-        f8_iter[op_sinc_out, "sinc_cuda", 1, 1, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            routed[op_sinc_out, cx_sinc_out, 2],
+            "sinc_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+        ],
         "sinc.out",
     ](site)
     impl[

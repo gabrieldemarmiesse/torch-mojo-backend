@@ -256,6 +256,28 @@ def test_unary_special_complex_inputs_match_cuda(
     cuda_oracle.assert_bitwise_equal(fn, torch.complex(re, im).to(dtype))
 
 
+@pytest.mark.parametrize("dtype", (torch.complex64, torch.complex128), ids=str)
+def test_sinc_complex_wide_range_and_variants_match_cuda(
+    cuda_oracle: CudaOracle, dtype: torch.dtype
+):
+    g = _gen(5)
+    mag = 10 ** (torch.rand(4096, generator=g) * 12 - 6)
+    re = (torch.randn(4096, generator=g) * mag).to(torch.float32)
+    im = (torch.randn(4096, generator=g) * mag.flip(0)).to(torch.float32)
+    z = torch.complex(re, im).to(dtype)
+    eq = cuda_oracle.assert_bitwise_equal
+    eq(torch.sinc, z, what="wide range")
+
+    def variants(t: torch.Tensor) -> object:
+        out = torch.empty_like(t)
+        torch.sinc(t, out=out)
+        strided = torch.zeros(2 * t.numel(), dtype=t.dtype, device=t.device)[::2]
+        torch.sinc(t, out=strided)
+        return out, strided, t.clone().sinc_(), t.t().sinc()
+
+    eq(variants, z.reshape(64, 64), what="out= / in-place / transposed")
+
+
 def _variants(fn: Callable[..., torch.Tensor], method: str | None, dtype: torch.dtype):
     """out= (dense, strided, another dtype), a transposed and an offset
     input, the in-place method on a view, a 0-dim and an empty input."""

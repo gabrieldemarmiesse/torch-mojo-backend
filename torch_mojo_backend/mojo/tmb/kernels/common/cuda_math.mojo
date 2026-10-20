@@ -1293,3 +1293,63 @@ def nv_lgammaf(a: Float32) -> Float32:
     var r = fma(-q, Float32(0.5), x) * _f(0x40490FDB)
     var s = _abs(_sin_poly(r, qi))
     return (_f(0x3F928682) - nv_logf(x * s)) - t
+
+
+# --------------------------------------------------------------------------- #
+# sinhf / coshf
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _div_approx_ftz(a: Float32, b: Float32) -> Float32:
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "div.approx.ftz.f32 $0, $1, $2;",
+            Float32,
+            constraints="=f,f,f",
+            has_side_effect=False,
+        ](a, b)
+    else:
+        return a / b
+
+
+@always_inline
+def _expf_quarter(x: Float32) -> Float32:
+    """e^x / 4 for x >= 0 (`__internal_expf_kernel` with scale 2^-2, as
+    `__nv_sinhf` / `__nv_coshf` inline it): j = trunc(x log2(e)) capped at
+    126, a two-term ln 2 reduction, ex2.approx.ftz times 2^(j - 2)."""
+    var j = _trunc(_mul_rn(x, _f(0x3FB8AA3B)))
+    if _abs(j) > Float32(126.0):
+        j = _copysign(Float32(126.0), j)
+    var r = fma(j, -_f(0x3F317218), x)
+    r = fma(j, _f(0x3102E308), r)
+    var z = r * _f(0x3FB8AA3B)
+    # j + 1.5 * 2^23 + 125: its low mantissa bits shifted into the exponent
+    var bias = j + Float32(12583037.0)
+    var scale = Float32(from_bits=bias.to_bits[DType.uint32]() << UInt32(23))
+    return _ex2_approx_ftz(z) * scale
+
+
+@always_inline
+def nv_sinhf(a: Float32) -> Float32:
+    """`__nv_sinhf`: 2 E - 1 / (8 E), E = e^|a| / 4, signed by `a`, from
+    |a| = 1 on; an odd polynomial below."""
+    var x = _abs(a)
+    if x >= Float32(1.0):
+        var e = _expf_quarter(x)
+        return _copysign(
+            fma(Float32(2.0), e, _div_approx_ftz(Float32(-0.125), e)), a
+        )
+    var a2 = a * a
+    var p = fma(_f(0x363D0ADA), a2, _f(0x394FFF49))
+    p = fma(p, a2, _f(0x3C08889A))
+    p = fma(p, a2, _f(0x3E2AAAAB))
+    p = p * a2
+    return fma(p, a, a)
+
+
+@always_inline
+def nv_coshf(a: Float32) -> Float32:
+    """`__nv_coshf`: 2 E + 1 / (8 E), E = e^|a| / 4."""
+    var e = _expf_quarter(_abs(a))
+    return fma(Float32(2.0), e, _div_approx_ftz(Float32(0.125), e))

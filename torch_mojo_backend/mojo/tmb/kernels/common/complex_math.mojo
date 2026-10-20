@@ -28,7 +28,11 @@ tests that survive the fast-math flags) rather than a comparison.
 """
 
 from std.memory import bitcast
+from std.sys.info import is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
+
+from tmb.kernels.common.cuda_math import nv_coshf, nv_cosf, nv_sinf, nv_sinhf
+from tmb.kernels.common.libdevice_port import nv_cosh, nv_sincos, nv_sinh
 
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pointwise_math import (
@@ -619,3 +623,152 @@ def cpow[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
     exp(log(x) * y), special values included (a zero base gives
     exp(-inf + NaN i) = 0 for a nonzero real exponent)."""
     return cexp(cmul(clog(x), y))
+
+
+# --------------------------------------------------------------------------- #
+# sinc of a complex number: the jiterator's sinc_string over libc++'s
+# <complex> (llvm_complex.cpp), NVRTC --fmad=true. The sin / sinh / neg
+# helpers below are the ones exact-unary-basic adds under the same names.
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _jnan[dt: DType]() -> Scalar[dt]:
+    """The jiterator's `NAN`, `__int_as_float(0x7fffffff)`: a float even
+    where it becomes a double (NVIDIA; elsewhere the plain NaN)."""
+    comptime if is_nvidia_gpu():
+        return bitcast[DType.float32](UInt32(0x7FFFFFFF)).cast[dt]()
+    else:
+        return nan[dt]()
+
+
+@always_inline
+def _isfin[dt: DType](x: Scalar[dt]) -> Bool:
+    return not (isinf(x) or isnan(x))
+
+
+@always_inline
+def neg_like_cuda[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """C's -x as CUDA compiles it: a sign-bit flip for float (a NaN's sign
+    flips too), the hardware negation for double. Elsewhere the plain -x."""
+    comptime if not is_nvidia_gpu():
+        return -x
+    elif dt == DType.float64:
+        return -x
+    else:
+        return bitcast[dt](
+            bitcast[DType.uint32](x.cast[DType.float32]()) ^ 0x80000000
+        ).cast[dt]()
+
+
+@always_inline
+def _jcos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return rebind[Scalar[dt]](nv_sincos(rebind[Float64](x))[1])
+    elif is_nvidia_gpu():
+        return rebind[Scalar[dt]](nv_cosf(rebind[Float32](x)))
+    else:
+        return _rcos(x)
+
+
+@always_inline
+def _jsin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return rebind[Scalar[dt]](nv_sincos(rebind[Float64](x))[0])
+    elif is_nvidia_gpu():
+        return rebind[Scalar[dt]](nv_sinf(rebind[Float32](x)))
+    else:
+        return _rsin(x)
+
+
+@always_inline
+def _nv_sinh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float64:
+        return rebind[Scalar[dt]](nv_sinh(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_sinhf(rebind[Float32](x)))
+
+
+@always_inline
+def _nv_cosh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float64:
+        return rebind[Scalar[dt]](nv_cosh(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_coshf(rebind[Float32](x)))
+
+
+@always_inline
+def csinh_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    """libc++'s sinh(complex)."""
+    if isinf(z.re) and not _isfin(z.im):
+        return Cx[dt](z.re, _jnan[dt]())
+    if _is_zero(z.re) and not _isfin(z.im):
+        return Cx[dt](z.re, _jnan[dt]())
+    if _is_zero(z.im) and not _isfin(z.re):
+        return z.copy()
+    return Cx[dt](_nv_sinh(z.re) * _jcos(z.im), _nv_cosh(z.re) * _jsin(z.im))
+
+
+@always_inline
+def csin_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    """libc++'s sin(complex): -i sinh(i z)."""
+    var w = csinh_jit(Cx[dt](neg_like_cuda(z.im), z.re))
+    return Cx[dt](w.im, neg_like_cuda(w.re))
+
+
+@always_inline
+def cmul_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+    """libc++'s operator*(complex, complex) with Annex G recovery."""
+    # Modified from libc++ operator*(const complex&, const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
+    var a = z.re
+    var b = z.im
+    var c = w.re
+    var d = w.im
+    var ac = a * c
+    var bd = b * d
+    var ad = a * d
+    var bc = b * c
+    var x = a.fma(c, -bd)
+    var y = a.fma(d, bc)
+    if isnan(x) and isnan(y):
+        var recalc = False
+        if isinf(a) or isinf(b):
+            a = _copysign(Scalar[dt](1) if isinf(a) else Scalar[dt](0), a)
+            b = _copysign(Scalar[dt](1) if isinf(b) else Scalar[dt](0), b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if isinf(c) or isinf(d):
+            c = _copysign(Scalar[dt](1) if isinf(c) else Scalar[dt](0), c)
+            d = _copysign(Scalar[dt](1) if isinf(d) else Scalar[dt](0), d)
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            recalc = True
+        if not recalc and (isinf(ac) or isinf(bd) or isinf(ad) or isinf(bc)):
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if recalc:
+            x = _inf[dt]() * a.fma(c, -(b * d))
+            y = _inf[dt]() * a.fma(d, b * c)
+    return Cx[dt](x, y)
+
+
+@always_inline
+def csinc_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    """The jiterator's sinc_string: 1 at 0, else sin(pi z) / (pi z)."""
+    if _is_zero(z.re) and _is_zero(z.im):
+        return Cx[dt](Scalar[dt](1), Scalar[dt](0))
+    var pi = Cx[dt](Float64(3.141592653589793).cast[dt](), Scalar[dt](0))
+    var product = cmul_jit(pi, z)
+    return cdiv_jit(csin_jit(product.copy()), product)

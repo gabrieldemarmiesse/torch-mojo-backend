@@ -43,6 +43,7 @@ from tmb.kernels.common.complex_math import (
     catan2,
     cdiv,
     cdiv_jit,
+    csinc_jit,
     cexp,
     cexp_jit,
     chypot,
@@ -85,6 +86,7 @@ comptime KINDS_CX_CX = [
     "rsqrt",
     "sgn",
     "square",
+    "sinc",
 ]
 comptime KINDS_CX_RE = ["abs", "angle", "real", "imag"]
 comptime KINDS_CX_B = ["isnan", "isinf", "isfinite", "nonzero"]
@@ -111,6 +113,8 @@ def _unary_cx[kind: StaticString, dt: DType](z: Cx[dt]) -> Cx[dt]:
         return cdiv_jit(Cx[dt](Scalar[dt](1), Scalar[dt](0)), csqrt_jit(z))
     elif kind == "sgn":
         return csgn(z)
+    elif kind == "sinc":
+        return csinc_jit(z)
     else:
         comptime assert kind == "square", "unknown complex unary kind"
         return cmul(z, z)
