@@ -24,6 +24,7 @@ from std.math import ceildiv
 from max.gpu.host import DeviceContext
 from std.sys import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
 from std.sys.defines import get_defined_int
+from std.sys._assembly import inlined_assembly
 from std.sys.info import (
     has_accelerator,
     has_amd_gpu_accelerator,
@@ -72,7 +73,7 @@ from tmb.kernels.common.op_utils import (
     _transpose2d_kernel,
 )
 
-from tmb.kernels.common.dtype_convert import f32_to_bf16
+from tmb.kernels.common.dtype_convert import f32_to_bf16, half_to_f64
 from tmb.kernels.common.float8 import f32_to_fp8, fp8_to_f32, is_float8
 from tmb.kernels.data_movement.batched_copy import copy_batched
 from tmb.kernels.data_movement.masked_select import (
@@ -2239,6 +2240,102 @@ comptime CAST_THREADS = GS_THREADS
 
 
 @always_inline
+def _nv_cvt_int[src: DType, dst: DType]() -> Bool:
+    """A float -> integer conversion `_nv_float_to_int` spells out."""
+    return src.is_floating_point() and (
+        dst == DType.int8
+        or dst == DType.int16
+        or dst == DType.uint16
+        or dst == DType.uint32
+        or dst == DType.uint64
+    )
+
+
+@always_inline
+def _nv_float_to_int[
+    src: DType, dst: DType, width: Int
+](v: SIMD[src, width]) -> SIMD[dst, width]:
+    """float -> integer as nvcc compiles CUDA's `static_cast` in the copy
+    kernel (a half / bfloat16 through float): int8 / int16 are the
+    saturating cvt.rzi.s32 truncated, uint16 the cvt.rzi.u32 one, uint32 /
+    uint64 cvt.rzi.u32 / u64 themselves (NaN 0, negative 0, too large the
+    maximum)."""
+    comptime fsrc = DType.float64 if src == DType.float64 else DType.float32
+    var f = v.cast[fsrc]()
+    var r = SIMD[dst, width]()
+    comptime for i in range(width):
+        comptime if dst == DType.uint64:
+            r[i] = rebind[Scalar[dst]](_cvt_rzi[DType.uint64](f[i]))
+        elif dst == DType.uint32 or dst == DType.uint16:
+            r[i] = _cvt_rzi[DType.uint32](f[i]).cast[dst]()
+        else:
+            r[i] = _cvt_rzi[DType.int32](f[i]).cast[dst]()
+    return r
+
+
+@always_inline
+def _cvt_rzi[ft: DType, //, it: DType](x: Scalar[ft]) -> Scalar[it]:
+    """cvt.rzi.<it>.<ft>: round toward zero, saturating, NaN 0."""
+    comptime if it == DType.uint64 and ft == DType.float64:
+        return rebind[Scalar[it]](
+            inlined_assembly[
+                "cvt.rzi.u64.f64 $0, $1;",
+                Scalar[DType.uint64],
+                constraints="=l,d",
+                has_side_effect=False,
+            ](x)
+        )
+    elif it == DType.uint64 and ft == DType.float32:
+        return rebind[Scalar[it]](
+            inlined_assembly[
+                "cvt.rzi.u64.f32 $0, $1;",
+                Scalar[DType.uint64],
+                constraints="=l,f",
+                has_side_effect=False,
+            ](x)
+        )
+    elif it == DType.uint32 and ft == DType.float64:
+        return rebind[Scalar[it]](
+            inlined_assembly[
+                "cvt.rzi.u32.f64 $0, $1;",
+                Scalar[DType.uint32],
+                constraints="=r,d",
+                has_side_effect=False,
+            ](x)
+        )
+    elif it == DType.uint32 and ft == DType.float32:
+        return rebind[Scalar[it]](
+            inlined_assembly[
+                "cvt.rzi.u32.f32 $0, $1;",
+                Scalar[DType.uint32],
+                constraints="=r,f",
+                has_side_effect=False,
+            ](x)
+        )
+    elif it == DType.int32 and ft == DType.float64:
+        return rebind[Scalar[it]](
+            inlined_assembly[
+                "cvt.rzi.s32.f64 $0, $1;",
+                Scalar[DType.int32],
+                constraints="=r,d",
+                has_side_effect=False,
+            ](x)
+        )
+    else:
+        comptime assert (
+            it == DType.int32 and ft == DType.float32
+        ), "no cvt.rzi for these types"
+        return rebind[Scalar[it]](
+            inlined_assembly[
+                "cvt.rzi.s32.f32 $0, $1;",
+                Scalar[DType.int32],
+                constraints="=r,f",
+                has_side_effect=False,
+            ](x)
+        )
+
+
+@always_inline
 def _cast_elem[
     src: DType, dst: DType, width: Int, sat: Bool = False
 ](v: SIMD[src, width]) -> SIMD[dst, width]:
@@ -2273,12 +2370,33 @@ def _cast_elem[
     """
     comptime if is_float8(src) or is_float8(dst):
         return _cast_float8[src, dst, width, sat](v)
+    elif is_nvidia_gpu() and _nv_cvt_int[src, dst]():
+        return _nv_float_to_int[src, dst, width](v)
+    elif is_nvidia_gpu() and src == DType.float16 and dst == DType.float64:
+        # Through float32, as c10::Half -> double is: cvt.f32.f16 makes a
+        # NaN the canonical 0x7FFFFFFF (an explicit instruction: LLVM would
+        # merge two fpexts into the payload-keeping cvt.f64.f16).
+        var mid = SIMD[DType.float32, width]()
+        comptime for i in range(width):
+            mid[i] = inlined_assembly[
+                "cvt.f32.f16 $0, $1;",
+                Float32,
+                constraints="=f,h",
+                has_side_effect=False,
+            ](rebind[Float16](v[i]))
+        return mid.cast[dst]()
     elif src == DType.float64 and (
         dst == DType.float16 or dst == DType.bfloat16
     ):
         var mid = v.cast[DType.float32]()
         var mid_bits = bitcast[DType.int32, width](mid)
         return bitcast[DType.float32, width](mid_bits).cast[dst]()
+    elif src == DType.float16 and dst == DType.float64 and is_nvidia_gpu():
+        # c10::Half widens through float: its cvt makes any NaN the
+        # canonical one (0x7FFFFFFF, 0x7FFFFFFFE0000000 as a double)
+        return rebind[SIMD[dst, width]](
+            half_to_f64(rebind[SIMD[DType.float16, width]](v))
+        )
     elif src.is_floating_point() and (
         dst == DType.uint8 or dst == DType.int8 or dst == DType.int16
     ):
@@ -2349,6 +2467,15 @@ def _cast_float8[
     var f: SIMD[DType.float32, width]
     comptime if is_float8(src):
         f = fp8_to_f32[src](bitcast[DType.uint8, width](v))
+        comptime if is_nvidia_gpu() and src == DType.float8_e5m2:
+            # c10's e5m2 -> float (fp16_ieee_to_fp32_value) scales the half
+            # bits by a float multiply, which makes a NaN 0x7FFFFFFF, then
+            # ORs the sign back in.
+            var fb = bitcast[DType.uint32, width](f)
+            var nan = (fb & 0x7FFFFFFF).gt(0x7F800000)
+            f = bitcast[DType.float32, width](
+                nan.select((fb & 0x80000000) | 0x7FFFFFFF, fb)
+            )
     elif src == DType.bool:
         f = v.cast[DType.uint8]().cast[DType.float32]()
     else:
@@ -2373,6 +2500,14 @@ def _cast_float8[
         return rebind[SIMD[dst, width]](f)
     elif dst.is_integral():
         return _f32_to_int_cuda[dst, width](f)
+    elif is_nvidia_gpu() and (dst == DType.float16 or dst == DType.bfloat16):
+        # cvt.rn.f16 / bf16.f32 makes every NaN 0x7FFF; spelled out, as the
+        # NaN constants of fp8_to_f32 would otherwise fold at compile time.
+        var nan = (bitcast[DType.uint32, width](f) & 0x7FFFFFFF).gt(0x7F800000)
+        return nan.select(
+            bitcast[dst, width](SIMD[DType.uint16, width](0x7FFF)),
+            _cast_elem[DType.float32, dst, width](f),
+        )
     else:
         return _cast_elem[DType.float32, dst, width](f)
 

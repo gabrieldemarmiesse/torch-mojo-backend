@@ -28,10 +28,21 @@ tests that survive the fast-math flags) rather than a comparison.
 """
 
 from std.memory import bitcast
+from std.sys import is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
+from tmb.kernels.common.libdevice_port import (
+    _mul_rn_d,
+    nv_atan2,
+    nv_cos,
+    nv_ldexp,
+    nv_ldexpf,
+    nv_sin,
+)
 from tmb.kernels.common.math_utils import ieee_sqrt
+from tmb.kernels.common.nan_order import nan_first2, nan_first3, quiet_nan
 from tmb.kernels.common.pointwise_math import (
+    _mul_rn,
     _exp,
     _log,
     _log1p,
@@ -48,6 +59,60 @@ struct Cx[dt: DType](Copyable, Movable):
 
     var re: Scalar[Self.dt]
     var im: Scalar[Self.dt]
+
+
+@always_inline
+def _nan64[dt: DType]() -> Bool:
+    """Whether NaN operands must be routed by hand: float64 on NVIDIA, where a
+    double op returns one of its NaN operands quieted (nan_order.mojo) and the
+    GPU build's fast-math flags may otherwise hand back any NaN."""
+    return dt == DType.float64 and is_nvidia_gpu()
+
+
+@always_inline
+def _q[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """The NaN `x` quieted, sign and payload kept."""
+    return quiet_nan[dt, 1](SIMD[dt, 1](x))[0]
+
+
+@always_inline
+def _mulx[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """`a * b` with DMUL's NaN rule (B, then A)."""
+    comptime if _nan64[dt]():
+        if isnan(b):
+            return _q(b)
+        if isnan(a):
+            return _q(a)
+        # opaque: an inf * 0 NaN must stay visible to the tests that follow
+        return rebind[Scalar[dt]](
+            _mul_rn_d(rebind[Float64](a), rebind[Float64](b))
+        )
+    return a * b
+
+
+@always_inline
+def _fmax[dt: DType](a: Scalar[dt], b: Scalar[dt], c: Scalar[dt]) -> Scalar[dt]:
+    """`fma(a, b, c)` with DFMA's NaN rule (B, then C, then A)."""
+    comptime if _nan64[dt]():
+        if isnan(b):
+            return _q(b)
+        if isnan(c):
+            return _q(c)
+        if isnan(a):
+            return _q(a)
+    return a.fma(b, c)
+
+
+@always_inline
+def _sub_self[dt: DType](y: Scalar[dt]) -> Scalar[dt]:
+    """`y - y`: the NaN itself quieted, NVIDIA's default NaN for an infinity."""
+    comptime if _nan64[dt]():
+        if isnan(y):
+            return _q(y)
+        if isinf(y):
+            return bitcast[dt](UInt64(0xFFF8000000000000))
+        return Scalar[dt](0)
+    return y - y
 
 
 @always_inline
@@ -84,22 +149,33 @@ def _is_zero[dt: DType](x: Scalar[dt]) -> Bool:
 
 @always_inline
 def _rexp[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if _nan64[dt]():
+        if isnan(x):
+            return _q(x)
     return _exp[dt, 1](x)
 
 
 @always_inline
 def _rlog[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if _nan64[dt]():
+        if isnan(x):
+            return _q(x)
     return _log[dt, 1](x)
 
 
 @always_inline
 def _rlog1p[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if _nan64[dt]():
+        if isnan(x):
+            return _q(x)
     return _log1p[dt, 1](x)
 
 
 @always_inline
 def _rcos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
-    comptime if dt == DType.float64:
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        return nv_cos(x.cast[DType.float64]()).cast[dt]()
+    elif dt == DType.float64:
         return _pcos[DType.float64](x.cast[DType.float64]()).cast[dt]()
     else:
         return _pcos[DType.float32](x.cast[DType.float32]()).cast[dt]()
@@ -107,7 +183,9 @@ def _rcos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def _rsin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
-    comptime if dt == DType.float64:
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        return nv_sin(x.cast[DType.float64]()).cast[dt]()
+    elif dt == DType.float64:
         return _psin[DType.float64](x.cast[DType.float64]()).cast[dt]()
     else:
         return _psin[DType.float32](x.cast[DType.float32]()).cast[dt]()
@@ -124,6 +202,16 @@ def chypot[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def catan2[dt: DType](y: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     """`arg(x + yi)` = atan2(y, x), the device's torch.atan2."""
+    comptime if _nan64[dt]():
+        # thrust's atan2 is libdevice's; a NaN operand comes back quieted,
+        # y's before x's (probed on stock CUDA).
+        if isnan(y):
+            return _q(y)
+        if isnan(x):
+            return _q(x)
+        return rebind[Scalar[dt]](
+            nv_atan2(rebind[Float64](y), rebind[Float64](x))
+        )
     var z = Scalar[dt](0)
     return pointwise["atan2", dt, dt, 1](y, x, z, SIMD[param_dtype[dt](), 4](0))
 
@@ -136,6 +224,40 @@ def cmul[dt: DType](a: Cx[dt], b: Cx[dt]) -> Cx[dt]:
     im = fma(a, d, b c). Spelled out so no contraction choice of this
     compiler can differ -- it decides overflow signs (inf - inf)."""
     return Cx[dt](a.re.fma(b.re, -(a.im * b.im)), a.re.fma(b.im, a.im * b.re))
+
+
+@always_inline
+def _dmul_u[dt: DType](x: Scalar[dt], u: Scalar[dt]) -> Scalar[dt]:
+    """x * u with `u` in the B slot: a float64 NaN is u's, then x's."""
+    return nan_first2[dt, 1](x * u, u, x)
+
+
+@always_inline
+def _dfma_u[
+    dt: DType, neg_c: Bool = False
+](x: Scalar[dt], u: Scalar[dt], c: Scalar[dt]) -> Scalar[dt]:
+    """fma(x, u, c) (`-c` with `neg_c`) as DFMA x, u, c: a float64 NaN is
+    u's, then c's (a negated c keeps its NaN's sign), then x's."""
+    var r = x.fma(u, -c if neg_c else c)
+    return nan_first3[dt, 1](r, u, c, x)
+
+
+@always_inline
+def cmul_scalar_first[dt: DType](s: Cx[dt], x: Cx[dt]) -> Cx[dt]:
+    """`cmul(s, x)` for a CPU scalar `s`, as CUDA's AUnaryFunctor computes
+    it: the same fmas, `s`'s parts in the B slots (`nan_order`)."""
+    var t = _dmul_u(x.im, s.im)
+    var u = _dmul_u(x.re, s.im)
+    return Cx[dt](_dfma_u[neg_c=True](x.re, s.re, t), _dfma_u(x.im, s.re, u))
+
+
+@always_inline
+def cmul_scalar_second[dt: DType](x: Cx[dt], v: Cx[dt]) -> Cx[dt]:
+    """`cmul(x, v)` for a CPU scalar `v` (BUnaryFunctor: div_true's product
+    by the reciprocal), `v`'s parts in the B slots."""
+    var t = _dmul_u(x.im, v.im)
+    var u = _dmul_u(x.im, v.re)
+    return Cx[dt](_dfma_u[neg_c=True](x.re, v.re, t), _dfma_u(x.re, v.im, u))
 
 
 @always_inline
@@ -271,11 +393,11 @@ def cexp[dt: DType](z: Cx[dt]) -> Cx[dt]:
     if hy >= INF_HI:
         # (double: thrust tests lx here, not ly -- kept)
         if lx != 0 or (hx & 0x7FFFFFFF) != INF_HI:
-            return Cx[dt](y - y, y - y)
+            return Cx[dt](_sub_self(y), _sub_self(y))
         elif (hx & 0x80000000) != 0:
             return Cx[dt](Scalar[dt](0), Scalar[dt](0))
         else:
-            return Cx[dt](x, y - y)
+            return Cx[dt](x, _sub_self(y))
     comptime EXP_OVFL = UInt32(0x40862E42) if dt == DType.float64 else UInt32(
         0x42B17218
     )
@@ -285,7 +407,7 @@ def cexp[dt: DType](z: Cx[dt]) -> Cx[dt]:
     if hx >= EXP_OVFL and hx <= CEXP_OVFL:
         return _ldexp_cexp(z, 0)
     var exp_x = _rexp(x)
-    return Cx[dt](exp_x * _rcos(y), exp_x * _rsin(y))
+    return Cx[dt](_mulx(exp_x, _rcos(y)), _mulx(exp_x, _rsin(y)))
 
 
 @always_inline
@@ -308,7 +430,7 @@ def clog[dt: DType](z: Cx[dt]) -> Cx[dt]:
     var x = z.re
     var y = z.im
     if isnan(x) or isnan(y):
-        return Cx[dt](_rlog(x.fma(x, y * y)), catan2(y, x))
+        return Cx[dt](_rlog(_fmax(x, x, _mulx(y, y))), catan2(y, x))
     var ax = abs(x)
     var ay = abs(y)
     if ax < ay:
@@ -440,6 +562,13 @@ def _logb[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 def _scalbn[dt: DType](x: Scalar[dt], n: Int) -> Scalar[dt]:
     """x * 2^n, exact (in up to three in-range power-of-two steps)."""
     # Modified from libc++ scalbn (libc++ <complex> helper, llvm_complex.cpp) (PyTorch v2.11.0; LLVM licence).
+    comptime if is_nvidia_gpu():
+        # CUDA's scalbn is libdevice's ldexp: one rounding, even into the
+        # subnormals (chunks of 2^-31 products, only the last one inexact)
+        comptime if dt == DType.float64:
+            return nv_ldexp(x.cast[DType.float64](), Int32(n)).cast[dt]()
+        else:
+            return nv_ldexpf(x.cast[DType.float32](), Int32(n)).cast[dt]()
     var r = x
     var k = n
     comptime lim = 1000 if dt == DType.float64 else 120
@@ -462,7 +591,7 @@ def _pow2[dt: DType](k: Int) -> Scalar[dt]:
 
 
 @always_inline
-def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+def cdiv_jit[dt: DType, contract: Bool = False](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
     """libc++'s operator/(complex, complex): scaled by the larger exponent
     of the divisor (logb / scalbn), Annex G recovery."""
     # Modified from libc++ operator/(const complex&, const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
@@ -481,9 +610,20 @@ def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
         ilogbw = Int(logbw)
         c = _scalbn(c, -ilogbw)
         d = _scalbn(d, -ilogbw)
-    var denom = c * c + d * d
-    var x = _scalbn((a * c + b * d) / denom, -ilogbw)
-    var y = _scalbn((b * c - a * d) / denom, -ilogbw)
+    var denom: Scalar[dt]
+    var x: Scalar[dt]
+    var y: Scalar[dt]
+    if contract and not (isnan(a) or isnan(b) or isnan(c) or isnan(d)):
+        # addcdiv's jiterated kernel: ptxas contracts the three sums in every
+        # inlined copy (SASS, and measured on complex64 and complex128):
+        # fma(c, c, d d), fma(a, c, b d), fma(b, c, -(a d))
+        denom = c.fma(c, _mul_rn[dt, 1](d, d))
+        x = _scalbn(a.fma(c, _mul_rn[dt, 1](b, d)) / denom, -ilogbw)
+        y = _scalbn(b.fma(c, -_mul_rn[dt, 1](a, d)) / denom, -ilogbw)
+    else:
+        denom = c * c + d * d
+        x = _scalbn((a * c + b * d) / denom, -ilogbw)
+        y = _scalbn((b * c - a * d) / denom, -ilogbw)
     if isnan(x) and isnan(y):
         if _is_zero(denom) and (not isnan(a) or not isnan(b)):
             var s = _copysign(_inf[dt](), c)
@@ -538,19 +678,32 @@ def clog_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
+def _cuda_nan[dt: DType]() -> Scalar[dt]:
+    """CUDA's `NAN` macro, `__int_as_float(0x7fffffff)`, as the NVRTC-compiled
+    libc++ complex code (the jiterated kernels) returns it, widened to double
+    for float64."""
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return bitcast[dt](UInt64(0x7FFFFFFFE0000000))
+    elif is_nvidia_gpu() and dt == DType.float32:
+        return bitcast[dt](UInt32(0x7FFFFFFF))
+    else:
+        return nan[dt]()
+
+
+@always_inline
 def _polar[dt: DType](rho: Scalar[dt], theta: Scalar[dt]) -> Cx[dt]:
     """libc++'s polar(rho, theta)."""
     # Modified from libc++ polar(const _Tp&, const _Tp&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
     if isnan(rho) or _signbit(rho):
-        return Cx[dt](nan[dt](), nan[dt]())
+        return Cx[dt](_cuda_nan[dt](), _cuda_nan[dt]())
     if isnan(theta):
         if isinf(rho):
             return Cx[dt](rho, theta)
         return Cx[dt](theta, theta)
     if isinf(theta):
         if isinf(rho):
-            return Cx[dt](rho, nan[dt]())
-        return Cx[dt](nan[dt](), nan[dt]())
+            return Cx[dt](rho, _cuda_nan[dt]())
+        return Cx[dt](_cuda_nan[dt](), _cuda_nan[dt]())
     var x = rho * _rcos(theta)
     if isnan(x):
         x = Scalar[dt](0)
@@ -618,4 +771,89 @@ def cpow[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
     """thrust's `pow(complex, complex)` (c10_complex_math::pow on CUDA):
     exp(log(x) * y), special values included (a zero base gives
     exp(-inf + NaN i) = 0 for a nonzero real exponent)."""
-    return cexp(cmul(clog(x), y))
+    var l = clog(x)
+    comptime if _nan64[dt]():
+        # thrust's operator* with the NaN rules of its DMUL / DFMA spelled out.
+        return cexp(
+            Cx[dt](
+                _fmax(l.re, y.re, -_mulx(l.im, y.im)),
+                _fmax(l.re, y.im, _mulx(l.im, y.re)),
+            )
+        )
+    return cexp(cmul(l, y))
+
+
+@always_inline
+def cexp_mul[dt: DType](fct: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+    """pow_scalar_tensor_impl's `std::exp(fct * exp)`: `fct` (the CPU-scalar
+    base's log) is a kernel argument, uniform, so ptxas puts it in the B slot
+    of the multiply's DMUL / DFMA and the tensor's value in A: where float64
+    NaNs meet, the scalar's wins (and the first product's)."""
+    comptime if _nan64[dt]():
+        return cexp(
+            Cx[dt](
+                _fmax(w.re, fct.re, -_mulx(w.im, fct.im)),
+                _fmax(w.im, fct.re, _mulx(w.re, fct.im)),
+            )
+        )
+    return cexp(cmul(fct, w))
+
+
+@always_inline
+def cmul_jit[dt: DType](z: Cx[dt], w: Cx[dt], fused: Bool = False) -> Cx[dt]:
+    """libc++'s operator*(complex, complex), as NVRTC compiles it for the
+    jiterated kernels (addcmul, lerp): four rounded products and one add
+    each (no contraction), then Annex G's recovery when both parts are NaN,
+    whose re-products NVRTC does contract: fma(a, c, -(b d)),
+    fma(b, c, a d). `fused`: the contracted product instead (see below)."""
+    # Modified from libc++ operator*(const complex&, const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
+    var a = z.re
+    var b = z.im
+    var c = w.re
+    var d = w.im
+    var ac = _mul_rn[dt, 1](a, c)
+    var bd = _mul_rn[dt, 1](b, d)
+    var ad = _mul_rn[dt, 1](a, d)
+    var bc = _mul_rn[dt, 1](b, c)
+    var x = ac - bd
+    var y = ad + bc
+    if fused and not (isnan(a) or isnan(b) or isnan(c) or isnan(d)):
+        # ptxas contracts the product of some inlined copies of the jiterated
+        # function: ac - bd as fma(a, c, -(b d)), ad + bc as fma(b, c, a d).
+        # (A NaN operand keeps the plain products: which NaN a contracted
+        # DFMA returns depends on the slots ptxas gave it, and the plain
+        # form is what measured exact for those.)
+        x = a.fma(c, -bd)
+        y = b.fma(c, ad)
+    if isnan(x) and isnan(y):
+        var recalc = False
+        if isinf(a) or isinf(b):
+            a = _unit_sign(a)
+            b = _unit_sign(b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if isinf(c) or isinf(d):
+            c = _unit_sign(c)
+            d = _unit_sign(d)
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            recalc = True
+        if not recalc and (isinf(ac) or isinf(bd) or isinf(ad) or isinf(bc)):
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if recalc:
+            x = _inf[dt]() * a.fma(c, -_mul_rn[dt, 1](b, d))
+            y = _inf[dt]() * b.fma(c, _mul_rn[dt, 1](a, d))
+    return Cx[dt](x, y)

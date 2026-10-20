@@ -1136,7 +1136,8 @@ def test_ldexp_large_float_exponent_tensor(mojo_gpu):
 
 def test_ldexp_int64_exponent_wraps_to_int(mojo_gpu):
     """An int64 exponent is converted to ::ldexp's int first (2**32 is 0),
-    for a device tensor, a CPU 0-d tensor and in place."""
+    for a device tensor and in place; a CPU 0-d one raises, as on CUDA (the
+    integer-exponent kernel's iterator takes no CPU scalar)."""
     x = torch.tensor([1.0, 0.5, -3.0])
     e = torch.tensor([2**32, -(2**32), 2**32 + 3])
     _close(
@@ -1146,24 +1147,23 @@ def test_ldexp_int64_exponent_wraps_to_int(mojo_gpu):
         atol=0.0,
     )
     for v in (2**32, 2**32 + 3, -(2**33) - 1):
-        e0 = torch.tensor(v)
-        _close(torch.ldexp(x.to(mojo_gpu), e0), torch.ldexp(x, e0), rtol=0.0, atol=0.0)
+        with pytest.raises(RuntimeError, match="same device"):
+            torch.ldexp(x.to(mojo_gpu), torch.tensor(v))
     y = x.to(mojo_gpu)
     y.ldexp_(e.to(mojo_gpu))
     _close(y, x.clone().ldexp_(e), rtol=0.0, atol=0.0)
 
 
 def test_ldexp_inplace_cpu_scalar_exponent(mojo_gpu):
-    """ldexp_ takes an explicit CPU 0-d exponent, float or integral."""
-    for e_cpu in (
-        torch.tensor(3.5, dtype=torch.float64),
-        torch.tensor(3),
-        torch.tensor(-2.25),
-    ):
+    """ldexp_ takes an explicit CPU 0-d float exponent (pow(2, e) is a CPU
+    scalar of mul); an integral one raises, as on CUDA."""
+    for e_cpu in (torch.tensor(3.5, dtype=torch.float64), torch.tensor(-2.25)):
         x_cpu = torch.tensor([1.0, 0.5, -3.0])
         x = x_cpu.to(mojo_gpu)
         x.ldexp_(e_cpu)
         _close(x, x_cpu.clone().ldexp_(e_cpu), rtol=0.0, atol=0.0)
+    with pytest.raises(RuntimeError, match="same device"):
+        torch.tensor([1.0], device=mojo_gpu).ldexp_(torch.tensor(3))
 
 
 def test_frexp_out_partially_overlapping_input(mojo_gpu):

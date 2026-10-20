@@ -29,7 +29,9 @@ def test_tensor_tensor(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
 @pytest.mark.parametrize(("op", "fn", "inplace"), _ARITH, ids=[a[0] for a in _ARITH])
 def test_tensor_scalar(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
-    scalars = bp.FLOAT_SCALARS + bp.COMPLEX_SCALARS
+    scalars = bp.FLOAT_SCALARS
+    if dtype != torch.float16:  # complex32: test_complex32_is_not_held
+        scalars = scalars + bp.COMPLEX_SCALARS
     reverse = [2.0, 3, -0.5, bp.nan_scalar(0x7FF8000000000123)] if op != "rsub" else []
     bp.check_all(
         cuda_oracle,
@@ -37,7 +39,7 @@ def test_tensor_scalar(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
     )
 
 
-_ALPHAS = [2, -1, 0, 3, 0.3, -2.5, 1e-40, float("nan"), True, 1.0]
+_ALPHAS = [2, -1, 0, 3, 0.3, -2.5, 1e-40, 1e300, float("nan"), True, 1.0]
 
 
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
@@ -62,8 +64,8 @@ def test_alpha(cuda_oracle: CudaOracle, op, dtype):
             cases.append(
                 (
                     f"t0d={s}/alpha={alpha!r}",
-                    lambda x, y, al=alpha: fn(x, y, alpha=al),
-                    (a, torch.tensor(s)),
+                    lambda x, s=s, al=alpha: fn(x, torch.tensor(s), alpha=al),
+                    (a,),
                 )
             )
         if op != "rsub":
@@ -107,6 +109,20 @@ def test_mixed_dtypes(cuda_oracle: CudaOracle, op, da, db):
     _, b = bp.pairs(db)
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
+    wide = torch.promote_types(da, db)
+    if wide in (torch.float64, torch.complex128):
+        real = torch.float64
+        both = torch.zeros(n, dtype=torch.bool)
+        for pa in (
+            (a.to(wide),) if not wide.is_complex else (a.to(wide).real, a.to(wide).imag)
+        ):
+            for pb in (
+                (b.to(wide),)
+                if not wide.is_complex
+                else (b.to(wide).real, b.to(wide).imag)
+            ):
+                both |= bp.two_distinct_nans(pa.to(real), pb.to(real))
+        a, b = a[~both], b[~both]
     bp.check_all(
         cuda_oracle,
         [
@@ -178,3 +194,15 @@ def test_cuda_float64_two_nans_depend_on_the_launch(cuda_oracle: CudaOracle):
     bits = torch.mul(a, b).cpu().view(torch.int64)
     assert bits[0] == nans[1:].view(torch.int64)[0]
     assert bits[-1] == nans[:1].view(torch.int64)[0]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="complex32 (float16 with a complex operand) is not held by the mojo"
+    " device (tmb/ops/complex.mojo): it declines where CUDA computes",
+)
+@pytest.mark.parametrize("op", ["add", "sub", "mul"])
+def test_complex32_is_not_held(cuda_oracle: CudaOracle, op):
+    a, _ = bp.pairs(torch.float16)
+    cuda_oracle.assert_bitwise_equal(lambda x: getattr(torch, op)(x, 1j), a)

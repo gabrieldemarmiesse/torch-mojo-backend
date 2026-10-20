@@ -82,6 +82,7 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.kernels.common.div_math import floor_div, trunc_div
 from tmb.kernels.common.cuda_div_math import (
     cuda_floor_div_by_scalar,
     cuda_trunc_div_by_scalar,
@@ -1106,8 +1107,8 @@ comptime SOP_POW = 2
 # ops layer's (true division).
 comptime SOP_FLOORDIV = 3
 comptime SOP_TRUNCDIV = 4
-# rsub(Tensor, Scalar other) with alpha 1: other - self in opmath, one
-# rounding (the CUDA sub kernel's fma(-1, self, other)).
+# `scalar + alpha * self` in opmath, one rounding: CUDA's add functor with
+# the CPU scalar first (rsub passes -alpha, its sub kernel's fma).
 comptime SOP_RSUB = 5
 
 
@@ -1189,8 +1190,8 @@ def _scalar_elementwise[
     ctx: DeviceContext,
     alpha: Float32 = 1,
 ) raises:
-    """`alpha`: add's (`a + alpha * scalar`) and rsub's
-    (`scalar - alpha * a`), both one fma in float as CUDA's add functors."""
+    """`alpha`: add's `a + alpha * scalar` and rsub's `scalar + alpha * a`
+    (rsub passes -alpha), each one fma in float as CUDA's add functors."""
     comptime if not dtype.is_floating_point():
         raise Error("scalar elementwise ops require a floating point dtype")
     else:
@@ -1235,17 +1236,21 @@ def _scalar_elementwise[
         ):
             sv = scalar.cast[dtype]().cast[DType.float32]()
 
+        # NVIDIA only: add / rsub take alpha as one fma. Elsewhere the plain
+        # body is launched (an unused closure compiles to nothing), so those
+        # kernels stay the ones that were measured.
         @always_inline
         @__parameter
         @__copy_capture(out_ptr, in_ptr, sv, alpha, inv)
-        def body[width: Int, al: Int, pk: Int](i: Int):
+        def body_exact[width: Int, al: Int, pk: Int](i: Int):
             var a = in_ptr.unsafe_load[width=width, alignment=al](i).cast[
                 DType.float32
             ]()
             var s = SIMD[DType.float32, width](sv)
             comptime if op_code == SOP_ADD:
                 out_ptr.unsafe_store[width=width, alignment=al](
-                    i, SIMD[DType.float32, width](alpha).fma(s, a).cast[dtype]()
+                    i,
+                    SIMD[DType.float32, width](alpha).fma(s, a).cast[dtype](),
                 )
             comptime if op_code == SOP_MUL:
                 # The float product rounds before the half conversion
@@ -1268,7 +1273,42 @@ def _scalar_elementwise[
             comptime if op_code == SOP_RSUB:
                 out_ptr.unsafe_store[width=width, alignment=al](
                     i,
-                    SIMD[DType.float32, width](-alpha).fma(a, s).cast[dtype](),
+                    SIMD[DType.float32, width](alpha).fma(a, s).cast[dtype](),
+                )
+
+        @always_inline
+        @__parameter
+        @__copy_capture(out_ptr, in_ptr, sv)
+        def body_plain[width: Int, al: Int, pk: Int](i: Int):
+            var a = in_ptr.unsafe_load[width=width, alignment=al](i).cast[
+                DType.float32
+            ]()
+            var s = SIMD[DType.float32, width](sv)
+            comptime if op_code == SOP_ADD:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, (a + s).cast[dtype]()
+                )
+            comptime if op_code == SOP_MUL:
+                # The float product rounds before the half conversion
+                # (mul_kernel_cuda's opmath): see `cast_rounded`.
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, cast_rounded[dtype](a * s)
+                )
+            comptime if op_code == SOP_FLOORDIV:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, floor_div(a, s).cast[dtype]()
+                )
+            comptime if op_code == SOP_TRUNCDIV:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, trunc_div(a, s).cast[dtype]()
+                )
+            comptime if op_code == SOP_POW:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, _pow_scalar_body[dtype, pk](a, s)
+                )
+            comptime if op_code == SOP_RSUB:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, (s - a).cast[dtype]()
                 )
 
         # Element alignment only: the CPU lanes and the GPU scalar lanes may
@@ -1280,7 +1320,10 @@ def _scalar_elementwise[
             @always_inline
             @__parameter
             def func[width: Int, alignment: Int = 1](idx: Coord):
-                body[width, size_of[dtype](), pk](Int(idx[0].value()))
+                comptime if has_nvidia_gpu_accelerator():
+                    body_exact[width, size_of[dtype](), pk](Int(idx[0].value()))
+                else:
+                    body_plain[width, size_of[dtype](), pk](Int(idx[0].value()))
 
             # 16-byte vectors once both bases proved aligned; the launcher's
             # width-1 tail lanes are element-aligned only.
@@ -1288,14 +1331,20 @@ def _scalar_elementwise[
             @__parameter
             def func_vec[width: Int, alignment: Int = 1](idx: Coord):
                 comptime al = 16 if width > 1 else size_of[dtype]()
-                body[width, al, pk](Int(idx[0].value()))
+                comptime if has_nvidia_gpu_accelerator():
+                    body_exact[width, al, pk](Int(idx[0].value()))
+                else:
+                    body_plain[width, al, pk](Int(idx[0].value()))
 
             # Every vector at 16-byte alignment: only launched when there
             # is no tail (the route other GPUs keep).
             @always_inline
             @__parameter
             def func_vec_no_tail[width: Int, alignment: Int = 1](idx: Coord):
-                body[width, 16, pk](Int(idx[0].value()))
+                comptime if has_nvidia_gpu_accelerator():
+                    body_exact[width, 16, pk](Int(idx[0].value()))
+                else:
+                    body_plain[width, 16, pk](Int(idx[0].value()))
 
             comptime if has_accelerator():
                 # scalar lanes moved 1.5 TB/s on H100, vectors ~3.

@@ -1,5 +1,5 @@
 """ATen ops: binary arithmetic — add/sub/mul/div, pow, maximum/minimum,
-remainder, floor_divide, lerp, addcmul/addcdiv, clamp and the logical and
+remainder, floor_divide, lerp, clamp and the logical and
 bitwise ops, with their in-place and `out=` variants.
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`): the same
@@ -22,6 +22,7 @@ from std.utils import IndexList
 from std.utils.numerics import nan
 
 from tmb.backend.abi import (
+    view_strided,
     is_float8_stype,
     max_dtype,
     DEVICE_TYPE_CPU,
@@ -78,6 +79,7 @@ from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     out_device_error,
+    is_wide_unsigned,
     is_cast_pair_on,
     decline_float8,
     ST_UNDEFINED,
@@ -139,7 +141,7 @@ from tmb.ops.complex_math import (
     cx_sub_,
     cx_sub_out,
 )
-from tmb.ops.foreach import foreach_addc_inplace, foreach_lerp_inplace
+from tmb.ops.foreach import foreach_lerp_inplace
 
 # ---------------------------------------------------------------------------
 # dtype predicates: the gates of the kernels this file calls
@@ -217,6 +219,16 @@ def _b_can_cast(src: Int32, dst: Int32) -> Bool:
     return _b_category(src) <= _b_category(dst)
 
 
+def _b_promotes_into(t: T, r: Int32) raises -> Bool:
+    """Whether the cast kernel takes `t` to the promoted dtype `r`: both are
+    cast dtypes, or `t` is a uint16 / 32 / 64 meeting a float."""
+    if _b_castable_on(t.stype, t) and _b_castable_on(r, t):
+        return True
+    return is_wide_unsigned(t.stype) and is_cast_pair_on(
+        t.dtype, max_dtype(r), t
+    )
+
+
 def _b_promote(a: T, b: T) raises -> Int32:
     """`torch.result_type(a, b)` for two mojo tensors (-1 = decline).
 
@@ -235,16 +247,14 @@ def _b_promote(a: T, b: T) raises -> Int32:
         if f8 != other.stype and not _b_castable_on(other.stype, other):
             return Int32(-1)
         return f8
-    if not known_stype(a.stype) or not known_stype(b.stype):
+    if not (known_stype(a.stype) or is_wide_unsigned(a.stype)) or not (
+        known_stype(b.stype) or is_wide_unsigned(b.stype)
+    ):
         return Int32(-1)
     var r = result_type(a, b)
-    if a.stype != r and not (
-        _b_castable_on(a.stype, a) and _b_castable_on(r, a)
-    ):
+    if a.stype != r and not _b_promotes_into(a, r):
         return Int32(-1)
-    if b.stype != r and not (
-        _b_castable_on(b.stype, b) and _b_castable_on(r, b)
-    ):
+    if b.stype != r and not _b_promotes_into(b, r):
         return Int32(-1)
     return r
 
@@ -267,6 +277,36 @@ struct Scal(Copyable, Movable):
 comptime MAX_EXACT_INT = 9007199254740992.0  # 2**53, the old `_MAX_EXACT_INT`
 
 
+def _b_f32_bits_to_f64(u: UInt32) -> Float64:
+    """A float's exact double from its bits, in integers (the host's
+    conversion flushes a subnormal float under the process's FTZ / DAZ),
+    NaN payloads kept."""
+    var sign = u.cast[DType.uint64]() >> 31
+    var e = (u >> 23) & 0xFF
+    var m = (u & 0x7FFFFF).cast[DType.uint64]()
+    if e == 0:
+        var mag = Float64(Int(m)) * Float64(
+            from_bits=UInt64(0x36A0000000000000)
+        )
+        return -mag if sign == 1 else mag  # 2^-149
+    var de = UInt64(0x7FF) if e == 0xFF else e.cast[DType.uint64]() + 896
+    return Float64(from_bits=(sign << 63) | (de << 52) | (m << 29))
+
+
+def _b_f16_bits_to_f64(h: UInt16) -> Float64:
+    """A half's exact double from its bits (see `_b_f32_bits_to_f64`)."""
+    var sign = h.cast[DType.uint64]() >> 15
+    var e = (h >> 10).cast[DType.uint64]() & 0x1F
+    var m = (h & 0x3FF).cast[DType.uint64]()
+    if e == 0:
+        var mag = Float64(Int(m)) * Float64(
+            from_bits=UInt64(0x3E70000000000000)
+        )
+        return -mag if sign == 1 else mag  # 2^-24
+    var de = UInt64(0x7FF) if e == 0x1F else e + 1008
+    return Float64(from_bits=(sign << 63) | (de << 52) | (m << 42))
+
+
 def _b_host_scalar(t: T) raises -> Scal:
     """The value of a 0-d CPU tensor, read straight out of host memory."""
     var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=t.ptr)
@@ -274,16 +314,18 @@ def _b_host_scalar(t: T) raises -> Scal:
         var on = p[] != 0
         return Scal(1.0 if on else 0.0, 1 if on else 0, True, True)
     if t.dtype == DType.float32:
-        var v32 = Float64(p.unsafe_bitcast[Float32]()[])
+        var v32 = _b_f32_bits_to_f64(p.unsafe_bitcast[UInt32]()[])
         return Scal(v32, Int(v32), False, False)
     if t.dtype == DType.float64:
         var v64 = p.unsafe_bitcast[Float64]()[]
         return Scal(v64, Int(v64), False, False)
     if t.dtype == DType.bfloat16:
-        var vb = Float64(p.unsafe_bitcast[BFloat16]()[])
+        var vb = _b_f32_bits_to_f64(
+            p.unsafe_bitcast[UInt16]()[].cast[DType.uint32]() << 16
+        )
         return Scal(vb, Int(vb), False, False)
     if t.dtype == DType.float16:
-        var vh = Float64(p.unsafe_bitcast[Float16]()[])
+        var vh = _b_f16_bits_to_f64(p.unsafe_bitcast[UInt16]()[])
         return Scal(vh, Int(vh), False, False)
     if is_float8(t.dtype):
         # A CPU 0-d float8 (a promotion operand): its exact value.
@@ -1126,6 +1168,8 @@ def _b_binary(
     var device: Int
     var dtype: Int32
     var scalar_side = 0 if lhs.is_t and rhs.is_t else (2 if lhs.is_t else 1)
+    if not _b_exact_sides(lhs, rhs):
+        scalar_side = 0
     if lhs.is_t and rhs.is_t:
         var a = lhs.t.value().copy()
         var b = rhs.t.value().copy()
@@ -1158,6 +1202,34 @@ def _b_binary(
         kop = _b_bool_add_as_or(op, dtype)
         _b_op_dtype_ok(kop, dtype, is_cmp)
         var fill = _b_scalar_fill(s, dtype, device)
+        if t.rank > 4:
+            # The spec entry's rank > 4 pass is flat: run the whole tensor
+            # as one dense 1-D span against the scalar, into a flat view of
+            # the full-shape output.
+            var dense = _b_ready(t, dtype, True)
+            var out_full = own(
+                new_tensor(
+                    dense.t.shape,
+                    dense.t.rank,
+                    out_stype if out_stype >= 0 else dtype,
+                    device,
+                )
+            )
+            var flat_in = own(_b_flat_view(dense.t))
+            var flat_out = own(_b_flat_view(out_full.t))
+            if lhs.is_t:
+                _b_binary_spec(
+                    kop, flat_in.t, fill.t, flat_out.t, alpha, scalar_side
+                )
+            else:
+                _b_binary_spec(
+                    kop, fill.t, flat_in.t, flat_out.t, alpha, scalar_side
+                )
+            _ = fill
+            _ = dense
+            _ = flat_in^
+            _ = flat_out^
+            return Res(out_full.take(), True)
         if lhs.is_t:
             a_h = _b_ready(t, dtype, False)
             b_h = fill^
@@ -1193,6 +1265,31 @@ def _b_binary(
     return Res(out.take(), True)
 
 
+def _b_flat_view(t: T) raises -> T:
+    """A 1-D view over a dense tensor's elements, in memory order."""
+    var shape = IndexList[MAX_RANK](1)
+    shape[MAX_RANK - 1] = t.numel
+    var strides = IndexList[MAX_RANK](0)
+    strides[MAX_RANK - 1] = 1
+    return view_strided(t, shape, strides, 1, t.offset)
+
+
+def _b_exact_on(t: T) raises -> Bool:
+    """Whether add / sub / mul take the bit-exact-vs-CUDA routes (opmath fma
+    alpha, CPU-scalar NaN order, promoted scalar routes): NVIDIA only. Other
+    backends keep the pre-exactness routes, which were never measured against
+    these."""
+    return t.on_mojo() and dev(t.device)[].api == "cuda"
+
+
+def _b_exact_sides(lhs: Side, rhs: Side) raises -> Bool:
+    if lhs.is_t:
+        return _b_exact_on(lhs.t.value())
+    if rhs.is_t:
+        return _b_exact_on(rhs.t.value())
+    return False
+
+
 def _b_try_scalar(
     op: StaticString,
     lhs: Side,
@@ -1200,6 +1297,7 @@ def _b_try_scalar(
     negate: Bool,
     dst: Optional[T],
     alpha: Float64 = 1.0,
+    promote: Bool = False,
 ) raises -> Optional[Res]:
     """The old `_try_spec_scalar`: contiguous float tensor with a numeric
     scalar in one elementwise launch.
@@ -1216,15 +1314,24 @@ def _b_try_scalar(
     if not lhs.is_t or rhs.is_t:
         return None
     var a = lhs.t.value().copy()
-    if not _b_float3(a.stype):
-        return None
-    if rhs.zero_st >= 0 and _b_side_result(a, rhs) != a.stype:
-        return None  # an explicit 0-d tensor promoting past `a`'s dtype
     var s = rhs.s.value().copy()
     if s.is_bool:
         return None
+    # `promote`: TensorIterator loads `a` converted to the result dtype, and
+    # add / mul read the scalar straight into opmath (float), never rounded
+    # to `a`'s dtype: an int tensor plus 2.5 is a float32 add of 2.5.
+    var result = _b_side_result(a, rhs)
+    var promoted = promote and _b_exact_on(a)
+    if not promoted:
+        if not _b_float3(a.stype):
+            return None
+        if rhs.zero_st >= 0 and result != a.stype:
+            return None  # an explicit 0-d tensor promoting past `a`'s dtype
+        result = a.stype
+    if not _b_float3(result):
+        return None
     var value = -s.f if negate else s.f
-    var src = _b_ready(a, a.stype, True)
+    var src = _b_ready(a, result, True)
     if dst:
         var d = dst.value().copy()
         if (
@@ -1639,9 +1746,14 @@ def _b_add_routes(
         var r = _b_try_add_f32_bf16(lhs, rhs)
         if r.__bool__():
             return r.value().copy()
-    var r = _b_try_scalar("AddScalarSpec", lhs, rhs, False, dst, alpha)
+    var r = _b_try_scalar("AddScalarSpec", lhs, rhs, False, dst, alpha, True)
     if r.__bool__():
         return r.value().copy()
+    # a CPU scalar first: `scalar + alpha * tensor` (CUDAFunctorOnOther_add)
+    if _b_exact_sides(lhs, rhs):
+        r = _b_try_scalar("RsubScalarSpec", rhs, lhs, False, dst, alpha, True)
+        if r.__bool__():
+            return r.value().copy()
     if alpha == 1.0:
         r = _b_try_int_scalar("AddScalarIntSpec", lhs, rhs, False)
         if r.__bool__():
@@ -1688,6 +1800,21 @@ def _b_negated_alpha(alpha_v: Value) -> Value:
     return Value(alpha_v.tag, 0, 0 - alpha_v.a, alpha_v.b)
 
 
+def _b_alpha_opmath(
+    alpha_v: Value, common: Int32, negate: Bool
+) raises -> Float64:
+    """alpha as CUDA's add kernel takes it for a floating result `common`:
+    `alpha.to<opmath_t>()`, checked (a float alpha past float's range
+    raises for the float32 / half types; an integer rounds once). `negate`:
+    sub's `-alpha`, the Scalar negated in its own type first (an integer 0
+    stays +0.0)."""
+    var opmath = ST_FLOAT64 if common == ST_FLOAT64 else ST_FLOAT32
+    if negate and (alpha_v.tag == TAG_SCALAR_INT or alpha_v.tag == TAG_INT):
+        return scalar_to_float(_b_negated_alpha(alpha_v), opmath)
+    var a = scalar_to_float(alpha_v, opmath)
+    return -a if negate else a
+
+
 def _b_alpha_prologue(
     lhs: Side, rhs: Side, alpha_v: Value, out_st: Int32, negate: Bool
 ) raises -> Tuple[Int32, Value]:
@@ -1710,6 +1837,9 @@ def _b_alpha_prologue(
             _b_cast_error(common, out_st)
         checked = out_st
     _b_alpha_check(checked, alpha_v)
+    if common >= 0 and is_wide_unsigned(common):
+        # CUDA has no integer add for these ("ufunc_add_CUDA" not implemented)
+        unsupported("add / sub of dtype " + _b_tname(common))
     if common >= 0 and (is_int_stype(common) or common == ST_BOOL):
         return (common, _kernel_alpha(common, alpha_v, negate))
     return (common, alpha_v.copy())
@@ -1782,10 +1912,12 @@ def _b_add(
         var metal = _b_try_apple_add(lhs, rhs, alpha)
         if metal.__bool__():
             return metal.value().copy()
-    if _b_is_floating(common):
+    if _b_is_floating(common) and _b_exact_sides(lhs, rhs):
         # CUDA's add takes alpha into its kernel, converted straight to
         # opmath: one fma.
-        return _b_add_routes(lhs, rhs, dst, v_f64(alpha_v))
+        return _b_add_routes(
+            lhs, rhs, dst, _b_alpha_opmath(alpha_v, common, False)
+        )
     if alpha == 1.0:
         return _b_add_routes(lhs, rhs, dst)
     if not rhs.is_t:
@@ -1842,9 +1974,11 @@ def _b_sub(
     var pro = _b_alpha_prologue(lhs, rhs, alpha_in, out_st, True)
     var common = pro[0]
     var alpha_v = pro[1].copy()
-    if _b_is_floating(common):
+    if _b_is_floating(common) and _b_exact_sides(lhs, rhs):
         # CUDA's sub is its add kernel with -alpha: one fma in opmath.
-        return _b_sub_routes(lhs, rhs, dst, v_f64(alpha_v))
+        return _b_add_routes(
+            lhs, rhs, dst, _b_alpha_opmath(alpha_v, common, True)
+        )
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     if alpha == 1.0:
         return _b_sub_routes(lhs, rhs, dst)
@@ -1906,9 +2040,14 @@ def _b_pow_float8(lhs: Side, rhs: Side) raises -> Optional[Res]:
 
 
 def _b_mul(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
-    var r = _b_try_scalar("MulScalarSpec", lhs, rhs, False, dst)
+    var r = _b_try_scalar("MulScalarSpec", lhs, rhs, False, dst, 1.0, True)
     if r.__bool__():
         return r.value().copy()
+    # mul is symmetric: CUDA multiplies by a CPU scalar on either side alike
+    if _b_exact_sides(lhs, rhs):
+        r = _b_try_scalar("MulScalarSpec", rhs, lhs, False, dst, 1.0, True)
+        if r.__bool__():
+            return r.value().copy()
     r = _b_try_int_scalar("MulScalarIntSpec", lhs, rhs, False)
     if r.__bool__():
         return r.value().copy()
@@ -1966,7 +2105,15 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # no output buffer and no copy back.
         var s = rhs.s.value().copy()
         if not s.is_bool:
-            _b_scalar_inplace("AddScalarInplace", self, s.f, alpha)
+            if _b_exact_on(self):
+                _b_scalar_inplace(
+                    "AddScalarInplace",
+                    self,
+                    s.f,
+                    _b_alpha_opmath(args[unsafe_offset=2], self.stype, False),
+                )
+            else:
+                _b_scalar_inplace("AddScalarInplace", self, s.f * alpha)
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
@@ -2038,7 +2185,15 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not rhs.is_t and self.contig and _b_float3(self.stype):
         var s = rhs.s.value().copy()
         if not s.is_bool:
-            _b_scalar_inplace("AddScalarInplace", self, -s.f, alpha)
+            if _b_exact_on(self):
+                _b_scalar_inplace(
+                    "AddScalarInplace",
+                    self,
+                    s.f,
+                    _b_alpha_opmath(args[unsafe_offset=2], self.stype, True),
+                )
+            else:
+                _b_scalar_inplace("AddScalarInplace", self, -(s.f * alpha))
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
@@ -2087,12 +2242,25 @@ def op_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         _b_sub_check(lhs, rhs)
         _ = _b_alpha_prologue(lhs, rhs, args[unsafe_offset=2], -1, True)
     # `other - alpha * self` for a float tensor and a number: one launch.
-    var fast = _b_try_scalar(
-        "RsubScalarSpec", rhs, lhs, False, None, v_f64(args[unsafe_offset=2])
-    )
-    if fast.__bool__():
-        _b_ret(rets, fast.value().copy())
-        return
+    var common = _b_common(lhs, rhs)
+    if _b_float3(common) and _b_exact_sides(lhs, rhs):
+        var fast = _b_try_scalar(
+            "RsubScalarSpec",
+            rhs,
+            lhs,
+            False,
+            None,
+            _b_alpha_opmath(args[unsafe_offset=2], common, True),
+            True,
+        )
+        if fast.__bool__():
+            _b_ret(rets, fast.value().copy())
+            return
+    elif v_f64(args[unsafe_offset=2]) == 1.0:
+        var fast = _b_try_scalar("RsubScalarSpec", rhs, lhs, False, None)
+        if fast.__bool__():
+            _b_ret(rets, fast.value().copy())
+            return
     var promoted = _rsub_promote(lhs, rhs)
     if promoted:
         rhs = _b_tside(promoted.value())
@@ -3317,74 +3485,8 @@ def op_clamp_max_tensor_out(
 
 
 # ---------------------------------------------------------------------------
-# addcmul / addcdiv
+# in-place operand checks
 # ---------------------------------------------------------------------------
-
-
-def _b_strides4(t: T, shape: IndexList[MAX_RANK]) -> List[Int]:
-    """The operand's rank-4 strides for the ternary kernel: 0 on every axis
-    it broadcasts over (the old `_bcast_meta`)."""
-    var out = List[Int](capacity=4)
-    for k in range(4):
-        var i = MAX_RANK - 4 + k
-        out.append(0 if t.shape[i] == 1 else t.strides[i])
-    return out^
-
-
-def _b_addc(
-    op: StaticString, args: Values, allow_int: Bool, dst: Optional[T] = None
-) raises -> Res:
-    """self + value * (tensor1 * tensor2) — or / — in one broadcast launch."""
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
-    var c = v_tensor(args[unsafe_offset=2])
-    if not a.on_mojo() or not b.on_mojo() or not c.on_mojo():
-        unsupported("addc* operands that are not all on the mojo device")
-    if a.device != b.device or a.device != c.device:
-        raise Error("expected every operand on the same mojo device")
-    if a.stype != b.stype or a.stype != c.stype:
-        unsupported("addc* operands of different dtypes")
-    # CUDA's addcmul_cuda / addcdiv_cuda dispatch no float8.
-    decline_float8(
-        a.dtype, "addcmul_cuda" if op == "AddcmulBcast" else "addcdiv_cuda"
-    )
-    if not _b_float3(a.stype) and not (allow_int and _b_int_dtype(a.stype)):
-        unsupported("addc* of dtype " + String(a.stype))
-    if a.rank > 4 or b.rank > 4 or c.rank > 4:
-        unsupported("addc* operands of rank > 4")
-    var value = _b_side(args[unsafe_offset=3])
-    if value.is_t:
-        unsupported("a tensor `value` for addc*")
-    var s = value.s.value().copy()
-    if s.is_bool:
-        unsupported("a bool `value` for addc*")
-    var merged = _b_broadcast3(a, b, c)
-    var rank = max(a.rank, max(b.rank, c.rank))
-    if dst:
-        var dest = dst.value().copy()
-        if (
-            dest.contig
-            and a.contig
-            and b.contig
-            and c.contig
-            and dest.stype == a.stype
-            and dest.same_shape(a)
-            and a.same_shape(b)
-            and a.same_shape(c)
-        ):
-            _b_no_partial_overlap(dest, a)
-            _b_no_partial_overlap(dest, b)
-            _b_no_partial_overlap(dest, c)
-            if _b_same_tensor(dest, a) and a.dtype == DType.float32:
-                foreach_addc_inplace(
-                    dest, b, c, s.f, multiplies=op == "AddcmulBcast"
-                )
-                return Res(dest^, False)
-            _b_addc_into(op, a, b, c, merged, s.f, dest)
-            return Res(dest^, False)
-    var out = own(new_tensor(merged, rank, a.stype, a.device))
-    _b_addc_into(op, a, b, c, merged, s.f, out.t)
-    return Res(out.take(), True)
 
 
 def _b_inplace_destination(dest: T) raises:
@@ -3410,100 +3512,6 @@ def _b_inplace_operand(dest: T, other: T) raises:
         other.contig or is_dense(other.shape, other.strides, other.rank)
     ):
         _b_no_partial_overlap(dest, other)
-
-
-def _b_addc_inplace(
-    op: StaticString, args: Values, rets: Values, allow_int: Bool
-) raises:
-    var dest = _b_self(args[unsafe_offset=0], "addc in-place")
-    _b_inplace_destination(dest)
-    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=1]))
-    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=2]))
-    _b_store_inplace(rets, dest, _b_addc(op, args, allow_int, dest.copy()))
-
-
-# aten::addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
-def op_addcmul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_addc_inplace("AddcmulBcast", args, rets, True)
-
-
-# aten::addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
-def op_addcdiv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_addc_inplace("AddcdivBcast", args, rets, False)
-
-
-def _b_addc_into(
-    op: StaticString,
-    a: T,
-    b: T,
-    c: T,
-    merged: IndexList[MAX_RANK],
-    value: Float64,
-    dest: T,
-) raises:
-    """Launch the existing ternary kernel into validated output storage."""
-    if dest.numel > 0:
-        var params = List[Int](capacity=16)
-        for k in range(4):
-            params.append(merged[MAX_RANK - 4 + k])
-        params.extend(_b_strides4(a, merged))
-        params.extend(_b_strides4(b, merged))
-        params.extend(_b_strides4(c, merged))
-        var ctx = ctx_for(a.device)
-        var call = KernelCall("logic", String(op))
-        call.arg_dtype(0, a.dtype)
-        call.arg_dtype(1, b.dtype)
-        call.arg_dtype(2, c.dtype)
-        call.out_dtype(dest.dtype)
-        call.int(dest.ptr)
-        call.int(a.ptr)
-        call.int(b.ptr)
-        call.int(c.ptr)
-        call.tuple(params)
-        call.f64(value)
-        call.int(dtype_code(a.dtype))
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = ctx
-
-
-# aten::addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
-def op_addcmul(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_ret(rets, _b_addc("AddcmulBcast", args, True))
-
-
-# aten::addcmul.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
-def op_addcmul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var dest = _b_out_tensor(
-        args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
-    )
-    _b_out_guard3(
-        dest,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
-        _b_side(args[unsafe_offset=2]),
-    )
-    _b_store_out(rets, dest, _b_addc("AddcmulBcast", args, True, dest.copy()))
-
-
-# aten::addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
-def op_addcdiv(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    # addcdiv is float-only: torch errors for integer inputs.
-    _b_ret(rets, _b_addc("AddcdivBcast", args, False))
-
-
-# aten::addcdiv.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
-def op_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var dest = _b_out_tensor(
-        args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
-    )
-    _b_out_guard3(
-        dest,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
-        _b_side(args[unsafe_offset=2]),
-    )
-    _b_store_out(rets, dest, _b_addc("AddcdivBcast", args, False, dest.copy()))
 
 
 # ---------------------------------------------------------------------------
@@ -3625,38 +3633,6 @@ def register_binary(site: Site) raises:
             alpha_idx=2,
         ],
         "add.out",
-    ](site)
-    impl[
-        f8_iter[op_addcdiv, "addcdiv_cuda", 7, -1, MODE_FN, False, PRE_NONE],
-        "addcdiv",
-    ](site)
-    impl[
-        f8_iter[
-            op_addcdiv_, "addcdiv_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
-        ],
-        "addcdiv_",
-    ](site)
-    impl[
-        f8_iter[
-            op_addcdiv_out, "addcdiv_cuda", 7, 4, MODE_CAST, False, PRE_NONE
-        ],
-        "addcdiv.out",
-    ](site)
-    impl[
-        f8_iter[op_addcmul, "addcmul_cuda", 7, -1, MODE_FN, False, PRE_NONE],
-        "addcmul",
-    ](site)
-    impl[
-        f8_iter[
-            op_addcmul_, "addcmul_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
-        ],
-        "addcmul_",
-    ](site)
-    impl[
-        f8_iter[
-            op_addcmul_out, "addcmul_cuda", 7, 4, MODE_CAST, False, PRE_NONE
-        ],
-        "addcmul.out",
     ](site)
     impl[f8_cx_scalar[op_bitwise_and], "bitwise_and.Scalar"](site)
     impl[

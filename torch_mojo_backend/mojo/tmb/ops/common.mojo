@@ -802,18 +802,27 @@ def is_cast_pair_on(a: DType, b: DType, t: T) raises -> Bool:
     def wide_unsigned(d: DType) -> Bool:
         return d == DType.uint16 or d == DType.uint32 or d == DType.uint64
 
-    return (is_float8(a) and wide_unsigned(b)) or (
+    if (is_float8(a) and wide_unsigned(b)) or (
         is_float8(b) and wide_unsigned(a)
-    )
+    ):
+        return True
+    # On NVIDIA the kernel converts them against every dtype the way CUDA's
+    # copy does (cvt.rzi.u32 / u64 from a float); elsewhere CPU torch does.
+    if t.on_mojo() and dev(t.device)[].api == "cuda":
+        return (wide_unsigned(a) and is_cast_dtype_on(b, t)) or (
+            wide_unsigned(b) and is_cast_dtype_on(a, t)
+        )
+    return False
 
 
 def cast_into(dst: T, src: T, saturate: Bool = True) raises:
     """dst = src.to(dst.dtype) for a contiguous dst (data_movement CastSpec).
 
     `saturate` is copy_ / to()'s float -> e4m3fn rule on an sm_89+ NVIDIA
-    GPU (stock torch's SATFINITE intrinsic, see the kernel); a type
-    promotion (a comparison's operand, ...) converts like c10 instead and
-    passes False."""
+    GPU (stock torch's SATFINITE intrinsic from torch 2.12 on, see the
+    kernel); a type promotion (a comparison's operand, ...) converts like
+    c10 instead and passes False, and so does every copy under an older
+    torch."""
     if src.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -821,7 +830,9 @@ def cast_into(dst: T, src: T, saturate: Bool = True) raises:
     var call = KernelCall("data_movement", "CastSpec")
     call.arg_dtype(0, src.dtype)
     call.out_dtype(dst.dtype)
-    if not saturate and dst.dtype == DType.float8_e4m3fn:
+    if dst.dtype == DType.float8_e4m3fn and (
+        not saturate or external_call["tmb_torch_version", Int32]() < 212
+    ):
         call.flag("FP8_NOSAT", 1)
     call.spec(src.spec(cp))
     call.int(dtype_code(dst.dtype))
@@ -1111,10 +1122,21 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
         # the complex type of the promoted value types (complex64 + float64
         # is complex128)
         return complex_of(promote_types(real_of(a), real_of(b)))
-    if is_float_stype(a) and _wide_unsigned_stype(b):
-        return a  # c10: a uint16 / 32 / 64 meets a float as any integer
-    if is_float_stype(b) and _wide_unsigned_stype(a):
-        return b
+    if is_wide_unsigned(a) or is_wide_unsigned(b):
+        # c10: uint16 / uint32 / uint64 promote with a floating dtype only.
+        if is_float_stype(a):
+            return a
+        if is_float_stype(b):
+            return b
+        raise Error(
+            (
+                "Promotion for uint16, uint32, uint64 types is not supported,"
+                " attempted to promote "
+            ),
+            scalar_type_name(a),
+            " and ",
+            scalar_type_name(b),
+        )
     if not known_stype(a) or not known_stype(b):
         unsupported(
             "type promotion of dtypes " + String(a) + " and " + String(b)
@@ -1920,9 +1942,8 @@ def cast_complex(t: T, stype: Int32) raises -> T:
     if is_complex_stype(stype):
         # real -> complex: zero the pairs, then the real parts in place
         var part = real_of(stype)
-        if src.t.stype != part and not (
-            is_cast_dtype_on(src.t.dtype, src.t)
-            and is_cast_dtype_on(max_dtype(part), src.t)
+        if src.t.stype != part and not is_cast_pair_on(
+            src.t.dtype, max_dtype(part), src.t
         ):
             var converted = own(host_convert(src.t, stype))
             _ = src^
@@ -1940,9 +1961,8 @@ def cast_complex(t: T, stype: Int32) raises -> T:
         cx_unary_into("nonzero", truth.t, src.t)
         _ = src^
         return truth.take()
-    if stype != real_of(src.t.stype) and not (
-        is_cast_dtype_on(src.t.dtype, src.t)
-        and is_cast_dtype_on(max_dtype(stype), src.t)
+    if stype != real_of(src.t.stype) and not is_cast_pair_on(
+        max_dtype(real_of(src.t.stype)), max_dtype(stype), src.t
     ):
         var converted = own(host_convert(src.t, stype))
         _ = src^

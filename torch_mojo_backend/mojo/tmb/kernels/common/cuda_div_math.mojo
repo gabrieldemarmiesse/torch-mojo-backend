@@ -48,6 +48,8 @@ def _nonzero[dtype: DType, w: Int](x: SIMD[dtype, w]) -> SIMD[DType.bool, w]:
 @always_inline
 def _negative[dtype: DType, w: Int](x: SIMD[dtype, w]) -> SIMD[DType.bool, w]:
     """`x < 0`: false for a zero and for a NaN."""
+    comptime if size_of[dtype]() >= 4:
+        return x.lt(0)
     comptime bt = _bits_dtype[dtype]()
     comptime sign = Scalar[bt](1) << Scalar[bt](size_of[dtype]() * 8 - 1)
     var b = bitcast[bt, w](x)
@@ -254,6 +256,20 @@ def cuda_fmod_op[
     """fmod_kernel_cuda: C's `::fmod` (a half pair in float, rounded once),
     C's `%` for integers."""
     comptime if dtype.is_floating_point():
+        comptime if not is_nvidia_gpu():
+            # the base's per-lane form (a vector cast reschedules the
+            # half types' code on AMD)
+            var r = SIMD[dtype, w]()
+            comptime for i in range(w):
+                comptime if dtype == DType.float64:
+                    r[i] = _fmod_f64_exact_scalar(
+                        a[i].cast[DType.float64](), b[i].cast[DType.float64]()
+                    ).cast[dtype]()
+                else:
+                    r[i] = _fmod_float32(
+                        a[i].cast[DType.float32](), b[i].cast[DType.float32]()
+                    ).cast[dtype]()
+            return r
         return cuda_fmod(a, b).cast[dtype]()
     elif is_nvidia_gpu():
         return cuda_int_divrem(a, b)[1]
@@ -269,14 +285,12 @@ def cuda_fmod_op[
 
 @always_inline
 def cuda_mul_by_inverse[
-    dtype: DType, w: Int
-](a: SIMD[dtype, w], inv: Float64) -> SIMD[dtype, w]:
-    """div_true_kernel_cuda by a CPU scalar: `a * inv_b` in opmath, `inv_b`
-    the reciprocal computed in double by the host (its float64 NaN first:
-    a uniform operand sits in DMUL's B slot)."""
-    comptime om = _opmath[dtype]()
-    var x = a.cast[om]()
-    var iv = SIMD[om, w](inv.cast[om]())
+    dtype: DType, om: DType, w: Int
+](x: SIMD[om, w], inv: Scalar[om]) -> SIMD[dtype, w]:
+    """div_true_kernel_cuda by a CPU scalar: `a * inv_b` in opmath `om` (`x`
+    the numerator in it), `inv_b` the reciprocal computed in double by the
+    host (its float64 NaN first: a uniform operand sits in DMUL's B slot)."""
+    var iv = SIMD[om, w](inv)
     return cast_rounded[dtype](nan_first2(x * iv, iv, x))
 
 

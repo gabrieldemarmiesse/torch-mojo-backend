@@ -116,25 +116,33 @@ def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_add_sub_alpha_reduced_precision_rounds_like_cuda(mojo_gpu, dtype):
-    """CUDA's add / sub kernel computes `a + alpha * b` as one fma in the
-    opmath type (float for the half types), with alpha kept in float32 and
-    rounded once to the operand type. Checked bit for bit against that
-    expression evaluated exactly (float64 holds the product and the sum)
-    and rounded to float32, then to the operand type."""
+def test_add_sub_alpha_reduced_precision_is_one_float_fma(mojo_gpu, dtype):
+    """CUDA's add kernel computes `a + alpha * b` in float (opmath) with alpha
+    converted straight to float, as one fma, and rounds to the half type
+    once (sub: alpha negated); tests/native/test_binary_cuda_parity.py holds
+    it to stock CUDA bit for bit where CUDA runs."""
     a = (torch.arange(64, dtype=torch.float32) / 7.0 - 4.0).to(dtype)
     b = (torch.arange(64, dtype=torch.float32) / 3.0 - 10.0).to(dtype)
     alpha = 1.0 / 3.0
-    alpha_f = torch.tensor(alpha, dtype=torch.float32).double()
+    alpha32 = torch.tensor(alpha, dtype=torch.float32).double()
     ad, bd = a.to(mojo_gpu), b.to(mojo_gpu)
+
+    def fma(sign: float) -> torch.Tensor:
+        # exact in float64 (11-bit operands, a 24-bit alpha), one float
+        # rounding, then the half type
+        return (a.double() + sign * alpha32 * b.double()).float().to(dtype)
 
     got = torch.add(ad, bd, alpha=alpha)
     assert got.dtype == dtype
-    expect = (a.double() + alpha_f * b.double()).float().to(dtype)
-    torch.testing.assert_close(got.cpu(), expect, atol=0, rtol=0)
+    torch.testing.assert_close(got.cpu(), fma(1.0), atol=0, rtol=0)
     got_sub = torch.sub(ad, bd, alpha=alpha)
-    expect_sub = (a.double() - alpha_f * b.double()).float().to(dtype)
-    torch.testing.assert_close(got_sub.cpu(), expect_sub, atol=0, rtol=0)
+    torch.testing.assert_close(got_sub.cpu(), fma(-1.0), atol=0, rtol=0)
+    # alpha rounded to the half type first (CPU torch's scalar loop) gives a
+    # DIFFERENT tensor: without this the test would pass on the
+    # implementation it is meant to reject.
+    alpha_r = torch.tensor(alpha).to(dtype).float()
+    rounded = (a.float() + (alpha_r * b.float()).to(dtype).float()).to(dtype)
+    assert not torch.equal(rounded, got.cpu())
 
 
 def _outcome(fn):
@@ -2050,15 +2058,13 @@ def test_rsub_checks_and_rank_promotion(mojo_gpu):
 
 @pytest.mark.parametrize(
     ("dtype", "alpha", "ok_alpha"),
-    [
-        (torch.float32, 1e100, 1e6),
-        (torch.float16, 7e4, 6e4),
-        (torch.bfloat16, 1e100, 1e6),
-    ],
+    [(torch.float32, 1e100, 1e6), (torch.bfloat16, 1e100, 1e6)],
 )
 def test_rsub_alpha_overflowing_result_dtype(mojo_gpu, dtype, alpha, ok_alpha):
     """A finite alpha past the result dtype's range raises, as CPU torch's
-    checked `alpha.to<scalar_t>()` does, instead of scaling by inf."""
+    checked `alpha.to<scalar_t>()` does, instead of scaling by inf. CUDA
+    raises the same for these dtypes (checked on stock CUDA); float16 is
+    the exception, see test_rsub_float16_alpha_is_float_opmath."""
     x_cpu = torch.tensor([1.0], dtype=dtype)
     x = x_cpu.to(mojo_gpu)
     for other_cpu in (3, x_cpu):
@@ -2067,11 +2073,34 @@ def test_rsub_alpha_overflowing_result_dtype(mojo_gpu, dtype, alpha, ok_alpha):
             torch.rsub(x_cpu, other_cpu, alpha=alpha)
         with pytest.raises(RuntimeError, match="without overflow") as err:
             torch.rsub(x, other, alpha=alpha)
-        assert str(err.value).startswith(str(cpu_err.value).splitlines()[0])
+        # CUDA converts alpha to opmath: "float" for bfloat16 too (verified)
+        assert str(err.value).startswith(
+            "value cannot be converted to type float without overflow"
+        )
+        assert cpu_err.value is not None
         torch.testing.assert_close(
             torch.rsub(x, other, alpha=ok_alpha).cpu(),
             torch.rsub(x_cpu, other_cpu, alpha=ok_alpha),
         )
+
+
+def test_rsub_float16_alpha_is_float_opmath(mojo_gpu):
+    """CUDA converts alpha to opmath (float) and rounds the result to half
+    once, so a half-range alpha of 7e4 does not raise there (CPU torch
+    does): `3 - 7e4 * 1` is -inf in half. Verified on stock CUDA."""
+    x = torch.tensor([1.0], dtype=torch.float16).to(mojo_gpu)
+    for other_cpu in (
+        torch.tensor([3.0], dtype=torch.float16),
+        torch.tensor([-2.5], dtype=torch.float16),
+    ):
+        other = other_cpu.to(mojo_gpu)
+        for alpha in (7e4, 6e4):
+            expect = (other_cpu.float() - torch.tensor(alpha, dtype=torch.float32)).to(
+                torch.float16
+            )
+            torch.testing.assert_close(
+                torch.rsub(x, other, alpha=alpha).cpu(), expect, atol=0, rtol=0
+            )
 
 
 def test_rsub_integral_promotes_before_alpha(mojo_gpu):
@@ -2316,3 +2345,24 @@ def test_floor_divide_out_errors(mojo_gpu):
     assert z.cpu().tolist() == [2**32 - 1] * 3
     with pytest.raises(RuntimeError):
         a.clone().floor_divide_(torch.ones(2, 3, device=mojo_gpu))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int32])
+@pytest.mark.parametrize("fn", [torch.add, torch.sub, torch.mul, torch.rsub])
+def test_rank5_tensor_with_python_scalar(mojo_gpu, fn, dtype):
+    """Rank > 4 with a number used to raise "rank > 4 needs equal shapes"
+    (float64 add / sub / mul, int rsub): the number runs against the dense
+    tensor as one flat span."""
+    x_cpu = torch.arange(2 * 3 * 4 * 5 * 6).reshape(2, 3, 4, 5, 6).to(dtype)
+    x = x_cpu.to(mojo_gpu)
+    for scalar in (2, 3.5) if dtype.is_floating_point else (2,):
+        torch.testing.assert_close(
+            fn(x, scalar).cpu(), fn(x_cpu, scalar), rtol=0, atol=0
+        )
+        if fn is not torch.rsub:
+            torch.testing.assert_close(
+                fn(scalar, x).cpu() if fn is not torch.sub else (scalar - x).cpu(),
+                fn(scalar, x_cpu) if fn is not torch.sub else scalar - x_cpu,
+                rtol=0,
+                atol=0,
+            )

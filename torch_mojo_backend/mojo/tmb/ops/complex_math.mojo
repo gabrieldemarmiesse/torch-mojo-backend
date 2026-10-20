@@ -7,6 +7,9 @@ promotion, operand flattening and `out=` handling) and the complex kernel
 family (tmb/kernels/complex, whose math follows the CUDA kernels stock
 PyTorch runs; tmb/kernels/common/complex_math.mojo).
 """
+from std.ffi import external_call
+from std.memory import bitcast
+from std.utils.numerics import isnan
 from std.utils import IndexList
 
 from tmb.backend.registry import Site, impl
@@ -71,6 +74,7 @@ from tmb.backend.abi import (
     OpFn,
     TAG_DTYPE,
     TAG_INT,
+    TAG_SCALAR_INT,
     v_is_complex,
     Owned,
     ST_BOOL,
@@ -152,6 +156,153 @@ def _host_reciprocal[
     return (Float64(rat * scl), Float64(-scl))
 
 
+@always_inline
+def _hmul[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """`a * b` rounded on its own: the host compiler of stock torch has no
+    FMA to contract it into the next add."""
+    var v = a * b
+    var ptr = Pointer(to=v)
+    ptr.unsafe_store[volatile=True](0, v)
+    return ptr.unsafe_load[volatile=True](0)
+
+
+@always_inline
+def _hlibm[dt: DType, name: StaticString](x: Scalar[dt]) -> Scalar[dt]:
+    """The host libm's `name` (its float variant for float32)."""
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](
+            external_call[name + "f", Float32](rebind[Float32](x))
+        )
+    else:
+        return rebind[Scalar[dt]](
+            external_call[name, Float64](rebind[Float64](x))
+        )
+
+
+@always_inline
+def _hlibm2[
+    dt: DType, name: StaticString
+](x: Scalar[dt], y: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](
+            external_call[name + "f", Float32](
+                rebind[Float32](x), rebind[Float32](y)
+            )
+        )
+    else:
+        return rebind[Scalar[dt]](
+            external_call[name, Float64](rebind[Float64](x), rebind[Float64](y))
+        )
+
+
+@always_inline
+def _htrim[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float64:
+        var b = bitcast[DType.uint64](rebind[Float64](x))
+        return rebind[Scalar[dt]](
+            bitcast[DType.float64](b & UInt64(0xFFFFFFF800000000))
+        )
+    else:
+        var b = bitcast[DType.uint32](rebind[Float32](x))
+        return rebind[Scalar[dt]](
+            bitcast[DType.float32](b & UInt32(0xFFFF0000))
+        )
+
+
+def _host_clog[dt: DType](re: Float64, im: Float64) -> Tuple[Float64, Float64]:
+    """thrust's clog / clogf as stock torch runs it on the HOST (the
+    `std::log(base)` of PowKernel.cu's pow_scalar_tensor_impl, a .cu file:
+    c10_complex_math::log is thrust's there), so with the host libm's log,
+    log1p, hypot, atan2 and no fused multiply-add (thrust/detail/complex/
+    clog.h, clogf.h, nvidia-cuda-cccl 13.0.85; FreeBSD msun's s_clog.c)."""
+    var x = Scalar[dt](re)
+    var y = Scalar[dt](im)
+    var arg = _hlibm2[dt, "atan2"](y, x)
+    if isnan(x) or isnan(y):
+        # thrust's norm: |x| ** 2 + |y| ** 2, scaled by 4 when both are tiny
+        var tiny = Scalar[dt](
+            1.0842021724855044e-19
+        ) if dt == DType.float32 else Scalar[dt](1.4916681462400413e-154)
+        var n: Scalar[dt]
+        if abs(x) < tiny and abs(y) < tiny:
+            var a4 = x * 4
+            var b4 = y * 4
+            n = (_hmul(a4, a4) + _hmul(b4, b4)) / 16
+        else:
+            n = _hmul(x, x) + _hmul(y, y)
+        return (Float64(_hlibm[dt, "log"](n)), Float64(arg))
+    var ax = abs(x)
+    var ay = abs(y)
+    if ax < ay:
+        var t = ax
+        ax = ay
+        ay = t
+    comptime f32 = dt == DType.float32
+    var big = Scalar[dt](1e34) if f32 else Scalar[dt](5e307)
+    var tiny1 = Scalar[dt](1e-19) if f32 else Scalar[dt](1e-150)
+    var lo = Scalar[dt](1e-6) if f32 else Scalar[dt](1e-50)
+    var hi = Scalar[dt](1e6) if f32 else Scalar[dt](1e50)
+    var one = Scalar[dt](1)
+    var half = Scalar[dt](0.5)
+    if ay > big:
+        var e = Scalar[dt](2.7182818284590452354)
+        var h = _hlibm2[dt, "hypot"](x / e, y / e)
+        return (Float64(_hlibm[dt, "log"](h) + one), Float64(arg))
+    if ax == one:
+        if ay < tiny1:
+            return (Float64(_hmul(ay * half, ay)), Float64(arg))
+        return (
+            Float64(_hlibm[dt, "log1p"](_hmul(ay, ay)) * half),
+            Float64(arg),
+        )
+    if ax < lo or ay < lo or ax > hi or ay > hi:
+        return (
+            Float64(_hlibm[dt, "log"](_hlibm2[dt, "hypot"](x, y))),
+            Float64(arg),
+        )
+    if ax >= one:
+        var s = _hmul(ax - one, ax + one) + _hmul(ay, ay)
+        return (Float64(_hlibm[dt, "log1p"](s) * half), Float64(arg))
+    var sq = _hmul(ax, ax) + _hmul(ay, ay)
+    if sq <= Scalar[dt](0.7):
+        return (Float64(_hlibm[dt, "log"](sq) * half), Float64(arg))
+    var x0 = _htrim(ax)
+    ax = ax - x0
+    var x1 = _htrim(ax)
+    var x2 = ax - x1
+    var y0 = _htrim(ay)
+    ay = ay - y0
+    var y1 = _htrim(ay)
+    var y2 = ay - y1
+    var two = Scalar[dt](2)
+    var val = SIMD[dt, 16](0)
+    val[0] = x0 * x0
+    val[1] = y0 * y0
+    val[2] = two * x0 * x1
+    val[3] = two * y0 * y1
+    val[4] = x1 * x1
+    val[5] = y1 * y1
+    val[6] = two * x0 * x2
+    val[7] = two * y0 * y2
+    val[8] = two * x1 * x2
+    val[9] = two * y1 * y2
+    val[10] = x2 * x2
+    val[11] = y2 * y2
+    var sorted = False
+    while not sorted:
+        sorted = True
+        for i in range(11):
+            if val[i] < val[i + 1]:
+                sorted = False
+                var t = val[i]
+                val[i] = val[i + 1]
+                val[i + 1] = t
+    var hm1 = -one
+    for i in range(12):
+        hm1 += val[i]
+    return (Float64(half * _hlibm[dt, "log1p"](hm1)), Float64(arg))
+
+
 def _arith(
     kind: StaticString, av: Value, bv: Value, alpha: Value
 ) raises -> Owned:
@@ -197,7 +348,32 @@ def _arith(
         # the kernel: 1 / 1e-40 is 1e40 -> inf, not inf + NaN i)
         var inv = _host_reciprocal[DType.float64](fb.re, fb.im)
         fb = _Flat(CX_HOST, 0, inv[0], inv[1])
-        launch_kind = "mul"
+        launch_kind = "mul_recip"
+    if (
+        kind == "pow"
+        and fa.mode == CX_HOST
+        and (av.tag == TAG_TENSOR or av.tag == TAG_TENSOR_REF)
+    ):
+        # pow_scalar_tensor_impl: a CPU-scalar base (`scalar_value<
+        # scalar_t>`, rounded to the component dtype) has its log taken
+        # once on the host, then `exp(fct * exp)` per element. (pow.Scalar's
+        # number base is a 0-d device tensor there: the plain cpow.)
+        var fct: Tuple[Float64, Float64]
+        if st == ST_COMPLEX64:
+            fct = _host_clog[DType.float32](fa.re, fa.im)
+        else:
+            fct = _host_clog[DType.float64](fa.re, fa.im)
+        fa = _Flat(CX_HOST, 0, fct[0], fct[1])
+        launch_kind = "exp_mul"
+    if (
+        kind == "pow"
+        and (fa.mode == CX_DEVICE or fa.mode == CX_HOST)
+        and fb.mode != CX_HOST
+        and av.tag == TAG_COMPLEX
+    ):
+        # pow.Scalar with a complex number base (probed: a real number or a
+        # 0-d tensor base keeps the contiguous slot order)
+        launch_kind = "pow_b0"
     if kind == "pow" and fb.mode == CX_HOST:
         # the CPU-scalar exponent becomes a scalar_t first
         # (iter.scalar_value<scalar_t>), so it is compared once rounded
@@ -211,7 +387,14 @@ def _arith(
         launch_kind = "square"
     if kind == "sub":
         launch_kind = "add"
-        p_re = -p_re
+        if alpha.tag == TAG_SCALAR_INT or alpha.tag == TAG_INT:
+            # an integer negates as an integer: -0 is +0.0
+            var neg = scalar_parts(
+                Value(alpha.tag, 0, 0 - alpha.a, alpha.b), st
+            )
+            p_re = neg[0]
+        else:
+            p_re = -p_re
         p_im = -p_im if alpha.tag == TAG_COMPLEX else 0.0
     cx_launch(
         launch_kind,
