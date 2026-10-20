@@ -469,14 +469,15 @@ def test_non_contiguous_mixed_dtype(mojo_device):
 
 
 def test_unsupported_mix_declines(mojo_device):
-    """A promotion needing a cast the cast kernel lacks (uint16) declines
-    (NotImplementedError); one it has promotes like `torch.result_type`
-    (int8 + int16 is int16, float32 + int64 is float32)."""
+    """uint16 with a signed integer is c10's "Promotion for uint16, uint32,
+    uint64 types is not supported" RuntimeError (as on CUDA); the ones it has
+    promote like `torch.result_type` (int8 + int16 is int16, float32 + int64
+    is float32)."""
     a8_cpu, a8 = _both((4,), torch.int8, mojo_device)
     b16_cpu, b16 = _both((4,), torch.int16, mojo_device)
     torch.testing.assert_close((a8 + b16).cpu(), a8_cpu + b16_cpu)
     u = torch.ones(4, dtype=torch.uint16, device=mojo_device)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match="Promotion for uint16"):
         u + b16
     a_cpu, a = _both((4,), torch.float32, mojo_device)
     b_cpu, b = _both((4,), torch.int64, mojo_device)
