@@ -575,6 +575,13 @@ def _b_cast_any(t: T, st: Int32) raises -> Held:
     return Held(cast_for_copy(t, st, False), True)
 
 
+def _b_cast_cuda_any(t: T, st: Int32) raises -> Held:
+    """`_b_cast_any` on a cuda device, `_b_cast` elsewhere."""
+    if dev(t.device)[].api == "cuda":
+        return _b_cast_any(t, st)
+    return _b_cast(t, st)
+
+
 def _b_ready(t: T, st: Int32, need_contig: Bool) raises -> Held:
     """`t` as the kernel wants it: in dtype `st` (a cast materializes a
     contiguous copy on its own) and contiguous when the caller needs it."""
@@ -2394,6 +2401,44 @@ def _b_is_floating(st: Int32) -> Bool:
     return _b_float3(st) or st == ST_FLOAT64
 
 
+def _b_true_div_dtype_legacy(a: T, rhs: Side) raises -> Int32:
+    """`torch.result_type` for TRUE division.
+
+    ATen builds the divide iterator with `promote_integer_inputs_to_float`,
+    so an otherwise-integral result becomes `torch.get_default_dtype()` --
+    not float32 unconditionally: `torch.set_default_dtype(torch.float64)`
+    moves it. A floating operand keeps its own dtype (int64 / float16 is
+    float16), and a float SCALAR against an integral tensor lands on the
+    default dtype too (`torch.result_type(int_tensor, 0.5)`).
+    """
+    var a_stype = a.stype
+    var common = a_stype
+    if rhs.is_t:
+        var b_stype = rhs.t.value().stype
+        var a_float = _b_is_floating(a_stype)
+        var b_float = _b_is_floating(b_stype)
+        if a_float and not b_float:
+            common = a_stype
+        elif b_float and not a_float:
+            common = b_stype
+        elif a_float and b_float:
+            common = _b_promote(a, rhs.t.value())
+            if common < 0:
+                unsupported(
+                    "no dtype promotion for "
+                    + String(a_stype)
+                    + " and "
+                    + String(b_stype)
+                )
+        else:
+            return default_dtype()
+    elif not rhs.s.value().is_int and not _b_is_floating(a_stype):
+        return default_dtype()
+    if not _b_is_floating(common):
+        return default_dtype()
+    return common
+
+
 def _b_true_div_dtype(a: T, rhs: Side) raises -> Int32:
     """`torch.result_type` for TRUE division.
 
@@ -2404,6 +2449,8 @@ def _b_true_div_dtype(a: T, rhs: Side) raises -> Int32:
     float16), and a float SCALAR against an integral tensor lands on the
     default dtype too (`torch.result_type(int_tensor, 0.5)`).
     """
+    if dev(a.device)[].api != "cuda":
+        return _b_true_div_dtype_legacy(a, rhs)
     var a_stype = a.stype
     if not rhs.is_t:
         # a Python number, or an explicit 0-d CPU tensor (which promotes as
@@ -2501,6 +2548,51 @@ def _b_rounding_op(floor: Bool) -> StaticString:
     return "TruncDivSpec"
 
 
+def _b_rounding_div_legacy(
+    floor: Bool, lhs: Side, rhs: Side, dst: Optional[T]
+) raises -> Res:
+    """Floor or trunc division: div.Tensor_mode and floor_divide.
+
+    Two rules of ATen's CPU div_floor_kernel / div_trunc_kernel that the
+    logic broadcast route alone would miss:
+
+    - An integer quotient by zero raises ZeroDivisionError. A zero HOST
+      scalar is known here for free, so it raises like CPU torch; a device
+      divisor cannot without a sync, and the kernel gives 0 for it (floor
+      and trunc alike, as ATen's `div_floor_integer` does).
+    - A bf16/fp16 tensor over a scalar-shaped divisor (`iter.is_scalar(2)`)
+      divides in float32 by the divisor's own value. A Python scalar goes to
+      the elementwise float-scalar family, which never rounds it to bf16 --
+      the broadcast route would embed it in a bf16 tensor first. A
+      one-element tensor divisor already is a bf16 value, and floor's
+      general route already divides in float32; trunc takes
+      TruncDivOpmathSpec, the float32 twin of its native-precision kernel.
+    """
+    if lhs.is_t and not rhs.is_t:
+        var a = lhs.t.value().copy()
+        var s = rhs.s.value().copy()
+        if not _b_is_floating(a.stype) and s.is_int and s.i == 0:
+            raise Error("ZeroDivisionError")
+        if a.stype == ST_BFLOAT16 or a.stype == ST_FLOAT16:
+            var op: StaticString = "TruncDivScalarSpec"
+            if floor:
+                op = "FloorDivScalarSpec"
+            var src = _b_ready(a, a.stype, True)
+            var out = own(new_like(src.t))
+            _b_scalar_spec(op, src.t, s.f, out.t)
+            _ = src
+            return Res(out.take(), True)
+    if floor:
+        return _b_binary("FloorDivSpec", lhs, rhs, Int32(-1), dst)
+    if lhs.is_t and rhs.is_t:
+        var a = lhs.t.value().copy()
+        var b = rhs.t.value().copy()
+        var common = _b_promote(a, b)
+        if b.numel == 1 and (common == ST_BFLOAT16 or common == ST_FLOAT16):
+            return _b_binary("TruncDivOpmathSpec", lhs, rhs, Int32(-1), dst)
+    return _b_binary("TruncDivSpec", lhs, rhs, Int32(-1), dst)
+
+
 def _b_rounding_div(
     floor: Bool, lhs: Side, rhs: Side, dst: Optional[T]
 ) raises -> Res:
@@ -2513,6 +2605,8 @@ def _b_rounding_div(
     true division. Integer scalars are wrapped into the dtype, and an
     integer division by zero does not raise (the kernels' own value).
     """
+    if dev(_b_device_of(lhs, rhs))[].api != "cuda":
+        return _b_rounding_div_legacy(floor, lhs, rhs, dst)
     if lhs.is_t and not rhs.is_t:
         var a = lhs.t.value().copy()
         var common = _b_side_result(a, rhs)
@@ -2581,12 +2675,16 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
         var name = v_string(mode)
         if name == "floor" or name == "trunc":
             return _b_rounding_div(name == "floor", lhs, rhs, dst)
+        if dev(_b_device_of(lhs, rhs))[].api != "cuda":
+            unsupported("div rounding_mode " + name)
         raise Error(
             "div expected rounding_mode to be one of None, 'trunc', or"
             " 'floor' but found '"
             + name
             + "'"
         )
+    if not lhs.is_t and dev(_b_device_of(lhs, rhs))[].api != "cuda":
+        unsupported("div with a scalar numerator")
     _b_f8_refuse("div_true_cuda", lhs, rhs)
     if not lhs.is_t:
         # div_true_kernel_cuda: a CPU-scalar numerator is read as scalar_t
@@ -2595,7 +2693,7 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
         var common0 = _b_true_div_dtype(b0, lhs)
         if not _b_is_floating(common0):
             unsupported("true division producing dtype " + String(common0))
-        var den0 = _b_cast_any(b0, common0)
+        var den0 = _b_cast_cuda_any(b0, common0)
         var r0 = _b_binary("DivSpec", lhs, _b_tside(den0.t), Int32(-1), dst)
         _ = den0
         return r0^
@@ -2612,7 +2710,7 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     # An integer numerator still has to be CAST into `common`, and
     # data_movement' CAST_DTYPES stops before float64: `_b_cast` declines
     # that pair on its own.
-    var num = _b_cast_any(a, common)
+    var num = _b_cast_cuda_any(a, common)
     if not rhs.is_t:
         var scalar = rhs.s.value().copy()
         if dev(a.device)[].api == "cuda":
@@ -2633,7 +2731,7 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     var b = rhs.t.value().copy()
     if not a.on_mojo() or not b.on_mojo() or b.device != a.device:
         raise Error("expected both operands on the same mojo device")
-    var den = _b_cast_any(b, common)
+    var den = _b_cast_cuda_any(b, common)
     var r2 = _b_binary(
         "DivSpec", _b_tside(num.t), _b_tside(den.t), Int32(-1), dst
     )
@@ -2649,7 +2747,7 @@ def _b_no_mode() -> Value:
 def _b_fast_div_scalar(a: T, s: Scal, rets: Values, dest_h: Int) raises -> Bool:
     """The reciprocal route `_b_div` takes for a dense float32 / half tensor
     over a scalar -- same rounding, no cascade."""
-    if not _b_float3(a.stype) or s.is_bool or dev(a.device)[].api == "metal":
+    if not _b_float3(a.stype) or s.is_bool or dev(a.device)[].api != "cuda":
         return False
     return _b_fast_ts(
         "MulScalarSpec",
@@ -3145,6 +3243,16 @@ def op_minimum_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::remainder.Scalar_Tensor(Scalar self, Tensor other) -> Tensor
 def op_remainder(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     # Divisor-signed remainder (Python/torch `%`), float and int dtypes.
+    if (
+        dev(
+            _b_device_of(
+                _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+            )
+        )[].api
+        != "cuda"
+    ):
+        _b_simple("RemainderSpec", args, rets)
+        return
     _b_ret(
         rets,
         _b_remainder(
@@ -3160,6 +3268,9 @@ def op_remainder_out(
 ) raises:
     var lhs = _b_side(args[unsafe_offset=0])
     var rhs = _b_side(args[unsafe_offset=1])
+    if dev(_b_device_of(lhs, rhs))[].api != "cuda":
+        _b_simple_out("RemainderSpec", args, rets, 2)
+        return
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
     _b_store_out(rets, dest, _b_remainder(lhs, rhs, Optional[T](dest.copy())))

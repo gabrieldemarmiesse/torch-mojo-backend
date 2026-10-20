@@ -47,6 +47,7 @@ from tmb.kernels.common.cuda_div_math import (
     cuda_trunc_div,
     cuda_trunc_div_by_scalar,
 )
+from tmb.kernels.common.div_math import trunc_div
 from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.nan_order import nan_first2, nan_first3
 from tmb.kernels.common.pow_math import torch_pow
@@ -112,12 +113,15 @@ comptime BOP_REMAINDER = 9
 comptime BOP_FLOORDIV = 10
 comptime BOP_POW = 11
 comptime BOP_TRUNCDIV = 12
+# BOP_TRUNCDIV of a bf16/fp16 tensor by a ONE-ELEMENT tensor, divided in
+# float32 (see there).
+comptime BOP_TRUNCDIV_OPMATH = 13
 # True / trunc / floor division by a CPU scalar, stock CUDA's own route for
 # it: `alpha` carries the double reciprocal (div) or the divisor (trunc,
 # floor); the `b` operand is not read.
-comptime BOP_DIV_BY_SCALAR = 13
-comptime BOP_TRUNCDIV_BY_SCALAR = 14
-comptime BOP_FLOORDIV_BY_SCALAR = 15
+comptime BOP_DIV_BY_SCALAR = 14
+comptime BOP_TRUNCDIV_BY_SCALAR = 15
+comptime BOP_FLOORDIV_BY_SCALAR = 16
 
 comptime COP_EQ = 0
 comptime COP_NE = 1
@@ -184,6 +188,8 @@ def _op_token[op_code: Int, is_cmp: Bool]() -> StaticString:
             return "pow"
         comptime if op_code == BOP_TRUNCDIV:
             return "trunc_divide"
+        comptime if op_code == BOP_TRUNCDIV_OPMATH:
+            return "trunc_divide_opmath"
         comptime if op_code == BOP_DIV_BY_SCALAR:
             return "div_by_scalar"
         comptime if op_code == BOP_TRUNCDIV_BY_SCALAR:
@@ -493,6 +499,16 @@ def _bin_vec_op[
             return cuda_floor_div(a, b).cast[out_dtype]()
         comptime if op_code == BOP_TRUNCDIV:
             return cuda_trunc_div(a, b).cast[out_dtype]()
+        comptime if op_code == BOP_TRUNCDIV_OPMATH:
+            # ATen's div_trunc_kernel for a reduced-float operand over a
+            # one-element tensor (`iter.is_scalar(2)`): divided in float32,
+            # rounded to bf16/fp16 once at the end.
+            comptime if dtype == DType.bfloat16 or dtype == DType.float16:
+                return trunc_div(
+                    a.cast[DType.float32](), b.cast[DType.float32]()
+                ).cast[out_dtype]()
+            else:
+                return trunc_div(a, b).cast[out_dtype]()
         comptime if dtype.is_floating_point():
             comptime om = _opmath[dtype]()
             comptime if op_code == BOP_DIV_BY_SCALAR:
@@ -2359,6 +2375,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             return 0
         comptime if _op_on["TruncDivSpec"]():
             _binary_dispatcher[BOP_TRUNCDIV, False](argv, argc)
+            return 0
+        comptime if _op_on["TruncDivOpmathSpec"]():
+            _binary_dispatcher[BOP_TRUNCDIV_OPMATH, False](argv, argc)
             return 0
         comptime if _op_on["DivByScalarSpec"]():
             _binary_dispatcher[BOP_DIV_BY_SCALAR, False](argv, argc)
