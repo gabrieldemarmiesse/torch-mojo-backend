@@ -1125,6 +1125,20 @@ def _cx_result3(a: _Operand, b: _Operand, c: _Operand, n: Int) raises -> Int32:
     return _pw_combine(dim, _pw_combine(zero, wrapped))
 
 
+def _cx_vectorizable(
+    o: _Operand, shape: IndexList[MAX_RANK], rank: Int, st: Int32
+) -> Bool:
+    if not o.is_t:
+        return True
+    var t = o.t.copy()
+    if t.rank != rank or not t.contig or t.ptr % 16 != 0 or t.stype != st:
+        return False
+    for i in range(MAX_RANK):
+        if t.shape[i] != shape[i]:
+            return False
+    return True
+
+
 def _cx_pw_launch(
     kind: StaticString,
     av: Value,
@@ -1164,6 +1178,13 @@ def _cx_pw_launch(
                 " can't be cast to the desired output type ",
                 scalar_type_name(d.dtype),
             )
+    # jitterator's vectorized kernel needs every operand dense, of the output's
+    # shape and 16-byte aligned; anything else runs its scalar kernel
+    var scalar_kernel = (
+        not _cx_vectorizable(a, shape, rank, st)
+        or not _cx_vectorizable(b, shape, rank, st)
+        or (n == 3 and not _cx_vectorizable(c, shape, rank, st))
+    )
     var fa = _flatten(a, st, shape, rank)
     var fb = _flatten(b, st, shape, rank)
     var fc = _flatten(c, st, shape, rank)
@@ -1178,7 +1199,12 @@ def _cx_pw_launch(
         call.int(fa.addr)
         call.int(fb.addr)
         call.int(fc.addr)
-        call.int(fa.mode | (fb.mode << 2) | (fc.mode << 4))
+        call.int(
+            fa.mode
+            | (fb.mode << 2)
+            | (fc.mode << 4)
+            | (64 if scalar_kernel else 0)
+        )
         call.f64(fa.re)
         call.f64(fa.im)
         call.f64(fb.re)

@@ -106,16 +106,18 @@ def _sub[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
-def _lerp[dt: DType](s: Cx[dt], e: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+def _lerp[
+    dt: DType
+](s: Cx[dt], e: Cx[dt], w: Cx[dt], fuse_small: Bool, fuse_big: Bool) -> Cx[dt]:
     """Lerp.cu's jiterated lerp: abs(w) < 0.5 ? s + w (e - s) :
     e - (e - s)(1 - w), abs being libc++'s hypot(re, im); 1 - w's
     imaginary part is 0 - w.im (NVRTC's FADD, +0 for a zero)."""
     var diff = _sub(e, s)
     var aw = chypot(w.re, w.im)
     if not isnan(aw) and aw < Scalar[dt](0.5):
-        return _add(s, cmul_jit(w, diff))
+        return _add(s, cmul_jit(w, diff, fuse_small))
     var omw = Cx[dt](_sub_rn(Scalar[dt](1), w.re), _sub_rn(Scalar[dt](0), w.im))
-    return _sub(e, cmul_jit(diff, omw))
+    return _sub(e, cmul_jit(diff, omw, fuse_big))
 
 
 @always_inline
@@ -169,17 +171,19 @@ def _fast_build_exp_inf[dt: DType](x: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
-def _log1p_cx[dt: DType](z: Cx[dt]) -> Cx[dt]:
+def _log1p_cx[dt: DType](z: Cx[dt], special: Bool) -> Cx[dt]:
     """The jiterator string's log1p(complex)."""
     var x = z.re
     var y = z.im
     var zabs = chypot(x, y)
     var theta = catan2(y, x + Scalar[dt](1))
     if zabs < Scalar[dt](0.5):
-        # ptxas fuses the other product per dtype (SASS of both jiterated
-        # kernels): float fma(y, y, x (2 + x)), double fma(x, 2 + x, y y)
+        # ptxas fuses the other product per kernel (SASS of the jiterated
+        # kernels): the vectorized float one fma(y, y, x (2 + x)), the
+        # non-vectorized float one (a 0-d operand) and the double one
+        # fma(x, 2 + x, y y)
         var r: Scalar[dt]
-        comptime if dt == DType.float32:
+        if dt == DType.float32 and not special:
             r = _fma_c(y, y, _mul_rn[dt, 1](x, Scalar[dt](2) + x))
         else:
             r = _fma_c(x, Scalar[dt](2) + x, _mul_rn[dt, 1](y, y))
@@ -198,7 +202,7 @@ def _fma_c[
 
 
 @always_inline
-def _logaddexp[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
+def _logaddexp[dt: DType](x: Cx[dt], y: Cx[dt], special: Bool) -> Cx[dt]:
     """The jiterated logaddexp_complex (LogAddExpKernel.cu)."""
     var mn = _minmax[dt, True](x, y)
     var mx = _minmax[dt, False](x, y)
@@ -213,7 +217,8 @@ def _logaddexp[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
             Cx[dt](
                 e_min.re + e_max.re - Scalar[dt](1),
                 e_min.im + e_max.im - Scalar[dt](0),
-            )
+            ),
+            False,
         )
     var mm = _sub(mn, mx)
     var ex: Cx[dt]
@@ -223,26 +228,30 @@ def _logaddexp[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
         )
     else:
         ex = _fast_build_exp(mm)
-    return _add(_log1p_cx(ex), mx)
+    return _add(_log1p_cx(ex, special), mx)
 
 
 @always_inline
 def _ternary[
     kind: StaticString, dt: DType
-](a: Cx[dt], b: Cx[dt], c: Cx[dt], p: Cx[dt]) -> Cx[dt]:
+](a: Cx[dt], b: Cx[dt], c: Cx[dt], p: Cx[dt], special: Bool, alt: Bool) -> Cx[
+    dt
+]:
+    var fuse_f32 = special and dt == DType.float32
     comptime if kind == "cx_lerp_scalar":
-        return _lerp(a, b, p)
+        return _lerp(a, b, p, fuse_f32, fuse_f32)
     elif kind == "cx_lerp":
-        return _lerp(a, b, c)
+        return _lerp(a, b, c, fuse_f32, False)
     elif kind == "cx_logaddexp":
-        return _logaddexp(a, b)
+        return _logaddexp(a, b, alt)
     elif kind == "cx_addcmul":
-        # a + alpha * (b * c): in complex128's SASS the inner product is
-        # contracted, the outer one not
+        # a + alpha * (b * c): the first inlined copy of the jiterated
+        # function (`special`) contracts the inner product, and in complex64
+        # the outer one too
         comptime if dt == DType.float64:
-            return _add(a, cmul_jit(p, cmul_jit(b, c, True)))
+            return _add(a, cmul_jit(p, cmul_jit(b, c, special)))
         else:
-            return _add(a, cmul_jit(p, cmul_jit(b, c)))
+            return _add(a, cmul_jit(p, cmul_jit(b, c, special), special))
     else:
         comptime assert kind == "cx_addcdiv", "unknown complex ternary kind"
         # a + alpha * (b / c)
@@ -277,6 +286,14 @@ def _launch[
     var hc_im = _hval[dt](h[5])
     var hp_re = _hval[dt](h[6])
     var hp_im = _hval[dt](h[7])
+    # Stock CUDA jiterates these as a vectorized kernel (complex64, every
+    # operand dense and of the result's dtype: the last partial block of
+    # 1024 runs its scalar tail) or a scalar one (complex128, or a 0-d /
+    # strided / broadcast / dynamically cast operand), whose first inlined
+    # copy of the function (the first 128 of every 1024 elements) ptxas
+    # contracts differently (`special`).
+    var scalar_kernel = (modes >> 6) & 1 != 0
+    var tail_start = (numel >> 10) << 10
 
     @always_inline
     @__parameter
@@ -296,6 +313,8 @@ def _launch[
         hc_im,
         hp_re,
         hp_im,
+        scalar_kernel,
+        tail_start,
     )
     def func[w: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -311,7 +330,13 @@ def _launch[
         if mode_c != MODE_HOST:
             var k = 2 * i if mode_c == MODE_FULL else 0
             c = Cx[dt](c_ptr[unsafe_offset=k], c_ptr[unsafe_offset=k + 1])
-        var r = _ternary[kind, dt](a, b, c, Cx[dt](hp_re, hp_im))
+        var scalar_path = dt == DType.float64 or scalar_kernel
+        # the first inlined copy of the jiterated function of a scalar kernel
+        var special = scalar_path and (i & 1023) < 128
+        # complex logaddexp's finite path: its fma association in every copy
+        # of a scalar kernel and in the vectorized one's scalar tail
+        var alt = scalar_path or i >= tail_start
+        var r = _ternary[kind, dt](a, b, c, Cx[dt](hp_re, hp_im), special, alt)
         out_ptr[unsafe_offset=2 * i] = r.re
         out_ptr[unsafe_offset=2 * i + 1] = r.im
 
