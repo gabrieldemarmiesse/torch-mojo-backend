@@ -80,7 +80,7 @@ from tmb.backend.abi import (
     v_tensor,
     view_strided,
 )
-from tmb.backend.device import ctx_for, ctx_ptr
+from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.f8_iter import (
     f8_cx_scalar,
@@ -137,6 +137,12 @@ from tmb.kernels.common.pow_math import (
     POW_SQUARE,
 )
 from tmb.ops.binary import (
+    op_addcdiv_legacy,
+    op_addcdiv_out_legacy,
+    op_addcdiv__legacy,
+    op_addcmul_legacy,
+    op_addcmul_out_legacy,
+    op_addcmul__legacy,
     Res,
     Scal,
     Side,
@@ -1615,6 +1621,18 @@ def cx_lerp_tensor_out(
 # ---------------------------------------------------------------------------
 
 
+def _pw_addc_cuda(args: Values) raises -> Bool:
+    """The pointwise addcmul / addcdiv kernels run on cuda; other devices keep
+    the logic broadcast kernels they always had."""
+    for i in range(3):
+        var tag = args[unsafe_offset=i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            var t = v_tensor_c(args[unsafe_offset=i])
+            if t.on_mojo():
+                return dev(t.device)[].api == "cuda"
+    return True
+
+
 def _pw_addc(
     kind: StaticString,
     args: Values,
@@ -1719,31 +1737,49 @@ def _pw_real_value(v: Value) raises -> Value:
 
 # aten::addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
 def op_addcmul(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_addc_cuda(args):
+        op_addcmul_legacy(args, n_args, rets, n_rets)
+        return
     _pw_addc("addcmul", args, rets, -1, False)
 
 
 # aten::addcmul.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
 def op_addcmul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_addc_cuda(args):
+        op_addcmul_out_legacy(args, n_args, rets, n_rets)
+        return
     _pw_addc("addcmul", args, rets, 4, False)
 
 
 # aten::addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
 def op_addcmul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_addc_cuda(args):
+        op_addcmul__legacy(args, n_args, rets, n_rets)
+        return
     _pw_addc("addcmul", args, rets, -1, True)
 
 
 # aten::addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
 def op_addcdiv(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_addc_cuda(args):
+        op_addcdiv_legacy(args, n_args, rets, n_rets)
+        return
     _pw_addc("addcdiv", args, rets, -1, False)
 
 
 # aten::addcdiv.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
 def op_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_addc_cuda(args):
+        op_addcdiv_out_legacy(args, n_args, rets, n_rets)
+        return
     _pw_addc("addcdiv", args, rets, 4, False)
 
 
 # aten::addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
 def op_addcdiv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_addc_cuda(args):
+        op_addcdiv__legacy(args, n_args, rets, n_rets)
+        return
     _pw_addc("addcdiv", args, rets, -1, True)
 
 

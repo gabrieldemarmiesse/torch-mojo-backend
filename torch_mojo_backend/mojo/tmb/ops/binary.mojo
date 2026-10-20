@@ -147,7 +147,7 @@ from tmb.ops.complex_math import (
     cx_sub_,
     cx_sub_out,
 )
-from tmb.ops.foreach import foreach_lerp_inplace
+from tmb.ops.foreach import foreach_addc_inplace, foreach_lerp_inplace
 
 # ---------------------------------------------------------------------------
 # dtype predicates: the gates of the kernels this file calls
@@ -3649,8 +3649,12 @@ def _b_clamp(
     # The bounds travel as the kernel's raw slots: a float64's bits for a
     # floating result, the integer itself for an integral one, so an int64
     # bound past 2**53 stays exact (`clamp_min(int64, 2**53 + 1)`).
-    var lo_v = _b_clamp_bound(lo, result_stype) if has_min else 0
-    var hi_v = _b_clamp_bound(hi, result_stype) if has_max else 0
+    var lo_v = _b_clamp_bound(
+        lo, result_stype, _b_exact_on(self)
+    ) if has_min else 0
+    var hi_v = _b_clamp_bound(
+        hi, result_stype, _b_exact_on(self)
+    ) if has_max else 0
     var src = _b_ready_any(self, result_stype)
     if dst:
         var d = dst.value().copy()
@@ -3688,11 +3692,11 @@ def _b_clamp_float8(
     return Res(self.copy(), False)  # unreachable: float8 always declines
 
 
-def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:
+def _b_clamp_bound(v: Value, result_stype: Int32, cuda: Bool) raises -> Int:
     """A clamp bound as `_b_clamp_launch`'s raw slot."""
     # `Scalar::to<scalar_t>()`: checked against the dtype (and exact for
     # an integral one).
-    if result_stype == ST_FLOAT16 or result_stype == ST_BFLOAT16:
+    if cuda and (result_stype == ST_FLOAT16 or result_stype == ST_BFLOAT16):
         # `lim.to<opmath_t>()`: checked against float and rounded to it; a
         # half result is then the kernel's rounding of max/min in float
         return Int(f64_bits(Float64(Float32(scalar_to_float(v, ST_FLOAT32)))))
@@ -3952,6 +3956,182 @@ def op_lerp_scalar_(
 
 
 # ---------------------------------------------------------------------------
+
+
+# addcmul / addcdiv as origin routed them (the logic broadcast kernels): non-cuda
+# devices keep these; cuda takes the pointwise kernels.
+
+
+def _b_strides4(t: T, shape: IndexList[MAX_RANK]) -> List[Int]:
+    """The operand's rank-4 strides for the ternary kernel: 0 on every axis
+    it broadcasts over (the old `_bcast_meta`)."""
+    var out = List[Int](capacity=4)
+    for k in range(4):
+        var i = MAX_RANK - 4 + k
+        out.append(0 if t.shape[i] == 1 else t.strides[i])
+    return out^
+
+
+def _b_addc(
+    op: StaticString, args: Values, allow_int: Bool, dst: Optional[T] = None
+) raises -> Res:
+    """self + value * (tensor1 * tensor2) — or / — in one broadcast launch."""
+    var a = v_tensor(args[unsafe_offset=0])
+    var b = v_tensor(args[unsafe_offset=1])
+    var c = v_tensor(args[unsafe_offset=2])
+    if not a.on_mojo() or not b.on_mojo() or not c.on_mojo():
+        unsupported("addc* operands that are not all on the mojo device")
+    if a.device != b.device or a.device != c.device:
+        raise Error("expected every operand on the same mojo device")
+    if a.stype != b.stype or a.stype != c.stype:
+        unsupported("addc* operands of different dtypes")
+    # CUDA's addcmul_cuda / addcdiv_cuda dispatch no float8.
+    decline_float8(
+        a.dtype, "addcmul_cuda" if op == "AddcmulBcast" else "addcdiv_cuda"
+    )
+    if not _b_float3(a.stype) and not (allow_int and _b_int_dtype(a.stype)):
+        unsupported("addc* of dtype " + String(a.stype))
+    if a.rank > 4 or b.rank > 4 or c.rank > 4:
+        unsupported("addc* operands of rank > 4")
+    var value = _b_side(args[unsafe_offset=3])
+    if value.is_t:
+        unsupported("a tensor `value` for addc*")
+    var s = value.s.value().copy()
+    if s.is_bool:
+        unsupported("a bool `value` for addc*")
+    var merged = _b_broadcast3(a, b, c)
+    var rank = max(a.rank, max(b.rank, c.rank))
+    if dst:
+        var dest = dst.value().copy()
+        if (
+            dest.contig
+            and a.contig
+            and b.contig
+            and c.contig
+            and dest.stype == a.stype
+            and dest.same_shape(a)
+            and a.same_shape(b)
+            and a.same_shape(c)
+        ):
+            _b_no_partial_overlap(dest, a)
+            _b_no_partial_overlap(dest, b)
+            _b_no_partial_overlap(dest, c)
+            if _b_same_tensor(dest, a) and a.dtype == DType.float32:
+                foreach_addc_inplace(
+                    dest, b, c, s.f, multiplies=op == "AddcmulBcast"
+                )
+                return Res(dest^, False)
+            _b_addc_into(op, a, b, c, merged, s.f, dest)
+            return Res(dest^, False)
+    var out = own(new_tensor(merged, rank, a.stype, a.device))
+    _b_addc_into(op, a, b, c, merged, s.f, out.t)
+    return Res(out.take(), True)
+
+
+def _b_addc_inplace(
+    op: StaticString, args: Values, rets: Values, allow_int: Bool
+) raises:
+    var dest = _b_self(args[unsafe_offset=0], "addc in-place")
+    _b_inplace_destination(dest)
+    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=1]))
+    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=2]))
+    _b_store_inplace(rets, dest, _b_addc(op, args, allow_int, dest.copy()))
+
+
+# aten::addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+def op_addcmul__legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_addc_inplace("AddcmulBcast", args, rets, True)
+
+
+# aten::addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+def op_addcdiv__legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_addc_inplace("AddcdivBcast", args, rets, False)
+
+
+def _b_addc_into(
+    op: StaticString,
+    a: T,
+    b: T,
+    c: T,
+    merged: IndexList[MAX_RANK],
+    value: Float64,
+    dest: T,
+) raises:
+    """Launch the existing ternary kernel into validated output storage."""
+    if dest.numel > 0:
+        var params = List[Int](capacity=16)
+        for k in range(4):
+            params.append(merged[MAX_RANK - 4 + k])
+        params.extend(_b_strides4(a, merged))
+        params.extend(_b_strides4(b, merged))
+        params.extend(_b_strides4(c, merged))
+        var ctx = ctx_for(a.device)
+        var call = KernelCall("logic", String(op))
+        call.arg_dtype(0, a.dtype)
+        call.arg_dtype(1, b.dtype)
+        call.arg_dtype(2, c.dtype)
+        call.out_dtype(dest.dtype)
+        call.int(dest.ptr)
+        call.int(a.ptr)
+        call.int(b.ptr)
+        call.int(c.ptr)
+        call.tuple(params)
+        call.f64(value)
+        call.int(dtype_code(a.dtype))
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+
+
+# aten::addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+def op_addcmul_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _b_ret(rets, _b_addc("AddcmulBcast", args, True))
+
+
+# aten::addcmul.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
+def op_addcmul_out_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _b_out_tensor(
+        args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
+    )
+    _b_out_guard3(
+        dest,
+        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=2]),
+    )
+    _b_store_out(rets, dest, _b_addc("AddcmulBcast", args, True, dest.copy()))
+
+
+# aten::addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+def op_addcdiv_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    # addcdiv is float-only: torch errors for integer inputs.
+    _b_ret(rets, _b_addc("AddcdivBcast", args, False))
+
+
+# aten::addcdiv.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
+def op_addcdiv_out_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var dest = _b_out_tensor(
+        args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
+    )
+    _b_out_guard3(
+        dest,
+        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=2]),
+    )
+    _b_store_out(rets, dest, _b_addc("AddcdivBcast", args, False, dest.copy()))
 
 
 def register_binary(site: Site) raises:
