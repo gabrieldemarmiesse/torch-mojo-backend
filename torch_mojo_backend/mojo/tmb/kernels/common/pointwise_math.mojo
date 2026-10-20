@@ -2623,6 +2623,24 @@ def pointwise[
     elif is_scalar_t_kind[kind]():
         comptime assert dtype.is_floating_point(), "losses take floats"
         return _scalar_t[kind](a, b, c, p).cast[out_dtype]()
+    elif (
+        (kind == "xlogy" or kind == "xlog1py")
+        and (out_dtype == DType.float16 or out_dtype == DType.bfloat16)
+        and dtype != DType.float64
+        and is_nvidia_gpu()
+    ):
+        # `return NAN` as Half/BFloat16 is cvt.rn of a float NaN: 0x7fff
+        # (LLVM would fold the constant to the quiet 0x7e00 / 0x7fc0).
+        var r = _wide[kind](
+            a.cast[DType.float32](),
+            b.cast[DType.float32](),
+            c.cast[DType.float32](),
+            p.cast[DType.float32](),
+        )
+        var canon = SIMD[DType.float32, n](
+            Float32(from_bits=UInt32(0x7FFFFFFF))
+        )
+        return isnan(r).select(canon, r).cast[out_dtype]()
     else:
         var q = p
         comptime if dtype == DType.float64:

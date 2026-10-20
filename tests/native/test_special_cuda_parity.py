@@ -489,7 +489,19 @@ def test_binary_special_scalars_and_promotion_match_cuda(
         what="f16, 0-dim f32",
     )
     eq(lambda t, u: fn(t.half(), u), a, b, what="f16, f32")
-    eq(lambda t, u: fn(t.double(), u), a, b, what="f64, f32")
+    # xlogy / xlog1py in float64 with a NaN x and a log(y) that is NaN: the
+    # sign of the result depends on the CUDA launch path (contiguous
+    # vectorized kernel: log's -NaN; the casting/strided kernel: x's +NaN),
+    # because ptxas orders the dmul operands per instantiation. Probed on
+    # 4 vs 66692 elements. The contiguous case is exact in
+    # test_binary_special_matches_cuda; here only the NaN sign may differ.
+    eq(
+        lambda t, u: fn(t.double(), u),
+        a,
+        b,
+        nan="any" if name in ("xlogy", "xlog1py") else "exact",
+        what="f64, f32",
+    )
     eq(
         lambda t, u: fn(t.to(torch.int32), u),
         a.nan_to_num(0).clamp(-50, 50),
