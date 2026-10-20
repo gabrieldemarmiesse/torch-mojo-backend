@@ -76,20 +76,10 @@ def _scalars(dtype):
     return _INT_SCALARS + [0.5, -3.0, 1e-40, float("inf"), float("nan")]
 
 
-_BF16_DENORMAL_FMOD = "fmod on bfloat16 with a denormal bfloat16 CPU divisor"
-
-
-def _bf16_denormal(s) -> bool:
-    return s != 0 and abs(s) < 2.0**-126  # below bfloat16's smallest normal
-
-
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
 @pytest.mark.parametrize(("op", "fn", "inplace", "rev"), _OPS, ids=_IDS)
 def test_tensor_scalar(cuda_oracle: CudaOracle, op, fn, inplace, rev, dtype):
     scalars = _scalars(dtype)
-    if op == "fmod" and dtype == torch.bfloat16:
-        # the denormal divisors are xfail below (test_bf16_fmod_denormal_scalar)
-        scalars = [s for s in scalars if not _bf16_denormal(s)]
     cases = bp.scalar_cases(fn, dtype, scalars, reverse=scalars if rev else ())
     a, _ = bp.pairs(dtype)
     for s in scalars:
@@ -304,13 +294,9 @@ def test_half_sweep(cuda_oracle: CudaOracle, op, fn, inplace, rev, dtype):
     bp.check_all(cuda_oracle, cases)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=_BF16_DENORMAL_FMOD
-    + ": the mojo device returns NaN where CUDA returns 0 (a divisor of 0 in the kernel), while the same divisor as a 0-d device tensor is exact; not yet root-caused",
-)
 @pytest.mark.parametrize("s", [1e-40, 3e-40, 1e-38])
 def test_bf16_fmod_denormal_scalar(cuda_oracle: CudaOracle, s):
+    """A bfloat16 denormal CPU divisor: the kernel must get its bits."""
     a, _ = bp.pairs(torch.bfloat16)
     bp.check_all(
         cuda_oracle,

@@ -349,6 +349,11 @@ def _launch[
     var p1 = params[1]
     var p2 = params[2]
     var p3 = params[3]
+    # A half-precision host scalar travels as its bits: by value, a bfloat16
+    # denormal reached the kernel as zero (fmod's divisor then NaN).
+    var vb_bits = UInt16(0)
+    comptime if size_of[dt]() == 2:
+        vb_bits = bitcast[DType.uint16](vb)
 
     @always_inline
     @__parameter
@@ -362,6 +367,7 @@ def _launch[
         dev_c,
         va,
         vb,
+        vb_bits,
         vc,
         p0,
         p1,
@@ -383,7 +389,10 @@ def _launch[
             comptime if full_b:
                 b = b_ptr.unsafe_load[width=w, alignment=in_align](i)
             else:
-                b = SIMD[dt, w](b_ptr[unsafe_offset=0] if dev_b else vb)
+                var vb_k = vb
+                comptime if size_of[dt]() == 2:
+                    vb_k = bitcast[dt](vb_bits)
+                b = SIMD[dt, w](b_ptr[unsafe_offset=0] if dev_b else vb_k)
         var c = SIMD[dt, w](0)
         comptime if arity >= 3:
             comptime if full_c:
