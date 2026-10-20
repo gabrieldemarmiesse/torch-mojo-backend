@@ -153,6 +153,9 @@ def _raised_mismatch(ours: object, cuda: object, check_message: bool) -> str | N
     b = cuda.summary(check_message) if isinstance(cuda, Raised) else None
     if a == b:
         return None
+    if __import__("os").environ.get("ORACLE_MSG"):
+        a = ours.summary(True) if isinstance(ours, Raised) else None
+        b = cuda.summary(True) if isinstance(cuda, Raised) else None
     return (
         f"ours {a or f'returned {_describe(ours)}'},"
         f" CUDA {b or f'returned {_describe(cuda)}'}"

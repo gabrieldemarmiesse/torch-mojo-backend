@@ -23,6 +23,7 @@ from std.utils.numerics import nan
 
 from tmb.backend.abi import (
     view_strided,
+    v_is_complex,
     is_float8_stype,
     max_dtype,
     DEVICE_TYPE_CPU,
@@ -75,6 +76,11 @@ from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
+    check_broadcastable,
+    device_str,
+    is_wide_unsigned,
+    can_cast,
+    cast_any,
     out_device_error,
     is_wide_unsigned,
     is_cast_pair_on,
@@ -568,6 +574,17 @@ def _b_ready(t: T, st: Int32, need_contig: Bool) raises -> Held:
     return Held(t.copy(), False)
 
 
+def _b_ready_any(t: T, st: Int32) raises -> Held:
+    """`_b_ready(t, st, True)` for any pair, the wide unsigned types
+    included (`cast_any`)."""
+    if t.stype == st or is_cast_pair_on(t.dtype, max_dtype(st), t):
+        return _b_ready(t, st, True)
+    var c = Held(cast_any(t, st), True)
+    if c.t.contig:
+        return c^
+    return Held(contiguous(c.t), True)
+
+
 def _b_fill_spec(dst: T, value: Float64) raises:
     """elementwise FillSpec into a caller-allocated contiguous output."""
     var ctx = ctx_for(dst.device)
@@ -612,6 +629,28 @@ def _b_scalar_fill(s: Scal, st: Int32, device: Int) raises -> Held:
             raise e
         return Held(t^, True)
     return _b_scalar_tensor(value, st, device)
+
+
+def _b_scalar_fill_exact(s: Scal, st: Int32, device: Int) raises -> Held:
+    """A Scalar operand as a 0-d tensor of dtype `st`, converted on the host
+    the way `iter.scalar_value<scalar_t>()` converts it: an integer narrows
+    with wrap into an integral dtype and rounds once into a floating one, a
+    double reaches the half types through float, a NaN keeps what the host
+    conversion keeps of its payload."""
+    var rec: Value
+    if s.is_bool:
+        rec = Value(TAG_SCALAR_BOOL, 0, Int64(1) if s.i != 0 else Int64(0), 0)
+    elif s.is_int:
+        rec = Value(TAG_SCALAR_INT, 0, Int64(s.i), 0)
+    else:
+        rec = Value(TAG_SCALAR_DOUBLE, 0, f64_bits(s.f), 0)
+    var t = new_scalar(st, device)
+    try:
+        fill_value(t, rec)
+    except e:
+        release(t.h)
+        raise e
+    return Held(t^, True)
 
 
 def _b_copy_into(dst: T, src: T) raises:
@@ -1140,9 +1179,14 @@ def _b_binary(
     out_stype: Int32,
     dst: Optional[T],
     alpha: Float64 = 1.0,
+    exact_fill: Bool = False,
 ) raises -> Res:
     """The old `_try_spec_binary`: promotion, scalar embedding, rank>4
     pre-materialization, output allocation and one logic launch.
+
+    `exact_fill` converts a Scalar operand on the host as c10 does
+    (`_b_scalar_fill_exact`): an integer wraps into an integral dtype, a
+    NaN keeps the payload a host conversion keeps.
 
     `out_stype` overrides the output dtype (-1 keeps the promoted one; only
     the comparison-shaped ops pass bool). `dst`, when given and eligible, is
@@ -1164,6 +1208,7 @@ def _b_binary(
         var b = rhs.t.value().copy()
         if a.device != b.device:
             raise Error("expected both operands on the same mojo device")
+        check_broadcastable([a.copy(), b.copy()])
         device = a.device
         var promoted = _b_promote(a, b)
         if promoted < 0:
@@ -1190,7 +1235,9 @@ def _b_binary(
         dtype = _b_side_result(t, rhs.copy() if lhs.is_t else lhs.copy())
         kop = _b_bool_add_as_or(op, dtype)
         _b_op_dtype_ok(kop, dtype, is_cmp)
-        var fill = _b_scalar_fill(s, dtype, device)
+        var fill = _b_scalar_fill_exact(
+            s, dtype, device
+        ) if exact_fill else _b_scalar_fill(s, dtype, device)
         if t.rank > 4:
             # The spec entry's rank > 4 pass is flat: run the whole tensor
             # as one dense 1-D span against the scalar, into a flat view of
@@ -2597,7 +2644,51 @@ def op_div_out_mode(
 # ---------------------------------------------------------------------------
 
 
+def _b_is_bitwise(op: StaticString) -> Bool:
+    return (
+        op == "BitwiseAndSpec"
+        or op == "BitwiseOrSpec"
+        or op == "BitwiseXorSpec"
+    )
+
+
+def _b_bitwise(
+    op: StaticString, lhs: Side, rhs: Side, dst: Optional[T]
+) raises -> Res:
+    """bitwise_and / or / xor in the common dtype (an integer Scalar wraps
+    into it, as `scalar_value<scalar_t>` does); AT_DISPATCH_INTEGRAL_TYPES
+    plus bool, so no uint16 / uint32 / uint64."""
+    var common = _b_sides_result(lhs, rhs, rhs)
+    if is_wide_unsigned(common):
+        unsupported(
+            '"'
+            + _b_cuda_kernel(op)
+            + "\" not implemented for '"
+            + scalar_type_name(max_dtype(common))
+            + "'"
+        )
+    var a = _b_cast_side_any(lhs, common)
+    var b = _b_cast_side_any(rhs, common)
+    var r = _b_binary(
+        op, a.side.copy(), b.side.copy(), Int32(-1), dst, exact_fill=True
+    )
+    _ = a^
+    _ = b^
+    return r^
+
+
 def _b_simple(op: StaticString, args: Values, rets: Values) raises:
+    if _b_is_bitwise(op):
+        _b_ret(
+            rets,
+            _b_bitwise(
+                op,
+                _b_side(args[unsafe_offset=0]),
+                _b_side(args[unsafe_offset=1]),
+                None,
+            ),
+        )
+        return
     _b_ret(
         rets,
         _b_binary(
@@ -2637,6 +2728,19 @@ def _b_simple_out(
                 + _b_tname(w.value())
                 + "'"
             )
+        # dispatched on the out dtype: a floating out refuses as itself
+        if not _b_int_dtype(dest.stype) and dest.stype != ST_BOOL:
+            unsupported(
+                '"'
+                + _b_cuda_kernel(op)
+                + "\" not implemented for '"
+                + scalar_type_name(max_dtype(dest.stype))
+                + "'"
+            )
+        _b_store_out(
+            rets, dest, _b_bitwise(op, lhs, rhs, Optional[T](dest.copy()))
+        )
+        return
     _b_store_out(
         rets, dest, _b_binary(op, lhs, rhs, Int32(-1), Optional[T](dest.copy()))
     )
@@ -2731,15 +2835,11 @@ def _b_maxmin_res(
     rhs: Side,
     dst: Optional[T],
 ) raises -> Res:
-    """maximum/minimum. Two bool tensors are torch's `a || b` / `a && b`
-    (MaxMinElementwiseKernel.cu), which the logical kernels compute."""
-    if (
-        lhs.is_t
-        and rhs.is_t
-        and lhs.t.value().stype == ST_BOOL
-        and rhs.t.value().stype == ST_BOOL
-    ):
-        return _b_binary(bool_op, lhs, rhs, ST_BOOL, dst)
+    """maximum/minimum (MaxMinElementwiseKernel.cu), dispatched on the
+    iterator's dtype: the common one, or a wider `out=`'s, which the
+    operands are converted to first. Bool is torch's `a || b` / `a && b`,
+    which the logical kernels compute. A CPU scalar is the functor's first
+    operand (`opmath_symmetric_gpu_kernel_with_scalars`): its NaN wins."""
     var f8 = _b_f8_into_out(lhs, rhs, dst)
     if f8:
         # max/min_elementwise dispatch on the OUTPUT dtype: a float8 pair
@@ -2751,7 +2851,40 @@ def _b_maxmin_res(
         _ = a^
         _ = b^
         return r^
-    return _b_binary(op, lhs, rhs, Int32(-1), dst)
+    var compute = _b_sides_result(lhs, rhs, rhs)
+    if is_float8_stype(compute):
+        return _b_binary(op, lhs, rhs, Int32(-1), dst)
+    if dst and can_cast(compute, dst.value().stype):
+        compute = dst.value().stype
+    if is_wide_unsigned(compute):
+        unsupported(
+            (
+                '"max_elementwise_cuda' if op
+                == "MaximumSpec" else '"minimum_cuda'
+            )
+            + "\" not implemented for '"
+            + scalar_type_name(max_dtype(compute))
+            + "'"
+        )
+    var a = _b_cast_side_any(lhs, compute)
+    var b = _b_cast_side_any(rhs, compute)
+    var r: Res
+    if compute == ST_BOOL:
+        r = _b_binary(
+            bool_op,
+            a.side.copy(),
+            b.side.copy(),
+            ST_BOOL,
+            dst,
+            exact_fill=True,
+        )
+    else:
+        r = _b_binary(
+            op, a.side.copy(), b.side.copy(), Int32(-1), dst, exact_fill=True
+        )
+    _ = a^
+    _ = b^
+    return r^
 
 
 def _b_f8_into_out(
@@ -2778,6 +2911,17 @@ def _b_cast_side(side: Side, st: Int32) raises -> _CastSide:
     if not side.is_t or side.t.value().stype == st:
         return _CastSide(side.copy(), None)
     var h = _b_cast(side.t.value(), st)
+    var s2 = _b_tside(h.t)
+    return _CastSide(s2^, h^)
+
+
+def _b_cast_side_any(side: Side, st: Int32) raises -> _CastSide:
+    """`_b_cast_side` for any pair, the wide unsigned types included
+    (`cast_any`)."""
+    if not side.is_t or side.t.value().stype == st:
+        return _CastSide(side.copy(), None)
+    var t = side.t.value().copy()
+    var h = Held(cast_any(t, st), True)
     var s2 = _b_tside(h.t)
     return _CastSide(s2^, h^)
 
@@ -2941,31 +3085,45 @@ def op_bitwise_xor_out(
 def _b_logical_res(
     op: StaticString, lhs: Side, rhs: Side, dst: Optional[T]
 ) raises -> Res:
-    """The promoted route when torch's promotion covers the pair, else each
-    operand reduced to bool first (the old `_try_logical`)."""
-    if lhs.is_t and rhs.is_t:
-        var a = lhs.t.value().copy()
-        var b = rhs.t.value().copy()
-        if _b_promote(a, b) < 0:
-            if not (_b_castable(a.stype) and _b_castable(b.stype)):
-                unsupported(
-                    "a logical op on dtypes "
-                    + String(a.stype)
-                    + " and "
-                    + String(b.stype)
-                )
-            var ba = _b_cast(a, ST_BOOL)
-            var bb = _b_cast(b, ST_BOOL)
-            var res = _b_binary(
-                op, _b_tside(ba.t), _b_tside(bb.t), ST_BOOL, dst
-            )
-            _ = ba
-            _ = bb
-            return res^
-    return _b_binary(op, lhs, rhs, ST_BOOL, dst)
+    """Both operands in their common dtype (TensorIterator's promotion: a
+    scalar's truth is the converted value's), then the bool kernel. The
+    kernels dispatch AT_ALL_TYPES_AND3(half, bool, bf16) plus complex."""
+    var common = _b_sides_result(lhs, rhs, rhs)
+    if is_wide_unsigned(common):
+        var name = "logical_and" if op == "LogicalAndSpec" else (
+            "logical_or" if op == "LogicalOrSpec" else "logical_xor"
+        )
+        unsupported(
+            '"'
+            + name
+            + "_cuda\" not implemented for '"
+            + scalar_type_name(max_dtype(common))
+            + "'"
+        )
+    var a = _b_cast_side_any(lhs, common)
+    var b = _b_cast_side_any(rhs, common)
+    var res = _b_binary(op, a.side.copy(), b.side.copy(), ST_BOOL, dst)
+    _ = a^
+    _ = b^
+    return res^
 
 
 def _b_logical(op: StaticString, args: Values, rets: Values) raises:
+    var self = v_tensor(args[unsafe_offset=0])
+    if not self.on_mojo():
+        # `comparison_op` allocates the result on self's device: a CPU 0-d
+        # self meets the mojo operand in TensorIterator's device check
+        var other = v_tensor(args[unsafe_offset=1])
+        raise Error(
+            (
+                "Expected all tensors to be on the same device, but found at"
+                " least two devices, "
+            ),
+            device_str(other),
+            " and ",
+            device_str(self),
+            "!",
+        )
     _b_ret(
         rets,
         _b_logical_res(
@@ -3030,22 +3188,32 @@ def op_logical_xor_out(
 # ---------------------------------------------------------------------------
 
 
-def _b_clamp_dtype(self_stype: Int32, lo: Value, hi: Value) -> Int32:
-    """`torch.result_type(self, min, max)`: ATen's clamp iterator promotes
-    its inputs to a common dtype, so a FLOAT bound against an integral (or
-    bool) tensor lands on the default floating dtype --
-    `torch.clamp(int_tensor, min=0.5)` is a float tensor. An integral bound
-    keeps the tensor's own dtype (and wraps into it, as ATen does)."""
-    var float_bound = (not v_is_none(lo) and not _b_scalar_is_int(lo)) or (
-        not v_is_none(hi) and not _b_scalar_is_int(hi)
-    )
+def _b_clamp_dtype(
+    self_stype: Int32, lo: Value, hi: Value, single_bound_op: Bool = False
+) raises -> Int32:
+    """TORCH_META_FUNC(clamp) / clamp_min / clamp_max's result dtype: a
+    floating self keeps its dtype, any other one promotes with the bounds
+    as wrapped Scalars (`torch.clamp(int_tensor, min=0.5)` is float32). A
+    complex bound refuses in clamp_min / clamp_max, and wherever it makes
+    the result complex."""
+    if v_is_complex(lo) or v_is_complex(hi):
+        if single_bound_op or not (
+            _b_is_floating(self_stype) or is_float8_stype(self_stype)
+        ):
+            unsupported("clamp is not supported for complex types")
+        return self_stype  # clamp_out's toDouble() decides
     if _b_is_floating(self_stype) or is_float8_stype(self_stype):
-        return self_stype  # a wrapped Scalar never promotes a float tensor
-    if float_bound:
-        return default_dtype()
-    if self_stype == ST_BOOL and (_b_int_bound(lo) or _b_int_bound(hi)):
-        return ST_INT64  # an int bound promotes a bool tensor to int64
-    return self_stype
+        return self_stype
+    var wrapped = ST_UNDEFINED
+    for k in range(2):
+        var v = lo.copy() if k == 0 else hi.copy()
+        if v_is_none(v):
+            continue
+        var st = ST_BOOL if (
+            v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL
+        ) else (ST_INT64 if _b_scalar_is_int(v) else default_dtype())
+        wrapped = promote_types(wrapped, st)
+    return combine_categories(self_stype, wrapped)
 
 
 def _b_int_bound(v: Value) -> Bool:
@@ -3080,7 +3248,7 @@ def _b_clamp(
         raise Error(
             "torch.clamp: At least one of 'min' or 'max' must not be None"
         )
-    var result_stype = _b_clamp_dtype(self.stype, lo, hi)
+    var result_stype = _b_clamp_dtype(self.stype, lo, hi, single_bound_op)
     if is_float8_stype(result_stype):
         return _b_clamp_float8(self, lo, hi, result_stype, single_bound_op)
     if not _b_bcast_dtype(result_stype) or (
@@ -3094,7 +3262,7 @@ def _b_clamp(
         var kept = own(
             new_tensor(self.shape, self.rank, result_stype, self.device)
         )
-        var casted = _b_ready(self, result_stype, False)
+        var casted = _b_ready_any(self, result_stype)
         _b_copy_into(kept.t, casted.t)
         _ = casted
         return Res(kept.take(), True)
@@ -3103,15 +3271,20 @@ def _b_clamp(
         var filled = own(
             new_tensor(self.shape, self.rank, result_stype, self.device)
         )
-        if filled.t.numel > 0:
-            _b_fill_spec(filled.t, nan[DType.float64]())
+        if single_bound_op:
+            # clamp_min / clamp_max: `fill_(result, bound)`, the bound's own
+            # NaN converted on the host
+            fill_value(filled.t, lo if lo_nan else hi)
+        else:
+            # clamp: `fill_(result, quiet_NaN)`
+            fill_value(filled.t, nan[DType.float64]())
         return Res(filled.take(), True)
     # The bounds travel as the kernel's raw slots: a float64's bits for a
     # floating result, the integer itself for an integral one, so an int64
     # bound past 2**53 stays exact (`clamp_min(int64, 2**53 + 1)`).
     var lo_v = _b_clamp_bound(lo, result_stype) if has_min else 0
     var hi_v = _b_clamp_bound(hi, result_stype) if has_max else 0
-    var src = _b_ready(self, result_stype, True)
+    var src = _b_ready_any(self, result_stype)
     if dst:
         var d = dst.value().copy()
         # Flat kernel: out[i] from in[i], exact even when `d` is `self`.
@@ -3152,6 +3325,10 @@ def _b_clamp_bound(v: Value, result_stype: Int32) raises -> Int:
     """A clamp bound as `_b_clamp_launch`'s raw slot."""
     # `Scalar::to<scalar_t>()`: checked against the dtype (and exact for
     # an integral one).
+    if result_stype == ST_FLOAT16 or result_stype == ST_BFLOAT16:
+        # `lim.to<opmath_t>()`: checked against float and rounded to it; a
+        # half result is then the kernel's rounding of max/min in float
+        return Int(f64_bits(Float64(Float32(scalar_to_float(v, ST_FLOAT32)))))
     if _b_is_floating(result_stype):
         return Int(f64_bits(scalar_to_float(v, result_stype)))
     return scalar_to_int(v, result_stype)
@@ -3194,7 +3371,7 @@ def _b_clamp_out(
 ) raises:
     var self = _b_self(args[unsafe_offset=0], "clamp")
     var dest = _b_out_tensor(args[unsafe_offset=out_index], self.device)
-    var result_stype = _b_clamp_dtype(self.stype, lo, hi)
+    var result_stype = _b_clamp_dtype(self.stype, lo, hi, single_bound_op)
     if is_float8_stype(result_stype) and dest.stype != result_stype:
         # A unary iterator: out must hold the result dtype, checked before
         # out is touched.
