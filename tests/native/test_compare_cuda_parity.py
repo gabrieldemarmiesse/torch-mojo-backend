@@ -9,6 +9,7 @@ tests/native/binary_parity.py.
 import functools
 import math
 import operator
+from collections.abc import Callable, Sequence
 
 import pytest
 import torch
@@ -47,7 +48,11 @@ def selection_triples(
     gen = torch.Generator().manual_seed(1)
     s = bp.specials(dtype)
     if len(s) > 30:
-        nan = s.isnan() if dtype.is_floating_point else torch.zeros_like(s, dtype=bool)
+        nan = (
+            s.isnan()
+            if dtype.is_floating_point
+            else torch.zeros_like(s, dtype=torch.bool)
+        )
         rest = s[~nan]
         rest = rest[torch.randperm(len(rest), generator=gen)[: 30 - int(nan.sum())]]
         s = torch.cat([rest, s[nan]])
@@ -74,7 +79,7 @@ def _mask(n: int) -> torch.Tensor:
     return torch.rand(n, generator=gen) < 0.5
 
 
-Cases = list[tuple[str, object, tuple]]
+Cases = list[tuple[str, Callable[..., object], Sequence[object]]]
 
 
 def _out_cases(fn, a, b, dtypes) -> Cases:
@@ -281,7 +286,7 @@ _SHIFTS = [
     ("right", torch.bitwise_right_shift, operator.rshift, "__irshift__"),
 ]
 _SHIFT_AMOUNTS = [0, 1, 2, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 100, 300]
-_SHIFT_AMOUNTS += [-1, -5, -64, 2**40, -(2**63), True, 2.0, 2.5, -0.0]
+_SHIFT_AMOUNTS = [*_SHIFT_AMOUNTS, -1, -5, -64, 2**40, -(2**63), True, 2.0, 2.5, -0.0]
 
 
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
@@ -604,7 +609,7 @@ def test_where_mixed_dtypes(cuda_oracle: CudaOracle, da, db):
 # -- masked_fill -------------------------------------------------------------------
 
 _FILL_VALUES = [3, 2.5, -1, 0, True, False, 300, -129, _NAN, _SNAN, -0.0]
-_FILL_VALUES += [math.inf, 1e30, 70000.0, 1e-40, 2**40, 1 + 2j]
+_FILL_VALUES = [*_FILL_VALUES, math.inf, 1e30, 70000.0, 1e-40, 2**40, 1 + 2j]
 
 
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
