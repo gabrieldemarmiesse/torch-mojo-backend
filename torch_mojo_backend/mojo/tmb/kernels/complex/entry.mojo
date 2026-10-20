@@ -37,7 +37,6 @@ from max.gpu.host import DeviceContext
 from std.sys.info import (
     has_accelerator,
     has_apple_gpu_accelerator,
-    has_nvidia_gpu_accelerator,
     is_nvidia_gpu,
     size_of,
 )
@@ -115,11 +114,6 @@ comptime KINDS_CX_CX = [
     "rsqrt",
     "sgn",
     "square",
-]
-
-# Kinds that only exist on NVIDIA (the jiterated and thrust ports): off NVIDIA the
-# family builds exactly the kinds it always had.
-comptime KINDS_CX_CX_NV = [
     "sin",
     "cos",
     "tan",
@@ -138,6 +132,7 @@ comptime KINDS_CX_CX_NV = [
     "expm1",
     "log1p",
 ]
+
 comptime KINDS_CX_RE = ["abs", "angle", "real", "imag"]
 comptime KINDS_CX_B = ["isnan", "isinf", "isfinite", "nonzero"]
 comptime KINDS_CXCX_CX = ["add", "mul", "div", "pow"]
@@ -489,11 +484,6 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             comptime if _op_on[kind]():
                 _complex_go[kind](argv, argc)
                 return 0
-        comptime if has_nvidia_gpu_accelerator():
-            comptime for kind in KINDS_CX_CX_NV:
-                comptime if _op_on[kind]():
-                    _complex_go[kind](argv, argc)
-                    return 0
         comptime for kind in KINDS_CX_RE:
             comptime if _op_on[kind]():
                 _complex_go[kind](argv, argc)
