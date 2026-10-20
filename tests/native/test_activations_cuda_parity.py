@@ -881,3 +881,20 @@ def test_complex_matches_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
         rand = torch.randn(4000, generator=g, dtype=dtype) * 3
         ops.append(torch.cat((rand, special.roll(k * 5))))
     cuda_oracle.assert_bitwise_equal(case.fn, *ops)
+
+
+@pytest.mark.parametrize("inplace", [False, True], ids=["functional", "inplace"])
+@pytest.mark.parametrize("dtype", FLOATS, ids=_dtype_id)
+def test_rrelu_train_matches_cuda(cuda_oracle: CudaOracle, dtype, inplace: bool):
+    """rrelu_with_noise in training: the slopes it draws from the device
+    generator (returned through `noise`) and the output, from the same seed."""
+    g = torch.Generator().manual_seed(0x5EED)
+    x = torch.randn(4097, generator=g, dtype=torch.float64).to(dtype)
+    op = A.rrelu_with_noise_ if inplace else A.rrelu_with_noise
+
+    def fn(device: str) -> tuple[torch.Tensor, torch.Tensor]:
+        xi = x.to(device)
+        noise = torch.empty_like(xi)
+        return op(xi, noise, 0.125, 1 / 3, True), noise
+
+    cuda_oracle.assert_bitwise_equal_by_device(fn, seed=7)
