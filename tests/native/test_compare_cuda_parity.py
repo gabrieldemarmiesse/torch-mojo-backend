@@ -732,11 +732,6 @@ def test_isclose(cuda_oracle: CudaOracle, dtype):
 _HALF_NANS = bp.from_bits([0x7E00, 0xFE00, 0x7E01, 0x7C01], torch.float16)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="CastSpec float16 -> float64 keeps the NaN payload; stock CUDA"
-    " converts through float32 (canonical NaN). Owned by the casts group.",
-)
 def test_half_nan_into_float64(cuda_oracle: CudaOracle):
     """A float16 NaN meeting a float64 computation or out=."""
     big = torch.tensor([1.0, -2.0, 3.0, 0.5], dtype=torch.float64)

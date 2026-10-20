@@ -541,6 +541,19 @@ def test_out_dtype_follows_torch(mojo_gpu, name, out_dtype):
     if out_dtype == torch.float64 and name == "gelu_backward.grad_input":
         pytest.skip("CPU torch's oneDNN gelu_backward has no float64 output")
     kwargs = _cpu_args(name)
+    if (
+        name.startswith(("bitwise_and", "bitwise_or", "bitwise_xor"))
+        and out_dtype.is_floating_point
+    ):
+        # CUDA's iterator takes the float out's dtype as the computation
+        # dtype and has no bitwise kernel for it (CPU torch casts instead).
+        out = torch.empty(0, dtype=out_dtype, device=mojo_gpu)
+        with (
+            _ran(name),
+            pytest.raises(NotImplementedError, match="not implemented for"),
+        ):
+            _op(name)(**_to(kwargs, mojo_gpu), **{_out_name(name): out})
+        return
     cpu = _outcome(
         lambda: _op(name)(
             **kwargs, **{_out_name(name): torch.empty(0, dtype=out_dtype)}
