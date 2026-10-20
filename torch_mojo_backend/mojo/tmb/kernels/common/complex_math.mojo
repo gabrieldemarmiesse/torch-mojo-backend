@@ -32,6 +32,7 @@ from std.utils.numerics import inf, isinf, isnan, nan
 
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pointwise_math import (
+    _mul_rn,
     _exp,
     _log,
     _log1p,
@@ -619,3 +620,55 @@ def cpow[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
     exp(log(x) * y), special values included (a zero base gives
     exp(-inf + NaN i) = 0 for a nonzero real exponent)."""
     return cexp(cmul(clog(x), y))
+
+
+@always_inline
+def cmul_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+    """libc++'s operator*(complex, complex), as NVRTC compiles it for the
+    jiterated kernels (addcmul, lerp): four rounded products and one add
+    each (no contraction), then Annex G's recovery when both parts are NaN,
+    whose re-products NVRTC does contract: fma(a, c, -(b d)),
+    fma(b, c, a d)."""
+    # Modified from libc++ operator*(const complex&, const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
+    var a = z.re
+    var b = z.im
+    var c = w.re
+    var d = w.im
+    var ac = _mul_rn[dt, 1](a, c)
+    var bd = _mul_rn[dt, 1](b, d)
+    var ad = _mul_rn[dt, 1](a, d)
+    var bc = _mul_rn[dt, 1](b, c)
+    var x = ac - bd
+    var y = ad + bc
+    if isnan(x) and isnan(y):
+        var recalc = False
+        if isinf(a) or isinf(b):
+            a = _unit_sign(a)
+            b = _unit_sign(b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if isinf(c) or isinf(d):
+            c = _unit_sign(c)
+            d = _unit_sign(d)
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            recalc = True
+        if not recalc and (isinf(ac) or isinf(bd) or isinf(ad) or isinf(bc)):
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if recalc:
+            x = _inf[dt]() * a.fma(c, -_mul_rn[dt, 1](b, d))
+            y = _inf[dt]() * b.fma(c, _mul_rn[dt, 1](a, d))
+    return Cx[dt](x, y)

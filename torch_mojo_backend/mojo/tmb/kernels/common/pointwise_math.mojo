@@ -55,6 +55,20 @@ from tmb.kernels.common.libdevice_port import (
     nv_log1pf,
     nv_logf,
 )
+from tmb.kernels.common.libdevice_port import (
+    nv_atan2,
+    nv_exp2,
+    nv_ldexp,
+    nv_ldexpf,
+)
+from tmb.kernels.common.nan_order import (
+    arith_nan,
+    is_nan_bits,
+    nan_first2,
+    nan_first3,
+    nan_result2,
+    quiet_nan,
+)
 from tmb.kernels.common.dtype_arithmetic import amd_opaque, cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
@@ -1034,11 +1048,18 @@ def _nextafter[
     var r = mag_a.eq(0).select(from_zero, stepped)
     r = a.eq(b).select(ub, r)
     r = both_zero.select(ub, r)
-    # The NaN select on the bits too: a float select of a half type may go
-    # through float32 and flush a subnormal result (bfloat16 on Apple GPUs).
-    comptime nan_bits = bitcast[u](nan[dtype]())
-    r = (isnan(a) | isnan(b)).select(SIMD[u, n](nan_bits), r)
-    return bitcast[dtype, n](r)
+    comptime if is_nvidia_gpu():
+        # libdevice / c10 return a + b for a NaN: float32's canonical NaN
+        # (rounded to half / bfloat16), float64's DADD keeps b's NaN, then
+        # a's (StepKernel.cu's SASS: DADD a, b).
+        return nan_result2(bitcast[dtype, n](r), b, a)
+    else:
+        # The NaN select on the bits too: a float select of a half type may
+        # go through float32 and flush a subnormal result (bfloat16 on Apple
+        # GPUs).
+        comptime nan_bits = bitcast[u](nan[dtype]())
+        r = (isnan(a) | isnan(b)).select(SIMD[u, n](nan_bits), r)
+        return bitcast[dtype, n](r)
 
 
 @always_inline
@@ -1147,8 +1168,26 @@ def _powi[
 @always_inline
 def _native[
     kind: StaticString, dtype: DType, n: Int
-](a: SIMD[dtype, n], b: SIMD[dtype, n], c: SIMD[dtype, n]) -> SIMD[dtype, n]:
-    comptime if kind == "copysign":
+](
+    a: SIMD[dtype, n],
+    b: SIMD[dtype, n],
+    c: SIMD[dtype, n],
+    scalar_a: Bool = False,
+) -> SIMD[dtype, n]:
+    comptime if kind == "copysign" and is_nvidia_gpu() and (
+        dtype == DType.float16 or dtype == DType.bfloat16
+    ):
+        # CopysignKernel.cu on c10::Half / BFloat16: copysignf of the
+        # operands widened to float (a half NaN widens to the canonical
+        # 0x7FFFFFFF, sign dropped), the result rounded back (a NaN to
+        # 0x7FFF).
+        comptime sign = UInt32(0x80000000)
+        var fa = bitcast[DType.uint32, n](a.cast[DType.float32]())
+        var fb = bitcast[DType.uint32, n](b.cast[DType.float32]())
+        return bitcast[DType.float32, n]((fa & ~sign) | (fb & sign)).cast[
+            dtype
+        ]()
+    elif kind == "copysign":
         # CopysignKernel.cu: the sign bit of b on the magnitude bits of a.
         comptime u = _uint_of[dtype]()
         comptime sign = Scalar[u](1) << Scalar[u](size_of[dtype]() * 8 - 1)
@@ -1188,6 +1227,17 @@ def _native[
             comptime if dtype.is_floating_point():
                 r = isnan(a).select(b, r)
                 r = isnan(b).select(a, r)
+                comptime if is_nvidia_gpu():
+                    # Two NaNs: float's FMNMX returns the canonical NaN
+                    # (the half types compute in float); double's
+                    # DSETP.MAX selects the second operand -- a CPU scalar
+                    # sits there -- and quiets it.
+                    var both = is_nan_bits(a) & is_nan_bits(b)
+                    comptime if dtype == DType.float64:
+                        var second = a if scalar_a else b
+                        r = both.select(quiet_nan(second), r)
+                    else:
+                        r = both.select(arith_nan[dtype, n](), r)
             return r
     elif kind == "fmod":
         # BinaryRemainderKernel.cu: C's fmod (the dividend's sign), exact:
@@ -1556,9 +1606,13 @@ def _scalar_t[
 @always_inline
 def _wide[
     kind: StaticString, w: DType, n: Int
-](a: SIMD[w, n], b: SIMD[w, n], c: SIMD[w, n], p: SIMD[w, 4]) -> SIMD[
-    w, n
-] where w.is_floating_point():
+](
+    a: SIMD[w, n],
+    b: SIMD[w, n],
+    c: SIMD[w, n],
+    p: SIMD[w, 4],
+    scalar_a: Bool = False,
+) -> SIMD[w, n] where w.is_floating_point():
     comptime zero = SIMD[w, n](0)
     comptime one = SIMD[w, n](1)
     # --- binary math -------------------------------------------------------
@@ -1569,7 +1623,19 @@ def _wide[
         # `precise::atan2(float, float)`); float64: fdlibm's atan2.
         var r = SIMD[w, n]()
         comptime for i in range(n):
-            comptime if w == DType.float64:
+            comptime if w == DType.float64 and is_nvidia_gpu():
+                # libdevice's __nv_atan2; a NaN is libdevice's |b| + |a|:
+                # DADD keeps its B operand's NaN first, b's in the tensor
+                # kernels, a CPU scalar a's when a is one.
+                var ai = a[i].cast[DType.float64]()
+                var bi = b[i].cast[DType.float64]()
+                var v = nv_atan2(ai, bi)
+                if scalar_a:
+                    v = nan_first2[DType.float64, 1](v, ai, bi)
+                else:
+                    v = nan_first2[DType.float64, 1](v, bi, ai)
+                r[i] = v.cast[w]()
+            elif w == DType.float64:
                 r[i] = _atan2_f64(
                     a[i].cast[DType.float64](), b[i].cast[DType.float64]()
                 ).cast[w]()
@@ -1589,7 +1655,7 @@ def _wide[
                 r[i] = cuda_hypotf(
                     a[i].cast[DType.float32](), b[i].cast[DType.float32]()
                 ).cast[w]()
-            return r
+            return is_nan_bits(r).select(arith_nan[w, n](), r)
         elif w == DType.float32 and is_apple_gpu():
             # c10::metal::hypot(|a|, |b|) (BinaryKernel.metal hypot_functor,
             # float for every input type): a sqrt(1 + (b/a)^2) with its a == b
@@ -1624,6 +1690,21 @@ def _wide[
                 r[i] = _hypot_f64(
                     a[i].cast[DType.float64](), b[i].cast[DType.float64]()
                 ).cast[w]()
+            comptime if is_nvidia_gpu():
+                # A NaN: libdevice orders the magnitudes, taken by DADD
+                # (which quiets a NaN and keeps its sign), by their bits; a
+                # NaN beside an infinity gives the infinity, beside a number
+                # its own quieted bits, two NaNs the smaller pattern.
+                var na = is_nan_bits(a)
+                var nb = is_nan_bits(b)
+                var qa = bitcast[DType.uint64, n](quiet_nan(a))
+                var qb = bitcast[DType.uint64, n](quiet_nan(b))
+                var both = bitcast[w, n](min(qa, qb))
+                var one = na.select(
+                    isinf(b).select(abs(b), quiet_nan(a)),
+                    isinf(a).select(abs(a), quiet_nan(b)),
+                )
+                r = (na & nb).select(both, (na | nb).select(one, r))
             return r
     elif kind == "logaddexp" or kind == "logaddexp2":
         # LogAddExpKernel.cu: inf == inf keeps it, else
@@ -1643,11 +1724,15 @@ def _wide[
             comptime for i in range(n):
                 comptime if w == DType.float32:
                     e2[i] = nv_exp2f(d[i].cast[DType.float32]()).cast[w]()
+                elif is_nvidia_gpu():
+                    e2[i] = nv_exp2(d[i].cast[DType.float64]()).cast[w]()
                 else:
                     e2[i] = _exp2_f64(d[i].cast[DType.float64]()).cast[w]()
             r = m + _log1p(e2) * inv_ln2
         r = (isinf(a) & a.eq(b)).select(a, r)
-        return (isnan(a) | isnan(b)).select(SIMD[w, n](nan[w]()), r)
+        # A NaN runs through a - b, exp, log1p and the add: float's
+        # canonical NaN; double keeps the NaN a - b's DADD keeps, b's first.
+        return nan_result2(r, b, a)
     elif kind == "xlogy" or kind == "xlog1py":
         # BinaryMiscOpsKernels.cu: NaN y -> NaN, x == 0 -> 0, else x log(y).
         # MPS (c10::metal::xlogy) returns x itself for x == 0, keeping -0.
@@ -1700,7 +1785,16 @@ def _wide[
         var diff = b - a
         var weight = SIMD[w, n](p[0])
         var small = abs(weight).lt(0.5)
-        return small.select(weight.fma(diff, a), b - diff * (one - weight))
+        var r = small.select(weight.fma(diff, a), (-diff).fma(one - weight, b))
+        comptime if w == DType.float64 and is_nvidia_gpu():
+            # Lerp.cu's float64 SASS: DADD(-self, end) keeps end's NaN,
+            # then self's; the small branch's DFMA(diff, w, self) w's, self's,
+            # diff's; the other's DFMA keeps 1 - w's or the diff's NaN by the
+            # lane of its vector (both NaN: no fixed rule, w's taken here),
+            # then end's.
+            var ok = small.select(nan_first2(r, a, b), nan_first2(r, b, a))
+            r = is_nan_bits(weight).select(quiet_nan(weight), ok)
+        return r
     elif kind == "lerp":
         # Lerp.h: self + weight * (end - self) for |weight| < 0.5, else
         # end - (end - self) * (1 - weight).
@@ -1708,7 +1802,13 @@ def _wide[
         # accurate near w = 1: the branch is kept on Apple GPUs too.)
         var diff = b - a
         var small = abs(c).lt(0.5)
-        return small.select(c.fma(diff, a), b - diff * (one - c))
+        var r = small.select(c.fma(diff, a), (-diff).fma(one - c, b))
+        comptime if w == DType.float64 and is_nvidia_gpu():
+            # Lerp.cu's float64 SASS (tensor weight): DADD(-self, end) keeps
+            # end's NaN, then self's; DFMA(w, diff, self) diff's, self's;
+            # DFMA(diff, 1 - w, end) 1 - w's (a NaN w), end's, diff's.
+            r = is_nan_bits(c).select(quiet_nan(c), nan_first2(r, b, a))
+        return r
     elif kind == "pow_scalar_base":
         # pow(Scalar base, Tensor exponent): PowKernel.cu's cpu-scalar base,
         # base ** exponent in opmath (the base rounded to the tensor's own
@@ -1760,7 +1860,21 @@ def _wide[
         # (half operands widened, rounded once by the caller's cast). b holds
         # the integer exponent, exact in the compute dtype up to where the
         # result saturates anyway.
-        return _ldexp(a, b)
+        comptime if is_nvidia_gpu():
+            # libdevice's ldexpf / ldexp (the int exponent clamped first:
+            # past the clamp the result has saturated anyway).
+            var e = min(max(b, SIMD[w, n](-4096)), SIMD[w, n](4096)).cast[
+                DType.int32
+            ]()
+            var r = SIMD[w, n]()
+            comptime for i in range(n):
+                comptime if w == DType.float64:
+                    r[i] = nv_ldexp(a[i].cast[DType.float64](), e[i]).cast[w]()
+                else:
+                    r[i] = nv_ldexpf(a[i].cast[DType.float32](), e[i]).cast[w]()
+            return r
+        else:
+            return _ldexp(a, b)
     elif kind == "ldexp_pow2":
         # BinaryOps.cpp's general ldexp: self * _pow2(self, other), where
         # _pow2 is pow(2, other) in its own dtype; p0 names that dtype when it
@@ -1774,7 +1888,9 @@ def _wide[
             pw = pw.cast[DType.bfloat16]().cast[w]()
         elif p[0] == 3:
             pw = pw.cast[DType.float32]().cast[w]()
-        return a * pw
+        # A NaN exponent: CUDA's pow(2, NaN) keeps it (2 + NaN), then mul's
+        # DMUL keeps it before self's.
+        return nan_result2(a * pw, b, a)
     # --- activations (forward: a = x) ----------------------------------------
     elif kind == "elu":
         # ActivationEluKernel.cu, p = (alpha, scale, input_scale):
@@ -2659,6 +2775,57 @@ def pointwise_op_impl[
 
 
 @always_inline
+def _addc[
+    kind: StaticString, dtype: DType, n: Int
+](
+    a: SIMD[dtype, n],
+    b: SIMD[dtype, n],
+    c: SIMD[dtype, n],
+    p: SIMD[param_dtype[dtype](), 4],
+) -> SIMD[dtype, n]:
+    """addcmul / addcdiv (PointwiseOpsKernel.cu): self + value * (t1 op
+    t2) in ATen's acc type (int64 for the integers, float for the half
+    types), p0 = value.to<acc>(), through `pointwise_op_impl` (alpha == 1:
+    one fma, or self + t1 / t2). float64 NaNs follow the SASS's operand
+    slots: DFMA(t1, t2, self) keeps t2's, self's, then t1's; DMUL(t1, t2)
+    then DFMA(prod, alpha, self) alpha's, self's, t2's, t1's; the quotient
+    (one div.rn, ours alike) then DADD(self, q) keeps q's, then self's."""
+    comptime if dtype.is_integral():
+        comptime i64 = DType.int64
+        var alpha = SIMD[i64, n](bitcast[i64](p[0]))
+        var q = b.cast[i64]() * c.cast[i64]()
+        return (a.cast[i64]() + alpha * q).cast[dtype]()
+    else:
+        comptime w = wide_dtype[dtype]()
+        var x = a.cast[w]()
+        var y = b.cast[w]()
+        var z = c.cast[w]()
+        var alpha = Scalar[w](p[0].cast[w]())
+        var r: SIMD[w, n]
+        comptime if kind == "addcmul":
+            if alpha == 1:
+                r = y.fma(z, x)
+                comptime if w == DType.float64:
+                    r = nan_first3(r, z, x, y)
+            else:
+                var q = _mul_rn(y, z)
+                r = SIMD[w, n](alpha).fma(q, x)
+                comptime if w == DType.float64:
+                    r = nan_first3(r, SIMD[w, n](alpha), x, nan_first2(q, z, y))
+        else:
+            var q = y / z
+            if alpha == 1:
+                r = x + q
+                comptime if w == DType.float64:
+                    r = nan_first2(r, q, x)
+            else:
+                r = SIMD[w, n](alpha).fma(q, x)
+                comptime if w == DType.float64:
+                    r = nan_first3(r, SIMD[w, n](alpha), x, q)
+        return r.cast[dtype]()
+
+
+@always_inline
 def pointwise[
     kind: StaticString, dtype: DType, out_dtype: DType, n: Int
 ](
@@ -2666,9 +2833,12 @@ def pointwise[
     b: SIMD[dtype, n],
     c: SIMD[dtype, n],
     p: SIMD[param_dtype[dtype](), 4],
+    scalar_a: Bool = False,
 ) -> SIMD[out_dtype, n]:
     """`kind` of (a, b, c) with scalar parameters `p`, rounded once into
-    `out_dtype`. Unused operands and parameters are ignored."""
+    `out_dtype`. Unused operands and parameters are ignored. `scalar_a`: a
+    is a CPU scalar, which stock CUDA keeps in a uniform register (the B
+    slot of a double instruction, whose NaN then wins)."""
     comptime if kind == "frexp_exponent":
         return _frexp_exponent(a).cast[out_dtype]()
     elif kind == "hardtanh" and dtype.is_integral():
@@ -2723,8 +2893,10 @@ def pointwise[
     elif kind == "standard_gamma_grad" or kind == "dirichlet_grad":
         comptime assert dtype.is_floating_point(), "gamma grads take floats"
         return _gamma_grads[kind](a, b, c).cast[out_dtype]()
+    elif kind == "addcmul" or kind == "addcdiv":
+        return _addc[kind](a, b, c, p).cast[out_dtype]()
     elif is_native_kind[kind]():
-        return _native[kind](a, b, c).cast[out_dtype]()
+        return _native[kind](a, b, c, scalar_a).cast[out_dtype]()
     elif is_scalar_t_kind[kind]():
         comptime assert dtype.is_floating_point(), "losses take floats"
         return _scalar_t[kind](a, b, c, p).cast[out_dtype]()
@@ -2736,6 +2908,7 @@ def pointwise[
                 b.cast[DType.float64](),
                 c.cast[DType.float64](),
                 q.cast[DType.float64](),
+                scalar_a,
             ).cast[out_dtype]()
         else:
             return _wide[kind](
@@ -2743,6 +2916,7 @@ def pointwise[
                 b.cast[DType.float32](),
                 c.cast[DType.float32](),
                 q.cast[DType.float32](),
+                scalar_a,
             ).cast[out_dtype]()
 
 

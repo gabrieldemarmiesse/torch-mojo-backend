@@ -1,5 +1,5 @@
 """ATen ops: binary arithmetic — add/sub/mul/div, pow, maximum/minimum,
-remainder, floor_divide, lerp, addcmul/addcdiv, clamp and the logical and
+remainder, floor_divide, lerp, clamp and the logical and
 bitwise ops, with their in-place and `out=` variants.
 
 Ported from the old Python fast path (`eager_kernels/aten_fast.py`): the same
@@ -136,7 +136,7 @@ from tmb.ops.complex_math import (
     cx_sub_,
     cx_sub_out,
 )
-from tmb.ops.foreach import foreach_addc_inplace, foreach_lerp_inplace
+from tmb.ops.foreach import foreach_lerp_inplace
 
 # ---------------------------------------------------------------------------
 # dtype predicates: the gates of the kernels this file calls
@@ -264,6 +264,36 @@ struct Scal(Copyable, Movable):
 comptime MAX_EXACT_INT = 9007199254740992.0  # 2**53, the old `_MAX_EXACT_INT`
 
 
+def _b_f32_bits_to_f64(u: UInt32) -> Float64:
+    """A float's exact double from its bits, in integers (the host's
+    conversion flushes a subnormal float under the process's FTZ / DAZ),
+    NaN payloads kept."""
+    var sign = u.cast[DType.uint64]() >> 31
+    var e = (u >> 23) & 0xFF
+    var m = (u & 0x7FFFFF).cast[DType.uint64]()
+    if e == 0:
+        var mag = Float64(Int(m)) * Float64(
+            from_bits=UInt64(0x36A0000000000000)
+        )
+        return -mag if sign == 1 else mag  # 2^-149
+    var de = UInt64(0x7FF) if e == 0xFF else e.cast[DType.uint64]() + 896
+    return Float64(from_bits=(sign << 63) | (de << 52) | (m << 29))
+
+
+def _b_f16_bits_to_f64(h: UInt16) -> Float64:
+    """A half's exact double from its bits (see `_b_f32_bits_to_f64`)."""
+    var sign = h.cast[DType.uint64]() >> 15
+    var e = (h >> 10).cast[DType.uint64]() & 0x1F
+    var m = (h & 0x3FF).cast[DType.uint64]()
+    if e == 0:
+        var mag = Float64(Int(m)) * Float64(
+            from_bits=UInt64(0x3E70000000000000)
+        )
+        return -mag if sign == 1 else mag  # 2^-24
+    var de = UInt64(0x7FF) if e == 0x1F else e + 1008
+    return Float64(from_bits=(sign << 63) | (de << 52) | (m << 42))
+
+
 def _b_host_scalar(t: T) raises -> Scal:
     """The value of a 0-d CPU tensor, read straight out of host memory."""
     var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=t.ptr)
@@ -271,16 +301,18 @@ def _b_host_scalar(t: T) raises -> Scal:
         var on = p[] != 0
         return Scal(1.0 if on else 0.0, 1 if on else 0, True, True)
     if t.dtype == DType.float32:
-        var v32 = Float64(p.unsafe_bitcast[Float32]()[])
+        var v32 = _b_f32_bits_to_f64(p.unsafe_bitcast[UInt32]()[])
         return Scal(v32, Int(v32), False, False)
     if t.dtype == DType.float64:
         var v64 = p.unsafe_bitcast[Float64]()[]
         return Scal(v64, Int(v64), False, False)
     if t.dtype == DType.bfloat16:
-        var vb = Float64(p.unsafe_bitcast[BFloat16]()[])
+        var vb = _b_f32_bits_to_f64(
+            p.unsafe_bitcast[UInt16]()[].cast[DType.uint32]() << 16
+        )
         return Scal(vb, Int(vb), False, False)
     if t.dtype == DType.float16:
-        var vh = Float64(p.unsafe_bitcast[Float16]()[])
+        var vh = _b_f16_bits_to_f64(p.unsafe_bitcast[UInt16]()[])
         return Scal(vh, Int(vh), False, False)
     if is_float8(t.dtype):
         # A CPU 0-d float8 (a promotion operand): its exact value.
@@ -3133,74 +3165,8 @@ def op_clamp_max_tensor_out(
 
 
 # ---------------------------------------------------------------------------
-# addcmul / addcdiv
+# in-place operand checks
 # ---------------------------------------------------------------------------
-
-
-def _b_strides4(t: T, shape: IndexList[MAX_RANK]) -> List[Int]:
-    """The operand's rank-4 strides for the ternary kernel: 0 on every axis
-    it broadcasts over (the old `_bcast_meta`)."""
-    var out = List[Int](capacity=4)
-    for k in range(4):
-        var i = MAX_RANK - 4 + k
-        out.append(0 if t.shape[i] == 1 else t.strides[i])
-    return out^
-
-
-def _b_addc(
-    op: StaticString, args: Values, allow_int: Bool, dst: Optional[T] = None
-) raises -> Res:
-    """self + value * (tensor1 * tensor2) — or / — in one broadcast launch."""
-    var a = v_tensor(args[unsafe_offset=0])
-    var b = v_tensor(args[unsafe_offset=1])
-    var c = v_tensor(args[unsafe_offset=2])
-    if not a.on_mojo() or not b.on_mojo() or not c.on_mojo():
-        unsupported("addc* operands that are not all on the mojo device")
-    if a.device != b.device or a.device != c.device:
-        raise Error("expected every operand on the same mojo device")
-    if a.stype != b.stype or a.stype != c.stype:
-        unsupported("addc* operands of different dtypes")
-    # CUDA's addcmul_cuda / addcdiv_cuda dispatch no float8.
-    decline_float8(
-        a.dtype, "addcmul_cuda" if op == "AddcmulBcast" else "addcdiv_cuda"
-    )
-    if not _b_float3(a.stype) and not (allow_int and _b_int_dtype(a.stype)):
-        unsupported("addc* of dtype " + String(a.stype))
-    if a.rank > 4 or b.rank > 4 or c.rank > 4:
-        unsupported("addc* operands of rank > 4")
-    var value = _b_side(args[unsafe_offset=3])
-    if value.is_t:
-        unsupported("a tensor `value` for addc*")
-    var s = value.s.value().copy()
-    if s.is_bool:
-        unsupported("a bool `value` for addc*")
-    var merged = _b_broadcast3(a, b, c)
-    var rank = max(a.rank, max(b.rank, c.rank))
-    if dst:
-        var dest = dst.value().copy()
-        if (
-            dest.contig
-            and a.contig
-            and b.contig
-            and c.contig
-            and dest.stype == a.stype
-            and dest.same_shape(a)
-            and a.same_shape(b)
-            and a.same_shape(c)
-        ):
-            _b_no_partial_overlap(dest, a)
-            _b_no_partial_overlap(dest, b)
-            _b_no_partial_overlap(dest, c)
-            if _b_same_tensor(dest, a) and a.dtype == DType.float32:
-                foreach_addc_inplace(
-                    dest, b, c, s.f, multiplies=op == "AddcmulBcast"
-                )
-                return Res(dest^, False)
-            _b_addc_into(op, a, b, c, merged, s.f, dest)
-            return Res(dest^, False)
-    var out = own(new_tensor(merged, rank, a.stype, a.device))
-    _b_addc_into(op, a, b, c, merged, s.f, out.t)
-    return Res(out.take(), True)
 
 
 def _b_inplace_destination(dest: T) raises:
@@ -3226,100 +3192,6 @@ def _b_inplace_operand(dest: T, other: T) raises:
         other.contig or is_dense(other.shape, other.strides, other.rank)
     ):
         _b_no_partial_overlap(dest, other)
-
-
-def _b_addc_inplace(
-    op: StaticString, args: Values, rets: Values, allow_int: Bool
-) raises:
-    var dest = _b_self(args[unsafe_offset=0], "addc in-place")
-    _b_inplace_destination(dest)
-    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=1]))
-    _b_inplace_operand(dest, v_tensor(args[unsafe_offset=2]))
-    _b_store_inplace(rets, dest, _b_addc(op, args, allow_int, dest.copy()))
-
-
-# aten::addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
-def op_addcmul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_addc_inplace("AddcmulBcast", args, rets, True)
-
-
-# aten::addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
-def op_addcdiv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_addc_inplace("AddcdivBcast", args, rets, False)
-
-
-def _b_addc_into(
-    op: StaticString,
-    a: T,
-    b: T,
-    c: T,
-    merged: IndexList[MAX_RANK],
-    value: Float64,
-    dest: T,
-) raises:
-    """Launch the existing ternary kernel into validated output storage."""
-    if dest.numel > 0:
-        var params = List[Int](capacity=16)
-        for k in range(4):
-            params.append(merged[MAX_RANK - 4 + k])
-        params.extend(_b_strides4(a, merged))
-        params.extend(_b_strides4(b, merged))
-        params.extend(_b_strides4(c, merged))
-        var ctx = ctx_for(a.device)
-        var call = KernelCall("logic", String(op))
-        call.arg_dtype(0, a.dtype)
-        call.arg_dtype(1, b.dtype)
-        call.arg_dtype(2, c.dtype)
-        call.out_dtype(dest.dtype)
-        call.int(dest.ptr)
-        call.int(a.ptr)
-        call.int(b.ptr)
-        call.int(c.ptr)
-        call.tuple(params)
-        call.f64(value)
-        call.int(dtype_code(a.dtype))
-        call.int(ctx_ptr(ctx))
-        call.run()
-        _ = ctx
-
-
-# aten::addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
-def op_addcmul(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _b_ret(rets, _b_addc("AddcmulBcast", args, True))
-
-
-# aten::addcmul.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
-def op_addcmul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var dest = _b_out_tensor(
-        args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
-    )
-    _b_out_guard3(
-        dest,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
-        _b_side(args[unsafe_offset=2]),
-    )
-    _b_store_out(rets, dest, _b_addc("AddcmulBcast", args, True, dest.copy()))
-
-
-# aten::addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
-def op_addcdiv(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    # addcdiv is float-only: torch errors for integer inputs.
-    _b_ret(rets, _b_addc("AddcdivBcast", args, False))
-
-
-# aten::addcdiv.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
-def op_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var dest = _b_out_tensor(
-        args[unsafe_offset=4], v_tensor(args[unsafe_offset=0]).device
-    )
-    _b_out_guard3(
-        dest,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
-        _b_side(args[unsafe_offset=2]),
-    )
-    _b_store_out(rets, dest, _b_addc("AddcdivBcast", args, False, dest.copy()))
 
 
 # ---------------------------------------------------------------------------
@@ -3441,38 +3313,6 @@ def register_binary(site: Site) raises:
             alpha_idx=2,
         ],
         "add.out",
-    ](site)
-    impl[
-        f8_iter[op_addcdiv, "addcdiv_cuda", 7, -1, MODE_FN, False, PRE_NONE],
-        "addcdiv",
-    ](site)
-    impl[
-        f8_iter[
-            op_addcdiv_, "addcdiv_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
-        ],
-        "addcdiv_",
-    ](site)
-    impl[
-        f8_iter[
-            op_addcdiv_out, "addcdiv_cuda", 7, 4, MODE_CAST, False, PRE_NONE
-        ],
-        "addcdiv.out",
-    ](site)
-    impl[
-        f8_iter[op_addcmul, "addcmul_cuda", 7, -1, MODE_FN, False, PRE_NONE],
-        "addcmul",
-    ](site)
-    impl[
-        f8_iter[
-            op_addcmul_, "addcmul_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
-        ],
-        "addcmul_",
-    ](site)
-    impl[
-        f8_iter[
-            op_addcmul_out, "addcmul_cuda", 7, 4, MODE_CAST, False, PRE_NONE
-        ],
-        "addcmul.out",
     ](site)
     impl[f8_cx_scalar[op_bitwise_and], "bitwise_and.Scalar"](site)
     impl[

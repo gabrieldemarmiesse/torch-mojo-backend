@@ -1107,6 +1107,21 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
         # the complex type of the promoted value types (complex64 + float64
         # is complex128)
         return complex_of(promote_types(real_of(a), real_of(b)))
+    if is_wide_unsigned(a) or is_wide_unsigned(b):
+        # c10: uint16 / uint32 / uint64 promote with a floating dtype only.
+        if is_float_stype(a):
+            return a
+        if is_float_stype(b):
+            return b
+        raise Error(
+            (
+                "Promotion for uint16, uint32, uint64 types is not supported,"
+                " attempted to promote "
+            ),
+            scalar_type_name(a),
+            " and ",
+            scalar_type_name(b),
+        )
     if not known_stype(a) or not known_stype(b):
         unsupported(
             "type promotion of dtypes " + String(a) + " and " + String(b)
