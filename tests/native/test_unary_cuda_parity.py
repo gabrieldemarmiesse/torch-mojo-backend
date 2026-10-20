@@ -37,29 +37,25 @@ def _dtype_id(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-# Open mismatches on NaN bits (strict: a fix turns the entry into a failure
-# that asks for its removal from this table).
-_NAN_SIGN_REASON = (
-    "NaN sign or payload of a complex64 negation differs from stock CUDA: "
-    "CUDA's result depends on the NaN's sign and on the tensor size"
+# complex64 neg and conj_physical on a NaN imaginary part: stock CUDA flips
+# the sign bit of the NaN for some tensor sizes and returns the canonical NaN
+# for others; this port does not reproduce that. Those inputs are open in
+# test_complex64_nan_imag (strict xfail); every other element is mandatory.
+_NAN_IMAG_OPS = ("neg", "conj_physical")
+_NAN_IMAG_REASON = (
+    "complex64 neg/conj_physical of a NaN imaginary part: CUDA's sign and "
+    "payload depend on the tensor size; not reproduced yet"
 )
-# Open mismatches on NaN bits (strict: a fix turns the entry into a failure
-# that asks for its removal from this table).
-_NAN_SIGN_XFAIL: dict[str, frozenset[tuple[str, str]]] = {
-    "test_unary": frozenset({("conj_physical", "complex64"), ("neg", "complex64")}),
-    "test_unary_out": frozenset({("conj_physical", "complex64"), ("neg", "complex64")}),
-    "test_unary_inplace": frozenset(
-        {("conj_physical", "complex64"), ("neg", "complex64")}
-    ),
-    "test_unary_layouts": frozenset({("neg", "complex64")}),
-}
 
 
-def _xfail_nan_sign(
-    request: pytest.FixtureRequest, test: str, op: str, dtype: torch.dtype
-) -> None:
-    if (op, _dtype_id(dtype)) in _NAN_SIGN_XFAIL.get(test, frozenset()):
-        request.applymarker(pytest.mark.xfail(strict=True, reason=_NAN_SIGN_REASON))
+def _values_for(op: str, dtype: torch.dtype) -> torch.Tensor:
+    """The inputs of `op`: every value of `dtype`, except that the open NaN
+    imaginary parts of complex64 neg and conj_physical are finite here."""
+    x = _values(dtype)
+    if dtype == torch.complex64 and op in _NAN_IMAG_OPS:
+        imag = torch.view_as_real(x)[..., 1]
+        imag[imag.isnan()] = 0.5
+    return x
 
 
 def _hashed(count: int, seed: int) -> list[int]:
@@ -324,11 +320,8 @@ def _functional(name: str) -> Callable[..., object]:
 
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("op", _UNARY)
-def test_unary(
-    request: pytest.FixtureRequest, cuda_oracle: CudaOracle, op: str, dtype: torch.dtype
-):
-    _xfail_nan_sign(request, "test_unary", op, dtype)
-    cuda_oracle.assert_bitwise_equal(_functional(op), _values(dtype))
+def test_unary(cuda_oracle: CudaOracle, op: str, dtype: torch.dtype):
+    cuda_oracle.assert_bitwise_equal(_functional(op), _values_for(op, dtype))
 
 
 def _result_dtype(cuda_oracle: CudaOracle, op: str, dtype: torch.dtype) -> torch.dtype:
@@ -345,16 +338,13 @@ def _result_dtype(cuda_oracle: CudaOracle, op: str, dtype: torch.dtype) -> torch
 
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("op", _UNARY)
-def test_unary_out(
-    request: pytest.FixtureRequest, cuda_oracle: CudaOracle, op: str, dtype: torch.dtype
-):
+def test_unary_out(cuda_oracle: CudaOracle, op: str, dtype: torch.dtype):
     """`out=` of the result dtype and the input's shape, then an empty one of
     a wider dtype (resized; cast to, or refused)."""
-    _xfail_nan_sign(request, "test_unary_out", op, dtype)
     fn = _packet(op, "out")
     if fn is None:
         pytest.skip(f"aten::{op} has no out overload")
-    x = _values(dtype)
+    x = _values_for(op, dtype)
     result = _result_dtype(cuda_oracle, op, dtype)
     out = torch.zeros(x.shape, dtype=result)
     cuda_oracle.assert_bitwise_equal(lambda a, o: fn(a, out=o), x, out)
@@ -366,14 +356,11 @@ def test_unary_out(
 
 @pytest.mark.parametrize("dtype", _DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("op", _UNARY)
-def test_unary_inplace(
-    request: pytest.FixtureRequest, cuda_oracle: CudaOracle, op: str, dtype: torch.dtype
-):
-    _xfail_nan_sign(request, "test_unary_inplace", op, dtype)
+def test_unary_inplace(cuda_oracle: CudaOracle, op: str, dtype: torch.dtype):
     fn = _packet(op + "_", "default")
     if fn is None:
         pytest.skip(f"aten::{op} has no in-place variant")
-    cuda_oracle.assert_bitwise_equal(fn, _values(dtype))
+    cuda_oracle.assert_bitwise_equal(fn, _values_for(op, dtype))
 
 
 _LAYOUT_DTYPES = [torch.float32, torch.bfloat16, torch.int32, torch.complex64]
@@ -381,13 +368,10 @@ _LAYOUT_DTYPES = [torch.float32, torch.bfloat16, torch.int32, torch.complex64]
 
 @pytest.mark.parametrize("dtype", _LAYOUT_DTYPES, ids=_dtype_id)
 @pytest.mark.parametrize("op", _UNARY)
-def test_unary_layouts(
-    request: pytest.FixtureRequest, cuda_oracle: CudaOracle, op: str, dtype: torch.dtype
-):
+def test_unary_layouts(cuda_oracle: CudaOracle, op: str, dtype: torch.dtype):
     """Strided, transposed, expanded, 0-dim and empty inputs, and a strided
     `out=`."""
-    _xfail_nan_sign(request, "test_unary_layouts", op, dtype)
-    values = _values(dtype)[: 37 * 41 * 2]
+    values = _values_for(op, dtype)[: 37 * 41 * 2]
     fn = _functional(op)
 
     def views(device: str) -> list[torch.Tensor]:
@@ -416,6 +400,15 @@ def test_unary_layouts(
         return base
 
     cuda_oracle.assert_bitwise_equal_by_device(strided_out, what=f"{op} strided out")
+
+
+@pytest.mark.parametrize("op", _NAN_IMAG_OPS)
+def test_complex64_nan_imag(request, cuda_oracle: CudaOracle, op: str):
+    """The open case: only the NaN imaginary parts of complex64 `op`."""
+    request.applymarker(pytest.mark.xfail(strict=True, reason=_NAN_IMAG_REASON))
+    x = _values(torch.complex64)
+    x = x[torch.view_as_real(x)[..., 1].isnan()]
+    cuda_oracle.assert_bitwise_equal(_functional(op), x)
 
 
 _ROUND_FLOATS = [*_FLOATS, torch.int32, torch.int64, torch.uint8, torch.complex64]

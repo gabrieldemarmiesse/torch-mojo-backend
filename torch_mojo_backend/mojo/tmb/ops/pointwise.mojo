@@ -65,7 +65,7 @@ from tmb.backend.abi import (
     v_tensor,
     view_strided,
 )
-from tmb.backend.device import ctx_for, ctx_ptr
+from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.f8_iter import (
     f8_cx_scalar,
@@ -956,7 +956,13 @@ def op_irshift(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _pw_frexp(self: T) raises -> Tuple[Res, Res]:
-    if not _pw_is_float(self.stype) and not is_float8(self.dtype):
+    # float8 reaches the CUDA refusal below; elsewhere it is the float check.
+    var cuda_f8 = (
+        is_float8(self.dtype)
+        and self.on_mojo()
+        and dev(self.device)[].api == "cuda"
+    )
+    if not _pw_is_float(self.stype) and not cuda_f8:
         raise Error("torch.frexp() only supports floating-point dtypes")
     if not self.on_mojo():
         unsupported("frexp of a tensor outside the mojo device")

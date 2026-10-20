@@ -531,7 +531,7 @@ def op_conj_physical_out(
         src = own(new_like(t))
         copy_strided_into(src.t, t)
     _out_prologue(t, dst, t.stype)
-    if (
+    if dev(t.device)[].api == "cuda" and (
         t.dtype == DType.uint16
         or t.dtype == DType.uint32
         or t.dtype == DType.uint64
@@ -1537,8 +1537,14 @@ def _nv_f64_op(op: String, t: T) raises -> Bool:
 
 
 def _angle_half_refuse(t: T) raises:
-    """angle_kernel_cuda dispatches float and double only for a real input."""
-    if t.dtype == DType.float16 or t.dtype == DType.bfloat16:
+    """angle_kernel_cuda dispatches float and double only for a real input
+    (CUDA only: the other GPUs run half angle)."""
+    if (
+        dev(t.device)[].api == "cuda"
+        and t.dtype == DType.float16
+        or dev(t.device)[].api == "cuda"
+        and t.dtype == DType.bfloat16
+    ):
         unsupported(
             '"angle_cuda" not implemented for \''
             + _scalar_type_name(t.dtype)
@@ -2489,7 +2495,12 @@ def _bitwise_not_kernel(src: T, dst: T) raises:
 
 def _bitwise_not_refuse(t: T) raises:
     """bitwise_not_kernel_cuda: AT_DISPATCH_INTEGRAL_TYPES (no barebones
-    unsigned type, no float)."""
+    unsigned type, no float). Only CUDA refuses wide unsigned types; the
+    other devices keep the generic message for a non-bitwise dtype."""
+    if not _is_bitwise_dtype(t.dtype) and dev(t.device)[].api != "cuda":
+        unsupported(
+            "bitwise_not: dtype " + String(t.dtype) + " is not supported"
+        )
     unsupported(
         '"bitwise_not_cuda" not implemented for \''
         + _scalar_type_name(t.dtype)
@@ -2500,7 +2511,9 @@ def _bitwise_not_refuse(t: T) raises:
 def _bitwise_not(t_in: T) raises -> T:
     if t_in.dtype == DType.bool:
         return _bool_unary("LogicalNotSpec", t_in)
-    if not _is_bitwise_dtype(t_in.dtype) or _is_wide_unsigned(t_in.dtype):
+    if not _is_bitwise_dtype(t_in.dtype) or (
+        _is_wide_unsigned(t_in.dtype) and dev(t_in.device)[].api == "cuda"
+    ):
         _bitwise_not_refuse(t_in)
     var src = contiguous(t_in)
     var out = own(new_like(src))
@@ -2517,7 +2530,7 @@ def _bitwise_not_into(t_in: T, mut dst: T) raises:
     if not _is_bitwise_dtype(t_in.dtype):
         _bitwise_not_refuse(t_in)
     _out_prologue(t_in, dst, t_in.stype)
-    if _is_wide_unsigned(t_in.dtype):
+    if _is_wide_unsigned(t_in.dtype) and dev(t_in.device)[].api == "cuda":
         _bitwise_not_refuse(t_in)
     var src = contiguous(t_in)
     if dst.contig:
