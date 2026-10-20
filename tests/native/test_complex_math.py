@@ -121,6 +121,52 @@ def test_unary(mojo_gpu: str, dtype: torch.dtype, op):
     _close(out, op(x), equal_nan=True)
 
 
+# The trig, hyperbolic and log/exp variants: NVIDIA runs the thrust or
+# bit-exact forms, the other devices the jiterator formulas; both are checked
+# against CPU torch on the same values.
+TRIG_LOG_UNARY = [
+    torch.sin,
+    torch.cos,
+    torch.tan,
+    torch.sinh,
+    torch.cosh,
+    torch.tanh,
+    torch.asin,
+    torch.acos,
+    torch.atan,
+    torch.asinh,
+    torch.acosh,
+    torch.atanh,
+    torch.log10,
+    torch.log2,
+    torch.exp2,
+    torch.expm1,
+    torch.log1p,
+]
+
+
+@pytest.mark.parametrize("dtype", CDTYPES)
+@pytest.mark.parametrize("op", TRIG_LOG_UNARY, ids=lambda f: f.__name__)
+def test_trig_log_unary(request, mojo_gpu: str, dtype: torch.dtype, op):
+    _skip_c128(mojo_gpu, dtype)
+    if op is torch.log2 and is_metal(mojo_gpu):
+        # log2(0): CPU torch gives an imaginary NaN, the jiterator form on
+        # Metal gives 0 (NVIDIA matches CPU); one element of 42.
+        request.applymarker(
+            pytest.mark.xfail(strict=True, reason="log2 at 0 on Metal: imag 0, CPU NaN")
+        )
+    x = _rand(6, 7, dtype=dtype) * 0.9
+    _put(x, (0, 0), 0)
+    _put(x, (0, 1), 1)
+    _put(x, (0, 2), -1)
+    _put(x, (0, 3), 1j)
+    _put(x, (0, 4), -2 + 0j)
+    d = x.to(mojo_gpu)
+    rtol = 1e-4 if dtype == torch.complex64 else 1e-9
+    _close(op(d), op(x), rtol=rtol, atol=1e-5, equal_nan=True)
+    _close(op(d.t()), op(x.t()), rtol=rtol, atol=1e-5, equal_nan=True)
+
+
 # sgn and rsqrt: stock CUDA (the reference) and CPU disagree on infinite
 # inputs; checked against CUDA's own values below.
 @pytest.mark.parametrize(

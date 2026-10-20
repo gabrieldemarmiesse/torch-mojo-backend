@@ -18,7 +18,10 @@ PyTorch's accelerator breaks CUDA autograd. Inductor/Triton integration needs
 a CPU torch wheel because its process-wide driver cannot coexist with the CUDA
 torch driver. The CPU wheel still runs Mojo kernels on the L4. GPU jobs check
 device availability first, so a missing driver cannot produce a successful run
-with every GPU test skipped. Tests requiring multiple GPUs, another vendor, or
+with every GPU test skipped. The Mojo device job also runs the stock-CUDA
+parity tests (`cuda_oracle` fixture, `cuda_oracle.md`): the locked CUDA wheel
+computes the reference live on the same L4, and the fixture fails rather than
+skips there if CUDA torch cannot initialize. Tests requiring multiple GPUs, another vendor, or
 an H100 still skip when that hardware is absent.
 
 The root `conftest.py` marks GPU tests from their fixture dependencies, including
