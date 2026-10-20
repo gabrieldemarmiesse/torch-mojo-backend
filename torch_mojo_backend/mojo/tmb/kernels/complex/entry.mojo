@@ -22,7 +22,7 @@
 #   cx -> cx : conj neg reciprocal exp log sqrt rsqrt sgn square
 #   cx -> re : abs angle real imag
 #   cx -> b  : isnan isinf isfinite nonzero
-#   cx, cx -> cx : add (a + p * b) mul div pow exp_mul (exp(a * b))
+#   cx, cx -> cx : add (a + p * b) mul div pow pow_b0 exp_mul (exp(a * b))
 #   cx, cx -> b  : eq ne
 #   re, re -> cx : make (complex(real, imag)) polar (polar(abs, angle))
 #
@@ -48,6 +48,8 @@ from tmb.kernels.common.complex_math import (
     chypot,
     clog_jit,
     cmul,
+    cexp_mul,
+    clog,
     cpow,
     creciprocal,
     csgn,
@@ -88,7 +90,7 @@ comptime KINDS_CX_CX = [
 ]
 comptime KINDS_CX_RE = ["abs", "angle", "real", "imag"]
 comptime KINDS_CX_B = ["isnan", "isinf", "isfinite", "nonzero"]
-comptime KINDS_CXCX_CX = ["add", "mul", "div", "pow", "exp_mul"]
+comptime KINDS_CXCX_CX = ["add", "mul", "div", "pow", "pow_b0", "exp_mul"]
 comptime KINDS_CXCX_B = ["eq", "ne"]
 comptime KINDS_RERE_CX = ["make", "polar"]
 
@@ -156,10 +158,15 @@ def _binary_cx[
         return cmul(a, b)
     elif kind == "div":
         return cdiv(a, b)
+    elif kind == "pow_b0":
+        # pow with a 0-d device base (pow.Scalar's number base): the same
+        # `exp(log(a) * b)`, whose multiply the broadcast kernel schedules
+        # with the tensor operand in the DFMA's A slot, as exp_mul's.
+        return cexp_mul(clog(a), b)
     elif kind == "exp_mul":
         # pow_scalar_tensor_impl's `std::exp(fct * exp)`: a = fct, the
         # CPU-scalar base's log taken on the host
-        return cexp(cmul(a, b))
+        return cexp_mul(a, b)
     else:
         comptime assert kind == "pow", "unknown complex binary kind"
         return cpow(a, b)
@@ -220,6 +227,7 @@ def _arity[kind: StaticString]() -> Int:
         or kind == "mul"
         or kind == "div"
         or kind == "pow"
+        or kind == "pow_b0"
         or kind == "exp_mul"
         or kind == "eq"
         or kind == "ne"

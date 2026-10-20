@@ -31,7 +31,12 @@ from std.memory import bitcast
 from std.sys.info import is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
-from tmb.kernels.common.libdevice_port import nv_atan2, nv_cos, nv_sin
+from tmb.kernels.common.libdevice_port import (
+    _mul_rn_d,
+    nv_atan2,
+    nv_cos,
+    nv_sin,
+)
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.nan_order import quiet_nan
 from tmb.kernels.common.pointwise_math import (
@@ -75,6 +80,10 @@ def _mulx[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
             return _q(b)
         if isnan(a):
             return _q(a)
+        # opaque: an inf * 0 NaN must stay visible to the tests that follow
+        return rebind[Scalar[dt]](
+            _mul_rn_d(rebind[Float64](a), rebind[Float64](b))
+        )
     return a * b
 
 
@@ -614,19 +623,32 @@ def clog_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
+def _cuda_nan[dt: DType]() -> Scalar[dt]:
+    """CUDA's `NAN` macro, `__int_as_float(0x7fffffff)`, as the NVRTC-compiled
+    libc++ complex code (the jiterated kernels) returns it, widened to double
+    for float64."""
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return bitcast[dt](UInt64(0x7FFFFFFFE0000000))
+    elif is_nvidia_gpu() and dt == DType.float32:
+        return bitcast[dt](UInt32(0x7FFFFFFF))
+    else:
+        return nan[dt]()
+
+
+@always_inline
 def _polar[dt: DType](rho: Scalar[dt], theta: Scalar[dt]) -> Cx[dt]:
     """libc++'s polar(rho, theta)."""
     # Modified from libc++ polar(const _Tp&, const _Tp&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
     if isnan(rho) or _signbit(rho):
-        return Cx[dt](nan[dt](), nan[dt]())
+        return Cx[dt](_cuda_nan[dt](), _cuda_nan[dt]())
     if isnan(theta):
         if isinf(rho):
             return Cx[dt](rho, theta)
         return Cx[dt](theta, theta)
     if isinf(theta):
         if isinf(rho):
-            return Cx[dt](rho, nan[dt]())
-        return Cx[dt](nan[dt](), nan[dt]())
+            return Cx[dt](rho, _cuda_nan[dt]())
+        return Cx[dt](_cuda_nan[dt](), _cuda_nan[dt]())
     var x = rho * _rcos(theta)
     if isnan(x):
         x = Scalar[dt](0)
@@ -704,3 +726,19 @@ def cpow[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
             )
         )
     return cexp(cmul(l, y))
+
+
+@always_inline
+def cexp_mul[dt: DType](fct: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+    """pow_scalar_tensor_impl's `std::exp(fct * exp)`: `fct` (the CPU-scalar
+    base's log) is a kernel argument, uniform, so ptxas puts it in the B slot
+    of the multiply's DMUL / DFMA and the tensor's value in A: where float64
+    NaNs meet, the scalar's wins (and the first product's)."""
+    comptime if _nan64[dt]():
+        return cexp(
+            Cx[dt](
+                _fmax(w.re, fct.re, -_mulx(w.im, fct.im)),
+                _fmax(w.im, fct.re, _mulx(w.re, fct.im)),
+            )
+        )
+    return cexp(cmul(fct, w))

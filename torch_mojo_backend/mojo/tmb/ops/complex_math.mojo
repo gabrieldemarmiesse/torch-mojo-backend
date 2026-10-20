@@ -364,6 +364,14 @@ def _arith(
             fct = _host_clog[DType.float64](fa.re, fa.im)
         fa = _Flat(CX_HOST, 0, fct[0], fct[1])
         launch_kind = "exp_mul"
+    if (
+        kind == "pow"
+        and (fa.mode == CX_DEVICE or fa.mode == CX_HOST)
+        and fb.mode != CX_HOST
+        and av.tag != TAG_TENSOR
+        and av.tag != TAG_TENSOR_REF
+    ):
+        launch_kind = "pow_b0"
     if kind == "pow" and fb.mode == CX_HOST:
         # the CPU-scalar exponent becomes a scalar_t first
         # (iter.scalar_value<scalar_t>), so it is compared once rounded
