@@ -1,0 +1,426 @@
+# ===----------------------------------------------------------------------=== #
+# Complex kernels of tmb/ops/pointwise.mojo's ternary ops: lerp (Scalar and
+# Tensor weight), addcmul, addcdiv. Stock CUDA jiterates them (Lerp.cu,
+# PointwiseOpsKernel.cu): libc++'s <complex> (llvm_complex.cpp) under NVRTC,
+# so the products are `cmul_jit`, the quotients `cdiv_jit`.
+#
+# Operands as in the complex family (tmb/kernels/complex): each full (a dense
+# buffer of the output's extent), one device element or a host value, the
+# interleaved component storage of a complex64 / complex128 tensor.
+#
+# Slots: out, a, b, c (addresses), modes (2 bits per operand: 0 full,
+# 1 device element, 2 host value), a_re, a_im, b_re, b_im, c_re, c_im (f64
+# bits), numel (complex elements), p_re, p_im (f64 bits: the weight or the
+# value), DeviceContext.
+# Defines: OP (the kind), DTYPE_ARG_0 (the component dtype).
+# ===----------------------------------------------------------------------=== #
+
+from max.gpu.host import DeviceContext
+from std.sys._assembly import inlined_assembly
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    is_nvidia_gpu,
+)
+from std.utils.numerics import inf, isinf, isnan
+from std.utils.coord import Coord
+
+from tmb.kernels.common.complex_math import (
+    Cx,
+    _rcos,
+    _rexp,
+    _rlog,
+    _rlog1p,
+    _rsin,
+    catan2,
+    cdiv_jit,
+    chypot,
+    cmul_jit,
+)
+from tmb.kernels.common.gpu_elementwise import elementwise
+from tmb.kernels.common.host_float import f32_bits_of
+from tmb.kernels.common.pointwise_math import _mul_rn
+from std.memory import bitcast
+from tmb.kernels.common.op_utils import (
+    Argv,
+    _make_ptr,
+    _raw_ctx,
+    _raw_f64,
+    _raw_int,
+)
+from tmb.kernels.common.variant_gates import (
+    ErrBuf,
+    NO_OP_COMPILED,
+    _dtype_arg_on,
+    _op_on,
+    _tmb_entry_error,
+)
+
+comptime MODE_FULL = 0
+comptime MODE_DEVICE = 1
+comptime MODE_HOST = 2
+
+comptime COMPONENT_DTYPES = [DType.float32, DType.float64]
+comptime KINDS = [
+    "cx_lerp_scalar",
+    "cx_lerp",
+    "cx_addcmul",
+    "cx_addcdiv",
+    "cx_logaddexp",
+]
+
+
+@always_inline
+def _hval[dt: DType](v: Float64) -> Scalar[dt]:
+    """A host component in dt: float32 by c10's conversion (no flush)."""
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](bitcast[DType.float32](f32_bits_of(v)))
+    else:
+        return v.cast[dt]()
+
+
+@always_inline
+def _sub_rn[dt: DType](x: Scalar[dt], y: Scalar[dt]) -> Scalar[dt]:
+    """x - y with no algebra (fast-math would fold 0 - y into -y, whose zero
+    has the other sign)."""
+    comptime if is_nvidia_gpu():
+        comptime asm = "sub.rn.f32 $0, $1, $2;" if dt == DType.float32 else (
+            "sub.rn.f64 $0, $1, $2;"
+        )
+        comptime cons = "=f,f,f" if dt == DType.float32 else "=d,d,d"
+        return inlined_assembly[
+            asm, Scalar[dt], constraints=cons, has_side_effect=False
+        ](x, y)
+    else:
+        return x - y
+
+
+@always_inline
+def _add[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
+    return Cx[dt](x.re + y.re, x.im + y.im)
+
+
+@always_inline
+def _sub[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
+    return Cx[dt](x.re - y.re, x.im - y.im)
+
+
+@always_inline
+def _lerp[
+    dt: DType
+](s: Cx[dt], e: Cx[dt], w: Cx[dt], fuse_small: Bool, fuse_big: Bool) -> Cx[dt]:
+    """Lerp.cu's jiterated lerp: abs(w) < 0.5 ? s + w (e - s) :
+    e - (e - s)(1 - w), abs being libc++'s hypot(re, im); 1 - w's
+    imaginary part is 0 - w.im (NVRTC's FADD, +0 for a zero)."""
+    var diff = _sub(e, s)
+    var aw = chypot(w.re, w.im)
+    if not isnan(aw) and aw < Scalar[dt](0.5):
+        return _add(s, cmul_jit(w, diff, fuse_small))
+    var omw = Cx[dt](_sub_rn(Scalar[dt](1), w.re), _sub_rn(Scalar[dt](0), w.im))
+    return _sub(e, cmul_jit(diff, omw, fuse_big))
+
+
+@always_inline
+def _canonical_nan[dt: DType]() -> Scalar[dt]:
+    """NVRTC's NAN: the float 0x7FFFFFFF, widened for a double."""
+    comptime if dt == DType.float64:
+        return bitcast[dt](UInt64(0x7FFFFFFFE0000000))
+    else:
+        return bitcast[dt](UInt32(0x7FFFFFFF))
+
+
+@always_inline
+def _finite[dt: DType](x: Scalar[dt]) -> Bool:
+    return not (isnan(x) or isinf(x))
+
+
+@always_inline
+def _is_nan_c[dt: DType](x: Cx[dt]) -> Bool:
+    return isnan(x.re) or isnan(x.im)
+
+
+@always_inline
+def _minmax[dt: DType, is_min: Bool](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
+    """LogAddExpKernel.cu's logaddexp_min / logaddexp_max."""
+    if _is_nan_c(y):
+        return y.copy()
+    elif _is_nan_c(x):
+        return x.copy()
+    comptime if is_min:
+        return x.copy() if x.re < y.re else y.copy()
+    else:
+        return x.copy() if x.re >= y.re else y.copy()
+
+
+@always_inline
+def _fast_build_exp[dt: DType](x: Cx[dt]) -> Cx[dt]:
+    var e = _rexp(x.re)
+    return Cx[dt](e * _rcos(x.im), e * _rsin(x.im))
+
+
+@always_inline
+def _fast_build_exp_inf[dt: DType](x: Cx[dt]) -> Cx[dt]:
+    var big = inf[dt]()
+    if not _finite(x.im):
+        return Cx[dt](big, _canonical_nan[dt]())
+    var sn = _rsin(x.im)
+    var cs = _rcos(x.im)
+    var re = Scalar[dt](0) if cs == 0 else big * cs
+    var im = Scalar[dt](0) if sn == 0 else big * sn
+    return Cx[dt](re, im)
+
+
+@always_inline
+def _log1p_cx[dt: DType](z: Cx[dt], special: Bool) -> Cx[dt]:
+    """The jiterator string's log1p(complex)."""
+    var x = z.re
+    var y = z.im
+    var zabs = chypot(x, y)
+    var theta = catan2(y, x + Scalar[dt](1))
+    if zabs < Scalar[dt](0.5):
+        # ptxas fuses the other product per kernel (SASS of the jiterated
+        # kernels): the vectorized float one fma(y, y, x (2 + x)), the
+        # non-vectorized float one (a 0-d operand) and the double one
+        # fma(x, 2 + x, y y)
+        var r: Scalar[dt]
+        if dt == DType.float32 and not special:
+            r = _fma_c(y, y, _mul_rn[dt, 1](x, Scalar[dt](2) + x))
+        else:
+            r = _fma_c(x, Scalar[dt](2) + x, _mul_rn[dt, 1](y, y))
+        if r == 0:
+            return Cx[dt](x, theta)
+        return Cx[dt](Scalar[dt](0.5) * _rlog1p(r), theta)
+    var z0 = chypot(x + Scalar[dt](1), y)
+    return Cx[dt](_rlog(z0), theta)
+
+
+@always_inline
+def _fma_c[
+    dt: DType
+](a: Scalar[dt], b: Scalar[dt], c: Scalar[dt]) -> Scalar[dt]:
+    return a.fma(b, c)
+
+
+@always_inline
+def _logaddexp[dt: DType](x: Cx[dt], y: Cx[dt], special: Bool) -> Cx[dt]:
+    """The jiterated logaddexp_complex (LogAddExpKernel.cu)."""
+    var mn = _minmax[dt, True](x, y)
+    var mx = _minmax[dt, False](x, y)
+    if _is_nan_c(mn):
+        return Cx[dt](_canonical_nan[dt](), _canonical_nan[dt]())
+    elif (not _finite(mn.re)) and mn.re == mx.re:
+        if mn.re < 0:
+            return mn^
+        var e_min = _fast_build_exp_inf(mn)
+        var e_max = _fast_build_exp_inf(mx)
+        return _log1p_cx(
+            Cx[dt](
+                e_min.re + e_max.re - Scalar[dt](1),
+                e_min.im + e_max.im - Scalar[dt](0),
+            ),
+            False,
+        )
+    var mm = _sub(mn, mx)
+    var ex: Cx[dt]
+    if not _finite(mm.re):
+        ex = Cx[dt](Scalar[dt](0), Scalar[dt](0)) if mm.re < 0 else (
+            _fast_build_exp_inf(mm)
+        )
+    else:
+        ex = _fast_build_exp(mm)
+    return _add(_log1p_cx(ex, special), mx)
+
+
+# ===----------------------------------------------------------------------=== #
+# ptxas's contraction of torch v2.11.0's unrolled jiterator loop.
+#
+# THE ONE PLACE that mirrors it; delete (and `Contraction` with it) if a torch
+# release changes how its jitterated kernels contract. NVRTC inlines the
+# jiterated function once per unrolled element of the scalar kernel (eight
+# 128-element slices per 1024-element block), and ptxas fuses multiplies and
+# adds differently from slice to slice (SASS of lerp / addcmul / addcdiv /
+# logaddexp_complex, then fitted against the live oracle, see
+# tests/native/test_pointwise_binary_cuda_parity.py). The vectorized
+# complex64 kernel runs the same function unfused in its vector body and the
+# scalar tail's contraction in the last partial 1024 block. Off NVIDIA the
+# plain forms are used.
+# ===----------------------------------------------------------------------=== #
+
+
+@fieldwise_init
+struct Contraction(TrivialRegisterPassable):
+    var slice: Int  # slice of 128 within the scalar kernel's block; 8 = none
+    var alt: Bool  # logaddexp's finite-path fma association
+
+
+@always_inline
+def _unrolled_contraction[
+    dt: DType
+](i: Int, scalar_kernel: Bool, tail_start: Int) -> Contraction:
+    comptime if not is_nvidia_gpu():
+        return Contraction(8, False)
+    else:
+        var scalar_path = dt == DType.float64 or scalar_kernel
+        var copy = ((i & 1023) >> 7) if scalar_path else 8
+        return Contraction(copy, scalar_path or i >= tail_start)
+
+
+@always_inline
+def _ternary[
+    kind: StaticString, dt: DType
+](a: Cx[dt], b: Cx[dt], c: Cx[dt], p: Cx[dt], cn: Contraction) -> Cx[dt]:
+    var copy = cn.slice
+    var alt = cn.alt
+    var fuse_f32 = copy == 0 and dt == DType.float32
+    comptime if kind == "cx_lerp_scalar":
+        return _lerp(a, b, p, fuse_f32, fuse_f32)
+    elif kind == "cx_lerp":
+        return _lerp(a, b, c, fuse_f32, False)
+    elif kind == "cx_logaddexp":
+        return _logaddexp(a, b, alt)
+    elif kind == "cx_addcmul":
+        # a + alpha * (b * c). The unrolled copies of the jiterated function
+        # (`copy`, the 128-element slice of 1024) contract it differently:
+        # the first both products, the second (complex64 only) the inner one
+        var inner = copy == 0 or (dt == DType.float32 and copy == 1)
+        return _add(a, cmul_jit(p, cmul_jit(b, c, inner), copy == 0))
+    else:
+        comptime assert kind == "cx_addcdiv", "unknown complex ternary kind"
+        # a + alpha * (b / c)
+        return _add(
+            a, cmul_jit(p, cdiv_jit[dt, is_nvidia_gpu()](b, c), copy == 0)
+        )
+
+
+@always_inline
+def _launch[
+    kind: StaticString, dt: DType
+](
+    out_addr: Int,
+    a_addr: Int,
+    b_addr: Int,
+    c_addr: Int,
+    modes: Int,
+    h: SIMD[DType.float64, 8],
+    numel: Int,
+    ctx: DeviceContext,
+) raises:
+    var out_ptr = _make_ptr[dt](out_addr)
+    var a_ptr = _make_ptr[dt](a_addr)
+    var b_ptr = _make_ptr[dt](b_addr)
+    var c_ptr = _make_ptr[dt](c_addr)
+    var mode_a = modes & 3
+    var mode_b = (modes >> 2) & 3
+    var mode_c = (modes >> 4) & 3
+    var ha_re = _hval[dt](h[0])
+    var ha_im = _hval[dt](h[1])
+    var hb_re = _hval[dt](h[2])
+    var hb_im = _hval[dt](h[3])
+    var hc_re = _hval[dt](h[4])
+    var hc_im = _hval[dt](h[5])
+    var hp_re = _hval[dt](h[6])
+    var hp_im = _hval[dt](h[7])
+    # Stock CUDA jiterates these as a vectorized kernel (complex64, every
+    # operand dense and of the result's dtype: the last partial block of
+    # 1024 runs its scalar tail) or a scalar one (complex128, or a 0-d /
+    # strided / broadcast / dynamically cast operand), whose first inlined
+    # copies of the function (128 elements each, eight per 1024) ptxas
+    # contracts differently (`copy`).
+    var scalar_kernel = (modes >> 6) & 1 != 0
+    var tail_start = (numel >> 10) << 10
+
+    @always_inline
+    @__parameter
+    @__copy_capture(
+        out_ptr,
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        mode_a,
+        mode_b,
+        mode_c,
+        ha_re,
+        ha_im,
+        hb_re,
+        hb_im,
+        hc_re,
+        hc_im,
+        hp_re,
+        hp_im,
+        scalar_kernel,
+        tail_start,
+    )
+    def func[w: Int, alignment: Int = 1](idx: Coord):
+        var i = Int(idx[0].value())
+        var a = Cx[dt](ha_re, ha_im)
+        if mode_a != MODE_HOST:
+            var k = 2 * i if mode_a == MODE_FULL else 0
+            a = Cx[dt](a_ptr[unsafe_offset=k], a_ptr[unsafe_offset=k + 1])
+        var b = Cx[dt](hb_re, hb_im)
+        if mode_b != MODE_HOST:
+            var k = 2 * i if mode_b == MODE_FULL else 0
+            b = Cx[dt](b_ptr[unsafe_offset=k], b_ptr[unsafe_offset=k + 1])
+        var c = Cx[dt](hc_re, hc_im)
+        if mode_c != MODE_HOST:
+            var k = 2 * i if mode_c == MODE_FULL else 0
+            c = Cx[dt](c_ptr[unsafe_offset=k], c_ptr[unsafe_offset=k + 1])
+        var cn = _unrolled_contraction[dt](i, scalar_kernel, tail_start)
+        var r = _ternary[kind, dt](a, b, c, Cx[dt](hp_re, hp_im), cn)
+        out_ptr[unsafe_offset=2 * i] = r.re
+        out_ptr[unsafe_offset=2 * i + 1] = r.im
+
+    elementwise[
+        func,
+        simd_width=1,
+        target="gpu",
+        _trace_description=kind,
+        _heavy=True,
+    ](Coord(numel), ctx)
+
+
+def _go[kind: StaticString](argv: Argv, argc: Int) raises:
+    if argc != 15:
+        raise Error("complex_pointwise expects 15 arguments, got ", argc)
+    var out_addr = _raw_int(argv[unsafe_offset=0])
+    var a_addr = _raw_int(argv[unsafe_offset=1])
+    var b_addr = _raw_int(argv[unsafe_offset=2])
+    var c_addr = _raw_int(argv[unsafe_offset=3])
+    var modes = _raw_int(argv[unsafe_offset=4])
+    var h = SIMD[DType.float64, 8](0)
+    for k in range(6):
+        h[k] = _raw_f64(argv[unsafe_offset=5 + k])
+    var numel = _raw_int(argv[unsafe_offset=11])
+    h[6] = _raw_f64(argv[unsafe_offset=12])
+    h[7] = _raw_f64(argv[unsafe_offset=13])
+    var ctx = _raw_ctx(argv[unsafe_offset=14])
+    if numel <= 0:
+        return
+    var handled = False
+    comptime for dt in COMPONENT_DTYPES:
+        comptime if _dtype_arg_on[0, dt]():
+            comptime if dt == DType.float64 and has_apple_gpu_accelerator():
+                raise Error("float64 is not supported on Apple GPU")
+            elif not has_accelerator():
+                raise Error("no GPU accelerator available")
+            else:
+                _launch[kind, dt](
+                    out_addr, a_addr, b_addr, c_addr, modes, h, numel, ctx
+                )
+                handled = True
+    if not handled:
+        raise Error("complex_pointwise ", kind, ": dtype not compiled in")
+
+
+@export
+def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
+    """C entry of this family: one kind and one component dtype per build.
+    Slots are described in the header; errors come back as (rc=1, message).
+    """
+    try:
+        comptime for kind in KINDS:
+            comptime if _op_on[kind]():
+                _go[kind](argv, argc)
+                return 0
+        raise Error(NO_OP_COMPILED)
+    except e:
+        return _tmb_entry_error(err, errcap, e)

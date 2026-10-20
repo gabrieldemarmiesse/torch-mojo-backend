@@ -20,6 +20,7 @@
 from std.memory import bitcast
 from std.sys import is_nvidia_gpu
 from std.sys.info import size_of
+from std.utils.numerics import nan
 
 
 @always_inline
@@ -94,3 +95,33 @@ def nan_first3[
         return nan_first2(nan_first2(r, q, s), p, p)
     else:
         return r
+
+
+@always_inline
+def arith_nan[dtype: DType, w: Int]() -> SIMD[dtype, w]:
+    """The NaN a float32 arithmetic instruction returns on NVIDIA, whatever
+    its operands: 0x7FFFFFFF, which rounds to 0x7FFF in half and bfloat16.
+    The default NaN elsewhere."""
+    comptime if is_nvidia_gpu() and dtype != DType.float64:
+        comptime bt = _bits_dtype[dtype]()
+        comptime if dtype == DType.float32:
+            return bitcast[dtype, w](SIMD[bt, w](Scalar[bt](0x7FFFFFFF)))
+        else:
+            return bitcast[dtype, w](SIMD[bt, w](Scalar[bt](0x7FFF)))
+    else:
+        return SIMD[dtype, w](nan[dtype]())
+
+
+@always_inline
+def nan_result2[
+    dtype: DType, w: Int
+](r: SIMD[dtype, w], p: SIMD[dtype, w], q: SIMD[dtype, w]) -> SIMD[dtype, w]:
+    """`r`, or the NaN an arithmetic chain over `p` and `q` ends in when
+    either is NaN: on NVIDIA the first NaN of p, q, quieted, for float64
+    (`nan_first2`), the canonical `arith_nan` otherwise; the default NaN
+    off NVIDIA."""
+    var any_nan = is_nan_bits(p) | is_nan_bits(q)
+    comptime if is_nvidia_gpu() and dtype == DType.float64:
+        return nan_first2(r, p, q)
+    else:
+        return any_nan.select(arith_nan[dtype, w](), r)

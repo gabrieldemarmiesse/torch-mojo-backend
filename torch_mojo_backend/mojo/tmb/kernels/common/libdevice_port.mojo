@@ -1980,3 +1980,101 @@ def nv_atan2(a: Float64, b: Float64) -> Float64:
     return _i2d(
         _lo(r), (_hi(r) & Int32(0x7FFFFFFF)) | (_hi(a) & Int32(-2147483648))
     )
+
+
+@always_inline
+def _mul_rn_f(a: Float32, b: Float32) -> Float32:
+    """mul.rn.f32: a product the fast-math flags may not reassociate."""
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "mul.rn.f32 $0, $1, $2;",
+            Float32,
+            constraints="=f,f,f",
+            has_side_effect=False,
+        ](a, b)
+    else:
+        return a * b
+
+
+@always_inline
+def nv_ldexpf(a: Float32, b: Int32) -> Float32:
+    """`__nv_ldexpf`: the exponent clamped to +-278 and applied as four
+    rounded products by powers of two (one, then 2^0 three times when
+    |b| <= 100)."""
+    var e = min(max(b, Int32(-278)), Int32(278))
+    var t = e + 508
+    var s0 = t >> 2
+    var s1 = t - 3 * s0
+    if abs(e) <= 100:
+        s0 = 127
+        s1 = e + 127
+    var f0 = _fr(s0 << 23)
+    var r = _mul_rn_f(a, _fr(s1 << 23))
+    r = _mul_rn_f(r, f0)
+    r = _mul_rn_f(r, f0)
+    return _mul_rn_f(r, f0)
+
+
+@always_inline
+def nv_ldexp(a: Float64, b: Int32) -> Float64:
+    """`__nv_ldexp`: as `nv_ldexpf`, the exponent clamped to +-2099 (|b| <=
+    216 in one product)."""
+    var e = min(max(b, Int32(-2099)), Int32(2099))
+    var t = e + 4092
+    var s0 = t >> 2
+    var s1 = t - 3 * s0
+    if abs(e) <= 216:
+        s0 = 1023
+        s1 = e + 1023
+    var f0 = _i2d(0, s0 << 20)
+    var r = _mul_rn_d(a, _i2d(0, s1 << 20))
+    r = _mul_rn_d(r, f0)
+    r = _mul_rn_d(r, f0)
+    return _mul_rn_d(r, f0)
+
+
+@always_inline
+def nv_exp2(a: Float64) -> Float64:
+    """`__nv_exp2`: a = j + f by the 1.5 * 2^52 rounding trick, 2^f =
+    e^(f ln 2) by one polynomial, 2^j added to the exponent (in two steps
+    near the range ends)."""
+    comptime SHIFT = Float64(from_bits=UInt64(0x4338000000000000))
+    var t = _add_rn_d(a, SHIFT)
+    var j = _add_rn_d(t, -SHIFT)
+    var k = _lo(t)
+    var f = a - j
+    var x = fma(
+        f,
+        Float64(from_bits=UInt64(0x3FE62E42FEFA39EF)),
+        f * Float64(from_bits=UInt64(0x3C7ABC9E3B39803F)),
+    )
+    var p = fma(
+        Float64(from_bits=UInt64(0x3E5ADE1569CE2BDF)),
+        x,
+        Float64(from_bits=UInt64(0x3E928AF3FCA213EA)),
+    )
+    p = fma(p, x, Float64(from_bits=UInt64(0x3EC71DEE62401315)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3EFA01997C89EB71)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3F2A01A014761F65)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3F56C16C1852B7AF)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3F81111111122322)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3FA55555555502A1)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3FC5555555555511)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3FE000000000000B)))
+    p = fma(p, x, Float64(1.0))
+    p = fma(p, x, Float64(1.0))
+    var ahi = _u32(_hi(a)) & UInt32(0x7FFFFFFF)
+    if ahi < UInt32(1083174912):  # |a| < 1022
+        return _i2d(_lo(p), (k << 20) + _hi(p))
+    var z: Float64
+    if _hi(a) < 0:
+        z = 0.0
+    else:
+        z = _F64_INF
+    if ahi > UInt32(0x7FF00000) or (ahi == UInt32(0x7FF00000) and _lo(a) != 0):
+        z = a + a  # NaN
+    if ahi < UInt32(1083231232):  # |a| < 1075
+        var k1 = (k + (k >> 31 & 1)) >> 1  # C's k / 2, truncating
+        var hi = _i2d(_lo(p), _hi(p) + (k1 << 20))
+        z = hi * _i2d(0, Int32(1072693248) + ((k - k1) << 20))
+    return z

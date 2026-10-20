@@ -729,6 +729,10 @@ def test_result_type_matches_torch(mojo_gpu, name, shapes):
     key = f"aten::{name.removesuffix('.default')}"
     if not torch._C._dispatch_has_kernel_for_dispatch_key(key, "PrivateUse1"):
         pytest.skip(f"{key} is not registered on the mojo device")
+    if shapes[1] == "cpu" and name in ("logaddexp.default", "nextafter.default"):
+        # no device_check: NoCheck, so a CPU tensor among the operands raises
+        # (on CUDA as here), a 0-d one included
+        pytest.skip(f"{name} raises for a CPU operand, as on CUDA")
     op = _op(name)
     metal = _metal(mojo_gpu)
     wrong = []

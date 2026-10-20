@@ -31,6 +31,7 @@ from std.sys.info import (
 from std.utils.coord import Coord
 
 from tmb.kernels.common.gpu_elementwise import elementwise
+from tmb.kernels.common.host_float import c10_half, f32_bits_of
 from tmb.kernels.common.op_utils import (
     Argv,
     _make_ptr,
@@ -176,6 +177,8 @@ comptime KINDS_2 = [
     "zeta",
 ]
 comptime KINDS_3 = [
+    "addcdiv",
+    "addcmul",
     "bce",
     "bce_backward",
     "bce_logits",
@@ -242,6 +245,7 @@ def _heavy_kind[kind: StaticString]() -> Bool:
         or kind == "fmin"
         or kind == "lerp"
         or kind == "lerp_scalar"
+        or kind == "addcdiv"
         or kind == "standard_gamma_grad"
         or kind == "dirichlet_grad"
         or is_polynomial[kind]()
@@ -300,12 +304,58 @@ def _host_value[dt: DType](v: Float64) -> Scalar[dt]:
     holds the int64's bits (the ops layer's `_pw_flat`; a bool travels as
     the byte type here), narrowed with two's complement wrap as torch
     narrows a wrapped number."""
-    comptime if dt.is_floating_point():
+    comptime if dt == DType.float16 or dt == DType.bfloat16:
+        return c10_half[dt](v)
+    elif dt == DType.float32:
+        return bitcast[dt](f32_bits_of(v))
+    elif dt.is_floating_point():
         return v.cast[dt]()
     elif dt.is_integral():
         return bitcast[DType.int64](v).cast[dt]()
     else:
         return Scalar[dt](Int(v))
+
+
+@always_inline
+def _splat[
+    dt: DType, w: Int
+](ptr: Pointer[Scalar[dt], MutUntrackedOrigin], dev: Bool, v: UInt64) -> SIMD[
+    dt, w
+]:
+    """A single operand -- the device element, or the host value `v` as its
+    bits (a half-type kernel argument, or a float select of one, may pass
+    through float32 and flush a subnormal) -- across the lanes."""
+    comptime if dt == DType.bfloat16 or dt == DType.float16:
+        var bits = v.cast[DType.uint16]()
+        if dev:
+            bits = ptr.unsafe_bitcast[UInt16]()[]
+        return SIMD[dt, w](bitcast[dt](bits))
+    else:
+        return SIMD[dt, w](ptr[unsafe_offset=0] if dev else _from_bits64[dt](v))
+
+
+@always_inline
+def _bits64[dt: DType](v: Scalar[dt]) -> UInt64:
+    comptime if size_of[dt]() == 8:
+        return bitcast[DType.uint64](v)
+    elif size_of[dt]() == 4:
+        return bitcast[DType.uint32](v).cast[DType.uint64]()
+    elif size_of[dt]() == 2:
+        return bitcast[DType.uint16](v).cast[DType.uint64]()
+    else:
+        return bitcast[DType.uint8](v).cast[DType.uint64]()
+
+
+@always_inline
+def _from_bits64[dt: DType](v: UInt64) -> Scalar[dt]:
+    comptime if size_of[dt]() == 8:
+        return bitcast[dt](v)
+    elif size_of[dt]() == 4:
+        return bitcast[dt](v.cast[DType.uint32]())
+    elif size_of[dt]() == 2:
+        return bitcast[dt](v.cast[DType.uint16]())
+    else:
+        return bitcast[dt](v.cast[DType.uint8]())
 
 
 @always_inline
@@ -345,61 +395,132 @@ def _launch[
     var p1 = params[1]
     var p2 = params[2]
     var p3 = params[3]
+    # NVIDIA: the host values travel as bits (a half kernel argument may pass
+    # through float32 and flush a subnormal) and a CPU-scalar `a` is flagged for
+    # the NaN order. Other targets keep the kernel they had.
+    comptime if has_nvidia_gpu_accelerator():
+        var ba = _bits64(va)
+        var bb = _bits64(vb)
+        var bc = _bits64(vc)
 
-    @always_inline
-    @__parameter
-    @__copy_capture(
-        out_ptr,
-        a_ptr,
-        b_ptr,
-        c_ptr,
-        dev_a,
-        dev_b,
-        dev_c,
-        va,
-        vb,
-        vc,
-        p0,
-        p1,
-        p2,
-        p3,
-    )
-    def func[w: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        # `ua`: full operands off the vector grid, loaded element-aligned.
-        comptime in_align = size_of[dt]() if ua else min(16, w * size_of[dt]())
-        comptime out_align = min(16, w * size_of[odt]())
-        var a: SIMD[dt, w]
-        comptime if full_a:
-            a = a_ptr.unsafe_load[width=w, alignment=in_align](i)
-        else:
-            a = SIMD[dt, w](a_ptr[unsafe_offset=0] if dev_a else va)
-        var b = SIMD[dt, w](0)
-        comptime if arity >= 2:
-            comptime if full_b:
-                b = b_ptr.unsafe_load[width=w, alignment=in_align](i)
-            else:
-                b = SIMD[dt, w](b_ptr[unsafe_offset=0] if dev_b else vb)
-        var c = SIMD[dt, w](0)
-        comptime if arity >= 3:
-            comptime if full_c:
-                c = c_ptr.unsafe_load[width=w, alignment=in_align](i)
-            else:
-                c = SIMD[dt, w](c_ptr[unsafe_offset=0] if dev_c else vc)
-        out_ptr.unsafe_store[width=w, alignment=out_align](
-            i,
-            pointwise[kind, dt, odt, w](
-                a, b, c, SIMD[param_dtype[dt](), 4](p0, p1, p2, p3)
-            ),
+        @always_inline
+        @__parameter
+        @__copy_capture(
+            out_ptr,
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            dev_a,
+            dev_b,
+            dev_c,
+            ba,
+            bb,
+            bc,
+            p0,
+            p1,
+            p2,
+            p3,
         )
+        def func[w: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            # `ua`: full operands off the vector grid, loaded element-aligned.
+            comptime in_align = size_of[dt]() if ua else min(
+                16, w * size_of[dt]()
+            )
+            comptime out_align = min(16, w * size_of[odt]())
+            var a: SIMD[dt, w]
+            comptime if full_a:
+                a = a_ptr.unsafe_load[width=w, alignment=in_align](i)
+            else:
+                a = _splat[dt, w](a_ptr, dev_a, ba)
+            var b = SIMD[dt, w](0)
+            comptime if arity >= 2:
+                comptime if full_b:
+                    b = b_ptr.unsafe_load[width=w, alignment=in_align](i)
+                else:
+                    b = _splat[dt, w](b_ptr, dev_b, bb)
+            var c = SIMD[dt, w](0)
+            comptime if arity >= 3:
+                comptime if full_c:
+                    c = c_ptr.unsafe_load[width=w, alignment=in_align](i)
+                else:
+                    c = _splat[dt, w](c_ptr, dev_c, bc)
+            out_ptr.unsafe_store[width=w, alignment=out_align](
+                i,
+                pointwise[kind, dt, odt, w](
+                    a,
+                    b,
+                    c,
+                    SIMD[param_dtype[dt](), 4](p0, p1, p2, p3),
+                    scalar_a=not full_a and not dev_a,
+                ),
+            )
 
-    elementwise[
-        func,
-        simd_width=width,
-        target="gpu",
-        _trace_description=kind,
-        _heavy=_heavy_kind[kind](),
-    ](Coord(numel), ctx)
+        elementwise[
+            func,
+            simd_width=width,
+            target="gpu",
+            _trace_description=kind,
+            _heavy=_heavy_kind[kind](),
+        ](Coord(numel), ctx)
+    else:
+
+        @always_inline
+        @__parameter
+        @__copy_capture(
+            out_ptr,
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            dev_a,
+            dev_b,
+            dev_c,
+            va,
+            vb,
+            vc,
+            p0,
+            p1,
+            p2,
+            p3,
+        )
+        def func_o[w: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            # `ua`: full operands off the vector grid, loaded element-aligned.
+            comptime in_align = size_of[dt]() if ua else min(
+                16, w * size_of[dt]()
+            )
+            comptime out_align = min(16, w * size_of[odt]())
+            var a: SIMD[dt, w]
+            comptime if full_a:
+                a = a_ptr.unsafe_load[width=w, alignment=in_align](i)
+            else:
+                a = SIMD[dt, w](a_ptr[unsafe_offset=0] if dev_a else va)
+            var b = SIMD[dt, w](0)
+            comptime if arity >= 2:
+                comptime if full_b:
+                    b = b_ptr.unsafe_load[width=w, alignment=in_align](i)
+                else:
+                    b = SIMD[dt, w](b_ptr[unsafe_offset=0] if dev_b else vb)
+            var c = SIMD[dt, w](0)
+            comptime if arity >= 3:
+                comptime if full_c:
+                    c = c_ptr.unsafe_load[width=w, alignment=in_align](i)
+                else:
+                    c = SIMD[dt, w](c_ptr[unsafe_offset=0] if dev_c else vc)
+            out_ptr.unsafe_store[width=w, alignment=out_align](
+                i,
+                pointwise[kind, dt, odt, w](
+                    a, b, c, SIMD[param_dtype[dt](), 4](p0, p1, p2, p3)
+                ),
+            )
+
+        elementwise[
+            func_o,
+            simd_width=width,
+            target="gpu",
+            _trace_description=kind,
+            _heavy=_heavy_kind[kind](),
+        ](Coord(numel), ctx)
 
 
 @always_inline
@@ -513,6 +634,12 @@ def _pointwise_go[kind: StaticString, arity: Int](argv: Argv, argc: Int) raises:
                             # MPS's kernels take these as scalar_t.
                             pd = pd.cast[dt]().cast[DType.float64]()
                         var params = pd.cast[pdt]()
+                        comptime if pdt == DType.float32:
+                            # The host's conversion may flush subnormals.
+                            comptime for k in range(4):
+                                params[k] = rebind[Scalar[pdt]](
+                                    bitcast[DType.float32](f32_bits_of(pd[k]))
+                                )
                         comptime if dt.is_integral():
                             # Integer parameters travel as the int64's bits
                             # (`_int_exact_param`): exact past 2**53.
