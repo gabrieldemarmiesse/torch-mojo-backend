@@ -1966,7 +1966,9 @@ def test_clamp_scalar_bound_overflow(mojo_device, dtype):
     """A finite Scalar bound past the result dtype's range raises as c10's
     checked conversion does, even on an empty tensor; inf and NaN bounds
     are fine, and a NaN fill never converts the other bound."""
-    big = {torch.float16: 70000.0, torch.bfloat16: 1e39, torch.float32: 1e40}[dtype]
+    # CUDA converts the bound to opmath float (ClampLimits), so a half bound
+    # of 70000 is fine there; past float32 it raises
+    big = {torch.float16: 1e39, torch.bfloat16: 1e39, torch.float32: 1e40}[dtype]
     x_cpu = torch.tensor([1.0, -2.0, 3.0], dtype=dtype)
     x = x_cpu.to(mojo_device)
     raising = [

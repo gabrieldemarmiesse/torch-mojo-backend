@@ -4187,21 +4187,30 @@ def _pw_isclose_composite(args: Values, rets: Values) raises:
         raise Error(
             "atol must be greater than or equal to zero, but got ", atol
         )
-    var close = _pw_call1("aten::eq", "Tensor", [av.copy(), bv.copy()])
+    var eq0 = _pw_call1("aten::eq", "Tensor", [av.copy(), bv.copy()])
+    var nan_close = Optional[Owned]()
     if equal_nan and is_complex_stype(st):
         var na = _pw_call1("aten::isnan", "", [av.copy()])
         var nb = _pw_call1("aten::isnan", "", [bv.copy()])
         var both = _pw_call1(
             "aten::logical_and", "", [tensor_arg(na.t), tensor_arg(nb.t)]
         )
-        close = _pw_call1(
-            "aten::logical_or", "", [tensor_arg(close.t), tensor_arg(both.t)]
+        nan_close = _pw_call1(
+            "aten::logical_or", "", [tensor_arg(eq0.t), tensor_arg(both.t)]
         )
         _ = na^  # alive past the calls: the argument records only borrow
         _ = nb^
         _ = both^
+    var close_v = tensor_arg(nan_close.value().t) if nan_close else tensor_arg(
+        eq0.t
+    )
     if rtol == 0 and atol == 0:
-        ret_owned(rets, 0, close)
+        if nan_close:
+            var only = nan_close.take()
+            ret_owned(rets, 0, only)
+            _ = eq0^
+        else:
+            ret_owned(rets, 0, eq0)
         return
     var other = Optional[Owned]()
     var other_v = bv.copy()
@@ -4252,7 +4261,7 @@ def _pw_isclose_composite(args: Values, rets: Values) raises:
         "aten::logical_and", "", [tensor_arg(fin.t), tensor_arg(within.t)]
     )
     var res = _pw_call1(
-        "aten::logical_or", "", [tensor_arg(close.t), tensor_arg(ok.t)]
+        "aten::logical_or", "", [close_v.copy(), tensor_arg(ok.t)]
     )
     _ = scaled^  # alive past the calls: the argument records only borrow
     _ = mag^
@@ -4262,7 +4271,8 @@ def _pw_isclose_composite(args: Values, rets: Values) raises:
     _ = fin^
     _ = within^
     _ = ok^
-    _ = close^
+    _ = eq0^
+    _ = nan_close^
     ret_owned(rets, 0, res)
     _ = other^
     _ = selfc^
