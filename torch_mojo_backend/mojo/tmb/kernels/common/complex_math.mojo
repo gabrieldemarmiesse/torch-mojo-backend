@@ -32,18 +32,26 @@ from std.utils.numerics import inf, isinf, isnan, nan
 
 from std.sys.info import is_nvidia_gpu
 
+from std.sys._assembly import inlined_assembly
+
 from tmb.kernels.common.cuda_math import (
+    cuda_acosf,
     cuda_atan2f,
+    nv_asinf,
     nv_coshf,
     nv_cosf,
     nv_sinf,
     nv_sinhf,
 )
 from tmb.kernels.common.libdevice_port import (
+    nv_acos,
+    nv_asin,
     nv_atan2,
     nv_cosh,
     nv_sincos,
     nv_sinh,
+    nv_tan,
+    nv_tanf,
 )
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pointwise_math import (
@@ -151,10 +159,52 @@ def _rsin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def chypot[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
-    """`abs(a + bi)`: thrust's `abs` is `hypot(re, im)`, and this is the
-    device's torch.hypot."""
+    """`abs(a + bi)` = hypot(re, im), the device's torch.hypot, except for a
+    NaN on NVIDIA, which follows libdevice's `__nv_hypot(f)`: its |.| are
+    adds with an |x| operand (a float NaN becomes 0x7FFFFFFF, a double one
+    is quieted, its sign kept) and the bitwise smaller magnitude wins when it
+    is not finite (hypot(inf, NaN) = inf)."""
     var z = Scalar[dt](0)
-    return pointwise["hypot", dt, dt, 1](a, b, z, SIMD[param_dtype[dt](), 4](0))
+    var r = pointwise["hypot", dt, dt, 1](
+        a, b, z, SIMD[param_dtype[dt](), 4](0)
+    )
+    comptime if is_nvidia_gpu():
+        if isnan(a) or isnan(b):
+            comptime if dt == DType.float64:
+                var ua = _habs_bits(a)
+                var ub = _habs_bits(b)
+                var mn = min(ua, ub)
+                if mn >= 0x7FF0000000000000:
+                    return bitcast[dt](mn)
+                return bitcast[dt](max(ua, ub))
+            else:
+                if isinf(a) or isinf(b):
+                    return _inf[dt]()
+                return bitcast[DType.float32](UInt32(0x7FFFFFFF)).cast[dt]()
+    return r
+
+
+@always_inline
+def _habs_bits[dt: DType](x: Scalar[dt]) -> UInt64:
+    """The bits of a float64 |x| as an add with an |x| operand makes them."""
+    var b = bitcast[DType.uint64](x.cast[DType.float64]())
+    if (b & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000:
+        return b | 0x0008000000000000
+    return b & 0x7FFFFFFFFFFFFFFF
+
+
+@always_inline
+def catan2_nvcc[dt: DType](y: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
+    """atan2 as nvcc's math library returns it in the gpu_kernel complex ops
+    (log1p, thrust's catrig): a float64 NaN comes out positive."""
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        return rebind[Scalar[dt]](
+            nv_atan2[keep_nan_sign=False](
+                rebind[Float64](y), rebind[Float64](x)
+            )
+        )
+    else:
+        return catan2(y, x)
 
 
 @always_inline
@@ -529,8 +579,8 @@ def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
     if isnan(x) and isnan(y):
         if _is_zero(denom) and (not isnan(a) or not isnan(b)):
             var s = _copysign(_inf[dt](), c)
-            x = s * a
-            y = s * b
+            x = _hmul(s, a)
+            y = _hmul(s, b)
         elif (
             (isinf(a) or isinf(b))
             and not (isinf(c) or isnan(c))
@@ -538,8 +588,8 @@ def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
         ):
             a = _unit_sign(a)
             b = _unit_sign(b)
-            x = _inf[dt]() * (a * c + b * d)
-            y = _inf[dt]() * (b * c - a * d)
+            x = _hmul(_inf[dt](), a * c + b * d)
+            y = _hmul(_inf[dt](), b * c - a * d)
         elif (
             isinf(logbw)
             and not _signbit(logbw)
@@ -548,8 +598,8 @@ def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
         ):
             c = _unit_sign(c)
             d = _unit_sign(d)
-            x = Scalar[dt](0) * (a * c + b * d)
-            y = Scalar[dt](0) * (b * c - a * d)
+            x = _hmul(Scalar[dt](0), a * c + b * d)
+            y = _hmul(Scalar[dt](0), b * c - a * d)
     return Cx[dt](x, y)
 
 
@@ -569,7 +619,7 @@ def cexp_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
                 i = _jnan[dt]()
             return Cx[dt](z.re, i)
     var e = _rexp(z.re)
-    return Cx[dt](e * _rcos(i), e * _rsin(i))
+    return Cx[dt](_hmul(e, _rcos(i)), _hmul(e, _rsin(i)))
 
 
 @always_inline
@@ -691,12 +741,18 @@ def neg_like_cuda[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def _jabs[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """fabs as CUDA's SASS computes it, an add with an |x| operand: a float
+    NaN comes out 0x7FFFFFFF, a double one quieted with its sign kept."""
     comptime if dt == DType.float64:
-        return bitcast[dt](bitcast[DType.uint64](x) & 0x7FFFFFFFFFFFFFFF)
+        var b = bitcast[DType.uint64](x)
+        if (b & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000:
+            return bitcast[dt](b | 0x0008000000000000)
+        return bitcast[dt](b & 0x7FFFFFFFFFFFFFFF)
     else:
-        return bitcast[dt](
-            bitcast[DType.uint32](x.cast[DType.float32]()) & 0x7FFFFFFF
-        ).cast[dt]()
+        var b = bitcast[DType.uint32](x.cast[DType.float32]())
+        if (b & 0x7FFFFFFF) > 0x7F800000:
+            return bitcast[DType.float32](UInt32(0x7FFFFFFF)).cast[dt]()
+        return bitcast[DType.float32](b & 0x7FFFFFFF).cast[dt]()
 
 
 @always_inline
@@ -719,15 +775,6 @@ def _nv_cosh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
         return rebind[Scalar[dt]](nv_cosh(rebind[Float64](x)))
     else:
         return rebind[Scalar[dt]](nv_coshf(rebind[Float32](x)))
-
-
-@always_inline
-def _jsqr_plus[dt: DType](z: Cx[dt], c: Scalar[dt]) -> Cx[dt]:
-    """__sqr(z) + c: ((re - im)(re + im) + c, 2 re im), the product and the
-    add contracted into one fma, as NVRTC compiles it."""
-    return Cx[dt](
-        (z.re - z.im).fma(z.re + z.im, c), (Scalar[dt](2) * z.re) * z.im
-    )
 
 
 @always_inline
@@ -755,31 +802,6 @@ def ccosh_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
-def ctanh_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    if isinf(z.re):
-        if not _isfin(z.im):
-            return Cx[dt](_copysign(Scalar[dt](1), z.re), Scalar[dt](0))
-        return Cx[dt](
-            _copysign(Scalar[dt](1), z.re),
-            _copysign(Scalar[dt](0), _rsin(Scalar[dt](2) * z.im)),
-        )
-    if isnan(z.re) and _is_zero(z.im):
-        return z.copy()
-    var r2 = Scalar[dt](2) * z.re
-    var i2 = Scalar[dt](2) * z.im
-    var d = _nv_cosh(r2) + _rcos(i2)
-    var rsh = _nv_sinh(r2)
-    if isinf(rsh) and isinf(d):
-        return Cx[dt](
-            Scalar[dt](-1) if _signbit(rsh) else Scalar[dt](1),
-            Scalar[dt](0) if (
-                not isnan(i2) and not _signbit(i2) and not _is_zero(i2)
-            ) else neg_like_cuda(Scalar[dt](0)),
-        )
-    return Cx[dt](rsh / d, _rsin(i2) / d)
-
-
-@always_inline
 def _rot_in[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """complex(-im, re): i z."""
     return Cx[dt](neg_like_cuda(z.im), z.re)
@@ -799,61 +821,6 @@ def csin_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
 @always_inline
 def ccos_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
     return ccosh_jit(_rot_in(z))
-
-
-@always_inline
-def ctan_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    return _rot_out(ctanh_jit(_rot_in(z)))
-
-
-@always_inline
-def casinh_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    var pi = _jpi[dt]()
-    if isinf(z.re):
-        if isnan(z.im):
-            return z.copy()
-        if isinf(z.im):
-            return Cx[dt](z.re, _copysign(pi * Scalar[dt](0.25), z.im))
-        return Cx[dt](z.re, _copysign(Scalar[dt](0), z.im))
-    if isnan(z.re):
-        if isinf(z.im):
-            return Cx[dt](z.im, z.re)
-        if _is_zero(z.im):
-            return z.copy()
-        return Cx[dt](z.re, z.re)
-    if isinf(z.im):
-        return Cx[dt](
-            _copysign(z.im, z.re), _copysign(pi / Scalar[dt](2), z.im)
-        )
-    var s = csqrt_jit(_jsqr_plus(z, Scalar[dt](1)))
-    var w = clog_jit(Cx[dt](z.re + s.re, z.im + s.im))
-    return Cx[dt](_copysign(w.re, z.re), _copysign(w.im, z.im))
-
-
-@always_inline
-def cacosh_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    var pi = _jpi[dt]()
-    if isinf(z.re):
-        if isnan(z.im):
-            return Cx[dt](_jabs(z.re), z.im)
-        if isinf(z.im):
-            if not _signbit(z.re):
-                return Cx[dt](z.re, _copysign(pi * Scalar[dt](0.25), z.im))
-            return Cx[dt](
-                neg_like_cuda(z.re), _copysign(pi * Scalar[dt](0.75), z.im)
-            )
-        if _signbit(z.re):
-            return Cx[dt](neg_like_cuda(z.re), _copysign(pi, z.im))
-        return Cx[dt](z.re, _copysign(Scalar[dt](0), z.im))
-    if isnan(z.re):
-        if isinf(z.im):
-            return Cx[dt](_jabs(z.im), z.re)
-        return Cx[dt](z.re, z.re)
-    if isinf(z.im):
-        return Cx[dt](_jabs(z.im), _copysign(pi / Scalar[dt](2), z.im))
-    var s = csqrt_jit(_jsqr_plus(z, Scalar[dt](-1)))
-    var w = clog_jit(Cx[dt](z.re + s.re, z.im + s.im))
-    return Cx[dt](_copysign(w.re, Scalar[dt](0)), _copysign(w.im, z.im))
 
 
 @always_inline
@@ -889,43 +856,10 @@ def catanh_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
-def casin_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    return _rot_out(casinh_jit(_rot_in(z)))
-
-
-@always_inline
 def catan_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    return _rot_out(catanh_jit(_rot_in(z)))
-
-
-@always_inline
-def cacos_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
-    var pi = _jpi[dt]()
-    if isinf(z.re):
-        if isnan(z.im):
-            return Cx[dt](z.im, z.re)
-        if isinf(z.im):
-            if _signbit(z.re):
-                return Cx[dt](Scalar[dt](0.75) * pi, neg_like_cuda(z.im))
-            return Cx[dt](Scalar[dt](0.25) * pi, neg_like_cuda(z.im))
-        if _signbit(z.re):
-            return Cx[dt](pi, neg_like_cuda(z.re) if _signbit(z.im) else z.re)
-        return Cx[dt](
-            Scalar[dt](0), z.re if _signbit(z.im) else neg_like_cuda(z.re)
-        )
-    if isnan(z.re):
-        if isinf(z.im):
-            return Cx[dt](z.re, neg_like_cuda(z.im))
-        return Cx[dt](z.re, z.re)
-    if isinf(z.im):
-        return Cx[dt](pi / Scalar[dt](2), neg_like_cuda(z.im))
-    if _is_zero(z.re) and (_is_zero(z.im) or isnan(z.im)):
-        return Cx[dt](pi / Scalar[dt](2), neg_like_cuda(z.im))
-    var s = csqrt_jit(_jsqr_plus(z, Scalar[dt](-1)))
-    var w = clog_jit(Cx[dt](z.re + s.re, z.im + s.im))
-    if _signbit(z.im):
-        return Cx[dt](_jabs(w.im), _jabs(w.re))
-    return Cx[dt](_jabs(w.im), neg_like_cuda(_jabs(w.re)))
+    # the -imag of the rotation is an arithmetic negation in stock torch's
+    # kernel (a float NaN comes out canonical)
+    return _rot_out(catanh_jit(Cx[dt](_hsub(_flipz[dt](), z.im), z.re)))
 
 
 @always_inline
@@ -949,8 +883,8 @@ def cexpm1_c10[dt: DType](z: Cx[dt]) -> Cx[dt]:
     2 sin(y / 2)^2) + i e^x sin(y), the subtraction fused into the product
     as stock torch's SASS has it."""
     var a = _rsin(z.im * Scalar[dt](0.5))
-    var er = _expm1[dt, 1](z.re).fma(_rcos(z.im), (a * Scalar[dt](-2)) * a)
-    return Cx[dt](er, _rexp(z.re) * _rsin(z.im))
+    var er = _hfma(_expm1[dt, 1](z.re), _rcos(z.im), (a * Scalar[dt](-2)) * a)
+    return Cx[dt](er, _hmul(_rexp(z.re), _rsin(z.im)))
 
 
 @always_inline
@@ -961,10 +895,417 @@ def clog1p_c10[dt: DType](z: Cx[dt]) -> Cx[dt]:
     var x = z.re
     var y = z.im
     var zabs = chypot(x, y)
-    var theta = catan2(y, x + Scalar[dt](1))
+    var theta = catan2_nvcc(y, x + Scalar[dt](1))
     if not isnan(zabs) and zabs < Scalar[dt](0.5):
         var r = y.fma(y, x * (Scalar[dt](2) + x))
         if _is_zero(r):
             return Cx[dt](x, theta)
         return Cx[dt](Scalar[dt](0.5) * _rlog1p(r), theta)
     return Cx[dt](_rlog(chypot(x + Scalar[dt](1), y)), theta)
+
+
+# --------------------------------------------------------------------------- #
+# thrust's ctanh / ctan and catrig (casinh, casin, cacos, cacosh): what
+# stock torch's complex tanh / tan / asinh / asin / acos / acosh run (their
+# jiterated kernels are disabled for accuracy, so these are gpu_kernels over
+# c10_complex_math, which forwards to thrust; FreeBSD msun's s_ctanh.c and
+# catrig.c), with the fused multiply-adds nvcc forms.
+#
+# Third-party code (full notices and licence texts: THIRD_PARTY_NOTICES.txt):
+#   Copyright (c) 2011 David Schultz (ctanh); Copyright (c) 2012 Stephen
+#   Montgomery-Smith (catrig). SPDX-License-Identifier: BSD-2-Clause
+#   Copyright 2008-2021 NVIDIA Corporation. SPDX-License-Identifier: Apache-2.0
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _hadd[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """a + b as one hardware add (NaN propagation included), opaque to the
+    fast-math folds of `x + 0` / `x - x`."""
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "add.rn.f64 $0, $1, $2;",
+                Float64,
+                constraints="=d,d,d",
+                has_side_effect=False,
+            ](rebind[Float64](a), rebind[Float64](b))
+        )
+    elif is_nvidia_gpu() and dt == DType.float32:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "add.rn.f32 $0, $1, $2;",
+                Float32,
+                constraints="=f,f,f",
+                has_side_effect=False,
+            ](rebind[Float32](a), rebind[Float32](b))
+        )
+    else:
+        return a + b
+
+
+@always_inline
+def _flipz[dt: DType]() -> Scalar[dt]:
+    """-0.0, built from the bits (a literal may fold to +0.0)."""
+    return neg_like_cuda(Scalar[dt](0))
+
+
+@always_inline
+def _hfma[dt: DType](a: Scalar[dt], b: Scalar[dt], c: Scalar[dt]) -> Scalar[dt]:
+    """fma(a, b, c) with its operand order kept (which NaN propagates)."""
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "fma.rn.f64 $0, $1, $2, $3;",
+                Float64,
+                constraints="=d,d,d,d",
+                has_side_effect=False,
+            ](rebind[Float64](a), rebind[Float64](b), rebind[Float64](c))
+        )
+    else:
+        return a.fma(b, c)
+
+
+@always_inline
+def _hsub[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "sub.rn.f64 $0, $1, $2;",
+                Float64,
+                constraints="=d,d,d",
+                has_side_effect=False,
+            ](rebind[Float64](a), rebind[Float64](b))
+        )
+    elif is_nvidia_gpu() and dt == DType.float32:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "sub.rn.f32 $0, $1, $2;",
+                Float32,
+                constraints="=f,f,f",
+                has_side_effect=False,
+            ](rebind[Float32](a), rebind[Float32](b))
+        )
+    else:
+        return a - b
+
+
+@always_inline
+def _hmul[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "mul.rn.f64 $0, $1, $2;",
+                Float64,
+                constraints="=d,d,d",
+                has_side_effect=False,
+            ](rebind[Float64](a), rebind[Float64](b))
+        )
+    elif is_nvidia_gpu() and dt == DType.float32:
+        return rebind[Scalar[dt]](
+            inlined_assembly[
+                "mul.rn.f32 $0, $1, $2;",
+                Float32,
+                constraints="=f,f,f",
+                has_side_effect=False,
+            ](rebind[Float32](a), rebind[Float32](b))
+        )
+    else:
+        return a * b
+
+
+@always_inline
+def _rtan[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float64:
+        return rebind[Scalar[dt]](nv_tan(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_tanf(rebind[Float32](x)))
+
+
+@always_inline
+def _rasin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float64:
+        return rebind[Scalar[dt]](nv_asin(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_asinf(rebind[Float32](x)))
+
+
+@always_inline
+def _racos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float64:
+        return rebind[Scalar[dt]](nv_acos(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](cuda_acosf(rebind[Float32](x)))
+
+
+@always_inline
+def _absbits[dt: DType](x: Scalar[dt]) -> UInt64:
+    comptime if dt == DType.float64:
+        return bitcast[DType.uint64](x) & 0x7FFFFFFFFFFFFFFF
+    else:
+        return UInt64(
+            bitcast[DType.uint32](x.cast[DType.float32]()) & 0x7FFFFFFF
+        )
+
+
+@always_inline
+def _lt[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Bool:
+    """a < b, false for a NaN (spelled with an isnan the fast-math build
+    keeps)."""
+    return not isnan(a) and not isnan(b) and a < b
+
+
+@always_inline
+def ctanh_thrust[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    var x = z.re
+    var y = z.im
+    comptime f64 = dt == DType.float64
+    var ix = _absbits(x)
+    comptime INF_BITS = UInt64(0x7FF0000000000000) if f64 else UInt64(
+        0x7F800000
+    )
+    if ix >= INF_BITS:
+        if ix != INF_BITS:  # x is NaN
+            return Cx[dt](x, y if _is_zero(y) else _hmul(x, y))
+        var one = _copysign(Scalar[dt](1), x)
+        var t = y if isinf(y) else _hmul(_rsin(y), _rcos(y))
+        return Cx[dt](one, _copysign(Scalar[dt](0), t))
+    if isinf(y) or isnan(y):
+        var d = _hsub(y, y)
+        return Cx[dt](d, d)
+    comptime BIG = UInt64(0x4036000000000000) if f64 else UInt64(0x41300000)
+    if ix >= BIG:  # |x| >= 22 (float: 11)
+        var exp_mx = _rexp(-_jabs(x))
+        return Cx[dt](
+            _copysign(Scalar[dt](1), x),
+            Scalar[dt](4) * _rsin(y) * _rcos(y) * exp_mx * exp_mx,
+        )
+    var t = _rtan(y)
+    var beta = t.fma(t, Scalar[dt](1))
+    var s = _nv_sinh(x)
+    var rho = ieee_sqrt(s.fma(s, Scalar[dt](1)))
+    var denom = s.fma(beta * s, Scalar[dt](1))
+    return Cx[dt]((beta * rho) * s / denom, t / denom)
+
+
+@always_inline
+def ctan_thrust[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    var w = ctanh_thrust(Cx[dt](neg_like_cuda(z.im), z.re))
+    return Cx[dt](w.im, neg_like_cuda(w.re))
+
+
+@always_inline
+def _cat_f[
+    dt: DType
+](a: Scalar[dt], b: Scalar[dt], h: Scalar[dt]) -> Scalar[dt]:
+    if _lt(b, Scalar[dt](0)):
+        return (h - b) / Scalar[dt](2)
+    if b == Scalar[dt](0):
+        return a / Scalar[dt](2)
+    return a * a / (h + b) / Scalar[dt](2)
+
+
+@always_inline
+def _eps[dt: DType]() -> Scalar[dt]:
+    comptime if dt == DType.float64:
+        return Scalar[dt](2.220446049250313e-16)
+    else:
+        return Scalar[dt](1.1920928955078125e-07)
+
+
+@fieldwise_init
+struct _HardWork[dt: DType](Copyable, Movable):
+    var rx: Scalar[Self.dt]
+    var b_usable: Bool
+    var b: Scalar[Self.dt]
+    var sqrt_a2my2: Scalar[Self.dt]
+    var new_y: Scalar[Self.dt]
+
+
+@always_inline
+def _do_hard_work[dt: DType](x: Scalar[dt], y: Scalar[dt]) -> _HardWork[dt]:
+    """catrig's do_hard_work (Hull et al.), x, y >= 0 finite."""
+    comptime f64 = dt == DType.float64
+    var eps = _eps[dt]()
+    var four_sqrt_min = Scalar[dt](
+        5.966672584960165394632772e-154 if f64 else 4.336808689942017736029811e-19
+    )
+    var one = Scalar[dt](1)
+    var r = chypot(x, y + one)
+    var s = chypot(x, y - one)
+    var a = (r + s) / Scalar[dt](2)
+    if _lt(a, one):
+        a = one
+    var rx: Scalar[dt]
+    if _lt(a, Scalar[dt](10)):
+        if y == one and _lt(x, eps * eps / Scalar[dt](128)):
+            rx = ieee_sqrt(x)
+        elif not _lt(x, eps * _jabs(y - one)):
+            var am1 = _cat_f(x, one + y, r) + _cat_f(x, one - y, s)
+            rx = _rlog1p(am1 + ieee_sqrt(am1 * (a + one)))
+        elif _lt(y, one):
+            rx = x / ieee_sqrt((one - y) * (one + y))
+        else:
+            rx = _rlog1p((y - one) + ieee_sqrt((y - one) * (y + one)))
+    else:
+        rx = _rlog(a + ieee_sqrt(a.fma(a, -one)))
+    var w = _HardWork[dt](rx, False, Scalar[dt](0), Scalar[dt](0), y)
+    if _lt(y, four_sqrt_min):
+        w.sqrt_a2my2 = a * (Scalar[dt](2) / eps)
+        w.new_y = y * (Scalar[dt](2) / eps)
+        return w^
+    w.b = y / a
+    w.b_usable = True
+    if not isnan(w.b) and w.b > Scalar[dt](0.6417):
+        w.b_usable = False
+        if y == one and _lt(x, eps / Scalar[dt](128)):
+            w.sqrt_a2my2 = ieee_sqrt(x) * ieee_sqrt((a + y) / Scalar[dt](2))
+        elif not _lt(x, eps * _jabs(y - one)):
+            var amy = _cat_f(x, y + one, r) + _cat_f(x, y - one, s)
+            w.sqrt_a2my2 = ieee_sqrt(amy * (a + y))
+        elif not isnan(y) and y > one:
+            var k = Scalar[dt](4) / eps / eps
+            w.sqrt_a2my2 = x * k * y / ieee_sqrt((y + one) * (y - one))
+            w.new_y = y * k
+        else:
+            w.sqrt_a2my2 = ieee_sqrt((one - y) * (one + y))
+    return w^
+
+
+@always_inline
+def _clog_large[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    """catrig's clog_for_large_values (thrust's double QUARTER_SQRT_MAX is
+    0x1p-509, not 0x1p509: kept)."""
+    comptime f64 = dt == DType.float64
+    var x = z.re
+    var y = z.im
+    var ax = _jabs(x)
+    var ay = _jabs(y)
+    if _lt(ax, ay):
+        var t = ax
+        ax = ay
+        ay = t
+    var half_max = Scalar[dt](
+        8.988465674311579e307 if f64 else 1.7014117331926443e38
+    )
+    var theta = catan2_nvcc(y, x)
+    if not isnan(ax) and ax > half_max:
+        var m_e = Scalar[dt](2.7182818284590452)
+        return Cx[dt](_rlog(chypot(x / m_e, y / m_e)) + Scalar[dt](1), theta)
+    var quarter_sqrt_max = Scalar[dt](
+        5.966672584960165394632772e-154 if f64 else 2.305843009213693952e18
+    )
+    var sqrt_min = Scalar[dt](
+        1.491668146240041348658193e-154 if f64 else 1.084202172485504434007453e-19
+    )
+    if (not isnan(ax) and ax > quarter_sqrt_max) or _lt(ay, sqrt_min):
+        return Cx[dt](_rlog(chypot(x, y)), theta)
+    return Cx[dt](_rlog(ax.fma(ax, ay * ay)) / Scalar[dt](2), theta)
+
+
+@always_inline
+def casinh_thrust[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    comptime f64 = dt == DType.float64
+    var x = z.re
+    var y = z.im
+    var ax = _jabs(x)
+    var ay = _jabs(y)
+    var zero = Scalar[dt](0)
+    if isnan(x) or isnan(y):
+        if isinf(x):
+            return Cx[dt](x, _hadd(y, y))
+        if isinf(y):
+            return Cx[dt](y, _hadd(x, x))
+        if _is_zero(y):
+            return Cx[dt](_hadd(x, x), y)
+        var n = _hadd(_hadd(x, zero), _hadd(y, zero))
+        return Cx[dt](n, n)
+    var recip_eps = Scalar[dt](1) / _eps[dt]()
+    var m_ln2 = Scalar[dt](6.9314718055994531e-1)
+    if ax > recip_eps or ay > recip_eps:
+        var w = _clog_large(
+            z.copy() if not _signbit(x) else Cx[dt](
+                neg_like_cuda(x), neg_like_cuda(y)
+            )
+        )
+        return Cx[dt](_copysign(w.re + m_ln2, x), _copysign(w.im, y))
+    if _is_zero(x) and _is_zero(y):
+        return z.copy()
+    var sqrt_6_eps = Scalar[dt](
+        3.6500241499888571e-8 if f64 else 8.4572793338e-4
+    )
+    if ax < sqrt_6_eps / Scalar[dt](4) and ay < sqrt_6_eps / Scalar[dt](4):
+        return z.copy()
+    var w = _do_hard_work(ax, ay)
+    var ry = _rasin(w.b) if w.b_usable else catan2_nvcc(w.new_y, w.sqrt_a2my2)
+    return Cx[dt](_copysign(w.rx, x), _copysign(ry, y))
+
+
+@always_inline
+def casin_thrust[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    var w = casinh_thrust(Cx[dt](z.im, z.re))
+    return Cx[dt](w.im, w.re)
+
+
+@always_inline
+def cacos_thrust[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    comptime f64 = dt == DType.float64
+    var x = z.re
+    var y = z.im
+    var sx = _signbit(x)
+    var sy = _signbit(y)
+    var ax = _jabs(x)
+    var ay = _jabs(y)
+    var zero = Scalar[dt](0)
+    var pio2_hi = Scalar[dt](1.5707963267948966)
+    var pio2_lo = Scalar[dt](6.1232339957367659e-17)
+    if isnan(x) or isnan(y):
+        if isinf(x):
+            return Cx[dt](_hadd(y, y), -_inf[dt]())
+        if isinf(y):
+            return Cx[dt](_hadd(x, x), neg_like_cuda(y))
+        if _is_zero(x):
+            return Cx[dt](_hadd(pio2_hi, pio2_lo), _hadd(y, y))
+        var n = _hadd(_hadd(x, zero), _hadd(y, zero))
+        return Cx[dt](n, n)
+    var recip_eps = Scalar[dt](1) / _eps[dt]()
+    var m_ln2 = Scalar[dt](6.9314718055994531e-1)
+    if ax > recip_eps or ay > recip_eps:
+        var w = _clog_large(z)
+        var ry = w.re + m_ln2
+        if not sy:
+            ry = neg_like_cuda(ry)
+        return Cx[dt](_jabs(w.im), ry)
+    if x == Scalar[dt](1) and _is_zero(y):
+        return Cx[dt](zero, neg_like_cuda(y))
+    var sqrt_6_eps = Scalar[dt](
+        3.6500241499888571e-8 if f64 else 8.4572793338e-4
+    )
+    if ax < sqrt_6_eps / Scalar[dt](4) and ay < sqrt_6_eps / Scalar[dt](4):
+        return Cx[dt](_hsub(pio2_hi, _hsub(x, pio2_lo)), neg_like_cuda(y))
+    var w = _do_hard_work(ay, ax)
+    var rx: Scalar[dt]
+    if w.b_usable:
+        rx = _racos(w.b if not sx else neg_like_cuda(w.b))
+    else:
+        rx = catan2_nvcc(
+            w.sqrt_a2my2, w.new_y if not sx else neg_like_cuda(w.new_y)
+        )
+    var ry = w.rx
+    if not sy:
+        ry = neg_like_cuda(ry)
+    return Cx[dt](rx, ry)
+
+
+@always_inline
+def cacosh_thrust[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    var w = cacos_thrust(z)
+    var rx = w.re
+    var ry = w.im
+    if isnan(rx) and isnan(ry):
+        return Cx[dt](ry, rx)
+    if isnan(rx):
+        return Cx[dt](_jabs(ry), rx)
+    if isnan(ry):
+        return Cx[dt](ry, ry)
+    return Cx[dt](_jabs(ry), _copysign(rx, z.im))

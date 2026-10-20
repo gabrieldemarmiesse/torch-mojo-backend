@@ -40,10 +40,10 @@ from std.utils.numerics import isinf, isnan
 
 from tmb.kernels.common.complex_math import (
     Cx,
-    cacos_jit,
-    cacosh_jit,
-    casin_jit,
-    casinh_jit,
+    cacos_thrust,
+    cacosh_thrust,
+    casin_thrust,
+    casinh_thrust,
     catan2,
     catan_jit,
     catanh_jit,
@@ -66,8 +66,8 @@ from tmb.kernels.common.complex_math import (
     csin_jit,
     csinh_jit,
     csqrt_jit,
-    ctan_jit,
-    ctanh_jit,
+    ctan_thrust,
+    ctanh_thrust,
     neg_like_cuda,
 )
 from tmb.kernels.common.gpu_elementwise import elementwise
@@ -150,23 +150,23 @@ def _unary_cx[kind: StaticString, dt: DType](z: Cx[dt]) -> Cx[dt]:
     elif kind == "cos":
         return ccos_jit(z)
     elif kind == "tan":
-        return ctan_jit(z)
+        return ctan_thrust(z)
     elif kind == "sinh":
         return csinh_jit(z)
     elif kind == "cosh":
         return ccosh_jit(z)
     elif kind == "tanh":
-        return ctanh_jit(z)
+        return ctanh_thrust(z)
     elif kind == "asin":
-        return casin_jit(z)
+        return casin_thrust(z)
     elif kind == "acos":
-        return cacos_jit(z)
+        return cacos_thrust(z)
     elif kind == "atan":
         return catan_jit(z)
     elif kind == "asinh":
-        return casinh_jit(z)
+        return casinh_thrust(z)
     elif kind == "acosh":
-        return cacosh_jit(z)
+        return cacosh_thrust(z)
     elif kind == "atanh":
         return catanh_jit(z)
     elif kind == "log10":

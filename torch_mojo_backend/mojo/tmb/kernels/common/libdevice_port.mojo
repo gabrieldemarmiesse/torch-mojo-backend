@@ -1587,7 +1587,7 @@ def nv_atanh(a: Float64) -> Float64:
 
 
 @always_inline
-def nv_atan2(a: Float64, b: Float64) -> Float64:
+def nv_atan2[keep_nan_sign: Bool = True](a: Float64, b: Float64) -> Float64:
     """`__nv_atan2(a, b)` = atan2(y = a, x = b): t = min / max of the
     magnitudes by IEEE division, `__nv_atan`'s polynomial, the quadrant from
     the larger magnitude and the sign of b, C99's zero and equal-magnitude
@@ -1635,7 +1635,13 @@ def nv_atan2(a: Float64, b: Float64) -> Float64:
         r = _dc(0x400921FB54442D18) if bneg else Float64(0.0)
     elif ub_x == ub_y:
         r = _dc(0x4002D97C7F3321D2) if bneg else _dc(0x3FE921FB54442D18)
-    var s = _add_rn_d(ax, ay)
-    if _is_nan_d(s):
-        return s
+    if _is_nan_d(a) or _is_nan_d(b):
+        # |b| + |a| as one add with |.| operands: the first NaN, quieted,
+        # its sign kept (libdevice in NVRTC) or cleared (nvcc's math
+        # library, keep_nan_sign=False).
+        var n = _ub(b) if _is_nan_d(b) else _ub(a)
+        n = n | UInt64(0x0008000000000000)
+        comptime if not keep_nan_sign:
+            n = n & UInt64(0x7FFFFFFFFFFFFFFF)
+        return _dc(n)
     return _copysign_d(r, a)
