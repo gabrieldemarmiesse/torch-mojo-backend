@@ -1194,13 +1194,15 @@ def _pow_exp[
             var sq = cast_rounded[dtype](x * x).cast[w]()
             return (1 / sq).cast[out_dtype]()
         if mode == POW_SQRT:
-            comptime if dtype == DType.float64:
+            comptime if dtype == DType.float64 and is_nvidia_gpu():
                 return cuda_sqrt(x).cast[out_dtype]()
             return elementwise_unary["sqrt"](x).cast[out_dtype]()
         if mode == POW_RSQRT:
-            return cuda_rsqrt(x).cast[out_dtype]()
+            comptime if is_nvidia_gpu():
+                return cuda_rsqrt(x).cast[out_dtype]()
+            return elementwise_unary["rsqrt"](x).cast[out_dtype]()
         if mode == POW_RECIPROCAL:
-            comptime if dtype == DType.float64:
+            comptime if dtype == DType.float64 and is_nvidia_gpu():
                 return cuda_reciprocal(x).cast[out_dtype]()
             return elementwise_unary["reciprocal"](x).cast[out_dtype]()
         comptime if dtype == DType.float64:
