@@ -166,8 +166,11 @@ def test_to_float8(mojo_device, src, dst):
 
 def _saturating_e4m3(device: str) -> bool:
     """Stock CUDA torch >= 2.12 (Copy.cu, #177870) converts float / half /
-    bfloat16 -> e4m3fn with the saturating sm_89+ intrinsic; CPU, ROCm, MPS
-    and older GPUs use c10's conversion, where an overflow is NaN."""
+    bfloat16 -> e4m3fn with the saturating sm_89+ intrinsic; CPU, ROCm, MPS,
+    older GPUs and older torch use c10's conversion, where an overflow is
+    NaN."""
+    if tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 12):
+        return False
     props = device_module.get_device_properties(device)
     if props.api != "cuda" or props.major is None or props.minor is None:
         return False
@@ -926,7 +929,7 @@ def test_scaled_grouped_mm_v2_out(mojo_device):
 
 def test_e4m3fn_saturation_matches_stock_cuda(mojo_device):
     """float32 [500, inf, -1e9, nan] -> e4m3fn: [448, 448, -448, nan] on an
-    sm_89+ NVIDIA GPU (stock torch 2.14), c10's [nan, nan, nan, nan]
+    sm_89+ NVIDIA GPU under torch >= 2.12, c10's [nan, nan, nan, nan]
     elsewhere; a float64 source is never saturated."""
     x = torch.tensor([500.0, float("inf"), -1e9, float("nan"), 3.0])
     got = x.to(mojo_device).to(torch.float8_e4m3fn).cpu().float()
