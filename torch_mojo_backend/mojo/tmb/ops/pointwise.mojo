@@ -3675,12 +3675,17 @@ def _bce_general(args: Values, rets: Values, out_v: Optional[Value]) raises:
             )
     else:
         loss = new_tensor(x.shape, x.rank, x.stype, x.device)
-    var ls = _squeeze_view(loss)
+    # Every view below is a handle of its own: wrapped in `Owned` so each is
+    # released when this function ends, on the raising paths too.
+    var ls_o = own(_squeeze_view(loss))
+    var xs_o = own(_squeeze_view(x))
+    var ts_o = own(_squeeze_view(t))
+    var ls = ls_o.t.copy()
     var res = _pw_run(
         "bce",
         3,
-        _b_tside(_squeeze_view(x)),
-        _b_tside(_squeeze_view(t)),
+        _b_tside(xs_o.t.copy()),
+        _b_tside(ts_o.t.copy()),
         _b_sside(Scal(1.0, 1, True, False)),
         x.stype,
         x.stype,
@@ -3700,11 +3705,15 @@ def _bce_general(args: Values, rets: Values, out_v: Optional[Value]) raises:
             flat[MAX_RANK - 1] = k
             var unit = IndexList[MAX_RANK](0)
             unit[MAX_RANK - 1] = 1
-            copy_strided_into(
-                view_strided(loss, flat, unit, 1, loss.offset),
-                view_strided(res.t, flat, unit, 1, res.t.offset),
-            )
+            var dst_o = own(view_strided(loss, flat, unit, 1, loss.offset))
+            var src_o = own(view_strided(res.t, flat, unit, 1, res.t.offset))
+            copy_strided_into(dst_o.t.copy(), src_o.t.copy())
+            _ = dst_o^
+            _ = src_o^
         release(res.t.h)
+    _ = ls_o^
+    _ = xs_o^
+    _ = ts_o^
     if not v_is_none(args[unsafe_offset=2]):
         _ = call_op(
             "aten::mul_",

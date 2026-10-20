@@ -898,3 +898,24 @@ def test_rrelu_train_matches_cuda(cuda_oracle: CudaOracle, dtype, inplace: bool)
         return op(xi, noise, 0.125, 1 / 3, True), noise
 
     cuda_oracle.assert_bitwise_equal_by_device(fn, seed=7)
+
+
+def test_bce_general_path_does_not_leak(mojo_gpu: str):
+    """Unreduced BCE with a [B, C] input and a broadcast [C] weight takes the
+    general path, which builds squeezed views of its operands and loss. Those
+    handles must be released: device memory is flat over repeated calls."""
+    g = torch.Generator().manual_seed(1)
+    x = torch.rand(8, 16, generator=g).to(mojo_gpu)
+    t = torch.rand(8, 16, generator=g).to(mojo_gpu)
+    w = torch.rand(16, generator=g).to(mojo_gpu)
+
+    def once() -> None:
+        A.binary_cross_entropy(x, t, w, 0)
+
+    once()
+    torch.accelerator.synchronize()
+    before = torch.accelerator.memory_allocated()
+    for _ in range(20):
+        once()
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_allocated() == before
