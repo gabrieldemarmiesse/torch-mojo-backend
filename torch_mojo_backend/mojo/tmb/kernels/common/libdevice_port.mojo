@@ -1196,3 +1196,446 @@ def nv_asinh(a: Float64) -> Float64:
     return _i2d(
         _lo(r), (_hi(r) & Int32(0x7FFFFFFF)) | (_hi(a) & Int32(-2147483648))
     )
+
+
+# --------------------------------------------------------------------------- #
+# float64 unary routines of CUDA 13's libdevice (the nvidia-nvvm 13.0 wheel)
+# that ATen's double kernels call: NVIDIA only (rsqrt / rcp.approx seeds),
+# each a translation of the `__nv_*` body with `__nvvm_reflect` = 0. Sums
+# whose rounding the algorithm relies on go through `_add_rn_d` (the GPU
+# build's fast-math flags may reassociate or contract plain ones), and every
+# NaN / infinity test is on the bits.
+# --------------------------------------------------------------------------- #
+
+
+comptime _D_MAGIC = Float64(from_bits=UInt64(0x4338000000000000))  # 1.5 * 2^52
+comptime _D_L2E = Float64(from_bits=UInt64(0x3FF71547652B82FE))
+comptime _D_LN2_HI = Float64(from_bits=UInt64(0x3FE62E42FEFA39EF))
+comptime _D_LN2_LO = Float64(from_bits=UInt64(0x3C7ABC9E3B39803F))
+
+
+@always_inline
+def _dc(bits: UInt64) -> Float64:
+    return Float64(from_bits=bits)
+
+
+@always_inline
+def _ub(x: Float64) -> UInt64:
+    return x.to_bits[DType.uint64]()
+
+
+@always_inline
+def _is_nan_d(x: Float64) -> Bool:
+    return (_ub(x) & UInt64(0x7FFFFFFFFFFFFFFF)) > UInt64(0x7FF0000000000000)
+
+
+@always_inline
+def _copysign_d(mag: Float64, sgn: Float64) -> Float64:
+    return _dc(
+        (_ub(mag) & UInt64(0x7FFFFFFFFFFFFFFF))
+        | (_ub(sgn) & UInt64(0x8000000000000000))
+    )
+
+
+@always_inline
+def _sub_rn_d(a: Float64, b: Float64) -> Float64:
+    """sub.rn.f64: libdevice's `add.rn(a, -b)` as nvcc assembles it, one
+    DADD with a negated operand (which keeps the sign of a NaN b)."""
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "sub.rn.f64 $0, $1, $2;",
+            Float64,
+            constraints="=d,d,d",
+            has_side_effect=False,
+        ](a, b)
+    else:
+        return a - b
+
+
+@always_inline
+def _mul_rn_d(a: Float64, b: Float64) -> Float64:
+    """mul.rn.f64, opaque to the optimizer (`x * 0` must stay a product)."""
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "mul.rn.f64 $0, $1, $2;",
+            Float64,
+            constraints="=d,d,d",
+            has_side_effect=False,
+        ](a, b)
+    else:
+        return a * b
+
+
+@always_inline
+def _rsqrt_approx_d(x: Float64) -> Float64:
+    """rsqrt.approx.f64 (llvm.nvvm.rsqrt.approx.d)."""
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "rsqrt.approx.f64 $0, $1;",
+            Float64,
+            constraints="=d,d",
+            has_side_effect=False,
+        ](x)
+    else:
+        return Float64(1.0) / llvm_intrinsic[
+            "llvm.sqrt", Float64, has_side_effect=False
+        ](x)
+
+
+@always_inline
+def _refined_sqrt_d(q: Float64) -> Float64:
+    """libdevice's inline double sqrt: rsqrt.approx.ftz, its half, then two
+    corrections of the root against q."""
+    var r = _rsqrt_approx_ftz_d(q)
+    var rh = _i2d(_lo(r), _hi(r) - Int32(1048576))
+    var s = q * r
+    var s1 = fma(fma(s, -s, q), rh, s)
+    var rh2 = fma(fma(r, -s1, Float64(1.0)), rh, rh)
+    return fma(fma(s1, -s1, q), rh2, s1)
+
+
+@always_inline
+def nv_rsqrt(a: Float64) -> Float64:
+    """`__nv_rsqrt`: rsqrt.approx.f64."""
+    return _rsqrt_approx_d(a)
+
+
+@always_inline
+def nv_log2(a: Float64) -> Float64:
+    """`__nv_log2`: `__nv_log`'s body times log2(e) as a double-double."""
+    var q = _log_core(a)
+    return fma(q, _D_L2E, q * _dc(0x3C7777D0FFDA0D24))
+
+
+@always_inline
+def nv_log10(a: Float64) -> Float64:
+    """`__nv_log10`: `__nv_log`'s body times log10(e) as a double-double."""
+    var q = _log_core(a)
+    return fma(q, _dc(0x3FDBCB7B1526E50E), q * _dc(0x3C695355BAAAFAD3))
+
+
+@always_inline
+def _exp_poly_d(r: Float64) -> Float64:
+    """`__nv_exp`'s polynomial: e^r for |r| <= ln(2) / 2."""
+    var p = fma(_dc(0x3E5ADE1569CE2BDF), r, _dc(0x3E928AF3FCA213EA))
+    p = fma(p, r, _dc(0x3EC71DEE62401315))
+    p = fma(p, r, _dc(0x3EFA01997C89EB71))
+    p = fma(p, r, _dc(0x3F2A01A014761F65))
+    p = fma(p, r, _dc(0x3F56C16C1852B7AF))
+    p = fma(p, r, _dc(0x3F81111111122322))
+    p = fma(p, r, _dc(0x3FA55555555502A1))
+    p = fma(p, r, _dc(0x3FC5555555555511))
+    p = fma(p, r, _dc(0x3FE000000000000B))
+    p = fma(p, r, Float64(1.0))
+    return fma(p, r, Float64(1.0))
+
+
+@always_inline
+def nv_exp2(a: Float64) -> Float64:
+    """`__nv_exp2`: 2^a = 2^j e^(f ln 2), j = rint(a), f = a - j."""
+    var t = _add_rn_d(a, _D_MAGIC)
+    var k = _add_rn_d(t, -_D_MAGIC)
+    var j = _lo(t)
+    var f = _add_rn_d(a, -k)
+    var p = _exp_poly_d(fma(f, _D_LN2_HI, f * _D_LN2_LO))
+    var ahi = _hi(a) & Int32(0x7FFFFFFF)
+    if ahi < Int32(0x408FF000):  # |a| < 1023
+        return _i2d(_lo(p), (j << Int32(20)) + _hi(p))
+    var z = Float64(0.0) if _hi(a) < Int32(0) else _F64_INF
+    if _is_nan_d(a):
+        z = a + a
+    if ahi < Int32(0x4090CC00):  # |a| < 1075: scale in two steps
+        var jh = (j + ((j >> Int32(31)) & Int32(1))) >> Int32(1)
+        var s1 = _i2d(_lo(p), _hi(p) + (jh << Int32(20)))
+        var s2 = _i2d(Int32(0), ((j - jh) << Int32(20)) + Int32(1072693248))
+        z = s1 * s2
+    return z
+
+
+@always_inline
+def nv_sinh(a: Float64) -> Float64:
+    """`__nv_sinh`: an odd polynomial below |a| = 1, else u + u / (2u + 1)
+    with u = expm1(|a|) / 2 (`__internal_expm1_scaled`), inf from
+    |a| >= 710.4758600739439; signed by `a`."""
+    var ahi = _hi(a) & Int32(0x7FFFFFFF)
+    var x = _i2d(_lo(a), ahi)
+    var z: Float64
+    if _u32(ahi) < UInt32(1072693248):
+        var x2 = x * x
+        var p = fma(_dc(0x3D6B4C75AB274C53), x2, _dc(0x3DE611A561D87DEF))
+        p = fma(p, x2, _dc(0x3E5AE64671B18F5C))
+        p = fma(p, x2, _dc(0x3EC71DE3A465B1E4))
+        p = fma(p, x2, _dc(0x3F2A01A01A02899D))
+        p = fma(p, x2, _dc(0x3F811111111110A6))
+        p = fma(p, x2, _dc(0x3FC5555555555556))
+        p = p * x2
+        z = fma(p, x, x)
+    else:
+        var t = fma(x, _D_L2E, _D_MAGIC)
+        var i = _lo(t) - Int32(1)
+        var k = _add_rn_d(t, -_D_MAGIC)
+        var r = fma(k, -_D_LN2_HI, x)
+        r = fma(k, -_D_LN2_LO, r)
+        var hi2 = _u32(ahi) << UInt32(1)
+        var small = hi2 < UInt32(2142496327)
+        var zz = x if small else r
+        if small:
+            i = Int32(0)
+        var q = fma(_dc(0x3E21F4076ACD15B6), zz, _dc(0x3E5AF86D8EBD13CD))
+        q = fma(q, zz, _dc(0x3E927E5092BA033D))
+        q = fma(q, zz, _dc(0x3EC71DDE6C5F9DA1))
+        q = fma(q, zz, _dc(0x3EFA01A018D034E6))
+        q = fma(q, zz, _dc(0x3F2A01A01B3B6940))
+        q = fma(q, zz, _dc(0x3F56C16C16C1B5DD))
+        q = fma(q, zz, _dc(0x3F8111111110F74D))
+        q = fma(q, zz, _dc(0x3FA555555555554D))
+        q = fma(q, zz, _dc(0x3FC5555555555557))
+        q = fma(q, zz, Float64(0.5))
+        q = q * zz
+        var e = fma(q, zz, zz)
+        var shi = (i << Int32(20)) + Int32(1072693248)
+        if i == Int32(1024):
+            shi = Int32(2145386496)
+        var s = _i2d(Int32(0), shi)
+        var u = fma(e, s, _add_rn_d(s, Float64(-0.5)))
+        if i == Int32(1024):
+            u = u + u
+        if hi2 == UInt32(0):
+            u = x
+        z = _add_rn_d(u, u / fma(Float64(2.0), u, Float64(1.0)))
+        var xb = _ub(x)
+        if xb >= UInt64(0x408633CE8FB9F87E) and xb <= UInt64(
+            0x7FF0000000000000
+        ):
+            z = _F64_INF
+    return _copysign_d(z, a)
+
+
+@always_inline
+def nv_cosh(a: Float64) -> Float64:
+    """`__nv_cosh`: 2 (E + 1 / (16 E)), E = e^|a| / 4, below |a| =
+    0x40862E4F..., else inf (NaN stays)."""
+    var ahi = _hi(a) & Int32(0x7FFFFFFF)
+    var x = _i2d(_lo(a), ahi)
+    var res: Float64
+    if _u32(ahi) < UInt32(1082536911):
+        var t = fma(x, _D_L2E, _D_MAGIC)
+        var j = _lo(t)
+        var k = _add_rn_d(t, -_D_MAGIC)
+        var r = fma(k, -_D_LN2_HI, x)
+        r = fma(k, -_D_LN2_LO, r)
+        var p = _exp_poly_d(r)
+        var e = _i2d(_lo(p), (j << Int32(20)) - Int32(2097152) + _hi(p))
+        var r0 = _rcp_approx_ftz_d(e)
+        var n = fma(-e, r0, Float64(1.0))
+        n = fma(n, n, n)
+        res = fma(fma(n, r0, r0), Float64(0.0625), e)
+    else:
+        res = a if _is_nan_d(a) else _F64_INF
+    return res + res
+
+
+@always_inline
+def nv_atan(a: Float64) -> Float64:
+    """`__nv_atan`: 1 / |a| (refined rcp.approx) above 1, an odd degree-39
+    polynomial, pi/2 - r for the reciprocal, signed by `a`."""
+    var x = _fabs_d(a)
+    var xb = _ub(x)
+    var big = xb > UInt64(0x3FF0000000000000) and xb <= UInt64(
+        0x7FF0000000000000
+    )
+    var t = x
+    if big:
+        var r0 = _rcp_approx_ftz_d(x)
+        var n = fma(-x, r0, Float64(1.0))
+        n = fma(n, n, n)
+        t = fma(n, r0, r0)
+        if xb == UInt64(0x7FF0000000000000):
+            t = Float64(0.0)
+    var t2 = t * t
+    var p = fma(_dc(0xBEF53E1D2A25FF7E), t2, _dc(0x3F2D3B63DBB65B49))
+    p = fma(p, t2, _dc(0xBF5312788DDE082E))
+    p = fma(p, t2, _dc(0x3F6F9690C8249315))
+    p = fma(p, t2, _dc(0xBF82CF5AABC7CF0D))
+    p = fma(p, t2, _dc(0x3F9162B0B2A3BFDE))
+    p = fma(p, t2, _dc(0xBF9A7256FEB6FC6B))
+    p = fma(p, t2, _dc(0x3FA171560CE4A489))
+    p = fma(p, t2, _dc(0xBFA4F44D841450E4))
+    p = fma(p, t2, _dc(0x3FA7EE3D3F36BB95))
+    p = fma(p, t2, _dc(0xBFAAD32AE04A9FD1))
+    p = fma(p, t2, _dc(0x3FAE17813D66954F))
+    p = fma(p, t2, _dc(0xBFB11089CA9A5BCD))
+    p = fma(p, t2, _dc(0x3FB3B12B2DB51738))
+    p = fma(p, t2, _dc(0xBFB745D022F8DC5C))
+    p = fma(p, t2, _dc(0x3FBC71C709DFE927))
+    p = fma(p, t2, _dc(0xBFC2492491FA1744))
+    p = fma(p, t2, _dc(0x3FC99999999840D2))
+    p = fma(p, t2, _dc(0xBFD555555555544C))
+    p = p * t2
+    var r = fma(p, t, t)
+    if big:
+        r = _sub_rn_d(_dc(0x3FF921FB54442D18), r)
+    return _copysign_d(r, a)
+
+
+@always_inline
+def _asin_poly_d(x2: Float64) -> Float64:
+    var p = fma(_dc(0x3FB0066BDC1895E9), x2, _dc(0xBFB3823B180754AF))
+    p = fma(p, x2, _dc(0x3FB11E52CC2F79AE))
+    p = fma(p, x2, _dc(0xBF924EAF3526861B))
+    p = fma(p, x2, _dc(0x3F91DF02A31E6CB7))
+    p = fma(p, x2, _dc(0x3F847D18B0EEC6CC))
+    p = fma(p, x2, _dc(0x3F8D0AF961BA53B0))
+    p = fma(p, x2, _dc(0x3F91BF7734CF1C48))
+    p = fma(p, x2, _dc(0x3F96E91483144EF7))
+    p = fma(p, x2, _dc(0x3F9F1C6E0A4F9F81))
+    p = fma(p, x2, _dc(0x3FA6DB6DC27FA92B))
+    p = fma(p, x2, _dc(0x3FB333333320F91B))
+    p = fma(p, x2, _dc(0x3FC5555555555F4D))
+    return p * x2
+
+
+@always_inline
+def nv_asin(a: Float64) -> Float64:
+    """`__nv_asin`: an odd polynomial below |a| = 0.575, else
+    pi/2 - 2 asin(sqrt((1 - |a|) / 2)), signed by `a`."""
+    if (_hi(a) & Int32(0x7FFFFFFF)) < Int32(0x3FE26666):
+        return fma(_asin_poly_d(a * a), a, a)
+    var q = fma(Float64(-0.5), _fabs_d(a), Float64(0.5))
+    var s = _refined_sqrt_d(q)
+    if _hi(q) < Int32(0):
+        s = _dc(0xFFF8000000000000)
+    if (_ub(q) & UInt64(0x7FFFFFFFFFFFFFFF)) == UInt64(0) or _is_nan_d(q):
+        s = q
+    var m = s * Float64(-2.0)
+    var c = fma(m, _asin_poly_d(q), _dc(0x3C91A62633145C07))
+    var v = _add_rn_d(m, _dc(0x3FE921FB54442D18))
+    v = _add_rn_d(v, c)
+    v = _add_rn_d(v, _dc(0x3FE921FB54442D18))
+    return _copysign_d(v, a)
+
+
+@always_inline
+def nv_acos(a: Float64) -> Float64:
+    """`__nv_acos`: pi/2 - asin(a) below |a| = 0.575, else
+    2 asin(sqrt((1 - |a|) / 2)) by its own polynomial, pi minus that for
+    negative a."""
+    var ahi = _hi(a)
+    var x = _fabs_d(a)
+    if _hi(x) < Int32(1071801958):
+        var r = fma(_asin_poly_d(x * x), x, x)
+        if ahi < Int32(0):
+            return _add_rn_d(
+                _dc(0x3FF921FB54442D18), _add_rn_d(r, _dc(0x3C91A62633145C07))
+            )
+        return _sub_rn_d(
+            _dc(0x3FF921FB54442D18), _add_rn_d(r, _dc(0xBC91A62633145C07))
+        )
+    var w = Float64(1.0) - x
+    var wh = _i2d(_lo(w), _hi(w) - Int32(1048576))
+    var s = _refined_sqrt_d(wh)
+    var s2 = _i2d(_lo(s), _hi(s) + Int32(1048576))
+    var p = fma(_dc(0x3EC715B371155F70), w, _dc(0xBEBAC2FE66FAAC4B))
+    p = fma(p, w, _dc(0x3ED9A9B88EFCD9B8))
+    p = fma(p, w, _dc(0x3EDD0F40A8A0C4C3))
+    p = fma(p, w, _dc(0x3EF46D4CFA9E0E1F))
+    p = fma(p, w, _dc(0x3F079C168D1E2422))
+    p = fma(p, w, _dc(0x3F1C9A88C3BCA540))
+    p = fma(p, w, _dc(0x3F31C4E64BD476DF))
+    p = fma(p, w, _dc(0x3F46E8BA60009C8F))
+    p = fma(p, w, _dc(0x3F5F1C71C62B05A2))
+    p = fma(p, w, _dc(0x3F76DB6DB6DC9F2C))
+    p = fma(p, w, _dc(0x3F9333333333329C))
+    p = fma(p, w, _dc(0x3FB5555555555555))
+    var hw = _hi(w)
+    var t = fma(p * w, s2, s2)
+    if hw < Int32(1):
+        t = _mul_rn_d(x, Float64(0.0))
+    if hw < Int32(0):
+        t = _mul_rn_d(t, _F64_INF)
+    if ahi < Int32(0):
+        t = _sub_rn_d(
+            _dc(0x400921FB54442D18), _add_rn_d(t, _dc(0xBCA1A62633145C07))
+        )
+    return t
+
+
+@always_inline
+def nv_acosh(a: Float64) -> Float64:
+    """`__nv_acosh`: log1p(d + sqrt(a^2 - 1)), d = a - 1; from d >= 2^52
+    (and for negative or NaN d) log1p(d - 1) + ln 2."""
+    var d = _add_rn_d(a, Float64(-1.0))
+    var dh = _hi(d)
+    var big = _u32(dh) > UInt32(1127219199)
+    var t = _refined_sqrt_d(fma(a, a, Float64(-1.0)))
+    if dh == Int32(0):
+        t = Float64(0.0)
+    if big:
+        t = _dc(0xBFF0000000000001)
+    var r = nv_log1p(_add_rn_d(d, t))
+    if big:
+        r = _add_rn_d(r, _D_LN2_HI)
+    return r
+
+
+@always_inline
+def nv_atanh(a: Float64) -> Float64:
+    """`__nv_atanh`: log1p(2 |a| / (1 - |a|)) / 2, signed by `a`."""
+    var x = _fabs_d(a)
+    var t = (x * Float64(2.0)) / (Float64(1.0) - x)
+    return _copysign_d(nv_log1p(t) * Float64(0.5), a)
+
+
+@always_inline
+def nv_atan2(a: Float64, b: Float64) -> Float64:
+    """`__nv_atan2(a, b)` = atan2(y = a, x = b): t = min / max of the
+    magnitudes by IEEE division, `__nv_atan`'s polynomial, the quadrant from
+    the larger magnitude and the sign of b, C99's zero and equal-magnitude
+    cases, NaN as |b| + |a|; signed by `a`."""
+    var ax = _fabs_d(b)
+    var ay = _fabs_d(a)
+    var ub_x = _ub(ax)
+    var ub_y = _ub(ay)
+    # `ay > ax`, ordered (NaN false), on the bits of two magnitudes
+    var swap = (
+        ub_y > ub_x
+        and ub_y <= UInt64(0x7FF0000000000000)
+        and ub_x <= UInt64(0x7FF0000000000000)
+    )
+    var mx = ay if swap else ax
+    var mn = ax if swap else ay
+    var t = mn / mx
+    var t2 = t * t
+    var p = fma(_dc(0xBEF53E1D2A25FF7E), t2, _dc(0x3F2D3B63DBB65B49))
+    p = fma(p, t2, _dc(0xBF5312788DDE082E))
+    p = fma(p, t2, _dc(0x3F6F9690C8249315))
+    p = fma(p, t2, _dc(0xBF82CF5AABC7CF0D))
+    p = fma(p, t2, _dc(0x3F9162B0B2A3BFDE))
+    p = fma(p, t2, _dc(0xBF9A7256FEB6FC6B))
+    p = fma(p, t2, _dc(0x3FA171560CE4A489))
+    p = fma(p, t2, _dc(0xBFA4F44D841450E4))
+    p = fma(p, t2, _dc(0x3FA7EE3D3F36BB95))
+    p = fma(p, t2, _dc(0xBFAAD32AE04A9FD1))
+    p = fma(p, t2, _dc(0x3FAE17813D66954F))
+    p = fma(p, t2, _dc(0xBFB11089CA9A5BCD))
+    p = fma(p, t2, _dc(0x3FB3B12B2DB51738))
+    p = fma(p, t2, _dc(0xBFB745D022F8DC5C))
+    p = fma(p, t2, _dc(0x3FBC71C709DFE927))
+    p = fma(p, t2, _dc(0xBFC2492491FA1744))
+    p = fma(p, t2, _dc(0x3FC99999999840D2))
+    p = fma(p, t2, _dc(0xBFD555555555544C))
+    p = p * t2
+    var r = fma(p, t, t)
+    var bneg = _hi(b) < Int32(0)
+    if swap:
+        r = _add_rn_d(r if bneg else -r, _dc(0x3FF921FB54442D18))
+    elif bneg:
+        r = _sub_rn_d(_dc(0x400921FB54442D18), r)
+    if (_ub(mx) & UInt64(0x7FFFFFFFFFFFFFFF)) == UInt64(0):
+        r = _dc(0x400921FB54442D18) if bneg else Float64(0.0)
+    elif ub_x == ub_y:
+        r = _dc(0x4002D97C7F3321D2) if bneg else _dc(0x3FE921FB54442D18)
+    var s = _add_rn_d(ax, ay)
+    if _is_nan_d(s):
+        return s
+    return _copysign_d(r, a)

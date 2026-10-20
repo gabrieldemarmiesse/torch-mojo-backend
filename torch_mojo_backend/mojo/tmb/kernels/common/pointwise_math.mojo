@@ -1071,6 +1071,19 @@ def _frexp_parts[
     var mant = sign | (Scalar[u](bias - 1) << Scalar[u](mb)) | frac
     var special = e.eq(Int32(emax)) | mag.eq(0)
     var res_m = special.select(bits, mant)
+    comptime if is_nvidia_gpu():
+        # CUDA's frexp returns a + a there, computed in float for a half
+        # dtype: a NaN comes out canonical (0x7FFFFFFF, 0x7FFF for the
+        # halves), a float64 one quieted.
+        var nan = e.eq(Int32(emax)) & m.ne(0)
+        comptime if dtype == DType.float64:
+            res_m = nan.select(
+                bits | (Scalar[u](1) << Scalar[u](mb - 1)), res_m
+            )
+        elif W == 32:
+            res_m = nan.select(SIMD[u, n](Scalar[u](0x7FFFFFFF)), res_m)
+        else:
+            res_m = nan.select(SIMD[u, n](Scalar[u](0x7FFF)), res_m)
     var res_e = special.select(SIMD[DType.int32, n](0), unbiased + 1)
     return (bitcast[dtype, n](res_m), res_e)
 

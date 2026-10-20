@@ -31,20 +31,50 @@ from std.sys.info import (
 )
 from std.utils.numerics import isnan, max_or_inf, nan
 from tmb.kernels.common.cuda_math import (
+    cuda_acosf,
+    nv_expm1,
+    nv_tanh,
+    nv_acoshf,
     nv_asinf,
     nv_atanf,
+    nv_atanhf,
+    nv_cosf,
+    nv_coshf,
     nv_erfcf,
     nv_erfinvf,
     nv_exp2f,
     nv_expm1f,
     nv_lgammaf,
     nv_log10f,
+    nv_rsqrtf,
+    nv_sinf,
+    nv_sinhf,
+    nv_tanhf,
 )
 from tmb.kernels.common.libdevice_port import (
+    nv_acos,
+    nv_acosh,
+    nv_asin,
     nv_asinh,
     nv_asinhf,
+    nv_atan,
+    nv_atanh,
+    nv_cosh,
+    nv_exp,
+    nv_exp2,
+    nv_expf,
+    nv_log,
+    nv_log10,
+    nv_log1p,
+    nv_log1pf,
+    nv_log2,
     nv_log2f,
     nv_logf,
+    nv_rsqrt,
+    nv_sincos,
+    nv_sinh,
+    nv_tan,
+    nv_tanf,
 )
 from tmb.kernels.common.math_utils import custom_tan, ieee_sqrt
 from tmb.kernels.common.ocml_math import (
@@ -442,6 +472,142 @@ def _asinh[
 
 
 @always_inline
+def _is_nv_f32_port[kind: StaticString]() -> Bool:
+    """The float kinds that run, on NVIDIA, the CUDA math routine stock torch
+    calls (`__nv_expf`, `__nv_sinf`, ...) one lane at a time."""
+    return (
+        kind == "exp"
+        or kind == "sin"
+        or kind == "cos"
+        or kind == "tan"
+        or kind == "tanh"
+        or kind == "sinh"
+        or kind == "cosh"
+        or kind == "atanh"
+        or kind == "acos"
+        or kind == "acosh"
+        or kind == "log1p"
+        or kind == "rsqrt"
+    )
+
+
+@always_inline
+def _nv_f32_port[kind: StaticString](a: Float32) -> Float32:
+    comptime if kind == "exp":
+        return nv_expf(a)
+    elif kind == "sin":
+        return nv_sinf(a)
+    elif kind == "cos":
+        return nv_cosf(a)
+    elif kind == "tan":
+        return nv_tanf(a)
+    elif kind == "tanh":
+        return nv_tanhf(a)
+    elif kind == "sinh":
+        return nv_sinhf(a)
+    elif kind == "cosh":
+        return nv_coshf(a)
+    elif kind == "atanh":
+        return nv_atanhf(a)
+    elif kind == "acos":
+        return cuda_acosf(a)
+    elif kind == "acosh":
+        return nv_acoshf(a)
+    elif kind == "log1p":
+        return nv_log1pf(a)
+    else:
+        comptime assert kind == "rsqrt", "no NVIDIA float32 port"
+        return nv_rsqrtf(a)
+
+
+@always_inline
+def is_nv_f64_port[kind: StaticString]() -> Bool:
+    """The float64 kinds that run, on NVIDIA, the libdevice routine stock
+    torch's double kernels call (`__nv_exp`, `__nv_sin`, ...), or the IEEE
+    operation itself (sqrt, reciprocal, ceil, floor: their NaN quieted by the
+    hardware, as CUDA's are)."""
+    return (
+        kind == "exp"
+        or kind == "exp2"
+        or kind == "expm1"
+        or kind == "log"
+        or kind == "log2"
+        or kind == "log10"
+        or kind == "log1p"
+        or kind == "sqrt"
+        or kind == "rsqrt"
+        or kind == "reciprocal"
+        or kind == "ceil"
+        or kind == "floor"
+        or kind == "sin"
+        or kind == "cos"
+        or kind == "tan"
+        or kind == "asin"
+        or kind == "acos"
+        or kind == "atan"
+        or kind == "sinh"
+        or kind == "cosh"
+        or kind == "tanh"
+        or kind == "asinh"
+        or kind == "acosh"
+        or kind == "atanh"
+    )
+
+
+@always_inline
+def _nv_f64_port[kind: StaticString](a: Float64) -> Float64:
+    comptime if kind == "exp":
+        return nv_exp(a)
+    elif kind == "exp2":
+        return nv_exp2(a)
+    elif kind == "expm1":
+        return nv_expm1(a)
+    elif kind == "log":
+        return nv_log(a)
+    elif kind == "log2":
+        return nv_log2(a)
+    elif kind == "log10":
+        return nv_log10(a)
+    elif kind == "log1p":
+        return nv_log1p(a)
+    elif kind == "sqrt":
+        return ieee_sqrt(a)
+    elif kind == "rsqrt":
+        return nv_rsqrt(a)
+    elif kind == "reciprocal":
+        return Float64(1.0) / a
+    elif kind == "ceil":
+        return ceil(a)
+    elif kind == "floor":
+        return floor(a)
+    elif kind == "sin":
+        return nv_sincos(a)[0]
+    elif kind == "cos":
+        return nv_sincos(a)[1]
+    elif kind == "tan":
+        return nv_tan(a)
+    elif kind == "asin":
+        return nv_asin(a)
+    elif kind == "acos":
+        return nv_acos(a)
+    elif kind == "atan":
+        return nv_atan(a)
+    elif kind == "sinh":
+        return nv_sinh(a)
+    elif kind == "cosh":
+        return nv_cosh(a)
+    elif kind == "tanh":
+        return nv_tanh(a)
+    elif kind == "asinh":
+        return nv_asinh(a)
+    elif kind == "acosh":
+        return nv_acosh(a)
+    else:
+        comptime assert kind == "atanh", "no NVIDIA float64 port"
+        return nv_atanh(a)
+
+
+@always_inline
 def _float_unary[
     kind: StaticString, dtype: DType, width: SIMDLength
 ](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
@@ -624,6 +790,15 @@ def elementwise_unary[
             return _rounding[kind](x.cast[DType.float32]()).cast[dtype]()
         else:
             return _rounding[kind](x)
+    elif (
+        is_nvidia_gpu() and dtype == DType.float64 and is_nv_f64_port[kind]()
+    ):
+        var r = SIMD[dtype, width]()
+        comptime for i in range(width):
+            r[i] = rebind[Scalar[dtype]](
+                _nv_f64_port[kind](rebind[Float64](x[i]))
+            )
+        return r
     elif is_apple_gpu() and _is_mps_special[kind]():
         var xf = x.cast[DType.float32]()
         var r = SIMD[DType.float32, width]()
@@ -636,10 +811,20 @@ def elementwise_unary[
         comptime for i in range(width):
             r[i] = _scalar_special[kind](xf[i])
         return r.cast[dtype]()
-    elif kind == "acosh" and (
-        dtype == DType.float16 or dtype == DType.bfloat16
+    elif (
+        kind == "acosh"
+        and not is_nvidia_gpu()
+        and (dtype == DType.float16 or dtype == DType.bfloat16)
     ):
         return _acosh[exact_sqrt=False](x.cast[DType.float32]()).cast[dtype]()
+    elif (
+        is_nvidia_gpu() and _is_nv_f32_port[kind]() and dtype != DType.float64
+    ):
+        var xf = x.cast[DType.float32]()
+        var r = SIMD[DType.float32, width]()
+        comptime for i in range(width):
+            r[i] = _nv_f32_port[kind](xf[i])
+        return r.cast[dtype]()
     elif dtype == DType.float16 or dtype == DType.bfloat16:
         # Compute once in float32 and round only the final result.
         return _float_unary[kind](x.cast[DType.float32]()).cast[dtype]()
@@ -703,7 +888,12 @@ def elementwise_predicate[
                 DType.uint32 if dtype == DType.float32 else DType.uint16
             )
             comptime top = bit_width_of[dtype]() - 1
-            return (bitcast[bits](x) >> SIMD[bits, width](top)).ne(0)
+            var neg = (bitcast[bits](x) >> SIMD[bits, width](top)).ne(0)
+            comptime if is_nvidia_gpu() and dtype == DType.float16:
+                # Read through float (opmath): cvt.f32.f16 makes every NaN
+                # the positive 0x7FFFFFFF.
+                return neg & ~isnan(x)
+            return neg
         else:
             return x.lt(0)
     else:
