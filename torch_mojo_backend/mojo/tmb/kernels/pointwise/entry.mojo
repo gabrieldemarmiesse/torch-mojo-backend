@@ -278,6 +278,18 @@ def _lanes[kind: StaticString, dt: DType]() -> Int:
 comptime _WIDE_MIN_NUMEL = 1 << 21
 
 
+def _rrelu_bits[kind: StaticString, dt: DType]() -> Bool:
+    """The float32-lane parameter encoding of `_rrelu` (kernels/common/
+    pointwise_math.mojo): rrelu on a float32 or half operand off Apple,
+    whose parameter lanes carry the bits of two doubles. Every other kind
+    and dtype keeps the parameter channel it always had."""
+    return (
+        (kind == "rrelu_train" or kind == "rrelu_noise")
+        and (dt == DType.float32 or dt == DType.float16 or dt == DType.bfloat16)
+        and not has_apple_gpu_accelerator()
+    )
+
+
 @always_inline
 def _wide_f32[kind: StaticString]() -> Bool:
     """float32 kinds launched 8 lanes per thread (two 16-byte vectors)
@@ -520,6 +532,15 @@ def _pointwise_go[kind: StaticString, arity: Int](argv: Argv, argc: Int) raises:
                             # (`_int_exact_param`): exact past 2**53.
                             params = rebind[SIMD[pdt, 4]](
                                 bitcast[DType.int64, 4](pd)
+                            )
+                        elif _rrelu_bits[kind, dt]():
+                            # rrelu's (lower, span) doubles travel as the
+                            # four float32 lanes' bits: exact, where a
+                            # float32 cast of each keeps 48 of 53 bits.
+                            params = rebind[SIMD[pdt, 4]](
+                                bitcast[DType.float32, 4](
+                                    SIMD[DType.float64, 2](p0, p1)
+                                )
                             )
                         var va = _host_value[dt](ha)
                         var vb = _host_value[dt](hb)

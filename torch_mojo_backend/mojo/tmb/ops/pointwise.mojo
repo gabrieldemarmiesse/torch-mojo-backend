@@ -2772,18 +2772,10 @@ def _rrelu(args: Values, rets: Values, out_index: Int, in_place: Bool) raises:
     _draw(draw.t, "Uniform", 0.0, 1.0, 0, 0, v_generator(args[unsafe_offset=5]))
     var a = _b_tside(self)
     var b = _b_tside(draw.t)
-    # (lower, range) as RreluWithNoise.cu's doubles: for float operands, the
-    # float each rounds to plus the float remainder (the kernel sums the two
-    # in double).
+    # (lower, range) as RreluWithNoise.cu's doubles; the launch carries their
+    # bits exactly for float32 and half operands (kernels/pointwise/entry.mojo).
     var span = upper - lower
     var params = _p(lower, span)
-    if self.stype != ST_FLOAT64:
-        params = _p(
-            lower,
-            span,
-            lower - lower.cast[DType.float32]().cast[DType.float64](),
-            span - span.cast[DType.float32]().cast[DType.float64](),
-        )
     var dest = Optional[T]()
     if in_place:
         _b_inplace_destination(self)
