@@ -176,7 +176,13 @@ def _log1p_cx[dt: DType](z: Cx[dt]) -> Cx[dt]:
     var zabs = chypot(x, y)
     var theta = catan2(y, x + Scalar[dt](1))
     if zabs < Scalar[dt](0.5):
-        var r = _fma_c(x, Scalar[dt](2) + x, _mul_rn[dt, 1](y, y))
+        # ptxas fuses the other product per dtype (SASS of both jiterated
+        # kernels): float fma(y, y, x (2 + x)), double fma(x, 2 + x, y y)
+        var r: Scalar[dt]
+        comptime if dt == DType.float32:
+            r = _fma_c(y, y, _mul_rn[dt, 1](x, Scalar[dt](2) + x))
+        else:
+            r = _fma_c(x, Scalar[dt](2) + x, _mul_rn[dt, 1](y, y))
         if r == 0:
             return Cx[dt](x, theta)
         return Cx[dt](Scalar[dt](0.5) * _rlog1p(r), theta)
@@ -231,8 +237,12 @@ def _ternary[
     elif kind == "cx_logaddexp":
         return _logaddexp(a, b)
     elif kind == "cx_addcmul":
-        # a + alpha * (b * c)
-        return _add(a, cmul_jit(p, cmul_jit(b, c)))
+        # a + alpha * (b * c): in complex128's SASS the inner product is
+        # contracted, the outer one not
+        comptime if dt == DType.float64:
+            return _add(a, cmul_jit(p, cmul_jit(b, c, True)))
+        else:
+            return _add(a, cmul_jit(p, cmul_jit(b, c)))
     else:
         comptime assert kind == "cx_addcdiv", "unknown complex ternary kind"
         # a + alpha * (b / c)

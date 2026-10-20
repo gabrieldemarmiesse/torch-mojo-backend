@@ -72,7 +72,7 @@ from tmb.kernels.common.op_utils import (
     _transpose2d_kernel,
 )
 
-from tmb.kernels.common.dtype_convert import f32_to_bf16
+from tmb.kernels.common.dtype_convert import f32_to_bf16, half_to_f64
 from tmb.kernels.common.float8 import f32_to_fp8, fp8_to_f32, is_float8
 from tmb.kernels.data_movement.batched_copy import copy_batched
 from tmb.kernels.data_movement.masked_select import (
@@ -2279,6 +2279,12 @@ def _cast_elem[
         var mid = v.cast[DType.float32]()
         var mid_bits = bitcast[DType.int32, width](mid)
         return bitcast[DType.float32, width](mid_bits).cast[dst]()
+    elif src == DType.float16 and dst == DType.float64:
+        # c10::Half widens through float: its cvt makes any NaN the
+        # canonical one (0x7FFFFFFF, 0x7FFFFFFFE0000000 as a double)
+        return rebind[SIMD[dst, width]](
+            half_to_f64(rebind[SIMD[DType.float16, width]](v))
+        )
     elif src.is_floating_point() and (
         dst == DType.uint8 or dst == DType.int8 or dst == DType.int16
     ):

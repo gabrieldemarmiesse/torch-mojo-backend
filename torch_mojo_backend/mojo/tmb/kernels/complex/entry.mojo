@@ -317,7 +317,17 @@ def _launch[
                         a, b
                     ) else UInt8(0)
                 else:
-                    var r = _binary_cx[kind, dt](a, b, Cx[dt](hp_re, hp_im))
+                    var r: Cx[dt]
+                    comptime if kind == "mul" and dt == DType.float32:
+                        # a CPU scalar is the first factor of CUDA's complex64
+                        # product, whichever side it is on: im = fma(s.re,
+                        # t.im, s.im t.re)
+                        if mode_b == MODE_HOST and mode_a != MODE_HOST:
+                            r = _binary_cx[kind, dt](b, a, Cx[dt](hp_re, hp_im))
+                        else:
+                            r = _binary_cx[kind, dt](a, b, Cx[dt](hp_re, hp_im))
+                    else:
+                        r = _binary_cx[kind, dt](a, b, Cx[dt](hp_re, hp_im))
                     out_ptr[unsafe_offset=2 * i] = r.re
                     out_ptr[unsafe_offset=2 * i + 1] = r.im
 

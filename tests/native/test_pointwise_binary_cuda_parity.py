@@ -58,7 +58,13 @@ def _no_nan_conflict(*ts: torch.Tensor) -> torch.Tensor:
 def _clean(dtype: torch.dtype, *ts: torch.Tensor) -> tuple[torch.Tensor, ...]:
     if dtype not in (torch.float64, torch.complex128):
         return ts
-    keep = ~_no_nan_conflict(*ts)
+    bad = _no_nan_conflict(*ts)
+    if dtype == torch.complex128:
+        # a NaN meeting an inf makes a second (default) NaN in the products
+        rows = [torch.view_as_real(t).reshape(len(t), -1) for t in ts]
+        allc = torch.cat(rows, dim=1)
+        bad |= allc.isnan().any(1) & allc.isinf().any(1)
+    keep = ~bad
     return tuple(t[keep] for t in ts)
 
 
@@ -82,6 +88,14 @@ def _drop_nan_rows(dtype: torch.dtype, *ts: torch.Tensor) -> tuple[torch.Tensor,
     return tuple(t[~nanrow] for t in ts)
 
 
+def _nan_free_pair(dtype: torch.dtype, a: torch.Tensor, b: torch.Tensor):
+    """`_drop_nan_rows` of (a, b) and their difference, whose NaN (inf - inf)
+    meets a NaN weight."""
+    if dtype not in (torch.float64, torch.complex128):
+        return a, b
+    return _drop_nan_rows(dtype, a, b, b - a)[:2]
+
+
 # A double whose rounding to float32 lands on a half / bfloat16 midpoint:
 # c10 converts a CPU scalar to Half / BFloat16 through float.
 _HALF_TIE = 1 + 2**-11 + 2**-40
@@ -91,7 +105,38 @@ _BF16_TIE = 1 + 2**-8 + 2**-40
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
 @pytest.mark.parametrize(("op", "fn", "inplace"), _BINARY, ids=_BINARY_IDS)
 def test_tensor_tensor(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
-    bp.check_all(cuda_oracle, bp.binary_cases(fn, dtype, inplace=inplace))
+    if op == "ldexp" and dtype == torch.complex128:
+        # a NaN exponent: test_ldexp_complex128_signaling_nan_exponent
+        a, b = bp.pairs(dtype)
+        keep = ~torch.view_as_real(b).isnan().any(-1)
+        a, b = a[keep], b[keep]
+
+        def with_out(x, y):
+            o = torch.empty(0, dtype=dtype, device=x.device)
+            return fn(x, y, out=o), o
+
+        cases = [
+            ("tt", fn, (a, b)),
+            ("out", with_out, (a, b)),
+            ("inplace", lambda x, y: x.ldexp_(y), (a, b)),
+        ]
+    else:
+        cases = bp.binary_cases(fn, dtype, inplace=inplace)
+    bp.check_all(cuda_oracle, cases)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="ldexp(complex128, complex128) with a signaling-NaN real exponent"
+    " part: CUDA's tensor-tensor complex pow (pow_ = thrust::pow, exp(log(2) *"
+    " z)) returns the quieted payload, the mojo device's cx pow (the complex"
+    " group's) a default NaN; pow(2.0, z), the Scalar-base kernel, agrees",
+)
+def test_ldexp_complex128_signaling_nan_exponent(cuda_oracle: CudaOracle):
+    nan = bp.from_bits([0x7FF0000000000001], torch.float64).item()
+    x = torch.ones(1, dtype=torch.complex128)
+    z = torch.tensor([complex(nan, 0.5)], dtype=torch.complex128)
+    cuda_oracle.assert_bitwise_equal(torch.ldexp, x, z)
 
 
 def _scalar_values(dtype: torch.dtype) -> list[object]:
@@ -204,6 +249,10 @@ def test_mixed_dtypes(cuda_oracle: CudaOracle, op, fn, inplace, da, db):
     _, b = bp.pairs(db)
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
+    if op == "ldexp" and db == torch.complex128:
+        # a NaN exponent: test_ldexp_complex128_signaling_nan_exponent
+        keep = ~torch.view_as_real(b).isnan().any(-1)
+        a, b = a[keep], b[keep]
     if torch.promote_types(da, db) == torch.float64:
         # two tensor NaNs of different payloads in float64: no fixed rule
         keep = ~bp.two_distinct_nans(a.to(torch.float64), b.to(torch.float64))
@@ -223,8 +272,6 @@ def test_mixed_dtypes(cuda_oracle: CudaOracle, op, fn, inplace, da, db):
         return fn(x, y, out=o), o
 
     for dt in (torch.float32, torch.float64, torch.int64, torch.float16):
-        if dt == torch.float64 and torch.promote_types(da, db) == torch.float16:
-            continue  # test_half_nan_into_float64_out
         cases.append(
             (f"out={bp.name(dt)}", lambda x, y, dt=dt: with_out(x, y, dt), (a, b))
         )
@@ -305,8 +352,6 @@ def test_ldexp_integer_exponent(cuda_oracle: CudaOracle, dtype, edtype):
         ("out", lambda x, y: with_out(x, y, dtype), (a, e)),
         ("out_f64", lambda x, y: with_out(x, y, torch.float64), (a, e)),
     ]
-    if dtype == torch.float16:
-        cases.pop()  # test_half_nan_into_float64_out
     cases += [
         ("out_int", lambda x, y: with_out(x, y, torch.int32), (a, e)),
         ("t-cpu0d", lambda x: torch.ldexp(x, torch.tensor(3, dtype=edtype)), (a,)),
@@ -341,7 +386,7 @@ def test_lerp_scalar(cuda_oracle: CudaOracle, dtype):
         x, y = a, b
         if isinstance(w, float) and math.isnan(w):
             # test_lerp_float64_nan_weight_lanes
-            x, y, _ = _drop_nan_rows(dtype, a, b, b - a)
+            x, y = _nan_free_pair(dtype, a, b)
         cases.append((f"w={w!r}", lambda x, y, w=w: torch.lerp(x, y, w), (x, y)))
         cases.append((f"inplace/w={w!r}", lambda x, y, w=w: x.lerp_(y, w), (x, y)))
         cases.append((f"out/w={w!r}", lambda x, y, w=w: with_out(x, y, w), (x, y)))
@@ -395,7 +440,7 @@ def test_lerp_tensor(cuda_oracle: CudaOracle, dtype):
     for w in (0.25, 0.75, 0.4999999999, bp.nan_scalar(0x7FF8000000000123)):
         a2, b2 = a, b
         if math.isnan(w):
-            a2, b2, _ = _drop_nan_rows(dtype, a, b, b - a)
+            a2, b2 = _nan_free_pair(dtype, a, b)
         for wd in (dtype, torch.float64, torch.float32):
             if dtype.is_complex and not wd.is_complex:
                 continue
@@ -689,13 +734,6 @@ def test_addc_layouts(cuda_oracle: CudaOracle, op):
     _check_layouts(cuda_oracle, cases)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a float16 NaN cast to float64 (the out= store of a float16 result):"
-    " CUDA widens it through float, whose cvt.f32.f16 returns the canonical NaN"
-    " (0x7fffffffe0000000); the mojo device's cast (CastSpec, the casts group's)"
-    " keeps the payload",
-)
 def test_half_nan_into_float64_out(cuda_oracle: CudaOracle):
     a, b = bp.pairs(torch.float16)
 

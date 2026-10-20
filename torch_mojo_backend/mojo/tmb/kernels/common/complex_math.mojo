@@ -623,12 +623,12 @@ def cpow[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
-def cmul_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+def cmul_jit[dt: DType](z: Cx[dt], w: Cx[dt], fused: Bool = False) -> Cx[dt]:
     """libc++'s operator*(complex, complex), as NVRTC compiles it for the
     jiterated kernels (addcmul, lerp): four rounded products and one add
     each (no contraction), then Annex G's recovery when both parts are NaN,
     whose re-products NVRTC does contract: fma(a, c, -(b d)),
-    fma(b, c, a d)."""
+    fma(b, c, a d). `fused`: the contracted product instead (see below)."""
     # Modified from libc++ operator*(const complex&, const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
     var a = z.re
     var b = z.im
@@ -640,6 +640,11 @@ def cmul_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
     var bc = _mul_rn[dt, 1](b, c)
     var x = ac - bd
     var y = ad + bc
+    if fused:
+        # ptxas contracts the product of some inlined copies of the jiterated
+        # function (ac - bd as fma(a, c, -bd), ad + bc as fma(a, d, bc))
+        x = a.fma(c, -bd)
+        y = a.fma(d, bc)
     if isnan(x) and isnan(y):
         var recalc = False
         if isinf(a) or isinf(b):
