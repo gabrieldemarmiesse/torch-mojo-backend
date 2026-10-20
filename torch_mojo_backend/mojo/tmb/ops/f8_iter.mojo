@@ -350,6 +350,28 @@ def _inputs_on_device(
         raise Error("Trying to pass too many CPU scalars to non-CPU kernel!")
 
 
+def cuda_device_check[
+    op: OpFn, ins: Int, out_idx: Int = -1
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`op` behind the CUDA dispatcher wrapper's
+    check_and_update_common_device (every op without `device_check:
+    NoCheck`): the tensors of `ins` (a bitmask of args) and the out= on one
+    device, a CPU 0-d tensor included, before anything else runs."""
+    var first = String("")
+    for i in range(_MAX_ARGS):
+        if (ins >> i) & 1 == 0 and i != out_idx:
+            continue
+        var v = args[unsafe_offset=i].copy()
+        if not _rec_tensor(v):
+            continue
+        var d = device_str(T(Int(v.a)))
+        if first == "":
+            first = d
+        elif d != first:
+            _device_error(first, d)
+    op(args, n_args, rets, n_rets)
+
+
 def _device_error(a: String, b: String) raises:
     raise Error(
         (

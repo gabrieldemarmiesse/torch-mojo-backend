@@ -540,6 +540,11 @@ def _unary_float64_on[op_code: Int]() -> Bool:
             or op_code == UOP_RECIPROCAL
             or op_code == UOP_CEIL
             or op_code == UOP_FLOOR
+            # NVIDIA only (the op layer's gate): libdevice ports in float64.
+            or op_code == UOP_SIGMOID
+            or op_code == UOP_SILU
+            or op_code == UOP_GELU_NONE
+            or op_code == UOP_GELU_TANH
         )
 
 

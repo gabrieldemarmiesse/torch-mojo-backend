@@ -51,7 +51,11 @@ from tmb.kernels.common.complex_math import (
     cpow,
     creciprocal,
     csgn,
+    csigmoid_backward_jit,
+    csigmoid_jit,
+    csilu,
     csqrt_jit,
+    ctanh_backward_jit,
 )
 from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.op_utils import (
@@ -85,10 +89,19 @@ comptime KINDS_CX_CX = [
     "rsqrt",
     "sgn",
     "square",
+    "sigmoid",
+    "silu",
 ]
 comptime KINDS_CX_RE = ["abs", "angle", "real", "imag"]
 comptime KINDS_CX_B = ["isnan", "isinf", "isfinite", "nonzero"]
-comptime KINDS_CXCX_CX = ["add", "mul", "div", "pow"]
+comptime KINDS_CXCX_CX = [
+    "add",
+    "mul",
+    "div",
+    "pow",
+    "sigmoid_backward",
+    "tanh_backward",
+]
 comptime KINDS_CXCX_B = ["eq", "ne"]
 comptime KINDS_RERE_CX = ["make", "polar"]
 
@@ -111,6 +124,10 @@ def _unary_cx[kind: StaticString, dt: DType](z: Cx[dt]) -> Cx[dt]:
         return cdiv_jit(Cx[dt](Scalar[dt](1), Scalar[dt](0)), csqrt_jit(z))
     elif kind == "sgn":
         return csgn(z)
+    elif kind == "sigmoid":
+        return csigmoid_jit(z)
+    elif kind == "silu":
+        return csilu(z)
     else:
         comptime assert kind == "square", "unknown complex unary kind"
         return cmul(z, z)
@@ -156,6 +173,10 @@ def _binary_cx[
         return cmul(a, b)
     elif kind == "div":
         return cdiv(a, b)
+    elif kind == "sigmoid_backward":
+        return csigmoid_backward_jit(a, b)
+    elif kind == "tanh_backward":
+        return ctanh_backward_jit(a, b)
     else:
         comptime assert kind == "pow", "unknown complex binary kind"
         return cpow(a, b)
@@ -216,6 +237,8 @@ def _arity[kind: StaticString]() -> Int:
         or kind == "mul"
         or kind == "div"
         or kind == "pow"
+        or kind == "sigmoid_backward"
+        or kind == "tanh_backward"
         or kind == "eq"
         or kind == "ne"
         or _real_in[kind]()

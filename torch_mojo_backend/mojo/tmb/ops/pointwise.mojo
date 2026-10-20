@@ -38,14 +38,18 @@ from tmb.backend.abi import (
     TAG_NONE,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
+    TAG_TENSOR,
+    TAG_TENSOR_REF,
     Value,
     bits_f64,
+    bool_arg,
     call_op,
     f64_bits,
     Values,
     default_dtype,
     dtype_name,
     max_dtype,
+    new_like,
     new_tensor,
     own,
     own_if_new,
@@ -62,12 +66,14 @@ from tmb.backend.abi import (
     v_int,
     v_is_none,
     v_string,
+    v_is_complex,
     v_tensor,
     view_strided,
 )
 from tmb.backend.device import ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.f8_iter import (
+    cuda_device_check,
     f8_cx_scalar,
     f8_iter,
     generated_out,
@@ -99,6 +105,8 @@ from tmb.ops.complex import (
 )
 from tmb.ops.complex_math import (
     _base_is_one,
+    cx_backward,
+    cx_backward_out,
     cx_pow_tensor,
     cx_pow_tensor_out,
     cx_pow_tensor_scalar,
@@ -135,6 +143,7 @@ from tmb.ops.binary import (
     op_rsub,
 )
 from tmb.ops.common import (
+    device_str,
     threshold_into_overlapping,
     threshold_scalar_check,
     threshold_scalar_overflows,
@@ -168,6 +177,8 @@ from tmb.ops.core import cast_for_copy
 from tmb.ops.distance import store_autogen_out
 from tmb.ops.reductions import _scalar_reduction
 from tmb.ops.unary import op_gelu_backward
+from tmb.ops.composed import _dispatch
+from tmb.ops.matmul import _sm90_cuda
 
 # ---------------------------------------------------------------------------
 # type promotion
@@ -1553,6 +1564,20 @@ def _pw_act(
     if out_index >= 0:
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
     var result_st = compute if out_st < 0 else out_st
+    # CUDA's activation kernels dispatch on iter.dtype(), the output's: an
+    # out= (or an output made from self's options) of another floating
+    # dtype is computed in, its operands converted to that dtype first.
+    # log_sigmoid_backward dispatches on the common dtype.
+    if kind != "log_sigmoid_backward" and not _pw_out_exact(kind):
+        var target = dest.value().stype if dest else result_st
+        if (
+            target != compute
+            and _pw_is_float(target)
+            and not _pw_is_f8(target)
+            and _pw_is_float(compute)
+        ):
+            compute = _pw_compute_dtype(kind, target, policy, f64_ok)
+            result_st = compute
     _pw_finish(
         rets,
         dest,
@@ -2119,7 +2144,10 @@ def _glu(args: Values, rets: Values, out_index: Int) raises:
         # The out= checks and resize precede the kernel dispatch.
         dest = _pw_out_of(args[unsafe_offset=out_index], sa, sb, _none_side())
         var o = dest.value().stype
-        if _pw_is_f8(common) or _pw_is_f8(o):
+        if _pw_is_float(o) and not _pw_is_f8(o) and not _pw_is_f8(common):
+            # glu_cuda computes in the out's floating dtype too
+            common = o
+        elif _pw_is_f8(common) or _pw_is_f8(o):
             # glu_cuda dispatches on the OUTPUT dtype: a float8 input into a
             # wider out computes there, a float8 out refuses as itself (out
             # resized first).
@@ -3589,10 +3617,122 @@ def _pw_same_view(a: T, b: T) -> Bool:
     return True
 
 
+def _squeeze_view(t: T) raises -> T:
+    """`at::squeeze(t)`: `t` without its size-1 dimensions."""
+    var shape = IndexList[MAX_RANK](1)
+    var strides = IndexList[MAX_RANK](0)
+    var rank = 0
+    for i in range(t.rank):
+        if t.dim(i) != 1:
+            rank += 1
+    var k = MAX_RANK - rank
+    for i in range(t.rank):
+        if t.dim(i) != 1:
+            shape[k] = t.dim(i)
+            strides[k] = t.stride(i)
+            k += 1
+    return view_strided(t, shape, strides, rank, t.offset)
+
+
+def _bce_needs_general(args: Values) raises -> Bool:
+    """Operands the fused bce kind does not take: input and target of other
+    shapes, or a weight of another dtype, device or shape than input."""
+    var x = v_tensor(args[unsafe_offset=0])
+    var t = v_tensor(args[unsafe_offset=1])
+    if not x.same_shape(t):
+        return True
+    if v_is_none(args[unsafe_offset=2]):
+        return False
+    var w = v_tensor(args[unsafe_offset=2])
+    return (
+        w.stype != x.stype
+        or not w.on_mojo()
+        or w.device != x.device
+        or not w.same_shape(x)
+    )
+
+
+def _bce_general(args: Values, rets: Values, out_v: Optional[Value]) raises:
+    """binary_cross_entropy_out_cuda step by step, reduction='none': the
+    kernel over squeeze(input) and squeeze(target), broadcast, into
+    squeeze(loss) -- a view TensorIterator resizes, never `loss` itself, so
+    of a loss of another shape only the first elements of its storage take
+    the result -- then `loss.mul_(weight)` through the dispatcher."""
+    var input = _b_side(args[unsafe_offset=0])
+    _loss_same_dtype(input, _b_side(args[unsafe_offset=1]))
+    var x = v_tensor(args[unsafe_offset=0])
+    var t = v_tensor(args[unsafe_offset=1])
+    var loss: T
+    if out_v:
+        loss = _pw_out_of(out_v.value(), _b_tside(x), _b_tside(t), _none_side())
+        if loss.stype != x.stype:
+            raise Error(
+                "Found dtype ",
+                dtype_name(loss.stype),
+                " but expected ",
+                dtype_name(x.stype),
+            )
+    else:
+        loss = new_tensor(x.shape, x.rank, x.stype, x.device)
+    var ls = _squeeze_view(loss)
+    var res = _pw_run(
+        "bce",
+        3,
+        _b_tside(_squeeze_view(x)),
+        _b_tside(_squeeze_view(t)),
+        _b_sside(Scal(1.0, 1, True, False)),
+        x.stype,
+        x.stype,
+        _p(),
+        ls.copy(),
+    )
+    if res.owned:
+        if res.t.same_shape(ls):
+            copy_strided_into(ls, res.t)
+        elif loss.numel > 0:
+            if not loss.contig:
+                unsupported(
+                    "binary_cross_entropy into a strided out of another shape"
+                )
+            var k = min(loss.numel, res.t.numel)
+            var flat = IndexList[MAX_RANK](1)
+            flat[MAX_RANK - 1] = k
+            var unit = IndexList[MAX_RANK](0)
+            unit[MAX_RANK - 1] = 1
+            copy_strided_into(
+                view_strided(loss, flat, unit, 1, loss.offset),
+                view_strided(res.t, flat, unit, 1, res.t.offset),
+            )
+        release(res.t.h)
+    if not v_is_none(args[unsafe_offset=2]):
+        _ = call_op(
+            "aten::mul_",
+            "Tensor",
+            [tensor_arg(loss), args[unsafe_offset=2].copy()],
+            1,
+        )
+    if out_v:
+        ret_ref(rets, 0, loss)
+    else:
+        var owned = own(loss^)
+        ret_owned(rets, 0, owned)
+
+
 def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
     """Loss.cu binary_cross_entropy_out_cuda: input and target of one dtype,
     the loss in it (`loss.mul_(weight)` keeps it: a float32 weight on
     float16 inputs is a float16 loss), the weight never growing its shape."""
+    if _loss_reduction(args[unsafe_offset=3]) == REDUCTION_NONE and (
+        _bce_needs_general(args)
+        or (
+            Bool(out_v)
+            and not v_tensor(out_v.value()).same_shape(
+                v_tensor(args[unsafe_offset=0])
+            )
+        )
+    ):
+        _bce_general(args, rets, out_v)
+        return
     var weight = _opt_weight(args[unsafe_offset=2])
     var input = _b_side(args[unsafe_offset=0])
     var raw_target = _b_side(args[unsafe_offset=1])
@@ -3679,27 +3819,30 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     gradient kernel when there is no weight, a second kind when there is."""
     var grad = _b_side(args[unsafe_offset=0])
     var input = _b_side(args[unsafe_offset=1])
-    var raw_target = _b_side(args[unsafe_offset=2])
-    var weight = _opt_weight(args[unsafe_offset=3])
+    var target = _b_side(args[unsafe_offset=2])
     var reduction = _loss_reduction(args[unsafe_offset=4])
-    if not grad.is_t or not input.is_t or not raw_target.is_t:
+    if not grad.is_t or not input.is_t or not target.is_t:
         unsupported("binary_cross_entropy_backward with a scalar operand")
-    var paired = own_if_new(
-        _bce_paired(
-            input.t.value(),
-            raw_target.t.value(),
-            "binary_cross_entropy_backward",
-        ),
-        raw_target.t.value(),
-    )
-    var target = _b_tside(paired.t)
+    # A weight of another dtype, device or shape: the kernel alone, then
+    # `grad_input.mul_(weight)` and the mean's `div_(numel)` through the
+    # dispatcher, as binary_cross_entropy_backward_out_cuda runs them.
+    var weight_v = args[unsafe_offset=3].copy()
+    var dispatched_weight = False
+    if not v_is_none(weight_v):
+        var w = v_tensor(weight_v)
+        var x = input.t.value().copy()
+        dispatched_weight = (
+            w.stype != x.stype
+            or not w.on_mojo()
+            or w.device != x.device
+            or not w.same_shape(x)
+        )
+    var weight = Optional[T]() if dispatched_weight else _opt_weight(weight_v)
     # One dtype for every operand (grad_input's is checked as exact below),
-    # and grad_input has self's shape: nothing may broadcast it larger.
+    # and grad_input has self's shape: nothing may broadcast it larger
+    # (grad.expand_as(input) included).
     _loss_same_dtype(input, target)
     _loss_same_dtype(input, grad)
-    _bce_decline_weight(
-        weight, input.t.value().stype, "binary_cross_entropy_backward"
-    )
     var shape = input.t.value().shape
     var rank = input.t.value().rank
     _loss_fits(shape, rank, grad, input, target)
@@ -3728,6 +3871,34 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     if Bool(weight) and Bool(dest):
         weight_is_out = _pw_same_view(dest.value(), weight.value())
     var out_st = input.t.value().stype
+    if dispatched_weight:
+        var gi = _pw_run(
+            "bce_backward",
+            3,
+            grad,
+            input,
+            target,
+            compute,
+            out_st,
+            _p(1.0),
+            dest,
+        )
+        var result = dest.value().copy() if dest else gi.t.copy()
+        _pw_finish(rets, dest, gi^, _pw_out_exact("bce_backward"))
+        _ = call_op(
+            "aten::mul_", "Tensor", [tensor_arg(result), weight_v.copy()], 1
+        )
+        if reduction == REDUCTION_MEAN:
+            _ = call_op(
+                "aten::div_",
+                "Scalar",
+                [
+                    tensor_arg(result),
+                    Value(TAG_SCALAR_INT, 0, Int64(input.t.value().numel), 0),
+                ],
+                1,
+            )
+        return
     if not weight:
         _pw_finish(
             rets,
@@ -3745,7 +3916,6 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
             ),
             _pw_out_exact("bce_backward"),
         )
-        _ = paired^
         return
     var gi = _pw_run(
         "bce_backward", 3, grad, input, target, compute, compute, _p(1.0), None
@@ -3763,7 +3933,6 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     )
     release(gi.t.h)
     _pw_finish(rets, dest, res^, _pw_out_exact("bce_backward"))
-    _ = paired^
 
 
 # aten::binary_cross_entropy_backward(Tensor grad_output, Tensor self, Tensor target, Tensor? weight=None, int reduction=Mean) -> Tensor
@@ -3780,10 +3949,136 @@ def op_binary_cross_entropy_backward_grad_input(
     _bce_backward(args, rets, args[unsafe_offset=5].copy())
 
 
+def _bce_logits_fusable(args: Values) raises -> Bool:
+    """Every tensor operand on one mojo device in target's dtype: what the
+    fused kind computes as the composite does."""
+    var t = v_tensor(args[unsafe_offset=1])
+    if not t.on_mojo():
+        return False
+    for i in range(4):
+        if i == 1 or v_is_none(args[unsafe_offset=i]):
+            continue
+        var o = v_tensor(args[unsafe_offset=i])
+        if not o.on_mojo() or o.device != t.device or o.stype != t.stype:
+            return False
+    return True
+
+
+def _inplace_call(
+    name: StaticString, overload: StaticString, self: T, var args: List[Value]
+) raises:
+    """`self.name_(...)` through the dispatcher. A CPU self with a device
+    operand is TensorIterator's device error on stock CUDA (its dispatcher
+    picks the device kernel here, which declines)."""
+    if self.on_cpu():
+        for i in range(1, len(args)):
+            if args[i].tag == TAG_TENSOR or args[i].tag == TAG_TENSOR_REF:
+                var o = T(Int(args[i].a))
+                if not o.on_cpu():
+                    raise Error(
+                        (
+                            "Expected all tensors to be on the same device, but"
+                            " found at least two devices, "
+                        ),
+                        device_str(o),
+                        " and cpu!",
+                    )
+    _ = call_op(String(name), String(overload), args^, 1)
+
+
+def _bce_logits_composed(
+    args: Values, rets: Values, out_v: Optional[Value]
+) raises:
+    """Loss.cpp's binary_cross_entropy_with_logits op by op through the
+    dispatcher (mixed dtypes, CPU operands), reduction='none':
+    log_sigmoid(input) (*= (pos_weight - 1) * target + 1), then
+    (1 - target).mul_(input).sub_(that) (.mul_(weight))."""
+    var one = Value(TAG_SCALAR_INT, 0, 1, 0)
+    var ls = own(
+        _dispatch("aten::log_sigmoid", "", [args[unsafe_offset=0].copy()])
+    )
+    if not v_is_none(args[unsafe_offset=3]):
+        var pw1 = own(
+            _dispatch(
+                "aten::sub",
+                "Scalar",
+                [args[unsafe_offset=3].copy(), one.copy(), one.copy()],
+            )
+        )
+        var lw = own(
+            _dispatch(
+                "aten::mul",
+                "Tensor",
+                [tensor_arg(pw1.t), args[unsafe_offset=1].copy()],
+            )
+        )
+        _inplace_call(
+            "aten::add_",
+            "Scalar",
+            lw.t,
+            [tensor_arg(lw.t), one.copy(), one.copy()],
+        )
+        _inplace_call(
+            "aten::mul_", "Tensor", ls.t, [tensor_arg(ls.t), tensor_arg(lw.t)]
+        )
+        _ = pw1^  # alive past the calls that read them
+        _ = lw^
+    # `1 - target`: empty_like(target).fill_(1).sub_(target), the values of
+    # rsub(target, 1)
+    var loss = own(
+        _dispatch(
+            "aten::rsub",
+            "Scalar",
+            [args[unsafe_offset=1].copy(), one.copy(), one.copy()],
+        )
+    )
+    _inplace_call(
+        "aten::mul_",
+        "Tensor",
+        loss.t,
+        [tensor_arg(loss.t), args[unsafe_offset=0].copy()],
+    )
+    _inplace_call(
+        "aten::sub_",
+        "Tensor",
+        loss.t,
+        [tensor_arg(loss.t), tensor_arg(ls.t), one.copy()],
+    )
+    _ = ls^
+    if not v_is_none(args[unsafe_offset=2]):
+        _inplace_call(
+            "aten::mul_",
+            "Tensor",
+            loss.t,
+            [tensor_arg(loss.t), args[unsafe_offset=2].copy()],
+        )
+    if out_v:
+        # the generated out= of a composite op: resize, then copy_
+        var d = v_tensor(out_v.value())
+        if not d.same_shape(loss.t):
+            resize_out(d, loss.t.shape, loss.t.rank)
+        _ = call_op(
+            "aten::copy_",
+            "",
+            [tensor_arg(d), tensor_arg(loss.t), bool_arg(False)],
+            1,
+        )
+        _ = loss^
+        ret_ref(rets, 0, d)
+    else:
+        ret_owned(rets, 0, loss)
+
+
 def _bce_logits(args: Values, rets: Values, out_v: Optional[Value]) raises:
     """Loss.cpp binary_cross_entropy_with_logits, whose CompositeExplicit
     body (log_sigmoid, sub, mul, rsub, ...) is one kind here; autograd keeps
     its own derivatives.yaml formula."""
+    if (
+        not _bce_logits_fusable(args)
+        and _loss_reduction(args[unsafe_offset=4]) == REDUCTION_NONE
+    ):
+        _bce_logits_composed(args, rets, out_v)
+        return
     var weight = _opt_weight(args[unsafe_offset=2])
     var pos_weight = _opt_weight(args[unsafe_offset=3])
     var input = _b_side(args[unsafe_offset=0])
@@ -4300,6 +4595,89 @@ def op_pow_scalar_out_meta(
 # rsub.Tensor / rsub.Scalar(self, other, alpha): sub(other, self) -- its
 # bool check, the result type of both operands (a Scalar other as a wrapped
 # number), alpha_check, then the kernel's dtype dispatch
+def _complex_pair(args: Values) -> Bool:
+    return v_is_complex(args[unsafe_offset=0]) or v_is_complex(
+        args[unsafe_offset=1]
+    )
+
+
+# aten::sigmoid_backward(Tensor grad_output, Tensor output) -> Tensor
+def op_sigmoid_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _complex_pair(args):
+        cx_backward["sigmoid_backward"](args, n_args, rets, n_rets)
+        return
+    _pw_act("sigmoid_backward", args, rets, 0, 1, -1, _p())
+
+
+# aten::sigmoid_backward.grad_input(Tensor grad_output, Tensor output, *, Tensor(a!) grad_input) -> Tensor(a!)
+def op_sigmoid_backward_grad_input(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _complex_pair(args):
+        cx_backward_out["sigmoid_backward"](args, n_args, rets, n_rets)
+        return
+    _pw_act("sigmoid_backward", args, rets, 0, 1, 2, _p())
+
+
+def _tanh_fused_inputs(grad: T, output: T) raises -> Bool:
+    """Same-shape dense float32 operands on an sm_90 GPU: the tuned
+    activation_backward kernel (the pointwise kind's formula)."""
+    return (
+        grad.on_mojo()
+        and output.on_mojo()
+        and grad.device == output.device
+        and grad.dtype == DType.float32
+        and output.dtype == DType.float32
+        and grad.contig
+        and output.contig
+        and grad.same_shape(output)
+        and _sm90_cuda(grad.device)
+    )
+
+
+def _tanh_fused_into(dst: T, grad: T, output: T) raises:
+    if dst.numel == 0:
+        return
+    var ctx = ctx_for(dst.device)
+    var call = KernelCall("activation_backward", "TanhBackwardF32")
+    call.int(dst.ptr)
+    call.int(grad.ptr)
+    call.int(output.ptr)
+    call.int(dst.numel)
+    call.int(ctx_ptr(ctx))
+    call.run()
+    _ = ctx
+
+
+# aten::tanh_backward(Tensor grad_output, Tensor output) -> Tensor
+def op_tanh_backward(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _complex_pair(args):
+        cx_backward["tanh_backward"](args, n_args, rets, n_rets)
+        return
+    var grad = v_tensor(args[unsafe_offset=0])
+    var output = v_tensor(args[unsafe_offset=1])
+    if _tanh_fused_inputs(grad, output):
+        var result = own(new_like(grad))
+        _tanh_fused_into(result.t, grad, output)
+        ret_owned(rets, 0, result)
+    else:
+        _pw_act("tanh_backward", args, rets, 0, 1, -1, _p())
+
+
+# aten::tanh_backward.grad_input(Tensor grad_output, Tensor output, *, Tensor(a!) grad_input) -> Tensor(a!)
+def op_tanh_backward_grad_input(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _complex_pair(args):
+        cx_backward_out["tanh_backward"](args, n_args, rets, n_rets)
+        return
+    _pw_act("tanh_backward", args, rets, 0, 1, 2, _p())
+
+
 comptime _rsub_fn = f8_iter[
     routed[op_rsub_any, cx_rsub, 3],
     "ufunc_add_CUDA",
@@ -4313,20 +4691,90 @@ comptime _rsub_fn = f8_iter[
 
 
 def register_pointwise(site: Site) raises:
+    impl[
+        cuda_device_check[
+            f8_iter[
+                op_sigmoid_backward,
+                "sigmoid_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
+            3,
+        ],
+        "sigmoid_backward",
+    ](site)
+    impl[
+        cuda_device_check[
+            f8_iter[
+                op_sigmoid_backward_grad_input,
+                "sigmoid_backward_cuda",
+                3,
+                2,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
+            3,
+            2,
+        ],
+        "sigmoid_backward.grad_input",
+    ](site)
+    impl[
+        cuda_device_check[
+            f8_iter[
+                op_tanh_backward,
+                "tanh_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
+            3,
+        ],
+        "tanh_backward",
+    ](site)
+    impl[
+        cuda_device_check[
+            f8_iter[
+                op_tanh_backward_grad_input,
+                "tanh_backward_cuda",
+                3,
+                2,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
+            3,
+            2,
+        ],
+        "tanh_backward.grad_input",
+    ](site)
     impl[op_sample_dirichlet, "_sample_dirichlet"](site)
     impl[
-        f8_iter[op_prelu_kernel, "prelu_cuda", 3, -1, MODE_FN, False, PRE_NONE],
+        cuda_device_check[
+            f8_iter[
+                op_prelu_kernel, "prelu_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            ],
+            3,
+        ],
         "_prelu_kernel",
     ](site)
     impl[
-        f8_iter[
-            op_prelu_kernel_backward,
-            "prelu_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_prelu_kernel_backward,
+                "prelu_backward_cuda",
+                7,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             7,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "_prelu_kernel_backward",
     ](site)
@@ -4417,26 +4865,33 @@ def register_pointwise(site: Site) raises:
         "elu.out",
     ](site)
     impl[
-        f8_iter[
-            op_elu_backward,
-            "elu_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_elu_backward,
+                "elu_backward_cuda",
+                33,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             33,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "elu_backward",
     ](site)
     impl[
-        f8_iter[
-            op_elu_backward_grad_input,
-            "elu_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_elu_backward_grad_input,
+                "elu_backward_cuda",
+                33,
+                6,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
             33,
             6,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "elu_backward.grad_input",
     ](site)
@@ -4512,13 +4967,20 @@ def register_pointwise(site: Site) raises:
         f8_iter[op_gcd_out, "gcd_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
         "gcd.out",
     ](site)
-    impl[op_binary_cross_entropy, "binary_cross_entropy"](site)
-    impl[op_binary_cross_entropy_out, "binary_cross_entropy.out"](site)
-    impl[op_binary_cross_entropy_backward, "binary_cross_entropy_backward"](
-        site
-    )
     impl[
-        op_binary_cross_entropy_backward_grad_input,
+        cuda_device_check[op_binary_cross_entropy, 3],
+        "binary_cross_entropy",
+    ](site)
+    impl[
+        cuda_device_check[op_binary_cross_entropy_out, 3, 4],
+        "binary_cross_entropy.out",
+    ](site)
+    impl[
+        cuda_device_check[op_binary_cross_entropy_backward, 15],
+        "binary_cross_entropy_backward",
+    ](site)
+    impl[
+        cuda_device_check[op_binary_cross_entropy_backward_grad_input, 15, 5],
         "binary_cross_entropy_backward.grad_input",
     ](site)
     impl[
@@ -4542,21 +5004,36 @@ def register_pointwise(site: Site) raises:
         "deg2rad_",
     ](site)
     impl[
-        f8_iter[
-            op_gelu_backward_any,
-            "GeluBackwardCUDAKernelImpl",
+        cuda_device_check[
+            f8_iter[
+                op_gelu_backward_any,
+                "GeluBackwardCUDAKernelImpl",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "gelu_backward",
     ](site)
-    impl[op_huber_loss, "huber_loss"](site)
-    impl[op_huber_loss_out, "huber_loss.out"](site)
-    impl[op_huber_loss_backward, "huber_loss_backward"](site)
-    impl[op_huber_loss_backward_out, "huber_loss_backward.out"](site)
+    impl[
+        cuda_device_check[op_huber_loss, 3],
+        "huber_loss",
+    ](site)
+    impl[
+        cuda_device_check[op_huber_loss_out, 3, 4],
+        "huber_loss.out",
+    ](site)
+    impl[
+        cuda_device_check[op_huber_loss_backward, 7],
+        "huber_loss_backward",
+    ](site)
+    impl[
+        cuda_device_check[op_huber_loss_backward_out, 7, 5],
+        "huber_loss_backward.out",
+    ](site)
     impl[
         f8_iter[op_ldexp, "pow_cuda", 3, -1, MODE_FN, False, PRE_LDEXP],
         "ldexp.Tensor",
@@ -4569,10 +5046,22 @@ def register_pointwise(site: Site) raises:
         f8_iter[op_ldexp_, "pow_cuda", 3, 0, MODE_INPLACE, False, PRE_LDEXP],
         "ldexp_",
     ](site)
-    impl[op_mse_loss, "mse_loss"](site)
-    impl[op_mse_loss_out, "mse_loss.out"](site)
-    impl[op_mse_loss_backward, "mse_loss_backward"](site)
-    impl[op_mse_loss_backward_grad_input, "mse_loss_backward.grad_input"](site)
+    impl[
+        cuda_device_check[op_mse_loss, 3],
+        "mse_loss",
+    ](site)
+    impl[
+        cuda_device_check[op_mse_loss_out, 3, 3],
+        "mse_loss.out",
+    ](site)
+    impl[
+        cuda_device_check[op_mse_loss_backward, 7],
+        "mse_loss_backward",
+    ](site)
+    impl[
+        cuda_device_check[op_mse_loss_backward_grad_input, 7, 4],
+        "mse_loss_backward.grad_input",
+    ](site)
     impl[
         f8_iter[op_rad2deg, "mul_cuda", 1, -1, MODE_FN, False, PRE_NONE],
         "rad2deg",
@@ -4585,22 +5074,35 @@ def register_pointwise(site: Site) raises:
         f8_iter[op_rad2deg_, "mul_cuda", 1, 0, MODE_INPLACE, False, PRE_NONE],
         "rad2deg_",
     ](site)
-    impl[op_smooth_l1_loss, "smooth_l1_loss"](site)
-    impl[op_smooth_l1_loss_out, "smooth_l1_loss.out"](site)
-    impl[op_smooth_l1_loss_backward, "smooth_l1_loss_backward"](site)
     impl[
-        op_smooth_l1_loss_backward_grad_input,
+        cuda_device_check[op_smooth_l1_loss, 3],
+        "smooth_l1_loss",
+    ](site)
+    impl[
+        cuda_device_check[op_smooth_l1_loss_out, 3, 4],
+        "smooth_l1_loss.out",
+    ](site)
+    impl[
+        cuda_device_check[op_smooth_l1_loss_backward, 7],
+        "smooth_l1_loss_backward",
+    ](site)
+    impl[
+        cuda_device_check[op_smooth_l1_loss_backward_grad_input, 7, 5],
         "smooth_l1_loss_backward.grad_input",
     ](site)
     impl[
-        f8_iter[
-            op_gelu_backward_grad_input,
-            "GeluBackwardCUDAKernelImpl",
+        cuda_device_check[
+            f8_iter[
+                op_gelu_backward_grad_input,
+                "GeluBackwardCUDAKernelImpl",
+                3,
+                3,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
             3,
             3,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "gelu_backward.grad_input",
     ](site)
@@ -4623,26 +5125,33 @@ def register_pointwise(site: Site) raises:
         "hardshrink.out",
     ](site)
     impl[
-        f8_iter[
-            op_shrink_backward,
-            "shrink_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_shrink_backward,
+                "shrink_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "hardshrink_backward",
     ](site)
     impl[
-        f8_iter[
-            op_shrink_backward_grad_input,
-            "shrink_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_shrink_backward_grad_input,
+                "shrink_backward_cuda",
+                3,
+                3,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
             3,
             3,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "hardshrink_backward.grad_input",
     ](site)
@@ -4677,26 +5186,33 @@ def register_pointwise(site: Site) raises:
         "hardsigmoid_",
     ](site)
     impl[
-        f8_iter[
-            op_hardsigmoid_backward,
-            "hardsigmoid_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_hardsigmoid_backward,
+                "hardsigmoid_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "hardsigmoid_backward",
     ](site)
     impl[
-        f8_iter[
-            op_hardsigmoid_backward_grad_input,
-            "hardsigmoid_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_hardsigmoid_backward_grad_input,
+                "hardsigmoid_backward_cuda",
+                3,
+                2,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
             3,
             2,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "hardsigmoid_backward.grad_input",
     ](site)
@@ -4719,14 +5235,17 @@ def register_pointwise(site: Site) raises:
         "hardswish_",
     ](site)
     impl[
-        f8_iter[
-            op_hardswish_backward,
-            "hardswish_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_hardswish_backward,
+                "hardswish_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "hardswish_backward",
     ](site)
@@ -4761,26 +5280,33 @@ def register_pointwise(site: Site) raises:
         "hardtanh_",
     ](site)
     impl[
-        f8_iter[
-            op_hardtanh_backward,
-            "hardtanh_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_hardtanh_backward,
+                "hardtanh_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "hardtanh_backward",
     ](site)
     impl[
-        f8_iter[
-            op_hardtanh_backward_grad_input,
-            "hardtanh_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_hardtanh_backward_grad_input,
+                "hardtanh_backward_cuda",
+                3,
+                4,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
             3,
             4,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "hardtanh_backward.grad_input",
     ](site)
@@ -4867,26 +5393,33 @@ def register_pointwise(site: Site) raises:
         "leaky_relu_",
     ](site)
     impl[
-        f8_iter[
-            op_leaky_relu_backward,
-            "leaky_relu_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_leaky_relu_backward,
+                "leaky_relu_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_SELF_FIRST,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_SELF_FIRST,
         ],
         "leaky_relu_backward",
     ](site)
     impl[
-        f8_iter[
-            op_leaky_relu_backward_grad_input,
-            "leaky_relu_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_leaky_relu_backward_grad_input,
+                "leaky_relu_backward_cuda",
+                3,
+                4,
+                MODE_OUTDT,
+                False,
+                PRE_SELF_FIRST,
+            ],
             3,
             4,
-            MODE_OUTDT,
-            False,
-            PRE_SELF_FIRST,
         ],
         "leaky_relu_backward.grad_input",
     ](site)
@@ -4931,26 +5464,33 @@ def register_pointwise(site: Site) raises:
         "lerp.Tensor_out",
     ](site)
     impl[
-        f8_iter[
-            op_log_sigmoid_backward,
-            "log_sigmoid_backward_cuda",
-            3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_ALL_SAME,
+        cuda_device_check[
+            f8_iter[
+                op_log_sigmoid_backward,
+                "log_sigmoid_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_ALL_SAME,
+            ],
+            7,
         ],
         "log_sigmoid_backward",
     ](site)
     impl[
-        f8_iter[
-            op_log_sigmoid_backward_grad_input,
-            "log_sigmoid_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_log_sigmoid_backward_grad_input,
+                "log_sigmoid_backward_cuda",
+                3,
+                3,
+                MODE_SAME,
+                False,
+                PRE_ALL_SAME,
+            ],
+            7,
             3,
-            3,
-            MODE_SAME,
-            False,
-            PRE_ALL_SAME,
         ],
         "log_sigmoid_backward.grad_input",
     ](site)
@@ -5015,20 +5555,27 @@ def register_pointwise(site: Site) raises:
         "logaddexp2.out",
     ](site)
     impl[
-        f8_iter[
-            op_logit_backward, "logit_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        cuda_device_check[
+            f8_iter[
+                op_logit_backward, "logit_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            ],
+            3,
         ],
         "logit_backward",
     ](site)
     impl[
-        f8_iter[
-            op_logit_backward_grad_input,
-            "logit_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_logit_backward_grad_input,
+                "logit_cuda",
+                3,
+                3,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
             3,
             3,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "logit_backward.grad_input",
     ](site)
@@ -5041,14 +5588,17 @@ def register_pointwise(site: Site) raises:
         "mish.out",
     ](site)
     impl[
-        f8_iter[
-            op_mish_backward,
-            "mish_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_mish_backward,
+                "mish_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_DISPATCH_SELF,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_DISPATCH_SELF,
         ],
         "mish_backward",
     ](site)
@@ -5112,38 +5662,60 @@ def register_pointwise(site: Site) raises:
         ],
         "pow.Tensor_Tensor_out",
     ](site)
-    impl[op_rrelu_with_noise, "rrelu_with_noise"](site)
-    impl[op_rrelu_with_noise_out, "rrelu_with_noise.out"](site)
+    impl[
+        cuda_device_check[op_rrelu_with_noise, 3],
+        "rrelu_with_noise",
+    ](site)
+    impl[
+        cuda_device_check[op_rrelu_with_noise_out, 3, 6],
+        "rrelu_with_noise.out",
+    ](site)
     impl[op_rrelu_with_noise_, "rrelu_with_noise_"](site)
     impl[op_glu, "glu"](site)
-    impl[op_glu_out, "glu.out"](site)
-    impl[op_glu_backward, "glu_backward"](site)
-    impl[op_glu_backward_grad_input, "glu_backward.grad_input"](site)
+    impl[
+        cuda_device_check[op_glu_out, 1, 2],
+        "glu.out",
+    ](site)
+    impl[
+        cuda_device_check[op_glu_backward, 3],
+        "glu_backward",
+    ](site)
+    impl[
+        cuda_device_check[op_glu_backward_grad_input, 3, 3],
+        "glu_backward.grad_input",
+    ](site)
     impl[op_glu_jvp, "glu_jvp"](site)
     impl[op_glu_jvp_out, "glu_jvp.out"](site)
     impl[op_glu_backward_jvp, "glu_backward_jvp"](site)
     impl[op_glu_backward_jvp_out, "glu_backward_jvp.out"](site)
     impl[
-        f8_iter[
-            op_silu_backward,
-            "silu_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_silu_backward,
+                "silu_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "silu_backward",
     ](site)
     impl[
-        f8_iter[
-            op_silu_backward_grad_input,
-            "silu_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_silu_backward_grad_input,
+                "silu_backward_cuda",
+                3,
+                2,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
             3,
             2,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "silu_backward.grad_input",
     ](site)
@@ -5158,26 +5730,33 @@ def register_pointwise(site: Site) raises:
         "softplus.out",
     ](site)
     impl[
-        f8_iter[
-            op_softplus_backward,
-            "softplus_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_softplus_backward,
+                "softplus_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "softplus_backward",
     ](site)
     impl[
-        f8_iter[
-            op_softplus_backward_grad_input,
-            "softplus_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_softplus_backward_grad_input,
+                "softplus_backward_cuda",
+                3,
+                4,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
             3,
             4,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "softplus_backward.grad_input",
     ](site)
@@ -5206,26 +5785,33 @@ def register_pointwise(site: Site) raises:
         "softshrink.out",
     ](site)
     impl[
-        f8_iter[
-            op_shrink_backward,
-            "shrink_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_shrink_backward,
+                "shrink_backward_cuda",
+                3,
+                -1,
+                MODE_FN,
+                False,
+                PRE_NONE,
+            ],
             3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
         ],
         "softshrink_backward",
     ](site)
     impl[
-        f8_iter[
-            op_shrink_backward_grad_input,
-            "shrink_backward_cuda",
+        cuda_device_check[
+            f8_iter[
+                op_shrink_backward_grad_input,
+                "shrink_backward_cuda",
+                3,
+                3,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+            ],
             3,
             3,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "softshrink_backward.grad_input",
     ](site)

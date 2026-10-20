@@ -509,6 +509,33 @@ def cx_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+# sigmoid_backward / tanh_backward --------------------------------------------
+
+
+def cx_backward[
+    kind: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`kind(grad_output, output)` with a complex operand."""
+    _ret(
+        rets,
+        _arith(kind, args[unsafe_offset=0], args[unsafe_offset=1], _no_alpha()),
+    )
+
+
+def cx_backward_out[
+    kind: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`kind.grad_input(grad_output, output, *, grad_input)` with a complex
+    operand."""
+    var dest = v_tensor_c(args[unsafe_offset=2])
+    _store_ew[2](
+        args,
+        dest,
+        _arith(kind, args[unsafe_offset=0], args[unsafe_offset=1], _no_alpha()),
+        rets,
+    )
+
+
 # mul / div ------------------------------------------------------------------
 
 
@@ -861,6 +888,10 @@ comptime cx_rsqrt = cx_unary["rsqrt", _TO_CX]
 comptime cx_rsqrt_out = cx_unary_out["rsqrt", _TO_CX]
 comptime cx_sgn = cx_unary["sgn", _TO_CX]
 comptime cx_sgn_out = cx_unary_same_out["sgn"]
+comptime cx_sigmoid = cx_unary["sigmoid", _TO_CX]
+comptime cx_sigmoid_out = cx_unary_out["sigmoid", _TO_CX]
+comptime cx_silu = cx_unary["silu", _TO_CX]
+comptime cx_silu_out = cx_unary_same_out["silu"]
 comptime cx_sqrt = cx_unary["sqrt", _TO_CX]
 comptime cx_sqrt_out = cx_unary_out["sqrt", _TO_CX]
 comptime cx_isnan = cx_unary["isnan", _TO_BOOL]

@@ -10,6 +10,7 @@ from std.math import (
     copysign,
     erf,
     exp,
+    fma,
     floor,
     log,
     log1p,
@@ -33,16 +34,22 @@ from std.utils.numerics import isnan, max_or_inf, nan
 from tmb.kernels.common.cuda_math import (
     nv_asinf,
     nv_atanf,
+    nv_erf,
+    nv_erff,
     nv_erfcf,
     nv_erfinvf,
     nv_exp2f,
     nv_expm1f,
     nv_lgammaf,
     nv_log10f,
+    nv_tanh,
+    nv_tanhf,
 )
 from tmb.kernels.common.libdevice_port import (
     nv_asinh,
     nv_asinhf,
+    nv_exp,
+    nv_expf_plus,
     nv_log2f,
     nv_logf,
 )
@@ -442,6 +449,45 @@ def _asinh[
 
 
 @always_inline
+def _cuda_activation_f32[kind: StaticString](x: Float32) -> Float32:
+    """sigmoid / silu / gelu as CUDA's float kernels run them
+    (UnarySpecialOpsKernel.cu, ActivationSiluKernel.cu,
+    ActivationGeluKernel.cu) in the order nvcc emits."""
+    comptime if kind == "sigmoid":
+        return Float32(1) / nv_expf_plus(-x, Float32(1))
+    elif kind == "silu":
+        return x / nv_expf_plus(-x, Float32(1))
+    elif kind == "gelu_none":
+        return (x * Float32(0.5)) * (
+            Float32(1) + nv_erff(x * Float32(0.70710678118654752440))
+        )
+    else:
+        # x + kKappa * x^3 contracts into one fma.
+        var inner = Float32(0.79788456080286535588) * fma(
+            (x * x) * x, Float32(0.044715), x
+        )
+        return (x * Float32(0.5)) * (Float32(1) + nv_tanhf(inner))
+
+
+@always_inline
+def _cuda_activation_f64[kind: StaticString](x: Float64) -> Float64:
+    """`_cuda_activation_f32` for double."""
+    comptime if kind == "sigmoid":
+        return Float64(1) / (Float64(1) + nv_exp(-x))
+    elif kind == "silu":
+        return x / (Float64(1) + nv_exp(-x))
+    elif kind == "gelu_none":
+        return (x * Float64(0.5)) * (
+            Float64(1) + nv_erf(x * Float64(0.70710678118654752440))
+        )
+    else:
+        var inner = Float64(0.79788456080286535588) * fma(
+            (x * x) * x, Float64(0.044715), x
+        )
+        return (x * Float64(0.5)) * (Float64(1) + nv_tanh(inner))
+
+
+@always_inline
 def _float_unary[
     kind: StaticString, dtype: DType, width: SIMDLength
 ](a: SIMD[dtype, width]) -> SIMD[dtype, width] where dtype.is_floating_point():
@@ -554,6 +600,23 @@ def _float_unary[
         res = 1 / a
     comptime if kind == "rsqrt":
         res = 1 / ieee_sqrt(a)
+    comptime if (
+        kind == "sigmoid"
+        or kind == "silu"
+        or kind == "gelu_none"
+        or kind == "gelu_tanh"
+    ) and is_nvidia_gpu():
+        # The CUDA kernels' formulas over libdevice, NaN included.
+        comptime for i in range(width):
+            comptime if dtype == DType.float32:
+                res[i] = _cuda_activation_f32[kind](
+                    a[i].cast[DType.float32]()
+                ).cast[dtype]()
+            else:
+                res[i] = _cuda_activation_f64[kind](
+                    a[i].cast[DType.float64]()
+                ).cast[dtype]()
+        return res
     comptime if kind == "sigmoid":
         res = 1 / (1 + exp(-a))
     comptime if kind == "silu":
@@ -600,6 +663,16 @@ def elementwise_unary[
     kind: StaticString, dtype: DType, width: SIMDLength
 ](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
     comptime if kind == "relu":
+        comptime if is_nvidia_gpu() and dtype.is_floating_point():
+            # CUDA's relu is clamp_min(x, 0): NaN kept, fmaxf(-0.0, 0) = +0.
+            # -0.0 is tested on the bits: a float `x <= 0` select becomes a
+            # max.f32, which loses the NaN payload.
+            comptime u = DType.uint64 if dtype == DType.float64 else (
+                DType.uint32 if dtype == DType.float32 else DType.uint16
+            )
+            comptime sign = Scalar[u](1) << Scalar[u](bit_width_of[dtype]() - 1)
+            var neg_zero = bitcast[u](x).eq(sign)
+            return (x.lt(0) | neg_zero).select(SIMD[dtype, width](0), x)
         # Return the input for NaN and signed zero, as ATen relu does.
         return x.lt(0).select(SIMD[dtype, width](0), x)
     elif kind == "abs":

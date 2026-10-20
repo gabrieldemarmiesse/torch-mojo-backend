@@ -115,6 +115,10 @@ from tmb.ops.complex_math import (
     cx_rsqrt_out,
     cx_sgn,
     cx_sgn_out,
+    cx_sigmoid,
+    cx_sigmoid_out,
+    cx_silu,
+    cx_silu_out,
     cx_sqrt,
     cx_sqrt_out,
 )
@@ -385,14 +389,6 @@ def _unary_out(
 def _float_unary(op: String, t: T) raises -> T:
     _require_float(op, t.dtype)
     return _unary("elementwise", op, t, t.dtype)
-
-
-def _float_unary_out(op: String, t: T, mut dst: T) raises:
-    _f8_out_refuse(op, t, dst, op == "SiluSpec")
-    _require_float(op, t.dtype)
-    # silu is a `unary_op` structured kernel (the out dtype is self's); the
-    # rest are `unary_float_op`s, which cast.
-    _unary_out("elementwise", op, t, dst, t.dtype, op != "SiluSpec")
 
 
 def _direct_unary(op: String, t: T) raises -> T:
@@ -797,7 +793,7 @@ def op_sigmoid_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::silu(Tensor self) -> Tensor
 def op_silu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
-    var out = own(_float_unary("SiluSpec", t))
+    var out = own(_activation_unary("SiluSpec", t))
     ret_owned(rets, 0, out)
 
 
@@ -805,7 +801,9 @@ def op_silu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_silu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var dst = v_tensor(args[unsafe_offset=1])
-    _float_unary_out("SiluSpec", t, dst)
+    # a `unary_op` structured kernel: the out dtype is self's
+    _f8_out_refuse("SiluSpec", t, dst, True)
+    _activation_unary_out("SiluSpec", t, dst)
     ret_ref(rets, 0, dst)
 
 
@@ -1423,6 +1421,26 @@ def _float_or_f64_unary(op: String, t: T) raises -> T:
     return _unary("elementwise", op, t, t.dtype)
 
 
+def _require_float_or_cuda_f64(op: String, t: T) raises:
+    """The float dtypes, plus float64 on NVIDIA, where the activation
+    kernels run the libdevice float64 ports CUDA's do."""
+    if t.dtype == DType.float64 and dev(t.device)[].api == "cuda":
+        return
+    _require_float(op, t.dtype)
+
+
+def _activation_unary(op: String, t: T) raises -> T:
+    _require_float_or_cuda_f64(op, t)
+    return _unary("elementwise", op, t, t.dtype)
+
+
+def _activation_unary_out(
+    op: String, t: T, mut dst: T, cast_ok: Bool = False
+) raises:
+    _require_float_or_cuda_f64(op, t)
+    _unary_out("elementwise", op, t, dst, t.dtype, cast_ok)
+
+
 def _float_or_f64_unary_out(
     op: String, t: T, mut dst: T, cast_ok: Bool = False
 ) raises:
@@ -1443,6 +1461,8 @@ def _promoting_unary(op: String, t: T) raises -> T:
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":  # the one op of these that takes float64
         return _float_or_f64_unary(op, src.t)
+    if op == "SigmoidSpec":
+        return _activation_unary(op, src.t)
     return _float_unary(op, src.t)
 
 
@@ -1452,6 +1472,8 @@ def _promoting_unary_out(op: String, t: T, mut dst: T) raises:
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":
         _float_or_f64_unary_out(op, src.t, dst, True)
+    elif op == "SigmoidSpec":
+        _activation_unary_out(op, src.t, dst, True)
     else:
         _require_float(op, src.t.dtype)
         _unary_out("elementwise", op, src.t, dst, src.t.dtype, True)
@@ -2078,7 +2100,7 @@ def op_gelu(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var t = v_tensor(args[unsafe_offset=0])
     var approximate = v_string(args[unsafe_offset=1])
     var spec = _gelu_spec(approximate)
-    var out = own(_float_unary(spec, t))
+    var out = own(_activation_unary(spec, t))
     ret_owned(rets, 0, out)
 
 
@@ -2090,8 +2112,7 @@ def op_gelu_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var spec = _gelu_spec(approximate)
     # gelu is a `unary_op`-style structured kernel: the out dtype is self's
     # (no cast, unlike the `unary_float_op`s).
-    _require_float(spec, t.dtype)
-    _unary_out("elementwise", spec, t, dst, t.dtype)
+    _activation_unary_out(spec, t, dst)
     ret_ref(rets, 0, dst)
 
 
@@ -2847,12 +2868,26 @@ def register_unary(site: Site) raises:
         "sgn.out",
     ](site)
     impl[
-        f8_iter[op_sigmoid, "sigmoid_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_sigmoid, cx_sigmoid, 1],
+            "sigmoid_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "sigmoid",
     ](site)
     impl[
         f8_iter[
-            op_sigmoid_out, "sigmoid_cuda", 1, 1, MODE_CAST, False, PRE_NONE
+            routed[op_sigmoid_out, cx_sigmoid_out, 2],
+            "sigmoid_cuda",
+            1,
+            1,
+            MODE_CAST,
+            False,
+            PRE_NONE,
         ],
         "sigmoid.out",
     ](site)
@@ -2915,11 +2950,27 @@ def register_unary(site: Site) raises:
         "signbit.out",
     ](site)
     impl[
-        f8_iter[op_silu, "silu_cuda", 1, -1, MODE_FN, False, PRE_NONE],
+        f8_iter[
+            routed[op_silu, cx_silu, 1],
+            "silu_cuda",
+            1,
+            -1,
+            MODE_FN,
+            False,
+            PRE_NONE,
+        ],
         "silu",
     ](site)
     impl[
-        f8_iter[op_silu_out, "silu_cuda", 1, 1, MODE_SAME, False, PRE_NONE],
+        f8_iter[
+            routed[op_silu_out, cx_silu_out, 2],
+            "silu_cuda",
+            1,
+            1,
+            MODE_SAME,
+            False,
+            PRE_NONE,
+        ],
         "silu.out",
     ](site)
     impl[

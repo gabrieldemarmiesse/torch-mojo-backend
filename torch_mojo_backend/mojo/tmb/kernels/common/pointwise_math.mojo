@@ -50,6 +50,7 @@ from tmb.kernels.common.libdevice_port import (
     _trig_reduction_slowpath_d,
     nv_exp,
     nv_expf,
+    nv_expf_plus,
     nv_log,
     nv_log1p,
     nv_log1pf,
@@ -175,8 +176,42 @@ def _tanh_cuda[w: DType, n: Int](x: SIMD[w, n]) -> SIMD[w, n]:
 
 
 @always_inline
+def _nan_arith[w: DType, n: Int](a: SIMD[w, n], r: SIMD[w, n]) -> SIMD[w, n]:
+    """`r`, with a NaN `a` replaced by what CUDA's arithmetic makes of it:
+    NVIDIA float32 math returns the canonical NaN (0x7FFFFFFF), float64
+    math the operand quieted; elsewhere `a` itself."""
+    comptime if is_nvidia_gpu() and w == DType.float32:
+        return isnan(a).select(
+            bitcast[w, n](SIMD[DType.uint32, n](0x7FFFFFFF)), r
+        )
+    elif is_nvidia_gpu() and w == DType.float64:
+        var quiet = bitcast[DType.uint64, n](a) | SIMD[DType.uint64, n](
+            UInt64(0x0008000000000000)
+        )
+        return isnan(a).select(bitcast[w, n](quiet), r)
+    else:
+        return isnan(a).select(a, r)
+
+
+@always_inline
+def _exp_plus[w: DType, n: Int](x: SIMD[w, n], c: SIMD[w, n]) -> SIMD[w, n]:
+    """`exp(x) + c` of a CUDA kernel: nvcc contracts expf's closing scale
+    product into the add (`nv_expf_plus`); double adds the rounded exp."""
+    comptime if w == DType.float32 and is_nvidia_gpu():
+        var r = SIMD[w, n]()
+        comptime for i in range(n):
+            r[i] = nv_expf_plus(
+                x[i].cast[DType.float32](), c[i].cast[DType.float32]()
+            ).cast[w]()
+        return r
+    else:
+        return _exp(x) + c
+
+
+@always_inline
 def _sigmoid[w: DType, n: Int](x: SIMD[w, n]) -> SIMD[w, n]:
-    return 1 / (1 + _exp(-x))
+    """`1 / (1 + exp(-x))` of the CUDA kernels."""
+    return 1 / _exp_plus(-x, SIMD[w, n](1))
 
 
 @always_inline
@@ -1390,6 +1425,8 @@ def is_scalar_t_kind[kind: StaticString]() -> Bool:
         or kind == "bce_backward"
         or kind == "bce_logits"
         or kind == "mul_scale"
+        or kind == "sigmoid_backward"
+        or kind == "tanh_backward"
     )
 
 
@@ -1539,6 +1576,18 @@ def _scalar_t[
             )
             - ls
         )
+    elif kind == "sigmoid_backward":
+        # BinaryMiscBackwardOpsKernels.cu, in scalar_t: a * (1 - b) * b.
+        res = _st_round[dtype](x * _st_round[dtype](one - y, fence), fence) * y
+    elif kind == "tanh_backward":
+        # a * (1 - b * b) in scalar_t; nvcc fuses float / double into
+        # a * fma(-b, b, 1).
+        comptime if dtype == w:
+            res = x * (-y).fma(y, one)
+        else:
+            res = x * _st_round[dtype](
+                one - _st_round[dtype](y * y, fence), fence
+            )
     elif kind == "mul_scale":
         # `t.mul_(w)` then a mean's `div_(numel)` (p0 = 1 / numel, or 1).
         res = _st_round[dtype](x * y, fence) * q[0]
@@ -1783,7 +1832,7 @@ def _wide[
         # CPU and CUDA keep; expm1 is kept on every GPU.)
         var negcoef = p[0] * p[1]
         var r = a.gt(0).select(a * p[1], _expm1(a * p[2]) * negcoef)
-        return isnan(a).select(a, r)
+        return _nan_arith(a, r)
     elif kind == "hardshrink":
         # p0 = lambd rounded to the input dtype by the host; NaN is kept.
         var keep = a.ge(-p[0]) & a.le(p[0])
@@ -1800,7 +1849,7 @@ def _wide[
             r = min(max((a + 3) / 6, zero), one)
         else:
             r = min(max(a + 3, zero), SIMD[w, n](6)) * _one_sixth[w, n]()
-        return isnan(a).select(a, r)
+        return _nan_arith(a, r)
     elif kind == "hardswish":
         # CUDA: x * min(max(x + 3, 0), 6) * one_sixth; MPS: ... / 6.
         var r: SIMD[w, n]
@@ -1808,7 +1857,7 @@ def _wide[
             r = a * min(max(a + 3, zero), SIMD[w, n](6)) / 6
         else:
             r = a * min(max(a + 3, zero), SIMD[w, n](6)) * _one_sixth[w, n]()
-        return isnan(a).select(a, r)
+        return _nan_arith(a, r)
     elif kind == "hardtanh":
         # hardtanh is two-bound clamp(x, min_val, max_val): a NaN x passes
         # through, and a NaN bound fills NaN (min/max would drop it).
@@ -1819,13 +1868,13 @@ def _wide[
         return isnan(a).select(a, r)
     elif kind == "leaky_relu":
         var r = a.gt(0).select(a, a * p[0])
-        return isnan(a).select(a, r)
+        return _nan_arith(a, r)
     elif kind == "softplus":
         # p = (beta, threshold): x * beta > threshold ? x
         #                       : log1p(exp(x * beta)) / beta.
         var xb = a * p[0]
         var r = xb.gt(p[1]).select(a, _log1p(_exp(xb)) / p[0])
-        return isnan(a).select(a, r)
+        return _nan_arith(a, r)
     elif kind == "mish":
         # ActivationMishKernel.cu: x * tanh(log1p(exp(x))), tanh being
         # c10::cuda::compat::tanh (libdevice tanhf) on NVIDIA.
@@ -1852,7 +1901,7 @@ def _wide[
     elif kind == "log_sigmoid":
         # ActivationLogSigmoidKernel.cu: min(0, x) - log1p(exp(-|x|)).
         var r = min(zero, a) - _log1p(_exp(-abs(a)))
-        return isnan(a).select(a, r)
+        return _nan_arith(a, r)
     # --- activation backwards ------------------------------------------------
     elif kind == "elu_backward":
         # a = grad, b = self or result; p = (alpha, scale, input_scale,
@@ -1867,7 +1916,8 @@ def _wide[
                 neg = a * (p[2] * p[0] * p[1] * _exp(b * p[2]))
         else:
             if p[3] != 0:
-                neg = a * p[2] * (b + negcoef)
+                # (a * input_scale) * (b + negcoef), each rounded
+                neg = _mul_rn(_mul_rn(a, SIMD[w, n](p[2])), b + negcoef)
             else:
                 neg = a * p[2] * negcoef * _exp(b * p[2])
         return (b.le(0) & ~isnan(b)).select(neg, a * p[1])
@@ -2738,12 +2788,56 @@ def pointwise[
                 q.cast[DType.float64](),
             ).cast[out_dtype]()
         else:
-            return _wide[kind](
+            var r = _wide[kind](
                 a.cast[DType.float32](),
                 b.cast[DType.float32](),
                 c.cast[DType.float32](),
                 q.cast[DType.float32](),
-            ).cast[out_dtype]()
+            )
+            comptime if is_nvidia_gpu() and _opmath_activation[kind]() and (
+                out_dtype == DType.float16 or out_dtype == DType.bfloat16
+            ):
+                # A NaN leaves stock CUDA's opmath kernels as 0x7FFF in half
+                # and bfloat16, whatever the operand's payload (measured).
+                r = isnan(r).select(
+                    bitcast[DType.float32, n](
+                        SIMD[DType.uint32, n](0x7FFFFFFF)
+                    ),
+                    r,
+                )
+            return r.cast[out_dtype]()
+
+
+@always_inline
+def _opmath_activation[kind: StaticString]() -> Bool:
+    """The activation kinds whose CUDA kernels compute in opmath_t (the
+    shrinks, threshold and hardtanh stay in scalar_t)."""
+    return (
+        kind == "elu"
+        or kind == "hardsigmoid"
+        or kind == "hardswish"
+        or kind == "leaky_relu"
+        or kind == "softplus"
+        or kind == "mish"
+        or kind == "log_sigmoid"
+        or kind == "elu_backward"
+        or kind == "hardsigmoid_backward"
+        or kind == "hardswish_backward"
+        or kind == "hardtanh_backward"
+        or kind == "leaky_relu_backward"
+        or kind == "softplus_backward"
+        or kind == "mish_backward"
+        or kind == "glu"
+        or kind == "glu_backward_a"
+        or kind == "glu_backward_b"
+        or kind == "glu_jvp"
+        or kind == "glu_jvp_res"
+        or kind == "silu_backward"
+        or kind == "log_sigmoid_backward"
+        or kind == "logit_backward"
+        or kind == "gelu_backward_none"
+        or kind == "gelu_backward_tanh"
+    )
 
 
 @always_inline

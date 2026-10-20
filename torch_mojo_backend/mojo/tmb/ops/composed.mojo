@@ -66,7 +66,6 @@ from tmb.backend.device import (
     dev,
 )
 from tmb.backend.kernel_call import KernelCall
-from tmb.ops.matmul import _sm90_cuda
 from tmb.ops.common import (
     scalar_type_name,
     threshold_into_overlapping,
@@ -123,22 +122,6 @@ def _dispatch_into(
     reference to `out`, which `Results` releases."""
     _ = call_op(String(name), String(overload), args^, 1)
     _ = target
-
-
-def _one_minus(x: T) raises -> T:
-    """1 - x as neg(x - 1): sub.Scalar then neg, both registered."""
-    var xm1 = _dispatch(
-        "aten::sub",
-        "Scalar",
-        [
-            _tensor_value(x),
-            Value(TAG_SCALAR_INT, 0, 1, 0),
-            Value(TAG_SCALAR_INT, 0, 1, 0),
-        ],
-    )
-    var r = _dispatch("aten::neg", "", [_tensor_value(xm1)])
-    release(xm1.h)
-    return r^
 
 
 # aten::threshold_backward(Tensor grad_output, Tensor self, Scalar threshold) -> Tensor
@@ -240,147 +223,6 @@ def op_threshold_backward_grad_input(
     ):
         return
     unsupported("threshold_backward.grad_input with an out off the mojo device")
-
-
-# aten::sigmoid_backward(Tensor grad_output, Tensor output) -> Tensor: grad * out * (1 - out)
-def _sigmoid_backward_factor(output: T) raises -> T:
-    var om = _one_minus(output)
-    var f = _dispatch(
-        "aten::mul", "Tensor", [_tensor_value(output), _tensor_value(om)]
-    )
-    release(om.h)
-    return f^
-
-
-def op_sigmoid_backward(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var grad = v_tensor(args[unsafe_offset=0])
-    var f = _sigmoid_backward_factor(v_tensor(args[unsafe_offset=1]))
-    var g = own(
-        _dispatch(
-            "aten::mul", "Tensor", [_tensor_value(grad), _tensor_value(f)]
-        )
-    )
-    release(f.h)
-    ret_owned(rets, 0, g)
-
-
-# aten::sigmoid_backward.grad_input(Tensor grad_output, Tensor output, *, Tensor(a!) grad_input)
-def op_sigmoid_backward_grad_input(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var grad = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=2])
-    var f = _sigmoid_backward_factor(v_tensor(args[unsafe_offset=1]))
-    _dispatch_into(
-        "aten::mul",
-        "out",
-        [_tensor_value(grad), _tensor_value(f), _tensor_value(out)],
-        out,
-    )
-    release(f.h)
-    ret_ref(rets, 0, out)
-
-
-def _tanh_fused_inputs(grad: T, output: T) raises -> Bool:
-    return (
-        grad.on_mojo()
-        and output.on_mojo()
-        and grad.device == output.device
-        and grad.dtype == DType.float32
-        and output.dtype == DType.float32
-        and grad.contig
-        and output.contig
-        and grad.same_shape(output)
-        and _sm90_cuda(grad.device)
-    )
-
-
-def _tanh_safe_output(dst: T, input: T) -> Bool:
-    # Called only for equal-shape contiguous FP32 tensors. Exact aliases are
-    # elementwise-safe; partial overlap keeps the existing temporary route.
-    return (
-        dst.numel == 0
-        or dst.ptr == input.ptr
-        or dst.ptr + dst.numel * dst.itemsize <= input.ptr
-        or input.ptr + input.numel * input.itemsize <= dst.ptr
-    )
-
-
-def _tanh_fused_into(dst: T, grad: T, output: T) raises:
-    if dst.numel == 0:
-        return
-    var ctx = ctx_for(dst.device)
-    var call = KernelCall("activation_backward", "TanhBackwardF32")
-    call.int(dst.ptr)
-    call.int(grad.ptr)
-    call.int(output.ptr)
-    call.int(dst.numel)
-    call.int(ctx_ptr(ctx))
-    call.run()
-    _ = ctx
-
-
-# aten::tanh_backward(Tensor grad_output, Tensor output) -> Tensor: grad * (1 - out^2)
-def _tanh_backward_factor(output: T) raises -> T:
-    var sq = _dispatch(
-        "aten::mul", "Tensor", [_tensor_value(output), _tensor_value(output)]
-    )
-    var f = _one_minus(sq)
-    release(sq.h)
-    return f^
-
-
-def op_tanh_backward(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var grad = v_tensor(args[unsafe_offset=0])
-    var output = v_tensor(args[unsafe_offset=1])
-    if _tanh_fused_inputs(grad, output):
-        var result = own(new_like(grad))
-        _tanh_fused_into(result.t, grad, output)
-        ret_owned(rets, 0, result)
-        return
-    var f = _tanh_backward_factor(output)
-    var g = own(
-        _dispatch(
-            "aten::mul", "Tensor", [_tensor_value(grad), _tensor_value(f)]
-        )
-    )
-    release(f.h)
-    ret_owned(rets, 0, g)
-
-
-# aten::tanh_backward.grad_input(Tensor grad_output, Tensor output, *, Tensor(a!) grad_input)
-def op_tanh_backward_grad_input(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    var grad = v_tensor(args[unsafe_offset=0])
-    var out = v_tensor(args[unsafe_offset=2])
-    var output = v_tensor(args[unsafe_offset=1])
-    if (
-        _tanh_fused_inputs(grad, output)
-        and out.on_mojo()
-        and out.device == grad.device
-        and out.dtype == DType.float32
-        and out.contig
-        and out.same_shape(grad)
-        and _tanh_safe_output(out, grad)
-        and _tanh_safe_output(out, output)
-    ):
-        _tanh_fused_into(out, grad, output)
-        ret_ref(rets, 0, out)
-        return
-    var f = _tanh_backward_factor(output)
-    _dispatch_into(
-        "aten::mul",
-        "out",
-        [_tensor_value(grad), _tensor_value(f), _tensor_value(out)],
-        out,
-    )
-    release(f.h)
-    ret_ref(rets, 0, out)
 
 
 # ---------------------------------------------------------------------------
@@ -1681,54 +1523,6 @@ def register_composed(site: Site) raises:
             False,
         ],
         "threshold_backward.grad_input",
-    ](site)
-    impl[
-        f8_iter[
-            op_sigmoid_backward,
-            "sigmoid_backward_cuda",
-            3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
-        ],
-        "sigmoid_backward",
-    ](site)
-    impl[
-        f8_iter[
-            op_sigmoid_backward_grad_input,
-            "sigmoid_backward_cuda",
-            3,
-            2,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
-        ],
-        "sigmoid_backward.grad_input",
-    ](site)
-    impl[
-        f8_iter[
-            op_tanh_backward,
-            "tanh_backward_cuda",
-            3,
-            -1,
-            MODE_FN,
-            False,
-            PRE_NONE,
-        ],
-        "tanh_backward",
-    ](site)
-    impl[
-        f8_iter[
-            op_tanh_backward_grad_input,
-            "tanh_backward_cuda",
-            3,
-            2,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
-        ],
-        "tanh_backward.grad_input",
     ](site)
     impl[routed[op_where_self_out, cx_where_out, 3], "where.self_out"](site)
     impl[op_native_batch_norm_backward, "native_batch_norm_backward"](site)

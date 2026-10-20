@@ -28,6 +28,8 @@ tests that survive the fast-math flags) rather than a comparison.
 """
 
 from std.memory import bitcast
+from std.sys._assembly import inlined_assembly
+from std.sys.info import is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
 from tmb.kernels.common.math_utils import ieee_sqrt
@@ -36,6 +38,7 @@ from tmb.kernels.common.pointwise_math import (
     _log,
     _log1p,
     _pcos,
+    _mul_rn,
     _psin,
     param_dtype,
     pointwise,
@@ -509,6 +512,119 @@ def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
             x = Scalar[dt](0) * (a * c + b * d)
             y = Scalar[dt](0) * (b * c - a * d)
     return Cx[dt](x, y)
+
+
+@always_inline
+def _radd[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """`a + b` as one add.rn on NVIDIA, never folded (`0 + x` turns a -0
+    imaginary part into +0 and quiets a NaN)."""
+    comptime if is_nvidia_gpu():
+        comptime asm = "add.rn.f64 $0, $1, $2;" if dt == DType.float64 else (
+            "add.rn.f32 $0, $1, $2;"
+        )
+        comptime cons = "=d,d,d" if dt == DType.float64 else "=f,f,f"
+        return inlined_assembly[
+            asm, Scalar[dt], constraints=cons, has_side_effect=False
+        ](a, b)
+    else:
+        return a + b
+
+
+@always_inline
+def _rmul[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """A product no later add may absorb into an fma (`_mul_rn`)."""
+    return _mul_rn[dt, 1](a, b)[0]
+
+
+@always_inline
+def cmul_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+    """libc++'s operator*(complex, complex) (the jiterated kernels'):
+    (ac - bd) + (ad + bc)i, each product rounded (no fused multiply-add:
+    what stock CUDA's complex64 kernels compute), with Annex G's recovery
+    of an infinite product that came out NaN + NaN i."""
+    # Modified from libc++ operator*(const complex&, const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
+    var a = z.re
+    var b = z.im
+    var c = w.re
+    var d = w.im
+    var x = _rmul(a, c) - _rmul(b, d)
+    var y = _rmul(a, d) + _rmul(b, c)
+    if isnan(x) and isnan(y):
+        var recalc = False
+        if isinf(a) or isinf(b):
+            a = _copysign(Scalar[dt](1) if isinf(a) else Scalar[dt](0), a)
+            b = _copysign(Scalar[dt](1) if isinf(b) else Scalar[dt](0), b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if isinf(c) or isinf(d):
+            c = _copysign(Scalar[dt](1) if isinf(c) else Scalar[dt](0), c)
+            d = _copysign(Scalar[dt](1) if isinf(d) else Scalar[dt](0), d)
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            recalc = True
+        if not recalc and (
+            isinf(z.re * w.re)
+            or isinf(z.im * w.im)
+            or isinf(z.re * w.im)
+            or isinf(z.im * w.re)
+        ):
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if recalc:
+            x = _inf[dt]() * (_rmul(a, c) - _rmul(b, d))
+            y = _inf[dt]() * (_rmul(a, d) + _rmul(b, c))
+    return Cx[dt](x, y)
+
+
+@always_inline
+def csigmoid_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    """sigmoid_kernel_cuda's jiterated complex body,
+    `T{1} / (T{1} + std::exp(-x))`, in libc++'s complex."""
+    var e = cexp_jit(Cx[dt](-z.re, -z.im))
+    return cdiv_jit(
+        Cx[dt](Scalar[dt](1), Scalar[dt](0)),
+        Cx[dt](_radd(Scalar[dt](1), e.re), _radd(Scalar[dt](0), e.im)),
+    )
+
+
+@always_inline
+def csilu[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    """silu_kernel's complex body, `x / (1 + ::exp(-x))` in c10::complex
+    (thrust's exp, c10's scaled division)."""
+    var e = cexp(Cx[dt](-z.re, -z.im))
+    return cdiv(
+        z, Cx[dt](_radd(Scalar[dt](1), e.re), _radd(Scalar[dt](0), e.im))
+    )
+
+
+@always_inline
+def csigmoid_backward_jit[dt: DType](a: Cx[dt], b: Cx[dt]) -> Cx[dt]:
+    """sigmoid_backward's jiterated complex body,
+    `a * std::conj((T{1.} - b) * b)`."""
+    var t = Cx[dt](_radd(Scalar[dt](1), -b.re), _radd(Scalar[dt](0), -b.im))
+    var u = cmul_jit(t, b)
+    return cmul_jit(a, Cx[dt](u.re, -u.im))
+
+
+@always_inline
+def ctanh_backward_jit[dt: DType](a: Cx[dt], b: Cx[dt]) -> Cx[dt]:
+    """tanh_backward's jiterated complex body, `a * std::conj(T{1.} - b * b)`.
+    """
+    var s = cmul_jit(b, b)
+    var t = Cx[dt](_radd(Scalar[dt](1), -s.re), _radd(Scalar[dt](0), -s.im))
+    return cmul_jit(a, Cx[dt](t.re, -t.im))
 
 
 @always_inline

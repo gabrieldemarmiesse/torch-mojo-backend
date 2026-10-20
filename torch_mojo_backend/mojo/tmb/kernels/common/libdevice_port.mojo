@@ -390,6 +390,14 @@ def nv_expf(a: Float32) -> Float32:
     comptime if not is_nvidia_gpu():
         return _std_exp(a)
 
+    var parts = _nv_expf_parts(a)
+    return parts[0] * parts[1]
+
+
+@always_inline
+def _nv_expf_parts(a: Float32) -> Tuple[Float32, Float32]:
+    """(ex2.approx.ftz(z), 2**j) of `__nv_expf`, whose product is e^a.
+    NVIDIA only."""
     comptime l2e = Float32(from_bits=UInt32(0x3FB8AA3B))  # log2(e) high
     comptime l2e_lo = Float32(from_bits=UInt32(0x32A57060))  # log2(e) low
     comptime magic = Float32(from_bits=UInt32(0x4B400000))  # 1.5 * 2**23
@@ -406,7 +414,18 @@ def nv_expf(a: Float32) -> Float32:
     # f is an integer in [1.5*2**23 + 1, +252]; its low 9 bits shifted into the
     # exponent field build 2**(f - 1.5*2**23).
     var scale = Float32(from_bits=f.to_bits[DType.uint32]() << UInt32(23))
-    return _ex2_approx_ftz_f(z) * scale
+    return (_ex2_approx_ftz_f(z), scale)
+
+
+@always_inline
+def nv_expf_plus(a: Float32, c: Float32) -> Float32:
+    """`__nv_expf(a) + c` as nvcc emits it once expf is inlined: the scale
+    product contracts into the add, fma(2**j, ex2(z), c) (sigmoid, silu:
+    `1 + exp(-x)`). Off NVIDIA, exp(a) + c."""
+    comptime if not is_nvidia_gpu():
+        return _std_exp(a) + c
+    var parts = _nv_expf_parts(a)
+    return fma(parts[1], parts[0], c)
 
 
 # --------------------------------------------------------------------------- #
