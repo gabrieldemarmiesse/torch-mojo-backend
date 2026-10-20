@@ -65,6 +65,9 @@ from tmb.kernels.common.pow_math import (
     POW_RSQRT,
     POW_SQRT,
     POW_SQUARE,
+    cuda_reciprocal,
+    cuda_rsqrt,
+    cuda_sqrt,
     pow_c99,
     torch_pow,
 )
@@ -1191,10 +1194,14 @@ def _pow_exp[
             var sq = cast_rounded[dtype](x * x).cast[w]()
             return (1 / sq).cast[out_dtype]()
         if mode == POW_SQRT:
+            comptime if dtype == DType.float64:
+                return cuda_sqrt(x).cast[out_dtype]()
             return elementwise_unary["sqrt"](x).cast[out_dtype]()
         if mode == POW_RSQRT:
-            return elementwise_unary["rsqrt"](x).cast[out_dtype]()
+            return cuda_rsqrt(x).cast[out_dtype]()
         if mode == POW_RECIPROCAL:
+            comptime if dtype == DType.float64:
+                return cuda_reciprocal(x).cast[out_dtype]()
             return elementwise_unary["reciprocal"](x).cast[out_dtype]()
         comptime if dtype == DType.float64:
             var xd = a.cast[DType.float64]()
