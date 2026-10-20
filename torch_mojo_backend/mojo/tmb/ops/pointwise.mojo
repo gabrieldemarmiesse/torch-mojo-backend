@@ -637,7 +637,7 @@ def _pw_complex_out_check(args: Values, arity: Int, out_index: Int) raises:
     if not dest.is_complex():
         raise Error(
             "result type ",
-            scalar_type_name(max_dtype(cx)),
+            scalar_type_name(cx),
             " can't be cast to the desired output type ",
             scalar_type_name(dest.dtype),
         )
@@ -5578,6 +5578,7 @@ def register_pointwise(site: Site) raises:
             MODE_OUTDT,
             False,
             PRE_NONE,
+            convert_to_out=True,
         ],
         "logaddexp.out",
     ](site)
@@ -5596,6 +5597,7 @@ def register_pointwise(site: Site) raises:
             MODE_OUTDT,
             False,
             PRE_NONE,
+            convert_to_out=True,
         ],
         "logaddexp2.out",
     ](site)
