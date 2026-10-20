@@ -2652,7 +2652,7 @@ def _b_is_bitwise(op: StaticString) -> Bool:
     )
 
 
-def _b_bitwise(
+def _b_bitwise_exact(
     op: StaticString, lhs: Side, rhs: Side, dst: Optional[T]
 ) raises -> Res:
     """bitwise_and / or / xor in the common dtype (an integer Scalar wraps
@@ -2675,6 +2675,14 @@ def _b_bitwise(
     _ = a^
     _ = b^
     return r^
+
+
+def _b_bitwise(
+    op: StaticString, lhs: Side, rhs: Side, dst: Optional[T]
+) raises -> Res:
+    if _b_exact_sides(lhs, rhs):
+        return _b_bitwise_exact(op, lhs, rhs, dst)
+    return _b_binary(op, lhs, rhs, Int32(-1), dst)
 
 
 def _b_simple(op: StaticString, args: Values, rets: Values) raises:
@@ -2729,7 +2737,12 @@ def _b_simple_out(
                 + "'"
             )
         # dispatched on the out dtype: a floating out refuses as itself
-        if not _b_int_dtype(dest.stype) and dest.stype != ST_BOOL:
+        # (CUDA only: elsewhere the result is cast into the out)
+        if (
+            _b_exact_on(dest)
+            and not _b_int_dtype(dest.stype)
+            and dest.stype != ST_BOOL
+        ):
             unsupported(
                 '"'
                 + _b_cuda_kernel(op)
@@ -2828,7 +2841,7 @@ def op_pow_tensor_out(
     _b_simple_out("PowSpec", args, rets, 2)
 
 
-def _b_maxmin_res(
+def _b_maxmin_res_exact(
     op: StaticString,
     bool_op: StaticString,
     lhs: Side,
@@ -2885,6 +2898,48 @@ def _b_maxmin_res(
     _ = a^
     _ = b^
     return r^
+
+
+def _b_maxmin_res_origin(
+    op: StaticString,
+    bool_op: StaticString,
+    lhs: Side,
+    rhs: Side,
+    dst: Optional[T],
+) raises -> Res:
+    """maximum/minimum. Two bool tensors are torch's `a || b` / `a && b`
+    (MaxMinElementwiseKernel.cu), which the logical kernels compute."""
+    if (
+        lhs.is_t
+        and rhs.is_t
+        and lhs.t.value().stype == ST_BOOL
+        and rhs.t.value().stype == ST_BOOL
+    ):
+        return _b_binary(bool_op, lhs, rhs, ST_BOOL, dst)
+    var f8 = _b_f8_into_out(lhs, rhs, dst)
+    if f8:
+        # max/min_elementwise dispatch on the OUTPUT dtype: a float8 pair
+        # computes in a wider out's dtype (TensorIterator casts the inputs).
+        var w = f8.value()
+        var a = _b_cast_side(lhs, w)
+        var b = _b_cast_side(rhs, w)
+        var r = _b_binary(op, a.side.copy(), b.side.copy(), Int32(-1), dst)
+        _ = a^
+        _ = b^
+        return r^
+    return _b_binary(op, lhs, rhs, Int32(-1), dst)
+
+
+def _b_maxmin_res(
+    op: StaticString,
+    bool_op: StaticString,
+    lhs: Side,
+    rhs: Side,
+    dst: Optional[T],
+) raises -> Res:
+    if _b_exact_sides(lhs, rhs):
+        return _b_maxmin_res_exact(op, bool_op, lhs, rhs, dst)
+    return _b_maxmin_res_origin(op, bool_op, lhs, rhs, dst)
 
 
 def _b_f8_into_out(
@@ -3082,7 +3137,7 @@ def op_bitwise_xor_out(
 # ---------------------------------------------------------------------------
 
 
-def _b_logical_res(
+def _b_logical_res_exact(
     op: StaticString, lhs: Side, rhs: Side, dst: Optional[T]
 ) raises -> Res:
     """Both operands in their common dtype (TensorIterator's promotion: a
@@ -3106,6 +3161,41 @@ def _b_logical_res(
     _ = a^
     _ = b^
     return res^
+
+
+def _b_logical_res_origin(
+    op: StaticString, lhs: Side, rhs: Side, dst: Optional[T]
+) raises -> Res:
+    """The promoted route when torch's promotion covers the pair, else each
+    operand reduced to bool first (the old `_try_logical`)."""
+    if lhs.is_t and rhs.is_t:
+        var a = lhs.t.value().copy()
+        var b = rhs.t.value().copy()
+        if _b_promote(a, b) < 0:
+            if not (_b_castable(a.stype) and _b_castable(b.stype)):
+                unsupported(
+                    "a logical op on dtypes "
+                    + String(a.stype)
+                    + " and "
+                    + String(b.stype)
+                )
+            var ba = _b_cast(a, ST_BOOL)
+            var bb = _b_cast(b, ST_BOOL)
+            var res = _b_binary(
+                op, _b_tside(ba.t), _b_tside(bb.t), ST_BOOL, dst
+            )
+            _ = ba
+            _ = bb
+            return res^
+    return _b_binary(op, lhs, rhs, ST_BOOL, dst)
+
+
+def _b_logical_res(
+    op: StaticString, lhs: Side, rhs: Side, dst: Optional[T]
+) raises -> Res:
+    if _b_exact_sides(lhs, rhs):
+        return _b_logical_res_exact(op, lhs, rhs, dst)
+    return _b_logical_res_origin(op, lhs, rhs, dst)
 
 
 def _b_logical(op: StaticString, args: Values, rets: Values) raises:

@@ -70,7 +70,7 @@ from tmb.backend.abi import (
     v_tensor,
     view_strided,
 )
-from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr
+from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import is_float8
@@ -289,10 +289,13 @@ def _as_signed(t: T) -> T:
     return v^
 
 
-def _cmp_check(op: StaticString, st: Int32) raises:
+def _cmp_check(op: StaticString, st: Int32, t: T) raises:
     """The common dtypes CUDA's kernels dispatch: eq / ne take every dtype,
     lt / le / gt / ge (`compare_cuda`, AT_DISPATCH_ALL_TYPES_AND3) neither
-    complex nor uint16 / uint32 / uint64."""
+    complex nor uint16 / uint32 / uint64. CUDA only: other devices keep the
+    pre-exactness behaviour."""
+    if not (t.on_mojo() and dev(t.device)[].api == "cuda"):
+        return
     if op == "EqSpec" or op == "NeSpec":
         return
     if is_complex_stype(st) or st == 8 or is_wide_unsigned(st):
@@ -435,7 +438,7 @@ def _compare_functional(op: StaticString, args: Values, rets: Values) raises:
     var b0 = v_tensor(args[unsafe_offset=1])
     _check_pair_devices(a0, b0)
     var stype = torch_dtype(_compare_dtype(a0, b0))
-    _cmp_check(op, stype)
+    _cmp_check(op, stype, a0 if a0.on_mojo() else b0)
     var ha = _operand_as(a0, b0, stype, False)
     var hb = _operand_as(b0, a0, stype, False)
     var shape = broadcast_shape(ha.t, hb.t)
@@ -458,7 +461,7 @@ def _compare_functional_out(
     # temporary exists (`eq(a, b, out=a)` with a cast `a` is still `out=a`).
     _compare_out_guard(out_arg, a0, b0)
     var stype = torch_dtype(_compare_dtype(a0, b0))
-    _cmp_check(op, stype)
+    _cmp_check(op, stype, a0 if a0.on_mojo() else b0)
     var ha = _operand_as(a0, b0, stype, False)
     var hb = _operand_as(b0, a0, stype, False)
     var pa = ha.t.copy()
@@ -550,6 +553,7 @@ struct _ScalarCmp(Movable):
                 == ST_FLOAT16 else (
                     ST_COMPLEX128 if st == ST_FLOAT64 else ST_COMPLEX64
                 ),
+                a,
             )
         var huge = v.tag == TAG_SCALAR_INT and v.b == 1
         if huge and a.stype == ST_BOOL:
@@ -560,7 +564,7 @@ struct _ScalarCmp(Movable):
         var common = a.stype if is_float8(
             a.dtype
         ) or huge else combine_categories(a.stype, _scalar_stype(v))
-        _cmp_check(op, common)
+        _cmp_check(op, common, a)
         self.a = own_if_new(cast_any(a, common), a)
         self.fill = _scalar_fill(
             a, _huge_as(v, common) if huge else v.copy(), common

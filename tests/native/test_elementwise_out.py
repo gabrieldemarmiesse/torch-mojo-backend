@@ -33,6 +33,7 @@ from typing import Any, NoReturn
 import pytest
 import torch
 
+from tests.native.conftest import is_cuda
 from torch_mojo_backend import get_accelerators, native
 
 # The elementwise overloads writing one caller-supplied output.
@@ -542,7 +543,8 @@ def test_out_dtype_follows_torch(mojo_gpu, name, out_dtype):
         pytest.skip("CPU torch's oneDNN gelu_backward has no float64 output")
     kwargs = _cpu_args(name)
     if (
-        name.startswith(("bitwise_and", "bitwise_or", "bitwise_xor"))
+        is_cuda(mojo_gpu)
+        and name.startswith(("bitwise_and", "bitwise_or", "bitwise_xor"))
         and out_dtype.is_floating_point
     ):
         # CUDA's iterator takes the float out's dtype as the computation

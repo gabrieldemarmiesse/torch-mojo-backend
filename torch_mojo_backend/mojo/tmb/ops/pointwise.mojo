@@ -141,6 +141,7 @@ from tmb.ops.binary import (
     Scal,
     Side,
     _b_alpha_check,
+    _b_exact_sides,
     _b_sub_check,
     _b_can_cast,
     _b_copy_into,
@@ -3779,7 +3780,12 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     var e_integral = (
         _pw_is_int(e_st) or e_st == ST_BOOL or is_wide_unsigned(e_st)
     )
-    if e_integral and _pw_is_float(x_st):
+    if (
+        e_integral
+        and _pw_is_float(x_st)
+        # the CPU scalar refusal is CUDA's iterator; elsewhere pow(2, e) as before
+        and ((a.is_t and b.is_t) or _b_exact_sides(a, b))
+    ):
         # Any floating out: the kernel runs in self's dtype, cast on store.
         _pw_ldexp_int(rets, a, b, x_st, dest)
         return
@@ -3978,7 +3984,9 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             "ldexp can't be cast to the desired output type ", self.stype
         )
     var dest = Optional[T](self.copy())
-    if _pw_is_int(e_st) or e_st == ST_BOOL or is_wide_unsigned(e_st):
+    if (_pw_is_int(e_st) or e_st == ST_BOOL or is_wide_unsigned(e_st)) and (
+        b.is_t or _b_exact_sides(a, b)
+    ):
         _pw_ldexp_int(rets, a, b, self.stype, dest)
         return
     _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
