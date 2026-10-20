@@ -27,7 +27,11 @@ def _scalar_special_kinds() -> set[str]:
 
 def _pointwise_float32_kinds() -> set[str]:
     source = (MOJO / "ops" / "pointwise.mojo").read_text()
-    return set(re.findall(r'_pw_math\(\s*"([a-z0-9_]+)",\s*P_[A-Z_]+,\s*False', source))
+    return set(
+        re.findall(
+            r'_pw_math(?:\(|_op\[)\s*"([a-z0-9_]+)",\s*P_[A-Z_]+,\s*False', source
+        )
+    )
 
 
 def test_float32_math_ops_match_the_mojo_sources():
