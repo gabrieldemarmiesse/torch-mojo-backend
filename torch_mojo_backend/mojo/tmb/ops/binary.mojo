@@ -1124,6 +1124,8 @@ def _b_binary(
     var device: Int
     var dtype: Int32
     var scalar_side = 0 if lhs.is_t and rhs.is_t else (2 if lhs.is_t else 1)
+    if not _b_exact_sides(lhs, rhs):
+        scalar_side = 0
     if lhs.is_t and rhs.is_t:
         var a = lhs.t.value().copy()
         var b = rhs.t.value().copy()
@@ -1191,6 +1193,22 @@ def _b_binary(
     return Res(out.take(), True)
 
 
+def _b_exact_on(t: T) raises -> Bool:
+    """Whether add / sub / mul take the bit-exact-vs-CUDA routes (opmath fma
+    alpha, CPU-scalar NaN order, promoted scalar routes): NVIDIA only. Other
+    backends keep the pre-exactness routes, which were never measured against
+    these."""
+    return t.on_mojo() and dev(t.device)[].api == "cuda"
+
+
+def _b_exact_sides(lhs: Side, rhs: Side) raises -> Bool:
+    if lhs.is_t:
+        return _b_exact_on(lhs.t.value())
+    if rhs.is_t:
+        return _b_exact_on(rhs.t.value())
+    return False
+
+
 def _b_try_scalar(
     op: StaticString,
     lhs: Side,
@@ -1222,7 +1240,8 @@ def _b_try_scalar(
     # add / mul read the scalar straight into opmath (float), never rounded
     # to `a`'s dtype: an int tensor plus 2.5 is a float32 add of 2.5.
     var result = _b_side_result(a, rhs)
-    if not promote:
+    var promoted = promote and _b_exact_on(a)
+    if not promoted:
         if not _b_float3(a.stype):
             return None
         if rhs.zero_st >= 0 and result != a.stype:
@@ -1650,9 +1669,10 @@ def _b_add_routes(
     if r.__bool__():
         return r.value().copy()
     # a CPU scalar first: `scalar + alpha * tensor` (CUDAFunctorOnOther_add)
-    r = _b_try_scalar("RsubScalarSpec", rhs, lhs, False, dst, alpha, True)
-    if r.__bool__():
-        return r.value().copy()
+    if _b_exact_sides(lhs, rhs):
+        r = _b_try_scalar("RsubScalarSpec", rhs, lhs, False, dst, alpha, True)
+        if r.__bool__():
+            return r.value().copy()
     if alpha == 1.0:
         r = _b_try_int_scalar("AddScalarIntSpec", lhs, rhs, False)
         if r.__bool__():
@@ -1811,7 +1831,7 @@ def _b_add(
         var metal = _b_try_apple_add(lhs, rhs, alpha)
         if metal.__bool__():
             return metal.value().copy()
-    if _b_is_floating(common):
+    if _b_is_floating(common) and _b_exact_sides(lhs, rhs):
         # CUDA's add takes alpha into its kernel, converted straight to
         # opmath: one fma.
         return _b_add_routes(
@@ -1873,7 +1893,7 @@ def _b_sub(
     var pro = _b_alpha_prologue(lhs, rhs, alpha_in, out_st, True)
     var common = pro[0]
     var alpha_v = pro[1].copy()
-    if _b_is_floating(common):
+    if _b_is_floating(common) and _b_exact_sides(lhs, rhs):
         # CUDA's sub is its add kernel with -alpha: one fma in opmath.
         return _b_add_routes(
             lhs, rhs, dst, _b_alpha_opmath(alpha_v, common, True)
@@ -1943,9 +1963,10 @@ def _b_mul(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
     if r.__bool__():
         return r.value().copy()
     # mul is symmetric: CUDA multiplies by a CPU scalar on either side alike
-    r = _b_try_scalar("MulScalarSpec", rhs, lhs, False, dst, 1.0, True)
-    if r.__bool__():
-        return r.value().copy()
+    if _b_exact_sides(lhs, rhs):
+        r = _b_try_scalar("MulScalarSpec", rhs, lhs, False, dst, 1.0, True)
+        if r.__bool__():
+            return r.value().copy()
     r = _b_try_int_scalar("MulScalarIntSpec", lhs, rhs, False)
     if r.__bool__():
         return r.value().copy()
@@ -2003,12 +2024,15 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # no output buffer and no copy back.
         var s = rhs.s.value().copy()
         if not s.is_bool:
-            _b_scalar_inplace(
-                "AddScalarInplace",
-                self,
-                s.f,
-                _b_alpha_opmath(args[unsafe_offset=2], self.stype, False),
-            )
+            if _b_exact_on(self):
+                _b_scalar_inplace(
+                    "AddScalarInplace",
+                    self,
+                    s.f,
+                    _b_alpha_opmath(args[unsafe_offset=2], self.stype, False),
+                )
+            else:
+                _b_scalar_inplace("AddScalarInplace", self, s.f * alpha)
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
@@ -2080,12 +2104,15 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not rhs.is_t and self.contig and _b_float3(self.stype):
         var s = rhs.s.value().copy()
         if not s.is_bool:
-            _b_scalar_inplace(
-                "AddScalarInplace",
-                self,
-                s.f,
-                _b_alpha_opmath(args[unsafe_offset=2], self.stype, True),
-            )
+            if _b_exact_on(self):
+                _b_scalar_inplace(
+                    "AddScalarInplace",
+                    self,
+                    s.f,
+                    _b_alpha_opmath(args[unsafe_offset=2], self.stype, True),
+                )
+            else:
+                _b_scalar_inplace("AddScalarInplace", self, -(s.f * alpha))
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
@@ -2135,7 +2162,7 @@ def op_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         _ = _b_alpha_prologue(lhs, rhs, args[unsafe_offset=2], -1, True)
     # `other - alpha * self` for a float tensor and a number: one launch.
     var common = _b_common(lhs, rhs)
-    if _b_float3(common):
+    if _b_float3(common) and _b_exact_sides(lhs, rhs):
         var fast = _b_try_scalar(
             "RsubScalarSpec",
             rhs,
@@ -2145,6 +2172,11 @@ def op_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             _b_alpha_opmath(args[unsafe_offset=2], common, True),
             True,
         )
+        if fast.__bool__():
+            _b_ret(rets, fast.value().copy())
+            return
+    elif v_f64(args[unsafe_offset=2]) == 1.0:
+        var fast = _b_try_scalar("RsubScalarSpec", rhs, lhs, False, None)
         if fast.__bool__():
             _b_ret(rets, fast.value().copy())
             return

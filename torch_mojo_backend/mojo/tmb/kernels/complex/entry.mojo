@@ -34,6 +34,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.host import DeviceContext
+from std.sys import is_nvidia_gpu
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 from std.utils.numerics import isinf, isnan
@@ -157,10 +158,11 @@ def _binary_cx[
     elif kind == "mul":
         # MulFunctor through opmath_symmetric_gpu_kernel_with_scalars: a CPU
         # scalar operand is always the left factor (AUnaryFunctor)
-        if mode_b == MODE_HOST and mode_a != MODE_HOST:
-            return cmul_scalar_first(b, a)
-        if mode_a == MODE_HOST and mode_b != MODE_HOST:
-            return cmul_scalar_first(a, b)
+        comptime if is_nvidia_gpu():
+            if mode_b == MODE_HOST and mode_a != MODE_HOST:
+                return cmul_scalar_first(b, a)
+            if mode_a == MODE_HOST and mode_b != MODE_HOST:
+                return cmul_scalar_first(a, b)
         return cmul(a, b)
     elif kind == "mul_recip":
         # div_true_kernel_cuda's `a * (1 / b)` for a CPU-scalar divisor, its

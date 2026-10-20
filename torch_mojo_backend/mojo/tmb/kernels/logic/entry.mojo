@@ -28,7 +28,12 @@ from std.math import ceildiv
 from std.memory import bitcast
 from std.utils.numerics import isnan
 from std.sys import is_amd_gpu, is_nvidia_gpu, llvm_intrinsic
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
+    size_of,
+)
 from std.utils.coord import Coord
 
 from std.utils import IndexList
@@ -399,7 +404,7 @@ def _bin_vec_op[
                 return (la ^ lb).cast[out_dtype]()
     else:
         comptime if op_code == BOP_ADD or op_code == BOP_SUB:
-            comptime if dtype.is_floating_point():
+            comptime if dtype.is_floating_point() and is_nvidia_gpu():
                 # ufunc::add's `self + alpha * other` in opmath, which nvcc
                 # contracts to fma(alpha, other, self); sub is add with
                 # -alpha. A float64 NaN: alpha's, then self's, then
@@ -423,7 +428,7 @@ def _bin_vec_op[
             else:
                 return (a - b).cast[out_dtype]()
         comptime if op_code == BOP_MUL:
-            comptime if dtype.is_floating_point():
+            comptime if dtype.is_floating_point() and is_nvidia_gpu():
                 return _scalar_nan_first(a * b, a, b, scalar_side).cast[
                     out_dtype
                 ]()
@@ -431,9 +436,12 @@ def _bin_vec_op[
                 return (a * b).cast[out_dtype]()
         comptime if op_code == BOP_DIV:
             comptime if dtype.is_floating_point():
-                return _scalar_nan_first(a / b, a, b, scalar_side).cast[
-                    out_dtype
-                ]()
+                comptime if is_nvidia_gpu():
+                    return _scalar_nan_first(a / b, a, b, scalar_side).cast[
+                        out_dtype
+                    ]()
+                else:
+                    return (a / b).cast[out_dtype]()
         comptime if op_code == BOP_MAX or op_code == BOP_MIN:
             var r = max(a, b) if op_code == BOP_MAX else min(a, b)
             comptime if dtype.is_floating_point():
@@ -485,8 +493,8 @@ def _bin_vec_op[
     return a.cast[out_dtype]()
 
 
-@__name(t"binary_strided_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
-def _bin_bcast_kernel[
+@always_inline
+def _bin_bcast_body[
     dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
     out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
@@ -543,8 +551,95 @@ def _bin_bcast_kernel[
         i += gstride
 
 
-@__name(t"binary_flat_vec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
-def _bin_flat_vec_kernel[
+@__name(t"binary_strided_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_bcast_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    ls3_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rs3_arg: Int64,
+    total_arg: Int64,
+):
+    """The pre-exactness signature, launched on every non-NVIDIA target so
+    their kernels stay the ones measured there."""
+    _bin_bcast_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        d1_arg,
+        d2_arg,
+        d3_arg,
+        ls0_arg,
+        ls1_arg,
+        ls2_arg,
+        ls3_arg,
+        rs0_arg,
+        rs1_arg,
+        rs2_arg,
+        rs3_arg,
+        total_arg,
+        1,
+        0,
+    )
+
+
+@__name(t"binary_strided_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_bcast_exact_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    ls3_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rs3_arg: Int64,
+    total_arg: Int64,
+    alpha: Scalar[_opmath[dtype]()],
+    scalar_side_arg: Int64,
+):
+    """With add / sub's alpha and the CPU-scalar side (NVIDIA)."""
+    _bin_bcast_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        d1_arg,
+        d2_arg,
+        d3_arg,
+        ls0_arg,
+        ls1_arg,
+        ls2_arg,
+        ls3_arg,
+        rs0_arg,
+        rs1_arg,
+        rs2_arg,
+        rs3_arg,
+        total_arg,
+        alpha,
+        scalar_side_arg,
+    )
+
+
+@always_inline
+def _bin_flat_vec_body[
     dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
     out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
@@ -630,8 +725,52 @@ def _bin_flat_vec_kernel[
         pass_over[False, False]()
 
 
-@__name(t"binary_rowvec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
-def _bin_rowvec_kernel[
+@__name(t"binary_flat_vec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_flat_vec_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    total_arg: Int64,
+    l_bcast_arg: Int64,
+    r_bcast_arg: Int64,
+):
+    """The pre-exactness signature, launched on every non-NVIDIA target so
+    their kernels stay the ones measured there."""
+    _bin_flat_vec_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr, l_ptr, r_ptr, total_arg, l_bcast_arg, r_bcast_arg, 1, 0
+    )
+
+
+@__name(t"binary_flat_vec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_flat_vec_exact_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    total_arg: Int64,
+    l_bcast_arg: Int64,
+    r_bcast_arg: Int64,
+    alpha: Scalar[_opmath[dtype]()],
+    scalar_side_arg: Int64,
+):
+    """With add / sub's alpha and the CPU-scalar side (NVIDIA)."""
+    _bin_flat_vec_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        total_arg,
+        l_bcast_arg,
+        r_bcast_arg,
+        alpha,
+        scalar_side_arg,
+    )
+
+
+@always_inline
+def _bin_rowvec_body[
     dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
     out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
@@ -691,6 +830,85 @@ def _bin_rowvec_kernel[
             )
             j += step
         row += Int(grid_dim.x)
+
+
+@__name(t"binary_rowvec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_rowvec_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rows_arg: Int64,
+):
+    """The pre-exactness signature, launched on every non-NVIDIA target so
+    their kernels stay the ones measured there."""
+    _bin_rowvec_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        d1_arg,
+        d2_arg,
+        d3_arg,
+        ls0_arg,
+        ls1_arg,
+        ls2_arg,
+        rs0_arg,
+        rs1_arg,
+        rs2_arg,
+        rows_arg,
+        1,
+        0,
+    )
+
+
+@__name(t"binary_rowvec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_rowvec_exact_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rows_arg: Int64,
+    alpha: Scalar[_opmath[dtype]()],
+    scalar_side_arg: Int64,
+):
+    """With add / sub's alpha and the CPU-scalar side (NVIDIA)."""
+    _bin_rowvec_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        d1_arg,
+        d2_arg,
+        d3_arg,
+        ls0_arg,
+        ls1_arg,
+        ls2_arg,
+        rs0_arg,
+        rs1_arg,
+        rs2_arg,
+        rows_arg,
+        alpha,
+        scalar_side_arg,
+    )
 
 
 @always_inline
@@ -813,80 +1031,155 @@ def _binary_bcast[
                         var blocks = _l2_wave_blocks(
                             slots, traffic, ctx
                         ) if is_cmp else _bw_flat_blocks(slots, traffic)
-                        _enqueue_cached[
-                            _bin_flat_vec_kernel[
-                                dtype, out_dtype, op_code, is_cmp
-                            ]
-                        ](
-                            ctx,
-                            blocks,
-                            1,
-                            1,
-                            GS_THREADS,
-                            out_ptr.as_unsafe_any_origin(),
-                            l_ptr.as_unsafe_any_origin().as_imm(),
-                            r_ptr.as_unsafe_any_origin().as_imm(),
-                            Int64(total),
-                            Int64(l_scalar),
-                            Int64(r_scalar),
-                            alpha.cast[_opmath[dtype]()](),
-                            Int64(scalar_side),
-                        )
+                        comptime if has_nvidia_gpu_accelerator():
+                            _enqueue_cached[
+                                _bin_flat_vec_exact_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                blocks,
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(total),
+                                Int64(l_scalar),
+                                Int64(r_scalar),
+                                alpha.cast[_opmath[dtype]()](),
+                                Int64(scalar_side),
+                            )
+                        else:
+                            _enqueue_cached[
+                                _bin_flat_vec_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                blocks,
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(total),
+                                Int64(l_scalar),
+                                Int64(r_scalar),
+                            )
                     elif aligned16 and rows_aligned:
                         var rows = total // d3
-                        _enqueue_cached[
-                            _bin_rowvec_kernel[
-                                dtype, out_dtype, op_code, is_cmp
-                            ]
-                        ](
-                            ctx,
-                            max(1, min(rows, 65535)),
-                            1,
-                            1,
-                            GS_THREADS,
-                            out_ptr.as_unsafe_any_origin(),
-                            l_ptr.as_unsafe_any_origin().as_imm(),
-                            r_ptr.as_unsafe_any_origin().as_imm(),
-                            Int64(d1),
-                            Int64(d2),
-                            Int64(d3),
-                            Int64(ls0),
-                            Int64(ls1),
-                            Int64(ls2),
-                            Int64(rs0),
-                            Int64(rs1),
-                            Int64(rs2),
-                            Int64(rows),
-                            alpha.cast[_opmath[dtype]()](),
-                            Int64(scalar_side),
-                        )
+                        comptime if has_nvidia_gpu_accelerator():
+                            _enqueue_cached[
+                                _bin_rowvec_exact_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                max(1, min(rows, 65535)),
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rows),
+                                alpha.cast[_opmath[dtype]()](),
+                                Int64(scalar_side),
+                            )
+                        else:
+                            _enqueue_cached[
+                                _bin_rowvec_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                max(1, min(rows, 65535)),
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rows),
+                            )
                     else:
-                        _enqueue_cached[
-                            _bin_bcast_kernel[dtype, out_dtype, op_code, is_cmp]
-                        ](
-                            ctx,
-                            _gs_blocks(total),
-                            1,
-                            1,
-                            GS_THREADS,
-                            out_ptr.as_unsafe_any_origin(),
-                            l_ptr.as_unsafe_any_origin().as_imm(),
-                            r_ptr.as_unsafe_any_origin().as_imm(),
-                            Int64(d1),
-                            Int64(d2),
-                            Int64(d3),
-                            Int64(ls0),
-                            Int64(ls1),
-                            Int64(ls2),
-                            Int64(ls3),
-                            Int64(rs0),
-                            Int64(rs1),
-                            Int64(rs2),
-                            Int64(rs3),
-                            Int64(total),
-                            alpha.cast[_opmath[dtype]()](),
-                            Int64(scalar_side),
-                        )
+                        comptime if has_nvidia_gpu_accelerator():
+                            _enqueue_cached[
+                                _bin_bcast_exact_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                _gs_blocks(total),
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(ls3),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rs3),
+                                Int64(total),
+                                alpha.cast[_opmath[dtype]()](),
+                                Int64(scalar_side),
+                            )
+                        else:
+                            _enqueue_cached[
+                                _bin_bcast_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                _gs_blocks(total),
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(ls3),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rs3),
+                                Int64(total),
+                            )
                 else:
                     raise Error("no GPU accelerator available at compile time")
 
