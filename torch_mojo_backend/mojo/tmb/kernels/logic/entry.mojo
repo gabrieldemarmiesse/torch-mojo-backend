@@ -1126,8 +1126,9 @@ def _clamp_scalar[
     var in_ptr = _make_ptr[dtype](in_addr)
     # The 16-bit floats clamp in float32 (ClampLimits in opmath: a bound below
     # the type's subnormals still rounds into it), one rounding at the end.
+    # NVIDIA only: the other backends keep the native 16-bit max/min.
     comptime lim = DType.float32 if (
-        dtype == DType.float16 or dtype == DType.bfloat16
+        is_nvidia_gpu() and (dtype == DType.float16 or dtype == DType.bfloat16)
     ) else dtype
     var lo_s: Scalar[lim]
     var hi_s: Scalar[lim]
