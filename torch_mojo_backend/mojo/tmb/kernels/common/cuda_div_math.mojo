@@ -13,7 +13,12 @@ from std.sys.info import size_of
 
 from tmb.kernels.common.dtype_arithmetic import cast_rounded
 from tmb.kernels.common.nan_order import _bits_dtype, is_nan_bits, nan_first2
-from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
+from tmb.kernels.common.div_math import floor_div, trunc_div
+from tmb.kernels.common.op_utils import (
+    _fmod_f64_exact_scalar,
+    _fmod_float32,
+    custom_remainder,
+)
 
 
 @always_inline
@@ -96,9 +101,14 @@ def cuda_fmod[
     var r = SIMD[om, w]()
     comptime for i in range(w):
         comptime if dtype == DType.float64:
-            r[i] = nv_fmod(
-                a[i].cast[DType.float64](), b[i].cast[DType.float64]()
-            ).cast[om]()
+            comptime if is_nvidia_gpu():
+                r[i] = nv_fmod(
+                    a[i].cast[DType.float64](), b[i].cast[DType.float64]()
+                ).cast[om]()
+            else:
+                r[i] = _fmod_f64_exact_scalar(
+                    a[i].cast[DType.float64](), b[i].cast[DType.float64]()
+                ).cast[om]()
         else:
             r[i] = _fmod_float32(
                 a[i].cast[DType.float32](), b[i].cast[DType.float32]()
@@ -151,6 +161,8 @@ def cuda_trunc_div[
 ](a: SIMD[dtype, w], b: SIMD[dtype, w]) -> SIMD[dtype, w]:
     """div_trunc_kernel_cuda over two tensors: `trunc(a / b)` with the
     quotient rounded to `scalar_t` first; C's `/` for integers."""
+    comptime if not is_nvidia_gpu():
+        return trunc_div(a, b)
     comptime if dtype.is_floating_point():
         return (a / b).__trunc__()
     else:
@@ -163,6 +175,8 @@ def cuda_floor_div[
 ](a: SIMD[dtype, w], b: SIMD[dtype, w]) -> SIMD[dtype, w]:
     """div_floor_kernel_cuda over two tensors: c10::div_floor_floating /
     div_floor_integer."""
+    comptime if not is_nvidia_gpu():
+        return floor_div(a, b)
     comptime if dtype.is_floating_point():
         comptime om = _opmath[dtype]()
         var x = a.cast[om]()
@@ -218,6 +232,8 @@ def cuda_remainder[
     """remainder_kernel_cuda: C's remainder, plus the divisor when it is
     nonzero and its sign differs from the divisor's (in opmath, rounded
     once, for the half types)."""
+    comptime if not is_nvidia_gpu():
+        return custom_remainder(a, b)
     comptime if dtype.is_floating_point():
         comptime om = _opmath[dtype]()
         var mod = cuda_fmod(a, b)
@@ -239,8 +255,16 @@ def cuda_fmod_op[
     C's `%` for integers."""
     comptime if dtype.is_floating_point():
         return cuda_fmod(a, b).cast[dtype]()
-    else:
+    elif is_nvidia_gpu():
         return cuda_int_divrem(a, b)[1]
+    else:
+        # the base integer route: `%` truncating, zero divisor gives 0
+        var safe = b.eq(0).select(SIMD[dtype, w](1), b)
+        var r = a % safe
+        comptime if dtype.is_signed():
+            var fix = r.ne(0) & (r.lt(0) ^ a.lt(0))
+            r = fix.select(r - safe, r)
+        return b.eq(0).select(SIMD[dtype, w](0), r)
 
 
 @always_inline
@@ -259,9 +283,12 @@ def cuda_mul_by_inverse[
 @always_inline
 def cuda_trunc_div_by_scalar[
     dtype: DType, om: DType, w: Int
-](x: SIMD[om, w], inv: Scalar[om]) -> SIMD[dtype, w]:
+](x: SIMD[om, w], inv: Scalar[om], b: Scalar[om]) -> SIMD[dtype, w]:
     """div_trunc_kernel_cuda by a CPU scalar: `trunc(a * inv_b)`, `inv_b`
-    = acc(1) / acc(b), `x` the numerator in opmath `om`."""
+    = acc(1) / acc(b), `x` the numerator in opmath `om`. Elsewhere the
+    base's `trunc_div(a, b)` in opmath."""
+    comptime if not is_nvidia_gpu():
+        return trunc_div(x, SIMD[om, w](b)).cast[dtype]()
     var iv = SIMD[om, w](inv)
     return cast_rounded[dtype](nan_first2(x * iv, iv, x).__trunc__())
 
@@ -273,6 +300,8 @@ def cuda_floor_div_by_scalar[
     """div_floor_kernel_cuda by a nonzero CPU scalar `b` (`inv` = acc(1) /
     b; a zero `b` takes the true-division route), `x` the numerator in
     opmath `om`."""
+    comptime if not is_nvidia_gpu():
+        return floor_div(x, SIMD[om, w](b)).cast[dtype]()
     var y = SIMD[om, w](b)
     var iv = SIMD[om, w](inv)
     var mod = rebind[SIMD[om, w]](cuda_fmod(x, y))

@@ -2703,7 +2703,7 @@ def pointwise[
         return _gamma_grads[kind](a, b, c).cast[out_dtype]()
     elif kind == "fmod":
         var r = cuda_fmod_op(a, b)
-        comptime if dtype == DType.float64:
+        comptime if dtype == DType.float64 and is_nvidia_gpu():
             # p0 = 2: `b` was a CPU scalar, whose NaN __nv_fmod returns
             # first (a uniform operand); two tensor NaNs depend on the launch
             if p[0].cast[DType.float64]() == 2.0:

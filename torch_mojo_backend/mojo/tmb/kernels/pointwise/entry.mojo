@@ -21,6 +21,7 @@
 
 from max.gpu.host import DeviceContext
 from std.memory import bitcast
+from std.sys import is_nvidia_gpu
 from std.sys.info import (
     has_accelerator,
     has_amd_gpu_accelerator,
@@ -352,7 +353,9 @@ def _launch[
     # A half-precision host scalar travels as its bits: by value, a bfloat16
     # denormal reached the kernel as zero (fmod's divisor then NaN).
     var vb_bits = UInt16(0)
-    comptime if size_of[dt]() == 2:
+    # Host-side target check (is_nvidia_gpu is the host's here); the kernel
+    # body below checks the device.
+    comptime if size_of[dt]() == 2 and has_nvidia_gpu_accelerator():
         vb_bits = bitcast[DType.uint16](vb)
 
     @always_inline
@@ -390,7 +393,7 @@ def _launch[
                 b = b_ptr.unsafe_load[width=w, alignment=in_align](i)
             else:
                 var vb_k = vb
-                comptime if size_of[dt]() == 2:
+                comptime if size_of[dt]() == 2 and is_nvidia_gpu():
                     vb_k = bitcast[dt](vb_bits)
                 b = SIMD[dt, w](b_ptr[unsafe_offset=0] if dev_b else vb_k)
         var c = SIMD[dt, w](0)

@@ -1259,7 +1259,7 @@ def _scalar_elementwise[
                 )
             comptime if op_code == SOP_TRUNCDIV:
                 out_ptr.unsafe_store[width=width, alignment=al](
-                    i, cuda_trunc_div_by_scalar[dtype](a, inv)
+                    i, cuda_trunc_div_by_scalar[dtype](a, inv, sv)
                 )
             comptime if op_code == SOP_POW:
                 out_ptr.unsafe_store[width=width, alignment=al](

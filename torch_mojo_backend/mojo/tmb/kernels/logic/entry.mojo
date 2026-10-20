@@ -28,7 +28,12 @@ from std.math import ceildiv
 from std.memory import bitcast
 from std.utils.numerics import isnan
 from std.sys import is_amd_gpu, is_nvidia_gpu, llvm_intrinsic
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
+    size_of,
+)
 from std.utils.coord import Coord
 
 from std.utils import IndexList
@@ -269,7 +274,9 @@ def _scalar_nan_first[
     r: SIMD[dtype, w], a: SIMD[dtype, w], b: SIMD[dtype, w], scalar_side: Int
 ) -> SIMD[dtype, w]:
     """`r` with the CPU-scalar operand's float64 NaN first (see
-    `_bin_vec_op`)."""
+    `_bin_vec_op`). NVIDIA's CUDA kernels only; elsewhere `r` as is."""
+    comptime if not is_nvidia_gpu():
+        return r
     if scalar_side == 1:
         return nan_first2(r, a, b)
     if scalar_side == 2:
@@ -484,9 +491,9 @@ def _bin_vec_op[
                 return cuda_mul_by_inverse(a, alpha).cast[out_dtype]()
             comptime if op_code == BOP_TRUNCDIV_BY_SCALAR:
                 var inv = Scalar[om](1) / alpha.cast[om]()
-                return cuda_trunc_div_by_scalar[dtype](a.cast[om](), inv).cast[
-                    out_dtype
-                ]()
+                return cuda_trunc_div_by_scalar[dtype](
+                    a.cast[om](), inv, alpha.cast[om]()
+                ).cast[out_dtype]()
             comptime if op_code == BOP_FLOORDIV_BY_SCALAR:
                 var bs = alpha.cast[om]()
                 return cuda_floor_div_by_scalar[dtype](
@@ -1834,11 +1841,25 @@ def _add_f32_bf16_spec_into_go(a_o: Arg, b_o: Arg, out_o: Arg) raises:
         )
 
 
+def _binary_spec_base[
+    op_code: Int, is_cmp: Bool
+](a_o: Arg, b_o: Arg, out_o: Arg) raises:
+    _binary_spec_into_go[op_code, is_cmp](a_o, b_o, out_o, 1.0, 0)
+
+
 def _binary_dispatcher[
     op_code: Int, is_cmp: Bool
 ](argv: Argv, argc: Int) raises:
     """Slots: a, b, out specs, then optionally alpha (f64 bits, add / sub)
     and scalar_side (see `_bin_vec_op`)."""
+    comptime if not has_nvidia_gpu_accelerator():
+        # Without the alpha / scalar_side slots the base's own spec call:
+        # the same kernels as before the CUDA-only operand routes.
+        if argc == 3:
+            _spec_dispatcher3[
+                _binary_spec_base[op_code, is_cmp], "a binary spec op"
+            ](argv, argc)
+            return
     if argc != 3 and argc != 5:
         raise Error("a binary spec op expects 3 or 5 arguments, got ", argc)
     var alpha = 1.0

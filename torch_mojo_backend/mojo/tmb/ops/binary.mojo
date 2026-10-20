@@ -2302,7 +2302,7 @@ def _b_rounding_div(
         var a = lhs.t.value().copy()
         var common = _b_side_result(a, rhs)
         var s = rhs.s.value().copy()
-        if _b_is_floating(common) and dev(a.device)[].api != "metal":
+        if _b_is_floating(common) and dev(a.device)[].api == "cuda":
             var num = _b_cast_any(a, common)
             # iter.scalar_value<accscalar_t>(2)
             var b = s.f if common == ST_FLOAT64 else Float64(Float32(s.f))
@@ -2400,7 +2400,7 @@ def _b_div(lhs: Side, rhs: Side, mode: Value, dst: Optional[T]) raises -> Res:
     var num = _b_cast_any(a, common)
     if not rhs.is_t:
         var scalar = rhs.s.value().copy()
-        if dev(a.device)[].api != "metal":
+        if dev(a.device)[].api == "cuda":
             # div_true_kernel_cuda's cpu-scalar route: the reciprocal in
             # double, rounded to opmath, times the numerator.
             var r0 = _b_by_scalar(
