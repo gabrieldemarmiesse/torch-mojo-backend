@@ -28,10 +28,17 @@ tests that survive the fast-math flags) rather than a comparison.
 """
 
 from std.memory import bitcast
+from std.sys.info import is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
+from tmb.kernels.common.libdevice_port import (
+    _mul_rn_d,
+    nv_atan2,
+    nv_cos,
+    nv_sin,
+)
 from tmb.kernels.common.math_utils import ieee_sqrt
-from tmb.kernels.common.nan_order import nan_first2, nan_first3
+from tmb.kernels.common.nan_order import nan_first2, nan_first3, quiet_nan
 from tmb.kernels.common.pointwise_math import (
     _exp,
     _log,
@@ -49,6 +56,60 @@ struct Cx[dt: DType](Copyable, Movable):
 
     var re: Scalar[Self.dt]
     var im: Scalar[Self.dt]
+
+
+@always_inline
+def _nan64[dt: DType]() -> Bool:
+    """Whether NaN operands must be routed by hand: float64 on NVIDIA, where a
+    double op returns one of its NaN operands quieted (nan_order.mojo) and the
+    GPU build's fast-math flags may otherwise hand back any NaN."""
+    return dt == DType.float64 and is_nvidia_gpu()
+
+
+@always_inline
+def _q[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """The NaN `x` quieted, sign and payload kept."""
+    return quiet_nan[dt, 1](SIMD[dt, 1](x))[0]
+
+
+@always_inline
+def _mulx[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """`a * b` with DMUL's NaN rule (B, then A)."""
+    comptime if _nan64[dt]():
+        if isnan(b):
+            return _q(b)
+        if isnan(a):
+            return _q(a)
+        # opaque: an inf * 0 NaN must stay visible to the tests that follow
+        return rebind[Scalar[dt]](
+            _mul_rn_d(rebind[Float64](a), rebind[Float64](b))
+        )
+    return a * b
+
+
+@always_inline
+def _fmax[dt: DType](a: Scalar[dt], b: Scalar[dt], c: Scalar[dt]) -> Scalar[dt]:
+    """`fma(a, b, c)` with DFMA's NaN rule (B, then C, then A)."""
+    comptime if _nan64[dt]():
+        if isnan(b):
+            return _q(b)
+        if isnan(c):
+            return _q(c)
+        if isnan(a):
+            return _q(a)
+    return a.fma(b, c)
+
+
+@always_inline
+def _sub_self[dt: DType](y: Scalar[dt]) -> Scalar[dt]:
+    """`y - y`: the NaN itself quieted, NVIDIA's default NaN for an infinity."""
+    comptime if _nan64[dt]():
+        if isnan(y):
+            return _q(y)
+        if isinf(y):
+            return bitcast[dt](UInt64(0xFFF8000000000000))
+        return Scalar[dt](0)
+    return y - y
 
 
 @always_inline
@@ -85,22 +146,33 @@ def _is_zero[dt: DType](x: Scalar[dt]) -> Bool:
 
 @always_inline
 def _rexp[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if _nan64[dt]():
+        if isnan(x):
+            return _q(x)
     return _exp[dt, 1](x)
 
 
 @always_inline
 def _rlog[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if _nan64[dt]():
+        if isnan(x):
+            return _q(x)
     return _log[dt, 1](x)
 
 
 @always_inline
 def _rlog1p[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if _nan64[dt]():
+        if isnan(x):
+            return _q(x)
     return _log1p[dt, 1](x)
 
 
 @always_inline
 def _rcos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
-    comptime if dt == DType.float64:
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        return nv_cos(x.cast[DType.float64]()).cast[dt]()
+    elif dt == DType.float64:
         return _pcos[DType.float64](x.cast[DType.float64]()).cast[dt]()
     else:
         return _pcos[DType.float32](x.cast[DType.float32]()).cast[dt]()
@@ -108,7 +180,9 @@ def _rcos[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def _rsin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
-    comptime if dt == DType.float64:
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        return nv_sin(x.cast[DType.float64]()).cast[dt]()
+    elif dt == DType.float64:
         return _psin[DType.float64](x.cast[DType.float64]()).cast[dt]()
     else:
         return _psin[DType.float32](x.cast[DType.float32]()).cast[dt]()
@@ -125,6 +199,16 @@ def chypot[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def catan2[dt: DType](y: Scalar[dt], x: Scalar[dt]) -> Scalar[dt]:
     """`arg(x + yi)` = atan2(y, x), the device's torch.atan2."""
+    comptime if _nan64[dt]():
+        # thrust's atan2 is libdevice's; a NaN operand comes back quieted,
+        # y's before x's (probed on stock CUDA).
+        if isnan(y):
+            return _q(y)
+        if isnan(x):
+            return _q(x)
+        return rebind[Scalar[dt]](
+            nv_atan2(rebind[Float64](y), rebind[Float64](x))
+        )
     var z = Scalar[dt](0)
     return pointwise["atan2", dt, dt, 1](y, x, z, SIMD[param_dtype[dt](), 4](0))
 
@@ -306,11 +390,11 @@ def cexp[dt: DType](z: Cx[dt]) -> Cx[dt]:
     if hy >= INF_HI:
         # (double: thrust tests lx here, not ly -- kept)
         if lx != 0 or (hx & 0x7FFFFFFF) != INF_HI:
-            return Cx[dt](y - y, y - y)
+            return Cx[dt](_sub_self(y), _sub_self(y))
         elif (hx & 0x80000000) != 0:
             return Cx[dt](Scalar[dt](0), Scalar[dt](0))
         else:
-            return Cx[dt](x, y - y)
+            return Cx[dt](x, _sub_self(y))
     comptime EXP_OVFL = UInt32(0x40862E42) if dt == DType.float64 else UInt32(
         0x42B17218
     )
@@ -320,7 +404,7 @@ def cexp[dt: DType](z: Cx[dt]) -> Cx[dt]:
     if hx >= EXP_OVFL and hx <= CEXP_OVFL:
         return _ldexp_cexp(z, 0)
     var exp_x = _rexp(x)
-    return Cx[dt](exp_x * _rcos(y), exp_x * _rsin(y))
+    return Cx[dt](_mulx(exp_x, _rcos(y)), _mulx(exp_x, _rsin(y)))
 
 
 @always_inline
@@ -343,7 +427,7 @@ def clog[dt: DType](z: Cx[dt]) -> Cx[dt]:
     var x = z.re
     var y = z.im
     if isnan(x) or isnan(y):
-        return Cx[dt](_rlog(x.fma(x, y * y)), catan2(y, x))
+        return Cx[dt](_rlog(_fmax(x, x, _mulx(y, y))), catan2(y, x))
     var ax = abs(x)
     var ay = abs(y)
     if ax < ay:
@@ -573,19 +657,32 @@ def clog_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
+def _cuda_nan[dt: DType]() -> Scalar[dt]:
+    """CUDA's `NAN` macro, `__int_as_float(0x7fffffff)`, as the NVRTC-compiled
+    libc++ complex code (the jiterated kernels) returns it, widened to double
+    for float64."""
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return bitcast[dt](UInt64(0x7FFFFFFFE0000000))
+    elif is_nvidia_gpu() and dt == DType.float32:
+        return bitcast[dt](UInt32(0x7FFFFFFF))
+    else:
+        return nan[dt]()
+
+
+@always_inline
 def _polar[dt: DType](rho: Scalar[dt], theta: Scalar[dt]) -> Cx[dt]:
     """libc++'s polar(rho, theta)."""
     # Modified from libc++ polar(const _Tp&, const _Tp&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
     if isnan(rho) or _signbit(rho):
-        return Cx[dt](nan[dt](), nan[dt]())
+        return Cx[dt](_cuda_nan[dt](), _cuda_nan[dt]())
     if isnan(theta):
         if isinf(rho):
             return Cx[dt](rho, theta)
         return Cx[dt](theta, theta)
     if isinf(theta):
         if isinf(rho):
-            return Cx[dt](rho, nan[dt]())
-        return Cx[dt](nan[dt](), nan[dt]())
+            return Cx[dt](rho, _cuda_nan[dt]())
+        return Cx[dt](_cuda_nan[dt](), _cuda_nan[dt]())
     var x = rho * _rcos(theta)
     if isnan(x):
         x = Scalar[dt](0)
@@ -653,4 +750,29 @@ def cpow[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
     """thrust's `pow(complex, complex)` (c10_complex_math::pow on CUDA):
     exp(log(x) * y), special values included (a zero base gives
     exp(-inf + NaN i) = 0 for a nonzero real exponent)."""
-    return cexp(cmul(clog(x), y))
+    var l = clog(x)
+    comptime if _nan64[dt]():
+        # thrust's operator* with the NaN rules of its DMUL / DFMA spelled out.
+        return cexp(
+            Cx[dt](
+                _fmax(l.re, y.re, -_mulx(l.im, y.im)),
+                _fmax(l.re, y.im, _mulx(l.im, y.re)),
+            )
+        )
+    return cexp(cmul(l, y))
+
+
+@always_inline
+def cexp_mul[dt: DType](fct: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+    """pow_scalar_tensor_impl's `std::exp(fct * exp)`: `fct` (the CPU-scalar
+    base's log) is a kernel argument, uniform, so ptxas puts it in the B slot
+    of the multiply's DMUL / DFMA and the tensor's value in A: where float64
+    NaNs meet, the scalar's wins (and the first product's)."""
+    comptime if _nan64[dt]():
+        return cexp(
+            Cx[dt](
+                _fmax(w.re, fct.re, -_mulx(w.im, fct.im)),
+                _fmax(w.im, fct.re, _mulx(w.re, fct.im)),
+            )
+        )
+    return cexp(cmul(fct, w))

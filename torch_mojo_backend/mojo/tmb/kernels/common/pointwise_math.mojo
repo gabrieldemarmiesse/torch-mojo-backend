@@ -58,8 +58,22 @@ from tmb.kernels.common.libdevice_port import (
 from tmb.kernels.common.dtype_arithmetic import amd_opaque, cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
-from tmb.kernels.common.pow_math import pow_c99, torch_pow
+from tmb.kernels.common.pow_math import (
+    POW_CUBE,
+    POW_INV_SQUARE,
+    POW_RECIPROCAL,
+    POW_RSQRT,
+    POW_SQRT,
+    POW_SQUARE,
+    cuda_reciprocal,
+    cuda_rsqrt,
+    cuda_sqrt,
+    pow_c99,
+    torch_pow,
+)
 from tmb.kernels.common.special_math import igamma_f, igammac_f, zeta_f
+from tmb.kernels.common.unary_math import elementwise_unary
+from tmb.kernels.common.nan_order import is_nan_bits, quiet_nan
 
 
 @always_inline
@@ -1123,6 +1137,85 @@ def _gcd_scalar[
 
 
 @always_inline
+def _pow_exp[
+    dtype: DType, out_dtype: DType, n: Int
+](a: SIMD[dtype, n], p: SIMD[param_dtype[dtype](), 4]) -> SIMD[out_dtype, n]:
+    """PowKernel.cu's pow_tensor_scalar_kernel: `a ** p0`, p0 the exponent
+    already `exp.to<scalar_t>()` on the host, computed the way p1 (a
+    pow_math.POW_* mode, the host's choice) names. The products run in
+    scalar_t (a half product rounds to half before the next operation); the
+    sqrt / rsqrt / reciprocal kernels and the full pow in opmath."""
+    var mode = Int(p[1])
+    comptime if dtype.is_integral():
+        # C++ integer promotion: the narrow types multiply in int, which
+        # wraps the same once truncated back.
+        comptime wide = DType.int64 if dtype == DType.int64 else DType.int32
+        var x = a.cast[wide]()
+        if mode == POW_SQUARE:
+            return (x * x).cast[out_dtype]()
+        if mode == POW_CUBE:
+            return (x * x * x).cast[out_dtype]()
+        if mode == POW_INV_SQUARE:
+            # `1.0 / (base * base)` (a CPU-scalar int exponent of -2 only):
+            # the double quotient truncated by F2I, which saturates (an int32
+            # one for the narrow types, unsigned for uint8, then truncated):
+            # 1 for a square of 1, the saturated value for 0, else 0.
+            var sq = x * x
+            comptime sat = Scalar[dtype](
+                -1
+            ) if dtype == DType.int8 or dtype == DType.int16 else (
+                Scalar[dtype](255) if dtype
+                == DType.uint8 else Scalar[dtype].MAX
+            )
+            return (
+                sq.eq(0)
+                .select(
+                    SIMD[dtype, n](sat),
+                    sq.eq(1).select(SIMD[dtype, n](1), SIMD[dtype, n](0)),
+                )
+                .cast[out_dtype]()
+            )
+        var e = p[0].cast[dtype]()
+        var r = SIMD[dtype, n]()
+        comptime for i in range(n):
+            r[i] = _powi(a[i], e)
+        return r.cast[out_dtype]()
+    else:
+        comptime w = DType.float64 if dtype == DType.float64 else DType.float32
+        var x = a.cast[w]()
+        if mode == POW_SQUARE:
+            return cast_rounded[dtype](x * x).cast[out_dtype]()
+        if mode == POW_CUBE:
+            var sq = cast_rounded[dtype](x * x).cast[w]()
+            return cast_rounded[dtype](sq * x).cast[out_dtype]()
+        if mode == POW_INV_SQUARE:
+            # the double quotient rounds to the float one (no double
+            # rounding at 2p + 2 bits): nvcc divides in float
+            var sq = cast_rounded[dtype](x * x).cast[w]()
+            return (1 / sq).cast[out_dtype]()
+        if mode == POW_SQRT:
+            comptime if dtype == DType.float64 and is_nvidia_gpu():
+                return cuda_sqrt(x).cast[out_dtype]()
+            return elementwise_unary["sqrt"](x).cast[out_dtype]()
+        if mode == POW_RSQRT:
+            comptime if is_nvidia_gpu():
+                return cuda_rsqrt(x).cast[out_dtype]()
+            return elementwise_unary["rsqrt"](x).cast[out_dtype]()
+        if mode == POW_RECIPROCAL:
+            comptime if dtype == DType.float64 and is_nvidia_gpu():
+                return cuda_reciprocal(x).cast[out_dtype]()
+            return elementwise_unary["reciprocal"](x).cast[out_dtype]()
+        comptime if dtype == DType.float64:
+            var xd = a.cast[DType.float64]()
+            var ed = SIMD[DType.float64, n](p[0].cast[DType.float64]())
+            return torch_pow(xd, ed).cast[out_dtype]()
+        else:
+            var xf = a.cast[DType.float32]()
+            var ef = SIMD[DType.float32, n](p[0].cast[DType.float32]())
+            return torch_pow(xf, ef).cast[out_dtype]()
+
+
+@always_inline
 def _powi[
     dtype: DType
 ](base: Scalar[dtype], exponent: Scalar[dtype]) -> Scalar[dtype]:
@@ -1718,26 +1811,20 @@ def _wide[
         # the CUDA float powf (float32 and the half types widened, on
         # NVIDIA and Apple) or a double-double float64 core, what stock
         # torch runs.
-        return torch_pow(SIMD[w, n](p[0]), a)
-    elif kind == "pow_tensor_scalar":
-        # PowKernel.cu's pow_tensor_scalar_kernel (the float64 route; the
-        # float types take the elementwise family's PowScalarSpec): p0 = the
-        # exponent. 2, 3 and -2 are products, 0.5 / -0.5 / -1 the sqrt /
-        # rsqrt / reciprocal kernels, the rest the full pow.
-        var e = p[0]
-        if e == 2:
-            return a * a
-        elif e == 3:
-            return (a * a) * a
-        elif e == -2:
-            return 1 / (a * a)
-        elif e == 0.5:
-            return ieee_sqrt(a)
-        elif e == -0.5:
-            return 1 / ieee_sqrt(a)
-        elif e == -1:
-            return 1 / a
-        return torch_pow(a, SIMD[w, n](e))
+        var r = torch_pow(SIMD[w, n](p[0]), a)
+        comptime if w == DType.float64 and is_nvidia_gpu():
+            # p1 != 0: pow.Scalar, whose base stock CUDA wraps in a 0-d
+            # DEVICE tensor (wrapped_scalar_tensor(base, exp.device())): its
+            # tensor kernel keeps the exponent's NaN of two (nv_pow's DADD),
+            # where a CPU-scalar base (the uniform here) keeps its own.
+            if p[1] != 0:
+                var both = is_nan_bits(SIMD[w, n](p[0])) & is_nan_bits(a)
+                r = both.select(quiet_nan(a), r)
+        return r
+    elif kind == "pow_tt":
+        # pow_(base, exp) of two tensors in the common dtype (Pow.cuh: float
+        # pow for float32 and the half types, double for float64)
+        return torch_pow(a, b)
     elif kind == "masked_scale":
         # Dropout.cu's masked_scale_kernel: (float)mask * src * scale, a =
         # src, b = the uint8 mask (exact in every float dtype), p0 = scale.
@@ -2698,6 +2785,8 @@ def pointwise[
         # zero as one fma, rounded once to the activation dtype.
         comptime w = DType.float64 if dtype == DType.float64 else DType.float32
         return (a.cast[w]() - 8).fma(b.cast[w](), c.cast[w]()).cast[out_dtype]()
+    elif kind == "pow_exp":
+        return _pow_exp[dtype, out_dtype](a, p)
     elif kind == "widen":
         # A plain conversion for dtype pairs the cast kernel does not build
         # (int8 -> float32 for aten::_weight_int8pack_mm): exact widening.

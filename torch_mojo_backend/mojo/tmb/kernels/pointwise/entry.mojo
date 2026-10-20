@@ -98,8 +98,8 @@ comptime KINDS_1 = [
     "leaky_relu",
     "log_sigmoid",
     "mish",
+    "pow_exp",
     "pow_scalar_base",
-    "pow_tensor_scalar",
     "scale",
     "softplus",
     "softshrink",
@@ -157,6 +157,7 @@ comptime KINDS_2 = [
     "mse",
     "mul_scale",
     "nextafter",
+    "pow_tt",
     "prelu",
     "rrelu_noise",
     "rrelu_train",
@@ -232,8 +233,9 @@ def _heavy_kind[kind: StaticString]() -> Bool:
         or kind == "fmod"
         or kind == "gcd"
         or kind == "lcm"
+        or kind == "pow_exp"
         or kind == "pow_scalar_base"
-        or kind == "pow_tensor_scalar"
+        or kind == "pow_tt"
         or kind == "ldexp_pow2"
         or kind == "nextafter"
         or kind == "fmax"

@@ -230,11 +230,12 @@ def binary_cases(
     *,
     inplace: str | None = None,
     out: bool = True,
+    operands: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> list[tuple[str, Callable[..., object], Sequence[object]]]:
-    """Tensor-tensor cases of `fn` over `pairs(dtype)`: functional, `out=`
-    (an empty out of the result's dtype, resized by the op) and the method
-    named `inplace`."""
-    a, b = pairs(dtype)
+    """Tensor-tensor cases of `fn` over `pairs(dtype)` (or `operands`):
+    functional, `out=` (an empty out of the result's dtype, resized by the
+    op) and the method named `inplace`."""
+    a, b = pairs(dtype) if operands is None else operands
     cases: list[tuple[str, Callable[..., object], Sequence[object]]] = [
         ("tt", fn, (a, b))
     ]
@@ -260,6 +261,7 @@ def scalar_cases(
     inplace: str | None = None,
     reverse: Sequence[object] = (),
     zero_dim: bool = True,
+    operands: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> list[tuple[str, Callable[..., object], Sequence[object]]]:
     """Tensor-with-number cases: `fn(t, s)`; the 0-d CPU tensor
     `torch.tensor(s)` in its place (a CPU scalar to CUDA's kernels, built
@@ -268,8 +270,9 @@ def scalar_cases(
     method; and `fn(s, t)` with the same three forms for `reverse`.
 
     A NaN `s` skips the 0-d device form for float64 / complex128 tensors:
-    that is two tensor NaNs (`two_distinct_nans`)."""
-    a, b = pairs(dtype)
+    that is two tensor NaNs (`two_distinct_nans`). `operands` replaces
+    `pairs(dtype)`."""
+    a, b = pairs(dtype) if operands is None else operands
     wide = dtype in (torch.float64, torch.complex128)
     cases: list[tuple[str, Callable[..., object], Sequence[object]]] = []
 
