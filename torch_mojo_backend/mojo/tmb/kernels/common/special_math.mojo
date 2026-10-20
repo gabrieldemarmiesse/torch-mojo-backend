@@ -22,7 +22,7 @@
 
 from std.builtin.globals import global_constant
 from std.collections import Array
-from std.math import fma
+from std.math import abs, floor, fma
 from std.sys import llvm_intrinsic
 from std.sys._assembly import inlined_assembly
 from std.sys.info import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
@@ -569,6 +569,73 @@ def trigamma[dt: DType](x_in: Scalar[dt]) -> Scalar[dt]:
         + ixx * (one / T(6.0) - ixx * (one / T(30.0) - ixx * (one / T(42.0))))
     ) / x
     return _mul_rn(sign, result)  # a real mul: fneg would flip a NaN's sign
+
+
+@always_inline
+def zeta_f_legacy(x: Float32, q: Float32) -> Float32:
+    """AMD / Apple: `zeta_string` in float as before the CUDA-exact port (`zeta`).
+    """
+    comptime MACHEP = Float32(1.11022302462515654042e-16)
+    comptime A = [
+        12.0,
+        -720.0,
+        30240.0,
+        -1209600.0,
+        47900160.0,
+        -1.8924375803183791606e9,
+        7.47242496e10,
+        -2.950130727918164224e12,
+        1.1646782814350067249e14,
+        -4.5979787224074726105e15,
+        1.8152105401943546773e17,
+        -7.1661652561756670113e18,
+    ]
+    # C's comparisons with NaN are all false; spelled out with `_isnan`,
+    # which the GPU build's fast-math flags cannot fold (a NaN q in the loop
+    # below could otherwise never leave it).
+    var x_nan = _isnan(x)
+    var q_nan = _isnan(q)
+    if not x_nan and x == Float32(1.0):
+        return _INF
+    if not x_nan and x < Float32(1.0):
+        return _NAN
+    if not q_nan and q <= Float32(0.0):
+        if q == floor(q):
+            return _INF
+        if x_nan or x != floor(x):
+            return _NAN
+    if x_nan or q_nan:
+        return _NAN
+    var s = powf_c99(q, -x)
+    var a = q
+    var i = 0
+    var b = Float32(0.0)
+    while (i < 9) or (a <= Float32(9.0)):
+        i += 1
+        a += Float32(1.0)
+        b = powf_c99(a, -x)
+        s += b
+        if (-MACHEP * s < b) and (b < MACHEP * s):
+            return s
+    var w = a
+    s += b * w / (x - Float32(1.0))
+    s -= Float32(0.5) * b
+    var aa = Float32(1.0)
+    var k = Float32(0.0)
+    comptime for j in range(12):
+        aa *= x + k
+        b /= w
+        comptime aj = A[j]
+        var t = aa * b / Float32(aj)
+        s = s + t
+        t = abs(t / s)
+        if t < MACHEP:
+            return s
+        k += Float32(1.0)
+        aa *= x + k
+        b /= w
+        k += Float32(1.0)
+    return s
 
 
 @always_inline

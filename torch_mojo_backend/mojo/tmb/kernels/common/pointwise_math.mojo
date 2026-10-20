@@ -72,6 +72,7 @@ from tmb.kernels.common.special_math import (
     igammac_f_legacy,
     jit_nan,
     zeta,
+    zeta_f_legacy,
 )
 
 
@@ -413,11 +414,169 @@ def _hypot_f64(x: Float64, y: Float64) -> Float64:
 
 
 @always_inline
+def _zeta_scalar_legacy(x: Float64, q: Float64) -> Float64:
+    """Hurwitz zeta, Cephes (aten/src/ATen/native/Math.h `zeta`), in double
+    for every input dtype: CPU torch accumulates float in double too."""
+    comptime MACHEP = 1.11022302462515654042e-16
+    var A = Array[Float64, 12](fill=0.0)
+    A[0] = 12.0
+    A[1] = -720.0
+    A[2] = 30240.0
+    A[3] = -1209600.0
+    A[4] = 47900160.0
+    A[5] = -1.8924375803183791606e9
+    A[6] = 7.47242496e10
+    A[7] = -2.950130727918164224e12
+    A[8] = 1.1646782814350067249e14
+    A[9] = -4.5979787224074726105e15
+    A[10] = 1.8152105401943546773e17
+    A[11] = -7.1661652561756670113e18
+    # C's comparisons with NaN are all false (zeta_f spells out why).
+    var x_nan = isnan(x)
+    var q_nan = isnan(q)
+    if not x_nan and x == 1.0:
+        return inf[DType.float64]()
+    if not x_nan and x < 1.0:
+        return nan[DType.float64]()
+    if not q_nan and q <= 0.0:
+        if q == floor(q):
+            return inf[DType.float64]()
+        if x_nan or x != floor(x):
+            return nan[DType.float64]()
+    if x_nan or q_nan:
+        return nan[DType.float64]()
+    var s = _zeta_pow(q, -x)
+    var a = q
+    var i = 0
+    var b = 0.0
+    while i < 9 or a <= 9.0:
+        i += 1
+        a += 1.0
+        b = _zeta_pow(a, -x)
+        s += b
+        if -MACHEP * s < b and b < MACHEP * s:
+            return s
+    var w = a
+    s += b * w / (x - 1.0)
+    s -= 0.5 * b
+    a = 1.0
+    var k = 0.0
+    for j in range(12):
+        a *= x + k
+        b /= w
+        var t = a * b / A[j]
+        s = s + t
+        t = abs(t / s)
+        if t < MACHEP:
+            return s
+        k += 1.0
+        a *= x + k
+        b /= w
+        k += 1.0
+    return s
+
+
+@always_inline
+def _zeta_pow(a: Float64, b: Float64) -> Float64:
+    """C's pow for zeta's terms (the jiterator's `pow` for T = double):
+    pow_math's special cases (pow(1, -inf) = 1, zero and negative bases)
+    around its double-double core."""
+    return torch_pow[DType.float64, 1](a, b)[0]
+
+
+@always_inline
+def _acos_f64_legacy(x: Float64) -> Float64:
+    """fdlibm's `__ieee754_acos` (a rational fit of asin on [0, 1/2], within
+    an ulp): std.math has no float64 acos on NVIDIA or AMD (`facos` has no
+    libcall there)."""
+    comptime PIO2_HI = 1.57079632679489655800e00
+    comptime PIO2_LO = 6.12323399573676603587e-17
+
+    @always_inline
+    def rat(z: Float64) -> Float64:
+        var p = z * (
+            1.66666666666666657415e-01
+            + z
+            * (
+                -3.25565818622400915405e-01
+                + z
+                * (
+                    2.01212532134862925881e-01
+                    + z
+                    * (
+                        -4.00555345006794114027e-02
+                        + z
+                        * (
+                            7.91534994289814532176e-04
+                            + z * 3.47933107596021167570e-05
+                        )
+                    )
+                )
+            )
+        )
+        var q = 1.0 + z * (
+            -2.40339491173441421878e00
+            + z
+            * (
+                2.02094576023350569471e00
+                + z
+                * (-6.88283971605453293030e-01 + z * 7.70381505559019352791e-02)
+            )
+        )
+        return p / q
+
+    if isnan(x) or abs(x) > 1.0:
+        return nan[DType.float64]()
+    if abs(x) < 0.5:
+        return PIO2_HI - (x - (PIO2_LO - x * rat(x * x)))
+    if x < 0.0:
+        var z = (1.0 + x) * 0.5
+        var s = ieee_sqrt(z)
+        var w = rat(z) * s - PIO2_LO
+        return 2.0 * (PIO2_HI - (s + w))
+    var z = (1.0 - x) * 0.5
+    var s = ieee_sqrt(z)
+    var df = bitcast[DType.float64](
+        bitcast[DType.uint64](s) & UInt64(0xFFFFFFFF00000000)
+    )
+    var c = (z - df * df) / (s + df)
+    var w = rat(z) * s + c
+    return 2.0 * (df + w)
+
+
+@always_inline
+def _negn[w: DType](m: Int) -> Scalar[w]:
+    """`-(n + 1)` of the polynomials: the integer negation on NVIDIA (C++
+    negates the int64), the float one elsewhere."""
+    comptime if is_nvidia_gpu():
+        return Scalar[w](-m)
+    else:
+        return -Scalar[w](m)
+
+
+@always_inline
+def _polynan[w: DType]() -> Scalar[w]:
+    """The jiterator's NaN on NVIDIA, the plain one elsewhere."""
+    comptime if is_nvidia_gpu():
+        return jit_nan[w]()
+    else:
+        return nan[w]()
+
+
+@always_inline
 def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
-    """`static_cast<int64_t>(n)` for the polynomial degree as the GPU
-    converts (cvt.rzi.s64): truncation, saturating at int64's bounds, NaN
-    to INT64_MIN. Apple GPUs have no float64, so their degrees convert from
-    float."""
+    """`static_cast<int64_t>(n)` for the polynomial degree. NVIDIA: as the GPU
+    converts (cvt.rzi.s64): truncation, saturating at int64's bounds, NaN to
+    INT64_MIN. Elsewhere NaN and degrees outside int64's range read as -1
+    (x86's cvttsd2si makes those a negative degree)."""
+    comptime if not is_nvidia_gpu():
+        if (
+            isnan(n)
+            or n >= 9223372036854775808.0
+            or n <= -9223372036854775808.0
+        ):
+            return -1
+        return Int(n)
     if _poly_isnan(n):
         return Int.MIN
     if n >= Scalar[w](9223372036854775808.0):
@@ -429,7 +588,9 @@ def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
 
 @always_inline
 def _poly_isnan[w: DType](x: Scalar[w]) -> Bool:
-    """On the bits, as `special_math._isnan`."""
+    """On the bits, as `special_math._isnan` (NVIDIA; elsewhere isnan)."""
+    comptime if not is_nvidia_gpu():
+        return isnan(x)
     comptime if w == DType.float64:
         return (
             rebind[Float64](x).to_bits[DType.uint64]()
@@ -500,8 +661,10 @@ def _pacos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
     its last-ulp differences n-fold), libdevice's acos for float64."""
     comptime if w == DType.float32 and is_nvidia_gpu():
         return cuda_acosf(x.cast[DType.float32]()).cast[w]()
-    elif w == DType.float64:
+    elif w == DType.float64 and is_nvidia_gpu():
         return nv_acos(x.cast[DType.float64]()).cast[w]()
+    elif w == DType.float64:
+        return _acos_f64_legacy(x.cast[DType.float64]()).cast[w]()
     else:
         return acos(x)
 
@@ -542,7 +705,7 @@ def _psin[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
 @always_inline
 def _poly_cos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
     """The polynomials' `cos`: libdevice's for double too."""
-    comptime if w == DType.float64:
+    comptime if w == DType.float64 and is_nvidia_gpu():
         return rebind[Scalar[w]](nv_cos(rebind[Float64](x)))
     else:
         return _pcos(x)
@@ -550,7 +713,7 @@ def _poly_cos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
 
 @always_inline
 def _poly_sin[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
-    comptime if w == DType.float64:
+    comptime if w == DType.float64 and is_nvidia_gpu():
         return rebind[Scalar[w]](nv_sin(rebind[Float64](x)))
     else:
         return _psin(x)
@@ -566,6 +729,12 @@ def _polynomial[
     comptime one = Scalar[w](1.0)
     if n < 0:
         return 0
+    comptime if not is_nvidia_gpu():
+        if isnan(x):
+            # Every special case compares x and fails for NaN, so the result
+            # is the degree-0 constant or NaN; tested up front because the
+            # GPU's fast-math flags may fold those comparisons either way.
+            return one if n == 0 else x
     comptime if kind == "chebyshev_polynomial_t":
         if abs(x) == one:
             if x > 0 or n % 2 == 0:
@@ -591,7 +760,7 @@ def _polynomial[
         if abs(x) == one:
             if x > 0 or n % 2 == 0:
                 return Scalar[w](n + 1)
-            return Scalar[w](-(n + 1))
+            return _negn[w](n + 1)
         if n > 8 and abs(x) < one:
             var t = _pacos(x)
             if _poly_sin(t) != 0:
@@ -617,14 +786,14 @@ def _polynomial[
                 return one
             if n % 2 == 0:
                 return Scalar[w](n + n + 1)
-            return Scalar[w](-(n + n + 1))
+            return _negn[w](n + n + 1)
         if n > 8 and abs(x) < one:
             var t = _pacos(x)
             if _poly_sin(t / 2) != one:
                 return _poly_cos((Scalar[w](n) + 0.5) * t) / _poly_cos(t / 2)
             if n % 2 == 0:
                 return Scalar[w](n + n + 1)
-            return Scalar[w](-(n + n + 1))
+            return _negn[w](n + n + 1)
         if n == 0:
             return one
         if n == 1:
@@ -676,7 +845,7 @@ def _polynomial[
             return x + x
         comptime limit = 512 if w == DType.float64 else 128
         if n > limit:
-            return jit_nan[w]()
+            return _polynan[w]()
         var p = one
         var q = x + x
         var r = Scalar[w](0)
@@ -694,7 +863,7 @@ def _polynomial[
             return x
         comptime limit = 512 if w == DType.float64 else 128
         if n > limit:
-            return jit_nan[w]()
+            return _polynan[w]()
         var p = one
         var q = x
         var r = Scalar[w](0)
@@ -772,7 +941,7 @@ def _polynomial[
             if x == one:
                 return Scalar[w](n + 1)
             if x == 0:
-                return Scalar[w](n + 1) if n % 2 == 0 else Scalar[w](-(n + 1))
+                return Scalar[w](n + 1) if n % 2 == 0 else _negn[w](n + 1)
             if n > 6 and abs(y) < one:
                 var t = _pacos(y)
                 if _poly_sin(t) != 0:
@@ -1572,6 +1741,8 @@ def _wide[
         else:
             # A NaN x reaches `x * log(y)`: the GPU's NaN of a product.
             r = a.eq(0).select(zero, r)
+            comptime if not is_nvidia_gpu():
+                r = isnan(a).select(a, r)
         return isnan(b).select(SIMD[w, n](nan[w]()), r)
     elif kind == "igamma" or kind == "igammac":
         # IGammaKernel.cu calc_igamma / calc_igammac (special_math.mojo):
@@ -1600,7 +1771,16 @@ def _wide[
         # as well; MPS's c10::metal::zeta is float too).
         var r = SIMD[w, n]()
         comptime for i in range(n):
-            r[i] = zeta(a[i], b[i])
+            comptime if is_nvidia_gpu():
+                r[i] = zeta(a[i], b[i])
+            elif w == DType.float32:
+                r[i] = zeta_f_legacy(
+                    a[i].cast[DType.float32](), b[i].cast[DType.float32]()
+                ).cast[w]()
+            else:
+                r[i] = _zeta_scalar_legacy(
+                    a[i].cast[DType.float64](), b[i].cast[DType.float64]()
+                ).cast[w]()
         return r
     elif is_polynomial[kind]():
         var r = SIMD[w, n]()
