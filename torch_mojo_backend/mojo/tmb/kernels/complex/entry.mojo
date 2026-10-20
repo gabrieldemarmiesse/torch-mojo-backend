@@ -46,6 +46,7 @@ from std.utils.numerics import isinf, isnan
 from tmb.kernels.common.complex_math import (
     Cx,
     cacos_jit,
+    cangle,
     cacos_thrust,
     cacosh_jit,
     cacosh_thrust,
@@ -218,7 +219,7 @@ def _unary_re[kind: StaticString, dt: DType](z: Cx[dt]) -> Scalar[dt]:
     comptime if kind == "abs":
         return chypot(z.re, z.im)
     elif kind == "angle":
-        return catan2(z.im, z.re)
+        return cangle(z)
     elif kind == "real":
         return z.re
     else:

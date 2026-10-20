@@ -604,6 +604,13 @@ def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
+def _quiet_f64[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """A float64 NaN quieted with its sign and payload kept, as an add with an
+    operand NaN leaves it on NVIDIA."""
+    return bitcast[dt](bitcast[DType.uint64](x) | 0x0008000000000000)
+
+
+@always_inline
 def cexp_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """libc++'s exp(complex)."""
     # Modified from libc++ exp(const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
@@ -618,14 +625,36 @@ def cexp_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
             if isinf(i):
                 i = _jnan[dt]()
             return Cx[dt](z.re, i)
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        # A NaN real part with an imaginary part that is not zero: stock CUDA
+        # returns that NaN, quieted with its sign and payload, in both parts
+        # (the product of NaNs picks the other factor's NaN here).
+        if isnan(z.re):
+            var q = _quiet_f64(z.re)
+            return Cx[dt](q, q)
     var e = _rexp(z.re)
     return Cx[dt](_hmul(e, _rcos(i)), _hmul(e, _rsin(i)))
+
+
+@always_inline
+def cangle[dt: DType](z: Cx[dt]) -> Scalar[dt]:
+    """arg(z) = atan2(im, re); on NVIDIA double a NaN imaginary part is the
+    result, quieted, as CUDA's atan2 returns its y operand's NaN."""
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        if isnan(z.im):
+            return _quiet_f64(z.im)
+    return catan2(z.im, z.re)
 
 
 @always_inline
 def clog_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """libc++'s log(complex): log(abs(z)) + i arg(z)."""
     # Modified from libc++ log(const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        # A NaN imaginary part is the result's imaginary part (CUDA's atan2
+        # returns its y operand's NaN), quieted.
+        if isnan(z.im):
+            return Cx[dt](_rlog(chypot(z.re, z.im)), _quiet_f64(z.im))
     return Cx[dt](_rlog(chypot(z.re, z.im)), catan2(z.im, z.re))
 
 
@@ -687,6 +716,17 @@ def creciprocal[dt: DType](z: Cx[dt]) -> Cx[dt]:
 
 
 @always_inline
+def _sgn_part_nan[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """A part of sgn of an infinite magnitude: a NaN part comes back quieted
+    on NVIDIA double (CUDA's x / |z| keeps it), an infinite one is the
+    hardware NaN."""
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        if isnan(x):
+            return _quiet_f64(x)
+    return _hwnan[dt]()
+
+
+@always_inline
 def csgn[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """`sgn_impl`: 0 at 0, else z / |z| (a complex over a real)."""
     if _is_zero(z.re) and _is_zero(z.im):
@@ -695,12 +735,12 @@ def csgn[dt: DType](z: Cx[dt]) -> Cx[dt]:
     if isinf(r):
         # x / inf: NaN for an infinite part, a signed zero for a finite one
         # (spelled out: the build may assume no infinities in a division)
-        var re = _hwnan[dt]() if isinf(z.re) or isnan(z.re) else _copysign(
-            Scalar[dt](0), z.re
-        )
-        var im = _hwnan[dt]() if isinf(z.im) or isnan(z.im) else _copysign(
-            Scalar[dt](0), z.im
-        )
+        var re = _sgn_part_nan[dt](z.re) if isinf(z.re) or isnan(
+            z.re
+        ) else _copysign(Scalar[dt](0), z.re)
+        var im = _sgn_part_nan[dt](z.im) if isinf(z.im) or isnan(
+            z.im
+        ) else _copysign(Scalar[dt](0), z.im)
         return Cx[dt](re, im)
     return Cx[dt](z.re / r, z.im / r)
 
@@ -890,6 +930,11 @@ def cexpm1_c10[dt: DType](z: Cx[dt]) -> Cx[dt]:
     """c10_complex_math::expm1 (a gpu_kernel, nvcc): (expm1(x) cos(y) -
     2 sin(y / 2)^2) + i e^x sin(y), the subtraction fused into the product
     as stock torch's SASS has it."""
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        # As cexp_jit: a NaN real part with an imaginary part that is not zero.
+        if isnan(z.re) and not _is_zero(z.im):
+            var q = _quiet_f64(z.re)
+            return Cx[dt](q, q)
     var a = _rsin(z.im * Scalar[dt](0.5))
     var er = _hfma(_expm1[dt, 1](z.re), _rcos(z.im), (a * Scalar[dt](-2)) * a)
     return Cx[dt](er, _hmul(_rexp(z.re), _rsin(z.im)))
@@ -904,6 +949,11 @@ def clog1p_c10[dt: DType](z: Cx[dt]) -> Cx[dt]:
     var y = z.im
     var zabs = chypot(x, y)
     var theta = catan2_nvcc(y, x + Scalar[dt](1))
+    comptime if dt == DType.float64 and is_nvidia_gpu():
+        if isnan(x):
+            theta = _quiet_f64(x)
+        elif isnan(y):
+            theta = _quiet_f64(y)
     if not isnan(zabs) and zabs < Scalar[dt](0.5):
         var r = y.fma(y, x * (Scalar[dt](2) + x))
         if _is_zero(r):

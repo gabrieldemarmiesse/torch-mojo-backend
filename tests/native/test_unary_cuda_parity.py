@@ -40,54 +40,16 @@ def _dtype_id(dtype: torch.dtype) -> str:
 # Open mismatches on NaN bits (strict: a fix turns the entry into a failure
 # that asks for its removal from this table).
 _NAN_SIGN_REASON = (
-    "NaN sign or payload of a complex result differs from stock CUDA: the "
-    "double-precision exp/log/expm1/sgn and complex64 negation paths are not "
-    "bit-exact on NaN yet"
+    "NaN sign or payload of a complex64 negation differs from stock CUDA: "
+    "CUDA's result depends on the NaN's sign and on the tensor size"
 )
+# Open mismatches on NaN bits (strict: a fix turns the entry into a failure
+# that asks for its removal from this table).
 _NAN_SIGN_XFAIL: dict[str, frozenset[tuple[str, str]]] = {
-    "test_unary": frozenset(
-        {
-            ("conj_physical", "complex64"),
-            ("neg", "complex64"),
-            ("angle", "complex128"),
-            ("exp", "complex128"),
-            ("exp2", "complex128"),
-            ("expm1", "complex128"),
-            ("log", "complex128"),
-            ("log2", "complex128"),
-            ("log10", "complex128"),
-            ("log1p", "complex128"),
-            ("sgn", "complex128"),
-        }
-    ),
-    "test_unary_out": frozenset(
-        {
-            ("conj_physical", "complex64"),
-            ("neg", "complex64"),
-            ("angle", "complex128"),
-            ("exp", "complex128"),
-            ("exp2", "complex128"),
-            ("expm1", "complex128"),
-            ("log", "complex128"),
-            ("log2", "complex128"),
-            ("log10", "complex128"),
-            ("log1p", "complex128"),
-            ("sgn", "complex128"),
-        }
-    ),
+    "test_unary": frozenset({("conj_physical", "complex64"), ("neg", "complex64")}),
+    "test_unary_out": frozenset({("conj_physical", "complex64"), ("neg", "complex64")}),
     "test_unary_inplace": frozenset(
-        {
-            ("conj_physical", "complex64"),
-            ("neg", "complex64"),
-            ("exp", "complex128"),
-            ("exp2", "complex128"),
-            ("expm1", "complex128"),
-            ("log", "complex128"),
-            ("log2", "complex128"),
-            ("log10", "complex128"),
-            ("log1p", "complex128"),
-            ("sgn", "complex128"),
-        }
+        {("conj_physical", "complex64"), ("neg", "complex64")}
     ),
     "test_unary_layouts": frozenset({("neg", "complex64")}),
 }
