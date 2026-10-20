@@ -69,6 +69,7 @@ from tmb.ops.common import (
 )
 from tmb.backend.abi import (
     OpFn,
+    tensor_arg,
     TAG_DTYPE,
     TAG_INT,
     v_is_complex,
@@ -528,12 +529,20 @@ def cx_backward_out[
     """`kind.grad_input(grad_output, output, *, grad_input)` with a complex
     operand."""
     var dest = v_tensor_c(args[unsafe_offset=2])
+    # CUDA dispatches on the out= dtype (BinaryMiscBackwardOpsKernels.cu):
+    # the operands are converted to it before the arithmetic, not after.
+    var g = v_tensor_c(args[unsafe_offset=0])
+    var o = v_tensor_c(args[unsafe_offset=1])
+    var gc = own_if_new(cast_complex(g, dest.stype), g)
+    var oc = own_if_new(cast_complex(o, dest.stype), o)
     _store_ew[2](
         args,
         dest,
-        _arith(kind, args[unsafe_offset=0], args[unsafe_offset=1], _no_alpha()),
+        _arith(kind, tensor_arg(gc.t), tensor_arg(oc.t), _no_alpha()),
         rets,
     )
+    _ = gc^
+    _ = oc^
 
 
 # mul / div ------------------------------------------------------------------
