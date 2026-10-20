@@ -57,8 +57,14 @@ def _round_away(x: Float32) -> Float32:
 
 @always_inline
 def _rint(x: Float32) -> Float32:
-    """llvm.nvvm.round.f (libdevice's rintf): nearest integer, ties to even."""
-    return llvm_intrinsic["llvm.roundeven", Float32, has_side_effect=False](x)
+    """llvm.nvvm.round.f (libdevice's rintf): nearest integer, ties to even
+    (NVIDIA; other targets keep the ties-away `_round_away` they always ran)."""
+    comptime if is_nvidia_gpu():
+        return llvm_intrinsic["llvm.roundeven", Float32, has_side_effect=False](
+            x
+        )
+    else:
+        return _round_away(x)
 
 
 @always_inline

@@ -937,10 +937,14 @@ def _trig_reduction_slowpath_d(
 
     var nz = count_leading_zeros(hi2).cast[DType.uint32]()
     var hi3 = hi2
-    if nz == UInt32(64):  # PTX clamps the shift: hi2 << 64 | lo2 >> 0
-        hi3 = lo2
-    elif nz != UInt32(0):
-        hi3 = (hi2 << _z64(nz)) | (lo2 >> _z64(UInt32(64) - nz))
+    comptime if is_nvidia_gpu():
+        if nz == UInt32(64):  # PTX clamps the shift: hi2 << 64 | lo2 >> 0
+            hi3 = lo2
+        elif nz != UInt32(0):
+            hi3 = (hi2 << _z64(nz)) | (lo2 >> _z64(UInt32(64) - nz))
+    else:
+        if nz != UInt32(0) and nz != UInt32(64):
+            hi3 = (hi2 << _z64(nz)) | (lo2 >> _z64(UInt32(64) - nz))
 
     var prod2 = _z128(hi3) * _z128(UInt64(0xC90FDAA22168C235))
     var phi = (prod2 >> UInt128(64)).cast[DType.uint64]()

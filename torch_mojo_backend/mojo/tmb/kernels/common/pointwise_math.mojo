@@ -569,7 +569,15 @@ def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
     converts (cvt.rzi.s64): truncation, saturating at int64's bounds, NaN to
     INT64_MIN. Elsewhere NaN and degrees outside int64's range read as -1
     (x86's cvttsd2si makes those a negative degree)."""
-    comptime if not is_nvidia_gpu():
+    comptime if is_nvidia_gpu():
+        if _poly_isnan(n):
+            return Int.MIN
+        if n >= Scalar[w](9223372036854775808.0):
+            return Int.MAX
+        if n <= Scalar[w](-9223372036854775808.0):
+            return Int.MIN
+        return Int(n)
+    else:
         if (
             isnan(n)
             or n >= 9223372036854775808.0
@@ -577,13 +585,6 @@ def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
         ):
             return -1
         return Int(n)
-    if _poly_isnan(n):
-        return Int.MIN
-    if n >= Scalar[w](9223372036854775808.0):
-        return Int.MAX
-    if n <= Scalar[w](-9223372036854775808.0):
-        return Int.MIN
-    return Int(n)
 
 
 @always_inline
@@ -591,7 +592,7 @@ def _poly_isnan[w: DType](x: Scalar[w]) -> Bool:
     """On the bits, as `special_math._isnan` (NVIDIA; elsewhere isnan)."""
     comptime if not is_nvidia_gpu():
         return isnan(x)
-    comptime if w == DType.float64:
+    elif w == DType.float64:
         return (
             rebind[Float64](x).to_bits[DType.uint64]()
             & UInt64(0x7FFFFFFFFFFFFFFF)
@@ -720,7 +721,7 @@ def _poly_sin[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
 
 
 @always_inline
-def _polynomial[
+def _polynomial_nv[
     kind: StaticString, w: DType
 ](x: Scalar[w], n_f: Scalar[w]) -> Scalar[w] where w.is_floating_point():
     """The orthogonal polynomials of aten/src/ATen/native/Math.h
@@ -1020,6 +1021,330 @@ def _polynomial[
                 q = r
                 k += 1
             return r
+
+
+def _poly_n_legacy[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
+    """`static_cast<int64_t>(n)` for the polynomial degree (truncation), in
+    the operand's own float type (no float64 on Apple GPUs); NaN and
+    degrees outside int64's range (-2^63, 2^63) read as -1, which every
+    polynomial maps to 0 (hermite does exactly this; the others are UB in
+    C++, which x86's cvttsd2si turns into INT64_MIN, a negative degree).
+    The cutoff is 2^63 exactly: every float below it converts, so a degree
+    such as 9.21e18 keeps its value."""
+    if isnan(n) or n >= 9223372036854775808.0 or n <= -9223372036854775808.0:
+        return -1
+    return Int(n)
+
+
+@always_inline
+def _polynomial_legacy[
+    kind: StaticString, w: DType
+](x: Scalar[w], n_f: Scalar[w]) -> Scalar[w] where w.is_floating_point():
+    """The orthogonal polynomials of aten/src/ATen/native/Math.h
+    (`*_polynomial_*_forward`), statement for statement, in the opmath type."""
+    var n = _poly_n_legacy(n_f)
+    comptime one = Scalar[w](1.0)
+    if n < 0:
+        return 0
+    if isnan(x):
+        # Every special case compares x and fails for NaN, so the result is
+        # the degree-0 constant or NaN; tested up front because the GPU's
+        # fast-math flags may fold those comparisons either way.
+        return one if n == 0 else x
+    comptime if kind == "chebyshev_polynomial_t":
+        if abs(x) == one:
+            if x > 0 or n % 2 == 0:
+                return one
+            return -one
+        if n > 6 and abs(x) < one:
+            return _pcos(Scalar[w](n) * _pacos(x))
+        if n == 0:
+            return one
+        if n == 1:
+            return x
+        var p = one
+        var q = x
+        var r = x
+        var k = 2
+        while k <= n and not isnan(q):
+            r = (x + x) * q - p
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "chebyshev_polynomial_u":
+        if abs(x) == one:
+            if x > 0 or n % 2 == 0:
+                return Scalar[w](n + 1)
+            return -Scalar[w](n + 1)
+        if n > 8 and abs(x) < one:
+            var t = _pacos(x)
+            if _psin(t) != 0:
+                return _psin(Scalar[w](n + 1) * t) / _psin(t)
+            return Scalar[w](n + 1) * _pcos(Scalar[w](n + 1) * t) / x
+        if n == 0:
+            return one
+        if n == 1:
+            return x + x
+        var p = one
+        var q = x + x
+        var r = q
+        var k = 2
+        while k <= n and not isnan(q):
+            r = (x + x) * q - p
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "chebyshev_polynomial_v":
+        if abs(x) == one:
+            if x > 0:
+                return one
+            if n % 2 == 0:
+                return Scalar[w](n + n + 1)
+            return -Scalar[w](n + n + 1)
+        if n > 8 and abs(x) < one:
+            var t = _pacos(x)
+            if _psin(t / 2) != one:
+                return _pcos((Scalar[w](n) + 0.5) * t) / _pcos(t / 2)
+            if n % 2 == 0:
+                return Scalar[w](n + n + 1)
+            return -Scalar[w](n + n + 1)
+        if n == 0:
+            return one
+        if n == 1:
+            return x + x - one
+        var p = one
+        var q = x + x - one
+        var r = q
+        var k = 2
+        while k <= n and not isnan(q):
+            r = (x + x) * q - p
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "chebyshev_polynomial_w":
+        if abs(x) == one:
+            if x > 0:
+                return Scalar[w](n + n + 1)
+            if n % 2 == 0:
+                return one
+            return -one
+        if n > 8 and abs(x) < one:
+            var t = _pacos(x)
+            if _pcos(t / 2) != one:
+                return _psin((Scalar[w](n) + 0.5) * t) / _psin(t / 2)
+            if x > 0:
+                return Scalar[w](n + n + 1)
+            if n % 2 == 0:
+                return one
+            return -one
+        if n == 0:
+            return one
+        if n == 1:
+            return x + x + one
+        var p = one
+        var q = x + x + one
+        var r = q
+        var k = 2
+        while k <= n and not isnan(q):
+            r = (x + x) * q - p
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "hermite_polynomial_h":
+        if n == 0:
+            return one
+        if n == 1:
+            return x + x
+        comptime limit = 512 if w == DType.float64 else 128
+        if n > limit:
+            return nan[w]()
+        var p = one
+        var q = x + x
+        var r = Scalar[w](0)
+        var k = 2
+        while k < n + n:
+            r = (x + x) * q - Scalar[w](k) * p
+            p = q
+            q = r
+            k += 2
+        return r
+    elif kind == "hermite_polynomial_he":
+        if n == 0:
+            return one
+        if n == 1:
+            return x
+        comptime limit = 512 if w == DType.float64 else 128
+        if n > limit:
+            return nan[w]()
+        var p = one
+        var q = x
+        var r = Scalar[w](0)
+        for k in range(1, n):
+            r = x * q - Scalar[w](k) * p
+            p = q
+            q = r
+        return r
+    elif kind == "laguerre_polynomial_l":
+        if abs(x) == 0:
+            return one
+        if n == 0:
+            return one
+        if n == 1:
+            return one - x
+        var p = one
+        var q = one - x
+        var r = q
+        var k = 1
+        while k < n and not isnan(q):
+            r = (
+                (Scalar[w](k + k) + (one - x)) * q - Scalar[w](k) * p
+            ) / Scalar[w](k + 1)
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "legendre_polynomial_p":
+        if abs(x) == one:
+            if x > 0 or n % 2 == 0:
+                return one
+            return -one
+        if n == 0:
+            return one
+        if n == 1:
+            return x
+        var p = one
+        var q = x
+        var r = q
+        var k = 1
+        while k < n and not isnan(q):
+            r = (Scalar[w](k + k + 1) * x * q - Scalar[w](k) * p) / Scalar[w](
+                k + 1
+            )
+            p = q
+            q = r
+            k += 1
+        return r
+    else:
+        # The shifted Chebyshev polynomials: T*(x) = T(2x - 1) and friends,
+        # with their own boundary cases at x = 0 and x = 1.
+        var y = x + x - one
+        comptime if kind == "shifted_chebyshev_polynomial_t":
+            if x == one:
+                return one
+            if x == 0:
+                return one if n % 2 == 0 else -one
+            if n > 6 and abs(y) < one:
+                return _pcos(Scalar[w](n) * _pacos(y))
+            if n == 0:
+                return one
+            if n == 1:
+                return y
+            var p = one
+            var q = y
+            var r = q
+            var k = 2
+            while k <= n and not isnan(q):
+                r = (y + y) * q - p
+                p = q
+                q = r
+                k += 1
+            return r
+        elif kind == "shifted_chebyshev_polynomial_u":
+            if x == one:
+                return Scalar[w](n + 1)
+            if x == 0:
+                return Scalar[w](n + 1) if n % 2 == 0 else -Scalar[w](n + 1)
+            if n > 6 and abs(y) < one:
+                var t = _pacos(y)
+                if _psin(t) != 0:
+                    return _psin(Scalar[w](n + 1) * t) / _psin(t)
+                return Scalar[w](n + 1) * _pcos(Scalar[w](n + 1) * t) / y
+            if n == 0:
+                return one
+            if n == 1:
+                return y + y
+            var p = one
+            var q = y + y
+            var r = q
+            var k = 2
+            while k <= n and not isnan(q):
+                r = (y + y) * q - p
+                p = q
+                q = r
+                k += 1
+            return r
+        elif kind == "shifted_chebyshev_polynomial_v":
+            if x == one:
+                return one
+            if x == 0:
+                return Scalar[w](n + n + 1) if n % 2 == 0 else -Scalar[w](
+                    n + n + 1
+                )
+            if n > 6 and abs(y) < one:
+                var t = _pacos(y)
+                if _psin(t / 2) != one:
+                    return _pcos((Scalar[w](n) + 0.5) * t) / _pcos(t / 2)
+                return Scalar[w](n + n + 1) if n % 2 == 0 else -Scalar[w](
+                    n + n + 1
+                )
+            if n == 0:
+                return one
+            if n == 1:
+                return y + y - one
+            var p = one
+            var q = y + y - one
+            var r = q
+            var k = 2
+            while k <= n and not isnan(q):
+                r = (y + y) * q - p
+                p = q
+                q = r
+                k += 1
+            return r
+        else:
+            comptime assert (
+                kind == "shifted_chebyshev_polynomial_w"
+            ), "unknown polynomial kind"
+            if x == one:
+                return Scalar[w](n + n + 1)
+            if x == 0:
+                return one if n % 2 == 0 else -one
+            if n > 4 and abs(y) < one:
+                var t = _pacos(y)
+                if _pcos(t / 2) != one:
+                    return _psin((Scalar[w](n) + 0.5) * t) / _psin(t / 2)
+                return one if n % 2 == 0 else -one
+            if n == 0:
+                return one
+            if n == 1:
+                return y + y + one
+            var p = one
+            var q = y + y + one
+            var r = q
+            var k = 2
+            while k <= n and not isnan(q):
+                r = (y + y) * q - p
+                p = q
+                q = r
+                k += 1
+            return r
+
+
+@always_inline
+@always_inline
+def _polynomial[
+    kind: StaticString, w: DType
+](x: Scalar[w], n_f: Scalar[w]) -> Scalar[w] where w.is_floating_point():
+    """NVIDIA: the CUDA-exact form; elsewhere the form this device always ran.
+    """
+    comptime if is_nvidia_gpu():
+        return _polynomial_nv[kind, w](x, n_f)
+    else:
+        return _polynomial_legacy[kind, w](x, n_f)
 
 
 @always_inline
