@@ -116,31 +116,25 @@ def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_add_sub_alpha_reduced_precision_rounds_like_cpu(mojo_gpu, dtype):
-    """ATen's CPU add/sub kernel takes `alpha` as a scalar_t (rounded to the
-    half type) and its scalar loop computes `a + alpha * b` one rounding at a
-    time; that is the documented policy here, checked bit for bit. CPU torch
-    itself is not a bit-exact oracle: its vectorized loop fuses the multiply
-    and add into one rounding, so which loop a given element hits depends on
-    the tensor size and the CPU's vector width. The conformance suite is the
-    CPU-parity check, on the small samples where the two agree."""
+def test_add_sub_alpha_reduced_precision_rounds_like_cuda(mojo_gpu, dtype):
+    """CUDA's add / sub kernel computes `a + alpha * b` as one fma in the
+    opmath type (float for the half types), with alpha kept in float32 and
+    rounded once to the operand type. Checked bit for bit against that
+    expression evaluated exactly (float64 holds the product and the sum)
+    and rounded to float32, then to the operand type."""
     a = (torch.arange(64, dtype=torch.float32) / 7.0 - 4.0).to(dtype)
     b = (torch.arange(64, dtype=torch.float32) / 3.0 - 10.0).to(dtype)
     alpha = 1.0 / 3.0
-    alpha_r = torch.tensor(alpha).to(dtype).float()  # alpha as a scalar_t
+    alpha_f = torch.tensor(alpha, dtype=torch.float32).double()
     ad, bd = a.to(mojo_gpu), b.to(mojo_gpu)
 
     got = torch.add(ad, bd, alpha=alpha)
     assert got.dtype == dtype
-    expect = (a.float() + (alpha_r * b.float()).to(dtype).float()).to(dtype)
+    expect = (a.double() + alpha_f * b.double()).float().to(dtype)
     torch.testing.assert_close(got.cpu(), expect, atol=0, rtol=0)
     got_sub = torch.sub(ad, bd, alpha=alpha)
-    expect_sub = (a.float() - (alpha_r * b.float()).to(dtype).float()).to(dtype)
+    expect_sub = (a.double() - alpha_f * b.double()).float().to(dtype)
     torch.testing.assert_close(got_sub.cpu(), expect_sub, atol=0, rtol=0)
-    # alpha kept in float32 gives a DIFFERENT tensor: without this the test
-    # would pass on the implementation it is meant to reject.
-    unrounded = (a.float() + (alpha * b.float()).to(dtype).float()).to(dtype)
-    assert not torch.equal(unrounded, got.cpu())
 
 
 def _outcome(fn):
@@ -2316,7 +2310,9 @@ def test_floor_divide_out_errors(mojo_gpu):
     a = torch.ones(3, device=mojo_gpu)
     with pytest.raises(RuntimeError, match="can't be cast"):
         torch.floor_divide(a, a, out=torch.empty(3, dtype=torch.long, device=mojo_gpu))
-    with pytest.raises(RuntimeError, match="ZeroDivisionError"):
-        torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
+    # CUDA does not raise on an integer division by zero: the GPU's division
+    # sequence gives 2**32 - 1 for these int64 operands (test_divmod_cuda_parity)
+    z = torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
+    assert z.cpu().tolist() == [2**32 - 1] * 3
     with pytest.raises(RuntimeError):
         a.clone().floor_divide_(torch.ones(2, 3, device=mojo_gpu))
