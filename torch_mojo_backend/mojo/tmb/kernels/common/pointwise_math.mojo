@@ -2074,8 +2074,70 @@ def _isclose[
 
 @always_inline
 def _tan_w[w: DType](x: Scalar[w]) -> Scalar[w]:
+    """tan as sin / cos: libdevice's sinf / cosf on NVIDIA, fdlibm's for
+    float64, std.math elsewhere (digamma's reflection, negative x only)."""
+    comptime if w == DType.float64:
+        var sc = _sincos_f64(x.cast[DType.float64]())
+        return (sc[0] / sc[1]).cast[w]()
+    elif is_nvidia_gpu():
+        var xf = x.cast[DType.float32]()
+        return (nv_sinf(xf) / nv_cosf(xf)).cast[w]()
+    else:
+        var xf = x.cast[DType.float32]()
+        return (sin(xf) / cos(xf)).cast[w]()
+
+
+@always_inline
+def _digamma_one[w: DType](x_in: Scalar[w]) -> Scalar[w]:
+    """Distributions.h's `digamma_one` (Cephes), in the accumulate type."""
+    comptime PSI_10 = Scalar[w](2.25175258906672110764)
+    comptime PI = Scalar[w](3.14159265358979323846)
+    var x = x_in
+    if x == 0:
+        return inf[w]()
+    var additional_summand = Scalar[w](0)
+    if x < 0:
+        if x == floor(x):
+            return inf[w]()
+        additional_summand = -PI / _tan_w(PI * x)
+        x = 1 - x
+    var result = Scalar[w](0)
+    # `while (x < 10)`, bounded: x >= 1 here, so at most 10 steps, and a
+    # NaN cannot spin it under the no-NaN flags.
+    for _ in range(11):
+        if not (x < 10):
+            break
+        result -= 1 / x
+        x += 1
+    if x == 10:
+        return result + PSI_10 + additional_summand
+    comptime A = [
+        8.33333333333333333333e-2,
+        -2.10927960927960927961e-2,
+        7.57575757575757575758e-3,
+        -4.16666666666666666667e-3,
+        3.96825396825396825397e-3,
+        -8.33333333333333333333e-3,
+        8.33333333333333333333e-2,
+    ]
+    var y = Scalar[w](0)
+    if x < Scalar[w](1.0e17):
+        var z = 1 / (x * x)
+        comptime a0 = A[0]
+        var poly = Scalar[w](a0)
+        comptime for i in range(1, 7):
+            comptime ai = A[i]
+            poly = poly * z + Scalar[w](ai)
+        y = z * poly
+    return (
+        result + _slog[w](x) - (Scalar[w](0.5) / x) - y + (additional_summand)
+    )
+
+
+@always_inline
+def _tan_cuda[w: DType](x: Scalar[w]) -> Scalar[w]:
     """CUDA's tanf / tan on NVIDIA; elsewhere sin / cos, fdlibm's for
-    float64 (digamma's reflection, negative x only)."""
+    float64 (the reflection of `_digamma_one_cuda`, negative x only)."""
     comptime if is_nvidia_gpu():
         comptime if w == DType.float64:
             return nv_tan(x.cast[DType.float64]()).cast[w]()
@@ -2090,8 +2152,9 @@ def _tan_w[w: DType](x: Scalar[w]) -> Scalar[w]:
 
 
 @always_inline
-def _digamma_one[w: DType](x_in: Scalar[w]) -> Scalar[w]:
-    """Distributions.h's `digamma_one` (Cephes), in the accumulate type."""
+def _digamma_one_cuda[w: DType](x_in: Scalar[w]) -> Scalar[w]:
+    """Distributions.h's `digamma_one` (Cephes), in the accumulate type, with
+    CUDA's rounding (fma where nvcc fuses); `_digamma_one` is the plain one."""
     comptime PSI_10 = Float64(2.25175258906672110764).cast[w]()
     comptime PI = Scalar[w](3.14159265358979323846)
     var x = x_in
@@ -2101,7 +2164,7 @@ def _digamma_one[w: DType](x_in: Scalar[w]) -> Scalar[w]:
     if x < 0:
         if x == floor(x):
             return inf[w]()
-        additional_summand = -PI / _tan_w(PI * x)
+        additional_summand = -PI / _tan_cuda(PI * x)
         x = 1 - x
     var result = Scalar[w](0)
     # `while (x < 10)`, bounded: x >= 1 here, so at most 10 steps, and a
@@ -2173,7 +2236,7 @@ def _standard_gamma_grad_one[
         # ptxas fuses the first product in the vectorized kernel (the
         # elementwise_kernel instance fuses the second one instead)
         var gamma_cdf_alpha = fma(
-            _slog[w](x) - _digamma_one[w](alpha),
+            _slog[w](x) - _digamma_one_cuda[w](alpha),
             gamma_cdf,
             -_mul_rn[w, 1](pow_x_alpha, series2),
         )
