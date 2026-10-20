@@ -35,6 +35,7 @@ from tmb.kernels.common.cuda_math import (
     ieee_sqrtf,
     nv_cosf,
     nv_erfcf,
+    nv_erfcxf,
     nv_expm1,
     nv_expm1f,
     nv_lgammaf,
@@ -43,6 +44,7 @@ from tmb.kernels.common.cuda_math import (
 from tmb.kernels.common.libdevice_port import (
     nv_cos,
     nv_erfc,
+    nv_erfcx,
     nv_exp,
     nv_expf,
     nv_lgamma,
@@ -409,6 +411,17 @@ def _erfc[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 
 @always_inline
+def _erfcx_libm[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    """CUDA's builtin erfcx (Apple GPUs keep the Faddeeva `erfcx`)."""
+    comptime if is_apple_gpu():
+        return erfcx(x)
+    comptime if dt == F64:
+        return rebind[Scalar[dt]](nv_erfcx(rebind[Float64](x)))
+    else:
+        return rebind[Scalar[dt]](nv_erfcxf(rebind[Float32](x)))
+
+
+@always_inline
 def _lgamma[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     comptime if dt == F64:
         return rebind[Scalar[dt]](nv_lgamma(rebind[Float64](x)))
@@ -591,8 +604,16 @@ def zeta[dt: DType](x: Scalar[dt], q: Scalar[dt]) -> Scalar[dt]:
             return _inf[dt]()
         if x_nan or x != _floorg(x):
             return _nan[dt]()
-    if x_nan or q_nan:
-        return _nan[dt]()
+    # Measured on stock CUDA: the float64 kernel returns a NaN input's own
+    # bits (x first); the float32 one always returns jit_nan's 0x7fffffff.
+    comptime if dt == F64:
+        if x_nan:
+            return x
+        if q_nan:
+            return q
+    else:
+        if x_nan or q_nan:
+            return _nan[dt]()
     var s = _pow(q, -x)
     var a = q
     var i = 0
@@ -737,7 +758,8 @@ def log_ndtr[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     comptime SQRT1_2 = T(0.707106781186547524400844362104849039)
     var t = x * SQRT1_2
     if x < T(-1.0):
-        return _log(erfcx(-t) / T(2.0)) - t * t
+        # CUDA's own erfcx (libdevice), not the Faddeeva `erfcx_string`.
+        return fma(-t, t, _log(_erfcx_libm(-t) / T(2.0)))
     return _log1p(-_erfc(t) / T(2.0))
 
 
@@ -871,7 +893,8 @@ def i1[dt: DType](a: Scalar[dt]) -> Scalar[dt]:
         res = _exp(x) * x * _chbevl[_I1_A](y)
     else:
         res = (_exp(x) * _chbevl[_I1_B](T(32.0) / x - T(2.0))) / _sqrt(x)
-    return _neg(res) if a < T(0.0) else res
+    # CUDA flips the sign bit here (i1(-inf) is -NaN), unlike i1e.
+    return -res if a < T(0.0) else res
 
 
 @always_inline

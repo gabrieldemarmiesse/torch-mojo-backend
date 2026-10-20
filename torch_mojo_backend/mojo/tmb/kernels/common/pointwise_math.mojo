@@ -406,9 +406,10 @@ def _hypot_f64(x: Float64, y: Float64) -> Float64:
 def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
     """`static_cast<int64_t>(n)` for the polynomial degree as the GPU
     converts (cvt.rzi.s64): truncation, saturating at int64's bounds, NaN
-    to 0. Apple GPUs have no float64, so their degrees convert from float."""
+    to INT64_MIN. Apple GPUs have no float64, so their degrees convert from
+    float."""
     if _poly_isnan(n):
-        return 0
+        return Int.MIN
     if n >= Scalar[w](9223372036854775808.0):
         return Int.MAX
     if n <= Scalar[w](-9223372036854775808.0):
@@ -580,7 +581,7 @@ def _polynomial[
         if abs(x) == one:
             if x > 0 or n % 2 == 0:
                 return Scalar[w](n + 1)
-            return -Scalar[w](n + 1)
+            return Scalar[w](-(n + 1))
         if n > 8 and abs(x) < one:
             var t = _pacos(x)
             if _poly_sin(t) != 0:
@@ -606,14 +607,14 @@ def _polynomial[
                 return one
             if n % 2 == 0:
                 return Scalar[w](n + n + 1)
-            return -Scalar[w](n + n + 1)
+            return Scalar[w](-(n + n + 1))
         if n > 8 and abs(x) < one:
             var t = _pacos(x)
             if _poly_sin(t / 2) != one:
                 return _poly_cos((Scalar[w](n) + 0.5) * t) / _poly_cos(t / 2)
             if n % 2 == 0:
                 return Scalar[w](n + n + 1)
-            return -Scalar[w](n + n + 1)
+            return Scalar[w](-(n + n + 1))
         if n == 0:
             return one
         if n == 1:
@@ -761,7 +762,7 @@ def _polynomial[
             if x == one:
                 return Scalar[w](n + 1)
             if x == 0:
-                return Scalar[w](n + 1) if n % 2 == 0 else -Scalar[w](n + 1)
+                return Scalar[w](n + 1) if n % 2 == 0 else Scalar[w](-(n + 1))
             if n > 6 and abs(y) < one:
                 var t = _pacos(y)
                 if _poly_sin(t) != 0:
@@ -785,8 +786,8 @@ def _polynomial[
             if x == one:
                 return one
             if x == 0:
-                return Scalar[w](n + n + 1) if n % 2 == 0 else -Scalar[w](
-                    n + n + 1
+                return Scalar[w](n + n + 1) if n % 2 == 0 else Scalar[w](
+                    -(n + n + 1)
                 )
             if n > 6 and abs(y) < one:
                 var t = _pacos(y)
@@ -794,8 +795,8 @@ def _polynomial[
                     return _poly_cos((Scalar[w](n) + 0.5) * t) / _poly_cos(
                         t / 2
                     )
-                return Scalar[w](n + n + 1) if n % 2 == 0 else -Scalar[w](
-                    n + n + 1
+                return Scalar[w](n + n + 1) if n % 2 == 0 else Scalar[w](
+                    -(n + n + 1)
                 )
             if n == 0:
                 return one

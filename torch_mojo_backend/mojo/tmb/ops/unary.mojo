@@ -1944,7 +1944,7 @@ def _mvlgamma_check(p: Int, t: T) raises:
     # read of the whole tensor; below that bound this returns lgamma's values.
     if p < 1:
         raise Error("p has to be greater than or equal to 1")
-    _require_float("mvlgamma", t.dtype)
+    _require_float_or_f64("mvlgamma", t)
 
 
 # aten::mvlgamma(Tensor self, int p) -> Tensor

@@ -2285,6 +2285,23 @@ def _cast_elem[
         var mid = v.cast[DType.int64]()
         var mid_bits = bitcast[DType.int64, width](mid)
         return bitcast[DType.int64, width](mid_bits).cast[dst]()
+    elif (
+        src == DType.float16
+        and (dst == DType.float32 or dst == DType.float64)
+        and is_nvidia_gpu()
+    ):
+        # CUDA's half -> float (cvt.f32.f16) turns every NaN into the
+        # canonical 0x7fffffff (sign and payload dropped); double is widened
+        # from that float. A direct fpext keeps the payload instead.
+        var hbits = bitcast[DType.int16, width](v)
+        var is_nan = (hbits & SIMD[DType.int16, width](0x7FFF)).gt(
+            SIMD[DType.int16, width](0x7C00)
+        )
+        var wide = v.cast[DType.float32]()
+        var canon = bitcast[DType.float32, width](
+            SIMD[DType.int32, width](0x7FFFFFFF)
+        )
+        return rebind[SIMD[dst, width]](is_nan.select(canon, wide).cast[dst]())
     elif src == DType.float32 and dst == DType.bfloat16:
         # Apple's hardware conversion flushes subnormals (see f32_to_bf16).
         return rebind[SIMD[dst, width]](

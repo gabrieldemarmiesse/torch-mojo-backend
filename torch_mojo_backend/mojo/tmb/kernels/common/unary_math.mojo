@@ -267,11 +267,11 @@ def _scalar_special[kind: StaticString, ct: DType](a: Scalar[ct]) -> Scalar[ct]:
     elif kind == "modified_bessel_k0":
         return modified_bessel_k0[ct, False](a)
     elif kind == "modified_bessel_k1":
-        return modified_bessel_k1[ct, False](a)
+        return modified_bessel_k1[ct, False, fb=ct == DType.float32](a)
     elif kind == "ndtri":
         return ndtri(a)
     elif kind == "scaled_modified_bessel_k0":
-        return modified_bessel_k0[ct, True](a)
+        return modified_bessel_k0[ct, True, fb=True](a)
     elif kind == "scaled_modified_bessel_k1":
         return modified_bessel_k1[ct, True](a)
     elif kind == "sinc":
@@ -842,6 +842,27 @@ def elementwise_unary_param[
                 return (_rounding["round"](q) * tp).cast[dtype]()
             var q = _to_dtype_rounded[dtype](xf * tp)
             return (_rounding["round"](q) / tp).cast[dtype]()
+    elif ct == DType.float64 and kind == "mvlgamma":
+        # The float32 sum below in double: same offsets, accumulator order
+        # and tree (CUDA's reduce over the p-long dim), nv_lgamma per term.
+        # The double tensor's offsets are exact, so nothing rounds per step.
+        var p = Int(rebind[Float64](p0))
+        var c = rebind[Float64](p1)
+        var start = Float64(1 - p) * Float64(0.5)
+        var r = SIMD[dtype, width]()
+        comptime for i in range(width):
+            var xi = rebind[Float64](x[i])
+            var acc = Array[Float64, 32](fill=Float64(0.0))
+            for j in range(p):
+                acc[j % 32] += nv_lgamma(
+                    xi + (start + Float64(j) * Float64(0.5))
+                )
+            comptime for level in range(5):
+                comptime half = 16 >> level
+                comptime for k in range(half):
+                    acc[k] += acc[k + half]
+            r[i] = rebind[Scalar[dtype]](acc[0] + c)
+        return r
     elif ct == DType.float64 and (kind == "logit" or kind == "polygamma"):
         var r = SIMD[dtype, width]()
         comptime if kind == "logit":

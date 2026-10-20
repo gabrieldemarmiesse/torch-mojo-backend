@@ -1386,6 +1386,7 @@ def _param_float64_on[index: Int]() -> Bool:
         or kind == "round_decimals"
         or kind == "logit"
         or kind == "polygamma"
+        or kind == "mvlgamma"
     )
 
 

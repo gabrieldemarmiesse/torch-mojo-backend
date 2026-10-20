@@ -593,6 +593,10 @@ def test_polynomial_scalars_match_cuda(cuda_oracle: CudaOracle, name: str):
     eq = cuda_oracle.assert_bitwise_equal
     for k in (0, 1, 2, 3, 6, 7, 30, 2.5, -1):
         eq(lambda t, k=k: fn(t, k), x, what=f"n={k}")
+    if name == "legendre_polynomial_p":
+        # CUDA's recurrence never ends for |x| < 1 and an infinite degree
+        # (int64 max steps of a bounded, never-NaN sequence).
+        n = n.nan_to_num(0.0, 100.0, -100.0)
     for v in (0.3, -0.7, 2.0, 0.5):
         eq(lambda u, v=v: fn(v, u), n, what=f"x={v}")
     eq(lambda t, u: fn(t.double(), u), x, n, what="f64, f32")
