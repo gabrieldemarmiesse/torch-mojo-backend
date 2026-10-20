@@ -327,7 +327,7 @@ def _bin_vec_op[
 ](
     a: SIMD[dtype, width],
     b: SIMD[dtype, width],
-    alpha: Float64 = 1.0,
+    alpha: Scalar[_opmath[dtype]()] = 1,
     scalar_side: Int = 0,
 ) -> SIMD[out_dtype, width]:
     """The op itself on one SIMD group: `dtype x dtype -> out_dtype`.
@@ -405,7 +405,7 @@ def _bin_vec_op[
                 # -alpha. A float64 NaN: alpha's, then self's, then
                 # other's -- other's first when it was the CPU scalar.
                 comptime om = _opmath[dtype]()
-                var al = SIMD[om, width](alpha.cast[om]())
+                var al = SIMD[om, width](alpha)
                 comptime if op_code == BOP_SUB:
                     al = -al
                 var x = a.cast[om]()
@@ -504,7 +504,7 @@ def _bin_bcast_kernel[
     rs2_arg: Int64,
     rs3_arg: Int64,
     total_arg: Int64,
-    alpha: Float64,
+    alpha: Scalar[_opmath[dtype]()],
     scalar_side_arg: Int64,
 ):
     """Fully general arm: any broadcast strides, one element per thread.
@@ -553,7 +553,7 @@ def _bin_flat_vec_kernel[
     total_arg: Int64,
     l_bcast_arg: Int64,
     r_bcast_arg: Int64,
-    alpha: Float64,
+    alpha: Scalar[_opmath[dtype]()],
     scalar_side_arg: Int64,
 ):
     """16-byte-vectorized binary op for the no-broadcast, all-contiguous
@@ -647,7 +647,7 @@ def _bin_rowvec_kernel[
     rs1_arg: Int64,
     rs2_arg: Int64,
     rows_arg: Int64,
-    alpha: Float64,
+    alpha: Scalar[_opmath[dtype]()],
     scalar_side_arg: Int64,
 ):
     """Vectorized along a stride-1 innermost dim; outer dims may be strided
@@ -829,7 +829,7 @@ def _binary_bcast[
                             Int64(total),
                             Int64(l_scalar),
                             Int64(r_scalar),
-                            alpha,
+                            alpha.cast[_opmath[dtype]()](),
                             Int64(scalar_side),
                         )
                     elif aligned16 and rows_aligned:
@@ -857,7 +857,7 @@ def _binary_bcast[
                             Int64(rs1),
                             Int64(rs2),
                             Int64(rows),
-                            alpha,
+                            alpha.cast[_opmath[dtype]()](),
                             Int64(scalar_side),
                         )
                     else:
@@ -884,7 +884,7 @@ def _binary_bcast[
                             Int64(rs2),
                             Int64(rs3),
                             Int64(total),
-                            alpha,
+                            alpha.cast[_opmath[dtype]()](),
                             Int64(scalar_side),
                         )
                 else:
