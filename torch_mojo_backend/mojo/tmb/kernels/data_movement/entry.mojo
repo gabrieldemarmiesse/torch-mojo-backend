@@ -2279,7 +2279,7 @@ def _cast_elem[
         var mid = v.cast[DType.float32]()
         var mid_bits = bitcast[DType.int32, width](mid)
         return bitcast[DType.float32, width](mid_bits).cast[dst]()
-    elif src == DType.float16 and dst == DType.float64:
+    elif src == DType.float16 and dst == DType.float64 and is_nvidia_gpu():
         # c10::Half widens through float: its cvt makes any NaN the
         # canonical one (0x7FFFFFFF, 0x7FFFFFFFE0000000 as a double)
         return rebind[SIMD[dst, width]](

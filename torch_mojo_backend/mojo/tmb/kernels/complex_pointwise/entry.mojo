@@ -231,10 +231,46 @@ def _logaddexp[dt: DType](x: Cx[dt], y: Cx[dt], special: Bool) -> Cx[dt]:
     return _add(_log1p_cx(ex, special), mx)
 
 
+# ===----------------------------------------------------------------------=== #
+# ptxas's contraction of torch v2.11.0's unrolled jiterator loop.
+#
+# THE ONE PLACE that mirrors it; delete (and `Contraction` with it) if a torch
+# release changes how its jitterated kernels contract. NVRTC inlines the
+# jiterated function once per unrolled element of the scalar kernel (eight
+# 128-element slices per 1024-element block), and ptxas fuses multiplies and
+# adds differently from slice to slice (SASS of lerp / addcmul / addcdiv /
+# logaddexp_complex, then fitted against the live oracle, see
+# tests/native/test_pointwise_binary_cuda_parity.py). The vectorized
+# complex64 kernel runs the same function unfused in its vector body and the
+# scalar tail's contraction in the last partial 1024 block. Off NVIDIA the
+# plain forms are used.
+# ===----------------------------------------------------------------------=== #
+
+
+@fieldwise_init
+struct Contraction(TrivialRegisterPassable):
+    var slice: Int  # slice of 128 within the scalar kernel's block; 8 = none
+    var alt: Bool  # logaddexp's finite-path fma association
+
+
+@always_inline
+def _unrolled_contraction[
+    dt: DType
+](i: Int, scalar_kernel: Bool, tail_start: Int) -> Contraction:
+    comptime if not is_nvidia_gpu():
+        return Contraction(8, False)
+    else:
+        var scalar_path = dt == DType.float64 or scalar_kernel
+        var copy = ((i & 1023) >> 7) if scalar_path else 8
+        return Contraction(copy, scalar_path or i >= tail_start)
+
+
 @always_inline
 def _ternary[
     kind: StaticString, dt: DType
-](a: Cx[dt], b: Cx[dt], c: Cx[dt], p: Cx[dt], copy: Int, alt: Bool) -> Cx[dt]:
+](a: Cx[dt], b: Cx[dt], c: Cx[dt], p: Cx[dt], cn: Contraction) -> Cx[dt]:
+    var copy = cn.slice
+    var alt = cn.alt
     var fuse_f32 = copy == 0 and dt == DType.float32
     comptime if kind == "cx_lerp_scalar":
         return _lerp(a, b, p, fuse_f32, fuse_f32)
@@ -251,7 +287,9 @@ def _ternary[
     else:
         comptime assert kind == "cx_addcdiv", "unknown complex ternary kind"
         # a + alpha * (b / c)
-        return _add(a, cmul_jit(p, cdiv_jit[dt, True](b, c), copy == 0))
+        return _add(
+            a, cmul_jit(p, cdiv_jit[dt, is_nvidia_gpu()](b, c), copy == 0)
+        )
 
 
 @always_inline
@@ -326,14 +364,8 @@ def _launch[
         if mode_c != MODE_HOST:
             var k = 2 * i if mode_c == MODE_FULL else 0
             c = Cx[dt](c_ptr[unsafe_offset=k], c_ptr[unsafe_offset=k + 1])
-        var scalar_path = dt == DType.float64 or scalar_kernel
-        # which inlined copy of the jiterated function of a scalar kernel
-        # (128 elements each, 8 per block) runs this element: 8 = none
-        var copy = ((i & 1023) >> 7) if scalar_path else 8
-        # complex logaddexp's finite path: its fma association in every copy
-        # of a scalar kernel and in the vectorized one's scalar tail
-        var alt = scalar_path or i >= tail_start
-        var r = _ternary[kind, dt](a, b, c, Cx[dt](hp_re, hp_im), copy, alt)
+        var cn = _unrolled_contraction[dt](i, scalar_kernel, tail_start)
+        var r = _ternary[kind, dt](a, b, c, Cx[dt](hp_re, hp_im), cn)
         out_ptr[unsafe_offset=2 * i] = r.re
         out_ptr[unsafe_offset=2 * i + 1] = r.im
 

@@ -34,7 +34,12 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.host import DeviceContext
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    is_nvidia_gpu,
+    size_of,
+)
 from std.utils.coord import Coord
 from std.utils.numerics import isinf, isnan
 
@@ -318,7 +323,7 @@ def _launch[
                     ) else UInt8(0)
                 else:
                     var r: Cx[dt]
-                    comptime if kind == "mul" and dt == DType.float32:
+                    comptime if kind == "mul" and dt == DType.float32 and is_nvidia_gpu():
                         # a CPU scalar is the first factor of CUDA's complex64
                         # product, whichever side it is on: im = fma(s.re,
                         # t.im, s.im t.re)

@@ -395,68 +395,132 @@ def _launch[
     var p1 = params[1]
     var p2 = params[2]
     var p3 = params[3]
-    var ba = _bits64(va)
-    var bb = _bits64(vb)
-    var bc = _bits64(vc)
+    # NVIDIA: the host values travel as bits (a half kernel argument may pass
+    # through float32 and flush a subnormal) and a CPU-scalar `a` is flagged for
+    # the NaN order. Other targets keep the kernel they had.
+    comptime if has_nvidia_gpu_accelerator():
+        var ba = _bits64(va)
+        var bb = _bits64(vb)
+        var bc = _bits64(vc)
 
-    @always_inline
-    @__parameter
-    @__copy_capture(
-        out_ptr,
-        a_ptr,
-        b_ptr,
-        c_ptr,
-        dev_a,
-        dev_b,
-        dev_c,
-        ba,
-        bb,
-        bc,
-        p0,
-        p1,
-        p2,
-        p3,
-    )
-    def func[w: Int, alignment: Int = 1](idx: Coord):
-        var i = Int(idx[0].value())
-        # `ua`: full operands off the vector grid, loaded element-aligned.
-        comptime in_align = size_of[dt]() if ua else min(16, w * size_of[dt]())
-        comptime out_align = min(16, w * size_of[odt]())
-        var a: SIMD[dt, w]
-        comptime if full_a:
-            a = a_ptr.unsafe_load[width=w, alignment=in_align](i)
-        else:
-            a = _splat[dt, w](a_ptr, dev_a, ba)
-        var b = SIMD[dt, w](0)
-        comptime if arity >= 2:
-            comptime if full_b:
-                b = b_ptr.unsafe_load[width=w, alignment=in_align](i)
-            else:
-                b = _splat[dt, w](b_ptr, dev_b, bb)
-        var c = SIMD[dt, w](0)
-        comptime if arity >= 3:
-            comptime if full_c:
-                c = c_ptr.unsafe_load[width=w, alignment=in_align](i)
-            else:
-                c = _splat[dt, w](c_ptr, dev_c, bc)
-        out_ptr.unsafe_store[width=w, alignment=out_align](
-            i,
-            pointwise[kind, dt, odt, w](
-                a,
-                b,
-                c,
-                SIMD[param_dtype[dt](), 4](p0, p1, p2, p3),
-                scalar_a=not full_a and not dev_a,
-            ),
+        @always_inline
+        @__parameter
+        @__copy_capture(
+            out_ptr,
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            dev_a,
+            dev_b,
+            dev_c,
+            ba,
+            bb,
+            bc,
+            p0,
+            p1,
+            p2,
+            p3,
         )
+        def func[w: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            # `ua`: full operands off the vector grid, loaded element-aligned.
+            comptime in_align = size_of[dt]() if ua else min(
+                16, w * size_of[dt]()
+            )
+            comptime out_align = min(16, w * size_of[odt]())
+            var a: SIMD[dt, w]
+            comptime if full_a:
+                a = a_ptr.unsafe_load[width=w, alignment=in_align](i)
+            else:
+                a = _splat[dt, w](a_ptr, dev_a, ba)
+            var b = SIMD[dt, w](0)
+            comptime if arity >= 2:
+                comptime if full_b:
+                    b = b_ptr.unsafe_load[width=w, alignment=in_align](i)
+                else:
+                    b = _splat[dt, w](b_ptr, dev_b, bb)
+            var c = SIMD[dt, w](0)
+            comptime if arity >= 3:
+                comptime if full_c:
+                    c = c_ptr.unsafe_load[width=w, alignment=in_align](i)
+                else:
+                    c = _splat[dt, w](c_ptr, dev_c, bc)
+            out_ptr.unsafe_store[width=w, alignment=out_align](
+                i,
+                pointwise[kind, dt, odt, w](
+                    a,
+                    b,
+                    c,
+                    SIMD[param_dtype[dt](), 4](p0, p1, p2, p3),
+                    scalar_a=not full_a and not dev_a,
+                ),
+            )
 
-    elementwise[
-        func,
-        simd_width=width,
-        target="gpu",
-        _trace_description=kind,
-        _heavy=_heavy_kind[kind](),
-    ](Coord(numel), ctx)
+        elementwise[
+            func,
+            simd_width=width,
+            target="gpu",
+            _trace_description=kind,
+            _heavy=_heavy_kind[kind](),
+        ](Coord(numel), ctx)
+    else:
+
+        @always_inline
+        @__parameter
+        @__copy_capture(
+            out_ptr,
+            a_ptr,
+            b_ptr,
+            c_ptr,
+            dev_a,
+            dev_b,
+            dev_c,
+            va,
+            vb,
+            vc,
+            p0,
+            p1,
+            p2,
+            p3,
+        )
+        def func_o[w: Int, alignment: Int = 1](idx: Coord):
+            var i = Int(idx[0].value())
+            # `ua`: full operands off the vector grid, loaded element-aligned.
+            comptime in_align = size_of[dt]() if ua else min(
+                16, w * size_of[dt]()
+            )
+            comptime out_align = min(16, w * size_of[odt]())
+            var a: SIMD[dt, w]
+            comptime if full_a:
+                a = a_ptr.unsafe_load[width=w, alignment=in_align](i)
+            else:
+                a = SIMD[dt, w](a_ptr[unsafe_offset=0] if dev_a else va)
+            var b = SIMD[dt, w](0)
+            comptime if arity >= 2:
+                comptime if full_b:
+                    b = b_ptr.unsafe_load[width=w, alignment=in_align](i)
+                else:
+                    b = SIMD[dt, w](b_ptr[unsafe_offset=0] if dev_b else vb)
+            var c = SIMD[dt, w](0)
+            comptime if arity >= 3:
+                comptime if full_c:
+                    c = c_ptr.unsafe_load[width=w, alignment=in_align](i)
+                else:
+                    c = SIMD[dt, w](c_ptr[unsafe_offset=0] if dev_c else vc)
+            out_ptr.unsafe_store[width=w, alignment=out_align](
+                i,
+                pointwise[kind, dt, odt, w](
+                    a, b, c, SIMD[param_dtype[dt](), 4](p0, p1, p2, p3)
+                ),
+            )
+
+        elementwise[
+            func_o,
+            simd_width=width,
+            target="gpu",
+            _trace_description=kind,
+            _heavy=_heavy_kind[kind](),
+        ](Coord(numel), ctx)
 
 
 @always_inline

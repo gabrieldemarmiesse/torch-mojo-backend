@@ -67,7 +67,7 @@ def convert[
     ):
         # c10::Half and c10::BFloat16 are built from float: round through it.
         return v.cast[DType.float32]().cast[D]()
-    elif src == DType.float16 and dst == DType.float64:
+    elif src == DType.float16 and dst == DType.float64 and is_nvidia_gpu():
         return rebind[SIMD[D, w]](
             half_to_f64(rebind[SIMD[DType.float16, w]](v))
         )

@@ -1736,7 +1736,10 @@ def _wide[
         r = (isinf(a) & a.eq(b)).select(a, r)
         # A NaN runs through a - b, exp, log1p and the add: float's
         # canonical NaN; double keeps the NaN a - b's DADD keeps, b's first.
-        return nan_result2(r, b, a)
+        comptime if is_nvidia_gpu():
+            return nan_result2(r, b, a)
+        else:
+            return (isnan(a) | isnan(b)).select(SIMD[w, n](nan[w]()), r)
     elif kind == "xlogy" or kind == "xlog1py":
         # BinaryMiscOpsKernels.cu: NaN y -> NaN, x == 0 -> 0, else x log(y).
         # MPS (c10::metal::xlogy) returns x itself for x == 0, keeping -0.
@@ -1789,8 +1792,10 @@ def _wide[
         var diff = b - a
         var weight = SIMD[w, n](p[0])
         var small = abs(weight).lt(0.5)
+        comptime if not is_nvidia_gpu():
+            return small.select(weight.fma(diff, a), b - diff * (one - weight))
         var r = small.select(weight.fma(diff, a), (-diff).fma(one - weight, b))
-        comptime if w == DType.float64 and is_nvidia_gpu():
+        comptime if w == DType.float64:
             # Lerp.cu's float64 SASS: DADD(-self, end) keeps end's NaN,
             # then self's; the small branch's DFMA(diff, w, self) w's, self's,
             # diff's; the other's DFMA keeps 1 - w's or the diff's NaN by the
@@ -1806,8 +1811,10 @@ def _wide[
         # accurate near w = 1: the branch is kept on Apple GPUs too.)
         var diff = b - a
         var small = abs(c).lt(0.5)
+        comptime if not is_nvidia_gpu():
+            return small.select(c.fma(diff, a), b - diff * (one - c))
         var r = small.select(c.fma(diff, a), (-diff).fma(one - c, b))
-        comptime if w == DType.float64 and is_nvidia_gpu():
+        comptime if w == DType.float64:
             # Lerp.cu's float64 SASS (tensor weight): DADD(-self, end) keeps
             # end's NaN, then self's; DFMA(w, diff, self) diff's, self's;
             # DFMA(diff, 1 - w, end) 1 - w's (a NaN w), end's, diff's.
@@ -1886,7 +1893,7 @@ def _wide[
         # pow(2, other), as PowKernel.cu's scalar-base kernel runs it
         # (float for the float types, never float64: Apple GPUs have none).
         var pw = torch_pow(SIMD[w, n](2), b)
-        comptime if w == DType.float64:
+        comptime if w == DType.float64 and is_nvidia_gpu():
             if p[1] != 0:
                 # p1: full({}, 2.0).pow(CPU scalar), whose 0.5 is sqrt_kernel
                 pw = b.eq(0.5).select(ieee_sqrt(SIMD[w, n](2)), pw)
@@ -1898,7 +1905,10 @@ def _wide[
             pw = pw.cast[DType.float32]().cast[w]()
         # A NaN exponent: CUDA's pow(2, NaN) keeps it (2 + NaN), then mul's
         # DMUL keeps it before self's.
-        return nan_result2(a * pw, b, a)
+        comptime if is_nvidia_gpu():
+            return nan_result2(a * pw, b, a)
+        else:
+            return a * pw
     # --- activations (forward: a = x) ----------------------------------------
     elif kind == "elu":
         # ActivationEluKernel.cu, p = (alpha, scale, input_scale):
