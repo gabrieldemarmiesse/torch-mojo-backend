@@ -31,6 +31,7 @@ from std.memory import bitcast
 from std.utils.numerics import inf, isinf, isnan, nan
 
 from tmb.kernels.common.math_utils import ieee_sqrt
+from tmb.kernels.common.nan_order import nan_first2, nan_first3
 from tmb.kernels.common.pointwise_math import (
     _exp,
     _log,
@@ -136,6 +137,40 @@ def cmul[dt: DType](a: Cx[dt], b: Cx[dt]) -> Cx[dt]:
     im = fma(a, d, b c). Spelled out so no contraction choice of this
     compiler can differ -- it decides overflow signs (inf - inf)."""
     return Cx[dt](a.re.fma(b.re, -(a.im * b.im)), a.re.fma(b.im, a.im * b.re))
+
+
+@always_inline
+def _dmul_u[dt: DType](x: Scalar[dt], u: Scalar[dt]) -> Scalar[dt]:
+    """x * u with `u` in the B slot: a float64 NaN is u's, then x's."""
+    return nan_first2[dt, 1](x * u, u, x)
+
+
+@always_inline
+def _dfma_u[
+    dt: DType, neg_c: Bool = False
+](x: Scalar[dt], u: Scalar[dt], c: Scalar[dt]) -> Scalar[dt]:
+    """fma(x, u, c) (`-c` with `neg_c`) as DFMA x, u, c: a float64 NaN is
+    u's, then c's (a negated c keeps its NaN's sign), then x's."""
+    var r = x.fma(u, -c if neg_c else c)
+    return nan_first3[dt, 1](r, u, c, x)
+
+
+@always_inline
+def cmul_scalar_first[dt: DType](s: Cx[dt], x: Cx[dt]) -> Cx[dt]:
+    """`cmul(s, x)` for a CPU scalar `s`, as CUDA's AUnaryFunctor computes
+    it: the same fmas, `s`'s parts in the B slots (`nan_order`)."""
+    var t = _dmul_u(x.im, s.im)
+    var u = _dmul_u(x.re, s.im)
+    return Cx[dt](_dfma_u[neg_c=True](x.re, s.re, t), _dfma_u(x.im, s.re, u))
+
+
+@always_inline
+def cmul_scalar_second[dt: DType](x: Cx[dt], v: Cx[dt]) -> Cx[dt]:
+    """`cmul(x, v)` for a CPU scalar `v` (BUnaryFunctor: div_true's product
+    by the reciprocal), `v`'s parts in the B slots."""
+    var t = _dmul_u(x.im, v.im)
+    var u = _dmul_u(x.im, v.re)
+    return Cx[dt](_dfma_u[neg_c=True](x.re, v.re, t), _dfma_u(x.re, v.im, u))
 
 
 @always_inline

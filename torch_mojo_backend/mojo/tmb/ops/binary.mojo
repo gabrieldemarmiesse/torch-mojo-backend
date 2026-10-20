@@ -75,6 +75,7 @@ from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     out_device_error,
+    is_wide_unsigned,
     is_cast_pair_on,
     decline_float8,
     ST_UNDEFINED,
@@ -214,6 +215,16 @@ def _b_can_cast(src: Int32, dst: Int32) -> Bool:
     return _b_category(src) <= _b_category(dst)
 
 
+def _b_promotes_into(t: T, r: Int32) raises -> Bool:
+    """Whether the cast kernel takes `t` to the promoted dtype `r`: both are
+    cast dtypes, or `t` is a uint16 / 32 / 64 meeting a float."""
+    if _b_castable_on(t.stype, t) and _b_castable_on(r, t):
+        return True
+    return is_wide_unsigned(t.stype) and is_cast_pair_on(
+        t.dtype, max_dtype(r), t
+    )
+
+
 def _b_promote(a: T, b: T) raises -> Int32:
     """`torch.result_type(a, b)` for two mojo tensors (-1 = decline).
 
@@ -232,16 +243,14 @@ def _b_promote(a: T, b: T) raises -> Int32:
         if f8 != other.stype and not _b_castable_on(other.stype, other):
             return Int32(-1)
         return f8
-    if not known_stype(a.stype) or not known_stype(b.stype):
+    if not (known_stype(a.stype) or is_wide_unsigned(a.stype)) or not (
+        known_stype(b.stype) or is_wide_unsigned(b.stype)
+    ):
         return Int32(-1)
     var r = result_type(a, b)
-    if a.stype != r and not (
-        _b_castable_on(a.stype, a) and _b_castable_on(r, a)
-    ):
+    if a.stype != r and not _b_promotes_into(a, r):
         return Int32(-1)
-    if b.stype != r and not (
-        _b_castable_on(b.stype, b) and _b_castable_on(r, b)
-    ):
+    if b.stype != r and not _b_promotes_into(b, r):
         return Int32(-1)
     return r
 
@@ -1189,6 +1198,7 @@ def _b_try_scalar(
     negate: Bool,
     dst: Optional[T],
     alpha: Float64 = 1.0,
+    promote: Bool = False,
 ) raises -> Optional[Res]:
     """The old `_try_spec_scalar`: contiguous float tensor with a numeric
     scalar in one elementwise launch.
@@ -1205,15 +1215,23 @@ def _b_try_scalar(
     if not lhs.is_t or rhs.is_t:
         return None
     var a = lhs.t.value().copy()
-    if not _b_float3(a.stype):
-        return None
-    if rhs.zero_st >= 0 and _b_side_result(a, rhs) != a.stype:
-        return None  # an explicit 0-d tensor promoting past `a`'s dtype
     var s = rhs.s.value().copy()
     if s.is_bool:
         return None
+    # `promote`: TensorIterator loads `a` converted to the result dtype, and
+    # add / mul read the scalar straight into opmath (float), never rounded
+    # to `a`'s dtype: an int tensor plus 2.5 is a float32 add of 2.5.
+    var result = _b_side_result(a, rhs)
+    if not promote:
+        if not _b_float3(a.stype):
+            return None
+        if rhs.zero_st >= 0 and result != a.stype:
+            return None  # an explicit 0-d tensor promoting past `a`'s dtype
+        result = a.stype
+    if not _b_float3(result):
+        return None
     var value = -s.f if negate else s.f
-    var src = _b_ready(a, a.stype, True)
+    var src = _b_ready(a, result, True)
     if dst:
         var d = dst.value().copy()
         if (
@@ -1628,7 +1646,11 @@ def _b_add_routes(
         var r = _b_try_add_f32_bf16(lhs, rhs)
         if r.__bool__():
             return r.value().copy()
-    var r = _b_try_scalar("AddScalarSpec", lhs, rhs, False, dst, alpha)
+    var r = _b_try_scalar("AddScalarSpec", lhs, rhs, False, dst, alpha, True)
+    if r.__bool__():
+        return r.value().copy()
+    # a CPU scalar first: `scalar + alpha * tensor` (CUDAFunctorOnOther_add)
+    r = _b_try_scalar("RsubScalarSpec", rhs, lhs, False, dst, alpha, True)
     if r.__bool__():
         return r.value().copy()
     if alpha == 1.0:
@@ -1677,6 +1699,21 @@ def _b_negated_alpha(alpha_v: Value) -> Value:
     return Value(alpha_v.tag, 0, 0 - alpha_v.a, alpha_v.b)
 
 
+def _b_alpha_opmath(
+    alpha_v: Value, common: Int32, negate: Bool
+) raises -> Float64:
+    """alpha as CUDA's add kernel takes it for a floating result `common`:
+    `alpha.to<opmath_t>()`, checked (a float alpha past float's range
+    raises for the float32 / half types; an integer rounds once). `negate`:
+    sub's `-alpha`, the Scalar negated in its own type first (an integer 0
+    stays +0.0)."""
+    var opmath = ST_FLOAT64 if common == ST_FLOAT64 else ST_FLOAT32
+    if negate and (alpha_v.tag == TAG_SCALAR_INT or alpha_v.tag == TAG_INT):
+        return scalar_to_float(_b_negated_alpha(alpha_v), opmath)
+    var a = scalar_to_float(alpha_v, opmath)
+    return -a if negate else a
+
+
 def _b_alpha_prologue(
     lhs: Side, rhs: Side, alpha_v: Value, out_st: Int32, negate: Bool
 ) raises -> Tuple[Int32, Value]:
@@ -1699,6 +1736,9 @@ def _b_alpha_prologue(
             _b_cast_error(common, out_st)
         checked = out_st
     _b_alpha_check(checked, alpha_v)
+    if common >= 0 and is_wide_unsigned(common):
+        # CUDA has no integer add for these ("ufunc_add_CUDA" not implemented)
+        unsupported("add / sub of dtype " + _b_tname(common))
     if common >= 0 and (is_int_stype(common) or common == ST_BOOL):
         return (common, _kernel_alpha(common, alpha_v, negate))
     return (common, alpha_v.copy())
@@ -1774,7 +1814,9 @@ def _b_add(
     if _b_is_floating(common):
         # CUDA's add takes alpha into its kernel, converted straight to
         # opmath: one fma.
-        return _b_add_routes(lhs, rhs, dst, v_f64(alpha_v))
+        return _b_add_routes(
+            lhs, rhs, dst, _b_alpha_opmath(alpha_v, common, False)
+        )
     if alpha == 1.0:
         return _b_add_routes(lhs, rhs, dst)
     if not rhs.is_t:
@@ -1833,7 +1875,9 @@ def _b_sub(
     var alpha_v = pro[1].copy()
     if _b_is_floating(common):
         # CUDA's sub is its add kernel with -alpha: one fma in opmath.
-        return _b_sub_routes(lhs, rhs, dst, v_f64(alpha_v))
+        return _b_add_routes(
+            lhs, rhs, dst, _b_alpha_opmath(alpha_v, common, True)
+        )
     var alpha = _b_alpha_as(v_f64(alpha_v), lhs, rhs)
     if alpha == 1.0:
         return _b_sub_routes(lhs, rhs, dst)
@@ -1895,7 +1939,11 @@ def _b_pow_float8(lhs: Side, rhs: Side) raises -> Optional[Res]:
 
 
 def _b_mul(lhs: Side, rhs: Side, dst: Optional[T]) raises -> Res:
-    var r = _b_try_scalar("MulScalarSpec", lhs, rhs, False, dst)
+    var r = _b_try_scalar("MulScalarSpec", lhs, rhs, False, dst, 1.0, True)
+    if r.__bool__():
+        return r.value().copy()
+    # mul is symmetric: CUDA multiplies by a CPU scalar on either side alike
+    r = _b_try_scalar("MulScalarSpec", rhs, lhs, False, dst, 1.0, True)
     if r.__bool__():
         return r.value().copy()
     r = _b_try_int_scalar("MulScalarIntSpec", lhs, rhs, False)
@@ -1955,7 +2003,12 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         # no output buffer and no copy back.
         var s = rhs.s.value().copy()
         if not s.is_bool:
-            _b_scalar_inplace("AddScalarInplace", self, s.f, alpha)
+            _b_scalar_inplace(
+                "AddScalarInplace",
+                self,
+                s.f,
+                _b_alpha_opmath(args[unsafe_offset=2], self.stype, False),
+            )
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
@@ -2027,7 +2080,12 @@ def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if not rhs.is_t and self.contig and _b_float3(self.stype):
         var s = rhs.s.value().copy()
         if not s.is_bool:
-            _b_scalar_inplace("AddScalarInplace", self, -s.f, alpha)
+            _b_scalar_inplace(
+                "AddScalarInplace",
+                self,
+                s.f,
+                _b_alpha_opmath(args[unsafe_offset=2], self.stype, True),
+            )
             ret_ref(rets, 0, self)
             return
     _b_store_inplace(
@@ -2076,12 +2134,20 @@ def op_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         _b_sub_check(lhs, rhs)
         _ = _b_alpha_prologue(lhs, rhs, args[unsafe_offset=2], -1, True)
     # `other - alpha * self` for a float tensor and a number: one launch.
-    var fast = _b_try_scalar(
-        "RsubScalarSpec", rhs, lhs, False, None, v_f64(args[unsafe_offset=2])
-    )
-    if fast.__bool__():
-        _b_ret(rets, fast.value().copy())
-        return
+    var common = _b_common(lhs, rhs)
+    if _b_float3(common):
+        var fast = _b_try_scalar(
+            "RsubScalarSpec",
+            rhs,
+            lhs,
+            False,
+            None,
+            _b_alpha_opmath(args[unsafe_offset=2], common, True),
+            True,
+        )
+        if fast.__bool__():
+            _b_ret(rets, fast.value().copy())
+            return
     var promoted = _rsub_promote(lhs, rhs)
     if promoted:
         rhs = _b_tside(promoted.value())

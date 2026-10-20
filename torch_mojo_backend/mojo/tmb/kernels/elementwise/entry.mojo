@@ -1106,8 +1106,8 @@ comptime SOP_POW = 2
 # scalar to the tensor's dtype first, and trunc there divides in bf16.
 comptime SOP_FLOORDIV = 3
 comptime SOP_TRUNCDIV = 4
-# rsub(Tensor, Scalar other) with alpha 1: other - self in opmath, one
-# rounding (the CUDA sub kernel's fma(-1, self, other)).
+# `scalar + alpha * self` in opmath, one rounding: CUDA's add functor with
+# the CPU scalar first (rsub passes -alpha, its sub kernel's fma).
 comptime SOP_RSUB = 5
 
 
@@ -1189,8 +1189,8 @@ def _scalar_elementwise[
     ctx: DeviceContext,
     alpha: Float32 = 1,
 ) raises:
-    """`alpha`: add's (`a + alpha * scalar`) and rsub's
-    (`scalar - alpha * a`), both one fma in float as CUDA's add functors."""
+    """`alpha`: add's `a + alpha * scalar` and rsub's `scalar + alpha * a`
+    (rsub passes -alpha), each one fma in float as CUDA's add functors."""
     comptime if not dtype.is_floating_point():
         raise Error("scalar elementwise ops require a floating point dtype")
     else:
@@ -1266,7 +1266,7 @@ def _scalar_elementwise[
             comptime if op_code == SOP_RSUB:
                 out_ptr.unsafe_store[width=width, alignment=al](
                     i,
-                    SIMD[DType.float32, width](-alpha).fma(a, s).cast[dtype](),
+                    SIMD[DType.float32, width](alpha).fma(a, s).cast[dtype](),
                 )
 
         # Element alignment only: the CPU lanes and the GPU scalar lanes may

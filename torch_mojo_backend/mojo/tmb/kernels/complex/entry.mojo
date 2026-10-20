@@ -48,6 +48,8 @@ from tmb.kernels.common.complex_math import (
     chypot,
     clog_jit,
     cmul,
+    cmul_scalar_first,
+    cmul_scalar_second,
     cpow,
     creciprocal,
     csgn,
@@ -88,7 +90,7 @@ comptime KINDS_CX_CX = [
 ]
 comptime KINDS_CX_RE = ["abs", "angle", "real", "imag"]
 comptime KINDS_CX_B = ["isnan", "isinf", "isfinite", "nonzero"]
-comptime KINDS_CXCX_CX = ["add", "mul", "div", "pow"]
+comptime KINDS_CXCX_CX = ["add", "mul", "mul_recip", "div", "pow"]
 comptime KINDS_CXCX_B = ["eq", "ne"]
 comptime KINDS_RERE_CX = ["make", "polar"]
 
@@ -145,7 +147,7 @@ def _unary_b[kind: StaticString, dt: DType](z: Cx[dt]) -> Bool:
 @always_inline
 def _binary_cx[
     kind: StaticString, dt: DType
-](a: Cx[dt], b: Cx[dt], p: Cx[dt]) -> Cx[dt]:
+](a: Cx[dt], b: Cx[dt], p: Cx[dt], mode_a: Int, mode_b: Int) -> Cx[dt]:
     comptime if kind == "add":
         # BinaryAddSubKernel.cu's AddFunctor: a + alpha * b, the product
         # always formed (alpha = 1 still turns inf * 0 into NaN, as on
@@ -153,7 +155,17 @@ def _binary_cx[
         var ab = cmul(p, b)
         return Cx[dt](a.re + ab.re, a.im + ab.im)
     elif kind == "mul":
+        # MulFunctor through opmath_symmetric_gpu_kernel_with_scalars: a CPU
+        # scalar operand is always the left factor (AUnaryFunctor)
+        if mode_b == MODE_HOST and mode_a != MODE_HOST:
+            return cmul_scalar_first(b, a)
+        if mode_a == MODE_HOST and mode_b != MODE_HOST:
+            return cmul_scalar_first(a, b)
         return cmul(a, b)
+    elif kind == "mul_recip":
+        # div_true_kernel_cuda's `a * (1 / b)` for a CPU-scalar divisor, its
+        # reciprocal in `b` (BUnaryFunctor)
+        return cmul_scalar_second(a, b)
     elif kind == "div":
         return cdiv(a, b)
     else:
@@ -214,6 +226,7 @@ def _arity[kind: StaticString]() -> Int:
     comptime if (
         kind == "add"
         or kind == "mul"
+        or kind == "mul_recip"
         or kind == "div"
         or kind == "pow"
         or kind == "eq"
@@ -317,7 +330,9 @@ def _launch[
                         a, b
                     ) else UInt8(0)
                 else:
-                    var r = _binary_cx[kind, dt](a, b, Cx[dt](hp_re, hp_im))
+                    var r = _binary_cx[kind, dt](
+                        a, b, Cx[dt](hp_re, hp_im), mode_a, mode_b
+                    )
                     out_ptr[unsafe_offset=2 * i] = r.re
                     out_ptr[unsafe_offset=2 * i + 1] = r.im
 

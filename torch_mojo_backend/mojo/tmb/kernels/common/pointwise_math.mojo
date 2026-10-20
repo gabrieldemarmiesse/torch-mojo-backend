@@ -1738,15 +1738,6 @@ def _wide[
         elif e == -1:
             return 1 / a
         return torch_pow(a, SIMD[w, n](e))
-    elif kind == "rsub_alpha" or kind == "rsub_alpha_scalar":
-        # rsub(self, other, alpha) is sub(other, self, alpha), CUDA's add
-        # kernel with -alpha: other + (-alpha) * self in opmath, one fma
-        # (a = self, b = other or p1 = a Python-number other, kept in opmath
-        # like the kernel's cpu scalar; p0 = alpha.to<opmath_t>()).
-        var other = b
-        comptime if kind == "rsub_alpha_scalar":
-            other = SIMD[w, n](p[1])
-        return SIMD[w, n](-p[0]).fma(a, other)
     elif kind == "masked_scale":
         # Dropout.cu's masked_scale_kernel: (float)mask * src * scale, a =
         # src, b = the uint8 mask (exact in every float dtype), p0 = scale.

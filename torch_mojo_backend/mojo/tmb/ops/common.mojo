@@ -802,6 +802,13 @@ def is_cast_pair_on(a: DType, b: DType, t: T) raises -> Bool:
     def wide_unsigned(d: DType) -> Bool:
         return d == DType.uint16 or d == DType.uint32 or d == DType.uint64
 
+    @__parameter
+    def floating(d: DType) -> Bool:
+        return d.is_floating_point() and not is_float8(d)
+
+    # an unsigned operand promoted into a float result (`u16 + 2.5`)
+    if wide_unsigned(a) and floating(b) and is_cast_dtype_on(b, t):
+        return True
     return (is_float8(a) and wide_unsigned(b)) or (
         is_float8(b) and wide_unsigned(a)
     )
@@ -1107,6 +1114,11 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
         # the complex type of the promoted value types (complex64 + float64
         # is complex128)
         return complex_of(promote_types(real_of(a), real_of(b)))
+    # A float absorbs uint16 / 32 / 64 (the cast kernel converts them).
+    if is_float_stype(a) and is_wide_unsigned(b):
+        return a
+    if is_float_stype(b) and is_wide_unsigned(a):
+        return b
     if not known_stype(a) or not known_stype(b):
         unsupported(
             "type promotion of dtypes " + String(a) + " and " + String(b)

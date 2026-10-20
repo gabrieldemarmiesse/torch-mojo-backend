@@ -71,6 +71,7 @@ from tmb.backend.abi import (
     OpFn,
     TAG_DTYPE,
     TAG_INT,
+    TAG_SCALAR_INT,
     v_is_complex,
     Owned,
     ST_BOOL,
@@ -197,7 +198,7 @@ def _arith(
         # the kernel: 1 / 1e-40 is 1e40 -> inf, not inf + NaN i)
         var inv = _host_reciprocal[DType.float64](fb.re, fb.im)
         fb = _Flat(CX_HOST, 0, inv[0], inv[1])
-        launch_kind = "mul"
+        launch_kind = "mul_recip"
     if kind == "pow" and fb.mode == CX_HOST:
         # the CPU-scalar exponent becomes a scalar_t first
         # (iter.scalar_value<scalar_t>), so it is compared once rounded
@@ -211,7 +212,14 @@ def _arith(
         launch_kind = "square"
     if kind == "sub":
         launch_kind = "add"
-        p_re = -p_re
+        if alpha.tag == TAG_SCALAR_INT or alpha.tag == TAG_INT:
+            # an integer negates as an integer: -0 is +0.0
+            var neg = scalar_parts(
+                Value(alpha.tag, 0, 0 - alpha.a, alpha.b), st
+            )
+            p_re = neg[0]
+        else:
+            p_re = -p_re
         p_im = -p_im if alpha.tag == TAG_COMPLEX else 0.0
     cx_launch(
         launch_kind,

@@ -1340,65 +1340,6 @@ def _pw_both_int(args: Values) raises -> Bool:
     )
 
 
-def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
-    """rsub with alpha != 1 on a floating result: `other - alpha * self` as
-    one fma in opmath, as CUDA's add kernel computes sub(other, self, alpha)
-    (the generic alpha cascade rounds alpha * self to the dtype first).
-    False for alpha 1 and integral results, which binary.mojo keeps."""
-    var alpha = v_f64(args[unsafe_offset=2])
-    if alpha == 1.0:
-        return False
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
-    if not a.is_t:
-        return False
-    var common = _pw_result_type(a, b, _none_side(), 2)
-    if not _pw_is_float(common):
-        return False
-    # `alpha.to<scalar_t>()`: a finite alpha past the result dtype's range
-    # raises, as ATen's checked conversion does.
-    alpha = scalar_to_float(args[unsafe_offset=2], common)
-    var compute = _pw_compute_dtype("rsub_alpha", common, P_FLOAT, True)
-    var dest = Optional[T]()
-    if out_index >= 0:
-        dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
-    if b.is_t:
-        _pw_finish(
-            rets,
-            dest,
-            _pw_run(
-                "rsub_alpha",
-                2,
-                a,
-                b,
-                _none_side(),
-                compute,
-                compute,
-                _p(alpha),
-                dest,
-            ),
-            True,  # rsub: `out` of the result dtype only
-        )
-    else:
-        _pw_finish(
-            rets,
-            dest,
-            _pw_run(
-                "rsub_alpha_scalar",
-                1,
-                a,
-                _none_side(),
-                _none_side(),
-                compute,
-                compute,
-                _p(alpha, b.s.value().f),
-                dest,
-            ),
-            True,  # rsub: `out` of the result dtype only
-        )
-    return True
-
-
 def _pw_rsub_check(args: Values) raises:
     """BinaryOps.cpp's sub_check and alpha_check (rsub is sub(other, self,
     alpha)): no bool operand, no bool alpha (it would need a bool result,
@@ -1416,8 +1357,7 @@ def _pw_rsub_check(args: Values) raises:
 # aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
 def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _pw_rsub_check(args)
-    if not _pw_rsub_alpha(args, rets, -1):
-        op_rsub(args, n_args, rets, n_rets)
+    op_rsub(args, n_args, rets, n_rets)
 
 
 # aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
