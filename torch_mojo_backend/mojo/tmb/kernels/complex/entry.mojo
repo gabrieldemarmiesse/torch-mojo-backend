@@ -40,18 +40,35 @@ from std.utils.numerics import isinf, isnan
 
 from tmb.kernels.common.complex_math import (
     Cx,
+    cacos_jit,
+    cacosh_jit,
+    casin_jit,
+    casinh_jit,
     catan2,
+    catan_jit,
+    catanh_jit,
+    ccos_jit,
+    ccosh_jit,
     cdiv,
     cdiv_jit,
     cexp,
+    cexp2_jit,
     cexp_jit,
+    cexpm1_c10,
     chypot,
+    clog1p_c10,
+    clog_base_jit,
     clog_jit,
     cmul,
     cpow,
     creciprocal,
     csgn,
+    csin_jit,
+    csinh_jit,
     csqrt_jit,
+    ctan_jit,
+    ctanh_jit,
+    neg_like_cuda,
 )
 from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.op_utils import (
@@ -85,6 +102,23 @@ comptime KINDS_CX_CX = [
     "rsqrt",
     "sgn",
     "square",
+    "sin",
+    "cos",
+    "tan",
+    "sinh",
+    "cosh",
+    "tanh",
+    "asin",
+    "acos",
+    "atan",
+    "asinh",
+    "acosh",
+    "atanh",
+    "log10",
+    "log2",
+    "exp2",
+    "expm1",
+    "log1p",
 ]
 comptime KINDS_CX_RE = ["abs", "angle", "real", "imag"]
 comptime KINDS_CX_B = ["isnan", "isinf", "isfinite", "nonzero"]
@@ -96,9 +130,9 @@ comptime KINDS_RERE_CX = ["make", "polar"]
 @always_inline
 def _unary_cx[kind: StaticString, dt: DType](z: Cx[dt]) -> Cx[dt]:
     comptime if kind == "conj":
-        return Cx[dt](z.re, -z.im)
+        return Cx[dt](z.re, neg_like_cuda(z.im))
     elif kind == "neg":
-        return Cx[dt](-z.re, -z.im)
+        return Cx[dt](neg_like_cuda(z.re), neg_like_cuda(z.im))
     elif kind == "reciprocal":
         return creciprocal(z)
     elif kind == "exp":
@@ -111,6 +145,40 @@ def _unary_cx[kind: StaticString, dt: DType](z: Cx[dt]) -> Cx[dt]:
         return cdiv_jit(Cx[dt](Scalar[dt](1), Scalar[dt](0)), csqrt_jit(z))
     elif kind == "sgn":
         return csgn(z)
+    elif kind == "sin":
+        return csin_jit(z)
+    elif kind == "cos":
+        return ccos_jit(z)
+    elif kind == "tan":
+        return ctan_jit(z)
+    elif kind == "sinh":
+        return csinh_jit(z)
+    elif kind == "cosh":
+        return ccosh_jit(z)
+    elif kind == "tanh":
+        return ctanh_jit(z)
+    elif kind == "asin":
+        return casin_jit(z)
+    elif kind == "acos":
+        return cacos_jit(z)
+    elif kind == "atan":
+        return catan_jit(z)
+    elif kind == "asinh":
+        return casinh_jit(z)
+    elif kind == "acosh":
+        return cacosh_jit(z)
+    elif kind == "atanh":
+        return catanh_jit(z)
+    elif kind == "log10":
+        return clog_base_jit[dt, 10](z)
+    elif kind == "log2":
+        return clog_base_jit[dt, 2](z)
+    elif kind == "exp2":
+        return cexp2_jit(z)
+    elif kind == "expm1":
+        return cexpm1_c10(z)
+    elif kind == "log1p":
+        return clog1p_c10(z)
     else:
         comptime assert kind == "square", "unknown complex unary kind"
         return cmul(z, z)
