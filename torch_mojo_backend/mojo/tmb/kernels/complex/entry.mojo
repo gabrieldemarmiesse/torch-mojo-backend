@@ -22,7 +22,7 @@
 #   cx -> cx : conj neg reciprocal exp log sqrt rsqrt sgn square
 #   cx -> re : abs angle real imag
 #   cx -> b  : isnan isinf isfinite nonzero
-#   cx, cx -> cx : add (a + p * b) mul div pow
+#   cx, cx -> cx : add (a + p * b) mul div pow exp_mul (exp(a * b))
 #   cx, cx -> b  : eq ne
 #   re, re -> cx : make (complex(real, imag)) polar (polar(abs, angle))
 #
@@ -88,7 +88,7 @@ comptime KINDS_CX_CX = [
 ]
 comptime KINDS_CX_RE = ["abs", "angle", "real", "imag"]
 comptime KINDS_CX_B = ["isnan", "isinf", "isfinite", "nonzero"]
-comptime KINDS_CXCX_CX = ["add", "mul", "div", "pow"]
+comptime KINDS_CXCX_CX = ["add", "mul", "div", "pow", "exp_mul"]
 comptime KINDS_CXCX_B = ["eq", "ne"]
 comptime KINDS_RERE_CX = ["make", "polar"]
 
@@ -156,6 +156,10 @@ def _binary_cx[
         return cmul(a, b)
     elif kind == "div":
         return cdiv(a, b)
+    elif kind == "exp_mul":
+        # pow_scalar_tensor_impl's `std::exp(fct * exp)`: a = fct, the
+        # CPU-scalar base's log taken on the host
+        return cexp(cmul(a, b))
     else:
         comptime assert kind == "pow", "unknown complex binary kind"
         return cpow(a, b)
@@ -216,6 +220,7 @@ def _arity[kind: StaticString]() -> Int:
         or kind == "mul"
         or kind == "div"
         or kind == "pow"
+        or kind == "exp_mul"
         or kind == "eq"
         or kind == "ne"
         or _real_in[kind]()

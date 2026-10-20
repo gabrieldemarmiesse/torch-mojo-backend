@@ -21,6 +21,10 @@ torch runs on CUDA, in float32 arithmetic alone (Apple GPUs have no float64;
 MPS computes a float pow there too). float64 is `_pow_f64_core`: a
 double-double log and a corrected exp, within about an ulp like CUDA's
 double pow (std.math.pow's float64 GPU lowering is 2^-12 relative off).
+
+On NVIDIA both are CUDA's own, bit for bit: float64 is libdevice's
+`nv_pow` whole (special cases included), and a float32 NaN result is the
+canonical 0x7FFFFFFF every CUDA float operation returns.
 """
 
 from std.math import floor, fma
@@ -30,7 +34,19 @@ from std.sys.info import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
 from tmb.kernels.common.cuda_math import cuda_powf_core
-from tmb.kernels.common.libdevice_port import nv_exp, nv_log
+from tmb.kernels.common.libdevice_port import nv_exp, nv_log, nv_pow
+
+
+# How PowKernel.cu's pow_tensor_scalar_kernel computes `base ** exponent`
+# for a scalar exponent (the "pow_exp" pointwise kind; the host picks one):
+# the full pow, or the special exponents' own kernels.
+comptime POW_GENERAL = 0
+comptime POW_SQUARE = 1  # base * base
+comptime POW_CUBE = 2  # base * base * base
+comptime POW_INV_SQUARE = 3  # 1.0 / (base * base)
+comptime POW_SQRT = 4  # sqrt_kernel_cuda
+comptime POW_RSQRT = 5  # rsqrt_kernel_cuda
+comptime POW_RECIPROCAL = 6  # reciprocal_kernel_cuda
 
 
 @always_inline
@@ -169,7 +185,19 @@ def _core[w: DType](ax: Scalar[w], y: Scalar[w]) -> Scalar[w]:
 
 
 @always_inline
+def _nan_result[w: DType]() -> Scalar[w]:
+    """The NaN `pow` returns: CUDA's float powf gives the canonical
+    0x7FFFFFFF."""
+    comptime if w == DType.float32 and is_nvidia_gpu():
+        return rebind[Scalar[w]](Float32(from_bits=UInt32(0x7FFFFFFF)))
+    else:
+        return nan[w]()
+
+
+@always_inline
 def _pow_scalar[w: DType](x: Scalar[w], y: Scalar[w]) -> Scalar[w]:
+    comptime if w == DType.float64 and is_nvidia_gpu():
+        return rebind[Scalar[w]](nv_pow(rebind[Float64](x), rebind[Float64](y)))
     comptime if w == DType.float32 and is_nvidia_gpu():
         # The common case first, on the bits: x positive, finite and not 1,
         # y finite and nonzero need none of the selects below (three integer
@@ -189,7 +217,7 @@ def _pow_scalar[w: DType](x: Scalar[w], y: Scalar[w]) -> Scalar[w]:
     if x == 1:
         return 1
     if isnan(x) or isnan(y):
-        return nan[w]()
+        return _nan_result[w]()
     var ax = abs(x)
     if isinf(y):
         if ax == 1:
@@ -213,7 +241,7 @@ def _pow_scalar[w: DType](x: Scalar[w], y: Scalar[w]) -> Scalar[w]:
         mag = Scalar[w](0) if y < 0 else inf[w]()
     else:
         if negative and not integral:
-            return nan[w]()
+            return _nan_result[w]()
         mag = _core(ax, y)
     return -mag if negative and odd else mag
 

@@ -32,10 +32,15 @@ from tmb.backend.abi import (
     ST_INT64,
     ST_INT8,
     ST_UINT8,
+    ST_UINT16,
+    ST_UINT32,
+    ST_UINT64,
     T,
     TAG_BOOL,
+    TAG_INT,
     TAG_INT_LIST,
     TAG_NONE,
+    TAG_SCALAR_BOOL,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
     Value,
@@ -106,6 +111,15 @@ from tmb.ops.complex_math import (
     cx_rsub,
 )
 from tmb.kernels.common.op_utils import MAX_RANK
+from tmb.kernels.common.pow_math import (
+    POW_CUBE,
+    POW_GENERAL,
+    POW_INV_SQUARE,
+    POW_RECIPROCAL,
+    POW_RSQRT,
+    POW_SQRT,
+    POW_SQUARE,
+)
 from tmb.ops.binary import (
     Res,
     Scal,
@@ -1239,14 +1253,16 @@ def _pw_pow_scalar_base(args: Values, rets: Values, out_index: Int) raises:
 def op_pow_scalar_base(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_pow_scalar_base(args, rets, -1)
+    if not _pw_pow_real(args, rets, _POW_ST, -1):
+        _pw_pow_scalar_base(args, rets, -1)
 
 
 # aten::pow.Scalar_out(Scalar self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
 def op_pow_scalar_base_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_pow_scalar_base(args, rets, 2)
+    if not _pw_pow_real(args, rets, _POW_ST, 2):
+        _pw_pow_scalar_base(args, rets, 2)
 
 
 def _pw_lerp_scalar(
@@ -1334,12 +1350,6 @@ def _pw_ipow(
     _pw_math("ipow", P_INT, True, 2, args, rets, out_index)
 
 
-def _pw_both_int(args: Values) raises -> Bool:
-    return _pw_int_side(_b_side(args[unsafe_offset=0])) and _pw_int_side(
-        _b_side(args[unsafe_offset=1])
-    )
-
-
 def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
     """rsub with alpha != 1 on a floating result: `other - alpha * self` as
     one fma in opmath, as CUDA's add kernel computes sub(other, self, alpha)
@@ -1420,13 +1430,245 @@ def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         op_rsub(args, n_args, rets, n_rets)
 
 
+# pow / float_power (float_power is composite: pow in float64 / complex128),
+# real dtypes. PowKernel.cu and Pow.cpp, case by case: a CPU-scalar base
+# (pow.Scalar, a 0-d CPU tensor) runs pow_scalar_tensor_impl with the base
+# converted to the common dtype; a CPU-scalar exponent runs
+# pow_tensor_scalar_kernel with it converted to the common dtype
+# (pow.Tensor_Tensor) or as the Scalar itself after Pow.cpp's 0 / 1
+# shortcuts (pow.Tensor_Scalar); two tensors run pow_ elementwise. The
+# complex dtypes take tmb/ops/complex_math.mojo, float8 operands the
+# binary.mojo routes (their refusals).
+
+comptime _POW_TT = 0  # pow.Tensor_Tensor
+comptime _POW_TS = 1  # pow.Tensor_Scalar
+comptime _POW_ST = 2  # pow.Scalar
+
+
+def _pw_pow_f8_side(side: Side) raises -> Bool:
+    if side.is_t:
+        return _pw_is_f8(side.t.value().stype)
+    return side.zero_st >= 0 and _pw_is_f8(side.zero_st)
+
+
+def _pw_wrap_int(v: Int, st: Int32) -> Int:
+    """`static_cast<scalar_t>(int64)`: two's complement wrap."""
+    var x = Int64(v)
+    if st == ST_INT8:
+        return Int(x.cast[DType.int8]())
+    if st == ST_UINT8:
+        return Int(x.cast[DType.uint8]())
+    if st == ST_INT16:
+        return Int(x.cast[DType.int16]())
+    if st == ST_INT32:
+        return Int(x.cast[DType.int32]())
+    return v
+
+
+def _pw_pow_ones(base: Side, expo: Side, common: Int32) raises -> Res:
+    var t = expo.t.value().copy() if expo.is_t else base.t.value().copy()
+    var bs = _pw_broadcast(base, expo, _none_side(), 2)
+    var ones = own(new_tensor(bs[0], bs[1], common, t.device))
+    fill_value(ones.t, 1.0)
+    return Res(ones.take(), True)
+
+
+def _pw_pow_scalar_exp(
+    base: Side, ev: Value, common: Int32, dest: Optional[T]
+) raises -> Res:
+    """PowKernel.cu's pow_tensor_scalar_kernel(iter, exp_scalar) on a real
+    common dtype: an exponent EQUAL to 0.5 / -0.5 / -1 (the Scalar itself)
+    is the sqrt / rsqrt / reciprocal kernel; otherwise `exp_scalar.to<
+    scalar_t>()` (checked) whose value 2 / 3 / -2 is a product, the rest
+    the full pow."""
+    var is_bool = ev.tag == TAG_SCALAR_BOOL or ev.tag == TAG_BOOL
+    var is_int = ev.tag == TAG_SCALAR_INT or ev.tag == TAG_INT
+    var d = Float64(ev.a) if is_int else v_f64(ev)
+    var mode = POW_GENERAL
+    if not is_bool:
+        if d == 0.5:
+            mode = POW_SQRT
+        elif d == -0.5:
+            mode = POW_RSQRT
+        elif d == -1.0:
+            mode = POW_RECIPROCAL
+    if mode != POW_GENERAL and not _pw_is_float(common):
+        var k = "sqrt" if mode == POW_SQRT else (
+            "rsqrt" if mode == POW_RSQRT else "reciprocal"
+        )
+        unsupported(
+            '"'
+            + k
+            + "_cuda\" not implemented for '"
+            + scalar_type_name(max_dtype(common))
+            + "'"
+        )
+    var compute = _pw_compute_dtype("pow_exp", common, P_NUMERIC, True)
+    var params = _p(0.0, Float64(mode))
+    if mode == POW_GENERAL:
+        if _pw_is_float(compute):
+            var e = _round_to(scalar_to_float(ev, compute), compute)
+            if e == 2.0:
+                mode = POW_SQUARE
+            elif e == 3.0:
+                mode = POW_CUBE
+            elif e == -2.0:
+                mode = POW_INV_SQUARE
+            params = _p(e, Float64(mode))
+        else:
+            if not is_int:
+                raise Error(
+                    (
+                        "invalid combination of type in Pow function, common"
+                        " dtype:"
+                    ),
+                    scalar_type_name(max_dtype(compute)),
+                    "exp is integral?false",
+                )
+            var e = _pw_wrap_int(scalar_to_int(ev, compute), compute)
+            if e == 2:
+                mode = POW_SQUARE
+            elif e == 3:
+                mode = POW_CUBE
+            elif e == -2:
+                mode = POW_INV_SQUARE
+            params = _p(bits_f64(Int64(e)), bits_f64(Int64(mode)))
+    return _pw_run(
+        "pow_exp",
+        1,
+        base,
+        _none_side(),
+        _none_side(),
+        compute,
+        compute,
+        params,
+        dest,
+    )
+
+
+def _pw_pow_real(
+    args: Values, rets: Values, schema: Int, out_index: Int
+) raises -> Bool:
+    """pow of real operands (see above). False for what binary.mojo keeps:
+    float8 operands, and two tensors of one floating dtype (its PowSpec
+    kernels)."""
+    var a = _b_side(args[unsafe_offset=0])
+    var b = _b_side(args[unsafe_offset=1])
+    if _pw_pow_f8_side(a) or _pw_pow_f8_side(b):
+        return False
+    if out_index >= 0 and _pw_is_f8(
+        v_tensor(args[unsafe_offset=out_index]).stype
+    ):
+        return False
+    if (
+        schema == _POW_TT
+        and a.is_t
+        and b.is_t
+        and a.t.value().stype == b.t.value().stype
+        and _pw_is_float(a.t.value().stype)
+    ):
+        return False
+    if schema == _POW_TS:
+        var st = a.t.value().stype
+        var s = b.s.value().copy()
+        if (
+            (
+                _pw_is_int(st)
+                or st == ST_BOOL
+                or st == ST_UINT16
+                or st == ST_UINT32
+                or st == ST_UINT64
+            )
+            and s.is_int
+            and s.i < 0
+        ):
+            raise Error("Integers to negative integer powers are not allowed.")
+    var common = _pw_result_type(a, b, _none_side(), 2)
+    var dest = Optional[T]()
+    if out_index >= 0:
+        dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
+    var to_kernel = schema != _POW_TS and not (
+        schema == _POW_ST and _base_is_one(args[unsafe_offset=0])
+    )
+    if to_kernel and (common == ST_BOOL or not _pw_known(common)):
+        unsupported(
+            '"pow_cuda" not implemented for \''
+            + scalar_type_name(max_dtype(common))
+            + "'"
+        )
+    var res: Res
+    if schema == _POW_ST and _base_is_one(args[unsafe_offset=0]):
+        # pow_Scalar_out: a base equal to 1 fills ones, no kernel
+        res = _pw_pow_ones(a, b, common)
+    elif schema == _POW_TS:
+        var s = b.s.value().copy()
+        if (s.is_bool and s.i == 0) or (not s.is_bool and s.f == 0.0):
+            # Pow.cpp: `out.fill_(1)`
+            res = _pw_pow_ones(a, b, common)
+        elif (s.is_bool and s.i == 1) or (not s.is_bool and s.f == 1.0):
+            # Pow.cpp: `out.copy_(base)`, base converted to the common dtype
+            var t = a.t.value().copy()
+            var c = own(new_tensor(t.shape, t.rank, common, t.device))
+            if t.stype == common:
+                copy_strided_into(c.t, t)
+            else:
+                var conv = own(cast_for_copy(t, common, False))
+                copy_strided_into(c.t, conv.t)
+                _ = conv^
+            res = Res(c.take(), True)
+        else:
+            res = _pw_pow_scalar_exp(
+                a, args[unsafe_offset=1].copy(), common, dest
+            )
+    elif not a.is_t:
+        # pow_scalar_tensor_impl: the CPU-scalar base as the common dtype
+        # (`iter.scalar_value<scalar_t>(1)`)
+        var s = a.s.value().copy()
+        if _pw_is_float(common):
+            var v = Float64(s.i) if s.is_int else s.f
+            res = _pw_run(
+                "pow_scalar_base",
+                1,
+                b,
+                _none_side(),
+                _none_side(),
+                common,
+                common,
+                _p(_round_to(v, common), 1.0 if schema == _POW_ST else 0.0),
+                dest,
+            )
+        else:
+            res = _pw_run(
+                "ipow", 2, a, b, _none_side(), common, common, _p(), dest
+            )
+    elif not b.is_t:
+        # pow_tensor_scalar_kernel with `Scalar(iter.scalar_value<
+        # scalar_t>(2))`: the exponent converted to the common dtype first,
+        # no 0 / 1 shortcut
+        var s = b.s.value().copy()
+        var ev: Value
+        if _pw_is_float(common):
+            var v = Float64(s.i) if s.is_int else s.f
+            ev = Value(TAG_SCALAR_DOUBLE, 0, f64_bits(_round_to(v, common)), 0)
+        else:
+            var v = s.i if s.is_int else Int(s.f)
+            ev = Value(TAG_SCALAR_INT, 0, Int64(_pw_wrap_int(v, common)), 0)
+        res = _pw_pow_scalar_exp(a, ev, common, dest)
+    elif _pw_is_float(common):
+        res = _pw_run(
+            "pow_tt", 2, a, b, _none_side(), common, common, _p(), dest
+        )
+    else:
+        res = _pw_run("ipow", 2, a, b, _none_side(), common, common, _p(), dest)
+    _pw_finish(rets, dest, res^)
+    return True
+
+
 # aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
 def op_pow_tensor_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _pw_both_int(args):
-        _pw_ipow(args, rets, -1, False)
-    else:
+    if not _pw_pow_real(args, rets, _POW_TT, -1):
         op_pow_tensor(args, n_args, rets, n_rets)
 
 
@@ -1434,65 +1676,15 @@ def op_pow_tensor_any(
 def op_pow_tensor_out_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _pw_both_int(args):
-        _pw_ipow(args, rets, 2, False)
-    else:
+    if not _pw_pow_real(args, rets, _POW_TT, 2):
         op_pow_tensor_out(args, n_args, rets, n_rets)
-
-
-def _pw_pow_f64_scalar(
-    args: Values, rets: Values, out_index: Int
-) raises -> Bool:
-    """A float64 tensor to a real scalar power: PowKernel.cu's special
-    exponents (products, sqrt, rsqrt, reciprocal) before the full pow, which
-    the elementwise family's PowScalarSpec does for the float types only."""
-    var base = _b_side(args[unsafe_offset=0])
-    var expo = _b_side(args[unsafe_offset=1])
-    if not base.is_t or expo.is_t:
-        return False
-    if base.t.value().stype != ST_FLOAT64:
-        return False
-    var dest = Optional[T]()
-    if out_index >= 0:
-        dest = _pw_out_of(
-            args[unsafe_offset=out_index], base, _none_side(), _none_side()
-        )
-    _pw_finish(
-        rets,
-        dest,
-        _pw_run(
-            "pow_tensor_scalar",
-            1,
-            base,
-            _none_side(),
-            _none_side(),
-            ST_FLOAT64,
-            ST_FLOAT64,
-            _p(expo.s.value().f),
-            dest,
-        ),
-    )
-    return True
-
-
-def _pw_int_scalar_pow(args: Values) raises -> Bool:
-    """An integral result of pow.Tensor_Scalar: an integer tensor, or a bool
-    one (`torch.square(bool_t)` is `pow(bool_t, 2)`, which promotes to int64),
-    to a non-bool integer exponent."""
-    var base = _b_side(args[unsafe_offset=0])
-    if not base.is_t or not _pw_int_side(_b_side(args[unsafe_offset=1])):
-        return False
-    var st = base.t.value().stype
-    return _pw_is_int(st) or st == ST_BOOL
 
 
 # aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
 def op_pow_scalar_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _pw_int_scalar_pow(args):
-        _pw_ipow(args, rets, -1, True)
-    elif not _pw_pow_f64_scalar(args, rets, -1):
+    if not _pw_pow_real(args, rets, _POW_TS, -1):
         op_pow_scalar(args, n_args, rets, n_rets)
 
 
@@ -1500,9 +1692,7 @@ def op_pow_scalar_any(
 def op_pow_scalar_out_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _pw_int_scalar_pow(args):
-        _pw_ipow(args, rets, 2, True)
-    elif not _pw_pow_f64_scalar(args, rets, 2):
+    if not _pw_pow_real(args, rets, _POW_TS, 2):
         op_pow_scalar_out(args, n_args, rets, n_rets)
 
 
