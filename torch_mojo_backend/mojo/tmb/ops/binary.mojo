@@ -3214,24 +3214,6 @@ def _b_wide_unsigned(side: Side) -> Bool:
     return st == ST_UINT16 or st == ST_UINT32 or st == ST_UINT64
 
 
-struct _HeldSide(Movable):
-    var side: Side
-    var held: Optional[Held]
-
-    def __init__(out self, var side: Side, var held: Optional[Held]):
-        self.side = side^
-        self.held = held^
-
-
-def _b_cast_side_any(side: Side, st: Int32) raises -> _HeldSide:
-    """A tensor side cast to `st` (`_b_cast_any`); a Scalar side as is."""
-    if not side.is_t or side.t.value().stype == st:
-        return _HeldSide(side.copy(), None)
-    var h = _b_cast_any(side.t.value(), st)
-    var t = h.t.copy()
-    return _HeldSide(_b_tside(t), Optional[Held](h^))
-
-
 # aten::floor_divide(Tensor self, Tensor other) -> Tensor
 # aten::floor_divide.Scalar(Tensor self, Scalar other) -> Tensor
 def op_floor_divide(
