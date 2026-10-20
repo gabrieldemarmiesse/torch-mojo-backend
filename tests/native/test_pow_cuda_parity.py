@@ -36,9 +36,31 @@ _COMPLEX = [1j, 2 + 1j, -0.5 + 0j, 2 + 0j, 0.5 + 0j, 1 + 0j, 0j]
 _DTYPES = bp.ALL + bp.UINTS
 
 
+def _split_nan(t):
+    """Where a complex value holds two NaNs of different payload, as a
+    double-precision kernel sees it. Which of the two a double DMUL / DFMA
+    keeps depends on the operand slots ptxas gave the instruction, and those
+    change with the launch (the contiguous kernel, the broadcast 0-d device
+    one, the scalar-base one): bp.two_distinct_nans, within one element."""
+    if not t.dtype.is_complex:
+        return torch.zeros(len(t), dtype=torch.bool)
+    r = torch.view_as_real(t.to(torch.complex128))
+    return bp.two_distinct_nans(r[..., 0].contiguous(), r[..., 1].contiguous())
+
+
+def _ops(dtype):
+    """`pairs(dtype)` without the `_split_nan` elements (complex dtypes)."""
+    a, b = bp.pairs(dtype)
+    keep = ~(_split_nan(a) | _split_nan(b))
+    return a[keep], b[keep]
+
+
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
 def test_tensor_tensor(cuda_oracle: CudaOracle, dtype):
-    bp.check_all(cuda_oracle, bp.binary_cases(torch.pow, dtype, inplace="pow_"))
+    bp.check_all(
+        cuda_oracle,
+        bp.binary_cases(torch.pow, dtype, inplace="pow_", operands=_ops(dtype)),
+    )
 
 
 def _integral(s: object) -> bool:
@@ -54,7 +76,14 @@ def test_tensor_scalar(cuda_oracle: CudaOracle, dtype):
         bases = [e for e in bases if _integral(e)]
     bp.check_all(
         cuda_oracle,
-        bp.scalar_cases(torch.pow, dtype, exps, inplace="pow_", reverse=bases),
+        bp.scalar_cases(
+            torch.pow,
+            dtype,
+            exps,
+            inplace="pow_",
+            reverse=bases,
+            operands=_ops(dtype),
+        ),
     )
 
 
@@ -77,13 +106,20 @@ def test_uint_float_promotion(cuda_oracle: CudaOracle, dtype):
 def test_complex_scalar(cuda_oracle: CudaOracle, dtype):
     bp.check_all(
         cuda_oracle,
-        bp.scalar_cases(torch.pow, dtype, _COMPLEX, inplace="pow_", reverse=_COMPLEX),
+        bp.scalar_cases(
+            torch.pow,
+            dtype,
+            _COMPLEX,
+            inplace="pow_",
+            reverse=_COMPLEX,
+            operands=_ops(dtype),
+        ),
     )
 
 
 def _out_cases(fn, dtype, operands=None):
     """`out=` with a Python-number operand on either side."""
-    a, b = bp.pairs(dtype) if operands is None else operands
+    a, b = _ops(dtype) if operands is None else operands
     cases = []
     for s in (0.5, 2, -1.0, 1.5, 0, 1, True):
         cases.append(
@@ -128,7 +164,7 @@ def _fp_nan_cases(a, b):
 def _no_half_nans(dtype):
     """`pairs(dtype)` without float16 NaNs, which float_power converts to
     float64 (see test_float_power_half_nan)."""
-    a, b = bp.pairs(dtype)
+    a, b = _ops(dtype)
     if dtype != torch.float16:
         return a, b
     keep = ~(a.isnan() | b.isnan())
@@ -202,7 +238,7 @@ def test_mixed_dtypes(cuda_oracle: CudaOracle, op, da, db):
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
     common = torch.result_type(a, b)
-    keep = torch.ones(n, dtype=torch.bool)
+    keep = ~(_split_nan(a) | _split_nan(b))
     if common == torch.float64 or (op == "float_power" and not common.is_complex):
         # two tensor NaNs in a double kernel: bp.two_distinct_nans
         keep &= ~bp.two_distinct_nans(a.double(), b.double())
