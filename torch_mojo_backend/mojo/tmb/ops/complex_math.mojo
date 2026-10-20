@@ -368,9 +368,10 @@ def _arith(
         kind == "pow"
         and (fa.mode == CX_DEVICE or fa.mode == CX_HOST)
         and fb.mode != CX_HOST
-        and av.tag != TAG_TENSOR
-        and av.tag != TAG_TENSOR_REF
+        and av.tag == TAG_COMPLEX
     ):
+        # pow.Scalar with a complex number base (probed: a real number or a
+        # 0-d tensor base keeps the contiguous slot order)
         launch_kind = "pow_b0"
     if kind == "pow" and fb.mode == CX_HOST:
         # the CPU-scalar exponent becomes a scalar_t first

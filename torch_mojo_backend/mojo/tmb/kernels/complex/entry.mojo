@@ -159,9 +159,10 @@ def _binary_cx[
     elif kind == "div":
         return cdiv(a, b)
     elif kind == "pow_b0":
-        # pow with a 0-d device base (pow.Scalar's number base): the same
-        # `exp(log(a) * b)`, whose multiply the broadcast kernel schedules
-        # with the tensor operand in the DFMA's A slot, as exp_mul's.
+        # pow.Scalar with a complex number base: the same `exp(log(a) * b)`,
+        # whose multiply CUDA schedules with the tensor operand in the
+        # DFMA's A slot, as exp_mul's (a real number or a 0-d tensor base
+        # keeps `pow`'s order).
         return cexp_mul(clog(a), b)
     elif kind == "exp_mul":
         # pow_scalar_tensor_impl's `std::exp(fct * exp)`: a = fct, the
