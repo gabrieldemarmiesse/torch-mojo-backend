@@ -90,14 +90,20 @@ def _copysign[dt: DType](mag: Scalar[dt], sgn: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def _jnan[dt: DType]() -> Scalar[dt]:
     """The jiterator's `NAN`, `__int_as_float(0x7fffffff)`: a float even
-    where it becomes a double."""
-    return bitcast[DType.float32](UInt32(0x7FFFFFFF)).cast[dt]()
+    where it becomes a double (NVIDIA; elsewhere the plain NaN)."""
+    comptime if is_nvidia_gpu():
+        return bitcast[DType.float32](UInt32(0x7FFFFFFF)).cast[dt]()
+    else:
+        return nan[dt]()
 
 
 @always_inline
 def _hwnan[dt: DType]() -> Scalar[dt]:
-    """The NaN an NVIDIA invalid operation (inf / inf, 0 * inf) produces."""
-    comptime if dt == DType.float64:
+    """The NaN an NVIDIA invalid operation (inf / inf, 0 * inf) produces
+    (elsewhere the plain NaN)."""
+    comptime if not is_nvidia_gpu():
+        return nan[dt]()
+    elif dt == DType.float64:
         return bitcast[DType.float64](UInt64(0xFFF8000000000000)).cast[dt]()
     else:
         return bitcast[DType.float32](UInt32(0x7FFFFFFF)).cast[dt]()
@@ -770,8 +776,10 @@ def _isfin[dt: DType](x: Scalar[dt]) -> Bool:
 @always_inline
 def neg_like_cuda[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     """C's -x as CUDA compiles it: a sign-bit flip for float (a NaN's sign
-    flips too), the hardware negation for double."""
-    comptime if dt == DType.float64:
+    flips too), the hardware negation for double. Elsewhere the plain -x."""
+    comptime if not is_nvidia_gpu():
+        return -x
+    elif dt == DType.float64:
         return -x
     else:
         return bitcast[dt](
