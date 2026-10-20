@@ -442,6 +442,10 @@ def _bin_vec_op[
                 # max/min may drop it.
                 r = isnan(b).select(b, r)
                 r = isnan(a).select(a, r)
+                if scalar_side == 2:
+                    # the CPU scalar is the functor's first operand
+                    # (opmath_symmetric_gpu_kernel_with_scalars)
+                    r = isnan(b).select(b, r)
             return r.cast[out_dtype]()
         comptime if op_code == BOP_AND:
             comptime if not dtype.is_floating_point():

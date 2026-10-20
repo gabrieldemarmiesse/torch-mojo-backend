@@ -20,6 +20,9 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    TAG_DTYPE,
+    is_complex_stype,
+    v_is_complex,
     is_dense,
     new_strided,
     ST_BFLOAT16,
@@ -135,6 +138,8 @@ from tmb.ops.binary import (
     op_rsub,
 )
 from tmb.ops.common import (
+    device_str,
+    is_wide_unsigned,
     threshold_into_overlapping,
     threshold_scalar_check,
     threshold_scalar_overflows,
@@ -624,6 +629,14 @@ def _pw_math(
         # TensorIterator's out= checks and resize precede the kernel
         # dispatch (a float8 computation is refused after the resize).
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
+        if policy == P_INT and not can_cast(common, dest.value().stype):
+            # TensorIterator's check on the output (`x.bitwise_left_shift_(2.0)`)
+            raise Error(
+                "result type ",
+                scalar_type_name(common),
+                " can't be cast to the desired output type ",
+                scalar_type_name(dest.value().stype),
+            )
     var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     _pw_finish(
         rets,
@@ -686,24 +699,61 @@ def op_copysign_out(
     _pw_math("copysign", P_FLOAT, True, 2, args, rets, 2)
 
 
+def _pw_fmaxmin(
+    kind: StaticString,
+    args: Values,
+    n_args: Int,
+    rets: Values,
+    out_index: Int,
+) raises:
+    """fmax / fmin with a CPU scalar as the first operand, where CUDA's
+    symmetric scalar kernel puts it (`opmath_symmetric_gpu_kernel_with_
+    scalars`): two float64 NaNs give the scalar's, quieted."""
+    if v_is_complex(args[unsafe_offset=0]) or v_is_complex(
+        args[unsafe_offset=1]
+    ):
+        _pw_math(kind, P_ALL, True, 2, args, rets, out_index)
+        return
+    var a = _b_side(args[unsafe_offset=0])
+    var b = _b_side(args[unsafe_offset=1])
+    if not a.is_t or b.is_t:
+        _pw_math(kind, P_ALL, True, 2, args, rets, out_index)
+        return
+    var swapped = List[Value](capacity=n_args)
+    for i in range(n_args):
+        swapped.append(args[unsafe_offset=i].copy())
+    swapped[0] = args[unsafe_offset=1].copy()
+    swapped[1] = args[unsafe_offset=0].copy()
+    _pw_math(
+        kind,
+        P_ALL,
+        True,
+        2,
+        Values(unsafe_from_address=Int(swapped.unsafe_ptr())),
+        rets,
+        out_index,
+    )
+    _ = swapped^
+
+
 # aten::fmax(Tensor self, Tensor other) -> Tensor
 def op_fmax(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmax", P_ALL, True, 2, args, rets, -1)
+    _pw_fmaxmin("fmax", args, n_args, rets, -1)
 
 
 # aten::fmax.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_fmax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmax", P_ALL, True, 2, args, rets, 2)
+    _pw_fmaxmin("fmax", args, n_args, rets, 2)
 
 
 # aten::fmin(Tensor self, Tensor other) -> Tensor
 def op_fmin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmin", P_ALL, True, 2, args, rets, -1)
+    _pw_fmaxmin("fmin", args, n_args, rets, -1)
 
 
 # aten::fmin.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_fmin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmin", P_ALL, True, 2, args, rets, 2)
+    _pw_fmaxmin("fmin", args, n_args, rets, 2)
 
 
 # aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor
@@ -932,6 +982,14 @@ def _pw_shift_inplace(kind: StaticString, args: Values, rets: Values) raises:
     var a = _b_tside(self)
     var b = _b_side(args[unsafe_offset=1])
     var common = _pw_result_type(a, b, _none_side(), 2)
+    if not can_cast(common, self.stype):
+        # TensorIterator's check on the in-place output (`x <<= 2.0`)
+        raise Error(
+            "result type ",
+            scalar_type_name(common),
+            " can't be cast to the desired output type ",
+            scalar_type_name(self.stype),
+        )
     var compute = _pw_compute_dtype(kind, common, P_INT, True)
     var res = _pw_run(
         kind, 2, a, b, _none_side(), compute, compute, _p(), self.copy()
@@ -1093,8 +1151,44 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
         raise Error(
             "torch.clamp: At least one of 'min' or 'max' must not be None"
         )
+    var first = v_tensor_c(
+        args[unsafe_offset=out_index if out_index >= 0 else 0]
+    )
+    for i in range(1, 3):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag == TAG_NONE:
+            continue
+        var bt = v_tensor_c(v)
+        if bt.device_type != first.device_type or bt.device != first.device:
+            # the dispatcher wrapper's check_and_update_common_device
+            # (CLAMP_CONFIG's iterator allows no CPU scalar either)
+            raise Error(
+                "Expected all tensors to be on the same device, but got ",
+                "min" if i == 1 else "max",
+                " is on ",
+                device_str(bt),
+                ", different from other tensors on ",
+                device_str(first),
+                " (when checking argument in method ",
+                "wrapper_CUDA_clamp_out_Tensor_out" if out_index
+                >= 0 else "wrapper_CUDA_clamp_Tensor",
+                ")",
+            )
     var a = _b_side(args[unsafe_offset=0])
     if has_min and has_max:
+        var common = _pw_result_type(
+            a,
+            _b_side(args[unsafe_offset=1]),
+            _b_side(args[unsafe_offset=2]),
+            3,
+        )
+        if common == ST_BOOL or is_wide_unsigned(common):
+            # clamp_kernel_impl: AT_DISPATCH_ALL_TYPES_AND2(half, bf16)
+            unsupported(
+                '"clamp_cuda" not implemented for \''
+                + scalar_type_name(common)
+                + "'"
+            )
         _pw_math("clamp", P_ALL, True, 3, args, rets, out_index)
         return
     # One bound: ATen's maximum_stub / minimum_stub over the promoted pair.
@@ -4049,7 +4143,107 @@ def _f32_bits_param(v: Float64) -> Float64:
 # CompositeImplicitAutograd upstream (eq, isnan, sub, mul, abs, add, le,
 # isfinite, and/or: about six kernels on CUDA); its bool output is not
 # differentiable, so one kernel here loses no gradient.
+def _pw_call1(
+    op: String, overload: String, var args: List[Value]
+) raises -> Owned:
+    var r = call_op(op, overload, args^, 1)
+    return own(r.take_tensor(0))
+
+
+def _pw_isclose_composite(args: Values, rets: Values) raises:
+    """isclose (TensorCompare.cpp) op by op through the dispatcher, for the
+    dtypes the fused kernel lacks (complex, uint16 / uint32 / uint64)."""
+    var av = args[unsafe_offset=0].copy()
+    var bv = args[unsafe_offset=1].copy()
+    var st = v_tensor_c(av).stype
+    var other_st = v_tensor_c(bv).stype
+    if st != other_st:
+        raise Error(
+            scalar_type_name(st), " did not match ", scalar_type_name(other_st)
+        )
+    var rtol = v_f64(args[unsafe_offset=2])
+    var atol = v_f64(args[unsafe_offset=3])
+    var equal_nan = v_bool(args[unsafe_offset=4])
+    if not (rtol >= 0):
+        raise Error(
+            "rtol must be greater than or equal to zero, but got ", rtol
+        )
+    if not (atol >= 0):
+        raise Error(
+            "atol must be greater than or equal to zero, but got ", atol
+        )
+    var close = _pw_call1("aten::eq", "Tensor", [av.copy(), bv.copy()])
+    if equal_nan and is_complex_stype(st):
+        var na = _pw_call1("aten::isnan", "", [av.copy()])
+        var nb = _pw_call1("aten::isnan", "", [bv.copy()])
+        var both = _pw_call1(
+            "aten::logical_and", "", [tensor_arg(na.t), tensor_arg(nb.t)]
+        )
+        close = _pw_call1(
+            "aten::logical_or", "", [tensor_arg(close.t), tensor_arg(both.t)]
+        )
+    if rtol == 0 and atol == 0:
+        ret_owned(rets, 0, close)
+        return
+    var other = Optional[Owned]()
+    var other_v = bv.copy()
+    if not is_complex_stype(st):
+        # an integral other: `other.to(default dtype)`
+        var cv = List[Value]()
+        cv.append(bv.copy())
+        cv.append(Value(TAG_DTYPE, 0, Int64(default_dtype()), 0))
+        for _ in range(3):  # layout, device, pin_memory
+            cv.append(Value(TAG_NONE, 0, 0, 0))
+        cv.append(Value(TAG_BOOL, 0, 0, 0))  # non_blocking
+        cv.append(Value(TAG_NONE, 0, 0, 0))  # memory_format
+        other = _pw_call1("aten::_to_copy", "", cv^)
+        other_v = tensor_arg(other.value().t)
+    var scaled = _pw_call1(
+        "aten::mul",
+        "Scalar",
+        [other_v.copy(), Value(TAG_SCALAR_DOUBLE, 0, f64_bits(rtol), 0)],
+    )
+    var mag = _pw_call1("aten::abs", "", [tensor_arg(scaled.t)])
+    var allowed = _pw_call1(
+        "aten::add",
+        "Scalar",
+        [
+            tensor_arg(mag.t),
+            Value(TAG_SCALAR_DOUBLE, 0, f64_bits(atol), 0),
+            Value(TAG_SCALAR_INT, 0, 1, 0),
+        ],
+    )
+    var diff = _pw_call1(
+        "aten::sub",
+        "Tensor",
+        [av.copy(), other_v.copy(), Value(TAG_SCALAR_INT, 0, 1, 0)],
+    )
+    var actual = _pw_call1("aten::abs", "", [tensor_arg(diff.t)])
+    var fin = _pw_call1("aten::isfinite", "", [tensor_arg(actual.t)])
+    var within = _pw_call1(
+        "aten::le", "Tensor", [tensor_arg(actual.t), tensor_arg(allowed.t)]
+    )
+    var ok = _pw_call1(
+        "aten::logical_and", "", [tensor_arg(fin.t), tensor_arg(within.t)]
+    )
+    var res = _pw_call1(
+        "aten::logical_or", "", [tensor_arg(close.t), tensor_arg(ok.t)]
+    )
+    ret_owned(rets, 0, res)
+    _ = other^
+
+
 def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    var at = v_tensor_c(args[unsafe_offset=0])
+    var bt = v_tensor_c(args[unsafe_offset=1])
+    if (
+        at.is_complex()
+        or bt.is_complex()
+        or is_wide_unsigned(at.stype)
+        or is_wide_unsigned(bt.stype)
+    ):
+        _pw_isclose_composite(args, rets)
+        return
     var a = _b_side(args[unsafe_offset=0])
     var b = _b_side(args[unsafe_offset=1])
     var st = _pw_side_stype(a)

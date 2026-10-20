@@ -17,6 +17,9 @@ from tmb.backend.abi import (
     ST_FLOAT8_E8M0FNU,
     ST_BFLOAT16,
     TAG_BOOL,
+    TAG_DTYPE,
+    TAG_NONE,
+    TAG_TENSOR,
     TAG_COMPLEX,
     TAG_DOUBLE,
     TAG_SCALAR_DOUBLE,
@@ -842,6 +845,25 @@ def cast_to(t: T, stype: Int32, saturate: Bool = True) raises -> T:
     return out.take()
 
 
+def cast_any(t: T, stype: Int32) raises -> T:
+    """`cast_to` without saturation, through the dispatcher's `_to_copy`
+    for a pair the device cast kernel does not convert (a uint16 / uint32 /
+    uint64 end). `t` itself when unchanged: wrap it in `own_if_new`."""
+    if t.stype == stype:
+        return t.copy()
+    if is_cast_pair_on(t.dtype, max_dtype(stype), t):
+        return cast_to(t, stype, False)
+    var args = List[Value](capacity=7)
+    args.append(Value(TAG_TENSOR, 0, Int64(t.h), 0))
+    args.append(Value(TAG_DTYPE, 0, Int64(stype), 0))
+    for _ in range(3):  # layout, device, pin_memory
+        args.append(Value(TAG_NONE, 0, 0, 0))
+    args.append(Value(TAG_BOOL, 0, 0, 0))  # non_blocking=False
+    args.append(Value(TAG_NONE, 0, 0, 0))  # memory_format
+    var rets = call_op("aten::_to_copy", "", args^, 1)
+    return rets.take_tensor(0)
+
+
 def one_device(a: T, b: T) raises:
     """Both operands of a raw-pointer launch on the same mojo device. A
     pointer belonging to another device -- or to no mojo device at all --
@@ -1098,6 +1120,22 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
             (
                 "Promotion for Float8 Types is not supported, attempted to"
                 " promote "
+            ),
+            scalar_type_name(a),
+            " and ",
+            scalar_type_name(b),
+        )
+    if is_wide_unsigned(a) or is_wide_unsigned(b):
+        # c10: a uint16 / uint32 / uint64 promotes with a floating type
+        # only (bool, the other integers and complex all raise)
+        if is_float_stype(a):
+            return a
+        if is_float_stype(b):
+            return b
+        raise Error(
+            (
+                "Promotion for uint16, uint32, uint64 types is not supported,"
+                " attempted to promote "
             ),
             scalar_type_name(a),
             " and ",
@@ -2249,6 +2287,8 @@ def scalar_type_name(st: Int32) -> String:
         return "ComplexFloat"
     if st == ST_COMPLEX128:
         return "ComplexDouble"
+    if st == 8:  # complex32: a promotion result only, never held here
+        return "ComplexHalf"
     if st == ST_FLOAT8_E4M3FN:
         return "Float8_e4m3fn"
     if st == ST_FLOAT8_E5M2:

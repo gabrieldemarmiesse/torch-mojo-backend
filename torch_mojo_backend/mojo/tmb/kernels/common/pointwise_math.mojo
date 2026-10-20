@@ -1188,6 +1188,29 @@ def _native[
             comptime if dtype.is_floating_point():
                 r = isnan(a).select(b, r)
                 r = isnan(b).select(a, r)
+                comptime if is_nvidia_gpu():
+                    # Two NaNs: CUDA's fmaxf / fminf (the half types' opmath
+                    # too) return the canonical NaN, double fmax / fmin the
+                    # first operand quieted.
+                    var both = isnan(a) & isnan(b)
+                    comptime if dtype == DType.float64:
+                        var q = bitcast[dtype, n](
+                            bitcast[DType.uint64, n](a)
+                            | SIMD[DType.uint64, n](0x0008000000000000)
+                        )
+                        r = both.select(q, r)
+                    elif dtype == DType.float32:
+                        r = both.select(
+                            bitcast[dtype, n](
+                                SIMD[DType.uint32, n](0x7FFFFFFF)
+                            ),
+                            r,
+                        )
+                    else:
+                        r = both.select(
+                            bitcast[dtype, n](SIMD[DType.uint16, n](0x7FFF)),
+                            r,
+                        )
             return r
     elif kind == "fmod":
         # BinaryRemainderKernel.cu: C's fmod (the dividend's sign), exact:

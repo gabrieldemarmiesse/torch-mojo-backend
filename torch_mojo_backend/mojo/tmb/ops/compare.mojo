@@ -11,6 +11,7 @@ predate that convention and take raw pointers plus fixed-rank-4 dim/stride
 tuples, so operands there are capped at rank 4 (declined above that, matching
 the old `_bcast_meta`'s `rank > 4: return None`).
 """
+from std.memory import bitcast
 from std.utils import IndexList
 
 from tmb.backend.abi import (
@@ -21,6 +22,7 @@ from tmb.backend.abi import (
     TAG_COMPLEX,
     TAG_SCALAR_BOOL,
     TAG_SCALAR_DOUBLE,
+    TAG_SCALAR_INT,
     Value,
     Values,
     ST_BOOL,
@@ -30,6 +32,13 @@ from tmb.backend.abi import (
     ST_INT32,
     ST_INT64,
     ST_UINT8,
+    ST_UINT16,
+    ST_UINT32,
+    ST_UINT64,
+    ST_FLOAT16,
+    ST_COMPLEX64,
+    ST_COMPLEX128,
+    is_complex_stype,
     default_dtype,
     f64_bits,
     dtype_code,
@@ -59,6 +68,7 @@ from tmb.backend.abi import (
     v_scalar_is_integral,
     v_string,
     v_tensor,
+    view_strided,
 )
 from tmb.backend.device import copy_from_host, ctx_for, ctx_ptr
 from tmb.backend.kernel_call import KernelCall
@@ -66,6 +76,11 @@ from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.kernels.common.float8 import is_float8
 from tmb.ops.data_movement import _scalar_type_name
 from tmb.ops.common import (
+    combine_categories,
+    cast_any,
+    is_cast_pair_on,
+    is_wide_unsigned,
+    scalar_type_name,
     out_device_error,
     device_str,
     fill_item,
@@ -83,6 +98,7 @@ from tmb.ops.common import (
     copy_strided_into,
     fill_value,
     is_cast_dtype_on,
+    is_float_stype,
     known_stype,
     promote_types,
     promoted_pair,
@@ -239,6 +255,11 @@ def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
         return
     _one_device(a, dst)
     _one_device(b, dst)
+    if is_wide_unsigned(a.stype) and a.stype == b.stype:
+        # eq / ne only (`_cmp_check`): the bits compare as the signed type
+        # of the same width
+        _compare_spec(op, _as_signed(a), _as_signed(b), dst)
+        return
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
     var call = KernelCall("logic", String(op))
@@ -250,6 +271,34 @@ def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
     call.spec(dst.spec(cp))
     call.run()
     _ = ctx
+
+
+def _as_signed(t: T) -> T:
+    """`t` read as the signed integer type of its width (a kernel-only view
+    of a uint16 / uint32 / uint64 tensor)."""
+    var v = t.copy()
+    if t.stype == ST_UINT16:
+        v.dtype = DType.int16
+        v.stype = ST_INT16
+    elif t.stype == ST_UINT32:
+        v.dtype = DType.int32
+        v.stype = ST_INT32
+    elif t.stype == ST_UINT64:
+        v.dtype = DType.int64
+        v.stype = ST_INT64
+    return v^
+
+
+def _cmp_check(op: StaticString, st: Int32) raises:
+    """The common dtypes CUDA's kernels dispatch: eq / ne take every dtype,
+    lt / le / gt / ge (`compare_cuda`, AT_DISPATCH_ALL_TYPES_AND3) neither
+    complex nor uint16 / uint32 / uint64."""
+    if op == "EqSpec" or op == "NeSpec":
+        return
+    if is_complex_stype(st) or st == 8 or is_wide_unsigned(st):
+        unsupported(
+            '"compare_cuda" not implemented for \'' + scalar_type_name(st) + "'"
+        )
 
 
 def _compare_out_guard(out_arg: T, a: T, b: T) raises:
@@ -330,16 +379,9 @@ def _compare_dtype(a: T, b: T) raises -> DType:
     (`half[2] == float[]` compares in half, as CUDA does)."""
     if is_float8(a.dtype) or is_float8(b.dtype):
         return _float8_common(a, b)
-    if (
-        a.dtype != b.dtype
-        and (a.rank == 0) != (b.rank == 0)
-        and known_stype(a.stype)
-        and known_stype(b.stype)
-    ):
-        var dt = max_dtype(result_type(a, b))
-        if is_cast_dtype_on(dt, a):
-            return dt
-    return binary_promotion(a, b)
+    if a.dtype == b.dtype:
+        return a.dtype
+    return max_dtype(result_type(a, b))
 
 
 def _cpu_scalar_operand(t: T, other: T) -> Bool:
@@ -368,7 +410,9 @@ def _operand_as(t: T, other: T, stype: Int32, saturate: Bool) raises -> Owned:
         )
         _ = host^
         return up^
-    return own_if_new(cast_to(t, stype, saturate), t)
+    if saturate and is_cast_pair_on(t.dtype, max_dtype(stype), t):
+        return own_if_new(cast_to(t, stype, saturate), t)
+    return own_if_new(cast_any(t, stype), t)
 
 
 def _check_pair_devices(a: T, b: T) raises:
@@ -391,6 +435,7 @@ def _compare_functional(op: StaticString, args: Values, rets: Values) raises:
     var b0 = v_tensor(args[unsafe_offset=1])
     _check_pair_devices(a0, b0)
     var stype = torch_dtype(_compare_dtype(a0, b0))
+    _cmp_check(op, stype)
     var ha = _operand_as(a0, b0, stype, False)
     var hb = _operand_as(b0, a0, stype, False)
     var shape = broadcast_shape(ha.t, hb.t)
@@ -413,6 +458,7 @@ def _compare_functional_out(
     # temporary exists (`eq(a, b, out=a)` with a cast `a` is still `out=a`).
     _compare_out_guard(out_arg, a0, b0)
     var stype = torch_dtype(_compare_dtype(a0, b0))
+    _cmp_check(op, stype)
     var ha = _operand_as(a0, b0, stype, False)
     var hb = _operand_as(b0, a0, stype, False)
     var pa = ha.t.copy()
@@ -436,13 +482,23 @@ def _compare_functional_out(
     ret_ref(rets, 0, out_arg)
 
 
-def _scalar_fill(a: T, v: Value) raises -> Owned:
-    """The Scalar operand as a 0-d tensor of `a`'s dtype. An integer scalar
-    against an integer tensor is filled from its int64 bits (the #606
-    integer-Scalar path, exact past 2**53); everything else goes through
-    `scalar_embed`'s Float64."""
-    var fill = own(new_scalar(a.stype, a.device))
-    if is_float8(a.dtype):
+def _scalar_stype(v: Value) -> Int32:
+    """A Scalar's dtype as a wrapped number: bool, int64 or the default
+    floating dtype."""
+    if v.tag == TAG_SCALAR_BOOL or v.tag == TAG_BOOL:
+        return ST_BOOL
+    if v_scalar_is_integral(v):
+        return ST_INT64
+    return default_dtype()
+
+
+def _scalar_fill(a: T, v: Value, st: Int32) raises -> Owned:
+    """The Scalar operand as a 0-d tensor of dtype `st`: CUDA's
+    `iter.scalar_value<scalar_t>()`, c10's conversion from the Scalar's own
+    double / int64 / bool (an integer narrows with wrap, rounds once into a
+    float; a double reaches the half types through float)."""
+    var fill = own(new_scalar(st, a.device))
+    if is_float8(max_dtype(st)):
         # The scalar rounds into a's float8 dtype unchecked (CUDA: `x == 1000.`
         # against e4m3fn compares with NaN, it does not raise).
         if v.tag == TAG_COMPLEX:
@@ -458,25 +514,67 @@ def _scalar_fill(a: T, v: Value) raises -> Owned:
                 Scalar[DType.int64](v_int(v)).cast[DType.float32]()
             ) if v_scalar_is_integral(v) else v_f64(v),
         )
-    elif (
-        v_scalar_is_integral(v)
-        and not a.dtype.is_floating_point()
-        and a.dtype != DType.bool
-    ):
-        fill_value(fill.t, v)
     else:
-        fill_value(fill.t, scalar_embed(v, a.dtype))
+        fill_value(fill.t, v)
     return fill^
+
+
+def _huge_as(v: Value, st: Int32) -> Value:
+    """A uint64 Scalar of 2**63 or more (the shim sets `b` = 1, bits in `a`)
+    as the record CUDA's wrapped-number cast gives `st`: the 64 bits for an
+    integer dtype (the fill wraps them), the nearest float for a floating
+    one (through float32 for the single-precision types)."""
+    if not (is_float_stype(st) or st == ST_COMPLEX64 or st == ST_COMPLEX128):
+        return Value(TAG_SCALAR_INT, 0, v.a, 0)
+    var u = Scalar[DType.int64](v.a).cast[DType.uint64]()
+    var f = u.cast[DType.float64]()
+    if st != ST_FLOAT64 and st != ST_COMPLEX128:
+        f = u.cast[DType.float32]().cast[DType.float64]()
+    return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(f), 0)
+
+
+struct _ScalarCmp(Movable):
+    """A comparison against a Scalar, in its common dtype: the tensor (cast
+    when the scalar promotes it) and the scalar as a 0-d tensor."""
+
+    var a: Owned
+    var fill: Owned
+
+    def __init__(out self, op: StaticString, a: T, v: Value) raises:
+        if v.tag == TAG_COMPLEX:
+            # eq / ne route complex scalars to tmb/ops/complex.mojo
+            var st = a.stype
+            _cmp_check(
+                op,
+                8 if st
+                == ST_FLOAT16 else (
+                    ST_COMPLEX128 if st == ST_FLOAT64 else ST_COMPLEX64
+                ),
+            )
+        var huge = v.tag == TAG_SCALAR_INT and v.b == 1
+        if huge and a.stype == ST_BOOL:
+            raise Error(
+                "Promotion for uint16, uint32, uint64 types is not supported,"
+                " attempted to promote UInt64 and Bool"
+            )
+        var common = a.stype if is_float8(
+            a.dtype
+        ) or huge else combine_categories(a.stype, _scalar_stype(v))
+        _cmp_check(op, common)
+        self.a = own_if_new(cast_any(a, common), a)
+        self.fill = _scalar_fill(
+            a, _huge_as(v, common) if huge else v.copy(), common
+        )
 
 
 def _compare_scalar(op: StaticString, args: Values, rets: Values) raises:
     var a = v_tensor(args[unsafe_offset=0])
     if not a.on_mojo():
         raise Error("expected the mojo device")
-    var fill = _scalar_fill(a, args[unsafe_offset=1])
+    var sc = _ScalarCmp(op, a, args[unsafe_offset=1])
     var out = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
-    _compare_spec(op, a, fill.t, out.t)
-    _ = fill^  # alive past the launch
+    _compare_spec(op, sc.a.t, sc.fill.t, out.t)
+    _ = sc^  # alive past the launch
     ret_owned(rets, 0, out)
 
 
@@ -486,22 +584,20 @@ def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
         raise Error("expected the mojo device")
     var out_arg = v_tensor(args[unsafe_offset=2])
     _compare_out_guard(out_arg, a, a)
-    var fill = _scalar_fill(a, args[unsafe_offset=1])
+    var sc = _ScalarCmp(op, a, args[unsafe_offset=1])
     if out_arg.stype != ST_BOOL:
         var res = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
-        _compare_spec(op, a, fill.t, res.t)
-        _ = fill^  # alive past the launch
+        _compare_spec(op, sc.a.t, sc.fill.t, res.t)
         _cast_into_out(out_arg, res.t, a.shape, a.rank, a.device)
         _ = res^  # alive past the launch
     elif _prepare_out(out_arg, a.shape, a.rank, ST_BOOL, a.device):
-        _compare_spec(op, a, fill.t, out_arg)
-        _ = fill^  # alive past the launch
+        _compare_spec(op, sc.a.t, sc.fill.t, out_arg)
     else:
         var tmp = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
-        _compare_spec(op, a, fill.t, tmp.t)
-        _ = fill^  # alive past the launch
+        _compare_spec(op, sc.a.t, sc.fill.t, tmp.t)
         copy_strided_into(out_arg, tmp.t)
         _ = tmp^  # alive past the launch
+    _ = sc^  # alive past the launch
     ret_ref(rets, 0, out_arg)
 
 
@@ -978,6 +1074,30 @@ def _bcast_strides(
     return strides
 
 
+def _flat_view(t: T) -> T:
+    """A contiguous `t` as one flat dimension (a kernel-only view)."""
+    var v = t.copy()
+    for i in range(MAX_RANK):
+        v.shape[i] = 1
+        v.strides[i] = 0
+    v.shape[MAX_RANK - 1] = t.numel
+    v.strides[MAX_RANK - 1] = 1
+    v.rank = 1
+    return v^
+
+
+def _dense_expanded(
+    t: T, strides: IndexList[MAX_RANK], like: T
+) raises -> Owned:
+    """`t` read with `strides` over `like`'s shape, laid out densely."""
+    var view = own(view_strided(t, like.shape, strides, like.rank, t.offset))
+    var dense = own_if_new(contiguous(view.t), view.t)
+    if dense.live:
+        _ = view^
+        return dense^
+    return view^
+
+
 def _where_select(
     cond: T,
     cond_s: IndexList[MAX_RANK],
@@ -987,12 +1107,49 @@ def _where_select(
     b_s: IndexList[MAX_RANK],
     dst: T,
 ) raises:
-    """dst[i] = cond[i] ? a[i] : b[i], for rank<=4 operands (each stride
-    array already the correct broadcast strides against dst's shape)."""
+    """dst[i] = cond[i] ? a[i] : b[i] (each stride array already the
+    correct broadcast strides against dst's shape). Above rank 4 the
+    operands are laid out densely first and selected flat."""
     _one_device(cond, dst)
     _one_device(a, dst)
     _one_device(b, dst)
     if dst.numel == 0:
+        return
+    if dst.rank > 4:
+        var hc = _dense_expanded(cond, cond_s, dst)
+        var ha = _dense_expanded(a, a_s, dst)
+        var hb = _dense_expanded(b, b_s, dst)
+        var ones = IndexList[MAX_RANK](0)
+        for i in range(MAX_RANK):
+            ones[i] = 1 if i == MAX_RANK - 1 else 0
+        if dst.contig:
+            _where_select(
+                _flat_view(hc.t),
+                ones,
+                _flat_view(ha.t),
+                ones,
+                _flat_view(hb.t),
+                ones,
+                _flat_view(dst),
+            )
+        else:
+            var tmp = own(
+                new_tensor(dst.shape, dst.rank, dst.stype, dst.device)
+            )
+            _where_select(
+                _flat_view(hc.t),
+                ones,
+                _flat_view(ha.t),
+                ones,
+                _flat_view(hb.t),
+                ones,
+                _flat_view(tmp.t),
+            )
+            copy_strided_into(dst, tmp.t)
+            _ = tmp^  # alive past the launch
+        _ = hc^
+        _ = ha^
+        _ = hb^
         return
     var ctx = ctx_for(dst.device)
     var cp = ctx_ptr(ctx)
@@ -1023,31 +1180,48 @@ def _where_select(
 
 # aten::where.self(Tensor condition, Tensor self, Tensor other) -> Tensor
 def op_where_self(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var cond = v_tensor(args[unsafe_offset=0])
+    """where_self_out: result_type(self, other) and `.to()` of each, a 0-d
+    CPU condition / self / other moved to the device, a uint8 condition
+    (deprecated) taken as its truth, any other non-bool one refused."""
+    var cond0 = v_tensor(args[unsafe_offset=0])
     var a0 = v_tensor(args[unsafe_offset=1])
     var b0 = v_tensor(args[unsafe_offset=2])
-    if cond.dtype != DType.bool:
-        unsupported("where: condition must be a bool tensor")
-    # A 0-d CPU self / other is allowed ("allow CPU scalars on non-cpu
-    # device", where_self_out); anything else must share cond's device.
-    var a_ok = (a0.on_mojo() and a0.device == cond.device) or (
-        _cpu_scalar_operand(a0, cond)
-    )
-    var b_ok = (b0.on_mojo() and b0.device == cond.device) or (
-        _cpu_scalar_operand(b0, cond)
-    )
-    if not cond.on_mojo() or not a_ok or not b_ok:
-        raise Error("expected all operands on the same mojo device")
-    if cond.rank > 4 or a0.rank > 4 or b0.rank > 4:
-        unsupported(
-            "where: operand rank exceeds the fast broadcast kernel's limit of 4"
-        )
-    # where_self_out: result_type(self, other), then `x.to(result_type)` --
-    # a real .to(), which saturates float -> e4m3fn on the device like any
-    # other copy (a CPU 0-d operand converts on the CPU, see _operand_as).
     var st = torch_dtype(_compare_dtype(a0, b0))
-    var ha = _operand_as(a0, cond, st, True)
-    var hb = _operand_as(b0, cond, st, True)
+    var anchor = a0.copy() if a0.on_mojo() else (
+        b0.copy() if b0.on_mojo() else cond0.copy()
+    )
+    if not anchor.on_mojo():
+        raise Error("expected all operands on the same mojo device")
+    var c_ok = (cond0.on_mojo() and cond0.device == anchor.device) or (
+        _cpu_scalar_operand(cond0, anchor)
+    )
+    var a_ok = (a0.on_mojo() and a0.device == anchor.device) or (
+        _cpu_scalar_operand(a0, anchor)
+    )
+    var b_ok = (b0.on_mojo() and b0.device == anchor.device) or (
+        _cpu_scalar_operand(b0, anchor)
+    )
+    if not c_ok or not a_ok or not b_ok:
+        raise Error("expected all operands on the same mojo device")
+    if cond0.stype != ST_BOOL and cond0.stype != ST_UINT8:
+        raise Error(
+            (
+                "where expected condition to be a boolean tensor, but got a"
+                " tensor with dtype "
+            ),
+            scalar_type_name(cond0.stype),
+        )
+    if is_wide_unsigned(st):
+        unsupported(
+            '"where_cuda" not implemented for \'' + scalar_type_name(st) + "'"
+        )
+    # `x.to(result_type)`: a real .to(), which saturates float -> e4m3fn on
+    # the device like any other copy (a CPU 0-d operand converts on the CPU,
+    # see _operand_as).
+    var hc = _operand_as(cond0, anchor, ST_BOOL, False)
+    var ha = _operand_as(a0, anchor, st, True)
+    var hb = _operand_as(b0, anchor, st, True)
+    var cond = hc.t.copy()
     var pa = ha.t.copy()
     var pb = hb.t.copy()
     var shape = _where_broadcast_shape(cond, pa, pb)
@@ -1057,14 +1231,68 @@ def op_where_self(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var b_s = _bcast_strides(pb, shape)
     var out = own(new_tensor(shape, rank, pa.stype, pa.device))
     _where_select(cond, cond_s, pa, a_s, pb, b_s, out.t)
+    _ = hc^
     _ = ha^
     _ = hb^
     ret_owned(rets, 0, out)
 
 
+def _as_int16(t: T) -> T:
+    """A 2-byte tensor read as int16 (a kernel-only view)."""
+    var v = t.copy()
+    v.dtype = DType.int16
+    v.stype = ST_INT16
+    return v^
+
+
+def c10_bf16_bits(f: Float32) -> UInt16:
+    """c10::BFloat16(float): round to nearest even on the bits; every NaN is
+    0x7FC0."""
+    var u = bitcast[DType.uint32](f)
+    if (u & 0x7FFFFFFF) > 0x7F800000:
+        return 0x7FC0
+    return UInt16((u + 0x7FFF + ((u >> 16) & 1)) >> 16)
+
+
+def c10_half_bits(f: Float32) -> UInt16:
+    """c10::Half(float) (fp16_ieee_from_fp32_value), in integers: round to
+    nearest even, subnormals included; every NaN is 0x7E00 with f's sign."""
+    var w = bitcast[DType.uint32](f)
+    var sign = UInt16((w >> 16) & 0x8000)
+    var a = w & 0x7FFFFFFF
+    if a > 0x7F800000:
+        return sign | 0x7E00
+    if a >= 0x477FF000:  # rounds to inf (65520 and up)
+        return sign | 0x7C00
+    var e = Int(a >> 23)
+    var m = (a & 0x7FFFFF) | (UInt32(0x800000) if e != 0 else UInt32(0))
+    # the half's units (2**-24 for subnormals, 2**(e-150+24) per mantissa
+    # step otherwise): m * 2**(e - 126 - ...) -- shift right by `sh`
+    var sh = 126 - e if e < 113 else 13
+    if e == 0:
+        sh = 125
+    if sh > 31:
+        return sign
+    var q = m >> UInt32(sh)
+    var rem = m - (q << UInt32(sh))
+    var halfway = UInt32(1) << UInt32(sh - 1)
+    if rem > halfway or (rem == halfway and (q & 1) != 0):
+        q += 1
+    if e >= 113:
+        q += UInt32(e - 112) << 10  # the exponent field over the mantissa
+        q -= 0x400  # the implicit bit
+    return sign | UInt16(q)
+
+
 def _masked_fill_validate(a: T, mask: T, in_place: Bool = False) raises:
     if mask.dtype != DType.bool:
-        unsupported("masked_fill: mask must be a bool tensor")
+        raise Error(
+            (
+                "masked_fill_ only supports boolean masks, but got mask with"
+                " dtype "
+            ),
+            _c10_name(mask.dtype),
+        )
     if not a.on_mojo() or not mask.on_mojo() or a.device != mask.device:
         raise Error("expected both operands on the same mojo device")
     if in_place:
@@ -1144,11 +1372,6 @@ def _masked_fill_where(mask: T, value: T, a: T, dst: T) raises:
     value (a real tensor or a synthesized 0-d fill)."""
     if dst.numel == 0:
         return
-    if mask.rank > 4 or value.rank > 4 or a.rank > 4:
-        unsupported(
-            "masked_fill: operand rank exceeds the fast broadcast kernel's"
-            " limit of 4"
-        )
     var mask_s = _bcast_strides(mask, a.shape)
     var value_s = _bcast_strides(value, a.shape)
     _where_select(mask, mask_s, value, value_s, a, a.strides, dst)
@@ -1224,6 +1447,25 @@ def _masked_fill_scalar_dispatch(
     var value = v_f64(rec)
     if a.dtype == DType.float16 or a.dtype == DType.bfloat16:
         # through float, as c10's Half / BFloat16 conversions from double
+        var half = a.dtype == DType.float16
+        var bits = c10_half_bits(Float32(value)) if half else c10_bf16_bits(
+            Float32(value)
+        )
+        var inf = UInt16(0x7C00) if half else UInt16(0x7F80)
+        var mag = bits & 0x7FFF
+        if (mag != 0 and (bits & inf) == 0) or mag > inf:
+            # a subnormal or a NaN: c10's bits, moved as int16 (the
+            # device-side conversion flushes subnormals)
+            if dst.numel == 0:
+                return
+            var ifill = own(new_scalar(ST_INT16, a.device))
+            fill_value(
+                ifill.t,
+                Value(TAG_SCALAR_INT, 0, Int64(bits.cast[DType.int16]()), 0),
+            )
+            _masked_fill_where(mask, ifill.t, _as_int16(a), _as_int16(dst))
+            _ = ifill^  # alive past the launch
+            return
         value = Float64(Float32(value))
     if dst.numel == 0:
         return
