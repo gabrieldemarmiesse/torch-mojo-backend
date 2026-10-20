@@ -22,12 +22,24 @@ from std.sys.info import (
     has_apple_gpu_accelerator,
     is_nvidia_gpu,
 )
-from std.utils.numerics import isnan
+from std.utils.numerics import inf, isinf, isnan
 from std.utils.coord import Coord
 
-from tmb.kernels.common.complex_math import Cx, cdiv_jit, chypot, cmul_jit
+from tmb.kernels.common.complex_math import (
+    Cx,
+    _rcos,
+    _rexp,
+    _rlog,
+    _rlog1p,
+    _rsin,
+    catan2,
+    cdiv_jit,
+    chypot,
+    cmul_jit,
+)
 from tmb.kernels.common.gpu_elementwise import elementwise
 from tmb.kernels.common.host_float import f32_bits_of
+from tmb.kernels.common.pointwise_math import _mul_rn
 from std.memory import bitcast
 from tmb.kernels.common.op_utils import (
     Argv,
@@ -49,7 +61,13 @@ comptime MODE_DEVICE = 1
 comptime MODE_HOST = 2
 
 comptime COMPONENT_DTYPES = [DType.float32, DType.float64]
-comptime KINDS = ["cx_lerp_scalar", "cx_lerp", "cx_addcmul", "cx_addcdiv"]
+comptime KINDS = [
+    "cx_lerp_scalar",
+    "cx_lerp",
+    "cx_addcmul",
+    "cx_addcdiv",
+    "cx_logaddexp",
+]
 
 
 @always_inline
@@ -96,10 +114,110 @@ def _lerp[dt: DType](s: Cx[dt], e: Cx[dt], w: Cx[dt]) -> Cx[dt]:
     var aw = chypot(w.re, w.im)
     if not isnan(aw) and aw < Scalar[dt](0.5):
         return _add(s, cmul_jit(w, diff))
-    var omw = Cx[dt](
-        _sub_rn(Scalar[dt](1), w.re), _sub_rn(Scalar[dt](0), w.im)
-    )
+    var omw = Cx[dt](_sub_rn(Scalar[dt](1), w.re), _sub_rn(Scalar[dt](0), w.im))
     return _sub(e, cmul_jit(diff, omw))
+
+
+@always_inline
+def _canonical_nan[dt: DType]() -> Scalar[dt]:
+    """NVRTC's NAN: the float 0x7FFFFFFF, widened for a double."""
+    comptime if dt == DType.float64:
+        return bitcast[dt](UInt64(0x7FFFFFFFE0000000))
+    else:
+        return bitcast[dt](UInt32(0x7FFFFFFF))
+
+
+@always_inline
+def _finite[dt: DType](x: Scalar[dt]) -> Bool:
+    return not (isnan(x) or isinf(x))
+
+
+@always_inline
+def _is_nan_c[dt: DType](x: Cx[dt]) -> Bool:
+    return isnan(x.re) or isnan(x.im)
+
+
+@always_inline
+def _minmax[dt: DType, is_min: Bool](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
+    """LogAddExpKernel.cu's logaddexp_min / logaddexp_max."""
+    if _is_nan_c(y):
+        return y.copy()
+    elif _is_nan_c(x):
+        return x.copy()
+    comptime if is_min:
+        return x.copy() if x.re < y.re else y.copy()
+    else:
+        return x.copy() if x.re >= y.re else y.copy()
+
+
+@always_inline
+def _fast_build_exp[dt: DType](x: Cx[dt]) -> Cx[dt]:
+    var e = _rexp(x.re)
+    return Cx[dt](e * _rcos(x.im), e * _rsin(x.im))
+
+
+@always_inline
+def _fast_build_exp_inf[dt: DType](x: Cx[dt]) -> Cx[dt]:
+    var big = inf[dt]()
+    if not _finite(x.im):
+        return Cx[dt](big, _canonical_nan[dt]())
+    var sn = _rsin(x.im)
+    var cs = _rcos(x.im)
+    var re = Scalar[dt](0) if cs == 0 else big * cs
+    var im = Scalar[dt](0) if sn == 0 else big * sn
+    return Cx[dt](re, im)
+
+
+@always_inline
+def _log1p_cx[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    """The jiterator string's log1p(complex)."""
+    var x = z.re
+    var y = z.im
+    var zabs = chypot(x, y)
+    var theta = catan2(y, x + Scalar[dt](1))
+    if zabs < Scalar[dt](0.5):
+        var r = _fma_c(x, Scalar[dt](2) + x, _mul_rn[dt, 1](y, y))
+        if r == 0:
+            return Cx[dt](x, theta)
+        return Cx[dt](Scalar[dt](0.5) * _rlog1p(r), theta)
+    var z0 = chypot(x + Scalar[dt](1), y)
+    return Cx[dt](_rlog(z0), theta)
+
+
+@always_inline
+def _fma_c[
+    dt: DType
+](a: Scalar[dt], b: Scalar[dt], c: Scalar[dt]) -> Scalar[dt]:
+    return a.fma(b, c)
+
+
+@always_inline
+def _logaddexp[dt: DType](x: Cx[dt], y: Cx[dt]) -> Cx[dt]:
+    """The jiterated logaddexp_complex (LogAddExpKernel.cu)."""
+    var mn = _minmax[dt, True](x, y)
+    var mx = _minmax[dt, False](x, y)
+    if _is_nan_c(mn):
+        return Cx[dt](_canonical_nan[dt](), _canonical_nan[dt]())
+    elif (not _finite(mn.re)) and mn.re == mx.re:
+        if mn.re < 0:
+            return mn^
+        var e_min = _fast_build_exp_inf(mn)
+        var e_max = _fast_build_exp_inf(mx)
+        return _log1p_cx(
+            Cx[dt](
+                e_min.re + e_max.re - Scalar[dt](1),
+                e_min.im + e_max.im - Scalar[dt](0),
+            )
+        )
+    var mm = _sub(mn, mx)
+    var ex: Cx[dt]
+    if not _finite(mm.re):
+        ex = Cx[dt](Scalar[dt](0), Scalar[dt](0)) if mm.re < 0 else (
+            _fast_build_exp_inf(mm)
+        )
+    else:
+        ex = _fast_build_exp(mm)
+    return _add(_log1p_cx(ex), mx)
 
 
 @always_inline
@@ -110,6 +228,8 @@ def _ternary[
         return _lerp(a, b, p)
     elif kind == "cx_lerp":
         return _lerp(a, b, c)
+    elif kind == "cx_logaddexp":
+        return _logaddexp(a, b)
     elif kind == "cx_addcmul":
         # a + alpha * (b * c)
         return _add(a, cmul_jit(p, cmul_jit(b, c)))

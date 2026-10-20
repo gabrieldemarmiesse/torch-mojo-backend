@@ -21,8 +21,10 @@ from std.utils import IndexList
 from tmb.backend.abi import (
     Owned,
     ST_COMPLEX64,
+    is_float8_stype,
     is_complex_stype,
     is_dense,
+    new_scalar,
     new_strided,
     ST_BFLOAT16,
     ST_BOOL,
@@ -99,13 +101,13 @@ from tmb.ops.f8_iter import (
     softshrink_check,
 )
 from tmb.backend.registry import Site, impl
-from tmb.kernels.common.float8 import is_float8
 from tmb.ops.complex import (
     _Operand,
     _broadcast_into,
     _first_tensor,
     _flatten,
     _operand,
+    _Call,
     _store,
     routed,
 )
@@ -197,7 +199,7 @@ struct _TypeState(Copyable, Movable):
 
 
 def _pw_is_f8(st: Int32) raises -> Bool:
-    return st != ST_UNDEFINED and is_float8(max_dtype(st))
+    return st != ST_UNDEFINED and is_float8_stype(st)
 
 
 def _pw_promote(a: Int32, b: Int32) raises -> Int32:
@@ -1158,7 +1160,7 @@ def _cx_pw_launch(
         if not can_cast(st, d.stype):
             raise Error(
                 "result type ",
-                scalar_type_name(max_dtype(st)),
+                scalar_type_name(st),
                 " can't be cast to the desired output type ",
                 scalar_type_name(d.dtype),
             )
@@ -1369,6 +1371,120 @@ def cx_lerp_scalar_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     _cx_lerp_scalar(args, rets, -1, True)
+
+
+def cx_logaddexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """logaddexp on complex tensors: the jiterated logaddexp_complex."""
+    _pw_same_device(args, 2)
+    _cx_pw_launch(
+        "cx_logaddexp",
+        args[unsafe_offset=0].copy(),
+        args[unsafe_offset=1].copy(),
+        args[unsafe_offset=1].copy(),
+        2,
+        0.0,
+        0.0,
+        Optional[T](),
+        rets,
+    )
+
+
+def cx_logaddexp_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _pw_same_device(args, 3)
+    _cx_pw_launch(
+        "cx_logaddexp",
+        args[unsafe_offset=0].copy(),
+        args[unsafe_offset=1].copy(),
+        args[unsafe_offset=1].copy(),
+        2,
+        0.0,
+        0.0,
+        Optional[T](v_tensor_c(args[unsafe_offset=2])),
+        rets,
+    )
+
+
+def _cx_pow2(self: T, other: T) raises -> Owned:
+    """BinaryOps.cpp's `_pow2`: `pow(2.0, other)` for an integral or float32
+    self, else `full({}, 2.0, self.options()).pow(other)`."""
+    var st = self.stype
+    if _pw_is_int(st) or st == ST_BOOL or st == ST_FLOAT32:
+        var c = _Call("aten::pow", "Scalar")
+        c.s(2.0)
+        c.t(other)
+        return c.one()
+    var base: Owned
+    if self.on_mojo():
+        base = own(new_scalar(st, self.device))
+        var f = _Call("aten::fill_", "Scalar")
+        f.t(base.t)
+        f.s(2.0)
+        _ = f.run(1)
+    else:
+        var f = _Call("aten::full")
+        f.ints(List[Int]())
+        f.s(2.0)
+        f.dtype(st)
+        f.none()
+        f.none()
+        f.none()
+        base = f.one()
+    var c = _Call("aten::pow", "Tensor_Tensor")
+    c.t(base.t)
+    c.t(other)
+    var r = c.one()
+    _ = base^
+    return r^
+
+
+def _cx_ldexp(args: Values, rets: Values, out_index: Int, inplace: Bool) raises:
+    """ldexp with a complex operand: `mul(self, _pow2(self, other))`, as
+    BinaryOps.cpp composes it (no integral-exponent route for a complex
+    self)."""
+    var self = v_tensor_c(args[unsafe_offset=0])
+    var other = v_tensor_c(args[unsafe_offset=1])
+    var dest = Optional[T]()
+    if inplace:
+        dest = self.copy()
+    elif out_index >= 0:
+        dest = v_tensor_c(args[unsafe_offset=out_index])
+    if dest:
+        var ds = dest.value().stype
+        if not (_pw_is_float(ds) or is_complex_stype(ds)):
+            raise Error(
+                "ldexp can't be cast to the desired output type ",
+                scalar_type_name(ds),
+            )
+    var p = _cx_pow2(self, other)
+    if dest:
+        var d = dest.value().copy()
+        var m = _Call("aten::mul", "out")
+        m.t(self)
+        m.t(p.t)
+        m.t(d)
+        _ = m.run(1)
+        ret_ref(rets, 0, d)
+    else:
+        var m = _Call("aten::mul", "Tensor")
+        m.t(self)
+        m.t(p.t)
+        var r = m.one()
+        ret_owned(rets, 0, r)
+    _ = p^
+
+
+def cx_ldexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_ldexp(args, rets, -1, False)
+
+
+def cx_ldexp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_ldexp(args, rets, 2, False)
+
+
+def cx_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_ldexp(args, rets, -1, True)
 
 
 def cx_lerp_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -3485,6 +3601,10 @@ def _pw_ldexp_pow2(
     if not _pw_is_float(compute):
         unsupported("ldexp on dtype " + String(compute))
     var kernel_compute = compute
+    if not a.is_t and (compute == ST_FLOAT16 or compute == ST_BFLOAT16):
+        # mul's CPU-scalar operand is read in opmath (float), not rounded
+        # to the half type first
+        kernel_compute = ST_FLOAT32
     var narrow = pdt
     if pdt != compute and promote_types(pdt, compute) != compute:
         # A pow result wider than mul's common dtype (a 0-d float64 exponent
@@ -3534,7 +3654,18 @@ def _pw_ldexp_pow2(
                     ),
                 )
                 return
-    var params = _p(_pw_narrow_code(narrow, kernel_compute))
+    # full({}, 2.0, self.dtype).pow(CPU scalar exponent): the scalar kernel
+    var scalar_pow = (
+        not b.is_t
+        and e_rank == 0
+        and (
+            not (_pw_is_int(x_st) or x_st == ST_BOOL or is_wide_unsigned(x_st))
+            and x_st != ST_FLOAT32
+        )
+    )
+    var params = _p(
+        _pw_narrow_code(narrow, kernel_compute), 1.0 if scalar_pow else 0.0
+    )
     _pw_finish(
         rets,
         dest,
@@ -5066,7 +5197,16 @@ def register_pointwise(site: Site) raises:
         "gcd",
     ](site)
     impl[
-        f8_iter[op_gcd_out, "gcd_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            op_gcd_out,
+            "gcd_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+            cast_first=True,
+        ],
         "gcd.out",
     ](site)
     impl[op_binary_cross_entropy, "binary_cross_entropy"](site)
@@ -5115,15 +5255,31 @@ def register_pointwise(site: Site) raises:
     impl[op_huber_loss_backward, "huber_loss_backward"](site)
     impl[op_huber_loss_backward_out, "huber_loss_backward.out"](site)
     impl[
-        f8_iter[op_ldexp, "pow_cuda", 3, -1, MODE_FN, False, PRE_LDEXP],
+        routed[
+            f8_iter[op_ldexp, "pow_cuda", 3, -1, MODE_FN, False, PRE_LDEXP],
+            cx_ldexp,
+            2,
+        ],
         "ldexp.Tensor",
     ](site)
     impl[
-        f8_iter[op_ldexp_out, "pow_cuda", 3, 2, MODE_CAST, False, PRE_LDEXP],
+        routed[
+            f8_iter[
+                op_ldexp_out, "pow_cuda", 3, 2, MODE_CAST, False, PRE_LDEXP
+            ],
+            cx_ldexp_out,
+            2,
+        ],
         "ldexp.out",
     ](site)
     impl[
-        f8_iter[op_ldexp_, "pow_cuda", 3, 0, MODE_INPLACE, False, PRE_LDEXP],
+        routed[
+            f8_iter[
+                op_ldexp_, "pow_cuda", 3, 0, MODE_INPLACE, False, PRE_LDEXP
+            ],
+            cx_ldexp_,
+            2,
+        ],
         "ldexp_",
     ](site)
     impl[op_mse_loss, "mse_loss"](site)
@@ -5390,7 +5546,16 @@ def register_pointwise(site: Site) raises:
         "lcm",
     ](site)
     impl[
-        f8_iter[op_lcm_out, "lcm_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            op_lcm_out,
+            "lcm_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+            cast_first=True,
+        ],
         "lcm.out",
     ](site)
     impl[
@@ -5564,21 +5729,29 @@ def register_pointwise(site: Site) raises:
         "log_sigmoid_forward.output",
     ](site)
     impl[
-        f8_iter[
-            op_logaddexp, "logaddexp_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        routed[
+            f8_iter[
+                op_logaddexp, "logaddexp_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            ],
+            cx_logaddexp,
+            2,
         ],
         "logaddexp",
     ](site)
     impl[
-        f8_iter[
-            op_logaddexp_out,
-            "logaddexp_cuda",
-            3,
+        routed[
+            f8_iter[
+                op_logaddexp_out,
+                "logaddexp_cuda",
+                3,
+                2,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+                convert_to_out=True,
+            ],
+            cx_logaddexp_out,
             2,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
-            convert_to_out=True,
         ],
         "logaddexp.out",
     ](site)

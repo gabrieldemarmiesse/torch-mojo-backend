@@ -44,6 +44,9 @@ def convert[
     ):
         # c10::Half and c10::BFloat16 are built from float: round through it.
         return v.cast[DType.float32]().cast[D]()
+    elif src == DType.float16 and dst == DType.float64:
+        # c10::Half widens through float (a NaN becomes the canonical one)
+        return v.cast[DType.float32]().cast[D]()
     elif src == DType.float32 and dst == DType.bfloat16:
         return rebind[SIMD[D, w]](
             f32_to_bf16(rebind[SIMD[DType.float32, w]](v))

@@ -54,6 +54,7 @@ from tmb.kernels.common.libdevice_port import (
     nv_log1p,
     nv_log1pf,
     nv_logf,
+    nv_sincos,
 )
 from tmb.kernels.common.libdevice_port import (
     nv_atan2,
@@ -504,6 +505,9 @@ def _sincos_f64(a: Float64) -> Tuple[Float64, Float64]:
     libdevice's reduction by pi/2 (three-part Cody-Waite, Payne-Hanek past
     2^31, `_trig_reduction_slowpath_d`), then fdlibm's sin and cos kernels
     (within an ulp)."""
+    comptime if is_nvidia_gpu():
+        # the exact port of libdevice's __nv_sincos
+        return nv_sincos(a)
     if isnan(a) or isinf(a):
         return (nan[DType.float64](), nan[DType.float64]())
     if a == 0.0:
@@ -1882,6 +1886,10 @@ def _wide[
         # pow(2, other), as PowKernel.cu's scalar-base kernel runs it
         # (float for the float types, never float64: Apple GPUs have none).
         var pw = torch_pow(SIMD[w, n](2), b)
+        comptime if w == DType.float64:
+            if p[1] != 0:
+                # p1: full({}, 2.0).pow(CPU scalar), whose 0.5 is sqrt_kernel
+                pw = b.eq(0.5).select(ieee_sqrt(SIMD[w, n](2)), pw)
         if p[0] == 1:
             pw = pw.cast[DType.float16]().cast[w]()
         elif p[0] == 2:
@@ -2826,7 +2834,7 @@ def _addc[
 
 
 @always_inline
-def pointwise[
+def _pointwise_impl[
     kind: StaticString, dtype: DType, out_dtype: DType, n: Int
 ](
     a: SIMD[dtype, n],
@@ -2918,6 +2926,48 @@ def pointwise[
                 q.cast[DType.float32](),
                 scalar_a,
             ).cast[out_dtype]()
+
+
+@always_inline
+def pointwise[
+    kind: StaticString, dtype: DType, out_dtype: DType, n: Int
+](
+    a: SIMD[dtype, n],
+    b: SIMD[dtype, n],
+    c: SIMD[dtype, n],
+    p: SIMD[param_dtype[dtype](), 4],
+    scalar_a: Bool = False,
+) -> SIMD[out_dtype, n]:
+    """`_pointwise_impl`, then CUDA's half -> double conversion of a NaN: c10::Half
+    widens through float, whose cvt gives the canonical NaN (0x7FFFFFFF as a
+    float, 0x7FFFFFFFE0000000 as a double)."""
+    var r = _pointwise_impl[kind, dtype, out_dtype, n](a, b, c, p, scalar_a)
+    comptime if (
+        is_nvidia_gpu()
+        and dtype == DType.float16
+        and out_dtype == DType.float64
+    ):
+        r = isnan(r).select(
+            SIMD[out_dtype, n](bitcast[out_dtype](UInt64(0x7FFFFFFFE0000000))),
+            r,
+        )
+    comptime if (
+        kind == "ldexp_pow2"
+        and is_nvidia_gpu()
+        and dtype == DType.float64
+        and out_dtype != DType.float64
+    ):
+        # the product ran in double for a narrower common dtype: CUDA
+        # multiplies in that dtype, whose NaN is the canonical one
+        comptime if out_dtype == DType.float32:
+            r = isnan(r).select(
+                SIMD[out_dtype, n](bitcast[out_dtype](UInt32(0x7FFFFFFF))), r
+            )
+        else:
+            r = isnan(r).select(
+                SIMD[out_dtype, n](bitcast[out_dtype](UInt16(0x7FFF))), r
+            )
+    return r
 
 
 @always_inline

@@ -33,6 +33,55 @@ _BINARY = [
 ]
 _BINARY_IDS = [b[0] for b in _BINARY]
 
+
+def _no_nan_conflict(*ts: torch.Tensor) -> torch.Tensor:
+    """Rows of float64 / complex128 operands where two NaNs of different
+    payloads meet in one element (`two_distinct_nans`, across the components
+    of every operand): stock CUDA keeps one by the operand slot ptxas gave
+    each in that instruction, which changes with the launch, so the parity
+    tests leave these elements out."""
+    comps = torch.cat(
+        [
+            (t.view(torch.float64).reshape(len(t), -1))
+            for t in [torch.view_as_real(x) if x.is_complex() else x for x in ts]
+        ],
+        dim=1,
+    )
+    quiet = comps.view(torch.int64) | (1 << 51)
+    isn = comps.isnan()
+    big, small = torch.iinfo(torch.int64).max, torch.iinfo(torch.int64).min
+    lo = torch.where(isn, quiet, big).min(1).values
+    hi = torch.where(isn, quiet, small).max(1).values
+    return isn.any(1) & (lo != hi)
+
+
+def _clean(dtype: torch.dtype, *ts: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    if dtype not in (torch.float64, torch.complex128):
+        return ts
+    keep = ~_no_nan_conflict(*ts)
+    return tuple(t[keep] for t in ts)
+
+
+def _pairs(dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+    return _clean(dtype, *bp.pairs(dtype))
+
+
+def _triples(dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+    return _clean(dtype, *bp.triples(dtype))
+
+
+def _drop_nan_rows(dtype: torch.dtype, *ts: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """float64 / complex128 rows with no NaN at all (a NaN Scalar meets
+    every tensor NaN: two NaNs again)."""
+    if dtype not in (torch.float64, torch.complex128):
+        return ts
+    nanrow = torch.zeros(len(ts[0]), dtype=torch.bool)
+    for t in ts:
+        r = torch.view_as_real(t) if t.is_complex() else t
+        nanrow |= r.reshape(len(t), -1).isnan().any(1)
+    return tuple(t[~nanrow] for t in ts)
+
+
 # A double whose rounding to float32 lands on a half / bfloat16 midpoint:
 # c10 converts a CPU scalar to Half / BFloat16 through float.
 _HALF_TIE = 1 + 2**-11 + 2**-40
@@ -82,18 +131,23 @@ def test_zero_dim_operands(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
             ):
                 continue
             tag = f"{s!r}:{bp.name(sd)}"
+            a_s, b_s = a, b
+            if op == "ldexp" and dtype == torch.float64 and s != s:
+                # full({}, 2.0).pow(NaN scalar) is a device NaN, times a
+                # tensor NaN: two NaNs
+                a_s, b_s = a[~a.isnan()], b[~b.isnan()]
             cases.append(
                 (
                     f"t-cpu0d={tag}",
                     lambda x, s=s, sd=sd: fn(x, torch.tensor(s, dtype=sd)),
-                    (a,),
+                    (a_s,),
                 )
             )
             cases.append(
                 (
                     f"cpu0d-t={tag}",
                     lambda y, s=s, sd=sd: fn(torch.tensor(s, dtype=sd), y),
-                    (b,),
+                    (b_s,),
                 )
             )
             if inplace is not None:
@@ -103,7 +157,7 @@ def test_zero_dim_operands(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
                         lambda x, s=s, sd=sd: getattr(x, inplace)(
                             torch.tensor(s, dtype=sd)
                         ),
-                        (a,),
+                        (a_s,),
                     )
                 )
     cases.append(("t-dev0d", lambda x, y: fn(x, y[5]), (a, b)))
@@ -150,6 +204,10 @@ def test_mixed_dtypes(cuda_oracle: CudaOracle, op, fn, inplace, da, db):
     _, b = bp.pairs(db)
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
+    if torch.promote_types(da, db) == torch.float64:
+        # two tensor NaNs of different payloads in float64: no fixed rule
+        keep = ~bp.two_distinct_nans(a.to(torch.float64), b.to(torch.float64))
+        a, b = a[keep], b[keep]
     cases = [
         ("tt", fn, (a, b)),
         ("t-dev0d", lambda x, y: fn(x, y[7]), (a, b)),
@@ -271,7 +329,7 @@ _WEIGHTS = [
 
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
 def test_lerp_scalar(cuda_oracle: CudaOracle, dtype):
-    a, b = bp.pairs(dtype)
+    a, b = _pairs(dtype)
     weights = _WEIGHTS + ([0.3 + 0.4j, 1j, 0.2 - 0.1j] if dtype.is_complex else [])
     cases = []
 
@@ -281,9 +339,9 @@ def test_lerp_scalar(cuda_oracle: CudaOracle, dtype):
 
     for w in weights:
         x, y = a, b
-        if dtype == torch.float64 and isinstance(w, float) and math.isnan(w):
-            keep = ~(a.isnan() | b.isnan())  # test_lerp_float64_nan_weight_lanes
-            x, y = a[keep], b[keep]
+        if isinstance(w, float) and math.isnan(w):
+            # test_lerp_float64_nan_weight_lanes
+            x, y, _ = _drop_nan_rows(dtype, a, b, b - a)
         cases.append((f"w={w!r}", lambda x, y, w=w: torch.lerp(x, y, w), (x, y)))
         cases.append((f"inplace/w={w!r}", lambda x, y, w=w: x.lerp_(y, w), (x, y)))
         cases.append((f"out/w={w!r}", lambda x, y, w=w: with_out(x, y, w), (x, y)))
@@ -308,7 +366,7 @@ def test_lerp_float64_nan_weight_lanes(cuda_oracle: CudaOracle):
 
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
 def test_lerp_tensor(cuda_oracle: CudaOracle, dtype):
-    a, b, c = bp.triples(dtype)
+    a, b, c = _triples(dtype)
     if dtype.is_floating_point:
         # weights around the branch point and in [0, 1]
         gen = torch.Generator().manual_seed(9)
@@ -336,9 +394,8 @@ def test_lerp_tensor(cuda_oracle: CudaOracle, dtype):
     ]
     for w in (0.25, 0.75, 0.4999999999, bp.nan_scalar(0x7FF8000000000123)):
         a2, b2 = a, b
-        if dtype == torch.float64 and math.isnan(w):
-            keep = ~(a.isnan() | b.isnan())  # test_lerp_float64_nan_weight_lanes
-            a2, b2 = a[keep], b[keep]
+        if math.isnan(w):
+            a2, b2, _ = _drop_nan_rows(dtype, a, b, b - a)
         for wd in (dtype, torch.float64, torch.float32):
             if dtype.is_complex and not wd.is_complex:
                 continue
@@ -434,7 +491,7 @@ def _values(dtype: torch.dtype) -> list[object]:
 @pytest.mark.parametrize("op", ["addcmul", "addcdiv"])
 def test_addc_tensors(cuda_oracle: CudaOracle, op, dtype):
     fn = getattr(torch, op)
-    a, b, c = bp.triples(dtype)
+    a, b, c = _triples(dtype)
     cases = []
 
     def with_out(x, y, z, v):
@@ -442,17 +499,18 @@ def test_addc_tensors(cuda_oracle: CudaOracle, op, dtype):
         return fn(x, y, z, value=v, out=o), o
 
     for v in _values(dtype):
-        cases.append((f"v={v!r}", lambda x, y, z, v=v: fn(x, y, z, value=v), (a, b, c)))
+        ops = (a, b, c)
+        if isinstance(v, float) and math.isnan(v):
+            ops = _drop_nan_rows(dtype, a, b, c)  # a NaN value meets any NaN
+        cases.append((f"v={v!r}", lambda x, y, z, v=v: fn(x, y, z, value=v), ops))
         cases.append(
             (
                 f"inplace/v={v!r}",
                 lambda x, y, z, v=v: getattr(x, op + "_")(y, z, value=v),
-                (a, b, c),
+                ops,
             )
         )
-        cases.append(
-            (f"out/v={v!r}", lambda x, y, z, v=v: with_out(x, y, z, v), (a, b, c))
-        )
+        cases.append((f"out/v={v!r}", lambda x, y, z, v=v: with_out(x, y, z, v), ops))
     bp.check_all(cuda_oracle, cases)
 
 
@@ -467,7 +525,7 @@ def test_addc_zero_dim(cuda_oracle: CudaOracle, op, dtype):
     a CPU self / tensor1 raises for addcmul; device 0-d tensors are
     ordinary operands."""
     fn = getattr(torch, op)
-    a, b, c = bp.triples(dtype)
+    a, b, c = _triples(dtype)
     wide = torch.complex128 if dtype.is_complex else torch.float64
     cases = []
     for s in _scalar_values(dtype)[:12]:
@@ -539,6 +597,16 @@ def test_addc_mixed_dtypes(cuda_oracle: CudaOracle, op, dtypes):
     ops = [bp.triples(d)[k] for k, d in enumerate(dtypes)]
     n = min(len(t) for t in ops)
     a, b, c = (t[:n] for t in ops)
+    if (
+        torch.promote_types(torch.promote_types(*dtypes[:2]), dtypes[2])
+        == torch.float64
+    ):
+        keep = ~(
+            bp.two_distinct_nans(a.double(), b.double())
+            | bp.two_distinct_nans(a.double(), c.double())
+            | bp.two_distinct_nans(b.double(), c.double())
+        )
+        a, b, c = a[keep], b[keep], c[keep]
 
     def with_out(x, y, z, dt):
         o = torch.empty(0, dtype=dt, device=x.device)
