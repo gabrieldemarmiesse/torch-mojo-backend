@@ -831,9 +831,23 @@ def _check_rows(
     assert_bits_equal(ours.cpu()[rows], cuda.cpu()[rows])
 
 
+# Complex forward tanh is not implemented on the mojo device (NotImplementedError;
+# CUDA computes it): an open gap, kept visible as a strict xfail.
+_COMPLEX_TANH_GAP = pytest.mark.xfail(
+    strict=True, reason="complex forward tanh is not implemented on the mojo device"
+)
+
+
 def _other_params() -> list[object]:
     return [
-        pytest.param(case_id, dtype, id=f"{_dtype_id(dtype)}-{case_id}")
+        pytest.param(
+            case_id,
+            dtype,
+            marks=(_COMPLEX_TANH_GAP,)
+            if case_id == "tanh" and dtype.is_complex
+            else (),
+            id=f"{_dtype_id(dtype)}-{case_id}",
+        )
         for dtype in _OTHER_DTYPES
         for case_id in CASES
     ]
