@@ -364,7 +364,7 @@ def test_mvlgamma_matches_cuda(cuda_oracle: CudaOracle, p: int, dtype: torch.dty
     else:
         x = torch.arange(int(lo) + 1, int(lo) + 300).to(dtype)
     cuda_oracle.assert_bitwise_equal(lambda t: torch.mvlgamma(t, p), x)
-    # the domain check raises on both sides
+    # below (p - 1) / 2 torch 2.11 has no domain check (CPU and CUDA return lgamma's values)
     cuda_oracle.assert_bitwise_equal(lambda t: torch.mvlgamma(t, p), x - 100)
 
 
