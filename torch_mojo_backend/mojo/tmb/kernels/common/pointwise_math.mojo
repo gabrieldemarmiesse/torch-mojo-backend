@@ -1736,8 +1736,11 @@ def _wide[
         r = (isinf(a) & a.eq(b)).select(a, r)
         # A NaN runs through a - b, exp, log1p and the add: float's
         # canonical NaN; double keeps the NaN a - b's DADD keeps, b's first.
-        comptime if is_nvidia_gpu():
+        comptime if is_nvidia_gpu() and w == DType.float64:
             return nan_result2(r, b, a)
+        elif is_nvidia_gpu():
+            # (r is NaN exactly when an operand is: one test, not two)
+            return is_nan_bits(r).select(arith_nan[w, n](), r)
         else:
             return (isnan(a) | isnan(b)).select(SIMD[w, n](nan[w]()), r)
     elif kind == "xlogy" or kind == "xlog1py":
