@@ -526,7 +526,21 @@ def _float_unary[
     comptime if kind == "exp":
         res = exp(a)
     comptime if kind == "tanh":
-        res = tanh(a)
+        # c10::cuda::compat::tanh on NVIDIA: libdevice's __nv_tanhf (float32
+        # and the half types, computed in float32), __nv_tanh (float64).
+        # Elsewhere the std tanh.
+        comptime if is_nvidia_gpu():
+            comptime for i in range(width):
+                comptime if dtype == DType.float64:
+                    # __nv_tanh quiets a signalling NaN (a + a), keeps payloads.
+                    var xd = a[i].cast[DType.float64]()
+                    res[i] = (xd + xd if isnan(xd) else nv_tanh(xd)).cast[
+                        dtype
+                    ]()
+                else:
+                    res[i] = nv_tanhf(a[i].cast[DType.float32]()).cast[dtype]()
+        else:
+            res = tanh(a)
     comptime if kind == "ceil":
         res = ceil(a)
     comptime if kind == "floor":
@@ -650,8 +664,10 @@ def _float_unary[
     # math preserves them already, so avoid an extra select on every lane.
     # Retain the existing correction on other backends and float64, except
     # for the vendor asinh ports, which quiet a signaling NaN as CUDA does.
-    comptime if not (is_nvidia_gpu() and dtype == DType.float32) and not (
-        kind == "asinh" and (is_nvidia_gpu() or is_amd_gpu())
+    comptime if (
+        not (is_nvidia_gpu() and dtype == DType.float32)
+        and not (kind == "asinh" and (is_nvidia_gpu() or is_amd_gpu()))
+        and not (kind == "tanh" and is_nvidia_gpu() and dtype == DType.float64)
     ):
         return isnan(a).select(a, res)
     else:

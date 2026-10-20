@@ -545,6 +545,7 @@ def _unary_float64_on[op_code: Int]() -> Bool:
             or op_code == UOP_SILU
             or op_code == UOP_GELU_NONE
             or op_code == UOP_GELU_TANH
+            or (op_code == UOP_TANH and has_nvidia_gpu_accelerator())
         )
 
 

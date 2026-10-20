@@ -111,6 +111,14 @@ def _cases() -> list[Case]:
             out=lambda g, y, o: A.sigmoid_backward.grad_input(g, y, grad_input=o),
         ),
         Case(
+            "tanh",
+            torch.tanh,
+            "x",
+            (0.0, 1.0),
+            out=lambda x, o: torch.tanh(x, out=o),
+            inplace=torch.tanh_,
+        ),
+        Case(
             "tanh_backward",
             A.tanh_backward,
             "gX",

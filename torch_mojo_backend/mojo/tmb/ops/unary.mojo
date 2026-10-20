@@ -1461,6 +1461,12 @@ def _promoting_unary(op: String, t: T) raises -> T:
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":  # the one op of these that takes float64
         return _float_or_f64_unary(op, src.t)
+    if (
+        op == "TanhSpec"
+        and t.dtype == DType.float64
+        and dev(t.device)[].api == "cuda"
+    ):
+        return _float_or_f64_unary(op, src.t)
     if op == "SigmoidSpec":
         return _activation_unary(op, src.t)
     return _float_unary(op, src.t)
@@ -1470,7 +1476,11 @@ def _promoting_unary_out(op: String, t: T, mut dst: T) raises:
     # Every op here is a `unary_float_op`: its result casts into `out`.
     _f8_out_refuse(op, t, dst, False)
     var src = own_if_new(_promote(t), t)
-    if op == "AngleSpec":
+    if op == "AngleSpec" or (
+        op == "TanhSpec"
+        and t.dtype == DType.float64
+        and dev(t.device)[].api == "cuda"
+    ):
         _float_or_f64_unary_out(op, src.t, dst, True)
     elif op == "SigmoidSpec":
         _activation_unary_out(op, src.t, dst, True)
