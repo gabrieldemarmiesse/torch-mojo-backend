@@ -966,6 +966,13 @@ def _pw_frexp(self: T) raises -> Tuple[Res, Res]:
             + scalar_type_name(self.dtype)
             + "'"
         )
+    if self.is_complex():
+        # CUDA's dispatch failure is a RuntimeError, not NotImplementedError.
+        raise Error(
+            '"frexp_cuda" not implemented for \''
+            + scalar_type_name(self.dtype)
+            + "'"
+        )
     var a = _b_tside(self)
     var mant = _pw_run(
         "frexp_mantissa",
@@ -1002,7 +1009,7 @@ def op_frexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::frexp.Tensor_out(Tensor self, *, Tensor(a!) mantissa, Tensor(b!) exponent) -> (Tensor(a!) mantissa, Tensor(b!) exponent)
 def op_frexp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = v_tensor_c(args[unsafe_offset=0])
-    var mant = v_tensor(args[unsafe_offset=1])
+    var mant = v_tensor_c(args[unsafe_offset=1])
     var expo = v_tensor(args[unsafe_offset=2])
     if mant.stype != self.stype:
         raise Error(
