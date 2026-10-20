@@ -76,16 +76,21 @@ def _triples(dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
     return _clean(dtype, *bp.triples(dtype))
 
 
-def _drop_nan_rows(dtype: torch.dtype, *ts: torch.Tensor) -> tuple[torch.Tensor, ...]:
+def _drop_nan_rows(
+    dtype: torch.dtype, *ts: torch.Tensor, inf: bool = False
+) -> tuple[torch.Tensor, ...]:
     """float64 / complex128 rows with no NaN at all (a NaN Scalar meets
-    every tensor NaN: two NaNs again)."""
+    every tensor NaN: two NaNs again) and, with `inf`, no infinity either
+    (inf - inf and 0 * inf make a second, default NaN)."""
     if dtype not in (torch.float64, torch.complex128):
         return ts
-    nanrow = torch.zeros(len(ts[0]), dtype=torch.bool)
+    bad = torch.zeros(len(ts[0]), dtype=torch.bool)
     for t in ts:
-        r = torch.view_as_real(t) if t.is_complex() else t
-        nanrow |= r.reshape(len(t), -1).isnan().any(1)
-    return tuple(t[~nanrow] for t in ts)
+        r = (torch.view_as_real(t) if t.is_complex() else t).reshape(len(t), -1)
+        bad |= r.isnan().any(1)
+        if inf:
+            bad |= r.isinf().any(1)
+    return tuple(t[~bad] for t in ts)
 
 
 def _nan_free_pair(dtype: torch.dtype, a: torch.Tensor, b: torch.Tensor):
@@ -343,8 +348,6 @@ def test_ldexp_integer_exponent(cuda_oracle: CudaOracle, dtype, edtype):
         ("inplace", lambda x, y: x.ldexp_(y), (a, e)),
         ("out", lambda x, y: with_out(x, y, dtype), (a, e)),
         ("out_f64", lambda x, y: with_out(x, y, torch.float64), (a, e)),
-    ]
-    cases += [
         ("out_int", lambda x, y: with_out(x, y, torch.int32), (a, e)),
         ("t-cpu0d", lambda x: torch.ldexp(x, torch.tensor(3, dtype=edtype)), (a,)),
         ("t-dev0d", lambda x, y: torch.ldexp(x, y[3]), (a, e)),
@@ -538,7 +541,7 @@ def test_addc_tensors(cuda_oracle: CudaOracle, op, dtype):
     for v in _values(dtype):
         ops = (a, b, c)
         if isinstance(v, float) and math.isnan(v):
-            ops = _drop_nan_rows(dtype, a, b, c)  # a NaN value meets any NaN
+            ops = _drop_nan_rows(dtype, a, b, c, inf=True)  # NaN meets any NaN
         cases.append((f"v={v!r}", lambda x, y, z, v=v: fn(x, y, z, value=v), ops))
         cases.append(
             (
