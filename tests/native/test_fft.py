@@ -12,15 +12,13 @@ absolute error of eps * max|X|), so the bound is relative to the largest
 output -- what both cuFFT and pocketfft achieve (~2e-7 for float32).
 """
 
-import os
-import subprocess
-import sys
 import textwrap
 import threading
 
 import pytest
 import torch
 
+from tests.conftest import run_python
 from tests.native.conftest import skip_if_metal
 from torch_mojo_backend import native
 
@@ -401,19 +399,7 @@ def test_bluestein_tables_do_not_leak(mojo_gpu: str):
     reverse) must not leak the cached reference it re-uploads over. Run in
     a fresh process: the table cache is process-wide, and the partial hit
     needs it empty at the start (any earlier test may have filled it)."""
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
-    proc = subprocess.run(
-        [sys.executable, "-c", _LEAK_SCRIPT],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    proc = run_python("-c", _LEAK_SCRIPT, timeout=600)
     assert "no growth" in proc.stdout
 
 
@@ -456,17 +442,5 @@ def test_cached_tables_are_complete_for_another_stream(mojo_gpu: str):
     the table is published). Run in a fresh process: the table cache is
     process-wide, and the first transform must be the one that uploads
     (an earlier test, e.g. the byte-bound one, may already have filled it)."""
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
-    proc = subprocess.run(
-        [sys.executable, "-c", _STREAM_SCRIPT],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    proc = run_python("-c", _STREAM_SCRIPT, timeout=600)
     assert "both complete" in proc.stdout

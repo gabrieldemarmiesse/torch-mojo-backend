@@ -24,19 +24,13 @@ import torch.nn.functional as F
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
 from tests.native.conftest import (
     flush_subnormals_on_metal,
+    native_count,
     require_stock_cuda,
+    reset_op_counts,
+    skip_float64_on_metal,
     skip_if_metal,
 )
 from torch_mojo_backend import aten_functions, get_accelerators, mojo_backend, native
-
-
-def _native_count(name: str) -> int:
-    return native.op_count(f"aten::{name}")
-
-
-def _reset_native_counts():
-    native.op_counting(True)
-    native.op_counts_reset()
 
 
 def _tol(dtype: torch.dtype) -> tuple[float | None, float | None]:
@@ -97,10 +91,10 @@ def test_unary_matches_cpu(mojo_gpu, op_name, fn, domain):
     x64 = _sample(domain, (3, 5))
     expected = fn(x64).to(SWEEP_DTYPE)
     x = x64.to(SWEEP_DTYPE).to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     y = fn(x)
     assert y.device.type == "mojo"
-    assert _native_count(op_name) > 0, f"aten::{op_name} did not run natively"
+    assert native_count(op_name) > 0, f"aten::{op_name} did not run natively"
     rtol, atol = _tol(SWEEP_DTYPE)
     torch.testing.assert_close(y.cpu(), expected, rtol=rtol, atol=atol)
 
@@ -113,9 +107,9 @@ def test_unary_on_mojo_device(mojo_device, op_name, fn):
     x64 = torch.randn(3, 5, dtype=torch.float64) * 2
     expected = fn(x64).to(torch.float32)
     x = x64.to(torch.float32).to(mojo_device)
-    _reset_native_counts()
+    reset_op_counts()
     y = fn(x)
-    assert _native_count(op_name) > 0
+    assert native_count(op_name) > 0
     torch.testing.assert_close(y.cpu(), expected)
 
 
@@ -163,9 +157,9 @@ def test_unary_launcher_layouts(
         else:
             storage = torch.stack((cpu, torch.zeros_like(cpu)), dim=1).to(mojo_gpu)
             x = storage[:, 0]
-        _reset_native_counts()
+        reset_op_counts()
         actual = fn(x)
-        assert _native_count(op_name) > 0
+        assert native_count(op_name) > 0
         torch.testing.assert_close(actual.cpu(), fn(cpu))
 
 
@@ -213,8 +207,7 @@ def test_unary_launcher_other_dtypes(
     mojo_gpu: str, op_name: str, dtype: torch.dtype, offset: int
 ):
     """SIMD alignment is measured in elements for every supported dtype."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal does not support float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     cpu = (torch.arange(261) % 13 + 1).to(dtype)
     if dtype != torch.uint8 and op_name not in {"rsqrt", "log2"}:
         cpu[::2].neg_()
@@ -322,8 +315,7 @@ def test_direct_unary_float64(mojo_gpu: str, op):
 
 @pytest.mark.parametrize("dtype", (torch.int64, torch.float64))
 def test_unary_launcher_predicate_offset_two(mojo_gpu: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal does not support float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     cpu = (torch.arange(260) % 13).to(dtype)
     if dtype == torch.float64:
         cpu[::7] = float("nan")
@@ -452,9 +444,9 @@ def test_unary_launcher_acosh_edges(mojo_gpu: str, dtype: torch.dtype, offset: i
         values += [1e20, 1e30]
     cpu = torch.tensor(values, dtype=dtype)
     storage = torch.cat((torch.zeros(offset, dtype=dtype), cpu)).to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     actual = torch.acosh(storage[offset:])
-    assert _native_count("acosh") > 0
+    assert native_count("acosh") > 0
     expected = torch.acosh(cpu.double()).to(dtype)
     torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
 
@@ -485,9 +477,9 @@ def test_direct_ops_int_dtypes(mojo_gpu, op_name, fn, dtype):
     lo, hi = (0, 6) if dtype == torch.uint8 else (-6, 6)
     x_cpu = torch.randint(lo, hi, (4, 5)).to(dtype)
     x = x_cpu.to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     y = fn(x)
-    assert _native_count(op_name) > 0
+    assert native_count(op_name) > 0
     assert y.cpu().tolist() == fn(x_cpu).tolist()
 
 
@@ -502,18 +494,18 @@ def test_out_variant(mojo_gpu, op_name, fn):
 
     # Ready out tensor (contiguous, right shape/dtype): compute straight into it.
     out1 = torch.empty(3, 4, device=mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     ret1 = fn(x, out=out1)
-    assert _native_count(out_name) > 0
+    assert native_count(out_name) > 0
     assert ret1.data_ptr() == out1.data_ptr()
     torch.testing.assert_close(out1.cpu(), expected)
 
     # Non-contiguous out tensor: compute into a temporary then copy_strided_into.
     out2 = torch.empty(4, 3, device=mojo_gpu).t()
     assert not out2.is_contiguous()
-    _reset_native_counts()
+    reset_op_counts()
     fn(x, out=out2)
-    assert _native_count(out_name) > 0
+    assert native_count(out_name) > 0
     # `.cpu()` on a strided mojo tensor would itself need a strided host
     # destination, which `_copy_from` (ops_core.mojo, outside this group)
     # does not support; materialize contiguous on-device first.
@@ -547,10 +539,10 @@ def test_relu_inplace(mojo_gpu):
     x64 = torch.randn(3, 4, dtype=torch.float64)
     expected = torch.relu(x64).to(torch.float32)
     x = x64.to(torch.float32).to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     ptr_before = x.data_ptr()
     ret = x.relu_()
-    assert _native_count("relu_") > 0
+    assert native_count("relu_") > 0
     assert ret.data_ptr() == ptr_before
     torch.testing.assert_close(x.cpu(), expected)
 
@@ -573,9 +565,9 @@ def test_ceil_floor_float(mojo_gpu, op_name, fn):
     x64 = torch.randn(3, 5, dtype=torch.float64) * 3
     expected = fn(x64).to(torch.float32)
     x = x64.to(torch.float32).to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     y = fn(x)
-    assert _native_count(op_name) > 0
+    assert native_count(op_name) > 0
     torch.testing.assert_close(y.cpu(), expected)
 
 
@@ -584,9 +576,9 @@ def test_ceil_floor_float64(mojo_gpu, op_name, fn):
     skip_if_metal(mojo_gpu, "Metal does not support float64")
     x = torch.randn(357, 789, dtype=torch.float64) * 1e3
     x[0, :3] = torch.tensor([2.0**52 + 0.5, -0.5, 1e300], dtype=torch.float64)
-    _reset_native_counts()
+    reset_op_counts()
     y = fn(x.to(mojo_gpu))
-    assert _native_count(op_name) > 0
+    assert native_count(op_name) > 0
     torch.testing.assert_close(y.cpu(), fn(x), rtol=0, atol=0)
     out = torch.empty(3, dtype=torch.float64, device=mojo_gpu)
     fn(x.to(mojo_gpu).t(), out=out)
@@ -610,9 +602,9 @@ def test_gelu_forward(mojo_gpu, approximate):
     x64 = torch.randn(3, 5, dtype=torch.float64) * 2
     expected = F.gelu(x64, approximate=approximate).to(SWEEP_DTYPE)
     x = x64.to(SWEEP_DTYPE).to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     y = F.gelu(x, approximate=approximate)
-    assert _native_count("gelu") > 0
+    assert native_count("gelu") > 0
     rtol, atol = _tol(SWEEP_DTYPE)
     torch.testing.assert_close(y.cpu(), expected, rtol=rtol, atol=atol)
 
@@ -622,9 +614,9 @@ def test_gelu_out_variant(mojo_gpu):
     expected = F.gelu(x64, approximate="tanh").to(torch.float32)
     x = x64.to(torch.float32).to(mojo_gpu)
     out = torch.empty(3, 5, device=mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     torch.ops.aten.gelu.out(x, approximate="tanh", out=out)
-    assert _native_count("gelu.out") > 0
+    assert native_count("gelu.out") > 0
     torch.testing.assert_close(out.cpu(), expected)
 
 
@@ -644,9 +636,9 @@ def test_gelu_backward_matches_cpu(mojo_gpu, approximate):
 
     x = x64.detach().to(SWEEP_DTYPE).to(mojo_gpu).requires_grad_()
     g = g64.to(SWEEP_DTYPE).to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     F.gelu(x, approximate=approximate).backward(g)
-    assert _native_count("gelu_backward") > 0
+    assert native_count("gelu_backward") > 0
     assert x.grad is not None
     rtol, atol = _tol(SWEEP_DTYPE)
     torch.testing.assert_close(x.grad.cpu(), expected_grad, rtol=rtol, atol=atol)
@@ -684,9 +676,9 @@ def test_an_unregistered_op_raises_out_of_the_dispatcher(mojo_gpu):
 def test_isnan(mojo_gpu):
     x_cpu = torch.tensor([1.0, float("nan"), -float("inf"), 2.0])
     x = x_cpu.to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     y = torch.isnan(x)
-    assert _native_count("isnan") > 0
+    assert native_count("isnan") > 0
     assert y.cpu().tolist() == torch.isnan(x_cpu).tolist()
 
 
@@ -731,9 +723,9 @@ def test_isposinf_isneginf_every_dtype(mojo_gpu, op, dtype):
 def test_logical_not(mojo_gpu):
     x_cpu = torch.tensor([True, False, True, False])
     x = x_cpu.to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     y = torch.logical_not(x)
-    assert _native_count("logical_not") > 0
+    assert native_count("logical_not") > 0
     assert y.cpu().tolist() == torch.logical_not(x_cpu).tolist()
 
 
@@ -744,18 +736,18 @@ def test_bitwise_not(mojo_gpu, dtype):
     else:
         x_cpu = torch.randint(0, 20, (5,)).to(dtype)
     x = x_cpu.to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     y = torch.bitwise_not(x)
-    assert _native_count("bitwise_not") > 0
+    assert native_count("bitwise_not") > 0
     assert y.cpu().tolist() == torch.bitwise_not(x_cpu).tolist()
 
 
 def test_fill_scalar_functional(mojo_gpu):
     x_cpu = torch.zeros(3, 4)
     x = x_cpu.to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     y = torch.fill(x, 7.5)
-    assert _native_count("fill.Scalar") > 0
+    assert native_count("fill.Scalar") > 0
     assert y.data_ptr() != x.data_ptr()  # functional: does not alias self
     assert y.cpu().tolist() == torch.full((3, 4), 7.5).tolist()
     assert x.cpu().tolist() == [[0.0] * 4] * 3  # self left untouched
@@ -1240,8 +1232,7 @@ def test_sqrt_ieee_spans(
 )
 @pytest.mark.parametrize("layout", ["contiguous", "transposed", "strided"])
 def test_sqrt_dtype_layout_fallback(mojo_gpu: str, dtype: torch.dtype, layout: str):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal does not support float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     host = torch.arange(1, 106, dtype=torch.float32).reshape(7, 15).to(dtype)
     source = host.to(mojo_gpu)
     if layout == "transposed":
@@ -1268,8 +1259,7 @@ def test_sqrt_dtype_layout_fallback(mojo_gpu: str, dtype: torch.dtype, layout: s
     "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float64]
 )
 def test_log2_domain(mojo_gpu: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal does not support float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     data = torch.tensor(
         [-1.0, -0.0, 0.0, 0.125, 1.0, 2.0, 3.0, float("inf"), float("nan")], dtype=dtype
     )
@@ -1697,8 +1687,7 @@ def test_inf_predicates(
     fn: Callable[[torch.Tensor], torch.Tensor],
     dtype: torch.dtype,
 ):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     if dtype.is_floating_point:
         base = torch.tensor(_INF_VALUES, dtype=torch.float64).to(dtype)
         # half overflow: 3e38 becomes +inf in float16, stays finite in bf16
@@ -1708,7 +1697,7 @@ def test_inf_predicates(
     else:
         x_cpu = torch.arange(0, 20, dtype=dtype)
     x = x_cpu.to(mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     got = fn(x)
     # One native op and nothing else: no abs / eq / ne / mul decomposition.
     assert native.op_counts() == {f"aten::{name}": 1}
@@ -1784,7 +1773,7 @@ def test_special_unary_out(mojo_gpu: str, name: str):
     x = x_cpu.to(mojo_gpu)
     want = fn(x_cpu)
     out = torch.empty(0, device=mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     assert fn(x, out=out) is out
     assert native.op_counts() == {f"aten::special_{name}.out": 1}
     torch.testing.assert_close(out.cpu(), want, rtol=1e-4, atol=1e-6)
@@ -1829,7 +1818,7 @@ def test_elementary_unary_out(mojo_gpu: str, name: str):
     close(fn(x), want)
     # An empty out is resized to the result.
     out = torch.empty(0, device=mojo_gpu)
-    _reset_native_counts()
+    reset_op_counts()
     assert fn(x, out=out) is out
     assert native.op_counts() == {f"aten::{name}.out": 1}
     close(out, want)

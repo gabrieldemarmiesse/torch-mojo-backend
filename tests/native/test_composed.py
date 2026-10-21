@@ -1,26 +1,10 @@
 """Ops composed from registered ops through the dispatcher (ops_composed.mojo)."""
 
-import contextlib
-
 import pytest
 import torch
 
-from tests.native.conftest import skip_if_metal
-from torch_mojo_backend import native
+from tests.native.conftest import ran_all, skip_float64_on_metal
 from torch_mojo_backend.native import device_module
-
-
-@contextlib.contextmanager
-def assert_ran(*op_names: str):
-    """Assert that each aten op ran as a native boxed kernel in the block."""
-    native.op_counting(True)
-    before = native.op_counts()
-    yield
-    after = native.op_counts()
-    for name in op_names:
-        assert after.get(name, 0) > before.get(name, 0), (
-            f"{name} did not run natively (counted: {sorted(after)})"
-        )
 
 
 @pytest.mark.parametrize("act", ["relu", "sigmoid", "tanh"])
@@ -174,8 +158,7 @@ def _check_tanh_backward_f32(
 )
 @pytest.mark.parametrize("layout", ["transpose", "broadcast", "resize", "strided_out"])
 def test_tanh_backward_generic_fallback(mojo_gpu, dtype, layout):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     g = torch.linspace(-0.5, 0.5, 35).reshape(5, 7).to(dtype)
     y = torch.linspace(-0.75, 0.75, 35).reshape(5, 7).to(dtype)
     gm, ym = g.to(mojo_gpu), y.to(mojo_gpu)
@@ -231,7 +214,7 @@ def test_where_self_out(mojo_gpu):
     a = torch.randn(4, 5, device=mojo_gpu)
     b = torch.randn(4, 5, device=mojo_gpu)
     out = torch.empty(4, 5, device=mojo_gpu)
-    with assert_ran("aten::where.self_out"):
+    with ran_all("aten::where.self_out"):
         got = torch.where(cond, a, b, out=out)
     assert got.data_ptr() == out.data_ptr()
     expected = torch.where(cond.cpu(), a.cpu(), b.cpu())
@@ -245,7 +228,7 @@ def test_where_self_out_resizes_and_broadcasts(mojo_gpu):
     a = torch.randn(3, 4, device=mojo_gpu)
     b = torch.randn(1, 4, device=mojo_gpu)
     out = torch.empty(0, device=mojo_gpu)
-    with assert_ran("aten::where.self_out"):
+    with ran_all("aten::where.self_out"):
         torch.where(cond, a, b, out=out)
     assert tuple(out.shape) == (3, 4)
     torch.testing.assert_close(out.cpu(), torch.where(cond.cpu(), a.cpu(), b.cpu()))
@@ -304,7 +287,7 @@ def test_batch_norm2d_training_step(mojo_gpu, dtype, affine, track):
     ours.load_state_dict(ref.state_dict())
 
     y_ref, gx_ref, gp_ref = _bn_grads(ref, x, grad)
-    with assert_ran("aten::native_batch_norm_backward"):
+    with ran_all("aten::native_batch_norm_backward"):
         y, gx, gp = _bn_grads(ours, x.to(dtype), grad.to(dtype), device=mojo_gpu)
 
     _close(y, y_ref, dtype)
@@ -338,7 +321,7 @@ def test_batch_norm2d_eval_backward(mojo_gpu, dtype):
     ours.eval()
 
     _, gx_ref, gp_ref = _bn_grads(ref, x, grad)
-    with assert_ran("aten::native_batch_norm_backward"):
+    with ran_all("aten::native_batch_norm_backward"):
         _, gx, gp = _bn_grads(ours, x.to(dtype), grad.to(dtype), device=mojo_gpu)
     _close(gx, gx_ref, dtype)
     for got, want in zip(gp, gp_ref):
@@ -355,7 +338,7 @@ def test_batch_norm1d_rank3(mojo_gpu):
     ours.load_state_dict(ref.state_dict())
 
     _, gx_ref, gp_ref = _bn_grads(ref, x, grad)
-    with assert_ran("aten::native_batch_norm_backward"):
+    with ran_all("aten::native_batch_norm_backward"):
         _, gx, gp = _bn_grads(ours, x, grad, device=mojo_gpu)
     _close(gx, gx_ref, torch.float32)
     for got, want in zip(gp, gp_ref):
@@ -373,7 +356,7 @@ def test_batch_norm3d_rank5(mojo_gpu):
     ours.load_state_dict(ref.state_dict())
 
     _, gx_ref, gp_ref = _bn_grads(ref, x, grad)
-    with assert_ran("aten::native_batch_norm_backward"):
+    with ran_all("aten::native_batch_norm_backward"):
         _, gx, gp = _bn_grads(ours, x, grad, device=mojo_gpu)
     assert tuple(gx.shape) == (2, 3, 2, 3, 4)
     _close(gx, gx_ref, torch.float32)
@@ -396,7 +379,7 @@ def test_batch_norm_input_grad_only(mojo_gpu):
         p.requires_grad_(False)
 
     _, gx_ref, _ = _bn_grads(ref, x, grad)
-    with assert_ran("aten::native_batch_norm_backward"):
+    with ran_all("aten::native_batch_norm_backward"):
         _, gx, _ = _bn_grads(ours, x, grad, device=mojo_gpu)
     _close(gx, gx_ref, torch.float32)
 
@@ -440,7 +423,7 @@ def test_native_batch_norm_backward_masks(mojo_gpu, dtype, train, affine, mask):
     )
     dev = [None if t is None else t.to(mojo_gpu) for t in [grad, x, weight]]
     rest = [t.to(mojo_gpu) for t in [running_mean, running_var, *stats]]
-    with assert_ran("aten::native_batch_norm_backward"):
+    with ran_all("aten::native_batch_norm_backward"):
         got = torch.ops.aten.native_batch_norm_backward(
             *dev, *rest, train, 1e-5, list(mask)
         )
@@ -495,7 +478,7 @@ def test_native_group_norm_backward(mojo_gpu, dtype, n, c, hxw, group, affine):
     _, dmean, drstd = torch.ops.aten.native_group_norm(
         dx, dw, None, n, c, hxw, group, 1e-5
     )
-    with assert_ran("aten::native_group_norm_backward"):
+    with ran_all("aten::native_group_norm_backward"):
         got = torch.ops.aten.native_group_norm_backward(
             grad.to(mojo_gpu), dx, dmean, drstd, dw, n, c, hxw, group, mask
         )
@@ -522,7 +505,7 @@ def test_native_group_norm_backward_masks(mojo_gpu, mask):
         grad, x, mean, rstd, weight, n, c, hxw, group, list(mask)
     )
     dev = [t.to(mojo_gpu) for t in [grad, x, mean, rstd, weight]]
-    with assert_ran("aten::native_group_norm_backward"):
+    with ran_all("aten::native_group_norm_backward"):
         got = torch.ops.aten.native_group_norm_backward(
             *dev, n, c, hxw, group, list(mask)
         )
@@ -550,7 +533,7 @@ def test_native_group_norm_backward_strided(mojo_gpu):
         grad.contiguous(), x, mean, rstd, weight, n, c, h * w, group, mask
     )
     dev = [t.to(mojo_gpu) for t in [x, mean, rstd, weight]]
-    with assert_ran("aten::native_group_norm_backward"):
+    with ran_all("aten::native_group_norm_backward"):
         got = torch.ops.aten.native_group_norm_backward(
             grad.to(mojo_gpu), *dev[:3], dev[3], n, c, h * w, group, mask
         )
@@ -584,7 +567,7 @@ def test_group_norm_autograd(mojo_gpu, dtype, affine, groups):
         return [leaf.grad, w.grad, b.grad]
 
     want = step("cpu", torch.float32)
-    with assert_ran("aten::native_group_norm_backward"):
+    with ran_all("aten::native_group_norm_backward"):
         got = step(mojo_gpu, dtype)
     for g, w in zip(got, want):
         assert g.dtype == dtype
@@ -600,7 +583,7 @@ def test_group_norm_module_training_step(mojo_gpu):
     x = torch.randn(3, 12, 9, 11)
     grad = torch.randn(3, 12, 9, 11)
     _, gx_ref, gp_ref = _bn_grads(ref, x, grad)
-    with assert_ran("aten::native_group_norm_backward"):
+    with ran_all("aten::native_group_norm_backward"):
         _, gx, gp = _bn_grads(ours, x, grad, device=mojo_gpu)
     _gn_close(gx, gx_ref, torch.float32)
     for got, want in zip(gp, gp_ref):
@@ -621,7 +604,7 @@ def test_softmax_backward(mojo_gpu, dim):
     torch.softmax(ref, dim=dim).backward(grad)
 
     ours = x.to(mojo_gpu).requires_grad_(True)
-    with assert_ran("aten::_softmax_backward_data"):
+    with ran_all("aten::_softmax_backward_data"):
         torch.softmax(ours, dim=dim).backward(grad.to(mojo_gpu))
     assert ours.grad is not None
     torch.testing.assert_close(ours.grad.cpu(), ref.grad, atol=1e-5, rtol=1e-5)
@@ -647,7 +630,7 @@ def test_softmax_backward_half(mojo_gpu, dtype, dim):
     out = torch.softmax(torch.randn(6, 50) * 3, dim).to(dtype)
     grad = torch.randn(6, 50).to(dtype)
     want = _softmax_backward_cuda(grad, out, dim, dtype)
-    with assert_ran("aten::_softmax_backward_data"):
+    with ran_all("aten::_softmax_backward_data"):
         got = torch.ops.aten._softmax_backward_data(
             grad.to(mojo_gpu), out.to(mojo_gpu), dim, dtype
         )
@@ -697,7 +680,7 @@ def test_softmax_backward_half_to_float(mojo_gpu):
 @pytest.mark.parametrize("shape", [(7, 9), (9, 7), (5, 5), (0, 3)])
 def test_trace(mojo_gpu, dtype, shape):
     x = (torch.randn(shape) * 10).to(dtype)
-    with assert_ran("aten::trace"):
+    with ran_all("aten::trace"):
         got = torch.trace(x.to(mojo_gpu))
     # CUDA's `trace_cuda` is `diagonal().sum()` for every dtype (CPU's trace
     # has no half/bool kernel).
@@ -719,7 +702,7 @@ def test_dot(mojo_gpu, op, dtype):
     g = torch.Generator().manual_seed(0)
     a = (torch.randn(37, generator=g) * 4).to(dtype)
     b = (torch.randn(37, generator=g) * 4).to(dtype)
-    with assert_ran("aten::vdot" if op == "vdot" else "aten::dot"):
+    with ran_all("aten::vdot" if op == "vdot" else "aten::dot"):
         got = fn(a.to(mojo_gpu), b.to(mojo_gpu))
     expected = fn(a.double(), b.double()).to(dtype)
     assert got.dtype == dtype
@@ -780,12 +763,11 @@ def test_dot_errors(mojo_gpu):
     ],
 )
 def test_linalg_cross(mojo_gpu, dtype, xs, ys, dim):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     g = torch.Generator().manual_seed(0)
     x = (torch.randn(xs, generator=g) * 8).to(dtype)
     y = (torch.randn(ys, generator=g) * 8).to(dtype)
-    with assert_ran("aten::linalg_cross"):
+    with ran_all("aten::linalg_cross"):
         got = torch.linalg.cross(x.to(mojo_gpu), y.to(mojo_gpu), dim=dim)
     # CPU's cross computes in the operand type like CUDA's `cross_kernel`
     # (c10::Half / BFloat16 round each product and the difference).
@@ -833,7 +815,7 @@ def test_linalg_cross_strided_out_and_cross(mojo_gpu):
     # out=: an empty out is resized, a transposed out of the right shape is
     # written in place
     out = torch.empty(0, device=mojo_gpu)
-    with assert_ran("aten::linalg_cross.out"):
+    with ran_all("aten::linalg_cross.out"):
         r = torch.linalg.cross(xm, ym.transpose(1, 2), dim=1, out=out)
     assert r is out
     torch.testing.assert_close(out.cpu(), expected, rtol=1e-5, atol=1e-5)
@@ -898,7 +880,7 @@ def test_test_optional_lists(mojo_gpu):
     ops = torch.ops.aten
     v = torch.tensor([1, 2, 3, -2147483647], dtype=torch.int32)
     vm = v.to(mojo_gpu)
-    with assert_ran("aten::_test_optional_intlist"):
+    with ran_all("aten::_test_optional_intlist"):
         got = ops._test_optional_intlist(vm, [1, 2, 3, -2])
     assert torch.equal(got.cpu(), ops._test_optional_intlist(v, [1, 2, 3, -2]))
     assert ops._test_optional_intlist(vm, None) is vm
@@ -946,7 +928,7 @@ def test_test_functorch_fallback(mojo_gpu):
     ops = torch.ops.aten
     x = torch.randn(3, 4)
     xm = x.to(mojo_gpu)
-    with assert_ran("aten::_test_functorch_fallback"):
+    with ran_all("aten::_test_functorch_fallback"):
         got = ops._test_functorch_fallback(xm.t(), xm)
     assert torch.equal(got.cpu(), x.t()) and got.data_ptr() != xm.data_ptr()
     out = torch.empty(0, device=mojo_gpu)

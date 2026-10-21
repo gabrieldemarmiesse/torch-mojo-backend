@@ -13,8 +13,13 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from tests.native.conftest import is_metal, skip_if_metal
-from torch_mojo_backend import native
+from tests.native.conftest import (
+    is_metal,
+    native_count,
+    reset_op_counts,
+    skip_float64_on_metal,
+    skip_if_metal,
+)
 
 S = torch.special
 
@@ -81,15 +86,6 @@ _CASES: list[tuple[str, Callable[[torch.Tensor], torch.Tensor], float, float]] =
 _IDS = [case[0] for case in _CASES]
 
 
-def _counted(name: str) -> bool:
-    return native.op_count(f"aten::{name}") > 0
-
-
-def _reset_counts():
-    native.op_counting(True)
-    native.op_counts_reset()
-
-
 def _sample(lo: float, hi: float, dtype: torch.dtype, n: int = 2000) -> torch.Tensor:
     g = torch.Generator().manual_seed(0)
     x = torch.rand(n, generator=g, dtype=torch.float64) * (hi - lo) + lo
@@ -136,9 +132,9 @@ def test_matches_cpu(
     dtype: torch.dtype,
 ):
     x = _sample(lo, hi, dtype)
-    _reset_counts()
+    reset_op_counts()
     actual = fn(x.to(mojo_gpu))
-    assert _counted(op_name), f"aten::{op_name} did not run natively"
+    assert native_count(op_name) > 0, f"aten::{op_name} did not run natively"
     expected = _reference(mojo_gpu, op_name, fn, x)
     torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
 
@@ -208,13 +204,12 @@ def test_bool_inputs(mojo_gpu: str, fn: Callable[..., torch.Tensor]):
     "dtype", (torch.float32, torch.float16, torch.bfloat16, torch.float64)
 )
 def test_signbit(mojo_gpu: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     x = torch.tensor([-0.0, 0.0, -1.5, 2.0, float("inf"), -float("inf")], dtype=dtype)
     x = torch.cat([x, -torch.tensor([float("nan")], dtype=dtype)])
-    _reset_counts()
+    reset_op_counts()
     actual = torch.signbit(x.to(mojo_gpu))
-    assert _counted("signbit")
+    assert native_count("signbit") > 0
     assert torch.equal(actual.cpu(), torch.signbit(x))
 
 
@@ -237,8 +232,7 @@ def _round_decimals_reference(x: torch.Tensor, decimals: int) -> torch.Tensor:
 )
 @pytest.mark.parametrize("decimals", (0, 1, 3, -1, -2))
 def test_round_decimals(mojo_gpu: str, dtype: torch.dtype, decimals: int):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     x = _sample(-500.0, 500.0, dtype)
     if is_metal(mojo_gpu):  # MPS's round_decimals_functor, see _MPS_SEMANTICS
         expected = torch.round(x.to("mps"), decimals=decimals).cpu()
@@ -283,13 +277,12 @@ def test_nan_to_num(
     posinf: float | None,
     neginf: float | None,
 ):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     x = _sample(-10.0, 10.0, dtype)
     expected = torch.nan_to_num(x, nan, posinf, neginf)
-    _reset_counts()
+    reset_op_counts()
     actual = torch.nan_to_num(x.to(mojo_gpu), nan, posinf, neginf)
-    assert _counted("nan_to_num")
+    assert native_count("nan_to_num") > 0
     torch.testing.assert_close(actual.cpu(), expected)
     out = torch.empty(x.numel() * 2, dtype=dtype).to(mojo_gpu)[::2]
     torch.nan_to_num(x.to(mojo_gpu), nan, posinf, neginf, out=out)
@@ -319,9 +312,9 @@ def test_logit(mojo_gpu: str, dtype: torch.dtype, eps: float | None):
         expected = torch.logit(x.to("mps"), eps).cpu()
     else:
         expected = torch.logit(x.float(), eps).to(dtype)
-    _reset_counts()
+    reset_op_counts()
     actual = torch.logit(x.to(mojo_gpu), eps)
-    assert _counted("logit")
+    assert native_count("logit") > 0
     torch.testing.assert_close(actual.cpu(), expected, equal_nan=True)
     out = torch.empty_like(x).to(mojo_gpu)
     torch.logit(x.to(mojo_gpu), eps, out=out)
@@ -349,9 +342,9 @@ def test_polygamma(mojo_gpu: str, dtype: torch.dtype, n: int):
     # From n = 2 on, zeta's alternating sum cancels badly for negative x:
     # CPU and CUDA torch themselves disagree there in the fourth digit.
     x = _sample(-10.0 if n < 2 else 0.05, 30.0, dtype)
-    _reset_counts()
+    reset_op_counts()
     actual = torch.polygamma(n, x.to(mojo_gpu))
-    assert _counted("polygamma")
+    assert native_count("polygamma") > 0
     expected = torch.polygamma(n, x)
     # Near the poles at the non-positive integers the result is huge and
     # ill-conditioned in the input: compare the regular part tightly.
@@ -369,9 +362,9 @@ def test_polygamma(mojo_gpu: str, dtype: torch.dtype, n: int):
 @pytest.mark.parametrize("p", (1, 2, 5))
 def test_mvlgamma(mojo_gpu: str, dtype: torch.dtype, p: int):
     x = (torch.rand(500, dtype=torch.float64) * 20 + (p - 1) / 2 + 0.01).to(dtype)
-    _reset_counts()
+    reset_op_counts()
     actual = torch.mvlgamma(x.to(mojo_gpu), p)
-    assert _counted("mvlgamma")
+    assert native_count("mvlgamma") > 0
     torch.testing.assert_close(actual.cpu(), torch.mvlgamma(x, p))
     out = torch.empty_like(x).to(mojo_gpu)
     torch.mvlgamma(x.to(mojo_gpu), p, out=out)

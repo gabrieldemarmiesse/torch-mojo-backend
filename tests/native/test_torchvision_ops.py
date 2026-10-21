@@ -20,15 +20,11 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from tests.native.conftest import skip_if_metal
+from tests.conftest import python_env
+from tests.native.conftest import skip_float64_on_metal
 
 vision = pytest.importorskip("torchvision")
 DTYPES = (torch.float32, torch.float16, torch.float64)
-
-
-def _dtype_supported(device: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(device, "Metal does not support float64")
 
 
 def _boxes(count: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -75,14 +71,6 @@ def _assert_close(got: torch.Tensor, want: torch.Tensor, dtype: torch.dtype):
     )
 
 
-def _reference_env() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key not in {"PYTHONHOME", "PYTHONEXECUTABLE"}
-    }
-
-
 def _cuda_reference_candidates() -> tuple[str, ...]:
     candidates = [os.environ.get("TORCHVISION_CUDA_REFERENCE_PYTHON"), sys.executable]
     candidates.extend(shutil.which(name) for name in ("python", "python3"))
@@ -121,7 +109,7 @@ def _find_cuda_reference(candidates: tuple[str, ...]) -> tuple[str | None, str]:
             result = subprocess.run(
                 [interpreter, "-c", script],
                 capture_output=True,
-                env=_reference_env(),
+                env=python_env(),
                 timeout=60,
             )
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -186,7 +174,7 @@ class _ReferenceWorker:
             [interpreter, "-c", _REFERENCE_WORKER],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            env=_reference_env(),
+            env=python_env(),
             bufsize=0,
         )
         atexit.register(self.close)
@@ -256,7 +244,7 @@ def _cuda_reference(
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("kind", ["roi_pool", "ps_roi_pool"])
 def test_roi_pool_rounding_neighbors(mojo_gpu: str, dtype: torch.dtype, kind: str):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     # Include the review's exact float32 predecessor of 0.5 and both signs.
     centers = torch.arange(-4, 5, dtype=dtype) + 0.5
     values = torch.stack(
@@ -297,7 +285,7 @@ def test_nms_half_intersection_rounding(mojo_gpu: str):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("autocast", [False, True])
 def test_nms_threshold_sweep(mojo_gpu: str, dtype: torch.dtype, autocast: bool):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     boxes = torch.tensor([[0, 0, 2, 1], [1, 0, 3, 1]], dtype=dtype)
     scores = torch.tensor([2, 1], dtype=dtype)
     center = torch.tensor(1 / 3, dtype=torch.float32)
@@ -322,7 +310,7 @@ def test_nms_threshold_sweep(mojo_gpu: str, dtype: torch.dtype, autocast: bool):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_roi_pool_integer_batch_bound(mojo_gpu: str, dtype: torch.dtype):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     data = torch.zeros(16777217, 1, 1, 1, dtype=dtype)
     data[-1] = 7
     data.requires_grad_()
@@ -345,7 +333,7 @@ def test_roi_pool_integer_batch_bound(mojo_gpu: str, dtype: torch.dtype):
     "kind", ["roi_align", "roi_pool", "ps_roi_align", "ps_roi_pool"]
 )
 def test_roi_cuda_dtype_arithmetic(mojo_gpu: str, dtype: torch.dtype, kind: str):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     data = (
         (torch.arange(100, dtype=torch.float64).reshape(1, 4, 5, 5) / 37)
         .to(dtype)
@@ -374,7 +362,7 @@ def test_roi_cuda_dtype_arithmetic(mojo_gpu: str, dtype: torch.dtype, kind: str)
 @pytest.mark.parametrize("count", [0, 1, 47, 3073])
 @pytest.mark.parametrize("threshold", [0.0, 0.5, 1.0])
 def test_nms(mojo_gpu: str, dtype: torch.dtype, count: int, threshold: float):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     boxes = _boxes(count, dtype)
     scores = torch.rand(count, generator=torch.Generator().manual_seed(171)).to(dtype)
     if dtype == torch.float16:
@@ -497,7 +485,7 @@ def test_roi_align_forward_backward(
 @pytest.mark.parametrize("kind", ["align", "pool"])
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_roi_dtypes(mojo_gpu: str, kind: str, dtype: torch.dtype):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     _check_roi(mojo_gpu, kind, dtype, 1.0, 2, True)
 
 
@@ -557,7 +545,7 @@ def _check_roi(
 def test_roi_backward_overlapping(
     mojo_gpu: str, kind: str, dtype: torch.dtype, count: int, full_image: bool
 ):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     data = ((torch.arange(2 * 3 * 17 * 19) * 71) % 997).reshape(2, 3, 17, 19)
     data = (data.to(torch.float64) / 1024).to(dtype)
     rois = torch.tensor(
@@ -696,7 +684,7 @@ def test_roi_pool_backward_rounded_bin_edge(mojo_gpu: str):
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("channels", [31, 32, 33])
 def test_roi_pool_geometry_regimes(mojo_gpu: str, dtype: torch.dtype, channels: int):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     data = torch.randn(
         1, channels, 15, 15, generator=torch.Generator().manual_seed(781)
     ).to(dtype)
@@ -771,7 +759,7 @@ def _check_ps_roi(
     empty: bool = False,
     noncontiguous: bool = False,
 ):
-    _dtype_supported(device, dtype)
+    skip_float64_on_metal(device, dtype)
     generator = torch.Generator().manual_seed(201)
     data = torch.randn(3, 45, 37, 53, generator=generator).to(dtype)
     rois = _rois(scale, dtype)
@@ -849,7 +837,7 @@ def test_ps_roi_align_zero_area(mojo_gpu: str, sampling: int):
 @pytest.mark.parametrize("kind", ["align", "pool"])
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_ps_roi_channel_mapping(mojo_gpu: str, kind: str, dtype: torch.dtype):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     data = torch.arange(30, dtype=dtype).reshape(1, 30, 1, 1).expand(1, 30, 9, 11)
     rois = torch.tensor([[0, 1, 1, 8, 7], [0, -9, -8, -6, -4]], dtype=dtype)
     op = getattr(torch.ops.torchvision, f"ps_roi_{kind}")
@@ -1011,7 +999,7 @@ def _check_deform(
     noncontiguous: bool = False,
     autocast: bool = False,
 ):
-    _dtype_supported(device, dtype)
+    skip_float64_on_metal(device, dtype)
     tensors = _deform_data(
         dtype, groups, offset_groups, stride, padding, dilation, batch
     )
@@ -1177,7 +1165,7 @@ def test_deform_conv2d_deterministic_algorithms(
 @pytest.mark.parametrize("kind", ["align", "pool"])
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_ps_roi_overlapping_backward(mojo_gpu: str, kind: str, dtype: torch.dtype):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     data = (torch.arange(30 * 11 * 13).reshape(1, 30, 11, 13) % 17).to(dtype) / 16
     rois = torch.tensor([[0, -2, -1, 10, 9]], dtype=dtype).repeat(257, 1)
     reference_dtype = dtype
@@ -1311,7 +1299,7 @@ def test_deform_conv2d_large_spatial_sampling(mojo_gpu: str, dtype: torch.dtype)
 def test_deform_conv2d_ignored_mask_gradient(
     mojo_gpu: str, batch: int, dtype: torch.dtype
 ):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     data = torch.ones(batch, 2, 3, 5, dtype=dtype)
     weight = torch.full((3, 2, 1, 1), 0.25, dtype=dtype)
     offset = torch.zeros(batch, 2, 3, 5, dtype=dtype)
@@ -1354,7 +1342,7 @@ def test_deform_conv2d_half_offset_knot(mojo_gpu: str, axis: int):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
 def test_deform_conv2d_cuda_dtype_arithmetic(mojo_gpu: str, dtype: torch.dtype):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     data = (torch.arange(24, dtype=torch.float64) / 13).to(dtype).reshape(1, 2, 3, 4)
     offset = torch.full((1, 2, 3, 4), 0.23, dtype=dtype)
     weight = torch.tensor([0.3, -0.7], dtype=dtype).reshape(1, 2, 1, 1)
@@ -1462,7 +1450,7 @@ def test_deform_conv2d_offset_boundary_derivative(mojo_gpu: str, axis: int):
 
 
 def test_deform_conv2d_numerical_gradient(mojo_gpu: str):
-    _dtype_supported(mojo_gpu, torch.float64)
+    skip_float64_on_metal(mojo_gpu, torch.float64)
     generator = torch.Generator().manual_seed(207)
     tensors = (
         torch.randn(1, 1, 4, 3, generator=generator, dtype=torch.float64),
@@ -1496,7 +1484,7 @@ def test_deform_conv2d_numerical_gradient(mojo_gpu: str):
 
 @pytest.mark.parametrize("kind", ["align", "pool"])
 def test_roi_numerical_gradient(mojo_gpu: str, kind: str):
-    _dtype_supported(mojo_gpu, torch.float64)
+    skip_float64_on_metal(mojo_gpu, torch.float64)
     data = torch.randn(
         1, 1, 4, 5, generator=torch.Generator().manual_seed(74), dtype=torch.float64
     )
@@ -1715,7 +1703,7 @@ def test_roi_pool_autocast_forward_backward(mojo_gpu: str, dtype: torch.dtype):
 def test_nms_identical_boxes(
     mojo_gpu: str, threshold: float, tied: bool, dtype: torch.dtype
 ):
-    _dtype_supported(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     boxes = torch.tensor([[0.125, 0.3125, 13.234, 31.445]], dtype=dtype).repeat(9, 1)
     scores = (
         torch.ones(9, dtype=dtype) if tied else torch.linspace(0.1, 0.9, 9).to(dtype)

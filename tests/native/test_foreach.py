@@ -33,7 +33,7 @@ from collections.abc import Sequence
 import pytest
 import torch
 
-from tests.native.conftest import is_metal, ran, skip_if_metal
+from tests.native.conftest import is_metal, ran, skip_float64_on_metal, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.testing import CallChecker
 
@@ -1527,8 +1527,7 @@ def test_fused_optimizer_matches_cpu(
     dtype_id: str,
 ):
     dtype = _FUSED_DTYPES[dtype_id]
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     lists = _fused_lists(name, n_lists, dtype)
     mojo = _to(lists, mojo_gpu)
     # Half types: CUDA computes in float from the stored values and rounds
@@ -2363,8 +2362,7 @@ def test_mta_core_overloads_match_cpu(mojo_gpu: str, name: str, dtype_id: str):
     """The overloads the multi-tensor apply started with, in every floating
     dtype, over ragged and misaligned lists."""
     dtype = _MTA_FLOATS[dtype_id]
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     call, reference = _MTA_CORE[name]
     cpu, dev = _mta_lists(mojo_gpu, dtype, -3, 3, seed=61)
     cpu1, dev1 = _mta_lists(mojo_gpu, dtype, -2, 2, seed=62)
@@ -2612,8 +2610,7 @@ _MTA_UNARY_CASES = [
 @pytest.mark.parametrize(("name", "dtype_id"), _MTA_UNARY_CASES)
 def test_mta_unary_matches_cpu(mojo_gpu: str, name: str, dtype_id: str, inplace: bool):
     dtype = _MTA_FLOATS[dtype_id]
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     lo, hi = _MTA_UNARY[name]
     cpu, dev = _mta_lists(mojo_gpu, dtype, lo, hi, seed=len(name))
     if inplace:
@@ -2656,8 +2653,7 @@ def test_mta_abs_and_zero_on_bool(mojo_gpu: str):
     "dtype", [torch.float32, torch.float16, torch.float64, torch.int64, torch.bool]
 )
 def test_mta_zero_(mojo_gpu: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     cpu, dev = _mta_lists(mojo_gpu, dtype, 1, 5, seed=1)
     with _one_launch("_foreach_zero_", mojo_gpu):
         torch._foreach_zero_(dev)
@@ -2799,8 +2795,7 @@ def test_mta_binary_matches_cpu(
     mojo_gpu: str, op: str, overload: str, dtype_id: str, inplace: bool
 ):
     dtype = _MTA_FLOATS[dtype_id]
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     scalars = [0.5 + 0.25 * i for i in range(len(_MTA_SIZES))]
     if op == "div":
         scalars = [s + 0.1 for s in scalars]
@@ -2844,8 +2839,7 @@ def test_mta_binary_bool(mojo_gpu: str, op: str):
 @pytest.mark.parametrize("dtype_id", list(_MTA_FLOATS))
 def test_mta_pow_scalar_and_tensor(mojo_gpu: str, dtype_id: str):
     dtype = _MTA_FLOATS[dtype_id]
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     cpu, dev = _mta_lists(mojo_gpu, dtype, -2, 2, seed=9)
     with _one_launch("_foreach_pow.ScalarAndTensor", mojo_gpu):
         actual = torch._foreach_pow(1.75, dev)
@@ -3065,8 +3059,7 @@ def test_mta_pointwise_matches_cpu(
     mojo_gpu: str, op: str, overload: str, dtype_id: str, inplace: bool
 ):
     dtype = _MTA_FLOATS[dtype_id]
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     cpu, dev = _mta_lists(mojo_gpu, dtype, -3, 3, seed=21)
     cpu1, dev1 = _mta_lists(mojo_gpu, dtype, -2, 2, seed=22)
     cpu2, dev2 = _mta_lists(mojo_gpu, dtype, 0.5, 2, seed=23)
@@ -3094,8 +3087,7 @@ def test_mta_lerp_matches_cpu(
     mojo_gpu: str, overload: str, dtype_id: str, inplace: bool
 ):
     dtype = _MTA_FLOATS[dtype_id]
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     cpu, dev = _mta_lists(mojo_gpu, dtype, -3, 3, seed=31)
     cpu_e, dev_e = _mta_lists(mojo_gpu, dtype, -3, 3, seed=32)
     cpu_w, dev_w = _mta_lists(mojo_gpu, dtype, -0.5, 1.5, seed=33)
@@ -3207,8 +3199,7 @@ def test_mta_norm_matches_cpu(mojo_gpu: str, dtype_id: str, ord_: float):
 def test_mta_powsum_matches_cpu(
     mojo_gpu: str, dtype: torch.dtype, out_dtype: torch.dtype | None, ord_: int
 ):
-    if out_dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, out_dtype)
     cpu, dev = _mta_lists(mojo_gpu, dtype, -2, 2, seed=52)
     kwargs = {} if out_dtype is None else {"dtype": out_dtype}
     with _one_launch("_foreach_powsum.Scalar", mojo_gpu):
@@ -3266,8 +3257,7 @@ def test_mta_norm_fallbacks_and_errors(mojo_gpu: str):
     ids=str,
 )  # fmt: skip
 def test_mta_max_matches_cpu(mojo_gpu: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     sizes = [7, 1, 65_537, 131_072, 3, 200_001]
     lo, hi = (0, 2) if dtype == torch.bool else (-100, 100)
     if dtype == torch.uint8:
@@ -3463,8 +3453,7 @@ def test_mta_powsum_complex_dtype_is_its_real_dtype(
     list), powsum computes in the complex dtype's real value dtype, as on
     stock CUDA: `_foreach_powsum([ones(2)], 3, dtype=complex64)` is float32
     2.0; norm refuses it (linalg.vector_norm's check)."""
-    if real == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, real)
     ones = [torch.ones(2, device=mojo_gpu)]
     for ord_, want in ((3, 2.0), (0, 2.0), (-1, 2.0), (float("inf"), 2.0)):
         (r,) = torch._foreach_powsum(ones, ord_, dtype=dtype)

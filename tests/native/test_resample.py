@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import ran, skip_float64_on_metal, skip_if_metal
 
 _FLOATS = [torch.float32, torch.float16, torch.bfloat16]
 
@@ -318,8 +318,7 @@ _HAS_LANCZOS = hasattr(torch.ops.aten, "_upsample_lanczos2d_aa")
 )
 def test_upsample_lanczos(mojo_device, shape, kwargs, dtype):
     """Lanczos-3 (CPU-only upstream): forward and backward against CPU."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_device, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_device, dtype)
     x = torch.randn(shape, dtype=dtype)
     _check_fwd_bwd(
         lambda t: F.interpolate(t, mode="lanczos", antialias=True, **kwargs),

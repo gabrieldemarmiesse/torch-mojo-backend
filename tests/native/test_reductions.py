@@ -13,7 +13,7 @@ import math
 import pytest
 import torch
 
-from tests.native.conftest import is_metal, ran, skip_if_metal
+from tests.native.conftest import is_metal, ran, skip_float64_on_metal, skip_if_metal
 from tests.native.test_scans import cuda_lowp_cumsum
 from torch_mojo_backend import get_accelerators, native, register_mojo_devices
 
@@ -3140,8 +3140,7 @@ def test_prod_rank0(mojo_gpu):
     "dtype", [torch.float32, torch.float64, torch.int32, torch.int64]
 )
 def test_max_and_min_full_reduction_rank0(mojo_device, dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_device, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_device, dtype)
     x = (
         torch.tensor(-3.5, dtype=dtype)
         if dtype.is_floating_point
@@ -3274,11 +3273,7 @@ def test_cumsum_shapes_match_cpu(mojo_gpu, shape, dim):
     torch.testing.assert_close(result, expected, rtol=2e-3, atol=2e-2)
 
 
-@pytest.mark.parametrize(
-    "dtype", [torch.bfloat16, torch.float16, torch.int32, torch.int64]
-)
-@pytest.mark.parametrize("shape,dim", [((4096, 4096), 1), ((4096, 4096), 0)])
-def test_cumsum_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
+def _check_cumsum_dtype(mojo_gpu, shape, dim, dtype):
     torch.manual_seed(0)
     if dtype.is_floating_point:
         x = torch.randn(shape).to(dtype)
@@ -3295,6 +3290,14 @@ def test_cumsum_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
         )
     else:
         torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float16, torch.int32, torch.int64]
+)
+@pytest.mark.parametrize("shape,dim", [((4096, 4096), 1), ((4096, 4096), 0)])
+def test_cumsum_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
+    _check_cumsum_dtype(mojo_gpu, shape, dim, dtype)
 
 
 @pytest.mark.parametrize(
@@ -3303,22 +3306,7 @@ def test_cumsum_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
 @pytest.mark.parametrize("shape,dim", [((4, 5120), 1), ((8, 100_003), 1)])
 def test_cumsum_workspace_dtypes_match_cpu(mojo_gpu, shape, dim, dtype):
     """The long-line 3-pass workspace path (few rows), per dtype."""
-    torch.manual_seed(0)
-    if dtype.is_floating_point:
-        x = torch.randn(shape).to(dtype)
-    else:
-        x = torch.randint(-100, 100, shape, dtype=dtype)
-    result = torch.cumsum(x.to(mojo_gpu), dim=dim)
-    expected = torch.cumsum(x, dim=dim)
-    assert result.dtype == expected.dtype
-    if dtype.is_floating_point:
-        # CUDA's half running sum rounds after every addition; CPU's float
-        # one rounds once, so the reference is CUDA's order, bit-exact.
-        torch.testing.assert_close(
-            result.cpu(), cuda_lowp_cumsum(x, dim), rtol=0, atol=0
-        )
-    else:
-        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+    _check_cumsum_dtype(mojo_gpu, shape, dim, dtype)
 
 
 @pytest.mark.parametrize("dim", [-1, -2])
@@ -3935,8 +3923,7 @@ def test_sort_every_dtype(mojo_gpu, dtype, columns):
     """Every kernel dtype, on a one-tile and a multi-tile row. The 64-bit
     dtypes matter most: their key is twice as wide, which halves the tile and
     so moves every route boundary."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     host = _dtype_probe((3, columns), dtype)
     for descending in (False, True):
         expected = torch.sort(host, dim=-1, descending=descending, stable=True)
@@ -3950,8 +3937,7 @@ def test_sort_every_dtype(mojo_gpu, dtype, columns):
 @pytest.mark.parametrize("dtype", [d for d in _SORT_DTYPES if d is not torch.bool])
 @pytest.mark.parametrize("k", [1, 9, 257])
 def test_topk_every_dtype(mojo_gpu, dtype, k):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     host = _dtype_probe((3, 257), dtype)
     for largest in (True, False):
         _check_topk(host, mojo_gpu, k, -1, largest)
@@ -3992,8 +3978,7 @@ def test_sort_and_topk_non_contiguous_input(mojo_gpu):
 def test_sort_orders_nan_and_signed_zero_like_aten(mojo_gpu, dtype):
     """A negative NaN's bits sit below -inf and -0.0's below +0.0, but ATen
     orders every NaN above every number and treats the two zeros as equal."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     nan = float("nan")
     inf = float("inf")
     x = torch.tensor([[0.0, -0.0, nan, -nan, inf, -inf, 1.0, -1.0, nan, 0.0]])
@@ -4190,8 +4175,7 @@ def test_kthvalue_matches_cpu_across_the_routes(mojo_gpu, columns, k):
 def test_median_and_kthvalue_every_dtype(mojo_gpu, dtype, columns):
     """Heavily tied values: median's lowest-index tie rule is exact, and
     kthvalue's value is, with an index pointing at it."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     host = _dtype_probe((3, columns), dtype)
     _check_median(host, mojo_gpu, -1, False)
     for k in (1, columns // 3, columns):
@@ -4360,8 +4344,7 @@ def test_float64_moments_do_not_overflow(mojo_gpu):
 def test_var_mean_of_one_infinite_element(mojo_gpu, dtype):
     """One element is its own mean, infinite or not (CUDA keeps mean=inf,
     variance NaN)."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     x = torch.tensor([float("inf")], dtype=dtype)
     for correction in (0, 1):
         v, m = torch.var_mean(x.to(mojo_gpu), correction=correction)
@@ -4390,8 +4373,7 @@ def test_var_mean_of_one_infinite_element(mojo_gpu, dtype):
 def test_var_mean_welford_geometries(mojo_gpu, dtype, shape, dims):
     """Every Welford route (contiguous rows, split rows, segmented rows,
     strided columns, permuted copy) against a float64 CPU reference."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(len(shape))
     x = (torch.randn(shape) * 3 + 5).to(dtype)
     ref_v, ref_m = torch.var_mean(x.double(), dim=dims, correction=1)
@@ -4407,8 +4389,7 @@ def test_var_mean_welford_geometries(mojo_gpu, dtype, shape, dims):
 def test_var_std_nan_correction_divides_by_zero(mojo_gpu, dtype):
     """CUDA's divisor is `n > correction ? n - correction : 0`: a NaN
     correction gives a zero divisor, so the variance is inf (not NaN)."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     nan = float("nan")
     x = torch.tensor([1.0, 2.0], dtype=dtype, device=mojo_gpu)
     x2 = torch.tensor([[1.0, 2.0], [3.0, 5.0]], dtype=dtype, device=mojo_gpu)
@@ -4464,8 +4445,7 @@ def test_welford_inf_and_nan_like_cuda(mojo_gpu, bad, shape, where, dim, correct
 def test_var_mean_is_welford_and_does_not_overflow(mojo_gpu, dtype, big):
     """CUDA's WelfordOps: the mean of [0, big, big] is 2 * big / 3 in every
     dtype (a sum-then-divide mean overflows)."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     x = torch.tensor([0.0, big, big], dtype=dtype)
     for op in (torch.var_mean, torch.std_mean):
         _, m = op(x.to(mojo_gpu))

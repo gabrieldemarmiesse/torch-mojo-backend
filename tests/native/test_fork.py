@@ -18,8 +18,6 @@ import gc
 import os
 import select
 import signal
-import subprocess
-import sys
 import textwrap
 import warnings
 from collections.abc import Callable
@@ -30,6 +28,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from tests.conftest import run_python
 from torch_mojo_backend import native
 from torch_mojo_backend.native import device_module  # what torch.mojo is
 
@@ -266,19 +265,7 @@ def test_fork_before_import_allows_fresh_child_pinned_allocator(
         _, status = os.waitpid(child, 0)
         assert os.waitstatus_to_exitcode(status) == 0, status
     """)
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
-    }
-    proc = subprocess.run(
-        [sys.executable, "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    proc = run_python("-c", script, timeout=180)
     assert "fresh pinning succeeded" in proc.stdout
 
 

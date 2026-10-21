@@ -9,7 +9,7 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
-from torch_mojo_backend import get_accelerators
+from tests.native.conftest import is_metal
 
 
 def _mul_loop(device: str):
@@ -26,7 +26,7 @@ def test_legacy_profiler_reports_time_or_unsupported_events(
     _mul_loop(mojo_gpu)  # warm the kernel build outside the profiled region
     with torch.autograd.profiler.profile(use_device="mojo") as prof:
         _mul_loop(mojo_gpu)
-    if list(get_accelerators())[int(mojo_gpu.rsplit(":", 1)[-1])].api == "metal":
+    if is_metal(mojo_gpu):
         # MAX has no Metal timing events. The callback must report the
         # failure without dereferencing a null event and crashing Python.
         assert "events are not supported on Apple GPU" in capfd.readouterr().err

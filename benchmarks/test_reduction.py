@@ -13,6 +13,8 @@ device kernel time only, which is exactly what the design pinned.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 import torch
 from bench_lib.cases import DTYPES, both, unit_interval
@@ -228,6 +230,20 @@ def _dim_case(
     return x_ref, x_our, dim
 
 
+def _bench_both(
+    bench: Bench,
+    fn: Callable[..., object],
+    x_ref: torch.Tensor,
+    x_our: torch.Tensor,
+    **kwargs: int | None,
+):
+    bench.run(
+        lambda: fn(x_ref, **kwargs),
+        lambda: fn(x_our, **kwargs),
+        flops=float(x_ref.numel()),
+    )
+
+
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
 @pytest.mark.parametrize("shape_id", DIM_SHAPES)
 @pytest.mark.bench_op("sum.dim_IntList")
@@ -235,18 +251,8 @@ def test_sum(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    if dim is None:
-        bench.run(
-            lambda: torch.sum(x_ref),
-            lambda: torch.sum(x_our),
-            flops=float(x_ref.numel()),
-        )
-    else:
-        bench.run(
-            lambda: torch.sum(x_ref, dim=dim),
-            lambda: torch.sum(x_our, dim=dim),
-            flops=float(x_ref.numel()),
-        )
+    kwargs = {} if dim is None else {"dim": dim}
+    _bench_both(bench, torch.sum, x_ref, x_our, **kwargs)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -255,18 +261,8 @@ def test_nansum(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    if dim is None:
-        bench.run(
-            lambda: torch.nansum(x_ref),
-            lambda: torch.nansum(x_our),
-            flops=float(x_ref.numel()),
-        )
-    else:
-        bench.run(
-            lambda: torch.nansum(x_ref, dim=dim),
-            lambda: torch.nansum(x_our, dim=dim),
-            flops=float(x_ref.numel()),
-        )
+    kwargs = {} if dim is None else {"dim": dim}
+    _bench_both(bench, torch.nansum, x_ref, x_our, **kwargs)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -275,18 +271,8 @@ def test_mean(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    if dim is None:
-        bench.run(
-            lambda: torch.mean(x_ref),
-            lambda: torch.mean(x_our),
-            flops=float(x_ref.numel()),
-        )
-    else:
-        bench.run(
-            lambda: torch.mean(x_ref, dim=dim),
-            lambda: torch.mean(x_our, dim=dim),
-            flops=float(x_ref.numel()),
-        )
+    kwargs = {} if dim is None else {"dim": dim}
+    _bench_both(bench, torch.mean, x_ref, x_our, **kwargs)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -295,18 +281,8 @@ def test_prod(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    if dim is None:
-        bench.run(
-            lambda: torch.prod(x_ref),
-            lambda: torch.prod(x_our),
-            flops=float(x_ref.numel()),
-        )
-    else:
-        bench.run(
-            lambda: torch.prod(x_ref, dim=dim),
-            lambda: torch.prod(x_our, dim=dim),
-            flops=float(x_ref.numel()),
-        )
+    kwargs = {} if dim is None else {"dim": dim}
+    _bench_both(bench, torch.prod, x_ref, x_our, **kwargs)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -362,11 +338,7 @@ def test_amax(
 ):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: torch.amax(x_ref, dim=dim),
-        lambda: torch.amax(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.amax, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -376,11 +348,7 @@ def test_amin(
 ):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: torch.amin(x_ref, dim=dim),
-        lambda: torch.amin(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.amin, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("f32",))
@@ -389,11 +357,7 @@ def test_argmax(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    bench.run(
-        lambda: torch.argmax(x_ref, dim=dim),
-        lambda: torch.argmax(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.argmax, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("f32",))
@@ -402,11 +366,7 @@ def test_argmin(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    bench.run(
-        lambda: torch.argmin(x_ref, dim=dim),
-        lambda: torch.argmin(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.argmin, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bool",))
@@ -416,18 +376,8 @@ def test_all(
 ):
     shape, dim = DIM_SHAPES[shape_id]
     x_ref, x_our = both(torch.rand(shape) < 0.999, hw, mojo_device)
-    if dim is None:
-        bench.run(
-            lambda: torch.all(x_ref),
-            lambda: torch.all(x_our),
-            flops=float(x_ref.numel()),
-        )
-    else:
-        bench.run(
-            lambda: torch.all(x_ref, dim=dim),
-            lambda: torch.all(x_our, dim=dim),
-            flops=float(x_ref.numel()),
-        )
+    kwargs = {} if dim is None else {"dim": dim}
+    _bench_both(bench, torch.all, x_ref, x_our, **kwargs)
 
 
 @pytest.mark.parametrize("dtype_id", ("bool",))
@@ -437,18 +387,8 @@ def test_any(
 ):
     shape, dim = DIM_SHAPES[shape_id]
     x_ref, x_our = both(torch.rand(shape) < 0.001, hw, mojo_device)
-    if dim is None:
-        bench.run(
-            lambda: torch.any(x_ref),
-            lambda: torch.any(x_our),
-            flops=float(x_ref.numel()),
-        )
-    else:
-        bench.run(
-            lambda: torch.any(x_ref, dim=dim),
-            lambda: torch.any(x_our, dim=dim),
-            flops=float(x_ref.numel()),
-        )
+    kwargs = {} if dim is None else {"dim": dim}
+    _bench_both(bench, torch.any, x_ref, x_our, **kwargs)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -459,11 +399,7 @@ def test_min_dim(
 ):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: torch.min(x_ref, dim=dim),
-        lambda: torch.min(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.min, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -510,11 +446,7 @@ def test_cumsum(
 ):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: torch.cumsum(x_ref, dim=dim),
-        lambda: torch.cumsum(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.cumsum, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bool",))
@@ -648,11 +580,7 @@ def test_max_dim(
 ):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: torch.max(x_ref, dim=dim),
-        lambda: torch.max(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.max, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -663,11 +591,7 @@ def test_aminmax(
 ):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: torch.aminmax(x_ref, dim=dim),
-        lambda: torch.aminmax(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.aminmax, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -677,11 +601,7 @@ def test_std(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    bench.run(
-        lambda: torch.std(x_ref, dim=dim),
-        lambda: torch.std(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.std, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -691,11 +611,7 @@ def test_var_mean(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    bench.run(
-        lambda: torch.var_mean(x_ref, dim=dim),
-        lambda: torch.var_mean(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.var_mean, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -705,11 +621,7 @@ def test_std_mean(
     shape_id: str, dtype_id: str, bench: Bench, hw: Hardware, mojo_device: torch.device
 ):
     x_ref, x_our, dim = _dim_case(shape_id, dtype_id, hw, mojo_device)
-    bench.run(
-        lambda: torch.std_mean(x_ref, dim=dim),
-        lambda: torch.std_mean(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.std_mean, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -722,11 +634,7 @@ def test_cumprod(
     # Factors near 1 keep the running product finite over 4096 steps.
     src = (torch.rand(shape) * 0.002 + 0.999).to(DTYPES[dtype_id])
     x_ref, x_our = both(src, hw, mojo_device)
-    bench.run(
-        lambda: torch.cumprod(x_ref, dim=dim),
-        lambda: torch.cumprod(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.cumprod, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -737,11 +645,7 @@ def test_cummax(
 ):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: torch.cummax(x_ref, dim=dim),
-        lambda: torch.cummax(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.cummax, x_ref, x_our, dim=dim)
 
 
 @pytest.mark.parametrize("dtype_id", ("bf16", "f32"))
@@ -752,11 +656,7 @@ def test_logcumsumexp(
 ):
     shape, dim = LASTDIM_SHAPES[shape_id]
     x_ref, x_our = both(unit_interval(shape, DTYPES[dtype_id]), hw, mojo_device)
-    bench.run(
-        lambda: torch.logcumsumexp(x_ref, dim=dim),
-        lambda: torch.logcumsumexp(x_our, dim=dim),
-        flops=float(x_ref.numel()),
-    )
+    _bench_both(bench, torch.logcumsumexp, x_ref, x_our, dim=dim)
 
 
 # mode sorts each row whole (the same routes as median), then one thread per

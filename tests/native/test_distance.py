@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.func import jvp
 
-from tests.native.conftest import ran, skip_if_metal
+from tests.native.conftest import ran, skip_float64_on_metal
 
 aten = torch.ops.aten
 
@@ -42,16 +42,11 @@ def _tol(dtype: torch.dtype, p: float) -> tuple[float, float]:
     return 1e-4, 1e-5
 
 
-def _dtype_or_skip(device: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(device, "Apple GPUs have no float64")
-
-
 @pytest.mark.parametrize("dtype", DIST_DTYPES)
 @pytest.mark.parametrize("p", P_VALUES)
 @pytest.mark.parametrize("shapes", CDIST_SHAPES, ids=str)
 def test_cdist(mojo_gpu, dtype, p, shapes):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(0)
     a = torch.randn(shapes[0], dtype=dtype, requires_grad=True)
     b = torch.randn(shapes[1], dtype=dtype, requires_grad=True)
@@ -211,7 +206,7 @@ def test_out_overloads(mojo_gpu):
 @pytest.mark.parametrize("p", [0.0, 1.0, 2.0, 10.0, 0.5, 1.5, float("inf")])
 @pytest.mark.parametrize("n,m", [(1, 5), (5, 1), (5, 5), (37, 357), (300, 3)])
 def test_pdist(mojo_gpu, dtype, p, n, m):
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(3)
     x = torch.randn(n, m, dtype=dtype, requires_grad=True)
     want = F.pdist(x, p)
@@ -259,7 +254,7 @@ def test_glu_jvp(mojo_gpu, dtype, dim):
     """glu_jvp_kernel computes in float and rounds once: the reference is
     the float32 kernel over the same operands (glu's output already rounded
     to the dtype, as forward AD hands it over), rounded to the dtype."""
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(4)
     x = (torch.randn(4, 6, 8) * 3).to(dtype)
     t = torch.randn(4, 6, 8).to(dtype)
@@ -289,7 +284,7 @@ def test_glu_backward_jvp(mojo_gpu, dtype, dim):
     """The same composite as GatedLinearUnit.cpp's, op by op: float32 and
     float64 match the CPU's; the half types round every intermediate as the
     CUDA composite does, so they are held to the float math loosely."""
-    _dtype_or_skip(mojo_gpu, dtype)
+    skip_float64_on_metal(mojo_gpu, dtype)
     if dtype == torch.float64:
         # ATen's composite runs sigmoid, which this device does not have in
         # float64 yet: the op declines exactly where its sigmoid does.

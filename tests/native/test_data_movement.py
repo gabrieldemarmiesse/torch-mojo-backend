@@ -17,8 +17,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tests.native.conftest import ran, skip_if_metal
-from tests.native.test_matmul import assert_ran
+from tests.native.conftest import ran, ran_all, skip_float64_on_metal, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators
 
 # tests/native/conftest.py registers devices at fixture setup. Registration
@@ -1726,7 +1725,7 @@ def test_gather(mojo_gpu, shape, dim, dtype, idx_dtype):
         max(1, s - 2) if d != dim % len(shape) else 11 for d, s in enumerate(shape)
     )
     index = torch.randint(0, shape[dim], index_shape, dtype=idx_dtype)
-    with assert_ran("aten::gather"):
+    with ran_all("aten::gather"):
         dev = torch.gather(x.to(mojo_gpu), dim, index.to(mojo_gpu))
     assert dev.shape == index.shape
     torch.testing.assert_close(dev.cpu(), torch.gather(x, dim, index), rtol=0, atol=0)
@@ -1737,13 +1736,13 @@ def test_gather_strided_operands_and_out(mojo_gpu):
     index = torch.randint(0, 41, (13, 29))
     expected = torch.gather(x.t(), 1, index.t())
     xs, idx = x.to(mojo_gpu).t(), index.to(mojo_gpu).t()
-    with assert_ran("aten::gather"):
+    with ran_all("aten::gather"):
         dev = torch.gather(xs, 1, idx)
     torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
     # A strided out= of the right shape is written where it lives.
     base = torch.zeros(13, 29, device=mojo_gpu)
     out = base.t()
-    with assert_ran("aten::gather.out"):
+    with ran_all("aten::gather.out"):
         returned = torch.gather(xs, 1, idx, out=out)
     assert returned.data_ptr() == base.data_ptr()
     torch.testing.assert_close(base.t().cpu(), expected, rtol=0, atol=0)
@@ -1771,7 +1770,7 @@ def test_gather_backward(mojo_gpu):
     x = torch.randn(9, 13)
     index = torch.randint(0, 13, (9, 20))
     xd = x.to(mojo_gpu).requires_grad_()
-    with assert_ran("aten::gather", "aten::scatter_add_"):
+    with ran_all("aten::gather", "aten::scatter_add_"):
         torch.gather(xd, 1, index.to(mojo_gpu)).sum().backward()
     xc = x.clone().requires_grad_()
     torch.gather(xc, 1, index).sum().backward()
@@ -1795,7 +1794,7 @@ def test_index_select(mojo_gpu, shape, dim, dtype, idx_dtype):
     x = _fill(shape, dtype)
     # Duplicated, out of order and not the indexed extent's length.
     index = torch.randint(0, shape[dim], (19,), dtype=idx_dtype)
-    with assert_ran("aten::index_select"):
+    with ran_all("aten::index_select"):
         dev = torch.index_select(x.to(mojo_gpu), dim, index.to(mojo_gpu))
     torch.testing.assert_close(
         dev.cpu(), torch.index_select(x, dim, index), rtol=0, atol=0
@@ -1807,7 +1806,7 @@ def test_index_select_strided_input_and_index(mojo_gpu, dim):
     x = torch.randn(9, 11, 7).permute(2, 0, 1)
     index = torch.randint(0, x.shape[dim], (26,))[::2]
     expected = torch.index_select(x, dim, index)
-    with assert_ran("aten::index_select"):
+    with ran_all("aten::index_select"):
         dev = torch.index_select(x.to(mojo_gpu), dim, index.to(mojo_gpu))
     torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
 
@@ -1824,7 +1823,7 @@ def test_index_select_out_zero_d_and_empty_index(mojo_gpu):
     assert torch.index_select(xd, 0, empty.to(mojo_gpu)).shape == (0, 5)
     out = torch.empty(0, device=mojo_gpu)
     index = torch.tensor([5, 0, 5])
-    with assert_ran("aten::index_select.out"):
+    with ran_all("aten::index_select.out"):
         torch.index_select(xd, 0, index.to(mojo_gpu), out=out)
     torch.testing.assert_close(out.cpu(), torch.index_select(x, 0, index))
 
@@ -1834,7 +1833,7 @@ def test_index_select_backward(mojo_gpu):
     x = torch.randn(8, 5)
     index = torch.tensor([7, 0, 7, 3, 7])
     xd = x.to(mojo_gpu).requires_grad_()
-    with assert_ran("aten::index_select", "aten::index_add_"):
+    with ran_all("aten::index_select", "aten::index_add_"):
         torch.index_select(xd, 0, index.to(mojo_gpu)).sum().backward()
     xc = x.clone().requires_grad_()
     torch.index_select(xc, 0, index).sum().backward()
@@ -1849,14 +1848,13 @@ def test_index_select_backward(mojo_gpu):
 )
 def test_scatter_add(mojo_gpu, shape, dim, dtype):
     """Every target collides many times: a plain scatter would fail."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     x = _small_ints(shape, dtype)
     index_shape = tuple(max(1, s - 1) for s in shape)
     index = torch.randint(0, min(3, shape[dim]), index_shape)
     src = _small_ints(shape, dtype).flip(0)
     expected = x.scatter_add(dim, index, src)
-    with assert_ran("aten::scatter_add"):
+    with ran_all("aten::scatter_add"):
         dev = x.to(mojo_gpu).scatter_add(dim, index.to(mojo_gpu), src.to(mojo_gpu))
     torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
 
@@ -1868,12 +1866,12 @@ def test_scatter_add_inplace_out_and_empty(mojo_gpu):
     expected = x.scatter_add(1, index, src)
     ours = x.to(mojo_gpu)
     pointer = ours.data_ptr()
-    with assert_ran("aten::scatter_add_"):
+    with ran_all("aten::scatter_add_"):
         ours.scatter_add_(1, index.to(mojo_gpu), src.to(mojo_gpu))
     assert ours.data_ptr() == pointer
     torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
     out = torch.full((9, 6), 5.0, device=mojo_gpu).t()
-    with assert_ran("aten::scatter_add.out"):
+    with ran_all("aten::scatter_add.out"):
         torch.scatter_add(
             x.to(mojo_gpu), 1, index.to(mojo_gpu), src.to(mojo_gpu), out=out
         )
@@ -1909,8 +1907,7 @@ def test_scatter_add_rejects_bad_indices(mojo_gpu):
     ("shape", "dim"), [((37, 53), 0), ((37, 53), -1), ((5, 7, 9), 1), ((3, 5, 4, 7), 2)]
 )
 def test_index_add(mojo_gpu, shape, dim, dtype, idx_dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     x = _small_ints(shape, dtype)
     index = torch.randint(0, shape[dim], (23,), dtype=idx_dtype)
     index[:4] = index[4]  # duplicates accumulate
@@ -1918,7 +1915,7 @@ def test_index_add(mojo_gpu, shape, dim, dtype, idx_dtype):
     source_shape[dim] = 23
     source = _small_ints(tuple(source_shape), dtype)
     expected = x.index_add(dim, index, source)
-    with assert_ran("aten::index_add"):
+    with ran_all("aten::index_add"):
         dev = x.to(mojo_gpu).index_add(dim, index.to(mojo_gpu), source.to(mojo_gpu))
     torch.testing.assert_close(dev.cpu(), expected, rtol=0, atol=0)
 
@@ -1929,11 +1926,11 @@ def test_index_add_alpha_inplace_out_and_errors(mojo_gpu):
     source = _small_ints((7, 3), torch.float32)
     expected = x.index_add(1, index, source, alpha=2)
     ours = x.to(mojo_gpu)
-    with assert_ran("aten::index_add_"):
+    with ran_all("aten::index_add_"):
         ours.index_add_(1, index.to(mojo_gpu), source.to(mojo_gpu), alpha=2)
     torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
     out = torch.empty(0, device=mojo_gpu)
-    with assert_ran("aten::index_add.out"):
+    with ran_all("aten::index_add.out"):
         torch.index_add(
             x.to(mojo_gpu), 1, index.to(mojo_gpu), source.to(mojo_gpu), out=out
         )
@@ -2007,7 +2004,7 @@ def test_index_put_accumulate(mojo_gpu, axis, dtype, idx_dtype):
     index_put_ = torch.ops.aten.index_put_
     expected = index_put_(data.clone(), [None] * axis + [indices], values, True)
     ours = data.to(mojo_gpu)
-    with assert_ran("aten::_index_put_impl_"):
+    with ran_all("aten::_index_put_impl_"):
         index_put_(
             ours, [None] * axis + [indices.to(mojo_gpu)], values.to(mojo_gpu), True
         )
@@ -2022,12 +2019,12 @@ def test_index_put_bool_mask_scalar(mojo_gpu, dtype):
     expected = x.clone()
     expected[x > 0] = -5
     ours = x.to(mojo_gpu)
-    with assert_ran("aten::_index_put_impl_", "aten::masked_fill_.Tensor"):
+    with ran_all("aten::_index_put_impl_", "aten::masked_fill_.Tensor"):
         ours[ours > 0] = -5
     torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
     # A one-element value tensor on the CPU is read on the host.
     expected[expected < 0] = 2
-    with assert_ran("aten::masked_fill_.Scalar"):
+    with ran_all("aten::masked_fill_.Scalar"):
         ours[ours < 0] = torch.tensor([2], dtype=dtype)
     torch.testing.assert_close(ours.cpu(), expected, rtol=0, atol=0)
 
@@ -2965,8 +2962,7 @@ def test_float_cast_to_narrow_int_wraps_like_an_int64_intermediate(
     every source dtype's own exact-integer range), so CPU and CUDA agree --
     genuinely out-of-int64-range magnitudes are implementation-defined and
     not tested for exact equality (`test_float64_cast_to_int_matches_cpu`)."""
-    if src_dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, src_dtype)
     values = [-1.0, -1.5, -255.0, -256.0, -257.0, 1.5, 254.0, 255.0, 256.0, 257.0, 0.0]
     x = torch.tensor(values, dtype=src_dtype)
     expected = x.to(dst_dtype)

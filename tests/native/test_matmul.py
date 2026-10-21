@@ -3,7 +3,7 @@ addmm, linear, linear_backward, addr and the convolution forward and
 backward.
 
 Public torch API only — every assertion compares the mojo device against the
-same computation on CPU, and `assert_ran` proves the native op is what
+same computation on CPU, and `ran_all` proves the native op is what
 produced it (rather than a decomposition into something else).
 """
 
@@ -21,23 +21,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import is_metal, side_stream_or_skip, skip_if_metal
+from tests.native.conftest import is_metal, ran_all, side_stream_or_skip, skip_if_metal
 from torch_mojo_backend import aten_functions, get_accelerators, native
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.testing import CallChecker
-
-
-@contextlib.contextmanager
-def assert_ran(*op_names: str):
-    """Assert that each aten op ran as a native boxed kernel in the block."""
-    native.op_counting(True)
-    before = native.op_counts()
-    yield
-    after = native.op_counts()
-    for name in op_names:
-        assert after.get(name, 0) > before.get(name, 0), (
-            f"{name} did not run natively (counted: {sorted(after)})"
-        )
 
 
 @pytest.fixture
@@ -83,10 +70,10 @@ def test_mm_transposed_operands(mojo_device):
     in place — no materialized transpose."""
     a = torch.randn(48, 32)
     bt = torch.randn(64, 32)
-    with assert_ran("aten::mm"):
+    with ran_all("aten::mm"):
         got = torch.mm(a.to(mojo_device), bt.to(mojo_device).t()).cpu()
     torch.testing.assert_close(got, a @ bt.t(), atol=1e-4, rtol=1e-4)
-    with assert_ran("aten::mm"):
+    with ran_all("aten::mm"):
         got2 = torch.mm(a.to(mojo_device).t().contiguous().t(), bt.to(mojo_device).t())
     torch.testing.assert_close(got2.cpu(), a @ bt.t(), atol=1e-4, rtol=1e-4)
 
@@ -106,7 +93,7 @@ def test_mm_float64(
     b = torch.randn(k, n, dtype=torch.float64, generator=generator)
     device_a = a.t().contiguous().to(mojo_gpu).t() if transpose_a else a.to(mojo_gpu)
     device_b = b.t().contiguous().to(mojo_gpu).t() if transpose_b else b.to(mojo_gpu)
-    with assert_ran("aten::mm"):
+    with ran_all("aten::mm"):
         result = torch.mm(device_a, device_b)
     assert result.dtype == torch.float64
     torch.testing.assert_close(result.cpu(), torch.mm(a, b), atol=2e-12, rtol=2e-12)
@@ -150,13 +137,13 @@ def test_mm_float32_tensor_core_regime(mojo_device, shape):
     # so at k = 4128 a correct result sits ~2e-4 from torch's blocked sum on
     # a few elements (measured on gfx942 and on the CPU device alike).
     tol = 1e-4 * max(1.0, (k / 64) ** 0.5)
-    with assert_ran("aten::mm"):
+    with ran_all("aten::mm"):
         got = torch.mm(a.to(mojo_device), b.to(mojo_device)).cpu()
     torch.testing.assert_close(got, a @ b, atol=tol, rtol=tol)
 
     # the same geometries through the fused-bias route
     bias = torch.randn(n)
-    with assert_ran("aten::addmm"):
+    with ran_all("aten::addmm"):
         got_bias = torch.addmm(
             bias.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
         ).cpu()
@@ -223,7 +210,7 @@ def test_bf16_gemm_leading_dimensions(mojo_gpu, shape, layout, bias, offsets):
     a, da, a_storage, da_storage = operand(m, k, layout[0] == "T", offsets[0])
     b, db, b_storage, db_storage = operand(k, n, layout[1] == "T", offsets[1])
     bias_cpu = torch.randn(n, generator=generator).to(torch.bfloat16)
-    with assert_ran("aten::addmm" if bias else "aten::mm"):
+    with ran_all("aten::addmm" if bias else "aten::mm"):
         result = (
             torch.addmm(bias_cpu.to(mojo_gpu), da, db) if bias else torch.mm(da, db)
         )
@@ -275,7 +262,7 @@ def test_bf16_gemm_k_tail_only(mojo_gpu, shape, layout):
     b[-1] = 1
     da = a.t().contiguous().to(mojo_gpu).t() if layout[0] == "T" else a.to(mojo_gpu)
     db = b.t().contiguous().to(mojo_gpu).t() if layout[1] == "T" else b.to(mojo_gpu)
-    with assert_ran("aten::mm"):
+    with ran_all("aten::mm"):
         result = torch.mm(da, db).cpu()
     assert result.dtype == torch.bfloat16
     wrong = (result != 1).sum().item()
@@ -303,7 +290,7 @@ def test_mm_integer_dtypes_are_exact(mojo_device, dtype):
     hi = 100 if dtype in (torch.int8, torch.uint8) else 1000
     a = torch.randint(0, hi, (37, 53), dtype=dtype, generator=generator)
     b = torch.randint(0, hi, (53, 29), dtype=dtype, generator=generator)
-    with assert_ran("aten::mm"):
+    with ran_all("aten::mm"):
         got = torch.mm(a.to(mojo_device), b.to(mojo_device)).cpu()
     assert torch.equal(got, torch.mm(a, b))
     a3 = torch.randint(0, hi, (3, 17, 9), dtype=dtype, generator=generator)
@@ -337,7 +324,7 @@ def test_bmm_expanded_batch(mojo_device):
     # as_strided rather than expand(): only the view ops this group's own
     # tests may rely on (`aten::as_strided`) are guaranteed registered here.
     shared = torch.as_strided(b.to(mojo_device), (4, 20, 8), (0, 8, 1))
-    with assert_ran("aten::bmm"):
+    with ran_all("aten::bmm"):
         got = torch.bmm(a.to(mojo_device), shared).cpu()
     ref = torch.bmm(a, torch.as_strided(b, (4, 20, 8), (0, 8, 1)))
     torch.testing.assert_close(got, ref)
@@ -433,7 +420,7 @@ def test_addmm_alpha_beta(mojo_device, dtype, beta, alpha, self_shape):
     b = torch.randn(37, 29, generator=generator).to(dtype)
     ref = torch.addmm(c, a, b, beta=beta, alpha=alpha)
     dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
-    with assert_ran("aten::addmm"):
+    with ran_all("aten::addmm"):
         got = torch.addmm(dc, da, db, beta=beta, alpha=alpha)
     _close(got, ref)
     out = torch.empty(0, dtype=dtype, device=mojo_device)
@@ -742,7 +729,7 @@ def test_baddbmm(mojo_device, dtype, beta, alpha):
         # batch2 (stock CUDA, like this device, gives exactly beta * self).
         ref = (beta * c.float()).expand(3, 11, 21).to(dtype)
     dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
-    with assert_ran("aten::baddbmm"):
+    with ran_all("aten::baddbmm"):
         got = torch.baddbmm(dc, da, db, beta=beta, alpha=alpha)
     _close(got, ref)
     out = torch.empty(3, 11, 21, dtype=dtype, device=mojo_device)
@@ -764,7 +751,7 @@ def test_addbmm_accumulates_batch_by_batch(mojo_device, dtype, beta, alpha):
     b = torch.randn(4, 15, 13, generator=generator).to(dtype)
     acc = torch.addbmm(c, a, b, beta=beta, alpha=alpha)
     dc, da, db = c.to(mojo_device), a.to(mojo_device), b.to(mojo_device)
-    with assert_ran("aten::addbmm"):
+    with ran_all("aten::addbmm"):
         got = torch.addbmm(dc, da, db, beta=beta, alpha=alpha)
     _close(got, acc)
     out = torch.empty(1, dtype=dtype, device=mojo_device)
@@ -789,7 +776,7 @@ def test_addmv(mojo_device, dtype, beta, alpha):
     vec = torch.randn(82, generator=generator).to(dtype)[::2]
     ref = torch.addmv(c, mat, vec, beta=beta, alpha=alpha)
     dc, dm, dv = c.to(mojo_device), mat.to(mojo_device), vec.to(mojo_device)
-    with assert_ran("aten::addmv"):
+    with ran_all("aten::addmv"):
         got = torch.addmv(dc, dm, dv, beta=beta, alpha=alpha)
     _close(got, ref)
     out = torch.empty(0, dtype=dtype, device=mojo_device)
@@ -979,7 +966,7 @@ def test_nt_mfma_bias_harness(mojo_gfx942, m, n, k):
         w = _nt_bias_hash((n, k), seed + 1)
         bias = _nt_bias_hash((n,), seed + 2)
         dx, dw, db = [t.to(mojo_gfx942) for t in (x, w, bias)]
-        with assert_ran("aten::linear"):
+        with ran_all("aten::linear"):
             got = torch.nn.functional.linear(dx, dw, db).cpu()
         for sample in range(72):
             row = (sample * 131 + sample * sample * 17) % m
@@ -1024,7 +1011,7 @@ def test_nt_mfma_bias_edges(mojo_gfx942, m, n, k, offset, op):
     ]
     if offset:
         assert dx.data_ptr() % 16 != 0 and dw.data_ptr() % 16 != 0
-    with assert_ran("aten::" + op):
+    with ran_all("aten::" + op):
         got = (
             torch.nn.functional.linear(dx, dw, db)
             if op == "linear"
@@ -1113,7 +1100,7 @@ def test_gemm16_linear_residue64_sites(mojo_h100, site, n, k, bias):
     w = torch.randn(n, k, dtype=torch.bfloat16)
     b = torch.randn(n, dtype=torch.bfloat16) if bias else None
     dev_b = b.to(mojo_h100) if b is not None else None
-    with assert_ran("aten::linear"):
+    with ran_all("aten::linear"):
         if bias:
             with assert_no_bias_add():
                 got = torch.nn.functional.linear(
@@ -1135,7 +1122,7 @@ def test_gemm16_linear_backward_residue64_sites(mojo_h100, site, n, k):
     x = torch.randn(XL_M, k, dtype=torch.bfloat16)
     w = torch.randn(n, k, dtype=torch.bfloat16)
     g = torch.randn(XL_M, n, dtype=torch.bfloat16)
-    with assert_ran("aten::linear_backward"):
+    with ran_all("aten::linear_backward"):
         dx, dw, db = torch.ops.aten.linear_backward(
             x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
         )
@@ -1199,7 +1186,7 @@ def test_gemm16_addmm_residue64_sites(mojo_h100, site, n, k):
     a = torch.randn(XL_M, k, dtype=torch.bfloat16)
     bt = torch.randn(n, k, dtype=torch.bfloat16)
     bias = torch.randn(n, dtype=torch.bfloat16)
-    with assert_ran("aten::addmm"):
+    with ran_all("aten::addmm"):
         with assert_no_bias_add():
             got = torch.addmm(bias.to(mojo_h100), a.to(mojo_h100), bt.to(mojo_h100).t())
     ref = a.float() @ bt.float().t() + bias.float()
@@ -1282,7 +1269,7 @@ def _exact_ref(a: torch.Tensor, b_nk: torch.Tensor, bias=None) -> torch.Tensor:
 def test_tf32_wgmma_nt_mm_is_bit_exact(mojo_h100, shape_id):
     m, n, k = TF32_WGMMA_SHAPES[shape_id]
     a, b = _nt_exact(m, n, k)
-    with _matmul_precision("high"), assert_ran("aten::mm"):
+    with _matmul_precision("high"), ran_all("aten::mm"):
         got = (a.to(mojo_h100) @ b.to(mojo_h100).t()).cpu()
     torch.testing.assert_close(got, _exact_ref(a, b), atol=0, rtol=0)
 
@@ -1455,7 +1442,7 @@ def test_gemm16_nt_bias_rolling_192(mojo_h100, m, n, k):
     x = torch.randn(m, k, dtype=torch.bfloat16)
     w = torch.randn(n, k, dtype=torch.bfloat16)
     b = torch.randn(n, dtype=torch.bfloat16)
-    with assert_ran("aten::linear"):
+    with ran_all("aten::linear"):
         with assert_no_bias_add():
             got = torch.nn.functional.linear(
                 x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100)
@@ -1474,7 +1461,7 @@ def test_gemm16_nt_bias_rolling_192_bias_only(mojo_h100, m, n, k):
     x = torch.zeros(m, k, dtype=torch.bfloat16)
     w = torch.zeros(n, k, dtype=torch.bfloat16)
     b = (torch.arange(n, dtype=torch.float32) % 251 - 125).to(torch.bfloat16)
-    with assert_ran("aten::linear"):
+    with ran_all("aten::linear"):
         with assert_no_bias_add():
             got = torch.nn.functional.linear(
                 x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100)
@@ -1518,7 +1505,7 @@ def test_gemm16_tn_rolling_geometry_dispatch(
     x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
     w = torch.randn(out_features, in_features, dtype=torch.bfloat16)
     g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
-    with assert_ran("aten::linear_backward"):
+    with ran_all("aten::linear_backward"):
         _dx, dw, _db = torch.ops.aten.linear_backward(
             x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
         )
@@ -1535,7 +1522,7 @@ def test_gemm16_tn_rolling_small_ragged_m(mojo_h100):
     x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
     w = torch.randn(out_features, in_features, dtype=torch.bfloat16)
     g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
-    with assert_ran("aten::linear_backward"):
+    with ran_all("aten::linear_backward"):
         _dx, dw, _db = torch.ops.aten.linear_backward(
             x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
         )
@@ -1582,7 +1569,7 @@ def test_gemm16_tn_rolling_occupancy_decline_escape_hatch(
     x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
     w = torch.randn(out_features, in_features, dtype=torch.bfloat16)
     g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
-    with assert_ran("aten::linear_backward"):
+    with ran_all("aten::linear_backward"):
         _dx, dw, _db = torch.ops.aten.linear_backward(
             x.to(mojo_h100), g.to(mojo_h100), w.to(mojo_h100), [True, True, True]
         )
@@ -1667,7 +1654,7 @@ def _mojo_devices() -> list[str]:
 def test_out_writes_the_callers_tensor(mojo_device, op):
     run, ref = _out_case(op, mojo_device)
     out = torch.empty(ref.shape, device=mojo_device)
-    with assert_ran(f"aten::{op}.out"):
+    with ran_all(f"aten::{op}.out"):
         got = run(out)
     assert got.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out.cpu(), ref, atol=1e-4, rtol=1e-4)
@@ -1863,7 +1850,7 @@ def test_linear_backward_through_autograd(mojo_device, dtype):
         torch.nn.functional.linear(xi, wi, bi).backward(upstream.to(device))
         return xi.grad, wi.grad, bi.grad
 
-    with assert_ran("aten::linear", "aten::linear_backward"):
+    with ran_all("aten::linear", "aten::linear_backward"):
         got = run(mojo_device)
     ref = run("cpu")
     for g, r in zip(got, ref, strict=True):
@@ -1921,7 +1908,7 @@ def test_addr(mojo_device, dtype):
     self_ = torch.randn(5, 10).to(dtype)
     vec1 = torch.randn(5).to(dtype)
     vec2 = torch.randn(10).to(dtype)
-    with assert_ran("aten::addr"):
+    with ran_all("aten::addr"):
         got = torch.addr(
             self_.to(mojo_device),
             vec1.to(mojo_device),
@@ -2118,7 +2105,7 @@ def test_conv1d(
     w = torch.randn(out_c, in_c // groups, k)
     b = torch.randn(out_c) if bias else None
     args = (stride, padding, dilation, groups)
-    with assert_ran("aten::convolution"):
+    with ran_all("aten::convolution"):
         got = torch.nn.functional.conv1d(
             x.to(dtype).to(mojo_device),
             w.to(dtype).to(mojo_device),
@@ -2144,7 +2131,7 @@ def test_conv1d_non_contiguous_input_and_module(mojo_device):
     with torch.no_grad():
         ref = conv(x)
         conv = conv.to(mojo_device)
-        with assert_ran("aten::convolution"):
+        with ran_all("aten::convolution"):
             got = conv(x.to(mojo_device))
     torch.testing.assert_close(got.cpu(), ref, atol=1e-4, rtol=1e-3)
 
@@ -2190,7 +2177,7 @@ def test_conv_transpose_trains(mojo_device, case, dtype):
         return [out.detach()] + [t.grad for t in ts]
 
     ref = run("cpu", torch.float64)
-    with assert_ran("aten::convolution", "aten::convolution_backward"):
+    with ran_all("aten::convolution", "aten::convolution_backward"):
         got = run(mojo_device, dtype)
     tol = 1e-4 if dtype == torch.float32 else 6e-2
     for g, r in zip(got, ref, strict=True):
@@ -2227,7 +2214,7 @@ def test_conv3d_trains(mojo_device, kwargs, dtype):
         return [out.detach()] + [t.grad for t in ts]
 
     ref = run("cpu", torch.float64)
-    with assert_ran("aten::convolution", "aten::convolution_backward"):
+    with ran_all("aten::convolution", "aten::convolution_backward"):
         got = run(mojo_device, dtype)
     tol = 1e-4 if dtype == torch.float32 else 3e-2
     for g, r in zip(got, ref, strict=True):
@@ -2419,13 +2406,11 @@ def test_conv_entry_points(mojo_device, name, args, ref_fn):
     # The depthwise kernels are CUDA-only upstream: their reference is the
     # grouped convolution they compute.
     ref = ref_fn(*args) if ref_fn else op(*args)
-    with assert_ran(f"aten::{name}"):
+    with ran_all(f"aten::{name}"):
         got = op(*_on(mojo_device, args))
     torch.testing.assert_close(got.cpu(), ref, atol=1e-4, rtol=1e-4)
     out = torch.empty(3, device=mojo_device)
-    with assert_ran(
-        f"aten::{name}.out" if hasattr(op, "out") else f"aten::{name}.output"
-    ):
+    with ran_all(f"aten::{name}.out" if hasattr(op, "out") else f"aten::{name}.output"):
         (op.out if hasattr(op, "out") else op.output)(
             *_on(mojo_device, args),
             **{("out" if hasattr(op, "out") else "output"): out},
@@ -2454,7 +2439,7 @@ def test_slow_conv2d_backward(mojo_device, mask):
     go = torch.randn(2, 5, 5, 9, generator=gen)
     args = ([3, 2], [2, 1], [1, 1])
     ref = torch.ops.aten._slow_conv2d_backward(go, x, w, *args, [True] * 3)
-    with assert_ran("aten::_slow_conv2d_backward.output_mask"):
+    with ran_all("aten::_slow_conv2d_backward.output_mask"):
         got = torch.ops.aten._slow_conv2d_backward(
             *_on(mojo_device, (go, x, w)), *args, mask
         )
@@ -2464,7 +2449,7 @@ def test_slow_conv2d_backward(mojo_device, mask):
             continue
         torch.testing.assert_close(g.cpu(), r, atol=1e-4, rtol=1e-4)
     outs = [torch.empty(0, device=mojo_device) for _ in range(3)]
-    with assert_ran("aten::_slow_conv2d_backward.grad_input"):
+    with ran_all("aten::_slow_conv2d_backward.grad_input"):
         torch.ops.aten._slow_conv2d_backward.grad_input(
             *_on(mojo_device, (go, x, w)),
             *args,
@@ -2557,7 +2542,7 @@ def _conv_bwd_bound(dtype: torch.dtype, k: int) -> float:
 def _check_conv_bwd(case: str, dtype: torch.dtype, mask: list[bool], device: str):
     tensors, rest = _conv_bwd_args(case)
     tensors = [t.to(dtype) for t in tensors]
-    with assert_ran("aten::convolution_backward"):
+    with ran_all("aten::convolution_backward"):
         got = torch.ops.aten.convolution_backward(
             *[t.to(device) for t in tensors], *rest, mask
         )
@@ -2627,7 +2612,7 @@ def test_convolution_backward_strided_operands(mojo_device):
     x_m = x.transpose(2, 3).contiguous().to(mojo_device).transpose(2, 3)
     w_m = weight.to(mojo_device).to(memory_format=torch.channels_last)
     assert not go_m.is_contiguous() and not x_m.is_contiguous()
-    with assert_ran("aten::convolution_backward"):
+    with ran_all("aten::convolution_backward"):
         got = torch.ops.aten.convolution_backward(go_m, x_m, w_m, *rest, [True] * 3)
     for g, r in zip(got, ref, strict=True):
         torch.testing.assert_close(g.cpu().double(), r, atol=1e-4, rtol=1e-4)
@@ -2670,7 +2655,7 @@ def test_conv_module_trains(mojo_device, make, bias, dtype):
         return [xi.grad] + [p.grad for p in module.parameters()]
 
     ref = run(copy.deepcopy(conv), "cpu", torch.float64)
-    with assert_ran("aten::convolution", "aten::convolution_backward"):
+    with ran_all("aten::convolution", "aten::convolution_backward"):
         got = run(conv, mojo_device, dtype)
     tol = 1e-4 if dtype == torch.float32 else 5e-2
     assert len(got) == len(ref)
@@ -2686,12 +2671,12 @@ def test_matmul_decomposes_to_mm_and_bmm(mojo_device):
     """aten::matmul is CompositeImplicitAutograd: it is not registered here,
     it reaches mm / bmm."""
     a2, b2 = torch.randn(6, 8), torch.randn(8, 4)
-    with assert_ran("aten::mm"):
+    with ran_all("aten::mm"):
         got2 = torch.matmul(a2.to(mojo_device), b2.to(mojo_device)).cpu()
     torch.testing.assert_close(got2, a2 @ b2, atol=1e-4, rtol=1e-4)
 
     a3, b3 = torch.randn(3, 6, 8), torch.randn(3, 8, 4)
-    with assert_ran("aten::bmm"):
+    with ran_all("aten::bmm"):
         got3 = torch.matmul(a3.to(mojo_device), b3.to(mojo_device)).cpu()
     torch.testing.assert_close(got3, a3 @ b3, atol=1e-4, rtol=1e-4)
 
@@ -2943,7 +2928,7 @@ def test_gemm16_sched_fused_forward(mojo_h100, m, n, k):
     w = torch.randn(n, k, dtype=torch.bfloat16)
     b = torch.randn(n, dtype=torch.bfloat16)
     dx, dw, db = x.to(mojo_h100), w.to(mojo_h100), b.to(mojo_h100)
-    with assert_ran("aten::linear"):
+    with ran_all("aten::linear"):
         with assert_no_bias_add():
             got = torch.nn.functional.linear(dx, dw, db)
     again = torch.nn.functional.linear(dx, dw, db)
@@ -2959,7 +2944,7 @@ def test_gemm16_sched_dx_mm(mojo_h100):
     """dX as a bare mm: the NN rolling body's own route."""
     m, n, k = SCHED_NN_DX
     a, b, ref = _sched_mm(mojo_h100, m, n, k)
-    with assert_ran("aten::mm"):
+    with ran_all("aten::mm"):
         got = torch.mm(a, b)
     assert torch.equal(got.cpu(), torch.mm(a, b).cpu())
     assert _rel_err(got, ref) < _bf16_bound(k)
@@ -2972,7 +2957,7 @@ def test_gemm16_sched_dw_mm(mojo_h100):
     x = torch.randn(tokens, in_features, dtype=torch.bfloat16)
     g = torch.randn(tokens, out_features, dtype=torch.bfloat16)
     dx, dg = x.to(mojo_h100), g.to(mojo_h100)
-    with assert_ran("aten::mm"):
+    with ran_all("aten::mm"):
         got = torch.mm(dg.t(), dx)
     assert torch.equal(got.cpu(), torch.mm(dg.t(), dx).cpu())
     assert _rel_err(got, g.float().t() @ x.float()) < _bf16_bound(tokens)

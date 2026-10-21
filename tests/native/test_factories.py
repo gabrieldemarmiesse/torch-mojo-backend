@@ -15,7 +15,11 @@ import numpy as np
 import pytest
 import torch
 
-from tests.native.conftest import is_metal as _metal, skip_if_metal
+from tests.native.conftest import (
+    is_metal as _metal,
+    skip_float64_on_metal,
+    skip_if_metal,
+)
 from torch_mojo_backend import aten_functions, native
 from torch_mojo_backend.native import device_module
 
@@ -171,8 +175,7 @@ UNIFORM_DTYPES = [torch.float32, torch.bfloat16, torch.float16, torch.float64]
 @pytest.mark.parametrize("dtype", UNIFORM_DTYPES)
 @pytest.mark.parametrize(("low", "high"), [(0.0, 1.0), (-100.0, 100.0), (1.0, 2.0)])
 def test_uniform_bounds_and_distribution(mojo_device, dtype, low, high):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_device, "uniform_ of dtype float64 is declined on Apple GPU")
+    skip_float64_on_metal(mojo_device, dtype)
     device_module.manual_seed_all(20260814)
     drawn = torch.empty(200_000, dtype=dtype, device=mojo_device).uniform_(low, high)
     host = drawn.cpu().double()
@@ -186,8 +189,7 @@ def test_uniform_bounds_and_distribution(mojo_device, dtype, low, high):
 
 @pytest.mark.parametrize("dtype", UNIFORM_DTYPES)
 def test_uniform_from_equals_to_is_constant(mojo_gpu, dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "uniform_ of dtype float64 is declined on Apple GPU")
+    skip_float64_on_metal(mojo_gpu, dtype)
     drawn = torch.empty(37, dtype=dtype, device=mojo_gpu).uniform_(2.5, 2.5)
     assert torch.equal(drawn.cpu(), torch.full((37,), 2.5, dtype=dtype))
 
@@ -939,8 +941,7 @@ def _cuda_linspace(
     ],
 )
 def test_linspace(mojo_gpu, dtype, start, end, steps):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     if not dtype.is_floating_point and (
         isinstance(start, float) and start < 0 and dtype == torch.uint8
     ):
@@ -977,8 +978,7 @@ def test_linspace_unsigned_wraps_negative_integers(mojo_gpu):
     [(0, 1, 5, 10.0), (-2, 3, 11, 2.0), (1, 0.5, 7, 3.0), (2, 2, 1, 10.0)],
 )
 def test_logspace(mojo_gpu, dtype, start, end, steps, base):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     if dtype == torch.uint8 and min(start, end) < 0:
         pytest.skip(
             "a negative float exponent is fine, a negative endpoint is not tested here"
@@ -1219,8 +1219,7 @@ def _moments(x: torch.Tensor) -> tuple[float, float]:
 )
 @pytest.mark.parametrize("rate", [0.0, 0.3, 4.0, 9.99, 10.0, 37.5, 1e4])
 def test_poisson_moments(mojo_gpu, dtype, rate):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal has no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     if dtype != torch.float32 and rate == 1e4:
         pytest.skip("1e4 is not exact in the half dtypes' samples")
     torch.manual_seed(2)
@@ -1279,8 +1278,7 @@ def test_poisson_seeding_generator_and_errors(mojo_gpu):
 def test_standard_gamma_moments(mojo_gpu, dtype, alpha):
     """Gamma(alpha, 1): mean alpha, variance alpha; samples positive (at
     least the dtype's smallest normal, CUDA's clamp)."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal has no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     if alpha == 1e6 and dtype not in (torch.float32, torch.float64):
         pytest.skip("1e6 overflows float16; bfloat16 spacing there dwarfs sd 1e3")
     torch.manual_seed(5)
@@ -1353,8 +1351,7 @@ def test_standard_gamma_edges_and_errors(mojo_gpu):
 def test_binomial_moments(mojo_gpu, dtype, count, prob):
     """Inversion (count * p < 10) and BTRS, both tails of p, the p = 0 / 1
     and count = 0 edges."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal has no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     torch.manual_seed(7)
     c = torch.full((_N,), count, dtype=dtype, device=mojo_gpu)
     p = torch.full((_N,), prob, dtype=dtype, device=mojo_gpu)
@@ -1455,8 +1452,7 @@ def test_bernoulli_rejects_probabilities_outside_0_1(mojo_gpu, bad):
     ],
 )
 def test_range_out(mojo_gpu, start, end, step, dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Apple GPUs have no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     ran = _op_count_delta("aten::range.out")
     out = torch.empty(0, dtype=dtype, device=mojo_gpu)
     torch.range(start, end, step, out=out)

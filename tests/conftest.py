@@ -1,6 +1,9 @@
 # ruff: noqa: E402 -- the environment variables below must be set before the imports
 import os
 import random
+import subprocess
+import sys
+from pathlib import Path
 from typing import TypedDict
 
 os.environ["MODULAR_TELEMETRY_ENABLED"] = "0"
@@ -191,3 +194,35 @@ def require_cuda_autograd(device: str):
             "PrivateUse1 backend (the mojo device) was registered earlier in "
             "this process, which breaks CUDA autograd inside PyTorch itself."
         )
+
+
+def python_env(preload: Path | None = None) -> dict[str, str]:
+    """os.environ for a child interpreter. MAX's Python interop sets
+    PYTHONHOME / PYTHONEXECUTABLE to its own prefix in this process; inherited,
+    they break the child's startup ("No module named 'encodings'").
+    `preload` is prepended to LD_PRELOAD."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONHOME", "PYTHONEXECUTABLE")
+    }
+    if preload is not None:
+        env["LD_PRELOAD"] = str(preload) + (
+            ":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else ""
+        )
+    return env
+
+
+def run_python(
+    *args: str, timeout: float, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run `sys.executable *args` and assert it exits 0."""
+    proc = subprocess.run(
+        [sys.executable, *args],
+        env=python_env() if env is None else env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return proc

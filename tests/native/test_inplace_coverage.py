@@ -39,17 +39,7 @@ from collections.abc import Callable
 import pytest
 import torch
 
-from tests.native.conftest import ran
-from torch_mojo_backend import native
-
-
-def _count(name: str) -> int:
-    return native.op_count(f"aten::{name}")
-
-
-def _reset():
-    native.op_counting(True)
-    native.op_counts_reset()
+from tests.native.conftest import ran, reset_op_counts
 
 
 def _tol(dtype: torch.dtype) -> tuple[float, float]:
@@ -119,7 +109,7 @@ def test_promoting_unary_inplace_matches_cpu(mojo_gpu, op, out_key, domain, dtyp
     cpu = x64.to(dtype)
     getattr(cpu, op)()
     x = x64.to(dtype).to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         y = getattr(x, op)()
     assert y.data_ptr() == x.data_ptr()
@@ -178,7 +168,7 @@ def test_direct_unary_inplace_matches_cpu(mojo_gpu, op, out_key, dtype):
     cpu = x64.to(dtype)
     getattr(cpu, op)()
     x = x64.to(dtype).to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         getattr(x, op)()
     assert torch.equal(x.cpu(), cpu)
@@ -207,7 +197,7 @@ def test_rounding_unary_inplace_matches_cpu(mojo_gpu, op, out_key, dtype):
     cpu = x64.to(dtype)
     getattr(cpu, op)()
     x = x64.to(dtype).to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         getattr(x, op)()
     torch.testing.assert_close(x.cpu(), cpu)
@@ -220,7 +210,7 @@ def test_round_decimals_inplace_matches_cpu(mojo_gpu):
     cpu = x64.to(torch.float32)
     cpu.round_(decimals=2)
     x = x64.to(torch.float32).to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran("aten::round_.decimals"):
         x.round_(decimals=2)
     torch.testing.assert_close(x.cpu(), cpu, rtol=1e-4, atol=1e-5)
@@ -231,7 +221,7 @@ def test_frac_inplace_matches_cpu(mojo_gpu):
     cpu = x64.to(torch.float32)
     cpu.frac_()
     x = x64.to(torch.float32).to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran("aten::frac.out"):
         x.frac_()
     torch.testing.assert_close(x.cpu(), cpu, rtol=1e-4, atol=1e-5)
@@ -242,7 +232,7 @@ def test_bitwise_not_inplace_matches_cpu(mojo_gpu):
     cpu = x64.clone()
     cpu.bitwise_not_()
     x = x64.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran("aten::bitwise_not.out"):
         x.bitwise_not_()
     assert torch.equal(x.cpu(), cpu)
@@ -271,7 +261,7 @@ def test_activation_inplace_matches_cpu(mojo_gpu, op, out_key):
     cpu = x64.to(torch.float32)
     fn(cpu)
     x = x64.to(torch.float32).to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         fn(x)
     torch.testing.assert_close(x.cpu(), cpu, rtol=1e-4, atol=1e-5)
@@ -288,7 +278,7 @@ def test_logit_inplace_matches_cpu(mojo_gpu):
     cpu = x64.to(torch.float32)
     cpu.logit_(eps=1e-4)
     x = x64.to(torch.float32).to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran("aten::logit_"):
         x.logit_(eps=1e-4)
     torch.testing.assert_close(x.cpu(), cpu, rtol=1e-4, atol=1e-5)
@@ -415,7 +405,7 @@ def test_binary_tensor_inplace_matches_cpu(mojo_gpu, op, out_key, mk_self, mk_ot
     getattr(cpu, op)(other_cpu)
     x = a64.to(torch.float32).to(mojo_gpu)
     other = b64.to(torch.float32).to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         getattr(x, op)(other)
     torch.testing.assert_close(x.cpu(), cpu, rtol=1e-4, atol=1e-5, equal_nan=True)
@@ -463,7 +453,7 @@ def test_int_binary_inplace_matches_cpu(mojo_gpu, op, out_key):
     getattr(cpu, op)(b)
     x = a.to(mojo_gpu)
     y = b.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         getattr(x, op)(y)
     assert torch.equal(x.cpu(), cpu)
@@ -484,7 +474,7 @@ def test_bitwise_tensor_inplace_matches_cpu(mojo_gpu, op, out_key):
     getattr(cpu, op)(b)
     x = a.to(mojo_gpu)
     y = b.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         getattr(x, op)(y)
     assert torch.equal(x.cpu(), cpu)
@@ -514,7 +504,7 @@ def test_bitwise_shift_tensor_inplace_matches_cpu(mojo_gpu, op, out_key):
     getattr(cpu, op)(b)
     x = a.to(mojo_gpu)
     y = b.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         getattr(x, op)(y)
     assert torch.equal(x.cpu(), cpu)
@@ -545,7 +535,7 @@ def test_div_tensor_inplace_matches_cpu(mojo_gpu, mode):
     x = a.to(mojo_gpu)
     y = b.to(mojo_gpu)
     out_key = "div.out" if mode is None else "div.out_mode"
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         x.div_(y, **kwargs)
     torch.testing.assert_close(x.cpu(), cpu, rtol=1e-4, atol=1e-5)
@@ -567,7 +557,7 @@ def test_pow_tensor_inplace_matches_cpu(mojo_gpu):
     cpu.pow_(b)
     x = a.to(mojo_gpu)
     y = b.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran("aten::pow.Tensor_Tensor_out"):
         x.pow_(y)
     torch.testing.assert_close(x.cpu(), cpu, rtol=1e-4, atol=1e-5)
@@ -578,7 +568,7 @@ def test_pow_scalar_inplace_matches_cpu(mojo_gpu):
     cpu = a.clone()
     cpu.pow_(2.0)
     x = a.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran("aten::pow.Tensor_Scalar_out"):
         x.pow_(2.0)
     torch.testing.assert_close(x.cpu(), cpu, rtol=1e-4, atol=1e-5)
@@ -591,7 +581,7 @@ def test_remainder_tensor_inplace_matches_cpu(mojo_gpu):
     cpu.remainder_(b)
     x = a.to(mojo_gpu)
     y = b.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran("aten::remainder.Tensor_out"):
         x.remainder_(y)
     torch.testing.assert_close(x.cpu(), cpu, rtol=1e-4, atol=1e-5)
@@ -629,7 +619,7 @@ def test_compare_tensor_inplace_matches_cpu(mojo_gpu, op, base, dtype):
     getattr(cpu, op)(b)
     x = a.to(mojo_gpu)
     y = b.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{base}.Tensor_out"):
         getattr(x, op)(y)
     assert torch.equal(x.cpu(), cpu) and x.dtype == cpu.dtype == dtype
@@ -677,7 +667,7 @@ def test_clamp_scalar_inplace_matches_cpu(mojo_gpu, op, out_key, kwargs):
     cpu = a.clone()
     getattr(cpu, op)(**bound_kwargs)
     x = a.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         getattr(x, op)(**bound_kwargs)
     torch.testing.assert_close(x.cpu(), cpu)
@@ -694,7 +684,7 @@ def test_clamp_max_min_tensor_inplace_matches_cpu(mojo_gpu, op, out_key):
     getattr(cpu, op)(bound)
     x = a.to(mojo_gpu)
     y = bound.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran(f"aten::{out_key}"):
         getattr(x, op)(y)
     torch.testing.assert_close(x.cpu(), cpu)
@@ -707,7 +697,7 @@ def test_clamp_tensor_both_bounds_inplace_matches_cpu(mojo_gpu):
     cpu = a.clone()
     cpu.clamp_(min=lo, max=hi)
     x = a.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran("aten::clamp.Tensor_out"):
         x.clamp_(min=lo.to(mojo_gpu), max=hi.to(mojo_gpu))
     torch.testing.assert_close(x.cpu(), cpu)
@@ -737,7 +727,7 @@ def test_lerp_tensor_inplace_matches_cpu(mojo_gpu):
     cpu = start.clone()
     cpu.lerp_(end, weight)
     x = start.to(mojo_gpu)
-    _reset()
+    reset_op_counts()
     with ran("aten::lerp.Tensor_out"):
         x.lerp_(end.to(mojo_gpu), weight.to(mojo_gpu))
     torch.testing.assert_close(x.cpu(), cpu)

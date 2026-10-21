@@ -23,7 +23,7 @@ import pytest
 import torch
 from torch.nn.functional import ScalingType, SwizzleType
 
-from tests.native.conftest import is_metal, require_stock_cuda
+from tests.native.conftest import is_metal, require_stock_cuda, skip_float64_on_metal
 from torch_mojo_backend.native import device_module
 
 FP8 = [
@@ -72,11 +72,6 @@ def _assert_same(got: torch.Tensor, want: torch.Tensor):
 
 def _all_codes(dtype: torch.dtype) -> torch.Tensor:
     return torch.arange(256, dtype=torch.int32).to(torch.uint8).view(dtype)
-
-
-def _skip_f64(device: str, *dtypes: torch.dtype):
-    if torch.float64 in dtypes and is_metal(device):
-        pytest.skip("Apple GPUs have no float64")
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +151,7 @@ def _sources(dtype: torch.dtype) -> torch.Tensor:
 @pytest.mark.parametrize("dst", FP8, ids=FP8_IDS)
 @pytest.mark.parametrize("src", OTHERS, ids=lambda d: str(d).removeprefix("torch."))
 def test_to_float8(mojo_device, src, dst):
-    _skip_f64(mojo_device, src)
+    skip_float64_on_metal(mojo_device, src)
     host = _sources(src)
     want = _stock_cast(host, dst, mojo_device)
     _assert_same(host.to(mojo_device).to(dst), want)
@@ -190,7 +185,7 @@ def _stock_cast(host: torch.Tensor, dst: torch.dtype, device: str) -> torch.Tens
     "dst", OTHERS + FP8, ids=lambda d: str(d).removeprefix("torch.")
 )
 def test_from_float8(mojo_device, src, dst):
-    _skip_f64(mojo_device, dst)
+    skip_float64_on_metal(mojo_device, dst)
     host = _all_codes(src)
     want = host.to(dst)
     if not dst.is_floating_point and dst != torch.bool:
@@ -3715,7 +3710,7 @@ def test_complex_to_float8_never_saturates(mojo_device, cdt, dst):
     (measured 2.11, H100; v2.14.0's float8_copy_kernel_cuda keys the
     intrinsic on kFloat / kHalf / kBFloat16 sources only)."""
     if cdt == torch.complex128:
-        _skip_f64(mojo_device, cdt)
+        skip_float64_on_metal(mojo_device, cdt)
     host = torch.tensor([1000 + 2j, 3 + 1j, complex(float("inf"), 0.0)], dtype=cdt)
     want = host.real.to(dst)
     d = host.to(mojo_device)

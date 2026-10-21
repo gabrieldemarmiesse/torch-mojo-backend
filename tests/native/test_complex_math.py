@@ -13,7 +13,7 @@ import warnings
 import pytest
 import torch
 
-from tests.native.conftest import is_metal, skip_if_metal
+from tests.native.conftest import is_metal, skip_float64_on_metal, skip_if_metal
 from tests.native.test_complex import CDTYPES, _close, _put, _rand, _skip_c128
 from torch_mojo_backend import native
 
@@ -225,8 +225,7 @@ def test_pow(mojo_gpu: str, dtype: torch.dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_complex_and_polar(mojo_gpu: str, dtype: torch.dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     re = torch.randn(4, 5, dtype=dtype)
     im = torch.randn(5, dtype=dtype)
     _close(torch.complex(re.to(mojo_gpu), im.to(mojo_gpu)), torch.complex(re, im))

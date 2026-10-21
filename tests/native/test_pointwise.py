@@ -20,21 +20,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import is_metal, skip_if_metal
-from torch_mojo_backend import get_accelerators, native
+from tests.native.conftest import is_metal, ran, skip_float64_on_metal, skip_if_metal
+from torch_mojo_backend import native
 
 FLOATS = [torch.float32, torch.float16, torch.bfloat16]
 INTS = [torch.int64, torch.int32, torch.int16, torch.int8, torch.uint8]
-
-
-@contextlib.contextmanager
-def ran(*op_names: str):
-    native.op_counting(True)
-    before = {name: native.op_count(name) for name in op_names}
-    yield
-    assert any(native.op_count(name) > before[name] for name in op_names), (
-        f"none of {op_names} ran natively"
-    )
 
 
 _SPECIAL = [
@@ -83,9 +73,7 @@ def _flushes_subnormals(device: str) -> bool:
     """Apple GPUs flush float32 (and bfloat16) subnormals to zero in float
     arithmetic and compares, as torch MPS's own Metal kernels then do: a
     subnormal operand or result cannot match CPU torch there."""
-    accelerators = list(get_accelerators())
-    idx = int(device.rsplit(":", 1)[-1])
-    return idx < len(accelerators) and accelerators[idx].api == "metal"
+    return is_metal(device)
 
 
 def _subnormal(t: torch.Tensor) -> torch.Tensor:
@@ -163,8 +151,7 @@ def test_lerp_scalar_inplace_never_resizes_self(mojo_gpu, dtype):
     """lerp_ writes into self: a broadcast shape larger than self raises,
     like torch, instead of resizing self (float32 keeps binary.mojo's route;
     every other dtype is the pointwise one)."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal has no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     a = torch.randn(1, 3, dtype=dtype)
     b = torch.randn(2, 3, dtype=dtype)
     with pytest.raises(RuntimeError):
@@ -375,8 +362,7 @@ def test_lerp_tensor_out_and_promotion(mojo_gpu):
 @pytest.mark.parametrize("approximate", ["tanh", "none"])
 @pytest.mark.parametrize("dtype", [*FLOATS, torch.float64])
 def test_gelu_backward_functional(mojo_gpu, approximate, dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal has no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
     # |x| < 1e18: past that x * x overflows float32 and CUDA's formula gives
     # NaN (inf * 0), where a float64 reference does not.
     special = [v for v in _SPECIAL if not abs(v) > 1e18]
@@ -847,8 +833,7 @@ def test_special_polynomials_huge_degree(mojo_gpu, name, x, dtype):
     A degree of 2^63 or more is UB in C++ (`static_cast<int64_t>`): x86
     CPU torch gives INT64_MIN (0 here) but ARM and CUDA saturate, so it is
     not compared."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     fn = getattr(torch.special, name)
     n = torch.tensor([9.21e18, 2.0**62, -9.21e18, -(2.0**63)], dtype=dtype)
     xs = torch.full_like(n, x)
@@ -924,8 +909,7 @@ def _only(op: str):
     "dtype", [*FLOATS, torch.float64, torch.int64, torch.int32, torch.bool]
 )
 def test_deg2rad_rad2deg(mojo_gpu, name, dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     fn = getattr(torch, name)
     if dtype.is_floating_point:
         x = torch.cat([torch.tensor(_SPECIAL), torch.randn(200) * 400]).to(dtype)
@@ -993,8 +977,7 @@ _LDEXP_E = [
 def test_ldexp_int_exponent(mojo_gpu, dtype, edtype):
     """The `_ldexp_int_exponent` route: ::ldexp(x, exp), exact (including
     subnormal results, rounded once) and saturating."""
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "no float64 on Apple GPUs")
+    skip_float64_on_metal(mojo_gpu, dtype)
     info = torch.iinfo(edtype)
     xs, es = zip(
         *[(x, e) for x in _LDEXP_X for e in _LDEXP_E if info.min <= e <= info.max]
@@ -2264,8 +2247,7 @@ def test_loss_backward_grad_input(mojo_gpu, op, extra):
 
 
 def _f64_or_skip(mojo_gpu, dtype):
-    if dtype == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal has no float64")
+    skip_float64_on_metal(mojo_gpu, dtype)
 
 
 @pytest.mark.parametrize("dtype", [*FLOATS, torch.float64])
@@ -2614,8 +2596,7 @@ def test_masked_scale_broadcasts_like_tensor_iterator(mojo_gpu):
 @pytest.mark.parametrize("dtype", [torch.int64, torch.uint8, torch.bool])
 def test_isclose_integers_under_another_default_dtype(mojo_gpu, default, dtype):
     """The integer tolerance test runs in the DEFAULT float dtype."""
-    if default == torch.float64:
-        skip_if_metal(mojo_gpu, "Metal has no float64")
+    skip_float64_on_metal(mojo_gpu, default)
     torch.manual_seed(8)
     a = torch.randint(0, 200, (300,)).to(dtype)
     b = torch.randint(0, 200, (300,)).to(dtype)
