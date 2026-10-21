@@ -1,0 +1,32 @@
+name: CPU runner setup
+description: The Modular cache and the project environment, for the hosted jobs without a GPU.
+
+inputs:
+  cache-key:
+    description: Prefix of the /tmp/modular cache key, one per job (and shard).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Modular directory
+      uses: actions/cache@v4
+      with:
+        path: /tmp/modular/
+        key: ${{ inputs.cache-key }}-${{ hashFiles('uv.lock') }}
+        # The trailing dash keeps shard 1 from restoring shard 10's cache.
+        restore-keys: |
+          ${{ inputs.cache-key }}-
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        prune-cache: false
+
+    - name: Install dependencies
+      shell: bash
+      run: uv run echo hello
+
+    - name: Point MAX at the cached directory
+      shell: bash
+      run: echo "MODULAR_HOME=/tmp/modular/" >> "$GITHUB_ENV"
