@@ -42,6 +42,7 @@ from tmb.kernels.common.libdevice_port import (
 )
 from tmb.kernels.common.op_utils import _enqueue_cached, _make_ptr
 from tmb.kernels.random.rng_metadata import I64x8
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 comptime DIST_UNIFORM = 0
 comptime DIST_NORMAL = 1
@@ -62,14 +63,6 @@ comptime _EPS_F32 = Float32(1.1920929e-07)
 comptime _EPS_F64 = Float64(2.220446049250313e-16)
 comptime _PI_F32 = Float32(3.14159265358979323846)
 comptime _PI_F64 = Float64(3.14159265358979323846)
-
-
-@always_inline
-def acc_dtype[dtype: DType]() -> DType:
-    comptime if dtype == DType.float64:
-        return DType.float64
-    else:
-        return DType.float32
 
 
 @always_inline
@@ -209,10 +202,10 @@ def _draw_uniform[
     w: U32x4,
     from_out: Scalar[dtype],
     to_out: Scalar[dtype],
-    from_acc: Scalar[acc_dtype[dtype]()],
-    range_acc: Scalar[acc_dtype[dtype]()],
+    from_acc: Scalar[wide_dtype[dtype]()],
+    range_acc: Scalar[wide_dtype[dtype]()],
 ) -> SIMD[dtype, N]:
-    comptime ACC = acc_dtype[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     var u = _uniform_acc[ACC, N](w)
     var value = fma(u, SIMD[ACC, N](range_acc), SIMD[ACC, N](from_acc)).cast[
         dtype
@@ -227,9 +220,11 @@ def _draw_uniform[
 def _draw_normal[
     dtype: DType, N: Int
 ](
-    w: U32x4, mean: Scalar[acc_dtype[dtype]()], std: Scalar[acc_dtype[dtype]()]
-) -> SIMD[acc_dtype[dtype](), N]:
-    comptime ACC = acc_dtype[dtype]()
+    w: U32x4,
+    mean: Scalar[wide_dtype[dtype]()],
+    std: Scalar[wide_dtype[dtype]()],
+) -> SIMD[wide_dtype[dtype](), N]:
+    comptime ACC = wide_dtype[dtype]()
     return fma(_normal_acc[ACC, N](w), SIMD[ACC, N](std), SIMD[ACC, N](mean))
 
 
@@ -237,9 +232,11 @@ def _draw_normal[
 def _draw_log_normal[
     dtype: DType, N: Int
 ](
-    w: U32x4, mean: Scalar[acc_dtype[dtype]()], std: Scalar[acc_dtype[dtype]()]
+    w: U32x4,
+    mean: Scalar[wide_dtype[dtype]()],
+    std: Scalar[wide_dtype[dtype]()],
 ) -> SIMD[dtype, N]:
-    comptime ACC = acc_dtype[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     var n = _draw_normal[dtype, N](w, mean, std)
     var out = SIMD[ACC, N]()
 
@@ -272,10 +269,10 @@ def _draw_cauchy[
     dtype: DType, N: Int
 ](
     w: U32x4,
-    median: Scalar[acc_dtype[dtype]()],
-    sigma: Scalar[acc_dtype[dtype]()],
+    median: Scalar[wide_dtype[dtype]()],
+    sigma: Scalar[wide_dtype[dtype]()],
 ) -> SIMD[dtype, N]:
-    comptime ACC = acc_dtype[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     var u = _uniform_acc[ACC, N](w)
     var out = SIMD[ACC, N]()
 
@@ -308,8 +305,8 @@ def _exponential_one[
 @always_inline
 def _draw_exponential[
     dtype: DType, N: Int
-](w: U32x4, lambd: Scalar[acc_dtype[dtype]()]) -> SIMD[dtype, N]:
-    comptime ACC = acc_dtype[dtype]()
+](w: U32x4, lambd: Scalar[wide_dtype[dtype]()]) -> SIMD[dtype, N]:
+    comptime ACC = wide_dtype[dtype]()
     var u = _uniform_acc[ACC, N](w)
     var out = SIMD[ACC, N]()
 
@@ -321,8 +318,8 @@ def _draw_exponential[
 @always_inline
 def _draw_geometric[
     dtype: DType, N: Int
-](w: U32x4, p: Scalar[acc_dtype[dtype]()]) -> SIMD[dtype, N]:
-    comptime ACC = acc_dtype[dtype]()
+](w: U32x4, p: Scalar[wide_dtype[dtype]()]) -> SIMD[dtype, N]:
+    comptime ACC = wide_dtype[dtype]()
     var u = _uniform_acc[ACC, N](w)
     var out = SIMD[ACC, N]()
 
@@ -334,8 +331,8 @@ def _draw_geometric[
 @always_inline
 def _draw_bernoulli[
     dtype: DType, N: Int
-](w: U32x4, p: Scalar[acc_dtype[dtype]()]) -> SIMD[dtype, N]:
-    comptime ACC = acc_dtype[dtype]()
+](w: U32x4, p: Scalar[wide_dtype[dtype]()]) -> SIMD[dtype, N]:
+    comptime ACC = wide_dtype[dtype]()
     var keep = _uniform_acc[ACC, N](w).lt(SIMD[ACC, N](p))
     comptime if dtype == DType.bool:
         return rebind[SIMD[dtype, N]](keep)
@@ -386,8 +383,8 @@ def dist_draw[
     w: U32x4,
     p_out0: Scalar[dtype],
     p_out1: Scalar[dtype],
-    p_acc0: Scalar[acc_dtype[dtype]()],
-    p_acc1: Scalar[acc_dtype[dtype]()],
+    p_acc0: Scalar[wide_dtype[dtype]()],
+    p_acc1: Scalar[wide_dtype[dtype]()],
     i0: Int64,
     i1: Int64,
 ) -> SIMD[dtype, dist_unroll[DIST, dtype]()]:
@@ -465,8 +462,8 @@ def _dist_kernel[
     strides: I64x8,
     p_out0: Scalar[dtype],
     p_out1: Scalar[dtype],
-    p_acc0: Scalar[acc_dtype[dtype]()],
-    p_acc1: Scalar[acc_dtype[dtype]()],
+    p_acc0: Scalar[wide_dtype[dtype]()],
+    p_acc1: Scalar[wide_dtype[dtype]()],
     i0: Int64,
     i1: Int64,
     seed: UInt64,
@@ -517,8 +514,8 @@ def enqueue_distribution[
     grid: Int,
     p_out0: Scalar[dtype],
     p_out1: Scalar[dtype],
-    p_acc0: Scalar[acc_dtype[dtype]()],
-    p_acc1: Scalar[acc_dtype[dtype]()],
+    p_acc0: Scalar[wide_dtype[dtype]()],
+    p_acc1: Scalar[wide_dtype[dtype]()],
     i0: Int64,
     i1: Int64,
     seed: UInt64,

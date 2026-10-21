@@ -604,6 +604,7 @@ def _mma_tile_impl[
 
 @always_inline
 def _gemm_layout_tag[TA: Bool, TB: Bool]() -> StaticString:
+    # Kernel-symbol layout suffix: A then B, "t" transposed, "n" not.
     comptime if TA:
         return "tt" if TB else "tn"
     else:
@@ -612,18 +613,18 @@ def _gemm_layout_tag[TA: Bool, TB: Bool]() -> StaticString:
 
 @always_inline
 def _gemm_regime_tag[BM: Int, BN: Int]() -> StaticString:
-    # The 64x64 case must be tested first: testing BN or BM alone is not
-    # injective at (64, 64) and would collide with the _w64 tag.
+    # The four tile regimes: 128x128 unsuffixed, 128x64 narrow-N, 64x128
+    # narrow-M, 64x64 small.  The 64x64 case must be tested first: testing
+    # BN or BM alone is not injective at (64, 64) and would collide with
+    # the _w64 tag.
     comptime if BM == 64 and BN == 64:
         return "_s64"
+    elif BN == 64:
+        return "_w64"
+    elif BM == 64:
+        return "_m64"
     else:
-        comptime if BN == 64:
-            return "_w64"
-        else:
-            comptime if BM == 64:
-                return "_m64"
-            else:
-                return ""
+        return ""
 
 
 @always_inline
@@ -836,45 +837,13 @@ def _gemm_splitk_reduce[
                         output[unsafe_offset=obase + e] = acc4[e].cast[_DT]()
 
 
-@always_inline
-def _bmm_layout_tag[TA: Bool, TB: Bool]() -> StaticString:
-    comptime if TA:
-        return "tt" if TB else "tn"
-    else:
-        return "nt" if TB else "nn"
-
-
-@always_inline
-def _bmm_regime_tag[BM: Int, BN: Int]() -> StaticString:
-    # The four tile regimes: 128x128 unsuffixed, 128x64 narrow-N, 64x128
-    # narrow-M, 64x64 small.  The 64x64 case must be tested first: testing
-    # BN or BM alone is not injective at (64, 64) and would collide with
-    # the _w64 tag.
-    comptime if BM == 64 and BN == 64:
-        return "_s64"
-    elif BN == 64:
-        return "_w64"
-    elif BM == 64:
-        return "_m64"
-    else:
-        return ""
-
-
-@always_inline
-def _bmm_fastk_tag[FASTK: Bool]() -> StaticString:
-    comptime if FASTK:
-        return "_f"
-    else:
-        return ""
-
-
 # One generic entry carries all 24 BMM specializations; only the comptime
 # tuple (layout pair, tile regime, FASTK) ever varied between them. BATCHED
 # is the complement of FASTK rather than a fourth axis: a FASTK launch maps
 # one batch per grid.z block, so it never runs the kernel's batch loop, while
 # a guarded launch grid-strides batches through it.
 @__name(
-    t"{_GEMM16_TAG}_bmm_{_bmm_layout_tag[TA, TB]()}{_bmm_regime_tag[BM, BN]()}{_bmm_fastk_tag[FASTK]()}"
+    t"{_GEMM16_TAG}_bmm_{_gemm_layout_tag[TA, TB]()}{_gemm_regime_tag[BM, BN]()}{_gemm_fastk_tag[FASTK]()}"
 )
 def _bmm_entry[
     TA: Bool, TB: Bool, BM: Int, BN: Int, FASTK: Bool
@@ -1259,16 +1228,7 @@ def _mma_tile_wide[
         lin += gdx
 
 
-@always_inline
-def _wide_layout_tag[TA: Bool, TB: Bool]() -> StaticString:
-    # Kernel-symbol layout suffix: A then B, "t" transposed, "n" not.
-    comptime if TA:
-        return "tt" if TB else "tn"
-    else:
-        return "nt" if TB else "nn"
-
-
-@__name(t"{_GEMM16_TAG}_gemm_{_wide_layout_tag[TA, TB]()}_wide")
+@__name(t"{_GEMM16_TAG}_gemm_{_gemm_layout_tag[TA, TB]()}_wide")
 def _gemm_wide[
     TA: Bool, TB: Bool
 ](
@@ -1314,7 +1274,7 @@ def _gemm_wide[
     )
 
 
-@__name(t"{_GEMM16_TAG}_bmm_{_wide_layout_tag[TA, TB]()}_wide")
+@__name(t"{_GEMM16_TAG}_bmm_{_gemm_layout_tag[TA, TB]()}_wide")
 def _bmm_wide[
     TA: Bool, TB: Bool
 ](

@@ -22,6 +22,7 @@ from tmb.kernels.common.op_utils import (
     _make_ptr,
     _raw_ctx,
     _raw_int,
+    _spec_dispatcher12,
 )
 
 from tmb.kernels.common.variant_gates import (
@@ -138,24 +139,6 @@ def _layer_norm_backward_go(
     )
 
 
-def _layer_norm_backward_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _layer_norm_backward_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-        args[unsafe_offset=9],
-        args[unsafe_offset=10],
-        args[unsafe_offset=11],
-    )
-
-
 @export
 def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     """C entry of this family: one kernel per build (see `OP`).
@@ -163,7 +146,9 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
     """
     try:
         comptime if _op_on["LayerNormBackwardF32"]():
-            _layer_norm_backward_dispatcher(argv, argc)
+            _spec_dispatcher12[_layer_norm_backward_go, "LayerNormBackwardF32"](
+                argv, argc
+            )
             return 0
         raise Error(NO_OP_COMPILED)
     except e:

@@ -3,23 +3,18 @@
 Scope (v1): bf16, head_dim=128, non-causal, contiguous (B, L, H, D),
 seqlen % BN == 0, Hq == Hk.
 
-PTX dump: when the build defines `MOJO_DUMP_PTX=<path>` (wired from
-the same-named environment variable by `_jit.py`), the device
-function's PTX is written to <path> at first-call JIT time via
-`compile_function(dump_asm=...)`. A `%` in the path expands to the
-kernel module name.
+PTX dump: `-D MOJO_DUMP_PTX=<path>` (launch_cache.dump_ptx_path).
 """
 
 from max.gpu.host import DeviceAttribute, DeviceContext, FuncAttribute
 from max.gpu.host.device_context import (
     _DeviceContextPtr,
     _DeviceContextCpp,
-    _DumpPath,
 )
 from max.gpu.host.nvidia.tma import TensorMapSwizzle
 from std.math import ceildiv
 from std.memory import OpaquePointer
-from std.sys import get_defined_string, size_of
+from std.sys import size_of
 from std.utils.index import IndexList
 
 from layout import UNKNOWN_VALUE
@@ -38,16 +33,7 @@ from tmb.kernels.fa4.fwd_common import (
     kFa4BlockN,
     kFa4KVStages,
 )
-from tmb.kernels.fa4.launch_cache import enqueue_fa4_cached
-
-comptime MOJO_DUMP_PTX: StaticString = get_defined_string["MOJO_DUMP_PTX", ""]()
-
-
-def _dump_ptx_path() -> _DumpPath:
-    comptime if MOJO_DUMP_PTX == StaticString(""):
-        return _DumpPath(False)
-    else:
-        return _DumpPath(MOJO_DUMP_PTX)
+from tmb.kernels.fa4.launch_cache import dump_ptx_path, enqueue_fa4_cached
 
 
 def launch_fwd_fa4[
@@ -231,7 +217,7 @@ def launch_fwd_fa4[
         enqueue_fa4_cached[
             kernel_inst_b,
             use_external_stream=use_external_stream,
-            dump_asm=_dump_ptx_path(),
+            dump_asm=dump_ptx_path(),
         ](
             ctx,
             ctx_handle_addr,
@@ -384,7 +370,7 @@ def launch_fwd_fa4[
         enqueue_fa4_cached[
             kernel_inst,
             use_external_stream=use_external_stream,
-            dump_asm=_dump_ptx_path(),
+            dump_asm=dump_ptx_path(),
         ](
             ctx,
             ctx_handle_addr,
@@ -500,7 +486,7 @@ def launch_fwd_fa4[
     enqueue_fa4_cached[
         kernel_inst,
         use_external_stream=use_external_stream,
-        dump_asm=_dump_ptx_path(),
+        dump_asm=dump_ptx_path(),
     ](
         ctx,
         ctx_handle_addr,

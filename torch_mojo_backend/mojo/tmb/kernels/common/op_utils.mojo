@@ -30,6 +30,7 @@ from std.sys.info import (
     _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
+    is_amd_gpu,
     is_nvidia_gpu,
     simd_width_of,
     size_of,
@@ -999,6 +1000,19 @@ def _moments_scan_contig[
         s_t += d
         q_t += d * d
         jt += threads
+
+
+@always_inline
+def _device_scope() -> StaticString:
+    """`Atomic` scope for device-wide atomics."""
+    # Device-scope atomics skip system-scope ordering cost on the discrete
+    # targets; every other accelerator keeps the portable default scope.
+    comptime if is_nvidia_gpu():
+        return "device"
+    elif is_amd_gpu():
+        return "agent"
+    else:
+        return ""
 
 
 @always_inline

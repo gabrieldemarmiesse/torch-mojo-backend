@@ -55,21 +55,15 @@ from tmb.kernels.common.libdevice_port import (
     nv_log1pf,
     nv_logf,
 )
-from tmb.kernels.common.dtype_arithmetic import amd_opaque, cast_rounded
+from tmb.kernels.common.dtype_arithmetic import (
+    amd_opaque,
+    cast_rounded,
+    wide_dtype,
+)
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
 from tmb.kernels.common.pow_math import pow_c99, torch_pow
 from tmb.kernels.common.special_math import igamma_f, igammac_f, zeta_f
-
-
-@always_inline
-def wide_dtype[dtype: DType]() -> DType:
-    """ATen's opmath type of a floating dtype: float64 stays, the rest
-    compute in float32 (integers too, for the kinds that promote them)."""
-    comptime if dtype == DType.float64:
-        return DType.float64
-    else:
-        return DType.float32
 
 
 @always_inline

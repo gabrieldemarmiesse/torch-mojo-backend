@@ -60,34 +60,6 @@ from linalg.utils import elementwise_epilogue_type
 from linalg.utils_gpu import MatmulConfig
 from std.sys import llvm_intrinsic
 
-# Apple 8x8 simdgroup-matrix primitives (vendored from
-# linalg.matmul.gpu.apple.matmul_8x8, whose helpers are not exported).
-comptime MMA8_DIM = 8
-comptime FRAG8 = 2  # 8x8 = 64 elems / 32 lanes = 2 per lane
-
-
-@always_inline
-def _frag8_layout(lane: Int) -> Tuple[Int, Int]:
-    """Apple 8x8 simdgroup-matrix per-lane layout: lane owns
-    (row, col_base) and (row, col_base + 1)."""
-    return (
-        ((lane & 6) >> 1) + ((lane & 16) >> 2),
-        ((lane & 1) << 1) + ((lane & 8) >> 1),
-    )
-
-
-@always_inline
-def _mma8x8(
-    a: SIMD[DType.float32, FRAG8],
-    b: SIMD[DType.float32, FRAG8],
-    c: SIMD[DType.float32, FRAG8],
-) -> SIMD[DType.float32, FRAG8]:
-    """One 8x8x8 simdgroup-matrix multiply-accumulate: D = A @ B + C."""
-    return llvm_intrinsic[
-        "llvm.air.simdgroup_matrix_8x8_multiply_accumulate",
-        SIMD[DType.float32, FRAG8],
-    ](a, b, c)
-
 
 from max.gpu.primitives import PDLLevel
 
@@ -140,6 +112,12 @@ from tmb.kernels.common.variant_gates import (
     _dtype_supported,
     _op_on,
     _tmb_entry_error,
+)
+from tmb.kernels.common.apple_mma8 import (
+    FRAG8,
+    MMA8_DIM,
+    _frag8_layout,
+    _mma8x8,
 )
 
 
@@ -6694,18 +6672,6 @@ def _bmm_causal_go(
         raise Error("BmmCausalF32 is Apple-GPU only")
 
 
-def _bmm_causal_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _bmm_causal_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
-
-
 # ---------------------------------------------------------------------------
 # In-place row-broadcast bias add: out[i] += bias[i % cols]. Used as the
 # addmm / conv-bias epilogue.
@@ -6884,35 +6850,6 @@ def _matmul_bias_launch[
         c_addr, a_addr, b_addr, 1, m, n, k, m * k, transpose_b, ctx
     )
     _bias_add_row[dt](c_addr, bias_addr, m * n, n, ctx)
-
-
-# METH_FASTCALL wrappers for the hot dispatchers (raw CPython unpack; the
-# internal Python callers guarantee argument types, and raise sites are
-# unsupported-dtype guards gated upstream).
-
-
-def _matmul_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _matmul_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
-
-
-def _bmm_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _bmm_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
 
 
 def _causal_bmm_go(
@@ -7538,13 +7475,13 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _spec_dispatcher3[_int_mm_spec_go, "IntMmSpec"](argv, argc)
             return 0
         comptime if _op_on["Matmul"]():
-            _matmul_dispatcher(argv, argc)
+            _spec_dispatcher6[_matmul_go, "Matmul"](argv, argc)
             return 0
         comptime if _op_on["Bmm"]():
-            _bmm_dispatcher(argv, argc)
+            _spec_dispatcher6[_bmm_go, "Bmm"](argv, argc)
             return 0
         comptime if _op_on["BmmCausalF32"]():
-            _bmm_causal_dispatcher(argv, argc)
+            _spec_dispatcher6[_bmm_causal_go, "BmmCausalF32"](argv, argc)
             return 0
         comptime if _op_on["CausalBmm"]():
             _spec_dispatcher6[_causal_bmm_go, "CausalBmm"](argv, argc)

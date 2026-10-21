@@ -22,7 +22,7 @@ from std.collections import Array
 from max.gpu import block_dim, block_idx, grid_dim, thread_idx
 from std.math import ceildiv
 from max.gpu.host import DeviceContext
-from std.sys import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
+from std.sys import is_apple_gpu, is_nvidia_gpu
 from std.sys.defines import get_defined_int
 from std.sys.info import (
     has_accelerator,
@@ -48,6 +48,7 @@ from tmb.kernels.common.op_utils import (
     _T2D_ROWS,
     _bw_blocks,
     _bw_flat_blocks,
+    _device_scope,
     _device_sm_count,
     _enqueue_cached,
     _enqueue_cached_2d,
@@ -66,6 +67,8 @@ from tmb.kernels.common.op_utils import (
     _scratch_contig,
     _spec_dispatcher3,
     _spec_dispatcher6,
+    _spec_dispatcher7,
+    _spec_dispatcher8,
     _spec_dispatcher9,
     _spec_ptr,
     _t2d_tile,
@@ -123,16 +126,6 @@ def _atomic_add_ok[dt: DType]() -> Bool:
 
 
 @always_inline
-def _atomic_scope() -> StaticString:
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
-
-
-@always_inline
 def _atomic_add[
     dtype: DType
 ](ptr: Pointer[Scalar[dtype], MutUntrackedOrigin], value: Scalar[dtype]):
@@ -174,7 +167,7 @@ def _atomic_add[
             ](word, expected, desired):
                 break
     else:
-        _ = Atomic[Scalar[dtype], scope=_atomic_scope()].fetch_add[
+        _ = Atomic[Scalar[dtype], scope=_device_scope()].fetch_add[
             ordering=Ordering.RELAXED
         ](ptr, value)
 
@@ -271,7 +264,7 @@ def _atomic_rmw[
             if desired == expected:
                 break
             if Atomic[
-                Scalar[DType.uint32], scope=_atomic_scope()
+                Scalar[DType.uint32], scope=_device_scope()
             ].compare_exchange[
                 success_ordering=Ordering.RELAXED,
                 failure_ordering=Ordering.RELAXED,
@@ -290,7 +283,7 @@ def _atomic_rmw[
             )
             if desired == expected:
                 break
-            if Atomic[Scalar[U], scope=_atomic_scope()].compare_exchange[
+            if Atomic[Scalar[U], scope=_device_scope()].compare_exchange[
                 success_ordering=Ordering.RELAXED,
                 failure_ordering=Ordering.RELAXED,
                 weak=True,
@@ -1187,20 +1180,6 @@ def _cat_n_go(
             raise Error("unsupported element size for batched cat")
     else:
         raise Error("no GPU accelerator available at compile time")
-
-
-def _cat_n_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _cat_n_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -4063,122 +4042,6 @@ def _scatter_dim_go[
 
 
 # ---------------------------------------------------------------------------
-# METH_FASTCALL wrappers: raw CPython argument unpacking (no owning
-# PythonObject per argument). Argument types are guaranteed by the internal
-# Python callers; raise sites are unsupported-dtype guards gated upstream.
-# ---------------------------------------------------------------------------
-
-
-def _permute_copy_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _permute_copy_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
-
-
-def _narrow_copy_dst_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _narrow_copy_dst_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-    )
-
-
-def _where_select_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _where_select_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-    )
-
-
-def _masked_fill_scalar_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _masked_fill_scalar_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-    )
-
-
-def _tile_copy_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _tile_copy_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-    )
-
-
-def _repeat_tiled_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _repeat_tiled_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-    )
-
-
-def _triangular_copy_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _triangular_copy_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
-
-
-def _gather_rows_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _gather_rows_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
-
-
-# ---------------------------------------------------------------------------
 # The deterministic scatter-add of ATen's `_scatter_via_index_put`
 # (native/TensorAdvancedIndexing.cpp), what CUDA runs for a floating
 # scatter_reduce sum / mean or scatter(reduce="add") under
@@ -4549,19 +4412,21 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _spec_dispatcher3[_cast_spec_into_go, "CastSpec"](argv, argc)
             return 0
         comptime if _op_on["PermuteCopy"]():
-            _permute_copy_dispatcher(argv, argc)
+            _spec_dispatcher6[_permute_copy_go, "PermuteCopy"](argv, argc)
             return 0
         comptime if _op_on["NarrowCopyDst"]():
-            _narrow_copy_dst_dispatcher(argv, argc)
+            _spec_dispatcher8[_narrow_copy_dst_go, "NarrowCopyDst"](argv, argc)
             return 0
         comptime if _op_on["CatN"]():
-            _cat_n_dispatcher(argv, argc)
+            _spec_dispatcher8[_cat_n_go, "CatN"](argv, argc)
             return 0
         comptime if _op_on["WhereSelect"]():
-            _where_select_dispatcher(argv, argc)
+            _spec_dispatcher7[_where_select_go, "WhereSelect"](argv, argc)
             return 0
         comptime if _op_on["MaskedFillScalar"]():
-            _masked_fill_scalar_dispatcher(argv, argc)
+            _spec_dispatcher7[_masked_fill_scalar_go, "MaskedFillScalar"](
+                argv, argc
+            )
             return 0
         comptime if _op_on["MaskedSelectCount"]():
             masked_select_count_dispatcher(argv, argc)
@@ -4570,16 +4435,16 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             masked_select_compact_dispatcher(argv, argc)
             return 0
         comptime if _op_on["TileCopy"]():
-            _tile_copy_dispatcher(argv, argc)
+            _spec_dispatcher7[_tile_copy_go, "TileCopy"](argv, argc)
             return 0
         comptime if _op_on["RepeatTiled"]():
-            _repeat_tiled_dispatcher(argv, argc)
+            _spec_dispatcher8[_repeat_tiled_go, "RepeatTiled"](argv, argc)
             return 0
         comptime if _op_on["TriangularCopy"]():
-            _triangular_copy_dispatcher(argv, argc)
+            _spec_dispatcher9[_triangular_copy_go, "TriangularCopy"](argv, argc)
             return 0
         comptime if _op_on["GatherRows"]():
-            _gather_rows_dispatcher(argv, argc)
+            _spec_dispatcher9[_gather_rows_go, "GatherRows"](argv, argc)
             return 0
         comptime if _op_on["IndexPutRows"]():
             _index_put_rows_dispatcher(argv, argc)

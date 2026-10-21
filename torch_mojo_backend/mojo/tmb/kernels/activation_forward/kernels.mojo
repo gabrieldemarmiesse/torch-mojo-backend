@@ -7,13 +7,13 @@ and rounds once on return.  Device functions are cached per supplied context.
 """
 
 from nn.activations import gelu_tanh
-from std.ffi import _get_global_or_null, external_call
 from max.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.host import DeviceContext
 from std.math import ceildiv, exp2
 from std.math.polynomial import polynomial_evaluate
 from std.memory import bitcast
-from std.memory.alloc import unsafe_alloc
+
+from tmb.kernels.common.op_utils import _enqueue_cached
 
 
 comptime _BLOCK = 256
@@ -163,86 +163,6 @@ def _gelu_forward_bf16_tanh(
         index += stride
 
 
-def _enqueue_exact_cached(
-    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
-    blocks: Int,
-    ctx: DeviceContext,
-) raises:
-    var cache_name = String(t"GELU_FORWARD_BF16_EXACT_VEC16_V1_{ctx.id()}")
-    comptime FuncT = type_of(ctx.compile_function[_gelu_forward_bf16_exact]())
-    var global_ptr = _get_global_or_null(cache_name)
-    if global_ptr:
-        var cached = global_ptr.value().unsafe_bitcast[FuncT]()
-        ctx.enqueue_function(
-            cached[],
-            output,
-            input,
-            Int64(elements),
-            Int64(vec_count),
-            grid_dim=(blocks,),
-            block_dim=(_BLOCK,),
-        )
-        return
-    var compiled = ctx.compile_function[_gelu_forward_bf16_exact]()
-    var cached = unsafe_alloc[FuncT](1)
-    cached.unsafe_write(compiled^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(cache_name), cached.unsafe_bitcast[NoneType]()
-    )
-    ctx.enqueue_function(
-        cached[],
-        output,
-        input,
-        Int64(elements),
-        Int64(vec_count),
-        grid_dim=(blocks,),
-        block_dim=(_BLOCK,),
-    )
-
-
-def _enqueue_tanh_cached(
-    output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    elements: Int,
-    vec_count: Int,
-    blocks: Int,
-    ctx: DeviceContext,
-) raises:
-    var cache_name = String(t"GELU_FORWARD_BF16_TANH_VEC16_V1_{ctx.id()}")
-    comptime FuncT = type_of(ctx.compile_function[_gelu_forward_bf16_tanh]())
-    var global_ptr = _get_global_or_null(cache_name)
-    if global_ptr:
-        var cached = global_ptr.value().unsafe_bitcast[FuncT]()
-        ctx.enqueue_function(
-            cached[],
-            output,
-            input,
-            Int64(elements),
-            Int64(vec_count),
-            grid_dim=(blocks,),
-            block_dim=(_BLOCK,),
-        )
-        return
-    var compiled = ctx.compile_function[_gelu_forward_bf16_tanh]()
-    var cached = unsafe_alloc[FuncT](1)
-    cached.unsafe_write(compiled^)
-    external_call["KGEN_CompilerRT_InsertGlobal", NoneType](
-        StringSlice(cache_name), cached.unsafe_bitcast[NoneType]()
-    )
-    ctx.enqueue_function(
-        cached[],
-        output,
-        input,
-        Int64(elements),
-        Int64(vec_count),
-        grid_dim=(blocks,),
-        block_dim=(_BLOCK,),
-    )
-
-
 def enqueue_gelu_forward_bf16(
     output: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
     input: Pointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -258,6 +178,26 @@ def enqueue_gelu_forward_bf16(
         elements, _BLOCK
     )
     if tanh_approx:
-        _enqueue_tanh_cached(output, input, elements, vec_count, blocks, ctx)
+        _enqueue_cached[_gelu_forward_bf16_tanh](
+            ctx,
+            blocks,
+            1,
+            1,
+            _BLOCK,
+            output,
+            input,
+            Int64(elements),
+            Int64(vec_count),
+        )
     else:
-        _enqueue_exact_cached(output, input, elements, vec_count, blocks, ctx)
+        _enqueue_cached[_gelu_forward_bf16_exact](
+            ctx,
+            blocks,
+            1,
+            1,
+            _BLOCK,
+            output,
+            input,
+            Int64(elements),
+            Int64(vec_count),
+        )

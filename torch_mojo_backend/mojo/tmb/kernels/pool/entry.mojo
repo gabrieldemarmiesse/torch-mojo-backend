@@ -33,7 +33,7 @@
 from max.gpu.host import DeviceContext
 from std.atomic import Atomic, Ordering
 from std.memory import bitcast
-from std.sys import is_amd_gpu, is_nvidia_gpu, size_of
+from std.sys import size_of
 from std.sys.info import has_apple_gpu_accelerator
 from std.utils.coord import Coord
 from std.utils.index import IndexList
@@ -41,10 +41,11 @@ from std.utils.numerics import min_or_neg_inf
 
 from max.gpu import block_idx, grid_dim, thread_idx
 
-from tmb.kernels.common.dtype_arithmetic import cast_rounded
+from tmb.kernels.common.dtype_arithmetic import cast_rounded, wide_dtype
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
+    _device_scope,
     _enqueue_cached,
     _make_ptr,
     _parallel_for_dt,
@@ -101,12 +102,6 @@ comptime G_DIV = 20  # avg: divisor_override (0 = none)
 comptime G_3D = 21  # 1 for the 3-D ops (the adaptive-avg divisor order)
 comptime G_LEN = 22
 comptime Geom = IndexList[G_LEN]
-
-
-@always_inline
-def _acc[dtype: DType]() -> DType:
-    """torch's `acc_type<scalar_t, /*is_cuda=*/true>`."""
-    return DType.float64 if dtype == DType.float64 else DType.float32
 
 
 @always_inline
@@ -293,7 +288,7 @@ def _max_pool_backward[
     var gin_ptr = _make_ptr[dtype](gin_addr)
     var gout_ptr = _make_ptr[dtype](gout_addr)
     var idx_ptr = _make_ptr[DType.int64](idx_addr)
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
 
     @always_inline
     @__parameter
@@ -357,7 +352,7 @@ def _fractional_max_pool[
     var idx_ptr = _make_ptr[DType.int64](idx_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
     var smp_ptr = _make_ptr[dtype](samples_addr)
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
 
     @always_inline
     @__parameter
@@ -412,16 +407,6 @@ def _fractional_max_pool[
 
 
 @always_inline
-def _scope() -> StaticString:
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
-
-
-@always_inline
 def _atomic_add[
     dtype: DType
 ](ptr: Pointer[Scalar[dtype], MutAnyOrigin], value: Scalar[dtype]):
@@ -445,14 +430,14 @@ def _atomic_add[
             var desired = (expected & ~(UInt32(0xFFFF) << shift)) | (
                 UInt32(bitcast[DType.uint16](sum)) << shift
             )
-            if Atomic[UInt32, scope=_scope()].compare_exchange[
+            if Atomic[UInt32, scope=_device_scope()].compare_exchange[
                 success_ordering=Ordering.RELAXED,
                 failure_ordering=Ordering.RELAXED,
                 weak=True,
             ](word, expected, desired):
                 return
     else:
-        _ = Atomic[Scalar[dtype], scope=_scope()].fetch_add[
+        _ = Atomic[Scalar[dtype], scope=_device_scope()].fetch_add[
             ordering=Ordering.RELAXED
         ](ptr, value)
 
@@ -583,7 +568,7 @@ def _avg_pool[
 ](out_addr: Int, in_addr: Int, g: Geom, ctx: DeviceContext) raises:
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
 
     @always_inline
     @__parameter
@@ -635,14 +620,14 @@ def _avg_pool[
 def _div_t[dtype: DType](a: Scalar[dtype], b: Int) -> Scalar[dtype]:
     """`scalar_t / int` in c10: the int converts to `scalar_t`, and a half
     quotient rounds to half."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     return (a.cast[acc_t]() / Scalar[dtype](b).cast[acc_t]()).cast[dtype]()
 
 
 @always_inline
 def _add_t[dtype: DType](a: Scalar[dtype], b: Scalar[dtype]) -> Scalar[dtype]:
     """`scalar_t += scalar_t` (a half sum rounds to half)."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     return (a.cast[acc_t]() + b.cast[acc_t]()).cast[dtype]()
 
 
@@ -666,7 +651,7 @@ def _avg_pool_backward[
     """
     var gin_ptr = _make_ptr[dtype](gin_addr)
     var gout_ptr = _make_ptr[dtype](gout_addr)
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
 
     @always_inline
     @__parameter
@@ -875,7 +860,7 @@ def _col2im[
     var in_ptr = _make_ptr[dtype](in_addr)
     # bool sums its 0/1 taps in float and stores "any": CUDA's bool
     # accumulate type ORs.
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
 
     @always_inline
     @__parameter

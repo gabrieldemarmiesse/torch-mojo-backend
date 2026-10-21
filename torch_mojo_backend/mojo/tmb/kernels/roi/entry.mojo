@@ -5,7 +5,6 @@ from std.atomic import Atomic, Ordering
 from max.gpu import block_idx, grid_dim, thread_idx
 from max.gpu.intrinsics import mulhi
 from std.sys import (
-    is_amd_gpu,
     is_nvidia_gpu,
     inlined_assembly,
     has_apple_gpu_accelerator,
@@ -16,6 +15,7 @@ from tmb.kernels.common.dtype_arithmetic import _product
 from std.memory import bitcast
 from tmb.kernels.common.op_utils import (
     Argv,
+    _device_scope,
     _device_sm_count,
     _enqueue_cached,
     _make_ptr,
@@ -416,20 +416,10 @@ def _pool_forward[
 
 
 @always_inline
-def _scope() -> StaticString:
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
-
-
-@always_inline
 def _add[dt: DType](ptr: Pointer[Scalar[dt], MutAnyOrigin], value: Scalar[dt]):
-    _ = Atomic[Scalar[dt], scope=_scope()].fetch_add[ordering=Ordering.RELAXED](
-        ptr, value
-    )
+    _ = Atomic[Scalar[dt], scope=_device_scope()].fetch_add[
+        ordering=Ordering.RELAXED
+    ](ptr, value)
 
 
 # Metal has no 16-bit atomic add/CAS. Store each half accumulator in its

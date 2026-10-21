@@ -99,6 +99,8 @@ from tmb.kernels.common.op_utils import (
     _spec_dispatcher4,
     _spec_dispatcher5,
     _spec_dispatcher7,
+    _spec_dispatcher9,
+    _spec_dispatcher15,
     _spec_ptr,
     ieee_sqrt,
 )
@@ -815,99 +817,6 @@ def _cumsum_outer_into[
         _cumsum_cols_portable[dtype](out_addr, in_addr, rows, cols, ctx)
 
 
-# ---------------------------------------------------------------------------
-# METH_FASTCALL wrappers: raw CPython argument unpacking (no owning
-# PythonObject per argument). Argument types are guaranteed by the internal
-# Python callers; raise sites are unsupported-dtype guards gated upstream.
-# ---------------------------------------------------------------------------
-
-
-def _batch_norm_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _batch_norm_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
-
-
-def _softmax_rows_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _softmax_rows_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
-
-
-def _softmax_rows_dropout_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _softmax_rows_dropout_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-        args[unsafe_offset=9],
-        args[unsafe_offset=10],
-        args[unsafe_offset=11],
-        args[unsafe_offset=12],
-        args[unsafe_offset=13],
-        args[unsafe_offset=14],
-    )
-
-
-def _gather0_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _gather0_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-        args[unsafe_offset=6],
-        args[unsafe_offset=7],
-        args[unsafe_offset=8],
-    )
-
-
-def _all_bool_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _all_bool_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-    )
-
-
-def _any_bool_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _any_bool_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-    )
-
-
 comptime SPEC_MAXROWS_DTYPES: List[DType] = [
     DType.float32,
     DType.float16,
@@ -1233,22 +1142,24 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             )
             return 0
         comptime if _op_on["BatchNormInference"]():
-            _batch_norm_dispatcher(argv, argc)
+            _spec_dispatcher9[_batch_norm_go, "BatchNormInference"](argv, argc)
             return 0
         comptime if _op_on["SoftmaxRows"]():
-            _softmax_rows_dispatcher(argv, argc)
+            _spec_dispatcher9[_softmax_rows_go, "SoftmaxRows"](argv, argc)
             return 0
         comptime if _op_on["SoftmaxRowsDropoutF32"]():
-            _softmax_rows_dropout_dispatcher(argv, argc)
+            _spec_dispatcher15[
+                _softmax_rows_dropout_go, "SoftmaxRowsDropoutF32"
+            ](argv, argc)
             return 0
         comptime if _op_on["Gather0"]():
-            _gather0_dispatcher(argv, argc)
+            _spec_dispatcher9[_gather0_go, "Gather0"](argv, argc)
             return 0
         comptime if _op_on["AllBool"]():
-            _all_bool_dispatcher(argv, argc)
+            _spec_dispatcher4[_all_bool_go, "AllBool"](argv, argc)
             return 0
         comptime if _op_on["AnyBool"]():
-            _any_bool_dispatcher(argv, argc)
+            _spec_dispatcher4[_any_bool_go, "AnyBool"](argv, argc)
             return 0
         raise Error(NO_OP_COMPILED)
     except e:

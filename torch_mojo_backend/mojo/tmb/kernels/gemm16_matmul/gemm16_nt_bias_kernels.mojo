@@ -73,6 +73,7 @@ from tmb.kernels.gemm16_matmul.gemm16_nt_v4_kernels import (
     _V4_A_TMA,
     _v4_b_layout,
     _v4_b_half_layout,
+    _v4c_nt_defer_tag,
     _v4c_nt_smem_bytes,
 )
 
@@ -124,15 +125,6 @@ def _v4_store_accum_bias_stmatrix[
         )
         var data = _v4_bias_epilogue_quad[bn](accum, t, lane, bias, n0, n)
         st_matrix[simd_width=4](wg_half.unsafe_offset(off), data)
-
-
-@always_inline
-def _v4c_nt_defer_tag[defer_release: Bool]() -> StaticString:
-    """Name suffix for the deferred-release pipeline variant."""
-    comptime if defer_release:
-        return "_dr"
-    else:
-        return ""
 
 
 @always_inline

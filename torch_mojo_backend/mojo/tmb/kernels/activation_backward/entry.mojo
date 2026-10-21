@@ -36,6 +36,7 @@ from tmb.kernels.common.op_utils import (
     _make_ptr,
     _raw_ctx,
     _raw_int,
+    _spec_dispatcher6,
 )
 
 from tmb.kernels.common.variant_gates import (
@@ -462,18 +463,6 @@ def _gelu_backward_go(
     )
 
 
-def _gelu_backward_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _gelu_backward_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
-
-
 def _gelu_backward_bf16_go(
     output_ptr_obj: Arg,
     grad_output_ptr_obj: Arg,
@@ -502,18 +491,6 @@ def _gelu_backward_bf16_go(
     )
 
 
-def _gelu_backward_bf16_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _gelu_backward_bf16_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
-
-
 # ---------------------------------------------------------------------------
 # Python module definition
 # ---------------------------------------------------------------------------
@@ -536,10 +513,12 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             )
             return 0
         comptime if _op_on["GeluBackwardF32"]():
-            _gelu_backward_dispatcher(argv, argc)
+            _spec_dispatcher6[_gelu_backward_go, "GeluBackwardF32"](argv, argc)
             return 0
         comptime if _op_on["GeluBackwardBF16"]():
-            _gelu_backward_bf16_dispatcher(argv, argc)
+            _spec_dispatcher6[_gelu_backward_bf16_go, "GeluBackwardBF16"](
+                argv, argc
+            )
             return 0
         raise Error(NO_OP_COMPILED)
     except e:

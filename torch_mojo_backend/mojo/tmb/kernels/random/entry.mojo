@@ -19,7 +19,6 @@ from tmb.kernels.random.distribution_kernels import (
     DIST_RANDOM_FULL_64,
     DIST_UNIFORM,
     I64x8,
-    acc_dtype,
     enqueue_bernoulli_tensor,
     enqueue_distribution,
 )
@@ -41,6 +40,7 @@ from tmb.kernels.random.multinomial_kernels import (
     enqueue_multinomial_check,
     enqueue_multinomial_draw,
 )
+from tmb.kernels.random.rng_metadata import _join_u64, _tuple_i64x8
 from tmb.kernels.common.op_utils import (
     Arg,
     Argv,
@@ -48,8 +48,6 @@ from tmb.kernels.common.op_utils import (
     _raw_dtype_int,
     _raw_f64,
     _raw_int,
-    _raw_tuple_int,
-    _raw_tuple_len,
     _spec_dispatcher4,
     _spec_dispatcher5,
     _spec_dispatcher6,
@@ -68,6 +66,7 @@ from tmb.kernels.common.variant_gates import (
     _op_on,
     _tmb_entry_error,
 )
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 comptime ALL_DTYPES = [
     DType.float32,
@@ -92,20 +91,6 @@ comptime MULTINOMIAL_DTYPES = [
     DType.float16,
     DType.float64,
 ]
-
-
-@always_inline
-def _join_u64(lo: Int, hi: Int) -> UInt64:
-    return UInt64(lo) | (UInt64(hi) << 32)
-
-
-@always_inline
-def _tuple_i64x8(t: Arg) -> I64x8:
-    var out = I64x8(fill=Int64(0))
-    var n = _raw_tuple_len(t)
-    for i in range(min(n, 8)):
-        out[i] = Int64(_raw_tuple_int(t, i))
-    return out^
 
 
 @always_inline
@@ -135,7 +120,7 @@ def _launch[
     seed: UInt64,
     offset: UInt64,
 ) raises:
-    comptime ACC = acc_dtype[dtype]()
+    comptime ACC = wide_dtype[dtype]()
     var p_out0 = Scalar[dtype]()
     var p_out1 = Scalar[dtype]()
     var p_acc0: Scalar[ACC]

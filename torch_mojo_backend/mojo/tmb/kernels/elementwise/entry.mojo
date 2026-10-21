@@ -69,6 +69,7 @@ from tmb.kernels.common.op_utils import (
     _spec_dispatcher2,
     _spec_dispatcher3,
     _spec_dispatcher5,
+    _spec_dispatcher6,
     _spec_ptr,
 )
 
@@ -1688,18 +1689,6 @@ def _bin_dispatcher[op_code: Int](argv: Argv, argc: Int) raises:
     )
 
 
-def _arange_dispatcher(argv: Argv, argc: Int) raises:
-    var args = argv
-    _arange_go(
-        args[unsafe_offset=0],
-        args[unsafe_offset=1],
-        args[unsafe_offset=2],
-        args[unsafe_offset=3],
-        args[unsafe_offset=4],
-        args[unsafe_offset=5],
-    )
-
-
 # ---------------------------------------------------------------------------
 # Linspace: aten::linspace.out / aten::logspace.out, the arithmetic of
 # ATen's CUDA kernels (native/cuda/RangeFactories.cu `linspace_cuda_out`,
@@ -2419,7 +2408,7 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             _bin_dispatcher[OP_ADD](argv, argc)
             return 0
         comptime if _op_on["Arange"]():
-            _arange_dispatcher(argv, argc)
+            _spec_dispatcher6[_arange_go, "Arange"](argv, argc)
             return 0
         comptime if _op_on["Linspace"]():
             _linspace_dispatcher(argv, argc)

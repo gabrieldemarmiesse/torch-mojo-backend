@@ -110,9 +110,11 @@ from std.atomic import Atomic, Ordering
 from std.ffi import _get_global_or_null, external_call
 from std.memory import AddressSpace
 from std.memory.alloc import unsafe_alloc
-from std.sys import inlined_assembly, is_amd_gpu, is_nvidia_gpu
+from std.sys import inlined_assembly
 
 from max.gpu.host import DeviceBuffer, DeviceContext
+
+from tmb.kernels.common.op_utils import _device_scope
 
 
 # --- layout constants ------------------------------------------------------
@@ -175,16 +177,6 @@ def _cluster_remote_smem_addr(local_addr: UInt32, peer_rank: UInt32) -> UInt32:
         constraints="=r,r,r",
         has_side_effect=False,
     ](local_addr, peer_rank)
-
-
-@always_inline
-def _sched_scope() -> StaticString:
-    comptime if is_nvidia_gpu():
-        return "device"
-    elif is_amd_gpu():
-        return "agent"
-    else:
-        return ""
 
 
 # --- device side -----------------------------------------------------------
@@ -297,7 +289,7 @@ def sched_read_local(ring: SCHED_SMEM_PTR, rm: UInt32) -> Int:
 
 @always_inline
 def sched_fetch_add(ptr: SCHED_PTR, delta: Int32) -> Int32:
-    return Atomic[Scalar[DType.int32], scope=_sched_scope()].fetch_add[
+    return Atomic[Scalar[DType.int32], scope=_device_scope()].fetch_add[
         ordering=Ordering.RELAXED
     ](ptr, delta)
 

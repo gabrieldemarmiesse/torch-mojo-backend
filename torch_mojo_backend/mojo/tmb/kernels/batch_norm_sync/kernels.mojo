@@ -36,6 +36,7 @@ from tmb.kernels.common.op_utils import (
     _parallel_for_dt,
 )
 from tmb.kernels.common.block_reduce import block_sum
+from tmb.kernels.common.dtype_arithmetic import wide_dtype
 
 comptime BN_SYNC_THREADS = 256
 # `var + epsilon` is a double sum in CUDA's InvStd; Apple GPUs have no
@@ -64,12 +65,6 @@ def _off(cl: Bool, n: Int, c: Int, s: Int, channels: Int, hxw: Int) -> Int:
 
 
 @always_inline
-def _acc[dtype: DType]() -> DType:
-    """torch's `acc_type<scalar_t, /*is_cuda=*/true>`."""
-    return DType.float64 if dtype == DType.float64 else DType.float32
-
-
-@always_inline
 def _inv_std[t: DType](var_: Scalar[t], eps: Scalar[EPS_T]) -> Scalar[t]:
     """Normalization.cuh `InvStd`: `T + double` is a double sum."""
     if var_ == 0 and eps == 0:
@@ -82,8 +77,8 @@ def _inv_std[t: DType](var_: Scalar[t], eps: Scalar[EPS_T]) -> Scalar[t]:
 def _stats_kernel[
     dtype: DType, rdtype: DType
 ](
-    mean_ptr: Pointer[Scalar[_acc[dtype]()], MutAnyOrigin],
-    var_ptr: Pointer[Scalar[_acc[dtype]()], MutAnyOrigin],
+    mean_ptr: Pointer[Scalar[wide_dtype[dtype]()], MutAnyOrigin],
+    var_ptr: Pointer[Scalar[wide_dtype[dtype]()], MutAnyOrigin],
     run_mean_ptr: Pointer[Scalar[rdtype], MutAnyOrigin],
     run_var_ptr: Pointer[Scalar[rdtype], MutAnyOrigin],
     in_ptr: Pointer[Scalar[dtype], MutAnyOrigin],
@@ -93,14 +88,14 @@ def _stats_kernel[
     invstd_arg: Int64,
     has_running_arg: Int64,
     eps: Scalar[EPS_T],
-    momentum: Scalar[_acc[rdtype]()],
-    bessel: Scalar[_acc[rdtype]()],
+    momentum: Scalar[wide_dtype[rdtype]()],
+    bessel: Scalar[wide_dtype[rdtype]()],
     layout_arg: Int64,
 ):
     """One block per channel: Welford mean and biased variance, then
     `InvStd` (batch_norm_stats) or the variance plus the running update
     (batch_norm_update_stats)."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var channels = Int(channels_arg)
     var hxw = Int(hxw_arg)
     var count = Int(batch_arg) * hxw
@@ -177,7 +172,7 @@ def _stats_kernel[
     else:
         var_ptr[unsafe_offset=c] = var_
     if Int(has_running_arg) != 0:
-        comptime racc = _acc[rdtype]()
+        comptime racc = wide_dtype[rdtype]()
         # batch_norm_update_stats: acc_t of the running dtype throughout.
         var mom = momentum
         var unbiased = var_.cast[racc]() * bessel
@@ -212,8 +207,8 @@ def bn_stats[
     """`mode` 0: the biased variance (batch_norm_update_stats), 1: InvStd
     (batch_norm_stats), 2: `rsqrt(var + eps)` (native batch norm training);
     the running update runs whenever `has_running`."""
-    comptime acc_t = _acc[dtype]()
-    comptime racc = _acc[rdtype]()
+    comptime acc_t = wide_dtype[dtype]()
+    comptime racc = wide_dtype[rdtype]()
     var count = batch * hxw
     # `static_cast<acc_t>(double(N) / double(N - 1))`, inf for N = 1.
     var bessel = Float64(count) / Float64(count - 1)
@@ -257,7 +252,7 @@ def bn_elemt[
 ) raises:
     """batch_norm_transform_input_kernel (train): `gamma * (x - mean) *
     invstd + beta` in the accumulation dtype, gamma 1 / beta 0 when absent."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
     var w_ptr = _make_ptr[pdtype](weight_addr)
@@ -338,7 +333,7 @@ def bn_gather[
     """batch_norm_reduce_statistics_kernel, one thread per feature; `rdtype`
     is its `scalar_t` (the running statistics' and counts' dtype), the math
     in `acc_type<scalar_t>`."""
-    comptime acc_t = _acc[rdtype]()
+    comptime acc_t = wide_dtype[rdtype]()
     var sm_ptr = _make_ptr[acc_t](save_mean_addr)
     var si_ptr = _make_ptr[acc_t](save_invstd_addr)
     var m_ptr = _make_ptr[sdtype](mean_addr)
@@ -432,7 +427,7 @@ def _backward_reduce_kernel[
     the two sums, bit 1 grad_weight (`dot * invstd`), bit 2 grad_bias, and
     bit 3 rounds each product through the input dtype (the non-channels-last
     route's GradOp does, the channels-last kernel does not)."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var channels = Int(channels_arg)
     var hxw = Int(hxw_arg)
     var count = Int(batch_arg) * hxw
@@ -520,7 +515,7 @@ def _backward_reduce_cuda_order_kernel[
     """batch_norm_backward_reduce_kernel with CUDA's (block_x, block_y)
     geometry and reduction order, launched with CUDA_MAX_BLOCK threads of
     which the first `bx * by` are CUDA's."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var s1 = stack_allocation[
         CUDA_MAX_BLOCK, acc_t, address_space=AddressSpace.SHARED
     ]()
@@ -724,7 +719,7 @@ def bn_backward_elemt[
 ) raises:
     """batch_norm_backward_elemt_kernel_impl, with `norm_fct = 1 / sum(count)`
     over the int32 per-replica counts read on the device, as CUDA does."""
-    comptime acc_t = _acc[dtype]()
+    comptime acc_t = wide_dtype[dtype]()
     var gi_ptr = _make_ptr[dtype](gi_addr)
     var go_ptr = _make_ptr[dtype](go_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
