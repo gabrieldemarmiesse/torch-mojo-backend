@@ -9,11 +9,7 @@ Public torch API only, run against the mojo device: `mojo_gpu`/`mojo_device`
 `native.register()`) rather than the old Python eager path.
 """
 
-import base64
-import functools
-import json
 import math
-import pathlib
 import struct
 from collections.abc import Callable
 
@@ -22,11 +18,8 @@ import torch
 import torch.nn.functional as F
 
 from tests.elementwise_cases import log1p_edge_input, log1p_rtol
-from tests.native.conftest import (
-    flush_subnormals_on_metal,
-    require_stock_cuda,
-    skip_if_metal,
-)
+from tests.native.conftest import flush_subnormals_on_metal, skip_if_metal
+from tests.native.cuda_oracle import CudaOracle, assert_bits_equal
 from torch_mojo_backend import aten_functions, get_accelerators, mojo_backend, native
 
 
@@ -1303,16 +1296,12 @@ def test_log_subnormal_inputs(
     )
 
 
-# log / log2 / asinh against stock CUDA bit for bit (torch 2.11+cu130,
-# H100; unary_cuda_bits.json next to this file). On NVIDIA the mojo device
-# runs ports of the libdevice routines CUDA's kernels call (`__nv_logf`,
-# `__nv_log2f`, and CUDA 13's `__nv_asinhf` / `__nv_asinh`: a cu12 wheel's
-# asinh is another algorithm and rounds differently in places); bfloat16 /
-# float16 compute in float32 and round, as CUDA does. The JSON maps
-# "op/dtype" to the results' bit patterns, little-endian, base64, for the
-# inputs of `_bits_inputs`. To rewrite it, on a machine with stock cu13 torch:
-#   uv run python -c "from tests.native.test_unary import write_unary_cuda_json; write_unary_cuda_json()"
-_BITS_JSON = pathlib.Path(__file__).parent / "unary_cuda_bits.json"
+# log / log2 / asinh against stock CUDA bit for bit (the live oracle,
+# tests/native/cuda_oracle.py). On NVIDIA the mojo device runs ports of the
+# libdevice routines CUDA's kernels call (`__nv_logf`, `__nv_log2f`, and
+# CUDA 13's `__nv_asinhf` / `__nv_asinh`: a cu12 wheel's asinh is another
+# algorithm and rounds differently in places); bfloat16 / float16 compute in
+# float32 and round, as CUDA does.
 _BITS_OPS = {"log": torch.log, "log2": torch.log2, "asinh": torch.asinh}
 _BITS_DTYPES = {
     "float32": (torch.float32, torch.int32),
@@ -1392,41 +1381,18 @@ def _bits_inputs(dtype: str) -> torch.Tensor:
     return torch.tensor(signed, dtype=int_dtype).view(float_dtype)
 
 
-def _unary_bits(op: str, dtype: str, device: str, route: str = "fn") -> torch.Tensor:
-    x = _bits_inputs(dtype).to(device)
+def _unary(op: str, x: torch.Tensor, route: str = "fn") -> torch.Tensor:
     if route == "foreach":
-        out = getattr(torch, f"_foreach_{op}")([x])[0]
-    elif route == "compile":
-        out = torch.compile(_BITS_OPS[op], backend=mojo_backend, fullgraph=True)(x)
-    else:
-        out = _BITS_OPS[op](x)
-    return out.cpu().view(_BITS_DTYPES[dtype][1])
+        return getattr(torch, f"_foreach_{op}")([x])[0]
+    if route == "compile":
+        return torch.compile(_BITS_OPS[op], backend=mojo_backend, fullgraph=True)(x)
+    return _BITS_OPS[op](x)
 
 
-def _unary_cases(device: str) -> dict[str, str]:
-    return {
-        # every supported host is little-endian
-        f"{op}/{dtype}": base64.b64encode(
-            _unary_bits(op, dtype, device).numpy().tobytes()
-        ).decode()
-        for op, dtype in _BITS_CASES
-    }
-
-
-def write_unary_cuda_json():
-    """Rewrite unary_cuda_bits.json from stock CUDA torch (see above)."""
-    assert torch.version.cuda is not None and torch.cuda.is_available(), (
-        "needs stock CUDA torch"
-    )
-    lines = [
-        f" {json.dumps(k)}: {json.dumps(v)}" for k, v in _unary_cases("cuda").items()
-    ]
-    _BITS_JSON.write_text("{\n" + ",\n".join(lines) + "\n}\n")
-
-
-@functools.cache
-def _unary_cuda() -> dict[str, str]:
-    return json.loads(_BITS_JSON.read_text())
+def _skip_asinh_before_cuda_13(op: str):
+    major = int((torch.version.cuda or "0").split(".")[0])
+    if op == "asinh" and major < 13:
+        pytest.skip("the port is CUDA 13's __nv_asinhf; this torch is cu12")
 
 
 # The eager op declines float64 asinh, so that one runs through
@@ -1441,30 +1407,14 @@ def _unary_cuda() -> dict[str, str]:
         and not (route == "fn" and dtype == "float64")
     ],
 )
-def test_unary_matches_cuda_bits(mojo_gpu: str, op: str, dtype: str, route: str):
-    accelerator = list(get_accelerators())[int(mojo_gpu.rsplit(":", 1)[-1])]
-    if accelerator.api != "cuda":
-        pytest.skip("the recorded bits are CUDA's libdevice results")
-    int_dtype = _BITS_DTYPES[dtype][1]
-    want = torch.frombuffer(
-        bytearray(base64.b64decode(_unary_cuda()[f"{op}/{dtype}"])), dtype=int_dtype
-    )
-    got = _unary_bits(op, dtype, mojo_gpu, route)
-    inputs = _bits_inputs(dtype).view(int_dtype)
-    mask = (1 << torch.iinfo(int_dtype).bits) - 1
-    bad = [
-        f"in 0x{int(inputs[i]) & mask:x}: got 0x{int(got[i]) & mask:x},"
-        f" CUDA 0x{int(want[i]) & mask:x}"
-        for i in (got != want).nonzero().flatten()[:10].tolist()
-    ]
-    assert not bad, f"{int((got != want).sum())} of {len(want)} differ: {bad}"
-
-
-@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
-def test_unary_cuda_bits_regenerate_on_stock_cuda():
-    """unary_cuda_bits.json is what stock CUDA computes today."""
-    require_stock_cuda()
-    assert _unary_cases("cuda") == _unary_cuda()
+def test_unary_matches_cuda_bits(
+    cuda_oracle: CudaOracle, op: str, dtype: str, route: str
+):
+    _skip_asinh_before_cuda_13(op)
+    x = _bits_inputs(dtype)
+    ours = _unary(op, x.to(cuda_oracle.mojo), route).cpu()
+    cuda = _unary(op, x.to(cuda_oracle.cuda)).cpu()
+    assert_bits_equal(ours, cuda, inputs=[x])
 
 
 @pytest.mark.parametrize(
@@ -1502,18 +1452,11 @@ def test_asinh_no_cancellation(mojo_gpu: str, dtype: torch.dtype):
     assert torch.signbit(got[:4]).tolist() == [False, True, False, True]
 
 
-def test_asinh_wide_matches_cuda_bits(mojo_gpu: str):
+def test_asinh_wide_matches_cuda_bits(cuda_oracle: CudaOracle):
     """float32 asinh over 4M elements: the launcher's big-grid configuration."""
-    accelerator = list(get_accelerators())[int(mojo_gpu.rsplit(":", 1)[-1])]
-    if accelerator.api != "cuda":
-        pytest.skip("the recorded bits are CUDA's libdevice results")
+    _skip_asinh_before_cuda_13("asinh")
     x = _bits_inputs("float32")
-    reps = (1 << 22) // len(x) + 1
-    got = torch.asinh(x.repeat(reps).to(mojo_gpu)).cpu().view(torch.int32)
-    want = torch.frombuffer(
-        bytearray(base64.b64decode(_unary_cuda()["asinh/float32"])), dtype=torch.int32
-    )
-    assert torch.equal(got, want.repeat(reps))
+    cuda_oracle.assert_bitwise_equal(torch.asinh, x.repeat((1 << 22) // len(x) + 1))
 
 
 @pytest.mark.parametrize("shape", [(), (0,), (3, 5)])
