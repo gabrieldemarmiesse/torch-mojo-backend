@@ -262,19 +262,25 @@ def autocast_policy_table() -> str:
     return "\n".join(lines) + "\n"
 
 
+def _torch_major_minor() -> tuple[int, int] | None:
+    """(major, minor) of the torch in use; a nightly counts as its series."""
+    m = re.match(r"(\d+)\.(\d+)", torch.__version__)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def _torch_version_number() -> int:
     """major * 100 + minor of the torch in use, for `#if` in the shim (the
     wheels ship no torch/version.h)."""
-    m = re.match(r"(\d+)\.(\d+)", torch.__version__)
-    return int(m.group(1)) * 100 + int(m.group(2)) if m else 0
+    v = _torch_major_minor()
+    return v[0] * 100 + v[1] if v else 0
 
 
 def _cxx_standard() -> str:
     """torch 2.14's headers need C++20 (std::strong_ordering, requires
     clauses); older releases compile as C++17, which keeps older compilers
     usable there. Major.minor only, so a 2.14 nightly counts as 2.14."""
-    m = re.match(r"(\d+)\.(\d+)", torch.__version__)
-    new_enough = m is not None and (int(m.group(1)), int(m.group(2))) >= (2, 14)
+    v = _torch_major_minor()
+    new_enough = v is not None and v >= (2, 14)
     return "-std=c++20" if new_enough else "-std=c++17"
 
 
@@ -391,8 +397,8 @@ def _torch_series() -> str:
     """major.minor of the running torch. One prebuilt shim serves a whole
     series: its C++ standard and its autocast policy table are decided by the
     torch headers it compiled against, and both are stable within a series."""
-    m = re.match(r"(\d+)\.(\d+)", torch.__version__)
-    return f"{m.group(1)}.{m.group(2)}" if m else torch.__version__
+    v = _torch_major_minor()
+    return f"{v[0]}.{v[1]}" if v else torch.__version__
 
 
 def shim_source_hash() -> str:

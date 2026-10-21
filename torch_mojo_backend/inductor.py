@@ -37,7 +37,6 @@ refuses rather than break torch's own CUDA path).
 
 from __future__ import annotations
 
-import ctypes
 import functools
 from dataclasses import dataclass
 
@@ -56,22 +55,13 @@ from torch._inductor.codegen.common import (
 from torch._inductor.codegen.triton import TritonScheduling
 from torch._inductor.codegen.wrapper import PythonWrapperCodegen
 
-from torch_mojo_backend import _ptxas, monkeypatching
+from torch_mojo_backend import _cuda_driver, _ptxas, monkeypatching
 from torch_mojo_backend.native import device_module
 from torch_mojo_backend.triton_driver import (
     accelerator_api,
     driver_class,
     enable_triton,
 )
-
-# CUdevice_attribute
-_ATTR_MAX_THREADS_PER_BLOCK = 1
-_ATTR_WARP_SIZE = 10
-_ATTR_MULTIPROCESSOR_COUNT = 16
-_ATTR_MAX_THREADS_PER_MULTIPROCESSOR = 39
-_ATTR_COMPUTE_CAPABILITY_MAJOR = 75
-_ATTR_COMPUTE_CAPABILITY_MINOR = 76
-_ATTR_MAX_REGISTERS_PER_MULTIPROCESSOR = 82
 
 # AMD GPUs have no sub-generational compute-capability split like CUDA's
 # major/minor: a bare gfx string (e.g. "gfx942") is both the arch Triton's
@@ -105,31 +95,23 @@ class MojoDeviceProperties:
 
 
 def _cuda_device_properties(index: int) -> MojoDeviceProperties:
-    cuda = ctypes.CDLL("libcuda.so.1")
-    cuda.cuInit(0)
-    handle = ctypes.c_int()
-    if cuda.cuDeviceGet(ctypes.byref(handle), index) != 0:
-        raise RuntimeError(f"cuDeviceGet({index}) failed")
+    cu = _cuda_driver
+    handle = cu.device(index)
 
     def attr(which: int) -> int:
-        out = ctypes.c_int()
-        if cuda.cuDeviceGetAttribute(ctypes.byref(out), which, handle) != 0:
-            raise RuntimeError(f"cuDeviceGetAttribute({which}) failed")
-        return out.value
+        return cu.attribute(handle, which)
 
-    name = ctypes.create_string_buffer(256)
-    cuda.cuDeviceGetName(name, ctypes.c_int(256), handle)
-    major = attr(_ATTR_COMPUTE_CAPABILITY_MAJOR)
-    minor = attr(_ATTR_COMPUTE_CAPABILITY_MINOR)
+    major = attr(cu.COMPUTE_CAPABILITY_MAJOR)
+    minor = attr(cu.COMPUTE_CAPABILITY_MINOR)
     return MojoDeviceProperties(
-        name=name.value.decode(errors="replace"),
+        name=cu.name(handle),
         cc=major * 10 + minor,
         major=major,
-        multi_processor_count=attr(_ATTR_MULTIPROCESSOR_COUNT),
-        max_threads_per_multi_processor=attr(_ATTR_MAX_THREADS_PER_MULTIPROCESSOR),
-        regs_per_multiprocessor=attr(_ATTR_MAX_REGISTERS_PER_MULTIPROCESSOR),
-        max_threads_per_block=attr(_ATTR_MAX_THREADS_PER_BLOCK),
-        warp_size=attr(_ATTR_WARP_SIZE),
+        multi_processor_count=attr(cu.MULTIPROCESSOR_COUNT),
+        max_threads_per_multi_processor=attr(cu.MAX_THREADS_PER_MULTIPROCESSOR),
+        regs_per_multiprocessor=attr(cu.MAX_REGISTERS_PER_MULTIPROCESSOR),
+        max_threads_per_block=attr(cu.MAX_THREADS_PER_BLOCK),
+        warp_size=attr(cu.WARP_SIZE),
     )
 
 

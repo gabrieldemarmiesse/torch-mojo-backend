@@ -2,35 +2,33 @@ import os
 
 POSITIVE_VALUES = ("1", "true", "yes")
 
+# Module constants: the env-var registry test reads names from these.
+PROFILE = "TORCH_MOJO_BACKEND_PROFILE"
+LEGACY_PROFILE = "PYTORCH_MOJO_BACKEND_PROFILE"
+VERBOSE = "TORCH_MOJO_BACKEND_VERBOSE"
+LEGACY_VERBOSE = "PYTORCH_MOJO_BACKEND_VERBOSE"
+DEBUG_GRAPH = "TORCH_MOJO_BACKEND_DEBUG_GRAPH"
+LEGACY_DEBUG_GRAPH = "PYTORCH_MOJO_BACKEND_DEBUG_GRAPH"
+
+
+def _enabled(name: str, legacy_name: str) -> bool:
+    """`name` (or its legacy PYTORCH_-prefixed alias) is set to a truthy value."""
+    return (
+        os.environ.get(name, "0").lower() in POSITIVE_VALUES
+        or os.environ.get(legacy_name, "0").lower() in POSITIVE_VALUES
+    )
+
 
 def profiling_enabled() -> bool:
-    """
-    Check if profiling is enabled by looking for the environment variable.
-    """
-    x = os.environ.get("TORCH_MOJO_BACKEND_PROFILE", "0").lower()
-    py_x = os.environ.get("PYTORCH_MOJO_BACKEND_PROFILE", "0").lower()
-
-    return x in POSITIVE_VALUES or py_x in POSITIVE_VALUES
+    return _enabled(PROFILE, LEGACY_PROFILE)
 
 
 def verbose_enabled() -> bool:
-    """
-    Check if verbose mode is enabled by looking for the environment variable.
-    """
-    x = os.environ.get("TORCH_MOJO_BACKEND_VERBOSE", "0").lower()
-    py_x = os.environ.get("PYTORCH_MOJO_BACKEND_VERBOSE", "0").lower()
-
-    return x in POSITIVE_VALUES or py_x in POSITIVE_VALUES
+    return _enabled(VERBOSE, LEGACY_VERBOSE)
 
 
 def debug_graph() -> bool:
-    """
-    Check if graph debugging is enabled by looking for the environment variable.
-    """
-    x = os.environ.get("TORCH_MOJO_BACKEND_DEBUG_GRAPH", "0").lower()
-    py_x = os.environ.get("PYTORCH_MOJO_BACKEND_DEBUG_GRAPH", "0").lower()
-
-    return x in POSITIVE_VALUES or py_x in POSITIVE_VALUES
+    return _enabled(DEBUG_GRAPH, LEGACY_DEBUG_GRAPH)
 
 
 def compile_native_kernels_enabled() -> bool:
