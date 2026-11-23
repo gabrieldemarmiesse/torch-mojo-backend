@@ -162,7 +162,7 @@ def _unary_b[kind: StaticString, dt: DType](z: Cx[dt]) -> Bool:
 @always_inline
 def _binary_cx[
     kind: StaticString, dt: DType
-](a: Cx[dt], b: Cx[dt], p: Cx[dt]) -> Cx[dt]:
+](a: Cx[dt], b: Cx[dt], p: Cx[dt], i: Int) -> Cx[dt]:
     comptime if kind == "add":
         # BinaryAddSubKernel.cu's AddFunctor: a + alpha * b, the product
         # always formed (alpha = 1 still turns inf * 0 into NaN, as on
@@ -174,9 +174,9 @@ def _binary_cx[
     elif kind == "div":
         return cdiv(a, b)
     elif kind == "sigmoid_backward":
-        return csigmoid_backward_jit(a, b)
+        return csigmoid_backward_jit(a, b, i)
     elif kind == "tanh_backward":
-        return ctanh_backward_jit(a, b)
+        return ctanh_backward_jit(a, b, i)
     else:
         comptime assert kind == "pow", "unknown complex binary kind"
         return cpow(a, b)
@@ -340,7 +340,7 @@ def _launch[
                         a, b
                     ) else UInt8(0)
                 else:
-                    var r = _binary_cx[kind, dt](a, b, Cx[dt](hp_re, hp_im))
+                    var r = _binary_cx[kind, dt](a, b, Cx[dt](hp_re, hp_im), i)
                     out_ptr[unsafe_offset=2 * i] = r.re
                     out_ptr[unsafe_offset=2 * i + 1] = r.im
 

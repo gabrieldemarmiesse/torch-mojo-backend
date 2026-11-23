@@ -14,12 +14,10 @@ fourth the dtypes the op does not compute in (CUDA's error type, or its bits).
 from __future__ import annotations
 
 import itertools
-import json
 import math
 import struct
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import pytest
 import torch
@@ -662,6 +660,14 @@ def test_specials_match_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
         assert_bits_equal(a[loose], b[loose], nan="any")
 
 
+def _transposed_buffer(like: torch.Tensor) -> torch.Tensor:
+    """A non-contiguous tensor of `like`'s shape and dtype: a contiguous
+    buffer of the reversed shape, transposed."""
+    out = torch.full(like.shape[::-1], 7.0, dtype=like.dtype, device=like.device).t()
+    assert not out.is_contiguous()
+    return out
+
+
 def _variant_calls(case: Case, dtype: torch.dtype) -> dict[str, Fn]:
     """`out=`, in-place, strided, broadcast, 0-dim, empty and mixed-dtype
     calls of `case`, each `fn(device)`."""
@@ -693,7 +699,7 @@ def _variant_calls(case: Case, dtype: torch.dtype) -> dict[str, Fn]:
             lambda a: out_fn(*a, torch.full_like(_result(case, a), 7.0))
         )(args(d))
         calls["out_strided"] = lambda d: (
-            lambda a: out_fn(*a, torch.full_like(_result(case, a).t(), 7.0).t())
+            lambda a: out_fn(*a, _transposed_buffer(_result(case, a)))
         )(args(d))
         calls["out_float64"] = lambda d: out_fn(
             *args(d), torch.empty(0, dtype=torch.float64, device=d)
@@ -796,39 +802,23 @@ _OTHER_DTYPES = (
 )
 
 
-# Complex128 rows that stock CUDA rounds differently (its jiterated complex
-# exp in sigmoid / silu, and the backward products) are kept out of the
-# mandatory tests: the failing rows of each seeded input set are listed in
-# data/complex128_open_inputs.json, and every other row is mandatory.
-# test_complex128_open_inputs checks exactly those rows, as a strict xfail.
-_OPEN = json.loads(
-    (Path(__file__).parent / "data" / "complex128_open_inputs.json").read_text()
-)
 _COMPLEX_CASES = ["sigmoid", "silu", "sigmoid_backward", "tanh_backward"]
 _MIXED_KINDS = ["sigmoid_backward", "tanh_backward"]
-
-
-def _rows(n: int, key: str) -> torch.Tensor:
-    """The mandatory rows of an n-row input set: all but `key`'s open rows.
-    The whole set still runs: CUDA's rounding depends on the element position
-    (see the comment above), so the rows are selected from the output."""
-    keep = torch.ones(n, dtype=torch.bool)
-    keep[_OPEN.get(key, [])] = False
-    return keep.nonzero().flatten()
-
-
-def _check_rows(
-    cuda_oracle: CudaOracle,
-    fn: Callable[[str], object],
-    rows: torch.Tensor | None = None,
-) -> None:
-    """`fn(device)` bit-equal to CUDA's, on `rows` of the output when given."""
-    if rows is None:
-        cuda_oracle.assert_bitwise_equal_by_device(fn)  # also exception types
-        return
-    ours, cuda = cuda_oracle.run_by_device(fn)
-    assert isinstance(ours, torch.Tensor) and isinstance(cuda, torch.Tensor)
-    assert_bits_equal(ours.cpu()[rows], cuda.cpu()[rows])
+# Open complex128 gaps, each a strict xfail of the whole-tensor bit comparison
+# plus a mandatory bound on what is still wrong (test_complex128_open_bounded):
+# - forward sigmoid / silu: our float64 sin / cos (`_sincos_f64`) are not
+#   libdevice's (an exact port lives on the exact-special / exact-binary
+#   branches), so finite components can be off by one ulp;
+# - sigmoid_backward / tanh_backward: every finite row is exact (the unrolled
+#   jiterator loop's contraction is reproduced, see `_first_slice`), but the
+#   sign / payload of a NaN result still differs from CUDA's in some special
+#   rows of the Annex G recovery.
+_CX128_OPEN = {
+    "sigmoid": 1,
+    "silu": 1,
+    "sigmoid_backward": 0,
+    "tanh_backward": 0,
+}  # case -> allowed ulps of a finite component
 
 
 # Complex forward tanh is not implemented on the mojo device (NotImplementedError;
@@ -872,11 +862,8 @@ def test_other_dtypes_match_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
     """Integer, bool and complex operands: CUDA's result bits, or its
     exception type (complex128: the mandatory rows, see above)."""
     case = CASES[case_id]
-    key = f"other_dtypes/{case_id}-complex128"
-    keep = _rows(7, key) if dtype == torch.complex128 and _OPEN.get(key) else None
-
-    _check_rows(
-        cuda_oracle, lambda device: case.fn(*_other_operands(case, dtype, device)), keep
+    cuda_oracle.assert_bitwise_equal_by_device(
+        lambda device: case.fn(*_other_operands(case, dtype, device))
     )
 
 
@@ -894,24 +881,61 @@ def _complex_ops(case: Case, dtype: torch.dtype) -> list[torch.Tensor]:
     return ops
 
 
-@pytest.mark.parametrize(
-    ("case_id", "dtype"),
-    [
-        pytest.param(c, d, id=f"{c}-{_dtype_id(d)}")
-        for c in _COMPLEX_CASES
-        for d in (torch.complex64, torch.complex128)
-    ],
-)
+def _complex_params() -> list[object]:
+    out = []
+    for c in _COMPLEX_CASES:
+        for d in (torch.complex64, torch.complex128):
+            marks = []
+            if d == torch.complex128 and c in _CX128_OPEN:
+                marks.append(
+                    pytest.mark.xfail(
+                        strict=True,
+                        reason="open complex128 gap (see _CX128_OPEN); bounded by "
+                        "test_complex128_open_bounded",
+                    )
+                )
+            out.append(pytest.param(c, d, id=f"{c}-{_dtype_id(d)}", marks=marks))
+    return out
+
+
+@pytest.mark.parametrize(("case_id", "dtype"), _complex_params())
 def test_complex_matches_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
     """The complex kernels (jiterated sigmoid / sigmoid_backward /
     tanh_backward, c10::complex silu) over random values and every pair of
-    special components (complex128: the mandatory rows, see above)."""
+    special components."""
     case = CASES[case_id]
     ops = _complex_ops(case, dtype)
-    keep = None
-    if dtype == torch.complex128:
-        keep = _rows(ops[0].numel(), f"complex_matches/{case_id}-complex128")
-    _check_rows(cuda_oracle, lambda device: case.fn(*[o.to(device) for o in ops]), keep)
+    cuda_oracle.assert_bitwise_equal_by_device(
+        lambda device: case.fn(*[o.to(device) for o in ops])
+    )
+
+
+def _ordered_bits(x: torch.Tensor) -> torch.Tensor:
+    """Float64 bit patterns as integers that order like the floats."""
+    b = x.contiguous().view(torch.int64)
+    return torch.where(b < 0, torch.iinfo(torch.int64).min - b, b)
+
+
+@pytest.mark.parametrize("case_id", list(_CX128_OPEN))
+def test_complex128_open_bounded(cuda_oracle: CudaOracle, case_id: str):
+    """What the strict xfail above leaves open must not grow: NaN components
+    are NaN on both sides (their sign and payload are the open part, the only
+    relaxation here), every finite component is within `_CX128_OPEN` ulps of
+    CUDA's, and infinities and zeros (signed) are bit-equal."""
+    case = CASES[case_id]
+    ops = _complex_ops(case, torch.complex128)
+    ours, cuda = cuda_oracle.run_by_device(
+        lambda device: case.fn(*[o.to(device) for o in ops])
+    )
+    assert isinstance(ours, torch.Tensor) and isinstance(cuda, torch.Tensor)
+    a = torch.view_as_real(ours.cpu())
+    b = torch.view_as_real(cuda.cpu())
+    assert bool((a.isnan() == b.isnan()).all())
+    finite = torch.isfinite(a) & torch.isfinite(b)
+    ulps = (_ordered_bits(a) - _ordered_bits(b)).abs()
+    assert bool((ulps[finite] <= _CX128_OPEN[case_id]).all()), int(ulps[finite].max())
+    exact = ~finite & ~a.isnan() | finite & ((a == 0) | (b == 0))  # inf, +-0
+    assert_bits_equal(a[exact], b[exact])
 
 
 @pytest.mark.parametrize("inplace", [False, True], ids=["functional", "inplace"])
@@ -952,6 +976,46 @@ def test_bce_general_path_does_not_leak(mojo_gpu: str):
     assert torch.accelerator.memory_allocated() == before
 
 
+def test_bce_general_path_does_not_leak_on_error(mojo_gpu: str):
+    """The general path allocates the loss before `loss.mul_(weight)`, which
+    raises for a weight that does not broadcast: that loss must be released."""
+    g = torch.Generator().manual_seed(1)
+    x = torch.rand(8, 16, generator=g).to(mojo_gpu)
+    t = torch.rand(8, 16, generator=g).to(mojo_gpu)
+    w = torch.rand(17, generator=g).to(mojo_gpu)
+
+    def once() -> None:
+        with pytest.raises(Exception):  # noqa: B017 -- any failure, not its type
+            A.binary_cross_entropy(x, t, w, 0)
+
+    once()
+    torch.accelerator.synchronize()
+    before = torch.accelerator.memory_allocated()
+    for _ in range(20):
+        once()
+    torch.accelerator.synchronize()
+    assert torch.accelerator.memory_allocated() == before
+
+
+@pytest.mark.parametrize("kind", _MIXED_KINDS)
+def test_real_operands_complex_out_match_cuda(cuda_oracle: CudaOracle, kind: str):
+    """Real float32 operands with a complex64 grad_input: CUDA computes in the
+    out dtype, so the complex route is taken for the destination too."""
+    g = torch.Generator().manual_seed(5)
+    grad = torch.randn(64, generator=g)
+    saved = torch.randn(64, generator=g)
+    op = getattr(A, kind).grad_input
+
+    def fn(device: str) -> torch.Tensor:
+        return op(
+            grad.to(device),
+            saved.to(device),
+            grad_input=torch.empty(0, dtype=torch.complex64, device=device),
+        )
+
+    cuda_oracle.assert_bitwise_equal_by_device(fn)
+
+
 def test_out_dtype_policy_matches_cuda(cuda_oracle: CudaOracle):
     """CUDA dispatches on the out= dtype: float16 out= of float32 operands is
     computed in float16, where `1 - 2**-24` rounds to 1 (so it is not below
@@ -985,15 +1049,9 @@ def test_complex_backward_out_dtype_matches_cuda(
     cuda_oracle: CudaOracle, kind: str, in_dtype, out_dtype
 ):
     """out= of another complex dtype than the inputs: CUDA computes in the
-    out dtype, converting the operands first (complex128 out: the mandatory
-    rows, see above)."""
+    out dtype, converting the operands first."""
     grad, saved = _mixed_operands(in_dtype)
     op = getattr(A, kind).grad_input
-    keep = (
-        _rows(64, f"mixed_c64_in_c128_out/{kind}")
-        if out_dtype == torch.complex128
-        else None
-    )
 
     def fn(device: str) -> torch.Tensor:
         return op(
@@ -1002,42 +1060,4 @@ def test_complex_backward_out_dtype_matches_cuda(
             grad_input=torch.empty(0, dtype=out_dtype, device=device),
         )
 
-    _check_rows(cuda_oracle, fn, keep)
-
-
-@pytest.mark.parametrize("key", sorted(k for k, rows in _OPEN.items() if rows))
-@pytest.mark.xfail(
-    strict=True,
-    reason="complex128 rows that stock CUDA rounds differently (jiterated "
-    "complex exp / backward products); not reproduced yet",
-)
-def test_complex128_open_inputs(cuda_oracle: CudaOracle, key: str):
-    """The open complex128 rows only (data/complex128_open_inputs.json), of
-    the same full input sets as the mandatory tests."""
-    family, name = key.split("/", 1)
-    rows = torch.tensor(_OPEN[key], dtype=torch.long)
-    if family == "complex_matches":
-        case = CASES[name.rsplit("-", 1)[0]]
-        ops = _complex_ops(case, torch.complex128)
-        _check_rows(
-            cuda_oracle, lambda device: case.fn(*[o.to(device) for o in ops]), rows
-        )
-    elif family == "other_dtypes":
-        case = CASES[name.rsplit("-", 1)[0]]
-        _check_rows(
-            cuda_oracle,
-            lambda device: case.fn(*_other_operands(case, torch.complex128, device)),
-            rows,
-        )
-    else:
-        grad, saved = _mixed_operands(torch.complex64)
-        op = getattr(A, name).grad_input
-        _check_rows(
-            cuda_oracle,
-            lambda device: op(
-                grad.to(device),
-                saved.to(device),
-                grad_input=torch.empty(0, dtype=torch.complex128, device=device),
-            ),
-            rows,
-        )
+    cuda_oracle.assert_bitwise_equal_by_device(fn)
