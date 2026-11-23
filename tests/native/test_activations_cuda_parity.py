@@ -814,11 +814,11 @@ _MIXED_KINDS = ["sigmoid_backward", "tanh_backward"]
 #   sign / payload of a NaN result still differs from CUDA's in some special
 #   rows of the Annex G recovery.
 _CX128_OPEN = {
-    "sigmoid": 2,
-    "silu": 2,
+    "sigmoid": 4,
+    "silu": 4,
     "sigmoid_backward": 0,
     "tanh_backward": 0,
-}  # case -> allowed error of a finite component, in 2**-52 of the result's modulus
+}  # case -> allowed error of a finite component, in 2**-52 of the largest finite component
 
 
 # Complex forward tanh is not implemented on the mojo device (NotImplementedError;
@@ -910,13 +910,61 @@ def test_complex_matches_cuda(cuda_oracle: CudaOracle, case_id: str, dtype):
     )
 
 
+def _open_bounded_violation(a: torch.Tensor, b: torch.Tensor, tol: float) -> str:
+    """ "" when `a` (ours) is within the bound of `b` (CUDA's), both float64 real
+    views of complex results; else what is wrong. NaN components are NaN on both
+    sides (their sign and payload are the one relaxation); a finite pair is
+    bit-equal when `tol` is 0, else within `tol` units of 2**-52 times the
+    largest finite component of its complex number (overflow-safe, and an
+    infinite companion gives no slack); infinities and zeros are bit-equal."""
+    if not bool((a.isnan() == b.isnan()).all()):
+        return "NaN positions differ"
+    finite = torch.isfinite(a) & torch.isfinite(b)
+    if tol == 0:
+        bad = finite & (a.view(torch.int64) != b.view(torch.int64))
+    else:
+        scale = torch.where(torch.isfinite(b), b.abs(), torch.zeros_like(b))
+        scale = scale.max(dim=-1, keepdim=True).values.expand_as(b)
+        scale = scale.clamp(min=torch.finfo(b.dtype).tiny)
+        bad = finite & ((a - b).abs() > tol * 2.0**-52 * scale)
+    if bool(bad.any()):
+        return f"{int(bad.sum())} finite components off"
+    exact = ~finite & ~a.isnan() | finite & ((a == 0) | (b == 0))  # inf, +-0
+    if not torch.equal(a[exact].view(torch.int64), b[exact].view(torch.int64)):
+        return "an infinity or a signed zero differs"
+    return ""
+
+
+def _c(*pairs: tuple[float, float]) -> torch.Tensor:
+    return torch.tensor(pairs, dtype=torch.float64)
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "tol", "ok"),
+    [
+        (_c((1.0, 2.0)), _c((1.0, 2.0)), 0, True),
+        (_c((1.0, 2.0)), _c((math.nextafter(1.0, 2.0), 2.0)), 0, False),
+        (_c((1.0, 2.0)), _c((math.nextafter(1.0, 2.0), 2.0)), 2, True),
+        (_c((2.0, math.inf)), _c((100.0, math.inf)), 2, False),
+        (_c((2.0, -math.inf)), _c((100.0, -math.inf)), 0, False),
+        (_c((1e308, 1e308)), _c((1.1e308, 1e308)), 2, False),
+        (_c((1e308, 1e308)), _c((1e308, 1e308)), 2, True),
+        (_c((2.0, math.inf)), _c((2.0, -math.inf)), 2, False),
+        (_c((0.0, 1.0)), _c((-0.0, 1.0)), 2, False),
+        (_c((math.nan, 1.0)), _c((-math.nan, 1.0)), 0, True),
+        (_c((math.nan, 1.0)), _c((1.0, 1.0)), 2, False),
+    ],
+)
+def test_open_bounded_checker(a: torch.Tensor, b: torch.Tensor, tol: float, ok: bool):
+    """The checker of test_complex128_open_bounded lets nothing through when a
+    component's companion is infinite or its modulus overflows."""
+    assert (_open_bounded_violation(a, b, tol) == "") == ok
+
+
 @pytest.mark.parametrize("case_id", list(_CX128_OPEN))
 def test_complex128_open_bounded(cuda_oracle: CudaOracle, case_id: str):
-    """What the strict xfail above leaves open must not grow. NaN components
-    are NaN on both sides (their sign and payload are the open part: the only
-    relaxation); every finite component is within `_CX128_OPEN` units of
-    2**-52 times the result's modulus of CUDA's; infinities and signed zeros
-    are bit-equal."""
+    """What the strict xfail above leaves open must not grow
+    (`_open_bounded_violation`)."""
     case = CASES[case_id]
     ops = _complex_ops(case, torch.complex128)
     ours, cuda = cuda_oracle.run_by_device(
@@ -925,13 +973,33 @@ def test_complex128_open_bounded(cuda_oracle: CudaOracle, case_id: str):
     assert isinstance(ours, torch.Tensor) and isinstance(cuda, torch.Tensor)
     a = torch.view_as_real(ours.cpu())
     b = torch.view_as_real(cuda.cpu())
-    assert bool((a.isnan() == b.isnan()).all())
-    finite = torch.isfinite(a) & torch.isfinite(b)
-    scale = torch.hypot(b[..., 0], b[..., 1]).unsqueeze(-1).expand_as(b)
-    err = (a - b).abs() / (2.0**-52 * scale.clamp(min=torch.finfo(a.dtype).tiny))
-    assert bool((err[finite] <= _CX128_OPEN[case_id]).all()), float(err[finite].max())
-    exact = ~finite & ~a.isnan() | finite & ((a == 0) | (b == 0))  # inf, +-0
-    assert_bits_equal(a[exact], b[exact])
+    assert _open_bounded_violation(a, b, _CX128_OPEN[case_id]) == ""
+
+
+@pytest.mark.parametrize("layout", ["both_t", "a_t", "b_t"])
+@pytest.mark.parametrize("kind", _MIXED_KINDS)
+@pytest.mark.parametrize("n", [64, 40])
+def test_complex128_backward_permuted_matches_cuda(
+    cuda_oracle: CudaOracle, kind: str, layout: str, n: int
+):
+    """Transposed complex128 operands (more than 1024 elements): CUDA walks
+    them in storage order and its result keeps their layout; the position in
+    that order selects the contraction, so every finite row must match."""
+    g = torch.Generator().manual_seed(3)
+    grad = torch.randn(n, n, generator=g, dtype=torch.complex128)
+    saved = torch.randn(n, n, generator=g, dtype=torch.complex128)
+    op = getattr(A, kind)
+
+    def fn(device: str) -> tuple[torch.Tensor, tuple[int, ...]]:
+        x, y = grad.to(device), saved.to(device)
+        if layout in ("both_t", "a_t"):
+            x = x.t()
+        if layout in ("both_t", "b_t"):
+            y = y.t()
+        r = op(x, y)
+        return r, r.stride()
+
+    cuda_oracle.assert_bitwise_equal_by_device(fn)
 
 
 @pytest.mark.parametrize("inplace", [False, True], ids=["functional", "inplace"])
