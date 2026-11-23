@@ -51,7 +51,7 @@ _GPU_FIXTURES = frozenset(
         "mojo_pair",
         "two_gpus",
         "mojo_h100",
-        "cuda_device",
+        "cuda_oracle",
     }
 )
 
@@ -83,6 +83,8 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if isinstance(item, pytest.Function) and _needs_gpu(item):
             item.add_marker(pytest.mark.gpu)
+        if "cuda_oracle" in getattr(item, "fixturenames", ()):
+            item.add_marker(pytest.mark.cuda_oracle)
         # CUDA graph tests need a process without PrivateUse1 registration;
         # CPU-torch integration tests need a different torch wheel, but still
         # execute on the GPU. Both belong to the GPU partition.

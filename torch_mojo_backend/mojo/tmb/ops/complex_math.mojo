@@ -69,6 +69,7 @@ from tmb.ops.common import (
 )
 from tmb.backend.abi import (
     OpFn,
+    tensor_arg,
     TAG_DTYPE,
     TAG_INT,
     v_is_complex,
@@ -509,6 +510,125 @@ def cx_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     )
 
 
+# sigmoid_backward / tanh_backward --------------------------------------------
+
+
+def _ti_swap(a: T, i0: Int, i1: Int) -> Int:
+    """TensorIterator's should_swap_dims for one operand: 1 swap, -1 keep,
+    0 undecided (a broadcast dim, or equal strides and sizes)."""
+    var s0 = a.stride(i0)
+    var s1 = a.stride(i1)
+    if s0 == 0 or s1 == 0:
+        return 0
+    if s0 < s1:
+        return -1
+    if s0 > s1:
+        return 1
+    if a.dim(i0) > a.dim(i1):
+        return 1
+    return 0
+
+
+def _ti_arith(
+    kind: StaticString, av: Value, bv: Value, out_like: Optional[T]
+) raises -> Owned:
+    """`_arith` of two same-shape tensors in TensorIterator's element order:
+    dims sorted by stride (the out's first, then the operands'), so a
+    transposed operand is walked in storage order, as CUDA does, and the
+    result keeps that layout. The position in that order selects ptxas's
+    contraction of the jiterated loop (`_first_slice`)."""
+    var a = v_tensor_c(av)
+    var b = v_tensor_c(bv)
+    var rank = a.rank
+    if not (a.on_mojo() and b.on_mojo() and rank >= 2 and a.same_shape(b)):
+        return _arith(kind, av, bv, _no_alpha())
+    # perm[0] is the fastest dim
+    var perm = List[Int]()
+    for k in range(rank):
+        perm.append(rank - 1 - k)
+    for i in range(1, rank):
+        var dim1 = i
+        for dim0 in range(i - 1, -1, -1):
+            var cmp = 0
+            if out_like and out_like.value().same_shape(a):
+                cmp = _ti_swap(out_like.value(), perm[dim0], perm[dim1])
+            if cmp == 0:
+                cmp = _ti_swap(a, perm[dim0], perm[dim1])
+            if cmp == 0:
+                cmp = _ti_swap(b, perm[dim0], perm[dim1])
+            if cmp > 0:
+                var tmp = perm[dim0]
+                perm[dim0] = perm[dim1]
+                perm[dim1] = tmp
+                dim1 = dim0
+            elif cmp < 0:
+                break
+    var identity = True
+    for k in range(rank):
+        if perm[k] != rank - 1 - k:
+            identity = False
+    if identity:
+        return _arith(kind, av, bv, _no_alpha())
+    var pad = MAX_RANK - rank
+    var va_shape = IndexList[MAX_RANK](1)
+    var va_strides = IndexList[MAX_RANK](0)
+    var vb_strides = IndexList[MAX_RANK](0)
+    for j in range(rank):  # slowest first
+        var d = perm[rank - 1 - j]
+        va_shape[pad + j] = a.dim(d)
+        va_strides[pad + j] = a.stride(d)
+        vb_strides[pad + j] = b.stride(d)
+    var va = own(view_strided(a, va_shape, va_strides, rank, a.offset))
+    var vb = own(view_strided(b, va_shape, vb_strides, rank, b.offset))
+    var res = _arith(kind, tensor_arg(va.t), tensor_arg(vb.t), _no_alpha())
+    _ = va^
+    _ = vb^
+    # back to the original dim order, over the same storage
+    var shape = IndexList[MAX_RANK](1)
+    var strides = IndexList[MAX_RANK](0)
+    for j in range(rank):
+        var d = perm[rank - 1 - j]
+        shape[pad + d] = res.t.shape[pad + j]
+        strides[pad + d] = res.t.strides[pad + j]
+    var view = own(view_strided(res.t, shape, strides, rank, res.t.offset))
+    _ = res^
+    return view^
+
+
+def cx_backward[
+    kind: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`kind(grad_output, output)` with a complex operand."""
+    _ret(
+        rets,
+        _ti_arith(kind, args[unsafe_offset=0], args[unsafe_offset=1], None),
+    )
+
+
+def cx_backward_out[
+    kind: StaticString
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`kind.grad_input(grad_output, output, *, grad_input)` with a complex
+    operand."""
+    var dest = v_tensor_c(args[unsafe_offset=2])
+    # CUDA dispatches on the out= dtype (BinaryMiscBackwardOpsKernels.cu):
+    # the operands are converted to it before the arithmetic, not after.
+    var g = v_tensor_c(args[unsafe_offset=0])
+    var o = v_tensor_c(args[unsafe_offset=1])
+    var gc = own_if_new(cast_complex(g, dest.stype), g)
+    var oc = own_if_new(cast_complex(o, dest.stype), o)
+    _store_ew[2](
+        args,
+        dest,
+        _ti_arith(
+            kind, tensor_arg(gc.t), tensor_arg(oc.t), Optional[T](dest.copy())
+        ),
+        rets,
+    )
+    _ = gc^
+    _ = oc^
+
+
 # mul / div ------------------------------------------------------------------
 
 
@@ -861,6 +981,10 @@ comptime cx_rsqrt = cx_unary["rsqrt", _TO_CX]
 comptime cx_rsqrt_out = cx_unary_out["rsqrt", _TO_CX]
 comptime cx_sgn = cx_unary["sgn", _TO_CX]
 comptime cx_sgn_out = cx_unary_same_out["sgn"]
+comptime cx_sigmoid = cx_unary["sigmoid", _TO_CX]
+comptime cx_sigmoid_out = cx_unary_out["sigmoid", _TO_CX]
+comptime cx_silu = cx_unary["silu", _TO_CX]
+comptime cx_silu_out = cx_unary_same_out["silu"]
 comptime cx_sqrt = cx_unary["sqrt", _TO_CX]
 comptime cx_sqrt_out = cx_unary_out["sqrt", _TO_CX]
 comptime cx_isnan = cx_unary["isnan", _TO_BOOL]

@@ -28,6 +28,8 @@ tests that survive the fast-math flags) rather than a comparison.
 """
 
 from std.memory import bitcast
+from std.sys._assembly import inlined_assembly
+from std.sys.info import is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
 from tmb.kernels.common.math_utils import ieee_sqrt
@@ -36,6 +38,7 @@ from tmb.kernels.common.pointwise_math import (
     _log,
     _log1p,
     _pcos,
+    _mul_rn,
     _psin,
     param_dtype,
     pointwise,
@@ -509,6 +512,205 @@ def cdiv_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
             x = Scalar[dt](0) * (a * c + b * d)
             y = Scalar[dt](0) * (b * c - a * d)
     return Cx[dt](x, y)
+
+
+@always_inline
+def _radd[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """`a + b` as one add.rn on NVIDIA, never folded (`0 + x` turns a -0
+    imaginary part into +0 and quiets a NaN)."""
+    comptime if is_nvidia_gpu():
+        comptime asm = "add.rn.f64 $0, $1, $2;" if dt == DType.float64 else (
+            "add.rn.f32 $0, $1, $2;"
+        )
+        comptime cons = "=d,d,d" if dt == DType.float64 else "=f,f,f"
+        return inlined_assembly[
+            asm, Scalar[dt], constraints=cons, has_side_effect=False
+        ](a, b)
+    else:
+        return a + b
+
+
+@always_inline
+def _rmul[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """A product no later add may absorb into an fma (`_mul_rn`)."""
+    return _mul_rn[dt, 1](a, b)[0]
+
+
+@always_inline
+def _dot_x[
+    dt: DType
+](
+    a: Scalar[dt], c: Scalar[dt], b: Scalar[dt], d: Scalar[dt], mode: Int
+) -> Scalar[dt]:
+    """`a c - b d`, the product of `mode` (1 first, 2 second) fused."""
+    if mode == 1:
+        return a.fma(c, -_rmul(b, d))
+    if mode == 2:
+        return (-b).fma(d, _rmul(a, c))
+    return _rmul(a, c) - _rmul(b, d)
+
+
+@always_inline
+def _dot_y[
+    dt: DType
+](
+    a: Scalar[dt], d: Scalar[dt], b: Scalar[dt], c: Scalar[dt], mode: Int
+) -> Scalar[dt]:
+    """`a d + b c`, the product of `mode` (1 first, 2 second) fused."""
+    if mode == 1:
+        return a.fma(d, _rmul(b, c))
+    if mode == 2:
+        return b.fma(c, _rmul(a, d))
+    return _rmul(a, d) + _rmul(b, c)
+
+
+@always_inline
+def _rsub[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    """`a - b` as one sub.rn on NVIDIA, never folded into an add of -b (which
+    would flip the sign of a NaN operand, as stock CUDA's does not)."""
+    comptime if is_nvidia_gpu():
+        comptime asm = "sub.rn.f64 $0, $1, $2;" if dt == DType.float64 else (
+            "sub.rn.f32 $0, $1, $2;"
+        )
+        comptime cons = "=d,d,d" if dt == DType.float64 else "=f,f,f"
+        return inlined_assembly[
+            asm, Scalar[dt], constraints=cons, has_side_effect=False
+        ](a, b)
+    else:
+        return a - b
+
+
+@always_inline
+def _cmul_modes[
+    dt: DType
+](z: Cx[dt], w: Cx[dt], x_mode: Int, y_mode: Int) -> Cx[dt]:
+    """libc++'s operator*(complex, complex) (the jiterated kernels'):
+    (ac - bd) + (ad + bc)i, each product rounded unless a mode fuses one into
+    its sum (1: the first product, 2: the second; ptxas contracts some
+    unrolled copies of a jiterated kernel that way), with Annex G's recovery
+    of an infinite product that came out NaN + NaN i."""
+    # Modified from libc++ operator*(const complex&, const complex&), llvm_complex.cpp (PyTorch v2.11.0; LLVM licence).
+    var a = z.re
+    var b = z.im
+    var c = w.re
+    var d = w.im
+    var x = _dot_x(a, c, b, d, x_mode)
+    var y = _dot_y(a, d, b, c, y_mode)
+    if isnan(x) and isnan(y):
+        var recalc = False
+        if isinf(a) or isinf(b):
+            a = _copysign(Scalar[dt](1) if isinf(a) else Scalar[dt](0), a)
+            b = _copysign(Scalar[dt](1) if isinf(b) else Scalar[dt](0), b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if isinf(c) or isinf(d):
+            c = _copysign(Scalar[dt](1) if isinf(c) else Scalar[dt](0), c)
+            d = _copysign(Scalar[dt](1) if isinf(d) else Scalar[dt](0), d)
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            recalc = True
+        if not recalc and (
+            isinf(z.re * w.re)
+            or isinf(z.im * w.im)
+            or isinf(z.re * w.im)
+            or isinf(z.im * w.re)
+        ):
+            if isnan(a):
+                a = _copysign(Scalar[dt](0), a)
+            if isnan(b):
+                b = _copysign(Scalar[dt](0), b)
+            if isnan(c):
+                c = _copysign(Scalar[dt](0), c)
+            if isnan(d):
+                d = _copysign(Scalar[dt](0), d)
+            recalc = True
+        if recalc:
+            x = _inf[dt]() * _dot_x(a, c, b, d, x_mode)
+            y = _inf[dt]() * _dot_y(a, d, b, c, y_mode)
+    return Cx[dt](x, y)
+
+
+@always_inline
+def cmul_jit[dt: DType](z: Cx[dt], w: Cx[dt]) -> Cx[dt]:
+    """`_cmul_modes` with every product rounded (what stock CUDA's complex64
+    kernels compute)."""
+    return _cmul_modes(z, w, 0, 0)
+
+
+@always_inline
+def csigmoid_jit[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    """sigmoid_kernel_cuda's jiterated complex body,
+    `T{1} / (T{1} + std::exp(-x))`, in libc++'s complex."""
+    var e = cexp_jit(Cx[dt](-z.re, -z.im))
+    return cdiv_jit(
+        Cx[dt](Scalar[dt](1), Scalar[dt](0)),
+        Cx[dt](_radd(Scalar[dt](1), e.re), _radd(Scalar[dt](0), e.im)),
+    )
+
+
+@always_inline
+def csilu[dt: DType](z: Cx[dt]) -> Cx[dt]:
+    """silu_kernel's complex body, `x / (1 + ::exp(-x))` in c10::complex
+    (thrust's exp, c10's scaled division)."""
+    var e = cexp(Cx[dt](-z.re, -z.im))
+    return cdiv(
+        z, Cx[dt](_radd(Scalar[dt](1), e.re), _radd(Scalar[dt](0), e.im))
+    )
+
+
+# ===----------------------------------------------------------------------=== #
+# ptxas's contraction of torch v2.11.0's unrolled jiterator loop (float64).
+#
+# NVRTC inlines the jiterated function once per unrolled element of the scalar
+# kernel (eight 128-element slices per 1024-element block) and ptxas fuses the
+# complex products of the first slice only: the multiplies of
+# `a * conj((1 - b) * b)` and `a * conj(1 - b * b)` into their sums (SASS,
+# then fitted against the live oracle: every other slice, and complex64, is
+# unfused). The same rule as kernels/complex_pointwise (exact-binary branch).
+# Off NVIDIA the plain forms are used.
+# ===----------------------------------------------------------------------=== #
+
+
+@always_inline
+def _first_slice[dt: DType](i: Int) -> Bool:
+    comptime if is_nvidia_gpu() and dt == DType.float64:
+        return (i & 1023) >> 7 == 0
+    else:
+        return False
+
+
+@always_inline
+def _cmul_slice[
+    dt: DType
+](z: Cx[dt], w: Cx[dt], fused: Bool, y_mode: Int) -> Cx[dt]:
+    if fused:
+        return _cmul_modes(z, w, 1, y_mode)
+    return cmul_jit(z, w)
+
+
+@always_inline
+def csigmoid_backward_jit[dt: DType](a: Cx[dt], b: Cx[dt], i: Int) -> Cx[dt]:
+    """sigmoid_backward's jiterated complex body,
+    `a * std::conj((T{1.} - b) * b)`; `i` is the element index."""
+    var fused = _first_slice[dt](i)
+    var t = Cx[dt](_rsub(Scalar[dt](1), b.re), _rsub(Scalar[dt](0), b.im))
+    var u = _cmul_slice(t, b, fused, 1)
+    return _cmul_slice(a, Cx[dt](u.re, -u.im), fused, 2)
+
+
+@always_inline
+def ctanh_backward_jit[dt: DType](a: Cx[dt], b: Cx[dt], i: Int) -> Cx[dt]:
+    """tanh_backward's jiterated complex body, `a * std::conj(T{1.} - b * b)`.
+    """
+    var fused = _first_slice[dt](i)
+    var s = _cmul_slice(b, b, fused, 1)
+    var t = Cx[dt](_rsub(Scalar[dt](1), s.re), _rsub(Scalar[dt](0), s.im))
+    return _cmul_slice(a, Cx[dt](t.re, -t.im), fused, 2)
 
 
 @always_inline
