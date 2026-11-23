@@ -705,6 +705,50 @@ def test_standard_gamma_grad_remainder_block_matches_cuda(cuda_oracle: CudaOracl
         )
 
 
+# Which CUDA kernel runs decides the gamma-grad contraction (the vectorized
+# one, the strided one, the unrolled one over misaligned storage), so every
+# layout below picks a path. Probed per index against stock CUDA.
+_SGG_LAYOUTS = {
+    "contig": (lambda n: n, lambda a, x: (a, x)),
+    "offset1": (lambda n: n + 1, lambda a, x: (a[1:], x[1:])),
+    "offset2": (lambda n: n + 2, lambda a, x: (a[2:], x[2:])),
+    "offset3": (lambda n: n + 3, lambda a, x: (a[3:], x[3:])),
+    "mixed_offsets": (lambda n: n + 1, lambda a, x: (a[1:], x[:-1])),
+    "stride2": (lambda n: 2 * n, lambda a, x: (a[::2], x[::2])),
+    "transposed": (
+        lambda n: n,
+        lambda a, x: (a.reshape(-1, 10).t(), x.reshape(-1, 10).t()),
+    ),
+    "broadcast": (lambda n: n, lambda a, x: (a.reshape(-1, 10), x[:10])),
+}
+
+
+@pytest.mark.parametrize("n", (1500, 1501, 2300))
+@pytest.mark.parametrize("layout", _SGG_LAYOUTS)
+@pytest.mark.parametrize("dtype", _F, ids=str)
+def test_standard_gamma_grad_launch_regimes_match_cuda(
+    cuda_oracle: CudaOracle, dtype: torch.dtype, layout: str, n: int
+):
+    """Remainder blocks and every launch path, per dtype: small-x inputs
+    (where the contraction decides the bits) in numel-sized storage."""
+    if layout in ("transposed", "broadcast") and n % 10:
+        pytest.skip("needs a multiple of 10")
+    size, view = _SGG_LAYOUTS[layout]
+    g = _gen(n)
+    sz = size(n)
+    alpha = (torch.rand(sz, generator=g, dtype=torch.float64) * 6 + 0.01).to(dtype)
+    x = (torch.rand(sz, generator=g, dtype=torch.float64) * 0.79 + 0.001).to(dtype)
+    if dtype == torch.float32:
+        sa, sx = _sgg_sensitive()
+        alpha[:4], x[:4] = sa, sx
+    elif dtype == torch.float16:
+        # a pair whose bits depend on the contraction in float16
+        alpha[0], x[0] = 0.1160888671875, 0.1561279296875
+    cuda_oracle.assert_bitwise_equal(
+        lambda a, b: torch.ops.aten._standard_gamma_grad(*view(a, b)), alpha, x
+    )
+
+
 @pytest.mark.parametrize("dtype", (*_F, torch.int32), ids=str)
 @pytest.mark.parametrize("eps", [None, 0.0, 1e-6, 0.25, -0.5])
 def test_logit_backward_matches_cuda(

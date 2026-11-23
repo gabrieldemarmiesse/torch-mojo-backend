@@ -388,13 +388,18 @@ def _launch[
                 c = c_ptr.unsafe_load[width=w, alignment=in_align](i)
             else:
                 c = SIMD[dt, w](c_ptr[unsafe_offset=0] if dev_c else vc)
-        comptime if (
-            kind == "standard_gamma_grad"
-            and dt == DType.float32
-            and is_nvidia_gpu()
-        ):
+        comptime if kind == "standard_gamma_grad" and is_nvidia_gpu():
             # the element count rides in p0 / p1 (ops/pointwise.mojo)
-            if sgg_alt_contraction(i, Int(p0) + Int(p1) * 4096):
+            var alt = False
+            if Int(p2) == 1 and dt.is_half_float():
+                alt = (i & 511) < 128
+            elif Int(p2) == 1:
+                alt = ((i >> 7) & 1) == 0
+            elif Int(p2) == 2:
+                alt = (i & 511) < 128
+            elif dt != DType.float64:
+                alt = sgg_alt_contraction(i, Int(p0) + Int(p1) * 4096)
+            if alt:
                 out_ptr.unsafe_store[width=w, alignment=out_align](
                     i,
                     pointwise[kind, dt, odt, w, True](

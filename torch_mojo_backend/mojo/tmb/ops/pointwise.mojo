@@ -434,6 +434,28 @@ def _pw_device(a: Side, b: Side, c: Side) raises -> Int:
     return device
 
 
+def _pw_sgg_path(a: Side, b: Side, count: Int, compute: Int32) -> Float64:
+    """Which CUDA kernel runs a tensor-tensor float op, as the code the
+    gamma-grad contraction keys on: 0 the vectorized one (every tensor
+    operand dense, same numel, aligned to two elements), 1 the strided
+    kernel (not dense or broadcast), 2 the unrolled one over misaligned
+    dense storage."""
+    var size = 8 if compute == ST_FLOAT64 else (
+        4 if compute == ST_FLOAT32 else 2
+    )
+    var path = 0
+    for k in range(2):
+        var s = a.copy() if k == 0 else b.copy()
+        if not s.is_t:
+            continue
+        var t = s.t.value().copy()
+        if not t.contig or t.numel != count:
+            return 1.0
+        if t.ptr % (2 * size) != 0:
+            path = 2
+    return Float64(path)
+
+
 def _pw_run(
     kind: StaticString,
     arity: Int,
@@ -468,6 +490,9 @@ def _pw_run(
             count *= shape[i]
         prm[0] = Float64(count % 4096)
         prm[1] = Float64(count // 4096)
+        # p2: 1 when CUDA runs its unrolled kernel (an operand that is not
+        # dense, broadcast or 16-byte aligned) instead of the vectorized one
+        prm[2] = _pw_sgg_path(a, b, count, compute)
     var fa = _pw_flat(a, compute, shape, rank)
     var fb = _pw_flat(b, compute, shape, rank) if arity >= 2 else _Flat(
         MODE_HOST, 0, 0.0
