@@ -66,6 +66,7 @@ from tmb.ops.common import (
     shares_storage,
 )
 from tmb.ops.f8_iter import (
+    cuda_routed,
     f8_iter,
     generated_out,
     MODE_CAST,
@@ -2879,7 +2880,7 @@ def register_unary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            routed[op_sigmoid, cx_sigmoid, 1],
+            cuda_routed[op_sigmoid, cx_sigmoid, 1],
             "sigmoid_cuda",
             1,
             -1,
@@ -2891,7 +2892,7 @@ def register_unary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            routed[op_sigmoid_out, cx_sigmoid_out, 2],
+            cuda_routed[op_sigmoid_out, cx_sigmoid_out, 2],
             "sigmoid_cuda",
             1,
             1,
@@ -2961,7 +2962,7 @@ def register_unary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            routed[op_silu, cx_silu, 1],
+            cuda_routed[op_silu, cx_silu, 1],
             "silu_cuda",
             1,
             -1,
@@ -2973,7 +2974,7 @@ def register_unary(site: Site) raises:
     ](site)
     impl[
         f8_iter[
-            routed[op_silu_out, cx_silu_out, 2],
+            cuda_routed[op_silu_out, cx_silu_out, 2],
             "silu_cuda",
             1,
             1,

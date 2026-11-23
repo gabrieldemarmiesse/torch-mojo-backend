@@ -56,10 +56,12 @@ from tmb.backend.abi import (
     tensor_arg,
     unsupported,
     v_f64,
+    v_is_complex,
     v_is_none,
     v_string,
 )
 from std.utils import IndexList
+from tmb.backend.device import dev
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
     ST_UNDEFINED,
@@ -350,6 +352,35 @@ def _inputs_on_device(
         raise Error("Trying to pass too many CPU scalars to non-CPU kernel!")
 
 
+def on_cuda_mojo(args: Values, ins: Int, out_idx: Int = -1) raises -> Bool:
+    """The first mojo tensor among the `ins` bitmask of args (and the out=)
+    sits on a CUDA device. Every CUDA-only behaviour of an op that existed
+    before is gated on this: the other targets keep their old behaviour."""
+    for i in range(_MAX_ARGS):
+        if (ins >> i) & 1 == 0 and i != out_idx:
+            continue
+        var v = args[unsafe_offset=i].copy()
+        if not _rec_tensor(v):
+            continue
+        var t = T(Int(v.a))
+        if t.on_mojo():
+            return dev(t.device)[].api == "cuda"
+    return False
+
+
+def cuda_routed[
+    real_op: OpFn, complex_op: OpFn, n_check: Int
+](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """`routed`, with the complex route taken on CUDA devices only (the op
+    raised for complex before; the other targets keep that)."""
+    if on_cuda_mojo(args, (1 << n_check) - 1):
+        comptime for i in range(n_check):
+            if i < n_args and v_is_complex(args[unsafe_offset=i]):
+                complex_op(args, n_args, rets, n_rets)
+                return
+    real_op(args, n_args, rets, n_rets)
+
+
 def cuda_device_check[
     op: OpFn, ins: Int, out_idx: Int = -1
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
@@ -357,6 +388,9 @@ def cuda_device_check[
     check_and_update_common_device (every op without `device_check:
     NoCheck`): the tensors of `ins` (a bitmask of args) and the out= on one
     device, a CPU 0-d tensor included, before anything else runs."""
+    if not on_cuda_mojo(args, ins, out_idx):
+        op(args, n_args, rets, n_rets)
+        return
     var first = String("")
     for i in range(_MAX_ARGS):
         if (ins >> i) & 1 == 0 and i != out_idx:

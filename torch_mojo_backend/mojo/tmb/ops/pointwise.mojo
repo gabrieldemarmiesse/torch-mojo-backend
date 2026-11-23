@@ -77,6 +77,7 @@ from tmb.ops.f8_iter import (
     f8_cx_scalar,
     f8_iter,
     generated_out,
+    on_cuda_mojo,
     MODE_CAST,
     MODE_FN,
     MODE_INPLACE,
@@ -177,8 +178,15 @@ from tmb.ops.core import cast_for_copy
 from tmb.ops.distance import store_autogen_out
 from tmb.ops.reductions import _scalar_reduction
 from tmb.ops.unary import op_gelu_backward
-from tmb.ops.composed import _dispatch
-from tmb.ops.matmul import _sm90_cuda
+from tmb.ops.composed import (
+    _dispatch,
+    _tanh_fused_inputs,
+    _tanh_fused_into,
+    op_sigmoid_backward as legacy_sigmoid_backward,
+    op_sigmoid_backward_grad_input as legacy_sigmoid_backward_grad_input,
+    op_tanh_backward as legacy_tanh_backward,
+    op_tanh_backward_grad_input as legacy_tanh_backward_grad_input,
+)
 
 # ---------------------------------------------------------------------------
 # type promotion
@@ -2150,8 +2158,13 @@ def _glu(args: Values, rets: Values, out_index: Int) raises:
         # The out= checks and resize precede the kernel dispatch.
         dest = _pw_out_of(args[unsafe_offset=out_index], sa, sb, _none_side())
         var o = dest.value().stype
-        if _pw_is_float(o) and not _pw_is_f8(o) and not _pw_is_f8(common):
-            # glu_cuda computes in the out's floating dtype too
+        if (
+            dev(self.device)[].api == "cuda"
+            and _pw_is_float(o)
+            and not _pw_is_f8(o)
+            and not _pw_is_f8(common)
+        ):
+            # glu_cuda computes in the out's floating dtype too (CUDA only)
             common = o
         elif _pw_is_f8(common) or _pw_is_f8(o):
             # glu_cuda dispatches on the OUTPUT dtype: a float8 input into a
@@ -3681,6 +3694,10 @@ def _bce_general(args: Values, rets: Values, out_v: Optional[Value]) raises:
             )
     else:
         loss = new_tensor(x.shape, x.rank, x.stype, x.device)
+    # The fresh loss is released on every raising path below; an out= is the
+    # caller's.
+    var loss_o = own(loss.copy())
+    loss_o.live = not Bool(out_v)
     # Every view below is a handle of its own: wrapped in `Owned` so each is
     # released when this function ends, on the raising paths too.
     var ls_o = own(_squeeze_view(loss))
@@ -3698,6 +3715,8 @@ def _bce_general(args: Values, rets: Values, out_v: Optional[Value]) raises:
         _p(),
         ls.copy(),
     )
+    var res_o = own(res.t.copy())
+    res_o.live = res.owned
     if res.owned:
         if res.t.same_shape(ls):
             copy_strided_into(ls, res.t)
@@ -3716,7 +3735,7 @@ def _bce_general(args: Values, rets: Values, out_v: Optional[Value]) raises:
             copy_strided_into(dst_o.t.copy(), src_o.t.copy())
             _ = dst_o^
             _ = src_o^
-        release(res.t.h)
+    _ = res_o^
     _ = ls_o^
     _ = xs_o^
     _ = ts_o^
@@ -3730,15 +3749,17 @@ def _bce_general(args: Values, rets: Values, out_v: Optional[Value]) raises:
     if out_v:
         ret_ref(rets, 0, loss)
     else:
-        var owned = own(loss^)
-        ret_owned(rets, 0, owned)
+        ret_owned(rets, 0, loss_o)
 
 
 def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
     """Loss.cu binary_cross_entropy_out_cuda: input and target of one dtype,
     the loss in it (`loss.mul_(weight)` keeps it: a float32 weight on
     float16 inputs is a float16 loss), the weight never growing its shape."""
-    if _loss_reduction(args[unsafe_offset=3]) == REDUCTION_NONE and (
+    if (
+        on_cuda_mojo(args, 7, 4 if out_v else -1)
+        and _loss_reduction(args[unsafe_offset=3]) == REDUCTION_NONE
+    ) and (
         _bce_needs_general(args)
         or (
             Bool(out_v)
@@ -3829,10 +3850,109 @@ def op_binary_cross_entropy_out(
     _bce(args, rets, args[unsafe_offset=4].copy())
 
 
+def _bce_backward_legacy(
+    args: Values, rets: Values, out_v: Optional[Value]
+) raises:
+    """The behaviour before the CUDA ports, kept as is for the other devices.
+    Loss.cu binary_cross_entropy_backward_out_cuda: the gradient kernel,
+    then `mul_(weight)` and the mean's `div_(numel)` -- folded into the
+    gradient kernel when there is no weight, a second kind when there is."""
+    var grad = _b_side(args[unsafe_offset=0])
+    var input = _b_side(args[unsafe_offset=1])
+    var raw_target = _b_side(args[unsafe_offset=2])
+    var weight = _opt_weight(args[unsafe_offset=3])
+    var reduction = _loss_reduction(args[unsafe_offset=4])
+    if not grad.is_t or not input.is_t or not raw_target.is_t:
+        unsupported("binary_cross_entropy_backward with a scalar operand")
+    var paired = own_if_new(
+        _bce_paired(
+            input.t.value(),
+            raw_target.t.value(),
+            "binary_cross_entropy_backward",
+        ),
+        raw_target.t.value(),
+    )
+    var target = _b_tside(paired.t)
+    # One dtype for every operand (grad_input's is checked as exact below),
+    # and grad_input has self's shape: nothing may broadcast it larger.
+    _loss_same_dtype(input, target)
+    _loss_same_dtype(input, grad)
+    _bce_decline_weight(
+        weight, input.t.value().stype, "binary_cross_entropy_backward"
+    )
+    var shape = input.t.value().shape
+    var rank = input.t.value().rank
+    _loss_fits(shape, rank, grad, input, target)
+    if weight:
+        _loss_fits(shape, rank, input, _b_tside(weight.value()), _none_side())
+    var common = _pw_result_type(grad, input, target, 3)
+    var compute = _pw_compute_dtype("bce_backward", common, P_FLOAT_ONLY, True)
+    var inv = 1.0
+    if reduction == REDUCTION_MEAN:
+        # div_true's CPU-scalar route multiplies by the opmath reciprocal.
+        var n = input.t.value().numel
+        if compute == ST_FLOAT64:
+            inv = 1.0 / Float64(n)
+        else:
+            inv = (Float32(1.0) / Float32(n)).cast[DType.float64]()
+    var dest = Optional[T]()
+    if out_v:
+        dest = _pw_out_of(out_v.value(), grad, input, target)
+        if weight:
+            # `grad_input.mul_(weight)`: its in-place meta refuses a weight
+            # partially overlapping grad_input.
+            _b_no_partial_overlap(dest.value(), weight.value())
+    # grad_input that IS the weight: ATen's `mul_(weight)` then reads the
+    # gradient it just wrote there (grad^2).
+    var weight_is_out = False
+    if Bool(weight) and Bool(dest):
+        weight_is_out = _pw_same_view(dest.value(), weight.value())
+    var out_st = input.t.value().stype
+    if not weight:
+        _pw_finish(
+            rets,
+            dest,
+            _pw_run(
+                "bce_backward",
+                3,
+                grad,
+                input,
+                target,
+                compute,
+                out_st,
+                _p(inv),
+                dest,
+            ),
+            _pw_out_exact("bce_backward"),
+        )
+        _ = paired^
+        return
+    var gi = _pw_run(
+        "bce_backward", 3, grad, input, target, compute, compute, _p(1.0), None
+    )
+    var res = _pw_run(
+        "mul_scale",
+        2,
+        _b_tside(gi.t),
+        _b_tside(gi.t) if weight_is_out else _b_tside(weight.value()),
+        _none_side(),
+        compute,
+        out_st,
+        _p(inv),
+        dest,
+    )
+    release(gi.t.h)
+    _pw_finish(rets, dest, res^, _pw_out_exact("bce_backward"))
+    _ = paired^
+
+
 def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     """Loss.cu binary_cross_entropy_backward_out_cuda: the gradient kernel,
     then `mul_(weight)` and the mean's `div_(numel)` -- folded into the
     gradient kernel when there is no weight, a second kind when there is."""
+    if not on_cuda_mojo(args, 15, 5 if out_v else -1):
+        _bce_backward_legacy(args, rets, out_v)
+        return
     var grad = _b_side(args[unsafe_offset=0])
     var input = _b_side(args[unsafe_offset=1])
     var target = _b_side(args[unsafe_offset=2])
@@ -4090,7 +4210,8 @@ def _bce_logits(args: Values, rets: Values, out_v: Optional[Value]) raises:
     body (log_sigmoid, sub, mul, rsub, ...) is one kind here; autograd keeps
     its own derivatives.yaml formula."""
     if (
-        not _bce_logits_fusable(args)
+        on_cuda_mojo(args, 15)
+        and not _bce_logits_fusable(args)
         and _loss_reduction(args[unsafe_offset=4]) == REDUCTION_NONE
     ):
         _bce_logits_composed(args, rets, out_v)
@@ -4611,9 +4732,13 @@ def op_pow_scalar_out_meta(
 # rsub.Tensor / rsub.Scalar(self, other, alpha): sub(other, self) -- its
 # bool check, the result type of both operands (a Scalar other as a wrapped
 # number), alpha_check, then the kernel's dtype dispatch
-def _complex_pair(args: Values) -> Bool:
-    return v_is_complex(args[unsafe_offset=0]) or v_is_complex(
-        args[unsafe_offset=1]
+def _complex_pair(args: Values, out_index: Int = -1) -> Bool:
+    """A complex operand, or a complex out=: CUDA dispatches the backward in
+    the out's dtype."""
+    return (
+        v_is_complex(args[unsafe_offset=0])
+        or v_is_complex(args[unsafe_offset=1])
+        or (out_index >= 0 and v_is_complex(args[unsafe_offset=out_index]))
     )
 
 
@@ -4621,77 +4746,55 @@ def _complex_pair(args: Values) -> Bool:
 def op_sigmoid_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _complex_pair(args):
+    if not on_cuda_mojo(args, 3):
+        legacy_sigmoid_backward(args, n_args, rets, n_rets)
+    elif _complex_pair(args):
         cx_backward["sigmoid_backward"](args, n_args, rets, n_rets)
-        return
-    _pw_act("sigmoid_backward", args, rets, 0, 1, -1, _p())
+    else:
+        _pw_act("sigmoid_backward", args, rets, 0, 1, -1, _p())
 
 
 # aten::sigmoid_backward.grad_input(Tensor grad_output, Tensor output, *, Tensor(a!) grad_input) -> Tensor(a!)
 def op_sigmoid_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _complex_pair(args):
+    if not on_cuda_mojo(args, 3, 2):
+        legacy_sigmoid_backward_grad_input(args, n_args, rets, n_rets)
+    elif _complex_pair(args, 2):
         cx_backward_out["sigmoid_backward"](args, n_args, rets, n_rets)
-        return
-    _pw_act("sigmoid_backward", args, rets, 0, 1, 2, _p())
-
-
-def _tanh_fused_inputs(grad: T, output: T) raises -> Bool:
-    """Same-shape dense float32 operands on an sm_90 GPU: the tuned
-    activation_backward kernel (the pointwise kind's formula)."""
-    return (
-        grad.on_mojo()
-        and output.on_mojo()
-        and grad.device == output.device
-        and grad.dtype == DType.float32
-        and output.dtype == DType.float32
-        and grad.contig
-        and output.contig
-        and grad.same_shape(output)
-        and _sm90_cuda(grad.device)
-    )
-
-
-def _tanh_fused_into(dst: T, grad: T, output: T) raises:
-    if dst.numel == 0:
-        return
-    var ctx = ctx_for(dst.device)
-    var call = KernelCall("activation_backward", "TanhBackwardF32")
-    call.int(dst.ptr)
-    call.int(grad.ptr)
-    call.int(output.ptr)
-    call.int(dst.numel)
-    call.int(ctx_ptr(ctx))
-    call.run()
-    _ = ctx
+    else:
+        _pw_act("sigmoid_backward", args, rets, 0, 1, 2, _p())
 
 
 # aten::tanh_backward(Tensor grad_output, Tensor output) -> Tensor
 def op_tanh_backward(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _complex_pair(args):
+    if not on_cuda_mojo(args, 3):
+        legacy_tanh_backward(args, n_args, rets, n_rets)
+    elif _complex_pair(args):
         cx_backward["tanh_backward"](args, n_args, rets, n_rets)
-        return
-    var grad = v_tensor(args[unsafe_offset=0])
-    var output = v_tensor(args[unsafe_offset=1])
-    if _tanh_fused_inputs(grad, output):
-        var result = own(new_like(grad))
-        _tanh_fused_into(result.t, grad, output)
-        ret_owned(rets, 0, result)
     else:
-        _pw_act("tanh_backward", args, rets, 0, 1, -1, _p())
+        var grad = v_tensor(args[unsafe_offset=0])
+        var output = v_tensor(args[unsafe_offset=1])
+        if _tanh_fused_inputs(grad, output):
+            var result = own(new_like(grad))
+            _tanh_fused_into(result.t, grad, output)
+            ret_owned(rets, 0, result)
+        else:
+            _pw_act("tanh_backward", args, rets, 0, 1, -1, _p())
 
 
 # aten::tanh_backward.grad_input(Tensor grad_output, Tensor output, *, Tensor(a!) grad_input) -> Tensor(a!)
 def op_tanh_backward_grad_input(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if _complex_pair(args):
+    if not on_cuda_mojo(args, 3, 2):
+        legacy_tanh_backward_grad_input(args, n_args, rets, n_rets)
+    elif _complex_pair(args, 2):
         cx_backward_out["tanh_backward"](args, n_args, rets, n_rets)
-        return
-    _pw_act("tanh_backward", args, rets, 0, 1, 2, _p())
+    else:
+        _pw_act("tanh_backward", args, rets, 0, 1, 2, _p())
 
 
 comptime _rsub_fn = f8_iter[
