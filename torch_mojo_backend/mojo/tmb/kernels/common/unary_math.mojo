@@ -959,7 +959,7 @@ def elementwise_unary_param[
                 return (_rounding["round"](q) * tp).cast[dtype]()
             var q = _to_dtype_rounded[dtype](xf * tp)
             return (_rounding["round"](q) / tp).cast[dtype]()
-    elif ct == DType.float64 and kind == "mvlgamma":
+    elif ct == DType.float64 and is_nvidia_gpu() and kind == "mvlgamma":
         # The float32 sum below in double: same offsets, accumulator order
         # and tree (CUDA's reduce over the p-long dim), nv_lgamma per term.
         # The double tensor's offsets are exact, so nothing rounds per step.
@@ -980,7 +980,11 @@ def elementwise_unary_param[
                     acc[k] += acc[k + half]
             r[i] = rebind[Scalar[dtype]](acc[0] + c)
         return r
-    elif ct == DType.float64 and (kind == "logit" or kind == "polygamma"):
+    elif (
+        ct == DType.float64
+        and is_nvidia_gpu()
+        and (kind == "logit" or kind == "polygamma")
+    ):
         var r = SIMD[dtype, width]()
         comptime if kind == "logit":
             var eps = rebind[Scalar[dtype]](p0)
