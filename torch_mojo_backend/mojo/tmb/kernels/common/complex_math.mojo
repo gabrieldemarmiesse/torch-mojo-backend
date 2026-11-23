@@ -683,7 +683,10 @@ def _jsin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def _nv_sinh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
-    comptime if dt == DType.float64:
+    comptime if not is_nvidia_gpu():
+        var e = _rexp(x)
+        return (e - Scalar[dt](1) / e) / Scalar[dt](2)
+    elif dt == DType.float64:
         return rebind[Scalar[dt]](nv_sinh(rebind[Float64](x)))
     else:
         return rebind[Scalar[dt]](nv_sinhf(rebind[Float32](x)))
@@ -691,7 +694,10 @@ def _nv_sinh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 @always_inline
 def _nv_cosh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
-    comptime if dt == DType.float64:
+    comptime if not is_nvidia_gpu():
+        var e = _rexp(x)
+        return (e + Scalar[dt](1) / e) / Scalar[dt](2)
+    elif dt == DType.float64:
         return rebind[Scalar[dt]](nv_cosh(rebind[Float64](x)))
     else:
         return rebind[Scalar[dt]](nv_coshf(rebind[Float32](x)))

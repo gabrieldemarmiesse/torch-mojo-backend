@@ -535,11 +535,13 @@ def _unary_float64_on[op_code: Int]() -> Bool:
         # trunc / round / frac / angle are exact in float64; the special
         # functions have double ports.
         comptime kind = _table_uop_kind[op_code]()
-        return is_rounding[kind]() or has_f64_port[kind]()
+        return is_rounding[kind]() or (
+            has_f64_port[kind]() and has_nvidia_gpu_accelerator()
+        )
     else:
         return (
             _unary_is_direct[op_code]()
-            or op_code == UOP_ERF
+            or (op_code == UOP_ERF and has_nvidia_gpu_accelerator())
             or op_code == UOP_LOG2
             or op_code == UOP_RECIPROCAL
             or op_code == UOP_CEIL
@@ -1384,9 +1386,10 @@ def _param_float64_on[index: Int]() -> Bool:
     return (
         kind == "nan_to_num"
         or kind == "round_decimals"
-        or kind == "logit"
-        or kind == "polygamma"
-        or kind == "mvlgamma"
+        or (
+            has_nvidia_gpu_accelerator()
+            and (kind == "logit" or kind == "polygamma" or kind == "mvlgamma")
+        )
     )
 
 

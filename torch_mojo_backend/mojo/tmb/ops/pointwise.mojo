@@ -434,6 +434,42 @@ def _pw_device(a: Side, b: Side, c: Side) raises -> Int:
     return device
 
 
+def count_of(shape: IndexList[MAX_RANK]) -> Int:
+    var count = 1
+    for i in range(MAX_RANK):
+        count *= shape[i]
+    return count
+
+
+def _pw_xlogy_nan(
+    a: Side, b: Side, count: Int, compute: Int32
+) raises -> Float64:
+    """xlogy / xlog1py in float64 with a NaN x and a NaN log: which NaN stock
+    CUDA returns. 1: x's (a tensor operand of another dtype, so the casting
+    kernel; a host scalar x; or misaligned dense storage); 0: log's (a
+    broadcast or strided tensor operand, 0-dim ones included); 2: x's in the
+    partial last 1024-block of a dense launch, log's before it. Known
+    limit: for permuted-dense operands (transposed) CUDA's block follows the
+    memory index, ours the logical one (strict xfail in the tests)."""
+    for k in range(2):
+        var s = a.copy() if k == 0 else b.copy()
+        if s.is_t and s.t.value().stype != compute:
+            return 1.0
+    if not a.is_t:
+        return 1.0
+    var misaligned = False
+    for k in range(2):
+        var s = a.copy() if k == 0 else b.copy()
+        if not s.is_t:
+            continue
+        var t = s.t.value().copy()
+        if t.numel != count or not is_dense(t.shape, t.strides, t.rank):
+            return 0.0
+        if t.contig and t.ptr % 16 != 0:
+            misaligned = True
+    return 1.0 if misaligned else 2.0
+
+
 def _pw_sgg_path(a: Side, b: Side, count: Int, compute: Int32) -> Float64:
     """Which CUDA kernel runs a tensor-tensor float op, as the code the
     gamma-grad contraction keys on: 0 the vectorized one (every tensor
@@ -473,25 +509,29 @@ def _pw_run(
     _pw_no_float8(kind, compute)
     var device = _pw_device(a, b, c)
     var prm = params
-    if (kind == "xlogy" or kind == "xlog1py") and compute == ST_FLOAT64:
-        # A tensor operand of another dtype makes CUDA run its casting
-        # kernel, which keeps x's NaN where the vectorized one gives log's.
-        if (a.is_t and a.t.value().stype != compute) or (
-            b.is_t and b.t.value().stype != compute
-        ):
-            prm[0] = 1.0
     var bs = _pw_broadcast(a, b, c, arity)
     var shape = bs[0]
     var rank = bs[1]
-    if kind == "standard_gamma_grad":
+    var nv_ctx = ctx_for(device)
+    var cuda = nv_ctx.api() == "cuda"
+    _ = nv_ctx
+    if (
+        cuda
+        and (kind == "xlogy" or kind == "xlog1py")
+        and compute == ST_FLOAT64
+    ):
+        prm[0] = _pw_xlogy_nan(a, b, count_of(shape), compute)
+        prm[1] = Float64(count_of(shape) % 4096)
+        prm[2] = Float64(count_of(shape) // 4096)
+    if cuda and kind == "standard_gamma_grad":
         # the kernel's block-tail contraction needs the element count
         var count = 1
         for i in range(MAX_RANK):
             count *= shape[i]
         prm[0] = Float64(count % 4096)
         prm[1] = Float64(count // 4096)
-        # p2: 1 when CUDA runs its unrolled kernel (an operand that is not
-        # dense, broadcast or 16-byte aligned) instead of the vectorized one
+        # p2: the CUDA launch path (see `_pw_sgg_path`); these parameters
+        # are written on CUDA devices only
         prm[2] = _pw_sgg_path(a, b, count, compute)
     var fa = _pw_flat(a, compute, shape, rank)
     var fb = _pw_flat(b, compute, shape, rank) if arity >= 2 else _Flat(

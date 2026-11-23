@@ -499,6 +499,7 @@ def test_igamma_branch_points_match_cuda(
     )
 
 
+@pytest.mark.parametrize("data_dtype", (torch.float32, torch.float64), ids=str)
 @pytest.mark.parametrize(
     ("name", "fn", "half_ok", "a_range", "b_range"), _BINARY, ids=_BINARY_IDS
 )
@@ -509,10 +510,11 @@ def test_binary_special_scalars_and_promotion_match_cuda(
     half_ok: bool,
     a_range: tuple[float, float],
     b_range: tuple[float, float],
+    data_dtype: torch.dtype,
 ):
     """Python scalars on either side (the CPU-scalar route of the kernel),
     0-dim tensors, mixed dtypes, broadcasting, out= and in-place."""
-    a, b = pair_inputs(torch.float32, a_range, b_range)
+    a, b = pair_inputs(data_dtype, a_range, b_range)
     a, b = a[:4096], b[:4096]
     eq = cuda_oracle.assert_bitwise_equal
     for s in (2.5, 3, True, -0.0, math.nan, 1e-3):
@@ -569,6 +571,71 @@ def test_binary_special_scalars_and_promotion_match_cuda(
     if method is not None:
         eq(lambda t, u: getattr(t, method)(u), a, b, what="in-place")
         eq(lambda t, u: getattr(t.half(), method)(u), a, b, what="in-place f16 self")
+
+
+_NAN_X_LAYOUTS = {
+    "contig": lambda a, b: (a, b),
+    "offset1": lambda a, b: (a[1:], b[1:]),
+    "stride2": lambda a, b: (a[::2], b[::2]),
+    "broadcast": lambda a, b: (a.reshape(-1, 10), b[:10]),
+    "python_scalar_y": lambda a, b: (a, -1.0),
+    "python_scalar_x": lambda a, b: (math.nan, b),
+    "zero_dim_y": lambda a, b: (a, b[:1].reshape(())),
+    "zero_dim_x": lambda a, b: (a[:1].reshape(()), b),
+    "mixed_f32_y": lambda a, b: (a, b.float()),
+    "int_y": lambda a, b: (a, torch.full_like(b, 3, dtype=torch.int64)),
+}
+
+
+def _nan_x_inputs(n: int, payload: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """x NaN (the given payload) against y -inf, -1, -0.5, 2, 0, 1, NaN: the
+    log is -NaN for a negative y, so which NaN wins decides the bits."""
+    nan_bits = 0x7FF8000000000000 | payload
+    a = torch.full((n + 1,), nan_bits, dtype=torch.int64).view(torch.float64)
+    ys = torch.tensor(
+        [-math.inf, -1.0, -0.5, 2.0, 0.0, 1.0, math.nan], dtype=torch.float64
+    )
+    return a, ys.repeat(n // 7 + 1)[: n + 1]
+
+
+@pytest.mark.parametrize(
+    "payload", (0, 0x123, -(1 << 51)), ids=("qnan", "payload", "negative")
+)
+@pytest.mark.parametrize("n", (70, 1024, 4900))
+@pytest.mark.parametrize("layout", _NAN_X_LAYOUTS)
+@pytest.mark.parametrize("name", ("xlogy", "xlog1py"))
+def test_xlogy_float64_nan_x_matches_cuda(
+    cuda_oracle: CudaOracle, name: str, layout: str, n: int, payload: int
+):
+    """Which NaN CUDA returns for NaN x with a NaN log: log's in full
+    vectorized blocks and for broadcast operands, x's in the partial last
+    1024-block, for host scalar x and for mixed operand dtypes."""
+    fn = {"xlogy": torch.xlogy, "xlog1py": torch.special.xlog1py}[name]
+    if layout == "broadcast" and (n % 10):
+        pytest.skip("needs a multiple of 10")
+    if payload < 0:
+        a, b = _nan_x_inputs(n, 0)
+        a = -a
+    else:
+        a, b = _nan_x_inputs(n, payload)
+    view = _NAN_X_LAYOUTS[layout]
+    cuda_oracle.assert_bitwise_equal(lambda x, y: fn(*view(x, y)), a, b)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="CUDA's partial-block rule keys on the memory index of the (permuted) "
+    "output; ours iterates the logical order",
+)
+def test_xlogy_float64_nan_x_transposed_matches_cuda(cuda_oracle: CudaOracle):
+    a, b = _nan_x_inputs(4899, 0)
+    cuda_oracle.assert_bitwise_equal(
+        lambda x, y: torch.xlogy(
+            x[:4900].reshape(-1, 10).t(), y[:4900].reshape(-1, 10).t()
+        ),
+        a,
+        b,
+    )
 
 
 _POLY = [

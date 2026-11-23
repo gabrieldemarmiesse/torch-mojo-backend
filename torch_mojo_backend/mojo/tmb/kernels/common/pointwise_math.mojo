@@ -2069,10 +2069,11 @@ def _wide[
             comptime if not is_nvidia_gpu():
                 r = isnan(a).select(a, r)
             elif w == DType.float64:
-                # The casting kernel (mixed operand dtypes, p[0] = 1) keeps
-                # x's NaN; the vectorized one gives log's.
-                if p[0] != 0:
-                    r = isnan(a).select(a + a, r)
+                # NaN x with a NaN log: the NaN of the operand CUDA's
+                # compiled product keeps. p[0] != 0: x's (casting kernel,
+                # host scalar x, partial last block); else log's.
+                var both = isnan(a) & isnan(l)
+                r = both.select(a + a if p[0] != 0 else l + l, r)
         return isnan(b).select(SIMD[w, n](nan[w]()), r)
     elif kind == "igamma" or kind == "igammac":
         # IGammaKernel.cu calc_igamma / calc_igammac (special_math.mojo):
