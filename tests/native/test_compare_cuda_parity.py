@@ -180,15 +180,14 @@ def test_compare_scalar(cuda_oracle: CudaOracle, op, dtype):
     reason="float16 against a device complex 0-d tensor computes in complex32,"
     " a dtype the device does not hold",
 )
+@pytest.mark.parametrize("s", [1j, 2 + 3j, -0.5 + 0j], ids=repr)
 @pytest.mark.parametrize("op", ["eq", "ne"])
-def test_compare_half_vs_device_complex_0d(cuda_oracle: CudaOracle, op):
+def test_compare_half_vs_device_complex_0d(cuda_oracle: CudaOracle, op, s):
     a, _ = bp.pairs(torch.float16)
     fn = getattr(torch, op)
-    cases = [
-        (f"tdev0d={s!r}", lambda x, s=s: fn(x, torch.tensor(s, device=x.device)), (a,))
-        for s in (1j, 2 + 3j, -0.5 + 0j)
-    ]
-    bp.check_all(cuda_oracle, cases)
+    cuda_oracle.assert_bitwise_equal(
+        lambda x: fn(x, torch.tensor(s, device=x.device)), a
+    )
 
 
 _MIXED = [
@@ -564,21 +563,26 @@ def test_where(cuda_oracle: CudaOracle, dtype):
     bp.check_all(cuda_oracle, cases)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="where(cond, half, 1e30) raises on CUDA (scalar_tensor fills with a"
+_WHERE_HALF_REASON = {
+    1e30: "where(cond, half, 1e30) raises on CUDA (scalar_tensor fills with a"
     " checked Half conversion; our scalar_tensor narrows unchecked to serve"
-    " Python item assignment) and where(cond, half, 1+2j) is a complex32"
-    " result, a dtype the device does not hold",
-)
-def test_where_half_scalars(cuda_oracle: CudaOracle):
+    " Python item assignment)",
+    1 + 2j: "where(cond, half, 1+2j) is a complex32 result, a dtype the device"
+    " does not hold",
+}
+
+
+@pytest.mark.parametrize("side", ["ts", "st"])
+@pytest.mark.parametrize("s", [1e30, 1 + 2j], ids=repr)
+def test_where_half_scalars(cuda_oracle: CudaOracle, request, s, side):
+    request.applymarker(pytest.mark.xfail(strict=True, reason=_WHERE_HALF_REASON[s]))
     a, _ = selection_pairs(torch.float16)
     c = _mask(len(a))
-    cases: Cases = []
-    for s in (1e30, 1 + 2j):
-        cases.append((f"ts={s!r}", lambda m, x, s=s: torch.where(m, x, s), (c, a)))
-        cases.append((f"st={s!r}", lambda m, x, s=s: torch.where(m, s, x), (c, a)))
-    bp.check_all(cuda_oracle, cases)
+    if side == "ts":
+        fn = lambda m, x: torch.where(m, x, s)  # noqa: E731
+    else:
+        fn = lambda m, x: torch.where(m, s, x)  # noqa: E731
+    cuda_oracle.assert_bitwise_equal(fn, c, a)
 
 
 def test_where_scalars(cuda_oracle: CudaOracle):

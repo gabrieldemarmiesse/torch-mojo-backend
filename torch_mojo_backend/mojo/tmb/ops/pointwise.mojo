@@ -760,7 +760,10 @@ def _pw_same_device(args: Values, n: Int) raises:
     """The dispatcher's device check of the ops without `device_check:
     NoCheck` (nextafter, logaddexp(2), gcd, lcm): a CPU tensor among the
     first `n` arguments -- a 0-d one too, which TensorIterator would read as
-    a scalar -- raises before anything else."""
+    a scalar -- raises before anything else. CUDA only: elsewhere a CPU 0-d
+    operand keeps working as before."""
+    if not _pw_cuda_args(args):
+        return
     for i in range(n):
         var tag = args[unsafe_offset=i].tag
         if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
@@ -1717,7 +1720,8 @@ def cx_lerp_tensor_out(
 def _pw_cuda_args(args: Values) raises -> Bool:
     """Whether the call's first mojo tensor is on a cuda device: the CUDA-exact
     pointwise routes run there; other devices keep their origin routing."""
-    for i in range(3):
+    # the first two arguments only: a 2-argument op has no args[2]
+    for i in range(2):
         var tag = args[unsafe_offset=i].tag
         if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
             var t = v_tensor_c(args[unsafe_offset=i])
@@ -1946,7 +1950,7 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
     var first = v_tensor_c(
         args[unsafe_offset=out_index if out_index >= 0 else 0]
     )
-    for i in range(1, 3):
+    for i in range(1, 3 if _pw_cuda_args(args) else 1):
         var v = args[unsafe_offset=i].copy()
         if v.tag == TAG_NONE:
             continue

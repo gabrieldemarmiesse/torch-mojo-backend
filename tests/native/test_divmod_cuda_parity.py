@@ -41,7 +41,9 @@ _DTYPES = bp.FLOATS + bp.INTS + bp.BOOL + bp.UINTS
 
 
 def _tt_cases(fn, inplace, dtype):
-    a, b = bp.pairs(dtype)
+    # float64 pairs of two distinct NaN payloads: CUDA keeps one by launch
+    # (bp.two_distinct_nans), as for add / sub / mul
+    a, b = bp.pairs(dtype, launch_dependent=True)
 
     def with_out(x, y):
         o = torch.empty(0, dtype=fn(x, y).dtype, device=x.device)

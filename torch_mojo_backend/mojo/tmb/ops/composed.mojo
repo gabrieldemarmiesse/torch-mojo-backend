@@ -578,8 +578,13 @@ def op_where_self_out(
     var common = result_type(
         v_tensor_c(args[unsafe_offset=1]), v_tensor_c(args[unsafe_offset=2])
     )
-    if common != out.stype:
-        # where_self_out's first check, before any dtype dispatch
+    if (
+        common != out.stype
+        and out.on_mojo()
+        and dev(out.device)[].api == "cuda"
+    ):
+        # where_self_out's first check (CUDA's order; elsewhere the functional
+        # result is computed first, as before), before any dtype dispatch
         raise Error(
             "Expected out type to be ",
             scalar_type_name(common),

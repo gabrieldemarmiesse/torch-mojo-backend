@@ -74,7 +74,7 @@ from tmb.backend.abi import (
     v_string,
     v_tensor,
 )
-from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, dev
+from tmb.backend.device import copy_d2d, ctx_for, ctx_ptr, current_device, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.kernels.common.float8 import fp8_bits_to_f64, is_float8
 from tmb.kernels.common.op_utils import MAX_RANK
@@ -316,21 +316,33 @@ def _b_f16_bits_to_f64(h: UInt16) -> Float64:
 def _b_host_scalar(t: T) raises -> Scal:
     """The value of a 0-d CPU tensor, read straight out of host memory."""
     var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=t.ptr)
+    # The bit-exact reads (subnormals / NaN payloads kept) are CUDA's; the
+    # other devices keep the plain host conversions they had.
+    var exact = dev(current_device())[].api == "cuda"
     if t.dtype == DType.bool:
         var on = p[] != 0
         return Scal(1.0 if on else 0.0, 1 if on else 0, True, True)
     if t.dtype == DType.float32:
+        if not exact:
+            var w32 = Float64(p.unsafe_bitcast[Float32]()[])
+            return Scal(w32, Int(w32), False, False)
         var v32 = _b_f32_bits_to_f64(p.unsafe_bitcast[UInt32]()[])
         return Scal(v32, Int(v32), False, False)
     if t.dtype == DType.float64:
         var v64 = p.unsafe_bitcast[Float64]()[]
         return Scal(v64, Int(v64), False, False)
     if t.dtype == DType.bfloat16:
+        if not exact:
+            var wb = Float64(p.unsafe_bitcast[BFloat16]()[])
+            return Scal(wb, Int(wb), False, False)
         var vb = _b_f32_bits_to_f64(
             p.unsafe_bitcast[UInt16]()[].cast[DType.uint32]() << 16
         )
         return Scal(vb, Int(vb), False, False)
     if t.dtype == DType.float16:
+        if not exact:
+            var wh = Float64(p.unsafe_bitcast[Float16]()[])
+            return Scal(wh, Int(wh), False, False)
         var vh = _b_f16_bits_to_f64(p.unsafe_bitcast[UInt16]()[])
         return Scal(vh, Int(vh), False, False)
     if is_float8(t.dtype):
@@ -1374,14 +1386,17 @@ def _b_try_scalar(
     # `promote`: TensorIterator loads `a` converted to the result dtype, and
     # add / mul read the scalar straight into opmath (float), never rounded
     # to `a`'s dtype: an int tensor plus 2.5 is a float32 add of 2.5.
-    var result = _b_side_result(a, rhs)
     var promoted = promote and _b_exact_on(a)
-    if not promoted:
+    var result = a.stype
+    if promoted:
+        result = _b_side_result(a, rhs)
+    else:
+        # origin's order: the float check first, so a raise in the
+        # result-type computation never pre-empts the fallback
         if not _b_float3(a.stype):
             return None
-        if rhs.zero_st >= 0 and result != a.stype:
+        if rhs.zero_st >= 0 and _b_side_result(a, rhs) != a.stype:
             return None  # an explicit 0-d tensor promoting past `a`'s dtype
-        result = a.stype
     if not _b_float3(result):
         return None
     var value = -s.f if negate else s.f
@@ -2145,7 +2160,9 @@ def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             and self.stype == b.stype
             and self.device == b.device
             and _b_bcast_dtype(self.stype)
-            and self.stype != ST_FLOAT64  # elementwise `Add` has none
+            # elementwise `Add` has no float64: CUDA only; other devices keep
+            # origin's route
+            and (self.stype != ST_FLOAT64 or not _b_exact_on(self))
             and _b_fits(self, b.shape)
         ):
             _b_raw_add(self, self, b)
@@ -2292,12 +2309,14 @@ def op_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     is this (the scalar form embeds `other` in the one sub launch)."""
     var lhs = _b_side(args[unsafe_offset=1])
     var rhs = _b_side(args[unsafe_offset=0])
-    if not _b_alpha_is_one(args[unsafe_offset=2]):
+    var exact = _b_exact_sides(lhs, rhs)
+    if exact and not _b_alpha_is_one(args[unsafe_offset=2]):
         _b_sub_check(lhs, rhs)
         _ = _b_alpha_prologue(lhs, rhs, args[unsafe_offset=2], -1, True)
     # `other - alpha * self` for a float tensor and a number: one launch.
-    var common = _b_common(lhs, rhs)
-    if _b_float3(common) and _b_exact_sides(lhs, rhs):
+    # (The checks and the opmath-alpha route are CUDA's; elsewhere origin's.)
+    if exact and _b_float3(_b_common(lhs, rhs)):
+        var common = _b_common(lhs, rhs)
         var fast = _b_try_scalar(
             "RsubScalarSpec",
             rhs,

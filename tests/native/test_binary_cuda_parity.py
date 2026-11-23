@@ -23,7 +23,10 @@ _DTYPES = bp.ALL + bp.UINTS
 @pytest.mark.parametrize(("op", "fn", "inplace"), _ARITH, ids=[a[0] for a in _ARITH])
 def test_tensor_tensor(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
     out = op != "rsub"
-    bp.check_all(cuda_oracle, bp.binary_cases(fn, dtype, inplace=inplace, out=out))
+    bp.check_all(
+        cuda_oracle,
+        bp.binary_cases(fn, dtype, inplace=inplace, out=out, launch_dependent=True),
+    )
 
 
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
@@ -46,7 +49,7 @@ _ALPHAS = [2, -1, 0, 3, 0.3, -2.5, 1e-40, 1e300, float("nan"), True, 1.0]
 @pytest.mark.parametrize("op", ["add", "sub", "rsub"])
 def test_alpha(cuda_oracle: CudaOracle, op, dtype):
     fn = getattr(torch, op)
-    a, b = bp.pairs(dtype)
+    a, b = bp.pairs(dtype, launch_dependent=True)
     cases = []
     alphas = _ALPHAS + ([1 + 2j] if dtype.is_complex else [])
     for alpha in alphas:
@@ -105,8 +108,8 @@ def test_mixed_dtypes(cuda_oracle: CudaOracle, op, da, db):
     """Type promotion: two tensors, and each one as a 0-d tensor (device and
     CPU), which only counts when its category is higher."""
     fn = getattr(torch, op)
-    a, _ = bp.pairs(da)
-    _, b = bp.pairs(db)
+    a, _ = bp.pairs(da, launch_dependent=True)
+    _, b = bp.pairs(db, launch_dependent=True)
     n = min(len(a), len(b))
     a, b = a[:n], b[:n]
     wide = torch.promote_types(da, db)
@@ -204,5 +207,5 @@ def test_cuda_float64_two_nans_depend_on_the_launch(cuda_oracle: CudaOracle):
 )
 @pytest.mark.parametrize("op", ["add", "sub", "mul"])
 def test_complex32_is_not_held(cuda_oracle: CudaOracle, op):
-    a, _ = bp.pairs(torch.float16)
+    a, _ = bp.pairs(torch.float16, launch_dependent=True)
     cuda_oracle.assert_bitwise_equal(lambda x: getattr(torch, op)(x, 1j), a)

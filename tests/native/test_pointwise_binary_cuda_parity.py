@@ -124,7 +124,12 @@ def test_tensor_tensor(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
             ("inplace", lambda x, y: x.ldexp_(y), (a, b)),
         ]
     else:
-        cases = bp.binary_cases(fn, dtype, inplace=inplace)
+        cases = bp.binary_cases(
+            fn,
+            dtype,
+            inplace=inplace,
+            launch_dependent=op in ("fmax", "fmin", "logaddexp", "logaddexp2"),
+        )
     bp.check_all(cuda_oracle, cases)
 
 

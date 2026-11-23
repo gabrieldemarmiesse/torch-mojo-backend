@@ -134,9 +134,12 @@ def random_values(dtype: torch.dtype, n: int, gen: torch.Generator) -> torch.Ten
 
 @functools.cache
 def pairs(
-    dtype: torch.dtype, n: int = 4096, seed: int = 0
+    dtype: torch.dtype, n: int = 4096, seed: int = 0, launch_dependent: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """(a, b): every pair of specials, then random pairs."""
+    """(a, b): every pair of specials, then random pairs. `launch_dependent`:
+    leave out the float64 pairs of two distinct NaN payloads, for the ops
+    (add, sub, mul, fmax, lerp) whose CUDA kernel picks a payload by launch
+    (see `two_distinct_nans`)."""
     gen = torch.Generator().manual_seed(seed)
     s = specials(dtype)
     if dtype.is_complex:
@@ -145,7 +148,7 @@ def pairs(
     m = min(len(ra), len(rb))
     a = torch.cat([s.repeat_interleave(len(s)), ra[:m]])
     b = torch.cat([s.repeat(len(s)), rb[:m]])
-    if dtype == torch.float64:
+    if launch_dependent and dtype == torch.float64:
         keep = ~two_distinct_nans(a, b)
         a, b = a[keep], b[keep]
     return a, b
@@ -168,7 +171,7 @@ def two_distinct_nans(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 @functools.cache
 def triples(
-    dtype: torch.dtype, n: int = 4096, seed: int = 0
+    dtype: torch.dtype, n: int = 4096, seed: int = 0, launch_dependent: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """(a, b, c): every triple of (up to 30) specials, then random triples."""
     gen = torch.Generator().manual_seed(seed)
@@ -182,7 +185,7 @@ def triples(
     a = torch.cat([s.repeat_interleave(k * k), r[0][:m]])
     b = torch.cat([s.repeat_interleave(k).repeat(k), r[1][:m]])
     c = torch.cat([s.repeat(k * k), r[2][:m]])
-    if dtype == torch.float64:
+    if launch_dependent and dtype == torch.float64:
         keep = ~(
             two_distinct_nans(a, b) | two_distinct_nans(a, c) | two_distinct_nans(b, c)
         )
@@ -231,11 +234,16 @@ def binary_cases(
     inplace: str | None = None,
     out: bool = True,
     operands: tuple[torch.Tensor, torch.Tensor] | None = None,
+    launch_dependent: bool = False,
 ) -> list[tuple[str, Callable[..., object], Sequence[object]]]:
     """Tensor-tensor cases of `fn` over `pairs(dtype)` (or `operands`):
     functional, `out=` (an empty out of the result's dtype, resized by the
     op) and the method named `inplace`."""
-    a, b = pairs(dtype) if operands is None else operands
+    a, b = (
+        pairs(dtype, launch_dependent=launch_dependent)
+        if operands is None
+        else operands
+    )
     cases: list[tuple[str, Callable[..., object], Sequence[object]]] = [
         ("tt", fn, (a, b))
     ]
