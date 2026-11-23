@@ -26,6 +26,7 @@ from std.sys.info import (
     has_amd_gpu_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,
+    is_nvidia_gpu,
     size_of,
 )
 from std.utils.coord import Coord
@@ -43,6 +44,7 @@ from tmb.kernels.common.pointwise_math import (
     metal_rounds_params,
     param_dtype,
     pointwise,
+    sgg_alt_contraction,
 )
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
@@ -363,6 +365,7 @@ def _launch[
         p1,
         p2,
         p3,
+        numel,
     )
     def func[w: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -386,6 +389,19 @@ def _launch[
                 c = c_ptr.unsafe_load[width=w, alignment=in_align](i)
             else:
                 c = SIMD[dt, w](c_ptr[unsafe_offset=0] if dev_c else vc)
+        comptime if (
+            kind == "standard_gamma_grad"
+            and dt == DType.float32
+            and is_nvidia_gpu()
+        ):
+            if sgg_alt_contraction(i, numel):
+                out_ptr.unsafe_store[width=w, alignment=out_align](
+                    i,
+                    pointwise[kind, dt, odt, w, True](
+                        a, b, c, SIMD[param_dtype[dt](), 4](p0, p1, p2, p3)
+                    ),
+                )
+                return
         out_ptr.unsafe_store[width=w, alignment=out_align](
             i,
             pointwise[kind, dt, odt, w](

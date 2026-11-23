@@ -121,8 +121,9 @@ def _nan[dt: DType]() -> Scalar[dt]:
 @always_inline
 def jit_nan[dt: DType]() -> Scalar[dt]:
     """The jiterator's `NAN` (`__int_as_float(0x7fffffff)`, widened for a
-    double). Apple GPUs run MPS's kernels, whose NaN is 0x7fc00000."""
-    comptime if is_apple_gpu():
+    double). Off NVIDIA the NaN is the plain 0x7fc00000 (MPS's, and what
+    these kernels returned on AMD before)."""
+    comptime if not is_nvidia_gpu():
         return _NAN.cast[dt]()
     comptime if dt == F64:
         return rebind[Scalar[dt]](Float64(from_bits=UInt64(0x7FFFFFFFE0000000)))
@@ -825,8 +826,11 @@ def log_ndtr[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     comptime SQRT1_2 = T(0.707106781186547524400844362104849039)
     var t = x * SQRT1_2
     if x < T(-1.0):
-        # CUDA's own erfcx (libdevice), not the Faddeeva `erfcx_string`.
-        return fma(-t, t, _log(_erfcx_libm(-t) / T(2.0)))
+        comptime if is_nvidia_gpu():
+            # CUDA's own erfcx (libdevice), not the Faddeeva `erfcx_string`.
+            return fma(-t, t, _log(_erfcx_libm(-t) / T(2.0)))
+        else:
+            return _log(erfcx(-t) / T(2.0)) - t * t
     return _log1p(-_erfc(t) / T(2.0))
 
 

@@ -450,6 +450,14 @@ def _pw_run(
     and a dense layout, else into a fresh tensor."""
     _pw_no_float8(kind, compute)
     var device = _pw_device(a, b, c)
+    var prm = params
+    if (kind == "xlogy" or kind == "xlog1py") and compute == ST_FLOAT64:
+        # A tensor operand of another dtype makes CUDA run its casting
+        # kernel, which keeps x's NaN where the vectorized one gives log's.
+        if (a.is_t and a.t.value().stype != compute) or (
+            b.is_t and b.t.value().stype != compute
+        ):
+            prm[0] = 1.0
     var bs = _pw_broadcast(a, b, c, arity)
     var shape = bs[0]
     var rank = bs[1]
@@ -481,10 +489,10 @@ def _pw_run(
         if fits:
             # Elementwise and dense: writing out[i] from operand[i] is exact
             # even when `d` is one of the operands (same view).
-            _pw_launch(kind, d, compute, fa, fb, fc, params)
+            _pw_launch(kind, d, compute, fa, fb, fc, prm)
             return Res(d^, False)
     var out = own(new_tensor(shape, rank, out_stype, device))
-    _pw_launch(kind, out.t, compute, fa, fb, fc, params)
+    _pw_launch(kind, out.t, compute, fa, fb, fc, prm)
     return Res(out.take(), True)
 
 
@@ -626,16 +634,17 @@ def _pw_no_half(kind: StaticString) -> Bool:
 def _pw_half_refuse(
     kind: StaticString, compute: Int32, a: Side, b: Side
 ) raises:
-    """`_pw_no_half` off Apple GPUs (MPS computes the half types)."""
+    """`_pw_no_half` on CUDA devices only (MPS and the AMD path compute the
+    half types, as before)."""
     if not _pw_no_half(kind) or (
         compute != ST_FLOAT16 and compute != ST_BFLOAT16
     ):
         return
     var device = a.t.value().device if a.is_t else b.t.value().device
     var ctx = ctx_for(device)
-    var metal = ctx.api() == "metal"
+    var cuda = ctx.api() == "cuda"
     _ = ctx
-    if metal:
+    if not cuda:
         return
     unsupported(
         '"'
@@ -644,6 +653,37 @@ def _pw_half_refuse(
         + _scalar_type_name(max_dtype(compute))
         + "'"
     )
+
+
+def _pw_cuda(side: Side) raises -> Bool:
+    """Whether the operand's device is an NVIDIA one."""
+    var device = side.t.value().device
+    var ctx = ctx_for(device)
+    var cuda = ctx.api() == "cuda"
+    _ = ctx
+    return cuda
+
+
+def _pw_igamma_policy(
+    kind: StaticString, a: Side, b: Side, policy: Int
+) raises -> Int:
+    """igamma / igammac: CUDA's floats-only dispatch (integers refused) on
+    NVIDIA; elsewhere the policy these ops always had (P_FLOAT)."""
+    if (kind == "igamma" or kind == "igammac") and not _pw_cuda(
+        a if a.is_t else b
+    ):
+        return P_FLOAT
+    return policy
+
+
+def _pw_igamma_f64(
+    kind: StaticString, a: Side, b: Side, f64_ok: Bool
+) raises -> Bool:
+    if (kind == "igamma" or kind == "igammac") and not _pw_cuda(
+        a if a.is_t else b
+    ):
+        return False
+    return f64_ok
 
 
 def _pw_math(
@@ -670,7 +710,12 @@ def _pw_math(
         # TensorIterator's out= checks and resize precede the kernel
         # dispatch (a float8 computation is refused after the resize).
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
-    var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
+    var compute = _pw_compute_dtype(
+        kind,
+        common,
+        _pw_igamma_policy(kind, a, b, policy),
+        _pw_igamma_f64(kind, a, b, f64_ok),
+    )
     _pw_half_refuse(kind, compute, a, b)
     _pw_finish(
         rets,
@@ -697,7 +742,12 @@ def _pw_math_inplace(
     var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
     var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
     var common = _pw_result_type(a, b, c, arity)
-    var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
+    var compute = _pw_compute_dtype(
+        kind,
+        common,
+        _pw_igamma_policy(kind, a, b, policy),
+        _pw_igamma_f64(kind, a, b, f64_ok),
+    )
     _pw_half_refuse(kind, compute, a, b)
     _b_store_inplace(
         rets,
@@ -3917,13 +3967,24 @@ def _pw_same_dtypes(args: Values, n: Int) raises -> Int32:
     return first
 
 
-def _pw_floating_dispatch(name: StaticString, st: Int32, half_ok: Bool) raises:
-    """ATen's AT_DISPATCH_FLOATING_TYPES(_AND2(Half, BFloat16)) refusal."""
+def _pw_floating_dispatch(
+    name: StaticString, st: Int32, half_ok: Bool, args: Values
+) raises:
+    """ATen's AT_DISPATCH_FLOATING_TYPES(_AND2(Half, BFloat16)) refusal (a
+    NotImplementedError on CUDA devices, the plain error elsewhere)."""
     var ok = st == ST_FLOAT32 or st == ST_FLOAT64
     if half_ok:
         ok = ok or st == ST_FLOAT16 or st == ST_BFLOAT16
     if not ok:
-        # AT_DISPATCH's refusal is a NotImplementedError
+        var cuda = _pw_cuda(_b_side(args[unsafe_offset=0]))
+        if not cuda:
+            raise Error(
+                '"',
+                name,
+                "\" not implemented for '",
+                _scalar_type_name(max_dtype(st)),
+                "'",
+            )
         unsupported(
             String('"')
             + name
@@ -3958,7 +4019,7 @@ def op_prelu_kernel(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var st = _pw_same_dtypes(args, 2)
-    _pw_floating_dispatch("prelu_cuda", st, True)
+    _pw_floating_dispatch("prelu_cuda", st, True, args)
     _b_ret(rets, _pw_fixed("prelu", 2, args, 0, st, _p()))
 
 
@@ -3970,7 +4031,7 @@ def op_prelu_kernel_backward(
     the broadcast shape (prelu's composite backward reduces grad_weight to
     the weight's shape afterwards)."""
     var st = _pw_same_dtypes(args, 3)
-    _pw_floating_dispatch("prelu_backward_cuda", st, True)
+    _pw_floating_dispatch("prelu_backward_cuda", st, True, args)
     var g = _b_side(args[unsafe_offset=0])
     var x = _b_side(args[unsafe_offset=1])
     var w = _b_side(args[unsafe_offset=2])
@@ -4231,7 +4292,7 @@ def op_masked_scale(
     var mask = v_tensor(args[unsafe_offset=1])
     if mask.stype != ST_UINT8:
         raise Error("mask should be torch.uint8 dtype")
-    _pw_floating_dispatch("masked_scale", self.stype, True)
+    _pw_floating_dispatch("masked_scale", self.stype, True, args)
     var scale = v_f64(args[unsafe_offset=2])
     # TensorIterator resizes the fresh `empty_like(self)` output to the
     # broadcast of self and mask (self (1, 3), mask (4, 3): (4, 3)).
@@ -4254,7 +4315,7 @@ def op_standard_gamma_grad(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var st = _pw_same_dtypes(args, 2)
-    _pw_floating_dispatch("_standard_gamma_grad_cuda", st, True)
+    _pw_floating_dispatch("_standard_gamma_grad_cuda", st, True, args)
     _b_ret(rets, _pw_fixed("standard_gamma_grad", 2, args, 0, st, _p()))
 
 
@@ -4263,7 +4324,7 @@ def op_dirichlet_grad(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var st = _pw_same_dtypes(args, 3)
-    _pw_floating_dispatch("_dirichlet_grad_cuda", st, False)
+    _pw_floating_dispatch("_dirichlet_grad_cuda", st, False, args)
     _b_ret(rets, _pw_fixed("dirichlet_grad", 3, args, 0, st, _p()))
 
 

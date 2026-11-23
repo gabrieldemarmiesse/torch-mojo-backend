@@ -83,6 +83,32 @@ from tmb.kernels.common.mps_math import (
     mps_sinc,
     rint_even,
 )
+from tmb.kernels.common.special_math_legacy import (
+    airy_ai_f,
+    bessel_j0_f,
+    bessel_j1_f,
+    bessel_y0_f,
+    bessel_y1_f,
+    digamma_f,
+    entr_f,
+    erfcx_f,
+    i0_f,
+    i0e_f,
+    i1_f,
+    i1e_f,
+    log_ndtr_f,
+    logit_f,
+    modified_bessel_i0_f,
+    modified_bessel_i1_f,
+    modified_bessel_k0_f,
+    modified_bessel_k1_f,
+    ndtri_f,
+    polygamma_f,
+    polygamma_series_f,
+    sinc_f,
+    spherical_bessel_j0_f,
+    trigamma_f,
+)
 from tmb.kernels.common.special_math import (
     airy_ai,
     bessel_j0,
@@ -229,10 +255,96 @@ def has_f64_port[kind: StaticString]() -> Bool:
 
 
 @always_inline
+def _scalar_special_legacy[kind: StaticString](a: Float32) -> Float32:
+    comptime if kind == "airy_ai":
+        return airy_ai_f(a)
+    elif kind == "asin":
+        comptime if is_amd_gpu():
+            return oc_asinf(a)
+        return nv_asinf(a)
+    elif kind == "atan":
+        comptime if is_amd_gpu():
+            return oc_atanf(a)
+        return nv_atanf(a)
+    elif kind == "bessel_j0":
+        return bessel_j0_f(a)
+    elif kind == "bessel_j1":
+        return bessel_j1_f(a)
+    elif kind == "bessel_y0":
+        return bessel_y0_f(a)
+    elif kind == "bessel_y1":
+        return bessel_y1_f(a)
+    elif kind == "digamma":
+        return digamma_f(a)
+    elif kind == "entr":
+        return entr_f(a)
+    elif kind == "erfc":
+        return nv_erfcf(a)
+    elif kind == "erfcx":
+        return erfcx_f(a)
+    elif kind == "erfinv":
+        comptime if is_amd_gpu():
+            return oc_erfinvf(a)
+        return nv_erfinvf(a)
+    elif kind == "exp2":
+        comptime if is_amd_gpu():
+            return oc_exp2f(a)
+        return nv_exp2f(a)
+    elif kind == "expm1":
+        comptime if is_amd_gpu():
+            return oc_expm1f(a)
+        return nv_expm1f(a)
+    elif kind == "i0":
+        return i0_f(a)
+    elif kind == "i0e":
+        return i0e_f(a)
+    elif kind == "i1":
+        return i1_f(a)
+    elif kind == "i1e":
+        return i1e_f(a)
+    elif kind == "lgamma":
+        return nv_lgammaf(a)
+    elif kind == "log10":
+        comptime if is_amd_gpu():
+            return oc_log10f(a)
+        return nv_log10f(a)
+    elif kind == "log_ndtr":
+        return log_ndtr_f(a)
+    elif kind == "logit":
+        return logit_f(a, Float32(-1.0))
+    elif kind == "modified_bessel_i0":
+        return modified_bessel_i0_f(a)
+    elif kind == "modified_bessel_i1":
+        return modified_bessel_i1_f(a)
+    elif kind == "modified_bessel_k0":
+        return modified_bessel_k0_f(a, scaled=False)
+    elif kind == "modified_bessel_k1":
+        return modified_bessel_k1_f(a, scaled=False)
+    elif kind == "ndtri":
+        return ndtri_f(a)
+    elif kind == "scaled_modified_bessel_k0":
+        return modified_bessel_k0_f(a, scaled=True)
+    elif kind == "scaled_modified_bessel_k1":
+        return modified_bessel_k1_f(a, scaled=True)
+    elif kind == "sinc":
+        return sinc_f(a)
+    elif kind == "spherical_bessel_j0":
+        return spherical_bessel_j0_f(a)
+    elif kind == "trigamma":
+        return trigamma_f(a)
+    else:
+        comptime assert False, "unsupported scalar special kind"
+
+
+@always_inline
 def _scalar_special[kind: StaticString, ct: DType](a: Scalar[ct]) -> Scalar[ct]:
     """`kind` in the compute type `ct`: float32, or float64 for the
-    `has_f64_port` kinds."""
-    comptime if kind == "airy_ai":
+    `has_f64_port` kinds. Off NVIDIA the float ports these kinds always had."""
+    comptime if not is_nvidia_gpu():
+        return rebind[Scalar[ct]](
+            _scalar_special_legacy[kind](rebind[Float32](a))
+        )
+    elif kind == "airy_ai":
         return airy_ai(a)
     elif kind == "bessel_j0":
         return bessel_j0(a)
@@ -676,7 +788,9 @@ def elementwise_unary[
             r[i] = _mps_special[kind, dtype](xf[i])
         return r.cast[dtype]()
     elif is_scalar_special[kind]():
-        comptime if dtype == DType.float64 and has_f64_port[kind]():
+        comptime if (
+            dtype == DType.float64 and has_f64_port[kind]() and is_nvidia_gpu()
+        ):
             var r = SIMD[dtype, width]()
             comptime for i in range(width):
                 r[i] = _scalar_special[kind, dtype](x[i])
@@ -684,7 +798,10 @@ def elementwise_unary[
         var xf = x.cast[DType.float32]()
         var r = SIMD[DType.float32, width]()
         comptime for i in range(width):
-            r[i] = _scalar_special[kind, DType.float32](xf[i])
+            comptime if is_nvidia_gpu():
+                r[i] = _scalar_special[kind, DType.float32](xf[i])
+            else:
+                r[i] = _scalar_special_legacy[kind](xf[i])
         return r.cast[dtype]()
     elif kind == "acosh" and (
         dtype == DType.float16 or dtype == DType.bfloat16
@@ -898,7 +1015,10 @@ def elementwise_unary_param[
                     r[i] = mps_logit(xf[i], eps, lo, hi)
             else:
                 comptime for i in range(width):
-                    r[i] = logit(xf[i], eps)
+                    comptime if is_nvidia_gpu():
+                        r[i] = logit(xf[i], eps)
+                    else:
+                        r[i] = logit_f(xf[i], eps)
         elif kind == "polygamma":
             # The order's int32 in two exact float halves, then 0 for
             # digamma / trigamma, else the order as a float, negated when
@@ -972,6 +1092,13 @@ def polygamma_lane[
             )
         return rebind[Scalar[dt]](mps_polygamma(xf, Int(n)))
     else:
+        comptime if not is_nvidia_gpu():
+            comptime assert dt == DType.float32, "float32 only off NVIDIA"
+            if series:
+                return rebind[Scalar[dt]](
+                    polygamma_series_f(rebind[Float32](x), n)
+                )
+            return rebind[Scalar[dt]](polygamma_f(rebind[Float32](x), Int(n)))
         if series:
             return polygamma_series(x, n)
         return polygamma(x, Int(n))

@@ -535,19 +535,7 @@ def test_binary_special_scalars_and_promotion_match_cuda(
         what="f16, 0-dim f32",
     )
     eq(lambda t, u: fn(t.half(), u), a, b, what="f16, f32")
-    # xlogy / xlog1py in float64 with a NaN x and a log(y) that is NaN: the
-    # sign of the result depends on the CUDA launch path (contiguous
-    # vectorized kernel: log's -NaN; the casting/strided kernel: x's +NaN),
-    # because ptxas orders the dmul operands per instantiation. Probed on
-    # 4 vs 66692 elements. The contiguous case is exact in
-    # test_binary_special_matches_cuda; here only the NaN sign may differ.
-    eq(
-        lambda t, u: fn(t.double(), u),
-        a,
-        b,
-        nan="any" if name in ("xlogy", "xlog1py") else "exact",
-        what="f64, f32",
-    )
+    eq(lambda t, u: fn(t.double(), u), a, b, what="f64, f32")
     eq(
         lambda t, u: fn(t.to(torch.int32), u),
         a.nan_to_num(0).clamp(-50, 50),
@@ -700,28 +688,21 @@ def test_standard_gamma_grad_matches_cuda(cuda_oracle: CudaOracle, dtype: torch.
     alpha, x = pair_inputs(dtype, (0.0, 20.0), (0.0, 20.0))
     sa, sx = _sgg_sensitive()
     alpha, x = torch.cat([alpha, sa.to(dtype)]), torch.cat([x, sx.to(dtype)])
-    # Whole launch blocks only: see test_standard_gamma_grad_remainder_block.
-    pad = -alpha.numel() % 4096
-    alpha = torch.cat([alpha, torch.full((pad,), 3.0, dtype=dtype)])
-    x = torch.cat([x, torch.full((pad,), 0.5, dtype=dtype)])
     cuda_oracle.assert_bitwise_equal(torch.ops.aten._standard_gamma_grad, alpha, x)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="stock CUDA's float32 result depends on the element's position: "
-    "the remainder block of its vectorized launch runs a second inlined copy "
-    "of the small-x expression, which ptxas fuses the other way",
-)
 def test_standard_gamma_grad_remainder_block_matches_cuda(cuda_oracle: CudaOracle):
     """In whole 1024-element blocks CUDA rounds pow(x, alpha) * series2 and
-    fuses the other product (what the mojo device computes); the first 128
-    elements of a partial last block round the other product instead, so
-    the same (alpha, x) gives different bits there."""
+    fuses the other product; the first 128 elements of a partial last block
+    round the other product instead, so the same (alpha, x) gives different
+    bits there (`sgg_alt_contraction`). Several block counts and tails."""
     sa, sx = _sgg_sensitive()
-    alpha = torch.cat([sa, torch.full((508,), 3.0)])
-    x = torch.cat([sx, torch.full((508,), 0.5)])
-    cuda_oracle.assert_bitwise_equal(torch.ops.aten._standard_gamma_grad, alpha, x)
+    for n in (512, 1500, 2300, 5000):
+        alpha = torch.cat([sa.repeat(n // 4), torch.full((n % 4,), 3.0)])
+        x = torch.cat([sx.repeat(n // 4), torch.full((n % 4,), 0.5)])
+        cuda_oracle.assert_bitwise_equal(
+            torch.ops.aten._standard_gamma_grad, alpha, x, what=f"numel {n}"
+        )
 
 
 @pytest.mark.parametrize("dtype", (*_F, torch.int32), ids=str)

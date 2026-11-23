@@ -1496,12 +1496,11 @@ def _is_special_f64(op: String) -> Bool:
 
 
 def require_special_dtype(op: String, cuda_name: String, t: T) raises:
-    """A special function's dtypes off Apple GPUs: CUDA's (float, double,
-    and half / bfloat16 unless `cuda_name` says the CUDA dispatch is float /
-    double only, which raises NotImplementedError for them). Apple GPUs keep
-    MPS's: float and the half types."""
-    if dev(t.device)[].api == "metal":
-        _require_float(op, t.dtype)
+    """A special function's dtypes on CUDA devices: float, double, and half /
+    bfloat16 unless `cuda_name` says the CUDA dispatch is float / double only
+    (NotImplementedError). Other devices keep float and the half types."""
+    if dev(t.device)[].api != "cuda":
+        _require_float(op, t.dtype)  # the policy these ops had off NVIDIA
         return
     if cuda_name != "" and (
         t.dtype == DType.float16 or t.dtype == DType.bfloat16
@@ -1521,7 +1520,7 @@ def _promoting_unary(op: String, t: T) raises -> T:
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":  # the one op of these that takes float64
         return _float_or_f64_unary(op, src.t)
-    if _is_special_f64(op):
+    if _is_special_f64(op) and dev(src.t.device)[].api == "cuda":
         require_special_dtype(op, _special_cuda_name(op), src.t)
         return _unary("elementwise", op, src.t, src.t.dtype)
     return _float_unary(op, src.t)
@@ -1533,7 +1532,7 @@ def _promoting_unary_out(op: String, t: T, mut dst: T) raises:
     var src = own_if_new(_promote(t), t)
     if op == "AngleSpec":
         _float_or_f64_unary_out(op, src.t, dst, True)
-    elif _is_special_f64(op):
+    elif _is_special_f64(op) and dev(src.t.device)[].api == "cuda":
         require_special_dtype(op, _special_cuda_name(op), src.t)
         _unary_out("elementwise", op, src.t, dst, src.t.dtype, True)
     else:
@@ -1946,7 +1945,10 @@ def _mvlgamma_check(p: Int, t: T) raises:
     # read of the whole tensor; below that bound this returns lgamma's values.
     if p < 1:
         raise Error("p has to be greater than or equal to 1")
-    _require_float_or_f64("mvlgamma", t)
+    if dev(t.device)[].api == "cuda":
+        _require_float_or_f64("mvlgamma", t)
+    else:
+        _require_float("mvlgamma", t.dtype)
 
 
 # aten::mvlgamma(Tensor self, int p) -> Tensor
