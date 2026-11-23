@@ -1028,7 +1028,7 @@ def test_bce_general_path_does_not_leak(mojo_gpu: str):
     t = torch.rand(8, 16, generator=g).to(mojo_gpu)
     w = torch.rand(16, generator=g).to(mojo_gpu)
 
-    def once() -> None:
+    def once():
         A.binary_cross_entropy(x, t, w, 0)
 
     once()
@@ -1048,7 +1048,7 @@ def test_bce_general_path_does_not_leak_on_error(mojo_gpu: str):
     t = torch.rand(8, 16, generator=g).to(mojo_gpu)
     w = torch.rand(17, generator=g).to(mojo_gpu)
 
-    def once() -> None:
+    def once():
         with pytest.raises(Exception):  # noqa: B017 -- any failure, not its type
             A.binary_cross_entropy(x, t, w, 0)
 
