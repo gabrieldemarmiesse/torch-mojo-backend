@@ -1250,7 +1250,16 @@ def test_sqrt_dtype_layout_fallback(mojo_gpu: str, dtype: torch.dtype, layout: s
         with pytest.raises(NotImplementedError, match="dtype float64 is not supported"):
             torch.sqrt(source)
         return
-    expected = host.double().sqrt().to(dtype)
+    # CPU torch's float64 sqrt is not correctly rounded (1 ulp off at 2, 8, 19, ...);
+    # CUDA's is, so the reference is math.sqrt.
+    expected = (
+        torch.tensor(
+            [math.sqrt(v) for v in host.double().flatten().tolist()],
+            dtype=torch.float64,
+        )
+        .reshape(host.shape)
+        .to(dtype)
+    )
     torch.testing.assert_close(torch.sqrt(source).cpu(), expected, rtol=0, atol=0)
     storage = torch.full(
         (source.shape[0], source.shape[1] * 2), -17.0, dtype=dtype, device=mojo_gpu

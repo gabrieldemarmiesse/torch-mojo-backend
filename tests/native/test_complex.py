@@ -279,7 +279,7 @@ def test_unsupported_declines(mojo_gpu: str):
     with pytest.raises((NotImplementedError, RuntimeError)):
         torch.linalg.cholesky(d)
     with pytest.raises(NotImplementedError):
-        torch.tanh(d)
+        torch.erf(d)
 
 
 def test_truth_ops(mojo_gpu: str):
