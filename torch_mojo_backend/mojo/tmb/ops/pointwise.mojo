@@ -811,7 +811,7 @@ def _pw_fmaxmin(
         return
     var a = _b_side(args[unsafe_offset=0])
     var b = _b_side(args[unsafe_offset=1])
-    if not a.is_t or b.is_t:
+    if not a.is_t or b.is_t or not _pw_cuda_args(args):
         _pw_math(kind, P_ALL, True, 2, args, rets, out_index)
         return
     var swapped = List[Value](capacity=n_args)
@@ -1232,6 +1232,62 @@ def _cx_vectorizable(
     return True
 
 
+def _cx_check_devices(like: T, vs: List[Value], dest: Optional[T]) raises:
+    """TensorIterator's device check, before any pointer is read: every mojo
+    operand (and the out= / in-place self) on one device."""
+    for i in range(len(vs)):
+        var tag = vs[i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            var t = v_tensor_c(vs[i])
+            if t.on_mojo() and (
+                t.device_type != like.device_type or t.device != like.device
+            ):
+                raise Error(
+                    (
+                        "Expected all tensors to be on the same device, but"
+                        " found at least two devices, "
+                    ),
+                    device_str(like),
+                    " and ",
+                    device_str(t),
+                    "!",
+                )
+    if dest:
+        var d = dest.value().copy()
+        if d.device_type != like.device_type or d.device != like.device:
+            raise Error(
+                (
+                    "Expected all tensors to be on the same device, but found"
+                    " at least two devices, "
+                ),
+                device_str(like),
+                " and ",
+                device_str(d),
+                "!",
+            )
+
+
+def _cx_check_overlap(vs: List[Value], dest: Optional[T], inplace: Bool) raises:
+    """The destination against the ORIGINAL operands, before computing: an
+    in-place op never changes self's shape and no operand may partially
+    overlap it (an `out=` is checked for the overlap alone)."""
+    if not dest:
+        return
+    var d = dest.value().copy()
+    if inplace:
+        _b_inplace_destination(d)
+    for i in range(len(vs)):
+        var tag = vs[i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            var t = v_tensor_c(vs[i])
+            if not t.on_mojo():
+                continue
+            if inplace:
+                _b_inplace_operand(d, t)
+            else:
+                _b_no_partial_overlap(d, t)
+
+
 def _cx_pw_launch(
     kind: StaticString,
     av: Value,
@@ -1243,11 +1299,19 @@ def _cx_pw_launch(
     dest: Optional[T],
     rets: Values,
     st_in: Int32 = ST_UNDEFINED,
+    inplace: Bool = False,
 ) raises:
     """One complex_pointwise launch over the 2 (lerp.Scalar) or 3 operands,
     promoted (or `st_in`), broadcast, flattened; stored into `dest` (out= /
     in-place self) or returned."""
     var like = _first_tensor(av, bv)
+    var ops = List[Value]()
+    ops.append(av.copy())
+    ops.append(bv.copy())
+    if n == 3:
+        ops.append(cv.copy())
+    _cx_check_devices(like, ops, dest)
+    _cx_check_overlap(ops, dest, inplace)
     var a = _operand(av, like)
     var b = _operand(bv, like)
     var c = _operand(cv, like) if n == 3 else _operand(av, like)
@@ -1356,6 +1420,7 @@ def _cx_lerp_scalar(
         w[1],
         dest,
         rets,
+        inplace=inplace,
     )
 
 
@@ -1398,6 +1463,7 @@ def _cx_lerp_tensor(
         0.0,
         dest,
         rets,
+        inplace=inplace,
     )
 
 
@@ -1449,6 +1515,7 @@ def _cx_addc(
         dest,
         rets,
         st,
+        inplace,
     )
 
 
@@ -1621,9 +1688,9 @@ def cx_lerp_tensor_out(
 # ---------------------------------------------------------------------------
 
 
-def _pw_addc_cuda(args: Values) raises -> Bool:
-    """The pointwise addcmul / addcdiv kernels run on cuda; other devices keep
-    the logic broadcast kernels they always had."""
+def _pw_cuda_args(args: Values) raises -> Bool:
+    """Whether the call's first mojo tensor is on a cuda device: the CUDA-exact
+    pointwise routes run there; other devices keep their origin routing."""
     for i in range(3):
         var tag = args[unsafe_offset=i].tag
         if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
@@ -1737,7 +1804,7 @@ def _pw_real_value(v: Value) raises -> Value:
 
 # aten::addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
 def op_addcmul(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if not _pw_addc_cuda(args):
+    if not _pw_cuda_args(args):
         op_addcmul_legacy(args, n_args, rets, n_rets)
         return
     _pw_addc("addcmul", args, rets, -1, False)
@@ -1745,7 +1812,7 @@ def op_addcmul(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::addcmul.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
 def op_addcmul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if not _pw_addc_cuda(args):
+    if not _pw_cuda_args(args):
         op_addcmul_out_legacy(args, n_args, rets, n_rets)
         return
     _pw_addc("addcmul", args, rets, 4, False)
@@ -1753,7 +1820,7 @@ def op_addcmul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
 def op_addcmul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if not _pw_addc_cuda(args):
+    if not _pw_cuda_args(args):
         op_addcmul__legacy(args, n_args, rets, n_rets)
         return
     _pw_addc("addcmul", args, rets, -1, True)
@@ -1761,7 +1828,7 @@ def op_addcmul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
 def op_addcdiv(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if not _pw_addc_cuda(args):
+    if not _pw_cuda_args(args):
         op_addcdiv_legacy(args, n_args, rets, n_rets)
         return
     _pw_addc("addcdiv", args, rets, -1, False)
@@ -1769,7 +1836,7 @@ def op_addcdiv(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::addcdiv.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
 def op_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if not _pw_addc_cuda(args):
+    if not _pw_cuda_args(args):
         op_addcdiv_out_legacy(args, n_args, rets, n_rets)
         return
     _pw_addc("addcdiv", args, rets, 4, False)
@@ -1777,7 +1844,7 @@ def op_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
 def op_addcdiv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    if not _pw_addc_cuda(args):
+    if not _pw_cuda_args(args):
         op_addcdiv__legacy(args, n_args, rets, n_rets)
         return
     _pw_addc("addcdiv", args, rets, -1, True)
@@ -1881,7 +1948,9 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
             _b_side(args[unsafe_offset=2]),
             3,
         )
-        if common == ST_BOOL or is_wide_unsigned(common):
+        if (common == ST_BOOL or is_wide_unsigned(common)) and _pw_cuda_args(
+            args
+        ):
             # clamp_kernel_impl: AT_DISPATCH_ALL_TYPES_AND2(half, bf16)
             unsupported(
                 '"clamp_cuda" not implemented for \''
@@ -2032,7 +2101,9 @@ def _pw_pow_scalar_base(args: Values, rets: Values, out_index: Int) raises:
 def op_pow_scalar_base(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if not _pw_pow_real(args, rets, _POW_ST, -1):
+    if not _pw_cuda_args(args):
+        op_pow_scalar_base_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_ST, -1):
         _pw_pow_scalar_base(args, rets, -1)
 
 
@@ -2040,7 +2111,9 @@ def op_pow_scalar_base(
 def op_pow_scalar_base_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if not _pw_pow_real(args, rets, _POW_ST, 2):
+    if not _pw_cuda_args(args):
+        op_pow_scalar_base_out_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_ST, 2):
         _pw_pow_scalar_base(args, rets, 2)
 
 
@@ -2151,6 +2224,9 @@ def _pw_rsub_check(args: Values) raises:
 # aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
 # aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
 def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_cuda_args(args):
+        op_rsub_any_legacy(args, n_args, rets, n_rets)
+        return
     _pw_rsub_check(args)
     op_rsub(args, n_args, rets, n_rets)
 
@@ -2393,7 +2469,9 @@ def _pw_pow_real(
 def op_pow_tensor_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if not _pw_pow_real(args, rets, _POW_TT, -1):
+    if not _pw_cuda_args(args):
+        op_pow_tensor_any_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_TT, -1):
         op_pow_tensor(args, n_args, rets, n_rets)
 
 
@@ -2401,7 +2479,9 @@ def op_pow_tensor_any(
 def op_pow_tensor_out_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if not _pw_pow_real(args, rets, _POW_TT, 2):
+    if not _pw_cuda_args(args):
+        op_pow_tensor_out_any_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_TT, 2):
         op_pow_tensor_out(args, n_args, rets, n_rets)
 
 
@@ -2409,7 +2489,9 @@ def op_pow_tensor_out_any(
 def op_pow_scalar_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if not _pw_pow_real(args, rets, _POW_TS, -1):
+    if not _pw_cuda_args(args):
+        op_pow_scalar_any_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_TS, -1):
         op_pow_scalar(args, n_args, rets, n_rets)
 
 
@@ -2417,8 +2499,381 @@ def op_pow_scalar_any(
 def op_pow_scalar_out_any(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    if not _pw_pow_real(args, rets, _POW_TS, 2):
+    if not _pw_cuda_args(args):
+        op_pow_scalar_out_any_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_TS, 2):
         op_pow_scalar_out(args, n_args, rets, n_rets)
+
+
+# Origin's ldexp host routing, verbatim (non-cuda devices).
+
+
+def _pw_ldexp_legacy(args: Values, rets: Values, out_index: Int) raises:
+    """BinaryOps.cpp's ldexp / ldexp_out. A floating `self` with an integral
+    exponent is its `_ldexp_int_exponent` route (::ldexp, the result in
+    self's dtype); everything else is `self * _pow2(self, other)`, fused.
+    (torch MPS registers no ldexp_stub and multiplies by pow(2, other) for an
+    integral exponent too, which under- and overflows where ::ldexp does
+    not: Apple GPUs keep the exact route.)"""
+    var a = _b_side(args[unsafe_offset=0])
+    var b = _b_side(args[unsafe_offset=1])
+    if not a.is_t:
+        unsupported("ldexp with a scalar self")
+    if not b.is_t and b.zero_st < 0:
+        unsupported("ldexp with a Python-number exponent")
+    var x = a.t.value().copy()
+    # An explicit CPU 0-d exponent is a rank-0 tensor of its own dtype.
+    var e_st = b.t.value().stype if b.is_t else b.zero_st
+    var e_rank = b.t.value().rank if b.is_t else 0
+    var dest = Optional[T]()
+    if out_index >= 0:
+        dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
+        var d = dest.value().copy()
+        if not (_pw_is_float(d.stype) or _pw_is_f8(d.stype)):
+            raise Error(
+                "ldexp can't be cast to the desired output type ",
+                scalar_type_name(d.dtype),
+            )
+    var e_integral = _pw_is_int(e_st) or e_st == ST_BOOL
+    if (
+        e_integral
+        and _pw_is_float(x.stype)
+        and (not dest or dest.value().stype == x.stype)
+    ):
+        _pw_ldexp_int_legacy(rets, a, b, x.stype, dest)
+        return
+    _pw_ldexp_pow2_legacy(rets, a, b, e_st, e_rank, dest)
+
+
+def _pw_ldexp_int_legacy(
+    rets: Values, a: Side, b: Side, x_st: Int32, dest: Optional[T]
+) raises:
+    """`_ldexp_int_exponent`: ::ldexp(x, int e), the result in x's dtype.
+    An int64 exponent is converted to that `int` first, wrapping as the C++
+    conversion does (2**32 is 0); the kernel then reads it in the float
+    compute dtype. bfloat16 computes in float32: its 8-bit mantissa cannot
+    carry every exponent that still changes the result."""
+    var compute = ST_FLOAT32 if x_st == ST_BFLOAT16 else x_st
+    if b.is_t and b.t.value().stype == ST_INT64:
+        var wrapped = own_if_new(cast_to(b.t.value(), ST_INT32), b.t.value())
+        _pw_finish(
+            rets,
+            dest,
+            _pw_run(
+                "ldexp",
+                2,
+                a,
+                _b_tside(wrapped.t),
+                _none_side(),
+                compute,
+                x_st,
+                _p(),
+                dest,
+            ),
+        )
+        _ = wrapped^
+        return
+    var e = b.copy()
+    if not b.is_t and b.zero_st == ST_INT64:
+        # A CPU 0-d int64 exponent, wrapped on the host.
+        var v = ((b.s.value().i + 2147483648) & 4294967295) - 2147483648
+        e = _b_sside(Scal(Float64(v), v, True, False))
+    _pw_finish(
+        rets,
+        dest,
+        _pw_run("ldexp", 2, a, e, _none_side(), compute, x_st, _p(), dest),
+    )
+
+
+def _pw_ldexp_pow2_legacy(
+    rets: Values, a: Side, b: Side, e_st: Int32, e_rank: Int, dest: Optional[T]
+) raises:
+    """`self * _pow2(self, other)` as one `ldexp_pow2` launch: pow runs in
+    its own result dtype `pdt`, and mul's TensorIterator casts that result
+    to mul's rank-aware common dtype before the product."""
+    var x = a.t.value().copy()
+    # _pow2: pow(2.0, other) for an integral or float32 self (a Python
+    # float base: an integral exponent gives the default dtype), else
+    # full({}, 2.0, self.dtype).pow(other), promoted as a 0-d tensor.
+    var pdt: Int32
+    if _pw_is_float(e_st):
+        pdt = e_st
+        if not (_pw_is_int(x.stype) or x.stype == ST_BOOL) and (
+            x.stype != ST_FLOAT32 and e_rank == 0
+        ):
+            pdt = promote_types(x.stype, e_st)
+    elif _pw_is_int(x.stype) or x.stype == ST_BOOL or x.stype == ST_FLOAT32:
+        pdt = default_dtype()
+    else:
+        pdt = x.stype
+    # mul(self, pow2): the pow result has other's rank.
+    var state = _TypeState(ST_UNDEFINED, ST_UNDEFINED, ST_UNDEFINED)
+    _pw_update(state, a)
+    if e_rank == 0:
+        state.zero = promote_types(state.zero, pdt)
+    else:
+        state.dim = promote_types(state.dim, pdt)
+    var compute = _pw_combine(state.dim, _pw_combine(state.zero, state.wrapped))
+    if not _pw_is_float(compute):
+        unsupported("ldexp on dtype " + String(compute))
+    var kernel_compute = compute
+    var narrow = pdt
+    if pdt != compute and promote_types(pdt, compute) != compute:
+        # A pow result wider than mul's common dtype (a 0-d float64 exponent
+        # against a float32 or half self): the exponent is not narrowed
+        # first, pow runs in pdt, and its result is rounded to the common
+        # dtype before the product. Reading the exponent as the narrower
+        # dtype instead turned 2^15.999 into 2^16 = inf in float16, and
+        # 2^127.999999 into 2^128 = inf in float32.
+        kernel_compute = promote_types(promote_types(pdt, compute), ST_FLOAT32)
+        narrow = compute
+        if kernel_compute == ST_FLOAT64 and not b.is_t:
+            # Metal has no double, so a CPU 0-d float64 exponent's pow runs
+            # on the host, in double, and only its result is rounded to the
+            # common dtype, as stock MPS does (the pow of CPU operands runs
+            # on CPU; exec_binary_kernel in mps/OperationUtils.mm then
+            # converts the 0-d double to float before the mul).
+            var ctx = ctx_for(x.device)
+            var metal = ctx.api() == "metal"
+            _ = ctx
+            if metal:
+                # The host pow returns 1 for 2^+-inf and inf for 2^NaN:
+                # the non-finite exponents take CUDA's values explicitly.
+                var e = b.s.value().f
+                var p2: Float64
+                if e != e or (e - e != 0.0 and e > 0.0):
+                    p2 = e  # NaN, +inf
+                elif e - e != 0.0:
+                    p2 = 0.0  # -inf
+                else:
+                    # The host pow returns 1 for 2^(2^32) too: past +-1100,
+                    # 2^e is inf / 0 in every floating dtype anyway.
+                    p2 = pow(Float64(2.0), min(max(e, -1100.0), 1100.0))
+                var pow2 = _round_to(p2, compute)
+                _pw_finish(
+                    rets,
+                    dest,
+                    _pw_run(
+                        "scale",
+                        1,
+                        a,
+                        _none_side(),
+                        _none_side(),
+                        compute,
+                        compute,
+                        _p(pow2),
+                        dest,
+                    ),
+                )
+                return
+    var params = _p(_pw_narrow_code(narrow, kernel_compute))
+    _pw_finish(
+        rets,
+        dest,
+        _pw_run(
+            "ldexp_pow2",
+            2,
+            a,
+            b,
+            _none_side(),
+            kernel_compute,
+            compute,
+            params,
+            dest,
+        ),
+    )
+
+
+def op_ldexp__legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """ATen's ldexp_ is ldexp_out(self, self, other): exact in place, since
+    the kernel is elementwise and dense (`_pw_run` writes self directly).
+    Unlike ldexp_out, self is never resized: an `other` that broadcasts it
+    to a larger shape raises."""
+    var self = _pw_inplace_self(args, "ldexp_", 2)
+    var a = _b_tside(self)
+    var b = _b_side(args[unsafe_offset=1])
+    _b_no_overlap_side(self, b)
+    if not b.is_t and b.zero_st < 0:
+        unsupported("ldexp_ with a Python-number exponent")
+    # An explicit CPU 0-d exponent is a rank-0 tensor of its own dtype.
+    var e_st = b.t.value().stype if b.is_t else b.zero_st
+    var e_rank = b.t.value().rank if b.is_t else 0
+    if not _pw_is_float(self.stype):
+        raise Error(
+            "ldexp can't be cast to the desired output type ", self.stype
+        )
+    var dest = Optional[T](self.copy())
+    if _pw_is_int(e_st) or e_st == ST_BOOL:
+        _pw_ldexp_int_legacy(rets, a, b, self.stype, dest)
+        return
+    _pw_ldexp_pow2_legacy(rets, a, b, e_st, e_rank, dest)
+
+
+# Origin's real pow / rsub-alpha host routing, verbatim: every non-cuda device
+# keeps it (the CUDA-exact routes above are cuda only).
+
+
+def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
+    """rsub with alpha != 1 on a floating result: `other - alpha * self` as
+    one fma in opmath, as CUDA's add kernel computes sub(other, self, alpha)
+    (the generic alpha cascade rounds alpha * self to the dtype first).
+    False for alpha 1 and integral results, which binary.mojo keeps."""
+    var alpha = v_f64(args[unsafe_offset=2])
+    if alpha == 1.0:
+        return False
+    var a = _b_side(args[unsafe_offset=0])
+    var b = _b_side(args[unsafe_offset=1])
+    if not a.is_t:
+        return False
+    var common = _pw_result_type(a, b, _none_side(), 2)
+    if not _pw_is_float(common):
+        return False
+    # `alpha.to<scalar_t>()`: a finite alpha past the result dtype's range
+    # raises, as ATen's checked conversion does.
+    alpha = scalar_to_float(args[unsafe_offset=2], common)
+    var compute = _pw_compute_dtype("rsub_alpha", common, P_FLOAT, True)
+    var dest = Optional[T]()
+    if out_index >= 0:
+        dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
+    if b.is_t:
+        _pw_finish(
+            rets,
+            dest,
+            _pw_run(
+                "rsub_alpha",
+                2,
+                a,
+                b,
+                _none_side(),
+                compute,
+                compute,
+                _p(alpha),
+                dest,
+            ),
+            True,  # rsub: `out` of the result dtype only
+        )
+    else:
+        _pw_finish(
+            rets,
+            dest,
+            _pw_run(
+                "rsub_alpha_scalar",
+                1,
+                a,
+                _none_side(),
+                _none_side(),
+                compute,
+                compute,
+                _p(alpha, b.s.value().f),
+                dest,
+            ),
+            True,  # rsub: `out` of the result dtype only
+        )
+    return True
+
+
+def _pw_pow_f64_scalar(
+    args: Values, rets: Values, out_index: Int
+) raises -> Bool:
+    """A float64 tensor to a real scalar power: PowKernel.cu's special
+    exponents (products, sqrt, rsqrt, reciprocal) before the full pow, which
+    the elementwise family's PowScalarSpec does for the float types only."""
+    var base = _b_side(args[unsafe_offset=0])
+    var expo = _b_side(args[unsafe_offset=1])
+    if not base.is_t or expo.is_t:
+        return False
+    if base.t.value().stype != ST_FLOAT64:
+        return False
+    var dest = Optional[T]()
+    if out_index >= 0:
+        dest = _pw_out_of(
+            args[unsafe_offset=out_index], base, _none_side(), _none_side()
+        )
+    _pw_finish(
+        rets,
+        dest,
+        _pw_run(
+            "pow_tensor_scalar",
+            1,
+            base,
+            _none_side(),
+            _none_side(),
+            ST_FLOAT64,
+            ST_FLOAT64,
+            _p(expo.s.value().f),
+            dest,
+        ),
+    )
+    return True
+
+
+def _pw_int_scalar_pow(args: Values) raises -> Bool:
+    """An integral result of pow.Tensor_Scalar: an integer tensor, or a bool
+    one (`torch.square(bool_t)` is `pow(bool_t, 2)`, which promotes to int64),
+    to a non-bool integer exponent."""
+    var base = _b_side(args[unsafe_offset=0])
+    if not base.is_t or not _pw_int_side(_b_side(args[unsafe_offset=1])):
+        return False
+    var st = base.t.value().stype
+    return _pw_is_int(st) or st == ST_BOOL
+
+
+def op_pow_tensor_any_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _pw_both_int(args):
+        _pw_ipow(args, rets, -1, False)
+    else:
+        op_pow_tensor(args, n_args, rets, n_rets)
+
+
+def op_pow_tensor_out_any_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _pw_both_int(args):
+        _pw_ipow(args, rets, 2, False)
+    else:
+        op_pow_tensor_out(args, n_args, rets, n_rets)
+
+
+def op_pow_scalar_any_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _pw_int_scalar_pow(args):
+        _pw_ipow(args, rets, -1, True)
+    elif not _pw_pow_f64_scalar(args, rets, -1):
+        op_pow_scalar(args, n_args, rets, n_rets)
+
+
+def op_pow_scalar_out_any_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _pw_int_scalar_pow(args):
+        _pw_ipow(args, rets, 2, True)
+    elif not _pw_pow_f64_scalar(args, rets, 2):
+        op_pow_scalar_out(args, n_args, rets, n_rets)
+
+
+def op_rsub_any_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _pw_rsub_check(args)
+    if not _pw_rsub_alpha(args, rets, -1):
+        op_rsub(args, n_args, rets, n_rets)
+
+
+def op_pow_scalar_base_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _pw_pow_scalar_base(args, rets, -1)
+
+
+def op_pow_scalar_base_out_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _pw_pow_scalar_base(args, rets, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -3801,6 +4256,9 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     (torch MPS registers no ldexp_stub and multiplies by pow(2, other) for an
     integral exponent too, which under- and overflows where ::ldexp does
     not: Apple GPUs keep the exact route.)"""
+    if not _pw_cuda_args(args):
+        _pw_ldexp_legacy(args, rets, out_index)
+        return
     var a = _b_side(args[unsafe_offset=0])
     var b = _b_side(args[unsafe_offset=1])
     if not a.is_t and a.zero_st < 0 or not b.is_t and b.zero_st < 0:
@@ -4011,6 +4469,9 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     the kernel is elementwise and dense (`_pw_run` writes self directly).
     Unlike ldexp_out, self is never resized: an `other` that broadcasts it
     to a larger shape raises."""
+    if not _pw_cuda_args(args):
+        op_ldexp__legacy(args, n_args, rets, n_rets)
+        return
     var self = _pw_inplace_self(args, "ldexp_", 2)
     var a = _b_tside(self)
     var b = _b_side(args[unsafe_offset=1])

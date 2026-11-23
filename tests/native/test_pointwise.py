@@ -2650,3 +2650,65 @@ def test_isclose_integers_under_another_default_dtype(mojo_gpu, default, dtype):
             assert torch.equal(got.cpu(), torch.isclose(big, same, 0.0, 1e-3))
     finally:
         torch.set_default_dtype(before)
+
+
+def _cx(shape, device, dtype=torch.complex64):
+    return torch.complex(torch.randn(shape), torch.randn(shape)).to(dtype).to(device)
+
+
+@pytest.mark.parametrize("op", ["lerp_scalar", "lerp_tensor", "addcmul", "addcdiv"])
+def test_complex_inplace_never_resizes_self(mojo_gpu, op):
+    """A complex in-place op whose operands broadcast past self raises (as
+    TensorIterator's in-place meta does) and leaves self alone."""
+    x = _cx((1, 3), mojo_gpu)
+    y = _cx((2, 3), mojo_gpu)
+    keep = x.clone()
+    with pytest.raises(RuntimeError):
+        if op == "lerp_scalar":
+            x.lerp_(y, 0.5)
+        elif op == "lerp_tensor":
+            x.lerp_(y, _cx((2, 3), mojo_gpu))
+        elif op == "addcmul":
+            x.addcmul_(y, y)
+        else:
+            x.addcdiv_(y, y)
+    assert x.shape == (1, 3)
+    torch.testing.assert_close(x.cpu(), keep.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("op", ["lerp_scalar", "addcmul"])
+def test_complex_partial_overlap_is_refused(mojo_gpu, op):
+    """An operand sharing storage with the written tensor without being the
+    same view of it (`x[1:].lerp_(x[:-1])`) raises, in place and with out=."""
+    x = _cx((6,), mojo_gpu)
+    keep = x.clone()
+    with pytest.raises(RuntimeError, match="single memory location"):
+        if op == "lerp_scalar":
+            x[1:].lerp_(x[:-1], 0.5)
+        else:
+            x[1:].addcmul_(x[:-1], x[:-1])
+    with pytest.raises(RuntimeError, match="single memory location"):
+        if op == "lerp_scalar":
+            torch.lerp(x[:-1], x[:-1], 0.5, out=x[1:])
+        else:
+            torch.addcmul(x[:-1], x[:-1], x[:-1], out=x[1:])
+    torch.testing.assert_close(x.cpu(), keep.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("op", ["lerp_scalar", "lerp_tensor", "addcmul", "addcdiv"])
+def test_complex_operands_on_two_gpus_are_refused(mojo_gpu, op):
+    """Operands on different mojo GPUs raise TensorIterator's device error
+    before any pointer is read."""
+    if len(list(get_accelerators())) < 2:
+        pytest.skip("needs two mojo GPUs")
+    a = _cx((4,), "mojo:0")
+    b = _cx((4,), "mojo:1")
+    with pytest.raises(RuntimeError, match="same device"):
+        if op == "lerp_scalar":
+            torch.lerp(a, b, 0.5)
+        elif op == "lerp_tensor":
+            torch.lerp(a, b, b)
+        elif op == "addcmul":
+            torch.addcmul(a, b, a)
+        else:
+            torch.addcdiv(a, a, b)

@@ -12,6 +12,7 @@ from std.memory import bitcast
 from std.utils.numerics import isnan
 from std.utils import IndexList
 
+from tmb.backend.device import dev
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.complex import (
@@ -340,6 +341,9 @@ def _arith(
         p_re = al[0]
         p_im = al[1]
     var launch_kind = kind
+    # The CUDA-exact host routes (reciprocal multiply, host log, swapped slot
+    # order, integer alpha negation) run on cuda devices only.
+    var cuda = dev(device)[].api == "cuda"
     if kind == "div" and fb.mode == CX_HOST:
         # div_true_kernel_cuda: a CPU-scalar divisor becomes a multiply by
         # its reciprocal, computed once on the host (1 / (0 + 0i) is
@@ -348,9 +352,10 @@ def _arith(
         # the kernel: 1 / 1e-40 is 1e40 -> inf, not inf + NaN i)
         var inv = _host_reciprocal[DType.float64](fb.re, fb.im)
         fb = _Flat(CX_HOST, 0, inv[0], inv[1])
-        launch_kind = "mul_recip"
+        launch_kind = "mul_recip" if cuda else "mul"
     if (
-        kind == "pow"
+        cuda
+        and kind == "pow"
         and fa.mode == CX_HOST
         and (av.tag == TAG_TENSOR or av.tag == TAG_TENSOR_REF)
     ):
@@ -366,7 +371,8 @@ def _arith(
         fa = _Flat(CX_HOST, 0, fct[0], fct[1])
         launch_kind = "exp_mul"
     if (
-        kind == "pow"
+        cuda
+        and kind == "pow"
         and (fa.mode == CX_DEVICE or fa.mode == CX_HOST)
         and fb.mode != CX_HOST
         and av.tag == TAG_COMPLEX
@@ -387,7 +393,7 @@ def _arith(
         launch_kind = "square"
     if kind == "sub":
         launch_kind = "add"
-        if alpha.tag == TAG_SCALAR_INT or alpha.tag == TAG_INT:
+        if cuda and (alpha.tag == TAG_SCALAR_INT or alpha.tag == TAG_INT):
             # an integer negates as an integer: -0 is +0.0
             var neg = scalar_parts(
                 Value(alpha.tag, 0, 0 - alpha.a, alpha.b), st

@@ -100,7 +100,7 @@ from tmb.backend.abi import (
     view_strided,
     IntList,
 )
-from tmb.backend.device import current_device
+from tmb.backend.device import current_device, dev as _dev_info
 from tmb.backend.registry import Site, impl
 from tmb.kernels.common.op_utils import MAX_RANK
 from tmb.ops.common import (
@@ -938,9 +938,10 @@ def _binary(kind: StaticString, av: Value, bv: Value) raises -> Owned:
     var like = _first_tensor(av, bv)
     var a = _operand(av, like)
     var b = _operand(bv, like)
-    if _half_vs_complex(a, b):
+    var cuda = _dev_info(like.device)[].api == "cuda"
+    if cuda and _half_vs_complex(a, b):
         return _complex_half_eq(kind, a.t, b)
-    if _half_vs_complex(b, a):
+    if cuda and _half_vs_complex(b, a):
         return _complex_half_eq(kind, b.t, a)
     var st = _result_type(a, b)
     if not is_complex_stype(st):
@@ -2070,6 +2071,10 @@ def cx_via_bool[
                     and c.is_complex()
                     and c.rank == 0
                     and v_tensor_c(args[unsafe_offset=0]).on_mojo()
+                    and _dev_info(
+                        v_tensor_c(args[unsafe_offset=0]).device
+                    )[].api
+                    == "cuda"
                 ):
                     unsupported(
                         '"' + op + "_cuda\" not implemented for 'ComplexHalf'"

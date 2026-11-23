@@ -103,6 +103,8 @@ comptime KINDS_1 = [
     "mish",
     "pow_exp",
     "pow_scalar_base",
+    "pow_tensor_scalar",
+    "rsub_alpha_scalar",
     "scale",
     "softplus",
     "softshrink",
@@ -165,6 +167,7 @@ comptime KINDS_2 = [
     "rrelu_noise",
     "rrelu_train",
     "rshift",
+    "rsub_alpha",
     "shifted_chebyshev_polynomial_t",
     "shifted_chebyshev_polynomial_u",
     "shifted_chebyshev_polynomial_v",
@@ -240,6 +243,7 @@ def _heavy_kind[kind: StaticString]() -> Bool:
         or kind == "lcm"
         or kind == "pow_exp"
         or kind == "pow_scalar_base"
+        or kind == "pow_tensor_scalar"
         or kind == "pow_tt"
         or kind == "ldexp_pow2"
         or kind == "nextafter"
@@ -306,9 +310,13 @@ def _host_value[dt: DType](v: Float64) -> Scalar[dt]:
     holds the int64's bits (the ops layer's `_pw_flat`; a bool travels as
     the byte type here), narrowed with two's complement wrap as torch
     narrows a wrapped number."""
-    comptime if dt == DType.float16 or dt == DType.bfloat16:
+    comptime if has_nvidia_gpu_accelerator() and (
+        dt == DType.float16 or dt == DType.bfloat16
+    ):
+        # CUDA's host conversion (c10): through float; other targets keep
+        # the direct cast they had
         return c10_half[dt](v)
-    elif dt == DType.float32:
+    elif has_nvidia_gpu_accelerator() and dt == DType.float32:
         return bitcast[dt](f32_bits_of(v))
     elif dt.is_floating_point():
         return v.cast[dt]()

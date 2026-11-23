@@ -1911,6 +1911,34 @@ def _wide[
                 var both = is_nan_bits(SIMD[w, n](p[0])) & is_nan_bits(a)
                 r = both.select(quiet_nan(a), r)
         return r
+    elif kind == "pow_tensor_scalar":
+        # PowKernel.cu's pow_tensor_scalar_kernel (the float64 route; the
+        # float types take the elementwise family's PowScalarSpec): p0 = the
+        # exponent. 2, 3 and -2 are products, 0.5 / -0.5 / -1 the sqrt /
+        # rsqrt / reciprocal kernels, the rest the full pow.
+        var e = p[0]
+        if e == 2:
+            return a * a
+        elif e == 3:
+            return (a * a) * a
+        elif e == -2:
+            return 1 / (a * a)
+        elif e == 0.5:
+            return ieee_sqrt(a)
+        elif e == -0.5:
+            return 1 / ieee_sqrt(a)
+        elif e == -1:
+            return 1 / a
+        return torch_pow(a, SIMD[w, n](e))
+    elif kind == "rsub_alpha" or kind == "rsub_alpha_scalar":
+        # rsub(self, other, alpha) is sub(other, self, alpha), CUDA's add
+        # kernel with -alpha: other + (-alpha) * self in opmath, one fma
+        # (a = self, b = other or p1 = a Python-number other, kept in opmath
+        # like the kernel's cpu scalar; p0 = alpha.to<opmath_t>()).
+        var other = b
+        comptime if kind == "rsub_alpha_scalar":
+            other = SIMD[w, n](p[1])
+        return SIMD[w, n](-p[0]).fma(a, other)
     elif kind == "pow_tt":
         # pow_(base, exp) of two tensors in the common dtype (Pow.cuh: float
         # pow for float32 and the half types, double for float64)

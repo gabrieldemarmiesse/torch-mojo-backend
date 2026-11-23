@@ -382,6 +382,20 @@ def _compare_dtype(a: T, b: T) raises -> DType:
     (`half[2] == float[]` compares in half, as CUDA does)."""
     if is_float8(a.dtype) or is_float8(b.dtype):
         return _float8_common(a, b)
+    if not (a.on_mojo() and dev(a.device)[].api == "cuda") and not (
+        b.on_mojo() and dev(b.device)[].api == "cuda"
+    ):
+        # origin's promotion off cuda
+        if (
+            a.dtype != b.dtype
+            and (a.rank == 0) != (b.rank == 0)
+            and known_stype(a.stype)
+            and known_stype(b.stype)
+        ):
+            var dt = max_dtype(result_type(a, b))
+            if is_cast_dtype_on(dt, a):
+                return dt
+        return binary_promotion(a, b)
     if a.dtype == b.dtype:
         return a.dtype
     return max_dtype(result_type(a, b))
