@@ -23,6 +23,8 @@ from tmb.backend.abi import (
     TAG_SCALAR_BOOL,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
+    TAG_TENSOR,
+    TAG_TENSOR_REF,
     Value,
     Values,
     ST_BOOL,
@@ -587,6 +589,9 @@ struct _ScalarCmp(Movable):
 
 def _compare_scalar(op: StaticString, args: Values, rets: Values) raises:
     var a = v_tensor(args[unsafe_offset=0])
+    if not _cmp_is_cuda(a):
+        _compare_scalar_legacy(op, args, rets)
+        return
     if not a.on_mojo():
         raise Error("expected the mojo device")
     var sc = _ScalarCmp(op, a, args[unsafe_offset=1])
@@ -598,6 +603,9 @@ def _compare_scalar(op: StaticString, args: Values, rets: Values) raises:
 
 def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
     var a = v_tensor(args[unsafe_offset=0])
+    if not _cmp_is_cuda(a):
+        _compare_scalar_out_legacy(op, args, rets)
+        return
     if not a.on_mojo():
         raise Error("expected the mojo device")
     var out_arg = v_tensor(args[unsafe_offset=2])
@@ -617,6 +625,179 @@ def _compare_scalar_out(op: StaticString, args: Values, rets: Values) raises:
         _ = tmp^  # alive past the launch
     _ = sc^  # alive past the launch
     ret_ref(rets, 0, out_arg)
+
+
+# ---- origin's scalar comparison / where, verbatim: non-cuda devices keep them ----
+
+
+def _cmp_is_cuda(t: T) raises -> Bool:
+    return t.on_mojo() and dev(t.device)[].api == "cuda"
+
+
+def _where_cuda(args: Values) raises -> Bool:
+    for i in range(3):
+        var tag = args[unsafe_offset=i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            var t = v_tensor(args[unsafe_offset=i])
+            if t.on_mojo():
+                return _cmp_is_cuda(t)
+    return True
+
+
+def _scalar_fill_legacy(a: T, v: Value) raises -> Owned:
+    """The Scalar operand as a 0-d tensor of `a`'s dtype. An integer scalar
+    against an integer tensor is filled from its int64 bits (the #606
+    integer-Scalar path, exact past 2**53); everything else goes through
+    `scalar_embed`'s Float64."""
+    var fill = own(new_scalar(a.stype, a.device))
+    if is_float8(a.dtype):
+        # The scalar rounds into a's float8 dtype unchecked (CUDA: `x == 1000.`
+        # against e4m3fn compares with NaN, it does not raise).
+        if v.tag == TAG_COMPLEX:
+            # c10's promoteTypes (Float8, ComplexDouble).
+            raise Error(
+                "Unknown Complex ScalarType for ", _scalar_type_name(a.dtype)
+            )
+        # An integer rounds to float32 once (c10's int64 -> float ->
+        # float8); through Float64 it would round twice.
+        fill_value(
+            fill.t,
+            Float64(
+                Scalar[DType.int64](v_int(v)).cast[DType.float32]()
+            ) if v_scalar_is_integral(v) else v_f64(v),
+        )
+    elif (
+        v_scalar_is_integral(v)
+        and not a.dtype.is_floating_point()
+        and a.dtype != DType.bool
+    ):
+        fill_value(fill.t, v)
+    else:
+        fill_value(fill.t, scalar_embed(v, a.dtype))
+    return fill^
+
+
+def _compare_scalar_legacy(op: StaticString, args: Values, rets: Values) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    if not a.on_mojo():
+        raise Error("expected the mojo device")
+    var fill = _scalar_fill_legacy(a, args[unsafe_offset=1])
+    var out = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
+    _compare_spec(op, a, fill.t, out.t)
+    _ = fill^  # alive past the launch
+    ret_owned(rets, 0, out)
+
+
+def _compare_scalar_out_legacy(
+    op: StaticString, args: Values, rets: Values
+) raises:
+    var a = v_tensor(args[unsafe_offset=0])
+    if not a.on_mojo():
+        raise Error("expected the mojo device")
+    var out_arg = v_tensor(args[unsafe_offset=2])
+    _compare_out_guard(out_arg, a, a)
+    var fill = _scalar_fill_legacy(a, args[unsafe_offset=1])
+    if out_arg.stype != ST_BOOL:
+        var res = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
+        _compare_spec(op, a, fill.t, res.t)
+        _ = fill^  # alive past the launch
+        _cast_into_out(out_arg, res.t, a.shape, a.rank, a.device)
+        _ = res^  # alive past the launch
+    elif _prepare_out(out_arg, a.shape, a.rank, ST_BOOL, a.device):
+        _compare_spec(op, a, fill.t, out_arg)
+        _ = fill^  # alive past the launch
+    else:
+        var tmp = own(new_tensor(a.shape, a.rank, ST_BOOL, a.device))
+        _compare_spec(op, a, fill.t, tmp.t)
+        _ = fill^  # alive past the launch
+        copy_strided_into(out_arg, tmp.t)
+        _ = tmp^  # alive past the launch
+    ret_ref(rets, 0, out_arg)
+
+
+def _where_select_legacy(
+    cond: T,
+    cond_s: IndexList[MAX_RANK],
+    a: T,
+    a_s: IndexList[MAX_RANK],
+    b: T,
+    b_s: IndexList[MAX_RANK],
+    dst: T,
+) raises:
+    """dst[i] = cond[i] ? a[i] : b[i], for rank<=4 operands (each stride
+    array already the correct broadcast strides against dst's shape)."""
+    _one_device(cond, dst)
+    _one_device(a, dst)
+    _one_device(b, dst)
+    if dst.numel == 0:
+        return
+    var ctx = ctx_for(dst.device)
+    var cp = ctx_ptr(ctx)
+    var params = List[Int](capacity=16)
+    for i in range(4):
+        params.append(dst.shape[MAX_RANK - 4 + i])
+    for i in range(4):
+        params.append(cond_s[MAX_RANK - 4 + i])
+    for i in range(4):
+        params.append(a_s[MAX_RANK - 4 + i])
+    for i in range(4):
+        params.append(b_s[MAX_RANK - 4 + i])
+    var call = KernelCall("data_movement", "WhereSelect")
+    call.arg_dtype(0, cond.dtype)
+    call.arg_dtype(1, a.dtype)
+    call.arg_dtype(2, b.dtype)
+    call.out_dtype(dst.dtype)
+    call.int(dst.ptr)
+    call.int(cond.ptr)
+    call.int(a.ptr)
+    call.int(b.ptr)
+    call.tuple(params)
+    call.int(dtype_code(dst.dtype))
+    call.int(cp)
+    call.run()
+    _ = ctx
+
+
+def op_where_self_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    var cond = v_tensor(args[unsafe_offset=0])
+    var a0 = v_tensor(args[unsafe_offset=1])
+    var b0 = v_tensor(args[unsafe_offset=2])
+    if cond.dtype != DType.bool:
+        unsupported("where: condition must be a bool tensor")
+    # A 0-d CPU self / other is allowed ("allow CPU scalars on non-cpu
+    # device", where_self_out); anything else must share cond's device.
+    var a_ok = (a0.on_mojo() and a0.device == cond.device) or (
+        _cpu_scalar_operand(a0, cond)
+    )
+    var b_ok = (b0.on_mojo() and b0.device == cond.device) or (
+        _cpu_scalar_operand(b0, cond)
+    )
+    if not cond.on_mojo() or not a_ok or not b_ok:
+        raise Error("expected all operands on the same mojo device")
+    if cond.rank > 4 or a0.rank > 4 or b0.rank > 4:
+        unsupported(
+            "where: operand rank exceeds the fast broadcast kernel's limit of 4"
+        )
+    # where_self_out: result_type(self, other), then `x.to(result_type)` --
+    # a real .to(), which saturates float -> e4m3fn on the device like any
+    # other copy (a CPU 0-d operand converts on the CPU, see _operand_as).
+    var st = torch_dtype(_compare_dtype(a0, b0))
+    var ha = _operand_as(a0, cond, st, True)
+    var hb = _operand_as(b0, cond, st, True)
+    var pa = ha.t.copy()
+    var pb = hb.t.copy()
+    var shape = _where_broadcast_shape(cond, pa, pb)
+    var rank = max(cond.rank, max(pa.rank, pb.rank))
+    var cond_s = _bcast_strides(cond, shape)
+    var a_s = _bcast_strides(pa, shape)
+    var b_s = _bcast_strides(pb, shape)
+    var out = own(new_tensor(shape, rank, pa.stype, pa.device))
+    _where_select_legacy(cond, cond_s, pa, a_s, pb, b_s, out.t)
+    _ = ha^
+    _ = hb^
+    ret_owned(rets, 0, out)
 
 
 # aten::eq.Tensor(Tensor self, Tensor other) -> Tensor
@@ -1201,6 +1382,9 @@ def op_where_self(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """where_self_out: result_type(self, other) and `.to()` of each, a 0-d
     CPU condition / self / other moved to the device, a uint8 condition
     (deprecated) taken as its truth, any other non-bool one refused."""
+    if not _where_cuda(args):
+        op_where_self_legacy(args, n_args, rets, n_rets)
+        return
     var cond0 = v_tensor(args[unsafe_offset=0])
     var a0 = v_tensor(args[unsafe_offset=1])
     var b0 = v_tensor(args[unsafe_offset=2])
@@ -1471,7 +1655,7 @@ def _masked_fill_scalar_dispatch(
         )
         var inf = UInt16(0x7C00) if half else UInt16(0x7F80)
         var mag = bits & 0x7FFF
-        if (mag != 0 and (bits & inf) == 0) or mag > inf:
+        if _cmp_is_cuda(a) and ((mag != 0 and (bits & inf) == 0) or mag > inf):
             # a subnormal or a NaN: c10's bits, moved as int16 (the
             # device-side conversion flushes subnormals)
             if dst.numel == 0:

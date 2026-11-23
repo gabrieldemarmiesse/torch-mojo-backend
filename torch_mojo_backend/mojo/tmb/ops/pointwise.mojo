@@ -158,6 +158,7 @@ from tmb.ops.binary import (
     _b_no_partial_overlap,
     _b_ret,
     _b_self,
+    _b_same_tensor,
     _b_shape_list,
     _b_side,
     _b_sside,
@@ -1274,6 +1275,7 @@ def _cx_check_overlap(vs: List[Value], dest: Optional[T], inplace: Bool) raises:
     if not dest:
         return
     var d = dest.value().copy()
+    var read_write = False
     if inplace:
         _b_inplace_destination(d)
     for i in range(len(vs)):
@@ -1286,6 +1288,30 @@ def _cx_check_overlap(vs: List[Value], dest: Optional[T], inplace: Bool) raises:
                 _b_inplace_operand(d, t)
             else:
                 _b_no_partial_overlap(d, t)
+                if _b_same_tensor(d, t):
+                    read_write = True
+    if read_write and not inplace:
+        # an out= that IS an input is never resized (`_b_out_guard3`): the
+        # broadcast shape must be its own
+        var shape = IndexList[MAX_RANK](1)
+        var rank = 0
+        for i in range(len(vs)):
+            var tag = vs[i].tag
+            if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+                var t = v_tensor_c(vs[i])
+                if t.on_mojo():
+                    _broadcast_into(shape, rank, t)
+        var fits = d.rank == rank
+        for i in range(MAX_RANK):
+            if d.shape[i] != shape[i]:
+                fits = False
+        if not fits:
+            raise Error(
+                "output with shape ",
+                _b_shape_list(d.shape, d.rank),
+                " doesn't match the broadcast shape ",
+                _b_shape_list(shape, rank),
+            )
 
 
 def _cx_pw_launch(
@@ -2266,6 +2292,21 @@ def _pw_wrap_int(v: Int, st: Int32) -> Int:
     return v
 
 
+def _pw_fill_ones_out(dest: T, base: Side, expo: Side, rets: Values) raises:
+    """Pow.cpp's `resize_output(result, sizes); result.fill_(1)`: ones go
+    straight into the caller's out=, whatever its dtype (no cast check)."""
+    var bs = _pw_broadcast(base, expo, _none_side(), 2)
+    var d = dest.copy()
+    var fits = d.rank == bs[1]
+    for i in range(MAX_RANK):
+        if d.shape[i] != bs[0][i]:
+            fits = False
+    if not fits:
+        resize_out(d, bs[0], bs[1])
+    fill_value(d, 1.0)
+    ret_ref(rets, 0, d)
+
+
 def _pw_pow_ones(base: Side, expo: Side, common: Int32) raises -> Res:
     var t = expo.t.value().copy() if expo.is_t else base.t.value().copy()
     var bs = _pw_broadcast(base, expo, _none_side(), 2)
@@ -2400,11 +2441,14 @@ def _pw_pow_real(
     var res: Res
     if schema == _POW_ST and _base_is_one(args[unsafe_offset=0]):
         # pow_Scalar_out: a base equal to 1 fills ones, no kernel
+        if dest:
+            _pw_fill_ones_out(dest.value(), a, b, rets)
+            return True
         res = _pw_pow_ones(a, b, common)
     elif schema == _POW_TS:
         var s = b.s.value().copy()
         if (s.is_bool and s.i == 0) or (not s.is_bool and s.f == 0.0):
-            # Pow.cpp: `out.fill_(1)`
+            # Pow.cpp: `out.fill_(1)` (its meta's out cast check came first)
             res = _pw_pow_ones(a, b, common)
         elif (s.is_bool and s.i == 1) or (not s.is_bool and s.f == 1.0):
             # Pow.cpp: `out.copy_(base)`, base converted to the common dtype

@@ -2712,3 +2712,53 @@ def test_complex_operands_on_two_gpus_are_refused(mojo_gpu, op):
             torch.addcmul(a, b, a)
         else:
             torch.addcdiv(a, a, b)
+
+
+@pytest.mark.parametrize("op", ["lerp_scalar", "lerp_tensor", "addcmul", "addcdiv"])
+def test_complex_out_that_is_an_input_is_never_resized(mojo_gpu, op):
+    """`op(x, y, ..., out=x)` where the broadcast shape is larger than x
+    raises (an out that is read and written is never resized) and leaves x
+    alone; the same call with matching shapes works."""
+    x = _cx((1,), mojo_gpu)
+    y = _cx((3,), mojo_gpu)
+    keep = x.clone()
+    calls = {
+        "lerp_scalar": lambda a, b: torch.lerp(a, b, 0.5, out=a),
+        "lerp_tensor": lambda a, b: torch.lerp(a, b, b, out=a),
+        "addcmul": lambda a, b: torch.addcmul(a, b, b, out=a),
+        "addcdiv": lambda a, b: torch.addcdiv(a, b, b, out=a),
+    }
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        calls[op](x, y)
+    assert x.shape == (1,)
+    torch.testing.assert_close(x.cpu(), keep.cpu(), rtol=0, atol=0)
+    z = _cx((3,), mojo_gpu)
+    w = _cx((3,), mojo_gpu)
+    ref = calls[op](z.cpu().clone(), w.cpu())
+    calls[op](z, w)
+    torch.testing.assert_close(z.cpu(), ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.int64, torch.float16, torch.bool])
+def test_pow_scalar_base_one_fills_any_out(cuda_oracle, out_dtype):
+    """pow(1, float_exponents, out=...) resizes and fills the supplied out
+    directly (Pow.cpp's pow_Scalar_out): no cast check, whatever its dtype
+    (stock CUDA; CPU torch refuses the cast)."""
+    e = torch.tensor([0.5, 2.0, -1.0, 3.0])
+
+    def f(x):
+        o = torch.empty(0, dtype=out_dtype, device=x.device)
+        return torch.pow(1, x, out=o), o
+
+    cuda_oracle.assert_bitwise_equal(f, e)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.int64, torch.bool])
+def test_pow_tensor_exponent_zero_checks_the_out_cast(cuda_oracle, out_dtype):
+    """pow(float, 0, out=int) fails the out cast check first (its meta)."""
+    e = torch.tensor([0.5, 2.0])
+
+    def f(x):
+        return torch.pow(x, 0, out=torch.empty(0, dtype=out_dtype, device=x.device))
+
+    cuda_oracle.assert_bitwise_equal(f, e)
