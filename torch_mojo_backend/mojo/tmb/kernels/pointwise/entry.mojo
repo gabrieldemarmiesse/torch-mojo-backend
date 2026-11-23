@@ -365,7 +365,6 @@ def _launch[
         p1,
         p2,
         p3,
-        numel,
     )
     def func[w: Int, alignment: Int = 1](idx: Coord):
         var i = Int(idx[0].value())
@@ -394,7 +393,8 @@ def _launch[
             and dt == DType.float32
             and is_nvidia_gpu()
         ):
-            if sgg_alt_contraction(i, numel):
+            # the element count rides in p0 / p1 (ops/pointwise.mojo)
+            if sgg_alt_contraction(i, Int(p0) + Int(p1) * 4096):
                 out_ptr.unsafe_store[width=w, alignment=out_align](
                     i,
                     pointwise[kind, dt, odt, w, True](

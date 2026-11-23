@@ -461,6 +461,13 @@ def _pw_run(
     var bs = _pw_broadcast(a, b, c, arity)
     var shape = bs[0]
     var rank = bs[1]
+    if kind == "standard_gamma_grad":
+        # the kernel's block-tail contraction needs the element count
+        var count = 1
+        for i in range(MAX_RANK):
+            count *= shape[i]
+        prm[0] = Float64(count % 4096)
+        prm[1] = Float64(count // 4096)
     var fa = _pw_flat(a, compute, shape, rank)
     var fb = _pw_flat(b, compute, shape, rank) if arity >= 2 else _Flat(
         MODE_HOST, 0, 0.0
