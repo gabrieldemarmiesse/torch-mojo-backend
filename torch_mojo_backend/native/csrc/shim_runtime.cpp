@@ -56,6 +56,7 @@ extern "C" void tmb_set_error(const char* message) {
 extern "C" const char* tmb_get_error(void) { return tmb_thread_error().c_str(); }
 extern "C" void tmb_lock(void) { tmb_mutex.lock(); }
 extern "C" int32_t tmb_is_in_bad_fork(void) { return tmb_in_bad_fork ? 1 : 0; }
+extern "C" int32_t tmb_torch_version(void) { return TMB_TORCH_VERSION; }
 extern "C" void tmb_unlock(void) { tmb_mutex.unlock(); }
 
 namespace {

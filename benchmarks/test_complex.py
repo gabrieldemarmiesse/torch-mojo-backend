@@ -4,15 +4,26 @@ kernel family (tmb/kernels/complex), against stock PyTorch's.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import pytest
 import torch
-from bench_lib.cases import both
+from bench_lib.cases import both, op_params
 from bench_lib.check import Bench
 from bench_lib.hw import Hardware
 
 SHAPES: dict[str, tuple[int, ...]] = {"B_256x1024": (256, 1024)}
 
 COVERS: dict[str, str] = {"aten::complex": "test_complex", "aten::polar": "test_polar"}
+
+COMPLEX_UNARY_OPS: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
+    "acos": torch.acos,
+    "acosh": torch.acosh,
+    "asin": torch.asin,
+    "asinh": torch.asinh,
+    "tan": torch.tan,
+    "tanh": torch.tanh,
+}
 
 _OUT = "out= plumbing (resize, copy_) over the functional op this module measures"
 SKIPPED: dict[str, str] = {"aten::complex.out": _OUT, "aten::polar.out": _OUT}
@@ -32,6 +43,29 @@ def test_complex(
         lambda: torch.complex(re_our, im_our),
         flops=2.0 * re_ref.numel(),
     )
+
+
+@pytest.mark.parametrize("dtype_id", ("c64", "c128"))
+@pytest.mark.parametrize("shape_id", ("B_256x1024",))
+@pytest.mark.parametrize("op_name", op_params(COMPLEX_UNARY_OPS))
+def test_complex_unary(
+    op_name: str,
+    shape_id: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """The complex unary ops on NVIDIA that use the thrust ports (ctanh,
+    ctan, catrig): the ratio to stock CUDA is the number to watch."""
+    shape = SHAPES[shape_id]
+    part = torch.float32 if dtype_id == "c64" else torch.float64
+    z = torch.complex(
+        torch.rand(shape, dtype=part) + 0.05, torch.rand(shape, dtype=part) + 0.05
+    )
+    z_ref, z_our = both(z, hw, mojo_device)
+    fn = COMPLEX_UNARY_OPS[op_name]
+    bench.run(lambda: fn(z_ref), lambda: fn(z_our), flops=20.0 * z.numel())
 
 
 @pytest.mark.parametrize("dtype_id", ("f32",))

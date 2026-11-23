@@ -150,6 +150,7 @@ void tmb_unlock(void);
 // 1 in a child forked after registration: the runtime is unusable there
 // (torch.mojo._is_in_bad_fork; device use raises)
 int32_t tmb_is_in_bad_fork(void);
+int32_t tmb_torch_version(void);  // major * 100 + minor
 // thread-local current device / stream, as torch's device guard sees them
 int32_t tmb_current_device(void);
 void tmb_set_current_device(int32_t device);

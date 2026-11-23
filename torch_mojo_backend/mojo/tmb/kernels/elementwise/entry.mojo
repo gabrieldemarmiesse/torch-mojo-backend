@@ -25,6 +25,7 @@ from tmb.kernels.common.unary_math import (
     elementwise_predicate,
     elementwise_unary,
     elementwise_unary_param,
+    is_nv_f64_port,
     is_rounding,
     param_compute_dtype,
 )
@@ -520,6 +521,48 @@ def _unary_is_direct[op_code: Int]() -> Bool:
 
 
 @always_inline
+def _uop_kind[op_code: Int]() -> StaticString:
+    """The `elementwise_unary` kind of a unary opcode."""
+    comptime if op_code >= UOP_TABLE_BASE:
+        return _table_uop_kind[op_code]()
+    else:
+        comptime kind = _CORE_UOP_KINDS[op_code]
+        return kind
+
+
+comptime _CORE_UOP_KINDS: List[StaticString] = [
+    "relu",
+    "exp",
+    "tanh",
+    "abs",
+    "neg",
+    "sign",
+    "ceil",
+    "floor",
+    "acos",
+    "asinh",
+    "atanh",
+    "cos",
+    "cosh",
+    "erf",
+    "log",
+    "log1p",
+    "reciprocal",
+    "rsqrt",
+    "sigmoid",
+    "silu",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "gelu_none",
+    "gelu_tanh",
+    "log2",
+    "acosh",
+]
+
+
+@always_inline
 def _unary_float64_on[op_code: Int]() -> Bool:
     """Whether `op_code` takes float64: the dtype gate admits it and the
     float64 route of `_unary_elementwise` instantiates its kernel.
@@ -530,7 +573,12 @@ def _unary_float64_on[op_code: Int]() -> Bool:
     only available on CPU targets", "DType.float64 is not supported for cos
     on NVIDIA GPU"; LLVM on AMD: "Cannot select: f64 = fcos").
     """
-    comptime if op_code >= UOP_TABLE_BASE:
+    comptime if has_nvidia_gpu_accelerator() and is_nv_f64_port[
+        _uop_kind[op_code]()
+    ]():
+        # The libdevice ports of `unary_math.is_nv_f64_port`.
+        return True
+    elif op_code >= UOP_TABLE_BASE:
         # trunc / round / frac / angle are exact in float64.
         return is_rounding[_table_uop_kind[op_code]()]()
     else:

@@ -35,7 +35,6 @@ from tmb.ops.complex import (
     _store,
     _store_ew,
     _store_ew_n,
-    _exact_dtype,
     _check_cast,
     _tensor_or_scalar,
     _unary,
@@ -845,10 +844,52 @@ def cx_bool_out[
     then resize and copy."""
     var x = v_tensor_c(args[unsafe_offset=0])
     var dest = v_tensor_c(args[unsafe_offset=1])
-    _exact_dtype(dest, ST_BOOL)
-    _store(dest, _unary(kind, _TO_BOOL, x), rets)
+    var res = _unary(kind, _TO_BOOL, x)
+    if dest.stype != ST_BOOL:  # resize_out_helper, then copy_arg's check
+        if not dest.same_shape(res.t):
+            resize_out(dest, res.t.shape, res.t.rank)
+        raise Error(
+            "Expected out tensor to have dtype bool, but got ",
+            scalar_type_name(dest.stype),
+            " instead",
+        )
+    _store(dest, res^, rets)
 
 
+comptime cx_sin = cx_unary["sin", _TO_CX]
+comptime cx_sin_out = cx_unary_out["sin", _TO_CX]
+comptime cx_cos = cx_unary["cos", _TO_CX]
+comptime cx_cos_out = cx_unary_out["cos", _TO_CX]
+comptime cx_tan = cx_unary["tan", _TO_CX]
+comptime cx_tan_out = cx_unary_out["tan", _TO_CX]
+comptime cx_sinh = cx_unary["sinh", _TO_CX]
+comptime cx_sinh_out = cx_unary_out["sinh", _TO_CX]
+comptime cx_cosh = cx_unary["cosh", _TO_CX]
+comptime cx_cosh_out = cx_unary_out["cosh", _TO_CX]
+comptime cx_tanh = cx_unary["tanh", _TO_CX]
+comptime cx_tanh_out = cx_unary_out["tanh", _TO_CX]
+comptime cx_asin = cx_unary["asin", _TO_CX]
+comptime cx_asin_out = cx_unary_out["asin", _TO_CX]
+comptime cx_acos = cx_unary["acos", _TO_CX]
+comptime cx_acos_out = cx_unary_out["acos", _TO_CX]
+comptime cx_atan = cx_unary["atan", _TO_CX]
+comptime cx_atan_out = cx_unary_out["atan", _TO_CX]
+comptime cx_asinh = cx_unary["asinh", _TO_CX]
+comptime cx_asinh_out = cx_unary_out["asinh", _TO_CX]
+comptime cx_acosh = cx_unary["acosh", _TO_CX]
+comptime cx_acosh_out = cx_unary_out["acosh", _TO_CX]
+comptime cx_atanh = cx_unary["atanh", _TO_CX]
+comptime cx_atanh_out = cx_unary_out["atanh", _TO_CX]
+comptime cx_log10 = cx_unary["log10", _TO_CX]
+comptime cx_log10_out = cx_unary_out["log10", _TO_CX]
+comptime cx_log2 = cx_unary["log2", _TO_CX]
+comptime cx_log2_out = cx_unary_out["log2", _TO_CX]
+comptime cx_exp2 = cx_unary["exp2", _TO_CX]
+comptime cx_exp2_out = cx_unary_out["exp2", _TO_CX]
+comptime cx_expm1 = cx_unary["expm1", _TO_CX]
+comptime cx_expm1_out = cx_unary_out["expm1", _TO_CX]
+comptime cx_log1p = cx_unary["log1p", _TO_CX]
+comptime cx_log1p_out = cx_unary_out["log1p", _TO_CX]
 comptime cx_exp = cx_unary["exp", _TO_CX]
 comptime cx_exp_out = cx_unary_out["exp", _TO_CX]
 comptime cx_log = cx_unary["log", _TO_CX]
