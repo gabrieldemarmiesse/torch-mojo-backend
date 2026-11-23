@@ -27,6 +27,15 @@ def side_stream_or_skip(device: str) -> torch.Stream:
     return torch.Stream(device=device)
 
 
+def is_cuda(device: str) -> bool:
+    """Whether `device` (a `mojo:<index>` string) is an NVIDIA GPU, where the
+    ops follow stock CUDA (tests/native/test_*_cuda_parity.py) rather than CPU
+    torch where the two differ."""
+    idx = int(device.rsplit(":", 1)[-1])
+    accelerators = list(get_accelerators())
+    return idx < len(accelerators) and accelerators[idx].api == "cuda"
+
+
 def is_metal(device: str) -> bool:
     """Whether `device` (a `mojo:<index>` string) is an Apple GPU -- the
     inverse of `skip_if_metal`'s own check, for a test that wants to assert

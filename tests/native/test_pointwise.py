@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import is_metal, skip_if_metal
+from tests.native.conftest import is_cuda, is_metal, skip_if_metal
 from torch_mojo_backend import get_accelerators, native
 
 FLOATS = [torch.float32, torch.float16, torch.bfloat16]
@@ -1950,6 +1950,10 @@ def test_bce_mixed_dtypes_declined(mojo_gpu):
     rather than approximated: a weight / pos_weight of another dtype than
     the input, logits input and target of different dtypes, and a backward
     weight of another dtype."""
+    if is_cuda(mojo_gpu):
+        pytest.skip(
+            "CUDA computes this like stock CUDA: test_activations_cuda_parity.py"
+        )
     aten = torch.ops.aten
     d = mojo_gpu
     h = torch.tensor([0.3, 0.6]).half().to(d)
@@ -1994,6 +1998,10 @@ def test_bce_pairs_squeezed_operands(mojo_gpu):
     [2, 1] input against a [2] target pairs element by element (no
     broadcast to [2, 2]), in input's shape; other shape mismatches are
     declined."""
+    if is_cuda(mojo_gpu):
+        pytest.skip(
+            "CUDA computes this like stock CUDA: test_activations_cuda_parity.py"
+        )
     aten = torch.ops.aten
     d = mojo_gpu
     x = torch.tensor([[0.25], [0.5]])
@@ -2103,6 +2111,10 @@ def test_bce_dtype_and_shape_rules(mojo_gpu):
 def test_bce_out_overloads(mojo_gpu):
     """The out= forms: resized from empty, written into a strided out, and
     an out of another dtype refused (no cast)."""
+    if is_cuda(mojo_gpu):
+        pytest.skip(
+            "CUDA computes this like stock CUDA: test_activations_cuda_parity.py"
+        )
     aten = torch.ops.aten
     d = mojo_gpu
     torch.manual_seed(5)

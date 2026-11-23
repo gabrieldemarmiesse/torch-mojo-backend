@@ -336,6 +336,18 @@ def _registered_or_skip(name: str):
         pytest.skip(f"aten::{name} is not registered on the mojo device")
 
 
+def _cuda_bce_out(device: str, name: str) -> bool:
+    """binary_cross_entropy.out follows stock CUDA (it never resizes its out)
+    on NVIDIA: tests/native/test_activations_cuda_parity.py."""
+    idx = int(device.rsplit(":", 1)[-1])
+    accelerators = list(get_accelerators())
+    return (
+        name == "binary_cross_entropy.out"
+        and idx < len(accelerators)
+        and accelerators[idx].api == "cuda"
+    )
+
+
 def _metal(device: str) -> bool:
     idx = int(device.rsplit(":", 1)[-1])
     accelerators = list(get_accelerators())
@@ -423,6 +435,8 @@ def test_out_resized_and_strided(mojo_gpu, name):
     """A wrong-shaped `out` is resized; a correctly shaped strided view of a
     larger buffer is written where it lives and nothing else is touched."""
     _registered_or_skip(name)
+    if _cuda_bce_out(mojo_gpu, name):
+        pytest.skip("follows stock CUDA, see test_activations_cuda_parity.py")
     kwargs = _cpu_args(name)
     expected = _cpu_result(name, kwargs)
     dtype = expected.dtype
@@ -536,6 +550,8 @@ def test_out_dtype_follows_torch(mojo_gpu, name, out_dtype):
     casts it (`canCast`, or an op's own exact-dtype rule), and refused where
     torch refuses it."""
     _registered_or_skip(name)
+    if _cuda_bce_out(mojo_gpu, name):
+        pytest.skip("follows stock CUDA, see test_activations_cuda_parity.py")
     if out_dtype == torch.float64 and _metal(mojo_gpu):
         pytest.skip("Apple GPUs have no float64")
     if out_dtype == torch.float64 and name == "gelu_backward.grad_input":
