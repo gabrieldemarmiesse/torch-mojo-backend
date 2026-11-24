@@ -673,12 +673,13 @@ def zeta[dt: DType](x: Scalar[dt], q: Scalar[dt]) -> Scalar[dt]:
         if x_nan or x != _floorg(x):
             return _nan[dt]()
     # Measured on stock CUDA: the float64 kernel returns a NaN input's own
-    # bits (x first); the float32 one always returns jit_nan's 0x7fffffff.
+    # bits (q's when both are NaN, whatever their dtypes); the float32 one
+    # always returns jit_nan's 0x7fffffff.
     comptime if dt == F64:
-        if x_nan:
-            return x
         if q_nan:
             return q
+        if x_nan:
+            return x
     else:
         if x_nan or q_nan:
             return _nan[dt]()

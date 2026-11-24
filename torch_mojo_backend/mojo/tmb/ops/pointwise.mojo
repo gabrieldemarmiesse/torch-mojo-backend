@@ -521,6 +521,8 @@ def _pw_run(
         and compute == ST_FLOAT64
     ):
         prm[0] = _pw_xlogy_nan(a, b, count_of(shape), compute)
+        if dst and dst.value().stype != compute:
+            prm[0] = 1.0  # an out= of another dtype: the casting kernel
         prm[1] = Float64(count_of(shape) % 4096)
         prm[2] = Float64(count_of(shape) // 4096)
     if cuda and kind == "standard_gamma_grad":

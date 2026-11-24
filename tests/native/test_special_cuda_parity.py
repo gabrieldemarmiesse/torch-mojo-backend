@@ -638,6 +638,32 @@ def test_xlogy_float64_nan_x_transposed_matches_cuda(cuda_oracle: CudaOracle):
     )
 
 
+@pytest.mark.parametrize(
+    "q_bits", (0x7FF8000000000123, -0x0008000000000000, 0x4000000000000000)
+)
+@pytest.mark.parametrize(
+    "mix", ("f64_f64", "f16_f64", "f32_f64", "f64_f32", "f64_zero_dim_f32")
+)
+def test_zeta_float64_nan_operands_match_cuda(
+    cuda_oracle: CudaOracle, mix: str, q_bits: int
+):
+    """NaN x against NaN or finite q: which NaN CUDA returns (q's when both)."""
+    x = (
+        torch.tensor([0x7FF8000000000456], dtype=torch.int64)
+        .view(torch.float64)
+        .repeat(8)
+    )
+    q = torch.tensor([q_bits], dtype=torch.int64).view(torch.float64).repeat(8)
+    views = {
+        "f64_f64": lambda a, b: (a, b),
+        "f16_f64": lambda a, b: (a.half(), b),
+        "f32_f64": lambda a, b: (a.float(), b),
+        "f64_f32": lambda a, b: (a, b.float()),
+        "f64_zero_dim_f32": lambda a, b: (a, b[0].float()),
+    }
+    cuda_oracle.assert_bitwise_equal(lambda a, b: S.zeta(*views[mix](a, b)), x, q)
+
+
 _POLY = [
     "chebyshev_polynomial_t",
     "chebyshev_polynomial_u",
