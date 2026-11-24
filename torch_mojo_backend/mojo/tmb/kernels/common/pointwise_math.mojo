@@ -728,6 +728,22 @@ def _polynomial_nv[
     (`*_polynomial_*_forward`), statement for statement, in the opmath type."""
     var n = _poly_n(n_f)
     comptime one = Scalar[w](1.0)
+    comptime if kind == "hermite_polynomial_he":
+        # The same cases as the branchy form below, as selects: one straight
+        # line per thread (the branches cost this tiny kernel 12%).
+        comptime limit = 512 if w == DType.float64 else 128
+        var p = one
+        var q = x
+        var r = Scalar[w](0)
+        for k in range(1, n if n <= limit else 0):
+            r = x * q - Scalar[w](k) * p
+            p = q
+            q = r
+        var res = r
+        res = x if n == 1 else res
+        res = one if n == 0 else res
+        res = _polynan[w]() if n > limit else res
+        return Scalar[w](0) if n < 0 else res
     if n < 0:
         return 0
     comptime if not is_nvidia_gpu():
