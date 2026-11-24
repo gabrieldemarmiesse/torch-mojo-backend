@@ -3212,16 +3212,14 @@ def sgg_alt_contraction(i: Int, numel: Int) -> Bool:
 @always_inline
 def _gamma_grads[
     kind: StaticString, dtype: DType, n: Int
-](
-    a: SIMD[dtype, n], b: SIMD[dtype, n], c: SIMD[dtype, n], alt: Bool = False
-) -> SIMD[dtype, n]:
+](a: SIMD[dtype, n], b: SIMD[dtype, n], c: SIMD[dtype, n]) -> SIMD[dtype, n]:
     comptime w = wide_dtype[dtype]()
     var r = SIMD[dtype, n]()
     comptime for i in range(n):
         comptime if kind == "standard_gamma_grad":
             comptime if is_nvidia_gpu():
                 r[i] = _standard_gamma_grad_one[w](
-                    a[i].cast[w](), b[i].cast[w](), alt
+                    a[i].cast[w](), b[i].cast[w]()
                 ).cast[dtype]()
             else:
                 # AMD / Apple keep their pre-port form.
@@ -3232,6 +3230,20 @@ def _gamma_grads[
             r[i] = _dirichlet_grad_one[w](
                 a[i].cast[w](), b[i].cast[w](), c[i].cast[w]()
             ).cast[dtype]()
+    return r
+
+
+@always_inline
+def _sgg_alt_lanes[
+    dtype: DType, n: Int
+](a: SIMD[dtype, n], b: SIMD[dtype, n], alt: Bool) -> SIMD[dtype, n]:
+    """NVIDIA's standard_gamma_grad with the runtime contraction choice."""
+    comptime w = wide_dtype[dtype]()
+    var r = SIMD[dtype, n]()
+    comptime for i in range(n):
+        r[i] = _standard_gamma_grad_one[w](
+            a[i].cast[w](), b[i].cast[w](), alt
+        ).cast[dtype]()
     return r
 
 
@@ -3367,12 +3379,10 @@ def pointwise[
         return _prelu[kind](a, b, c).cast[out_dtype]()
     elif kind == "standard_gamma_grad" or kind == "dirichlet_grad":
         comptime assert dtype.is_floating_point(), "gamma grads take floats"
-        return _gamma_grads[kind](
-            a,
-            b,
-            c,
-            kind == "standard_gamma_grad" and is_nvidia_gpu() and p[3] != 0,
-        ).cast[out_dtype]()
+        comptime if kind == "standard_gamma_grad" and is_nvidia_gpu():
+            return _sgg_alt_lanes(a, b, p[3] != 0).cast[out_dtype]()
+        else:
+            return _gamma_grads[kind](a, b, c).cast[out_dtype]()
     elif is_native_kind[kind]():
         return _native[kind](a, b, c).cast[out_dtype]()
     elif is_scalar_t_kind[kind]():
