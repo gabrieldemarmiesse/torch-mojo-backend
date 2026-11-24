@@ -736,7 +736,11 @@ def _operand(v: Value, like: T) raises -> _Operand:
         return _Operand(
             like, 1.0 if v.a != 0 else 0.0, 0.0, ST_BOOL, _RANK_WRAPPED
         )
-    if v.tag == TAG_SCALAR_INT and v.b == 1:
+    if (
+        v.tag == TAG_SCALAR_INT
+        and v.b == 1
+        and _dev_info(like.device)[].api == "cuda"
+    ):
         # a uint64 Scalar of 2**63 or more (bits in `a`): its float value
         var u = Scalar[DType.int64](v.a).cast[DType.uint64]()
         return _Operand(
