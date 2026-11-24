@@ -64,6 +64,7 @@ markers = [
     "gpu: requires a GPU (also inferred from GPU fixtures); select with -m gpu or -m 'not gpu'",
     "cuda: CUDA graph tests that must run before Mojo device registration, in a separate process",
     "cpu_torch: Mojo GPU integration requiring a CPU-only torch wheel (Inductor/Triton)",
+    "cuda_oracle: compares against stock CUDA live (inferred from the cuda_oracle fixture); select with -m cuda_oracle",
 ]
 filterwarnings = [
     # MAX 26.6's eager executor warns when its interpreter refuses a graph it
