@@ -423,14 +423,16 @@ def _launch[
                 alt = (i & 511) < 128
             elif dt != DType.float64:
                 alt = sgg_alt_contraction(i, Int(p0) + Int(p1) * 4096)
+            var pp3 = p3 * 0
             if alt:
-                out_ptr.unsafe_store[width=w, alignment=out_align](
-                    i,
-                    pointwise[kind, dt, odt, w, True](
-                        a, b, c, SIMD[param_dtype[dt](), 4](p0, p1, p2, p3)
-                    ),
-                )
-                return
+                pp3 = pp3 + 1
+            out_ptr.unsafe_store[width=w, alignment=out_align](
+                i,
+                pointwise[kind, dt, odt, w](
+                    a, b, c, SIMD[param_dtype[dt](), 4](p0, p1, p2, pp3)
+                ),
+            )
+            return
         out_ptr.unsafe_store[width=w, alignment=out_align](
             i,
             pointwise[kind, dt, odt, w](

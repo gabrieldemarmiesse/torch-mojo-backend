@@ -2839,8 +2839,8 @@ def _standard_gamma_grad_one_legacy[
 
 @always_inline
 def _standard_gamma_grad_one[
-    w: DType, alt: Bool = False
-](alpha: Scalar[w], x: Scalar[w]) -> Scalar[w]:
+    w: DType
+](alpha: Scalar[w], x: Scalar[w], alt: Bool = False) -> Scalar[w]:
     """Distributions.h's `standard_gamma_grad_one`: the reparameterized
     gradient -(d/dalpha cdf(x; alpha)) / pdf(x; alpha), in the accumulate
     type."""
@@ -2864,7 +2864,7 @@ def _standard_gamma_grad_one[
         # elements of a partial last block, fuse the second one instead)
         var dg = _slog[w](x) - _digamma_one_cuda[w](alpha)
         var gamma_cdf_alpha: Scalar[w]
-        comptime if alt:
+        if alt:
             # the remainder block's first 128 elements (see
             # `sgg_alt_contraction`) fuse the other product
             gamma_cdf_alpha = fma(
@@ -3211,15 +3211,17 @@ def sgg_alt_contraction(i: Int, numel: Int) -> Bool:
 
 @always_inline
 def _gamma_grads[
-    kind: StaticString, dtype: DType, n: Int, alt: Bool = False
-](a: SIMD[dtype, n], b: SIMD[dtype, n], c: SIMD[dtype, n]) -> SIMD[dtype, n]:
+    kind: StaticString, dtype: DType, n: Int
+](
+    a: SIMD[dtype, n], b: SIMD[dtype, n], c: SIMD[dtype, n], alt: Bool = False
+) -> SIMD[dtype, n]:
     comptime w = wide_dtype[dtype]()
     var r = SIMD[dtype, n]()
     comptime for i in range(n):
         comptime if kind == "standard_gamma_grad":
             comptime if is_nvidia_gpu():
-                r[i] = _standard_gamma_grad_one[w, alt](
-                    a[i].cast[w](), b[i].cast[w]()
+                r[i] = _standard_gamma_grad_one[w](
+                    a[i].cast[w](), b[i].cast[w](), alt
                 ).cast[dtype]()
             else:
                 # AMD / Apple keep their pre-port form.
@@ -3302,7 +3304,6 @@ def pointwise[
     dtype: DType,
     out_dtype: DType,
     n: Int,
-    alt: Bool = False,
 ](
     a: SIMD[dtype, n],
     b: SIMD[dtype, n],
@@ -3310,8 +3311,9 @@ def pointwise[
     p: SIMD[param_dtype[dtype](), 4],
 ) -> SIMD[out_dtype, n]:
     """`kind` of (a, b, c) with scalar parameters `p`, rounded once into
-    `out_dtype`. Unused operands and parameters are ignored. `alt` selects
-    the other ptxas contraction of `sgg_alt_contraction`'s elements."""
+    `out_dtype`. Unused operands and parameters are ignored. For
+    standard_gamma_grad p[3] != 0 selects the other ptxas contraction (see
+    `sgg_alt_contraction`)."""
     comptime if kind == "frexp_exponent":
         return _frexp_exponent(a).cast[out_dtype]()
     elif kind == "hardtanh" and dtype.is_integral():
@@ -3365,7 +3367,12 @@ def pointwise[
         return _prelu[kind](a, b, c).cast[out_dtype]()
     elif kind == "standard_gamma_grad" or kind == "dirichlet_grad":
         comptime assert dtype.is_floating_point(), "gamma grads take floats"
-        return _gamma_grads[kind, alt=alt](a, b, c).cast[out_dtype]()
+        return _gamma_grads[kind](
+            a,
+            b,
+            c,
+            kind == "standard_gamma_grad" and is_nvidia_gpu() and p[3] != 0,
+        ).cast[out_dtype]()
     elif is_native_kind[kind]():
         return _native[kind](a, b, c).cast[out_dtype]()
     elif is_scalar_t_kind[kind]():
