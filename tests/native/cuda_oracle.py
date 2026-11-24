@@ -79,17 +79,21 @@ def _hex(bits: int, width: int) -> str:
     return f"0x{bits & ((1 << (8 * width)) - 1):0{2 * width}x}"
 
 
-def _element(t: torch.Tensor, index: tuple[int, ...]) -> str:
-    """Element `index` of `t` (a complex `t` indexed through its real view)
-    as `0xBITS (value)`."""
-    host = t.detach().resolve_conj().resolve_neg().cpu()
-    if host.is_complex():
-        host = torch.view_as_real(host)
-    width = host.element_size()
-    bits = int(_bits(host)[index])
-    value = host[index]
-    shown = value.item() if value.dtype not in _FLOAT8 else value.float().item()
-    return f"{_hex(bits, width)} ({shown!r})"
+class _Shown:
+    """`t` on the host (a complex `t` as its real view) and its bit
+    patterns, made once so each reported element is an index, not a copy."""
+
+    def __init__(self, t: torch.Tensor):
+        host = t.detach().resolve_conj().resolve_neg().cpu()
+        self.host = torch.view_as_real(host) if host.is_complex() else host
+        self.bits = _bits(self.host)
+
+    def element(self, index: tuple[int, ...]) -> str:
+        """Element `index` as `0xBITS (value)`."""
+        value = self.host[index]
+        shown = value.item() if value.dtype not in _FLOAT8 else value.float().item()
+        bits = int(self.bits[index])
+        return f"{_hex(bits, self.host.element_size())} ({shown!r})"
 
 
 def tensor_mismatch(
@@ -131,15 +135,22 @@ def tensor_mismatch(
     bad = (~same).nonzero()
     complex_parts = ours.is_complex()
     lines = [f"{len(bad)} of {same.numel()} elements differ (dtype {ours.dtype}):"]
+    shown_ours, shown_cuda = _Shown(ours), _Shown(cuda)
+    shown_inputs = [
+        (k, _Shown(t))
+        for k, t in enumerate(inputs)
+        if t.shape == ours.shape and t.is_complex() == complex_parts
+    ]
     for row in bad[:_MAX_REPORTED].tolist():
         index = tuple(row)
         where = list(index[:-1] if complex_parts else index)
         part = (".real", ".imag")[index[-1]] if complex_parts else ""
-        line = f"  [{', '.join(map(str, where))}]{part}: ours {_element(ours, index)}"
-        line += f", CUDA {_element(cuda, index)}"
-        for k, t in enumerate(inputs):
-            if t.shape == ours.shape and t.is_complex() == complex_parts:
-                line += f"; input {k} {_element(t, index)}"
+        line = (
+            f"  [{', '.join(map(str, where))}]{part}: ours {shown_ours.element(index)}"
+        )
+        line += f", CUDA {shown_cuda.element(index)}"
+        for k, shown in shown_inputs:
+            line += f"; input {k} {shown.element(index)}"
         lines.append(line)
     return "\n".join(lines)
 
