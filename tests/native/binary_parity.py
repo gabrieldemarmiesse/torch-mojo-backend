@@ -138,7 +138,8 @@ def pairs(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(a, b): every pair of specials, then random pairs. `launch_dependent`:
     leave out the float64 pairs of two distinct NaN payloads, for the ops
-    (add, sub, mul, fmax, lerp) whose CUDA kernel picks a payload by launch
+    measured to fail without it (add, sub, mul, fmax / fmin, fmod, remainder,
+    floor_divide, logaddexp(2)): their CUDA kernel picks a payload by launch
     (see `two_distinct_nans`)."""
     gen = torch.Generator().manual_seed(seed)
     s = specials(dtype)

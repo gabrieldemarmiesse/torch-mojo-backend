@@ -25,7 +25,9 @@ def test_tensor_tensor(cuda_oracle: CudaOracle, op, fn, inplace, dtype):
     out = op != "rsub"
     bp.check_all(
         cuda_oracle,
-        bp.binary_cases(fn, dtype, inplace=inplace, out=out, launch_dependent=True),
+        bp.binary_cases(
+            fn, dtype, inplace=inplace, out=out, launch_dependent=op != "rsub"
+        ),
     )
 
 
@@ -49,7 +51,7 @@ _ALPHAS = [2, -1, 0, 3, 0.3, -2.5, 1e-40, 1e300, float("nan"), True, 1.0]
 @pytest.mark.parametrize("op", ["add", "sub", "rsub"])
 def test_alpha(cuda_oracle: CudaOracle, op, dtype):
     fn = getattr(torch, op)
-    a, b = bp.pairs(dtype, launch_dependent=True)
+    a, b = bp.pairs(dtype, launch_dependent=op != "rsub")
     cases = []
     alphas = _ALPHAS + ([1 + 2j] if dtype.is_complex else [])
     for alpha in alphas:
@@ -207,5 +209,5 @@ def test_cuda_float64_two_nans_depend_on_the_launch(cuda_oracle: CudaOracle):
 )
 @pytest.mark.parametrize("op", ["add", "sub", "mul"])
 def test_complex32_is_not_held(cuda_oracle: CudaOracle, op):
-    a, _ = bp.pairs(torch.float16, launch_dependent=True)
+    a, _ = bp.pairs(torch.float16)
     cuda_oracle.assert_bitwise_equal(lambda x: getattr(torch, op)(x, 1j), a)

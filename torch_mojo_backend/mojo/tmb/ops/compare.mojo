@@ -257,9 +257,20 @@ def _compare_spec(op: StaticString, a: T, b: T, dst: T) raises:
         return
     _one_device(a, dst)
     _one_device(b, dst)
-    if is_wide_unsigned(a.stype) and a.stype == b.stype:
-        # eq / ne only (`_cmp_check`): the bits compare as the signed type
-        # of the same width
+    if (
+        is_wide_unsigned(a.stype)
+        and a.stype == b.stype
+        and dev(dst.device)[].api == "cuda"
+    ):
+        # CUDA only (elsewhere the logic kernels have no such dtype and raise,
+        # as in origin). eq / ne compare the bits as the signed type of the
+        # same width; an ordered comparison must never get here.
+        if op != "EqSpec" and op != "NeSpec":
+            unsupported(
+                '"compare_cuda" not implemented for \''
+                + scalar_type_name(a.stype)
+                + "'"
+            )
         _compare_spec(op, _as_signed(a), _as_signed(b), dst)
         return
     var ctx = ctx_for(dst.device)

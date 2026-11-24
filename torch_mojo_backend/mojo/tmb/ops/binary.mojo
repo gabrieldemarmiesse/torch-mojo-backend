@@ -313,12 +313,15 @@ def _b_f16_bits_to_f64(h: UInt16) -> Float64:
     return Float64(from_bits=(sign << 63) | (de << 52) | (m << 42))
 
 
-def _b_host_scalar(t: T) raises -> Scal:
-    """The value of a 0-d CPU tensor, read straight out of host memory."""
+def _b_host_scalar(t: T, device: Int = -1) raises -> Scal:
+    """The value of a 0-d CPU tensor, read straight out of host memory.
+    `device`: the mojo device of the operand it meets (the current one when
+    the caller has none, as in `_b_side`: a mismatching device raises
+    later anyway)."""
     var p = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=t.ptr)
     # The bit-exact reads (subnormals / NaN payloads kept) are CUDA's; the
     # other devices keep the plain host conversions they had.
-    var exact = dev(current_device())[].api == "cuda"
+    var exact = dev(device if device >= 0 else current_device())[].api == "cuda"
     if t.dtype == DType.bool:
         var on = p[] != 0
         return Scal(1.0 if on else 0.0, 1 if on else 0, True, True)
@@ -1071,7 +1074,9 @@ def _b_fast_route(
             return _b_fast_tt(tt, a, b, rets, dest_h)
         if ts.byte_length() == 0 or not _b_wrapped_number(b):
             return False
-        return _b_fast_ts(ts, a, _b_host_scalar(b), negate, rets, dest_h)
+        return _b_fast_ts(
+            ts, a, _b_host_scalar(b, a.device), negate, rets, dest_h
+        )
     if ts.byte_length() == 0:
         return False
     var ms = _b_rec_scalar(bv)
@@ -2801,7 +2806,7 @@ def _b_fast_div(args: Values, rets: Values, dest_h: Int) raises -> Bool:
             return _b_fast_tt("DivSpec", a, b, rets, dest_h)
         if not _b_wrapped_number(b):
             return False
-        return _b_fast_div_scalar(a, _b_host_scalar(b), rets, dest_h)
+        return _b_fast_div_scalar(a, _b_host_scalar(b, a.device), rets, dest_h)
     var ms = _b_rec_scalar(bv)
     if not ms.ok:
         return False

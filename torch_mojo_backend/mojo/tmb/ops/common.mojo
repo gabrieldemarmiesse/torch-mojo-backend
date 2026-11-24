@@ -855,8 +855,14 @@ def cast_into(dst: T, src: T, saturate: Bool = True) raises:
     var call = KernelCall("data_movement", "CastSpec")
     call.arg_dtype(0, src.dtype)
     call.out_dtype(dst.dtype)
+    # (the torch < 2.12 clause only matters where the kernel saturates: cuda;
+    # elsewhere the specialization stays origin's)
     if dst.dtype == DType.float8_e4m3fn and (
-        not saturate or external_call["tmb_torch_version", Int32]() < 212
+        not saturate
+        or (
+            dev(dst.device)[].api == "cuda"
+            and external_call["tmb_torch_version", Int32]() < 212
+        )
     ):
         call.flag("FP8_NOSAT", 1)
     call.spec(src.spec(cp))

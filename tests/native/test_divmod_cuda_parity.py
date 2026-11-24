@@ -40,10 +40,13 @@ _IDS = [o[0] for o in _OPS]
 _DTYPES = bp.FLOATS + bp.INTS + bp.BOOL + bp.UINTS
 
 
-def _tt_cases(fn, inplace, dtype):
-    # float64 pairs of two distinct NaN payloads: CUDA keeps one by launch
-    # (bp.two_distinct_nans), as for add / sub / mul
-    a, b = bp.pairs(dtype, launch_dependent=True)
+# float64 pairs of two distinct NaN payloads: CUDA keeps one by launch
+# (bp.two_distinct_nans) for these four (measured failing without the drop)
+_NAN_LAUNCH_OPS = ("div_floor", "floor_divide", "remainder", "fmod")
+
+
+def _tt_cases(op, fn, inplace, dtype):
+    a, b = bp.pairs(dtype, launch_dependent=op in _NAN_LAUNCH_OPS)
 
     def with_out(x, y):
         o = torch.empty(0, dtype=fn(x, y).dtype, device=x.device)
@@ -62,7 +65,7 @@ def _tt_cases(fn, inplace, dtype):
 @pytest.mark.parametrize("dtype", _DTYPES, ids=bp.name)
 @pytest.mark.parametrize(("op", "fn", "inplace", "rev"), _OPS, ids=_IDS)
 def test_tensor_tensor(cuda_oracle: CudaOracle, op, fn, inplace, rev, dtype):
-    bp.check_all(cuda_oracle, _tt_cases(fn, inplace, dtype))
+    bp.check_all(cuda_oracle, _tt_cases(op, fn, inplace, dtype))
 
 
 _INT_SCALARS = bp.INT_SCALARS + [-2, 5, -7, 1, 128, -32769, 1 << 40, -(1 << 33)]

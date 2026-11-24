@@ -997,3 +997,26 @@ def test_functional_assert_async_and_dep_token(mojo_gpu):
         )
     with pytest.raises(RuntimeError, match="Assertion is failed"):
         aten._functional_assert_async.msg(torch.tensor(0.0, device=mojo_gpu), "", token)
+
+
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
+@pytest.mark.parametrize("op", [torch.lt, torch.le, torch.gt, torch.ge])
+def test_ordered_comparison_of_wide_unsigned_never_wrong(mojo_gpu, op, dtype):
+    """Ordered comparisons of uint16 / uint32 / uint64 either raise (no
+    kernel: CUDA and the other backends) or give the right values; never the
+    signed reading (2**31 < 1 true)."""
+    hi = {torch.uint16: 1 << 15, torch.uint32: 1 << 31, torch.uint64: 1 << 63}[dtype]
+    # the bit patterns through int64 (CPU torch has no uint64 arithmetic)
+    wrap = hi - (1 << 64) if dtype == torch.uint64 else hi
+    a_cpu = torch.tensor([wrap, 1, 5], dtype=torch.int64).view(torch.int64)
+    b_cpu = torch.tensor([1, wrap, 5], dtype=torch.int64)
+    if dtype == torch.uint64:
+        a_cpu, b_cpu = a_cpu.view(torch.uint64), b_cpu.view(torch.uint64)
+    else:
+        a_cpu, b_cpu = a_cpu.to(dtype), b_cpu.to(dtype)
+    a, b = a_cpu.to(mojo_gpu), b_cpu.to(mojo_gpu)
+    try:
+        got = op(a, b)
+    except (RuntimeError, NotImplementedError):
+        return
+    torch.testing.assert_close(got.cpu(), op(a_cpu, b_cpu), rtol=0, atol=0)

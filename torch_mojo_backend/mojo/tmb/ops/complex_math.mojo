@@ -164,7 +164,9 @@ def _hmul[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
     var v = a * b
     var ptr = Pointer(to=v)
     ptr.unsafe_store[volatile=True](0, v)
-    return ptr.unsafe_load[volatile=True](0)
+    var r = ptr.unsafe_load[volatile=True](0)
+    _ = v  # alive past the volatile load
+    return r
 
 
 @always_inline

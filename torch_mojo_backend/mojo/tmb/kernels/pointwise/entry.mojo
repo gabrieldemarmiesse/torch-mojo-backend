@@ -644,8 +644,12 @@ def _pointwise_go[kind: StaticString, arity: Int](argv: Argv, argc: Int) raises:
                             # MPS's kernels take these as scalar_t.
                             pd = pd.cast[dt]().cast[DType.float64]()
                         var params = pd.cast[pdt]()
-                        comptime if pdt == DType.float32:
-                            # The host's conversion may flush subnormals.
+                        comptime if (
+                            pdt == DType.float32
+                            and has_nvidia_gpu_accelerator()
+                        ):
+                            # The host's conversion may flush subnormals
+                            # (CUDA's host path only).
                             comptime for k in range(4):
                                 params[k] = rebind[Scalar[pdt]](
                                     bitcast[DType.float32](f32_bits_of(pd[k]))
