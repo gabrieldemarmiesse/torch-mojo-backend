@@ -478,7 +478,19 @@ def _b_f8_refuse(kernel: StaticString, a: Side, b: Side) raises:
         decline_float8(max_dtype(common), String(kernel))
 
 
-def _b_side(v: Value) raises -> Side:
+def _b_args_device(args: Values) raises -> Int:
+    """The mojo device of the first two operands of a call (-1: none), which
+    a 0-d CPU scalar among them meets."""
+    for i in range(2):
+        var tag = args[unsafe_offset=i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            var t = v_tensor(args[unsafe_offset=i])
+            if t.on_mojo():
+                return t.device
+    return -1
+
+
+def _b_side(v: Value, device: Int = -1) raises -> Side:
     """Read one operand record.
 
     A `Tensor` argument that is a 0-d CPU tensor is torch's *wrapped number*:
@@ -495,7 +507,7 @@ def _b_side(v: Value) raises -> Side:
         if t.on_mojo():
             return _b_tside(t)
         if t.device_type == DEVICE_TYPE_CPU and t.numel == 1 and t.rank == 0:
-            var side = _b_sside(_b_host_scalar(t))
+            var side = _b_sside(_b_host_scalar(t, device))
             if not t.is_wrapped_number():
                 side.zero_st = t.stype
             return side^
@@ -2137,8 +2149,8 @@ def op_add_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_ret(
         rets,
         _b_add(
-            _b_side(args[unsafe_offset=0]),
-            _b_side(args[unsafe_offset=1]),
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
             args[unsafe_offset=2],
             None,
         ),
@@ -2148,7 +2160,7 @@ def op_add_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::add_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
 def op_add_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "add_")
-    var rhs = _b_side(args[unsafe_offset=1])
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     _b_no_overlap_side(self, rhs)
     if not _b_alpha_is_one(args[unsafe_offset=2]):
         # the cast into self, then alpha_check (and its conversion)
@@ -2210,8 +2222,8 @@ def op_add_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         _b_out_handle(args[unsafe_offset=3]),
     ):
         return
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
     _b_store_out(
@@ -2236,8 +2248,8 @@ def op_sub_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_ret(
         rets,
         _b_sub(
-            _b_side(args[unsafe_offset=0]),
-            _b_side(args[unsafe_offset=1]),
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
             args[unsafe_offset=2],
             None,
         ),
@@ -2247,7 +2259,7 @@ def op_sub_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::sub_.Tensor(Tensor(a!) self, Tensor other, *, Scalar alpha=1) -> Tensor(a!)
 def op_sub_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "sub_")
-    var rhs = _b_side(args[unsafe_offset=1])
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     _b_no_overlap_side(self, rhs)
     _b_sub_check(_b_tside(self), rhs)
     if not _b_alpha_is_one(args[unsafe_offset=2]):
@@ -2290,8 +2302,8 @@ def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         _b_out_handle(args[unsafe_offset=3]),
     ):
         return
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
     _b_store_out(
@@ -2312,8 +2324,8 @@ def op_sub_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_rsub(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """other - alpha * self: ATen's rsub is `sub(other, self, alpha)`, and so
     is this (the scalar form embeds `other` in the one sub launch)."""
-    var lhs = _b_side(args[unsafe_offset=1])
-    var rhs = _b_side(args[unsafe_offset=0])
+    var lhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
     var exact = _b_exact_sides(lhs, rhs)
     if exact and not _b_alpha_is_one(args[unsafe_offset=2]):
         _b_sub_check(lhs, rhs)
@@ -2371,8 +2383,8 @@ def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_ret(
         rets,
         _b_mul(
-            _b_side(args[unsafe_offset=0]),
-            _b_side(args[unsafe_offset=1]),
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
             None,
         ),
     )
@@ -2382,7 +2394,7 @@ def op_mul_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 # aten::mul_.Scalar(Tensor(a!) self, Scalar other) -> Tensor(a!)
 def op_mul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     var self = _b_self(args[unsafe_offset=0], "mul_")
-    var rhs = _b_side(args[unsafe_offset=1])
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     _b_no_overlap_side(self, rhs)
     if not rhs.is_t and self.contig and _b_float3(self.stype):
         var s = rhs.s.value().copy()
@@ -2409,8 +2421,8 @@ def op_mul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         _b_out_handle(args[unsafe_offset=2]),
     ):
         return
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
     _b_store_out(rets, dest, _b_mul(lhs, rhs, Optional[T](dest.copy())))
@@ -2820,8 +2832,8 @@ def op_div_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_ret(
         rets,
         _b_div(
-            _b_side(args[unsafe_offset=0]),
-            _b_side(args[unsafe_offset=1]),
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
             _b_no_mode(),
             None,
         ),
@@ -2833,8 +2845,8 @@ def op_div_mode(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_ret(
         rets,
         _b_div(
-            _b_side(args[unsafe_offset=0]),
-            _b_side(args[unsafe_offset=1]),
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
             args[unsafe_offset=2],
             None,
         ),
@@ -2845,8 +2857,8 @@ def op_div_mode(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_div_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if _b_fast_div(args, rets, _b_out_handle(args[unsafe_offset=2])):
         return
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
     _b_store_out(
@@ -2858,8 +2870,8 @@ def op_div_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_div_out_mode(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var dest = _b_out_tensor(args[unsafe_offset=3], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
     _b_store_out(
@@ -2921,8 +2933,8 @@ def _b_simple(op: StaticString, args: Values, rets: Values) raises:
             rets,
             _b_bitwise(
                 op,
-                _b_side(args[unsafe_offset=0]),
-                _b_side(args[unsafe_offset=1]),
+                _b_side(args[unsafe_offset=0], _b_args_device(args)),
+                _b_side(args[unsafe_offset=1], _b_args_device(args)),
                 None,
             ),
         )
@@ -2931,8 +2943,8 @@ def _b_simple(op: StaticString, args: Values, rets: Values) raises:
         rets,
         _b_binary(
             op,
-            _b_side(args[unsafe_offset=0]),
-            _b_side(args[unsafe_offset=1]),
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
             Int32(-1),
             None,
         ),
@@ -2945,8 +2957,8 @@ def _b_simple_out(
     """`out=` twin of `_b_simple`: the result is written straight into `out`
     when it already has the result's dtype, shape and a dense layout, and
     computed then copied (cast) into it otherwise."""
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var dest = _b_out_tensor(
         args[unsafe_offset=out_index], _b_device_of(lhs, rhs)
     )
@@ -3002,8 +3014,8 @@ def _b_pow_float_base(lhs: Side, rhs: Side) raises:
 def op_pow_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if _b_fast_route("", "PowScalarSpec", False, args, rets, 0):
         return
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var f8 = _b_pow_float8(lhs, rhs)
     if f8:
         _b_ret(rets, f8.value().copy())
@@ -3032,8 +3044,8 @@ def op_pow_scalar_out(
         _b_out_handle(args[unsafe_offset=2]),
     ):
         return
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
     var f8 = _b_pow_float8(lhs, rhs)
@@ -3056,7 +3068,8 @@ def op_pow_scalar_out(
 # aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
 def op_pow_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_pow_float_base(
-        _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
     )
     _b_simple("PowSpec", args, rets)
 
@@ -3066,7 +3079,8 @@ def op_pow_tensor_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     _b_pow_float_base(
-        _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
     )
     _b_simple_out("PowSpec", args, rets, 2)
 
@@ -3217,8 +3231,8 @@ def _b_maxmin(
     return _b_maxmin_res(
         op,
         bool_op,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         dst,
     )
 
@@ -3233,11 +3247,14 @@ def _b_maxmin_out(
     var dest = _b_out_tensor(
         args[unsafe_offset=out_index],
         _b_device_of(
-            _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
         ),
     )
     _b_out_guard(
-        dest, _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+        dest,
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
     )
     _b_store_out(rets, dest, _b_maxmin(op, bool_op, args, dest.copy()))
 
@@ -3270,7 +3287,8 @@ def op_remainder(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     if (
         dev(
             _b_device_of(
-                _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1])
+                _b_side(args[unsafe_offset=0], _b_args_device(args)),
+                _b_side(args[unsafe_offset=1], _b_args_device(args)),
             )
         )[].api
         != "cuda"
@@ -3280,7 +3298,9 @@ def op_remainder(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _b_ret(
         rets,
         _b_remainder(
-            _b_side(args[unsafe_offset=0]), _b_side(args[unsafe_offset=1]), None
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
+            None,
         ),
     )
 
@@ -3290,8 +3310,8 @@ def op_remainder(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_remainder_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if dev(_b_device_of(lhs, rhs))[].api != "cuda":
         _b_simple_out("RemainderSpec", args, rets, 2)
         return
@@ -3358,8 +3378,8 @@ def op_floor_divide(
         rets,
         _b_rounding_div(
             True,
-            _b_side(args[unsafe_offset=0]),
-            _b_side(args[unsafe_offset=1]),
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
             None,
         ),
     )
@@ -3371,8 +3391,8 @@ def op_floor_divide_out(
 ) raises:
     """floor_divide_out: `div_floor_stub` over a binary_op TensorIterator,
     the route div.out_mode(rounding_mode="floor") takes."""
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs)
     _b_store_out(
@@ -3385,7 +3405,7 @@ def op_floor_divide_(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var self = _b_self(args[unsafe_offset=0], "floor_divide_")
-    var rhs = _b_side(args[unsafe_offset=1])
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     _b_inplace_destination(self)
     if rhs.is_t:
         _b_inplace_operand(self, rhs.t.value())
@@ -3519,8 +3539,8 @@ def _b_logical(op: StaticString, args: Values, rets: Values) raises:
         rets,
         _b_logical_res(
             op,
-            _b_side(args[unsafe_offset=0]),
-            _b_side(args[unsafe_offset=1]),
+            _b_side(args[unsafe_offset=0], _b_args_device(args)),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
             None,
         ),
     )
@@ -3529,8 +3549,8 @@ def _b_logical(op: StaticString, args: Values, rets: Values) raises:
 def _b_logical_out(op: StaticString, args: Values, rets: Values) raises:
     """`out=` twin of `_b_logical`: the bool result, written straight into a
     bool `out` or cast into any other dtype (torch's comparison iterator)."""
-    var lhs = _b_side(args[unsafe_offset=0])
-    var rhs = _b_side(args[unsafe_offset=1])
+    var lhs = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var rhs = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var dest = _b_out_tensor(args[unsafe_offset=2], _b_device_of(lhs, rhs))
     _b_out_guard(dest, lhs, rhs, False)
     _b_store_out(
@@ -3916,7 +3936,7 @@ def _b_lerp(args: Values, dst: Optional[T] = None) raises -> Res:
         raise Error("expected both operands on the same mojo device")
     if start.stype != ST_FLOAT32 or finish.stype != ST_FLOAT32:
         unsupported("lerp of a dtype other than float32")
-    var w = _b_side(args[unsafe_offset=2])
+    var w = _b_side(args[unsafe_offset=2], _b_args_device(args))
     if w.is_t:
         unsupported("a tensor weight for lerp.Scalar")
     var weight = w.s.value().f
@@ -4017,7 +4037,7 @@ def _b_addc(
         unsupported("addc* of dtype " + String(a.stype))
     if a.rank > 4 or b.rank > 4 or c.rank > 4:
         unsupported("addc* operands of rank > 4")
-    var value = _b_side(args[unsafe_offset=3])
+    var value = _b_side(args[unsafe_offset=3], _b_args_device(args))
     if value.is_t:
         unsupported("a tensor `value` for addc*")
     var s = value.s.value().copy()
@@ -4127,9 +4147,9 @@ def op_addcmul_out_legacy(
     )
     _b_out_guard3(
         dest,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
-        _b_side(args[unsafe_offset=2]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
+        _b_side(args[unsafe_offset=2], _b_args_device(args)),
     )
     _b_store_out(rets, dest, _b_addc("AddcmulBcast", args, True, dest.copy()))
 
@@ -4151,9 +4171,9 @@ def op_addcdiv_out_legacy(
     )
     _b_out_guard3(
         dest,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
-        _b_side(args[unsafe_offset=2]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
+        _b_side(args[unsafe_offset=2], _b_args_device(args)),
     )
     _b_store_out(rets, dest, _b_addc("AddcdivBcast", args, False, dest.copy()))
 

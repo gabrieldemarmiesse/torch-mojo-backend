@@ -6,6 +6,7 @@ device only -- see agents_docs/native_backend.md and AGENT_BRIEF.md.
 import pytest
 import torch
 
+from tests.native.conftest import is_cuda
 from torch_mojo_backend import aten_functions, register_mojo_devices
 from torch_mojo_backend.testing import CallChecker
 
@@ -1001,22 +1002,41 @@ def test_functional_assert_async_and_dep_token(mojo_gpu):
 
 @pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
 @pytest.mark.parametrize("op", [torch.lt, torch.le, torch.gt, torch.ge])
-def test_ordered_comparison_of_wide_unsigned_never_wrong(mojo_gpu, op, dtype):
-    """Ordered comparisons of uint16 / uint32 / uint64 either raise (no
-    kernel: CUDA and the other backends) or give the right values; never the
-    signed reading (2**31 < 1 true)."""
+def test_ordered_comparison_of_wide_unsigned_raises(mojo_gpu, op, dtype):
+    """Ordered comparisons of uint16 / uint32 / uint64 have no kernel (CUDA:
+    `compare_cuda` is not implemented; the other backends have none either):
+    they raise on every device, never the signed reading (2**31 < 1 true)."""
     hi = {torch.uint16: 1 << 15, torch.uint32: 1 << 31, torch.uint64: 1 << 63}[dtype]
-    # the bit patterns through int64 (CPU torch has no uint64 arithmetic)
     wrap = hi - (1 << 64) if dtype == torch.uint64 else hi
-    a_cpu = torch.tensor([wrap, 1, 5], dtype=torch.int64).view(torch.int64)
-    b_cpu = torch.tensor([1, wrap, 5], dtype=torch.int64)
+    a_bits = torch.tensor([wrap, 1, 5], dtype=torch.int64)
+    b_bits = torch.tensor([1, wrap, 5], dtype=torch.int64)
     if dtype == torch.uint64:
-        a_cpu, b_cpu = a_cpu.view(torch.uint64), b_cpu.view(torch.uint64)
+        a_cpu, b_cpu = a_bits.view(torch.uint64), b_bits.view(torch.uint64)
     else:
-        a_cpu, b_cpu = a_cpu.to(dtype), b_cpu.to(dtype)
-    a, b = a_cpu.to(mojo_gpu), b_cpu.to(mojo_gpu)
+        a_cpu, b_cpu = a_bits.to(dtype), b_bits.to(dtype)
+    with pytest.raises((RuntimeError, NotImplementedError)):
+        op(a_cpu.to(mojo_gpu), b_cpu.to(mojo_gpu))
+
+
+@pytest.mark.parametrize("dtype", [torch.uint16, torch.uint32, torch.uint64])
+@pytest.mark.parametrize("op", [torch.eq, torch.ne])
+def test_equality_of_wide_unsigned_values(mojo_gpu, op, dtype):
+    """eq / ne of the wide unsigned types compare the bits (CUDA has the
+    kernel); expected values from int64 (a sign flip keeps uint64 order and
+    equality)."""
+    hi = {torch.uint16: 1 << 15, torch.uint32: 1 << 31, torch.uint64: 1 << 63}[dtype]
+    wrap = hi - (1 << 64) if dtype == torch.uint64 else hi
+    a_bits = torch.tensor([wrap, 1, 5], dtype=torch.int64)
+    b_bits = torch.tensor([1, wrap, 5], dtype=torch.int64)
+    if dtype == torch.uint64:
+        a_cpu, b_cpu = a_bits.view(torch.uint64), b_bits.view(torch.uint64)
+    else:
+        a_cpu, b_cpu = a_bits.to(dtype), b_bits.to(dtype)
+    want = op(a_bits.to(torch.int64), b_bits.to(torch.int64))
     try:
-        got = op(a, b)
+        got = op(a_cpu.to(mojo_gpu), b_cpu.to(mojo_gpu))
     except (RuntimeError, NotImplementedError):
-        return
-    torch.testing.assert_close(got.cpu(), op(a_cpu, b_cpu), rtol=0, atol=0)
+        if is_cuda(mojo_gpu):
+            raise  # the cuda leg must run
+        return  # other backends: no kernel, as in origin
+    torch.testing.assert_close(got.cpu(), want, rtol=0, atol=0)

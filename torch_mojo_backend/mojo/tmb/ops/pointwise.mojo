@@ -160,6 +160,7 @@ from tmb.ops.binary import (
     _b_self,
     _b_same_tensor,
     _b_shape_list,
+    _b_args_device,
     _b_side,
     _b_sside,
     _b_store_inplace,
@@ -620,7 +621,7 @@ def _pw_inplace_self(
     var self = _b_self(args[unsafe_offset=0], what)
     _b_inplace_destination(self)
     for i in range(1, n_operands):
-        var side = _b_side(args[unsafe_offset=i])
+        var side = _b_side(args[unsafe_offset=i], _b_args_device(args))
         if side.is_t:
             _b_inplace_operand(self, side.t.value())
     return self^
@@ -688,9 +689,15 @@ def _pw_math(
     dtype instead of casting into it."""
     if not exact_dtype and not _pw_out_exact(kind):
         _pw_complex_out_check(args, arity, out_index)
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
-    var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = (
+        _b_side(args[unsafe_offset=1], _b_args_device(args)) if arity
+        >= 2 else _none_side()
+    )
+    var c = (
+        _b_side(args[unsafe_offset=2], _b_args_device(args)) if arity
+        >= 3 else _none_side()
+    )
     var dest = Optional[T]()
     if out_index >= 0:
         # TensorIterator's out= checks and resize precede the kernel
@@ -739,8 +746,14 @@ def _pw_math_inplace(
     it."""
     var self = _pw_inplace_self(args, kind, arity)
     var a = _b_tside(self)
-    var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
-    var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
+    var b = (
+        _b_side(args[unsafe_offset=1], _b_args_device(args)) if arity
+        >= 2 else _none_side()
+    )
+    var c = (
+        _b_side(args[unsafe_offset=2], _b_args_device(args)) if arity
+        >= 3 else _none_side()
+    )
     _ = _pw_broadcast(a, b, c, arity)
     var common = _pw_result_type(a, b, c, arity)
     var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
@@ -813,8 +826,8 @@ def _pw_fmaxmin(
     ):
         _pw_math(kind, P_ALL, True, 2, args, rets, out_index)
         return
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not a.is_t or b.is_t or not _pw_cuda_args(args):
         _pw_math(kind, P_ALL, True, 2, args, rets, out_index)
         return
@@ -863,7 +876,11 @@ def op_fmod(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 def _fmod_params(args: Values) raises -> SIMD[DType.float64, 4]:
     """p0 = 2 when the divisor is a CPU scalar (its float64 NaN first)."""
-    return _p(2.0 if not _b_side(args[unsafe_offset=1]).is_t else 0.0)
+    return _p(
+        2.0 if not _b_side(
+            args[unsafe_offset=1], _b_args_device(args)
+        ).is_t else 0.0
+    )
 
 
 # aten::fmod.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
@@ -911,8 +928,8 @@ def _pw_side_stype(side: Side) -> Int32:
 def _pw_same_dtype(name: StaticString, args: Values) raises:
     """heaviside's meta check: both tensors of one dtype, a CPU 0-d
     `values` included."""
-    var a = _pw_side_stype(_b_side(args[unsafe_offset=0]))
-    var b = _pw_side_stype(_b_side(args[unsafe_offset=1]))
+    var a = _pw_side_stype(_b_side(args[unsafe_offset=0], _b_args_device(args)))
+    var b = _pw_side_stype(_b_side(args[unsafe_offset=1], _b_args_device(args)))
     if a != b:
         raise Error(
             String(name)
@@ -1094,7 +1111,7 @@ def _pw_shift_inplace(kind: StaticString, args: Values, rets: Values) raises:
     as TensorIterator does for any in-place op (`_b_store_inplace`)."""
     var self = _pw_inplace_self(args, "an in-place shift", 2)
     var a = _b_tside(self)
-    var b = _b_side(args[unsafe_offset=1])
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var common = _pw_result_type(a, b, _none_side(), 2)
     if not can_cast(common, self.stype):
         # TensorIterator's check on the in-place output (`x <<= 2.0`)
@@ -1747,8 +1764,12 @@ def _pw_addc(
         "addcdiv_cuda"
     )
     if kind == "addcdiv":
-        var s1 = _pw_side_stype(_b_side(args[unsafe_offset=1]))
-        var s2 = _pw_side_stype(_b_side(args[unsafe_offset=2]))
+        var s1 = _pw_side_stype(
+            _b_side(args[unsafe_offset=1], _b_args_device(args))
+        )
+        var s2 = _pw_side_stype(
+            _b_side(args[unsafe_offset=2], _b_args_device(args))
+        )
         var int1 = _pw_is_int(s1) or s1 == ST_BOOL or is_wide_unsigned(s1)
         var int2 = _pw_is_int(s2) or s2 == ST_BOOL or is_wide_unsigned(s2)
         if int1 and int2:
@@ -1763,8 +1784,8 @@ def _pw_addc(
     var a = _b_tside(self.value()) if inplace else _b_side(
         args[unsafe_offset=0]
     )
-    var b = _b_side(args[unsafe_offset=1])
-    var c = _b_side(args[unsafe_offset=2])
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    var c = _b_side(args[unsafe_offset=2], _b_args_device(args))
     var dest = Optional[T]()
     if out_index >= 0:
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
@@ -1886,9 +1907,9 @@ def op_addcdiv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 
 def _pw_lerp(args: Values, rets: Values, out_index: Int) raises:
-    var start = _b_side(args[unsafe_offset=0])
-    var end = _b_side(args[unsafe_offset=1])
-    var weight = _b_side(args[unsafe_offset=2])
+    var start = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var end = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    var weight = _b_side(args[unsafe_offset=2], _b_args_device(args))
     if start.is_t and end.is_t:
         if start.t.value().stype != end.t.value().stype:
             raise Error(
@@ -1970,12 +1991,12 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
                 >= 0 else "wrapper_CUDA_clamp_Tensor",
                 ")",
             )
-    var a = _b_side(args[unsafe_offset=0])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
     if has_min and has_max:
         var common = _pw_result_type(
             a,
-            _b_side(args[unsafe_offset=1]),
-            _b_side(args[unsafe_offset=2]),
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
+            _b_side(args[unsafe_offset=2], _b_args_device(args)),
             3,
         )
         if (common == ST_BOOL or is_wide_unsigned(common)) and _pw_cuda_args(
@@ -1990,7 +2011,9 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
         _pw_math("clamp", P_ALL, True, 3, args, rets, out_index)
         return
     # One bound: ATen's maximum_stub / minimum_stub over the promoted pair.
-    var bound = _b_side(args[unsafe_offset=1 if has_min else 2])
+    var bound = _b_side(
+        args[unsafe_offset=1 if has_min else 2], _b_args_device(args)
+    )
     var common = _pw_result_type(a, bound, _none_side(), 2)
     var dest = Optional[T]()
     if out_index >= 0:
@@ -2061,8 +2084,8 @@ def _pw_pow_scalar_base(args: Values, rets: Values, out_index: Int) raises:
     to the result dtype as PowKernel.cu's cpu-scalar base
     (`iter.scalar_value<scalar_t>(1)`; MPS wraps it in a tensor of that
     dtype); floating results only."""
-    var base = _b_side(args[unsafe_offset=0])
-    var expo = _b_side(args[unsafe_offset=1])
+    var base = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var expo = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if base.is_t:
         unsupported("pow.Scalar with a tensor base")
     if _pw_int_side(base) and _pw_int_side(expo):
@@ -2152,8 +2175,8 @@ def _pw_lerp_scalar(
 ) raises:
     """lerp.Scalar: the weight is a parameter, converted to opmath like
     Lerp.cu. `in_place` is lerp_ (self written, never resized)."""
-    var start = _b_side(args[unsafe_offset=0])
-    var end = _b_side(args[unsafe_offset=1])
+    var start = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var end = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if start.is_t and end.is_t and start.t.value().stype != end.t.value().stype:
         raise Error(
             "expected dtype "
@@ -2226,16 +2249,16 @@ def _pw_ipow(
 ) raises:
     """Integer pow (Pow.h powi) for two integral operands."""
     if scalar_exponent:
-        var e = _b_side(args[unsafe_offset=1])
+        var e = _b_side(args[unsafe_offset=1], _b_args_device(args))
         if e.s.value().i < 0:
             raise Error("Integers to negative integer powers are not allowed.")
     _pw_math("ipow", P_INT, True, 2, args, rets, out_index)
 
 
 def _pw_both_int(args: Values) raises -> Bool:
-    return _pw_int_side(_b_side(args[unsafe_offset=0])) and _pw_int_side(
-        _b_side(args[unsafe_offset=1])
-    )
+    return _pw_int_side(
+        _b_side(args[unsafe_offset=0], _b_args_device(args))
+    ) and _pw_int_side(_b_side(args[unsafe_offset=1], _b_args_device(args)))
 
 
 def _pw_rsub_check(args: Values) raises:
@@ -2243,8 +2266,8 @@ def _pw_rsub_check(args: Values) raises:
     alpha)): no bool operand, no bool alpha (it would need a bool result,
     which sub_check already refused), no floating alpha for an integral
     result."""
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     _b_sub_check(b, a)
     _b_alpha_check(
         _pw_result_type(a, b, _none_side(), 2), args[unsafe_offset=2]
@@ -2398,8 +2421,8 @@ def _pw_pow_real(
     """pow of real operands (see above). False for what binary.mojo keeps:
     float8 operands, and two tensors of one floating dtype (its PowSpec
     kernels)."""
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if _pw_pow_f8_side(a) or _pw_pow_f8_side(b):
         return False
     if out_index >= 0 and _pw_is_f8(
@@ -2563,8 +2586,8 @@ def _pw_ldexp_legacy(args: Values, rets: Values, out_index: Int) raises:
     (torch MPS registers no ldexp_stub and multiplies by pow(2, other) for an
     integral exponent too, which under- and overflows where ::ldexp does
     not: Apple GPUs keep the exact route.)"""
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not a.is_t:
         unsupported("ldexp with a scalar self")
     if not b.is_t and b.zero_st < 0:
@@ -2741,7 +2764,7 @@ def op_ldexp__legacy(
     to a larger shape raises."""
     var self = _pw_inplace_self(args, "ldexp_", 2)
     var a = _b_tside(self)
-    var b = _b_side(args[unsafe_offset=1])
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     _b_no_overlap_side(self, b)
     if not b.is_t and b.zero_st < 0:
         unsupported("ldexp_ with a Python-number exponent")
@@ -2771,8 +2794,8 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
     var alpha = v_f64(args[unsafe_offset=2])
     if alpha == 1.0:
         return False
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not a.is_t:
         return False
     var common = _pw_result_type(a, b, _none_side(), 2)
@@ -2828,8 +2851,8 @@ def _pw_pow_f64_scalar(
     """A float64 tensor to a real scalar power: PowKernel.cu's special
     exponents (products, sqrt, rsqrt, reciprocal) before the full pow, which
     the elementwise family's PowScalarSpec does for the float types only."""
-    var base = _b_side(args[unsafe_offset=0])
-    var expo = _b_side(args[unsafe_offset=1])
+    var base = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var expo = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not base.is_t or expo.is_t:
         return False
     if base.t.value().stype != ST_FLOAT64:
@@ -2861,8 +2884,10 @@ def _pw_int_scalar_pow(args: Values) raises -> Bool:
     """An integral result of pow.Tensor_Scalar: an integer tensor, or a bool
     one (`torch.square(bool_t)` is `pow(bool_t, 2)`, which promotes to int64),
     to a non-bool integer exponent."""
-    var base = _b_side(args[unsafe_offset=0])
-    if not base.is_t or not _pw_int_side(_b_side(args[unsafe_offset=1])):
+    var base = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    if not base.is_t or not _pw_int_side(
+        _b_side(args[unsafe_offset=1], _b_args_device(args))
+    ):
         return False
     var st = base.t.value().stype
     return _pw_is_int(st) or st == ST_BOOL
@@ -2962,9 +2987,12 @@ def _pw_act(
     dtype, operand a = args[a_index], b = args[b_index]. The result is in
     the compute dtype, or in `out_st` when given (a TensorIterator whose
     output is allocated from one input's options)."""
-    var a = _b_side(args[unsafe_offset=a_index])
+    var a = _b_side(args[unsafe_offset=a_index], _b_args_device(args))
     var arity = 1 if b_index < 0 else 2
-    var b = _b_side(args[unsafe_offset=b_index]) if arity == 2 else _none_side()
+    var b = (
+        _b_side(args[unsafe_offset=b_index], _b_args_device(args)) if arity
+        == 2 else _none_side()
+    )
     var common = _pw_result_type(a, b, _none_side(), arity)
     var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     var dest = Optional[T]()
@@ -3084,8 +3112,8 @@ def _shrink_backward_p(args: Values) raises -> SIMD[DType.float64, 4]:
     (grad, self) dtype, not self's (float16 self 0.3 is 0.30005, outside a
     float32 lambd of 0.3; a float16 lambd would round to 0.30005 too)."""
     var common = _pw_result_type(
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         2,
     )
@@ -4071,8 +4099,12 @@ def op_log_sigmoid_forward_output(
 def _log_sigmoid_backward_check(args: Values) raises:
     """ATen builds log_sigmoid_backward's iterator with the default
     check_all_same_dtype: grad_output must have self's dtype, no promotion."""
-    var grad = _pw_side_stype(_b_side(args[unsafe_offset=0]))
-    var self = _pw_side_stype(_b_side(args[unsafe_offset=1]))
+    var grad = _pw_side_stype(
+        _b_side(args[unsafe_offset=0], _b_args_device(args))
+    )
+    var self = _pw_side_stype(
+        _b_side(args[unsafe_offset=1], _b_args_device(args))
+    )
     if grad != self:
         raise Error(
             "Found dtype ", dtype_name(grad), " but expected ", dtype_name(self)
@@ -4307,8 +4339,8 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     if not _pw_cuda_args(args):
         _pw_ldexp_legacy(args, rets, out_index)
         return
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not a.is_t and a.zero_st < 0 or not b.is_t and b.zero_st < 0:
         unsupported("ldexp with a Python-number operand")
     # An explicit CPU 0-d operand is a rank-0 tensor of its own dtype.
@@ -4522,7 +4554,7 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
         return
     var self = _pw_inplace_self(args, "ldexp_", 2)
     var a = _b_tside(self)
-    var b = _b_side(args[unsafe_offset=1])
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     _b_no_overlap_side(self, b)
     if not b.is_t and b.zero_st < 0:
         unsupported("ldexp_ with a Python-number exponent")
@@ -4763,8 +4795,8 @@ def op_mse_loss(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _loss_forward(
         "mse",
         2,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
         _p(),
@@ -4780,8 +4812,8 @@ def op_mse_loss_out(
     _loss_forward(
         "mse",
         2,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
         _p(),
@@ -4791,13 +4823,13 @@ def op_mse_loss_out(
 
 
 def _mse_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
-    var input = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var reduction = _loss_reduction(args[unsafe_offset=3])
     _loss_backward(
         "mse_backward",
-        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
         input,
-        _b_side(args[unsafe_offset=2]),
+        _b_side(args[unsafe_offset=2], _b_args_device(args)),
         _loss_norm(input, reduction, 2.0),
         0.0,
         out_v,
@@ -4826,8 +4858,8 @@ def _smooth_l1(args: Values, rets: Values, out_v: Optional[Value]) raises:
     _loss_forward(
         "smooth_l1",
         2,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
         _p(beta),
@@ -4854,13 +4886,13 @@ def op_smooth_l1_loss_out(
 def _smooth_l1_backward(
     args: Values, rets: Values, out_v: Optional[Value]
 ) raises:
-    var input = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var reduction = _loss_reduction(args[unsafe_offset=3])
     _loss_backward(
         "smooth_l1_backward",
-        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
         input,
-        _b_side(args[unsafe_offset=2]),
+        _b_side(args[unsafe_offset=2], _b_args_device(args)),
         _loss_norm(input, reduction, 1.0),
         v_f64(args[unsafe_offset=4]),
         out_v,
@@ -4888,7 +4920,7 @@ def _huber(args: Values, rets: Values, out_v: Optional[Value]) raises:
         raise Error(
             "huber_loss does not support non-positive values for delta."
         )
-    var a = _b_side(args[unsafe_offset=0])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
     if not a.is_t:
         unsupported("huber with a scalar operand")
     # ATen's huber_loss allocates `empty_like(input)`: the loss is in the
@@ -4897,7 +4929,7 @@ def _huber(args: Values, rets: Values, out_v: Optional[Value]) raises:
         "huber",
         2,
         a,
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
         _p(delta),
@@ -4921,13 +4953,13 @@ def op_huber_loss_out(
 
 
 def _huber_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
-    var input = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var reduction = _loss_reduction(args[unsafe_offset=3])
     _loss_backward(
         "huber_backward",
-        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
         input,
-        _b_side(args[unsafe_offset=2]),
+        _b_side(args[unsafe_offset=2], _b_args_device(args)),
         _loss_norm(input, reduction, 1.0),
         v_f64(args[unsafe_offset=4]),
         out_v,
@@ -5045,8 +5077,8 @@ def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
     the loss in it (`loss.mul_(weight)` keeps it: a float32 weight on
     float16 inputs is a float16 loss), the weight never growing its shape."""
     var weight = _opt_weight(args[unsafe_offset=2])
-    var input = _b_side(args[unsafe_offset=0])
-    var raw_target = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var raw_target = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not input.is_t or not raw_target.is_t:
         unsupported("binary_cross_entropy with a scalar operand")
     _loss_same_dtype(input, raw_target)
@@ -5128,9 +5160,9 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     """Loss.cu binary_cross_entropy_backward_out_cuda: the gradient kernel,
     then `mul_(weight)` and the mean's `div_(numel)` -- folded into the
     gradient kernel when there is no weight, a second kind when there is."""
-    var grad = _b_side(args[unsafe_offset=0])
-    var input = _b_side(args[unsafe_offset=1])
-    var raw_target = _b_side(args[unsafe_offset=2])
+    var grad = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var input = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    var raw_target = _b_side(args[unsafe_offset=2], _b_args_device(args))
     var weight = _opt_weight(args[unsafe_offset=3])
     var reduction = _loss_reduction(args[unsafe_offset=4])
     if not grad.is_t or not input.is_t or not raw_target.is_t:
@@ -5237,8 +5269,8 @@ def _bce_logits(args: Values, rets: Values, out_v: Optional[Value]) raises:
     its own derivatives.yaml formula."""
     var weight = _opt_weight(args[unsafe_offset=2])
     var pos_weight = _opt_weight(args[unsafe_offset=3])
-    var input = _b_side(args[unsafe_offset=0])
-    var target = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var target = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not input.is_t or not target.is_t:
         unsupported("binary_cross_entropy_with_logits with a scalar operand")
     var c = _b_tside(pos_weight.value()) if pos_weight else _b_sside(
@@ -5307,9 +5339,13 @@ def op_binary_cross_entropy_with_logits_out(
 def _pw_same_dtypes(args: Values, n: Int) raises -> Int32:
     """TensorIterator's `check_all_same_dtype` over args[0 .. n): the
     common dtype, or CPU torch's "Found dtype X but expected Y"."""
-    var first = _pw_side_stype(_b_side(args[unsafe_offset=0]))
+    var first = _pw_side_stype(
+        _b_side(args[unsafe_offset=0], _b_args_device(args))
+    )
     for i in range(1, n):
-        var st = _pw_side_stype(_b_side(args[unsafe_offset=i]))
+        var st = _pw_side_stype(
+            _b_side(args[unsafe_offset=i], _b_args_device(args))
+        )
         if st != first:
             raise Error(
                 "Found dtype ",
@@ -5345,12 +5381,14 @@ def _pw_fixed(
 ) raises -> Res:
     """`kind` over args[first .. first + arity), all of dtype `st`, into a
     fresh tensor of their broadcast shape."""
-    var a = _b_side(args[unsafe_offset=first])
+    var a = _b_side(args[unsafe_offset=first], _b_args_device(args))
     var b = (
-        _b_side(args[unsafe_offset=first + 1]) if arity >= 2 else _none_side()
+        _b_side(args[unsafe_offset=first + 1], _b_args_device(args)) if arity
+        >= 2 else _none_side()
     )
     var c = (
-        _b_side(args[unsafe_offset=first + 2]) if arity >= 3 else _none_side()
+        _b_side(args[unsafe_offset=first + 2], _b_args_device(args)) if arity
+        >= 3 else _none_side()
     )
     return _pw_run(kind, arity, a, b, c, st, st, params, None)
 
@@ -5373,9 +5411,9 @@ def op_prelu_kernel_backward(
     the weight's shape afterwards)."""
     var st = _pw_same_dtypes(args, 3)
     _pw_floating_dispatch("prelu_backward_cuda", st, True)
-    var g = _b_side(args[unsafe_offset=0])
-    var x = _b_side(args[unsafe_offset=1])
-    var w = _b_side(args[unsafe_offset=2])
+    var g = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var x = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    var w = _b_side(args[unsafe_offset=2], _b_args_device(args))
     var gi = _pw_run("prelu_backward_input", 3, x, w, g, st, st, _p(), None)
     var gw = _pw_run("prelu_backward_weight", 3, x, w, g, st, st, _p(), None)
     ret_tensor(rets, 0, gi.t)
@@ -5442,8 +5480,8 @@ def _add_relu(args: Values, rets: Values, out_index: Int, inplace: Bool) raises:
     if inplace:
         a = _b_tside(_pw_inplace_self(args, "_add_relu_", 2))
     else:
-        a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+        a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var c = _none_side()
     var common = _pw_result_type(a, b, c, 2)
     _add_relu_check(_pw_side_stype(a), common)
@@ -5631,8 +5669,8 @@ def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     ):
         _pw_isclose_composite(args, rets)
         return
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var st = _pw_side_stype(a)
     var other_st = _pw_side_stype(b)
     if st != other_st:
