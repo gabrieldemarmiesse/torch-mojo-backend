@@ -37,6 +37,7 @@ from tmb.kernels.common.libdevice_port import nv_cosh, nv_sincos, nv_sinh
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pointwise_math import (
     _exp,
+    _expm1,
     _log,
     _log1p,
     _pcos,
@@ -682,10 +683,31 @@ def _jsin[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 
 
 @always_inline
+def _plain_sinh_cosh[dt: DType, cosh: Bool](x: Scalar[dt]) -> Scalar[dt]:
+    """sinh / cosh off NVIDIA: an expm1 form (exact for small |x|), and
+    e^(|x| - ln 2) past the point where e^-|x| no longer registers, which
+    stays finite up to the true overflow."""
+    var ax = _copysign(x, Scalar[dt](1))
+    comptime big = Scalar[dt](40) if dt == DType.float64 else Scalar[dt](12)
+    var r: Scalar[dt]
+    if ax > big:
+        r = _rexp(ax - Scalar[dt](0.6931471805599453))
+    else:
+        var em = _expm1[dt, 1](ax)
+        comptime if cosh:
+            r = Scalar[dt](1) + em * em / (Scalar[dt](2) * (em + Scalar[dt](1)))
+        else:
+            r = (em + em / (em + Scalar[dt](1))) / Scalar[dt](2)
+    comptime if cosh:
+        return r
+    else:
+        return _copysign(r, x)
+
+
+@always_inline
 def _nv_sinh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     comptime if not is_nvidia_gpu():
-        var e = _rexp(x)
-        return (e - Scalar[dt](1) / e) / Scalar[dt](2)
+        return _plain_sinh_cosh[dt, False](x)
     elif dt == DType.float64:
         return rebind[Scalar[dt]](nv_sinh(rebind[Float64](x)))
     else:
@@ -695,8 +717,7 @@ def _nv_sinh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
 @always_inline
 def _nv_cosh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     comptime if not is_nvidia_gpu():
-        var e = _rexp(x)
-        return (e + Scalar[dt](1) / e) / Scalar[dt](2)
+        return _plain_sinh_cosh[dt, True](x)
     elif dt == DType.float64:
         return rebind[Scalar[dt]](nv_cosh(rebind[Float64](x)))
     else:

@@ -3198,6 +3198,9 @@ def sgg_alt_contraction(i: Int, numel: Int) -> Bool:
     its vectorized launch): the first 128 elements of a partial last block
     run a second inlined copy of the small-x expression, which ptxas fuses
     the other way. Probed per index at numel 512 / 1500 / 2300 / 5000.
+    The slice rules (here and for the other paths) were probed on sm_90
+    only; other NVIDIA architectures cap the vector width at 4, so the
+    half-precision rules are unverified there.
     The other launch paths (strided, misaligned) are keyed in
     kernels/pointwise/entry.mojo. Known limit: tensors of more than 2**31
     elements run CUDA's 64-bit-indexing kernels, which were not probed (too

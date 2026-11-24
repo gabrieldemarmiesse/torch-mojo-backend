@@ -574,16 +574,23 @@ def test_binary_special_scalars_and_promotion_match_cuda(
 
 
 _NAN_X_LAYOUTS = {
-    "contig": lambda a, b: (a, b),
-    "offset1": lambda a, b: (a[1:], b[1:]),
-    "stride2": lambda a, b: (a[::2], b[::2]),
-    "broadcast": lambda a, b: (a.reshape(-1, 10), b[:10]),
-    "python_scalar_y": lambda a, b: (a, -1.0),
-    "python_scalar_x": lambda a, b: (math.nan, b),
-    "zero_dim_y": lambda a, b: (a, b[:1].reshape(())),
-    "zero_dim_x": lambda a, b: (a[:1].reshape(()), b),
-    "mixed_f32_y": lambda a, b: (a, b.float()),
-    "int_y": lambda a, b: (a, torch.full_like(b, 3, dtype=torch.int64)),
+    "contig": lambda a, b, n: (a, b),
+    "offset1": lambda a, b, n: (a[1:], b[1:]),
+    "stride2": lambda a, b, n: (a[::2], b[::2]),
+    "mixed_perm": lambda a, b, n: (
+        a[:n].reshape(-1, _inner(n, (10, 8))).t(),
+        b[:n].reshape(_inner(n, (10, 8)), -1),
+    ),
+    "broadcast": lambda a, b, n: (
+        a[:n].reshape(-1, _inner(n, (10, 8))),
+        b[: _inner(n, (10, 8))],
+    ),
+    "python_scalar_y": lambda a, b, n: (a, -1.0),
+    "python_scalar_x": lambda a, b, n: (math.nan, b),
+    "zero_dim_y": lambda a, b, n: (a, b[:1].reshape(())),
+    "zero_dim_x": lambda a, b, n: (a[:1].reshape(()), b),
+    "mixed_f32_y": lambda a, b, n: (a, b.float()),
+    "int_y": lambda a, b, n: (a, torch.full_like(b, 3, dtype=torch.int64)),
 }
 
 
@@ -611,19 +618,18 @@ def test_xlogy_float64_nan_x_matches_cuda(
     vectorized blocks and for broadcast operands, x's in the partial last
     1024-block, for host scalar x and for mixed operand dtypes."""
     fn = {"xlogy": torch.xlogy, "xlog1py": torch.special.xlog1py}[name]
-    if layout == "broadcast" and (n % 10):
-        pytest.skip("needs a multiple of 10")
     if payload < 0:
         a, b = _nan_x_inputs(n, 0)
         a = -a
     else:
         a, b = _nan_x_inputs(n, payload)
     view = _NAN_X_LAYOUTS[layout]
-    cuda_oracle.assert_bitwise_equal(lambda x, y: fn(*view(x, y)), a, b)
+    cuda_oracle.assert_bitwise_equal(lambda x, y: fn(*view(x, y, n)), a, b)
 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="CUDA's partial-block rule keys on the memory index of the (permuted) "
     "output; ours iterates the logical order",
 )
@@ -662,6 +668,36 @@ def test_zeta_float64_nan_operands_match_cuda(
         "f64_zero_dim_f32": lambda a, b: (a, b[0].float()),
     }
     cuda_oracle.assert_bitwise_equal(lambda a, b: S.zeta(*views[mix](a, b)), x, q)
+
+
+_OUT_VIEWS = {
+    "dense": lambda o: o,
+    "offset1": lambda o: o[1:],
+    "stride2": lambda o: o[::2],
+    # a 2-D out= for 1-D operands is resized to a fresh dense tensor
+    "resized_2d": lambda o: o.reshape(-1, 10).t(),
+}
+
+
+@pytest.mark.parametrize("n", (1000, 4900))
+@pytest.mark.parametrize("out_view", _OUT_VIEWS)
+@pytest.mark.parametrize("name", ("xlogy", "xlog1py"))
+def test_xlogy_float64_nan_x_out_views_match_cuda(
+    cuda_oracle: CudaOracle, name: str, out_view: str, n: int
+):
+    """The out= tensor's layout and alignment pick the CUDA kernel too."""
+    fn = {"xlogy": torch.xlogy, "xlog1py": torch.special.xlog1py}[name]
+    a, b = _nan_x_inputs(n, 0x123)
+    a, b = a[:n], b[:n]
+    size = {"dense": n, "offset1": n + 1, "stride2": 2 * n, "resized_2d": n}[out_view]
+
+    def run(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        buf = torch.zeros(size, dtype=torch.float64, device=x.device)
+        out = _OUT_VIEWS[out_view](buf)
+        fn(x, y, out=out)
+        return buf
+
+    cuda_oracle.assert_bitwise_equal(run, a, b)
 
 
 _POLY = [
@@ -801,18 +837,72 @@ def test_standard_gamma_grad_remainder_block_matches_cuda(cuda_oracle: CudaOracl
 # Which CUDA kernel runs decides the gamma-grad contraction (the vectorized
 # one, the strided one, the unrolled one over misaligned storage), so every
 # layout below picks a path. Probed per index against stock CUDA.
+# (alpha, x) bit patterns whose small-x result depends on the contraction, per
+# dtype, found against stock CUDA (vectorized vs misaligned launch of one dataset).
+_SGG_PAIRS = {
+    torch.float32: [
+        (0x40772C7C, 0x3F48887C),
+        (0x405F171F, 0x3E4C4D00),
+        (0x408A91A2, 0x3EAE5D4B),
+        (0x3FFE0393, 0x3E95E8E9),
+    ],
+    torch.float16: [
+        (0x3825, 0x3991),
+        (0x41A3, 0x2A24),
+        (0x3149, 0x3974),
+        (0x41EF, 0x3901),
+    ],
+    torch.bfloat16: [
+        (0x3CFB, 0x3F05),
+        (0x3D4A, 0x3E76),
+        (0x3C82, 0x3ECC),
+        (0x3E1A, 0x3E2A),
+    ],
+    torch.float64: [
+        (0x400166546CF478C5, 0x3FD367BCCEFA37E2),
+        (0x400BE2E3E944DDBC, 0x3FC9899FFE4B738D),
+        (0x3FFF6DE837EA447A, 0x3FE2285E449AC33E),
+        (0x4013455E9F352FA4, 0x3FBD8701F8C41140),
+    ],
+}
+
+
+def _sgg_pairs_tiled(
+    dtype: torch.dtype, size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Every element a contraction-sensitive pair (cycling through the dtype's
+    pairs), so each storage index of every layout is probed."""
+    int_dtype = {2: torch.int16, 4: torch.int32, 8: torch.int64}[
+        torch.empty(0, dtype=dtype).element_size()
+    ]
+    bits = (_SGG_PAIRS[dtype] * (size // 4 + 1))[:size]
+    a = torch.tensor([u for u, _ in bits], dtype=int_dtype).view(dtype)
+    x = torch.tensor([v for _, v in bits], dtype=int_dtype).view(dtype)
+    return a, x
+
+
+def _inner(n: int, options: tuple[int, ...]) -> int:
+    return next(f for f in options if n % f == 0)
+
+
 _SGG_LAYOUTS = {
-    "contig": (lambda n: n, lambda a, x: (a, x)),
-    "offset1": (lambda n: n + 1, lambda a, x: (a[1:], x[1:])),
-    "offset2": (lambda n: n + 2, lambda a, x: (a[2:], x[2:])),
-    "offset3": (lambda n: n + 3, lambda a, x: (a[3:], x[3:])),
-    "mixed_offsets": (lambda n: n + 1, lambda a, x: (a[1:], x[:-1])),
-    "stride2": (lambda n: 2 * n, lambda a, x: (a[::2], x[::2])),
+    "contig": (lambda n: n, lambda a, x, n: (a, x)),
+    "offset1": (lambda n: n + 1, lambda a, x, n: (a[1:], x[1:])),
+    "offset2": (lambda n: n + 2, lambda a, x, n: (a[2:], x[2:])),
+    "offset3": (lambda n: n + 3, lambda a, x, n: (a[3:], x[3:])),
+    "mixed_offsets": (lambda n: n + 1, lambda a, x, n: (a[1:], x[:-1])),
+    "stride2": (lambda n: 2 * n, lambda a, x, n: (a[::2], x[::2])),
     "transposed": (
         lambda n: n,
-        lambda a, x: (a.reshape(-1, 10).t(), x.reshape(-1, 10).t()),
+        lambda a, x, n: (
+            a.reshape(-1, _inner(n, (10, 19))).t(),
+            x.reshape(-1, _inner(n, (10, 19))).t(),
+        ),
     ),
-    "broadcast": (lambda n: n, lambda a, x: (a.reshape(-1, 10), x[:10])),
+    "broadcast": (
+        lambda n: n,
+        lambda a, x, n: (a.reshape(-1, _inner(n, (10, 19))), x[: _inner(n, (10, 19))]),
+    ),
 }
 
 
@@ -822,23 +912,13 @@ _SGG_LAYOUTS = {
 def test_standard_gamma_grad_launch_regimes_match_cuda(
     cuda_oracle: CudaOracle, dtype: torch.dtype, layout: str, n: int
 ):
-    """Remainder blocks and every launch path, per dtype: small-x inputs
-    (where the contraction decides the bits) in numel-sized storage."""
-    if layout in ("transposed", "broadcast") and n % 10:
-        pytest.skip("needs a multiple of 10")
+    """Remainder blocks and every launch path, per dtype: contraction-
+    sensitive pairs at every storage index of every layout."""
     size, view = _SGG_LAYOUTS[layout]
-    g = _gen(n)
     sz = size(n)
-    alpha = (torch.rand(sz, generator=g, dtype=torch.float64) * 6 + 0.01).to(dtype)
-    x = (torch.rand(sz, generator=g, dtype=torch.float64) * 0.79 + 0.001).to(dtype)
-    if dtype == torch.float32:
-        sa, sx = _sgg_sensitive()
-        alpha[:4], x[:4] = sa, sx
-    elif dtype == torch.float16:
-        # a pair whose bits depend on the contraction in float16
-        alpha[0], x[0] = 0.1160888671875, 0.1561279296875
+    alpha, x = _sgg_pairs_tiled(dtype, sz)
     cuda_oracle.assert_bitwise_equal(
-        lambda a, b: torch.ops.aten._standard_gamma_grad(*view(a, b)), alpha, x
+        lambda a, b: torch.ops.aten._standard_gamma_grad(*view(a, b, n)), alpha, x
     )
 
 

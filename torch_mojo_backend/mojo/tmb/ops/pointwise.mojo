@@ -442,29 +442,45 @@ def count_of(shape: IndexList[MAX_RANK]) -> Int:
 
 
 def _pw_xlogy_nan(
-    a: Side, b: Side, count: Int, compute: Int32
+    a: Side, b: Side, count: Int, compute: Int32, dst: Optional[T]
 ) raises -> Float64:
     """xlogy / xlog1py in float64 with a NaN x and a NaN log: which NaN stock
-    CUDA returns. 1: x's (a tensor operand of another dtype, so the casting
-    kernel; a host scalar x; or misaligned dense storage); 0: log's (a
-    broadcast or strided tensor operand, 0-dim ones included); 2: x's in the
-    partial last 1024-block of a dense launch, log's before it. Known
-    limit: for permuted-dense operands (transposed) CUDA's block follows the
-    memory index, ours the logical one (strict xfail in the tests)."""
+    CUDA returns. 1: x's (a tensor operand or out= of another dtype, so the
+    casting kernel; a host scalar x; or misaligned dense storage); 0: log's
+    (a broadcast, strided, or differently laid out tensor operand or out=,
+    0-dim ones included); 2: x's in the partial last 1024-block of a dense
+    launch, log's before it. Known limit: for permuted-dense operands
+    (transposed) CUDA's block follows the memory index, ours the logical one
+    (strict xfail in the tests)."""
+    var tensors = List[T]()
     for k in range(2):
         var s = a.copy() if k == 0 else b.copy()
-        if s.is_t and s.t.value().stype != compute:
+        if s.is_t:
+            tensors.append(s.t.value().copy())
+    if dst:
+        # an out= of another shape is resized to a fresh dense tensor: only
+        # its dtype counts then
+        var same_shape = len(tensors) > 0
+        if same_shape:
+            for d in range(MAX_RANK):
+                if dst.value().shape[d] != tensors[0].shape[d]:
+                    same_shape = False
+        if same_shape or dst.value().stype != compute:
+            tensors.append(dst.value().copy())
+    for i in range(len(tensors)):
+        if tensors[i].stype != compute:
             return 1.0
     if not a.is_t:
         return 1.0
     var misaligned = False
-    for k in range(2):
-        var s = a.copy() if k == 0 else b.copy()
-        if not s.is_t:
-            continue
-        var t = s.t.value().copy()
+    for i in range(len(tensors)):
+        ref t = tensors[i]
         if t.numel != count or not is_dense(t.shape, t.strides, t.rank):
             return 0.0
+        if i > 0:
+            for d in range(MAX_RANK):
+                if t.strides[d] != tensors[0].strides[d]:
+                    return 0.0
         if t.contig and t.ptr % 16 != 0:
             misaligned = True
     return 1.0 if misaligned else 2.0
@@ -520,9 +536,7 @@ def _pw_run(
         and (kind == "xlogy" or kind == "xlog1py")
         and compute == ST_FLOAT64
     ):
-        prm[0] = _pw_xlogy_nan(a, b, count_of(shape), compute)
-        if dst and dst.value().stype != compute:
-            prm[0] = 1.0  # an out= of another dtype: the casting kernel
+        prm[0] = _pw_xlogy_nan(a, b, count_of(shape), compute, dst)
         prm[1] = Float64(count_of(shape) % 4096)
         prm[2] = Float64(count_of(shape) // 4096)
     if cuda and kind == "standard_gamma_grad":
