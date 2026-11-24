@@ -873,22 +873,6 @@ def _polynomial_nv[
             q = r
             k += 2
         return r
-    elif kind == "hermite_polynomial_he":
-        if n == 0:
-            return one
-        if n == 1:
-            return x
-        comptime limit = 512 if w == DType.float64 else 128
-        if n > limit:
-            return _polynan[w]()
-        var p = one
-        var q = x
-        var r = Scalar[w](0)
-        for k in range(1, n):
-            r = x * q - Scalar[w](k) * p
-            p = q
-            q = r
-        return r
     elif kind == "laguerre_polynomial_l":
         if abs(x) == 0:
             return one
@@ -1350,7 +1334,6 @@ def _polynomial_legacy[
             return r
 
 
-@always_inline
 @always_inline
 def _polynomial[
     kind: StaticString, w: DType
@@ -3233,15 +3216,10 @@ def _gamma_grads[
     var r = SIMD[dtype, n]()
     comptime for i in range(n):
         comptime if kind == "standard_gamma_grad":
-            comptime if is_nvidia_gpu():
-                r[i] = _standard_gamma_grad_one[w](
-                    a[i].cast[w](), b[i].cast[w]()
-                ).cast[dtype]()
-            else:
-                # AMD / Apple keep their pre-port form.
-                r[i] = _standard_gamma_grad_one_legacy[w](
-                    a[i].cast[w](), b[i].cast[w]()
-                ).cast[dtype]()
+            # AMD / Apple (NVIDIA runs `_sgg_alt_lanes`): the pre-port form.
+            r[i] = _standard_gamma_grad_one_legacy[w](
+                a[i].cast[w](), b[i].cast[w]()
+            ).cast[dtype]()
         else:
             r[i] = _dirichlet_grad_one[w](
                 a[i].cast[w](), b[i].cast[w](), c[i].cast[w]()

@@ -468,8 +468,9 @@ def _pw_xlogy_nan(
                     same_shape = False
         if same_shape or dst.value().stype != compute:
             tensors.append(dst.value().copy())
-        elif dst.value().numel == count and dst.value().ptr % 16 != 0:
-            # resized in place over the same storage: its alignment counts
+        elif dst.value().ptr % 16 != 0:
+            # resized over the same storage (resize_ keeps the pointer while
+            # the data fits): its alignment counts
             misaligned = True
     for i in range(len(tensors)):
         if tensors[i].stype != compute:

@@ -681,6 +681,8 @@ _OUT_VIEWS = {
     # a 2-D out= of the same numel is resized in place on the offset storage
     "offset1_resized": lambda o: o[1:].reshape(-1, 10),
     "rank2_same_numel": lambda o: o.reshape(1, -1),
+    # a larger offset buffer resized down keeps its (misaligned) pointer
+    "offset1_oversized": lambda o: o[1:],
 }
 
 
@@ -701,6 +703,7 @@ def test_xlogy_float64_nan_x_out_views_match_cuda(
         "resized_2d": n,
         "offset1_resized": n + 1,
         "rank2_same_numel": n,
+        "offset1_oversized": n + 6,
     }[out_view]
 
     def run(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -770,6 +773,26 @@ def test_polynomial_matches_cuda(
             x.nan_to_num(0).clamp(-50, 50).to(dtype),
             n.nan_to_num(0).clamp(-5, 40).to(dtype),
         )
+    cuda_oracle.assert_bitwise_equal(fn, x, n)
+
+
+@pytest.mark.parametrize("name", ("hermite_polynomial_he", "hermite_polynomial_h"))
+@pytest.mark.parametrize("dtype", (*_F, torch.int64), ids=str)
+def test_hermite_degree_limits_match_cuda(
+    cuda_oracle: CudaOracle, name: str, dtype: torch.dtype
+):
+    """Degrees around the recurrence limits (128 float / 512 double), negative
+    ones, and NaN / infinite x, for every dtype (half is refused by both)."""
+    fn = getattr(S, name)
+    degrees = [0, 1, 2, 127, 128, 129, 511, 512, 513, -1, -5, -(2**40)]
+    xs = [0.0, -0.0, 0.3, -1.5, 2.0, 7.5, math.nan, math.inf, -math.inf]
+    x = torch.tensor(xs * len(degrees), dtype=torch.float64)
+    n = torch.tensor(degrees, dtype=torch.float64).repeat_interleave(len(xs))
+    if dtype.is_floating_point:
+        x, n = x.to(dtype), n.to(dtype)
+    else:
+        x = x.nan_to_num(0).clamp(-50, 50).to(dtype)
+        n = n.nan_to_num(0).clamp(-5, 600).to(dtype)
     cuda_oracle.assert_bitwise_equal(fn, x, n)
 
 
