@@ -452,6 +452,7 @@ def _pw_xlogy_nan(
     launch, log's before it. Known limit: for permuted-dense operands
     (transposed) CUDA's block follows the memory index, ours the logical one
     (strict xfail in the tests)."""
+    var misaligned = False
     var tensors = List[T]()
     for k in range(2):
         var s = a.copy() if k == 0 else b.copy()
@@ -467,19 +468,22 @@ def _pw_xlogy_nan(
                     same_shape = False
         if same_shape or dst.value().stype != compute:
             tensors.append(dst.value().copy())
+        elif dst.value().numel == count and dst.value().ptr % 16 != 0:
+            # resized in place over the same storage: its alignment counts
+            misaligned = True
     for i in range(len(tensors)):
         if tensors[i].stype != compute:
             return 1.0
     if not a.is_t:
         return 1.0
-    var misaligned = False
     for i in range(len(tensors)):
         ref t = tensors[i]
         if t.numel != count or not is_dense(t.shape, t.strides, t.rank):
             return 0.0
         if i > 0:
             for d in range(MAX_RANK):
-                if t.strides[d] != tensors[0].strides[d]:
+                # size-1 and pad dims carry no meaningful stride (TI drops them)
+                if t.shape[d] > 1 and t.strides[d] != tensors[0].strides[d]:
                     return 0.0
         if t.contig and t.ptr % 16 != 0:
             misaligned = True

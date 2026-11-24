@@ -581,6 +581,8 @@ _NAN_X_LAYOUTS = {
         a[:n].reshape(-1, _inner(n, (10, 8))).t(),
         b[:n].reshape(_inner(n, (10, 8)), -1),
     ),
+    "unsqueezed_y": lambda a, b, n: (a[:n], b[:n].reshape(1, -1)),
+    "rank2_both": lambda a, b, n: (a[:n].reshape(1, -1), b[:n].reshape(1, -1)),
     "broadcast": lambda a, b, n: (
         a[:n].reshape(-1, _inner(n, (10, 8))),
         b[: _inner(n, (10, 8))],
@@ -676,6 +678,9 @@ _OUT_VIEWS = {
     "stride2": lambda o: o[::2],
     # a 2-D out= for 1-D operands is resized to a fresh dense tensor
     "resized_2d": lambda o: o.reshape(-1, 10).t(),
+    # a 2-D out= of the same numel is resized in place on the offset storage
+    "offset1_resized": lambda o: o[1:].reshape(-1, 10),
+    "rank2_same_numel": lambda o: o.reshape(1, -1),
 }
 
 
@@ -689,7 +694,14 @@ def test_xlogy_float64_nan_x_out_views_match_cuda(
     fn = {"xlogy": torch.xlogy, "xlog1py": torch.special.xlog1py}[name]
     a, b = _nan_x_inputs(n, 0x123)
     a, b = a[:n], b[:n]
-    size = {"dense": n, "offset1": n + 1, "stride2": 2 * n, "resized_2d": n}[out_view]
+    size = {
+        "dense": n,
+        "offset1": n + 1,
+        "stride2": 2 * n,
+        "resized_2d": n,
+        "offset1_resized": n + 1,
+        "rank2_same_numel": n,
+    }[out_view]
 
     def run(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         buf = torch.zeros(size, dtype=torch.float64, device=x.device)
@@ -867,41 +879,89 @@ _SGG_PAIRS = {
 }
 
 
-def _sgg_pairs_tiled(
-    dtype: torch.dtype, size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Every element a contraction-sensitive pair (cycling through the dtype's
-    pairs), so each storage index of every layout is probed."""
-    int_dtype = {2: torch.int16, 4: torch.int32, 8: torch.int64}[
-        torch.empty(0, dtype=dtype).element_size()
-    ]
-    bits = (_SGG_PAIRS[dtype] * (size // 4 + 1))[:size]
-    a = torch.tensor([u for u, _ in bits], dtype=int_dtype).view(dtype)
-    x = torch.tensor([v for _, v in bits], dtype=int_dtype).view(dtype)
-    return a, x
-
-
 def _inner(n: int, options: tuple[int, ...]) -> int:
     return next(f for f in options if n % f == 0)
 
 
+def _sgg_pairs(
+    dtype: torch.dtype, idx: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(alpha, x) of the dtype's sensitive pair number `idx % 4`, per element."""
+    int_dtype = {2: torch.int16, 4: torch.int32, 8: torch.int64}[
+        torch.empty(0, dtype=dtype).element_size()
+    ]
+    pairs = _SGG_PAIRS[dtype]
+    a = torch.tensor([u for u, _ in pairs], dtype=int_dtype).view(dtype)
+    x = torch.tensor([v for _, v in pairs], dtype=int_dtype).view(dtype)
+    return a[idx % 4], x[idx % 4]
+
+
+def _pad(t: torch.Tensor, front: int = 0, back: int = 0) -> torch.Tensor:
+    return torch.cat([t[:1].repeat(front), t, t[:1].repeat(back)])
+
+
+def _sgg_transposed_storage(t: torch.Tensor, f: int) -> torch.Tensor:
+    """Storage whose `.reshape(-1, f).t()` reads t in logical order."""
+    return t.reshape(f, -1).t().reshape(-1).contiguous()
+
+
+def _sgg_logical(dtype: torch.dtype, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return _sgg_pairs(dtype, torch.arange(n))
+
+
+# name -> (prep(dtype, n) -> (alpha storage, x storage), view(alpha, x, n)). The
+# prep puts the same sensitive pair on the two operands of every output element.
 _SGG_LAYOUTS = {
-    "contig": (lambda n: n, lambda a, x, n: (a, x)),
-    "offset1": (lambda n: n + 1, lambda a, x, n: (a[1:], x[1:])),
-    "offset2": (lambda n: n + 2, lambda a, x, n: (a[2:], x[2:])),
-    "offset3": (lambda n: n + 3, lambda a, x, n: (a[3:], x[3:])),
-    "mixed_offsets": (lambda n: n + 1, lambda a, x, n: (a[1:], x[:-1])),
-    "stride2": (lambda n: 2 * n, lambda a, x, n: (a[::2], x[::2])),
+    "contig": (lambda dt, n: _sgg_logical(dt, n), lambda a, x, n: (a, x)),
+    "offset1": (
+        lambda dt, n: tuple(_pad(t, 1) for t in _sgg_logical(dt, n)),
+        lambda a, x, n: (a[1:], x[1:]),
+    ),
+    "offset2": (
+        lambda dt, n: tuple(_pad(t, 2) for t in _sgg_logical(dt, n)),
+        lambda a, x, n: (a[2:], x[2:]),
+    ),
+    "offset3": (
+        lambda dt, n: tuple(_pad(t, 3) for t in _sgg_logical(dt, n)),
+        lambda a, x, n: (a[3:], x[3:]),
+    ),
+    "mixed_offsets": (
+        lambda dt, n: (
+            _pad(_sgg_logical(dt, n)[0], 1),
+            _pad(_sgg_logical(dt, n)[1], 0, 1),
+        ),
+        lambda a, x, n: (a[1:], x[:-1]),
+    ),
+    "stride2": (
+        lambda dt, n: tuple(t.repeat_interleave(2) for t in _sgg_logical(dt, n)),
+        lambda a, x, n: (a[::2], x[::2]),
+    ),
     "transposed": (
-        lambda n: n,
+        lambda dt, n: tuple(
+            _sgg_transposed_storage(t, _inner(n, (10, 19))) for t in _sgg_logical(dt, n)
+        ),
         lambda a, x, n: (
             a.reshape(-1, _inner(n, (10, 19))).t(),
             x.reshape(-1, _inner(n, (10, 19))).t(),
         ),
     ),
+    "mixed_perm": (
+        lambda dt, n: (
+            _sgg_transposed_storage(_sgg_logical(dt, n)[0], _inner(n, (10, 19))),
+            _sgg_logical(dt, n)[1],
+        ),
+        lambda a, x, n: (
+            a.reshape(-1, _inner(n, (10, 19))).t(),
+            x.reshape(_inner(n, (10, 19)), -1),
+        ),
+    ),
     "broadcast": (
-        lambda n: n,
-        lambda a, x, n: (a.reshape(-1, _inner(n, (10, 19))), x[: _inner(n, (10, 19))]),
+        # output (r, c): alpha[r * f + c] with x[c], so both follow c % 4
+        lambda dt, n: (
+            _sgg_pairs(dt, torch.arange(n) % _inner(n, (10, 19)))[0],
+            _sgg_pairs(dt, torch.arange(_inner(n, (10, 19))))[1],
+        ),
+        lambda a, x, n: (a.reshape(-1, _inner(n, (10, 19))), x),
     ),
 }
 
@@ -914,9 +974,14 @@ def test_standard_gamma_grad_launch_regimes_match_cuda(
 ):
     """Remainder blocks and every launch path, per dtype: contraction-
     sensitive pairs at every storage index of every layout."""
-    size, view = _SGG_LAYOUTS[layout]
-    sz = size(n)
-    alpha, x = _sgg_pairs_tiled(dtype, sz)
+    prep, view = _SGG_LAYOUTS[layout]
+    alpha, x = prep(dtype, n)
+    # every output element must see a matched sensitive pair of its dtype
+    va, vx = torch.broadcast_tensors(*view(alpha, x, n))
+    table_a, table_x = _sgg_pairs(dtype, torch.arange(4))
+    ia = (va.unsqueeze(-1) == table_a).to(torch.int64).argmax(-1)
+    assert (table_a[ia] == va).all() and (table_x[ia] == vx).all()
+    assert va.numel() == n
     cuda_oracle.assert_bitwise_equal(
         lambda a, b: torch.ops.aten._standard_gamma_grad(*view(a, b, n)), alpha, x
     )

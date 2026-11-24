@@ -1115,7 +1115,8 @@ def elementwise_polygamma[
     """The polygamma function lane by lane for the torch.compile graph, the
     order `n` (the int64 order) a custom-op parameter: exact, where a float
     operand of the input dtype would round it."""
-    comptime ct = DType.float64 if dtype == DType.float64 and is_nvidia_gpu() else DType.float32
+    comptime f64_ok = dtype == DType.float64 and is_nvidia_gpu()
+    comptime ct = DType.float64 if f64_ok else DType.float32
     var xf = x.cast[ct]()
     var r = SIMD[ct, width]()
     comptime for i in range(width):
