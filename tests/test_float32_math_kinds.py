@@ -19,15 +19,31 @@ from torch_mojo_backend.aten_functions import MAPPING_TORCH_ATEN_TO_MOJO
 MOJO = Path(custom_mojo_ops.__file__).parent / "mojo" / "tmb"
 
 
+def _function_body(source: str, signature: str) -> str:
+    return source.split(signature, 1)[1].split("\n\n\n", 1)[0]
+
+
 def _scalar_special_kinds() -> set[str]:
     source = (MOJO / "kernels" / "common" / "unary_math.mojo").read_text()
-    body = source.split("def is_scalar_special[", 1)[1].split("\n\n\n", 1)[0]
-    return set(re.findall(r'kind == "([a-z0-9_]+)"', body))
+    kinds = set()
+    # `has_f64_port`'s kinds are listed apart from `is_scalar_special`'s,
+    # which includes them.
+    for signature in ("def is_scalar_special[", "def has_f64_port["):
+        kinds |= set(
+            re.findall(r'kind == "([a-z0-9_]+)"', _function_body(source, signature))
+        )
+    return kinds
 
 
 def _pointwise_float32_kinds() -> set[str]:
     source = (MOJO / "ops" / "pointwise.mojo").read_text()
-    return set(re.findall(r'_pw_math\(\s*"([a-z0-9_]+)",\s*P_[A-Z_]+,\s*False', source))
+    kinds = set(
+        re.findall(r'_pw_math\(\s*"([a-z0-9_]+)",\s*P_[A-Z_]+,\s*False', source)
+    )
+    # igamma / igammac compute float64 on NVIDIA devices only: the host
+    # policy names them in `_pw_igamma_f64`, and elsewhere they stay float.
+    body = _function_body(source, "def _pw_igamma_f64(")
+    return kinds | set(re.findall(r'kind == "([a-z0-9_]+)"', body))
 
 
 def test_float32_math_ops_match_the_mojo_sources():

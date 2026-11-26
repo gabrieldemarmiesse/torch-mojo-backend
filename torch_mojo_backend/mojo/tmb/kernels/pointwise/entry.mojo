@@ -26,6 +26,7 @@ from std.sys.info import (
     has_amd_gpu_accelerator,
     has_apple_gpu_accelerator,
     has_nvidia_gpu_accelerator,
+    is_nvidia_gpu,
     size_of,
 )
 from std.utils.coord import Coord
@@ -43,6 +44,7 @@ from tmb.kernels.common.pointwise_math import (
     metal_rounds_params,
     param_dtype,
     pointwise,
+    sgg_alt_contraction,
 )
 from tmb.kernels.common.variant_gates import (
     ErrBuf,
@@ -386,6 +388,51 @@ def _launch[
                 c = c_ptr.unsafe_load[width=w, alignment=in_align](i)
             else:
                 c = SIMD[dt, w](c_ptr[unsafe_offset=0] if dev_c else vc)
+        comptime if (
+            (kind == "xlogy" or kind == "xlog1py")
+            and dt == DType.float64
+            and is_nvidia_gpu()
+        ):
+            # p0: 0 log's NaN, 1 x's NaN, 2 x's NaN in the partial last
+            # 1024-block (the count rides in p1 / p2)
+            var x_wins = Int(p0) == 1
+            var one = p0 * 0 + 1
+            if Int(p0) == 2:
+                var count = Int(p1) + Int(p2) * 4096
+                x_wins = count % 1024 != 0 and i >= (count // 1024) * 1024
+            out_ptr.unsafe_store[width=w, alignment=out_align](
+                i,
+                pointwise[kind, dt, odt, w](
+                    a,
+                    b,
+                    c,
+                    SIMD[param_dtype[dt](), 4](
+                        one if x_wins else p0 * 0, p1, p2, p3
+                    ),
+                ),
+            )
+            return
+        comptime if kind == "standard_gamma_grad" and is_nvidia_gpu():
+            # the element count rides in p0 / p1 (ops/pointwise.mojo)
+            var alt = False
+            if Int(p2) == 1 and dt.is_half_float():
+                alt = (i & 511) < 128
+            elif Int(p2) == 1:
+                alt = ((i >> 7) & 1) == 0
+            elif Int(p2) == 2:
+                alt = (i & 511) < 128
+            elif dt != DType.float64:
+                alt = sgg_alt_contraction(i, Int(p0) + Int(p1) * 4096)
+            var pp3 = p3 * 0
+            if alt:
+                pp3 = pp3 + 1
+            out_ptr.unsafe_store[width=w, alignment=out_align](
+                i,
+                pointwise[kind, dt, odt, w](
+                    a, b, c, SIMD[param_dtype[dt](), 4](p0, p1, p2, pp3)
+                ),
+            )
+            return
         out_ptr.unsafe_store[width=w, alignment=out_align](
             i,
             pointwise[kind, dt, odt, w](

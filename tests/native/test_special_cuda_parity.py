@@ -1,0 +1,1021 @@
+"""The special functions against stock CUDA, bit for bit (the live oracle,
+tests/native/cuda_oracle.py): erf/erfc/erfinv, the gamma family (lgamma,
+digamma, polygamma, mvlgamma, igamma/igammac, _standard_gamma_grad), the
+Bessel / Airy / error-function family of torch.special, sinc, logit (and
+its backward), xlogy / xlog1py, zeta and the orthogonal polynomials.
+
+Every dtype CUDA computes is covered, float64 included, and every dtype it
+refuses must be refused too (the same exception type). float16 / bfloat16
+take all 65536 bit patterns; float32 / float64 take the special values,
+every power of two with its neighbours, pseudo-random bit patterns, a
+log-uniform sweep and dense sweeps over each function's branch points.
+"""
+
+import math
+from collections.abc import Callable
+
+import pytest
+import torch
+
+from tests.native.cuda_oracle import CudaOracle
+
+S = torch.special
+_F = (torch.float32, torch.float16, torch.bfloat16, torch.float64)
+_INTS = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.bool)
+_BITS = {torch.float32: torch.int32, torch.float64: torch.int64}
+
+
+def _gen(seed: int) -> torch.Generator:
+    return torch.Generator().manual_seed(seed)
+
+
+def _from_bits(bits: list[int] | torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    int_dtype = _BITS[dtype]
+    width = torch.iinfo(int_dtype).bits
+    if isinstance(bits, torch.Tensor) and width == 32:
+        bits = bits.to(torch.int64)
+        bits = torch.where(bits >= 1 << 31, bits - (1 << 32), bits)
+    if not isinstance(bits, torch.Tensor):
+        # unsigned patterns -> the signed integers of the same bits
+        bits = torch.tensor(
+            [b - (1 << width) if b >= 1 << (width - 1) else b for b in bits],
+            dtype=int_dtype,
+        )
+    return bits.to(int_dtype).view(dtype)
+
+
+def _special_bits(dtype: torch.dtype) -> list[int]:
+    """Zeros, infinities, NaNs with several payloads (quiet, signalling,
+    negative), denormals, the normal boundary and the largest finite."""
+    if dtype == torch.float64:
+        pos = [
+            0x0,
+            0x7FF0000000000000,
+            0x7FF8000000000000,
+            0x7FFFFFFFFFFFFFFF,
+            0x7FF0000000000001,
+            0x7FF4000000000000,
+            0x1,
+            0xFFFFFFFFFFFFF,
+            0x10000000000000,
+            0x7FEFFFFFFFFFFFFF,
+        ]
+        sign = 1 << 63
+    else:
+        pos = [
+            0x0,
+            0x7F800000,
+            0x7FC00000,
+            0x7FFFFFFF,
+            0x7F800001,
+            0x7FA00000,
+            0x1,
+            0x7FFFFF,
+            0x800000,
+            0x7F7FFFFF,
+        ]
+        sign = 1 << 31
+    return pos + [b | sign for b in pos]
+
+
+def float_inputs(
+    dtype: torch.dtype, sweeps: tuple[tuple[float, float], ...] = ()
+) -> torch.Tensor:
+    """The inputs of a float `dtype` (see the module docstring); `sweeps`
+    are (lo, hi) intervals sampled densely on top."""
+    if dtype in (torch.float16, torch.bfloat16):
+        return (
+            torch.arange(-(1 << 15), 1 << 15, dtype=torch.int32)
+            .to(torch.int16)
+            .view(dtype)
+        )
+    is64 = dtype == torch.float64
+    mant = 52 if is64 else 23
+    top = 2046 if is64 else 254
+    parts = [_from_bits(_special_bits(dtype), dtype)]
+    # every power of two (subnormal ones too) with both neighbours, both signs
+    exps = torch.arange(1, top + 1, dtype=torch.int64) << mant
+    sub = torch.tensor([1 << k for k in range(mant)], dtype=torch.int64)
+    pw = torch.cat([exps, sub])
+    pw = torch.cat([pw - 1, pw, pw + 1])
+    # the negatives: the same bits with the sign bit, as signed integers
+    neg = pw - (1 << 63) if is64 else pw - (1 << 31)
+    parts.append(_from_bits(torch.cat([pw, neg]), dtype))
+    g = _gen(1234)
+    n = 1 << 15
+    if is64:
+        rb = torch.randint(-(2**63), 2**63 - 1, (n,), generator=g, dtype=torch.int64)
+    else:
+        rb = torch.randint(-(2**31), 2**31 - 1, (n,), generator=g, dtype=torch.int64)
+        rb = rb.to(torch.int32)
+    parts.append(_from_bits(rb, dtype))
+    lim = 700.0 if is64 else 87.0
+    mag = torch.empty(n, dtype=torch.float64).uniform_(-lim, lim, generator=g).exp()
+    sgn = torch.randint(0, 2, (n,), generator=g).to(torch.float64) * 2 - 1
+    parts.append((mag * sgn).to(dtype))
+    ints = torch.arange(-60, 61, dtype=torch.float64)
+    parts.append(torch.cat([ints, ints + 0.5, ints + 1e-3, ints - 1e-3]).to(dtype))
+    for lo, hi in sweeps:
+        pts = torch.empty(1 << 13, dtype=torch.float64).uniform_(lo, hi, generator=g)
+        parts.append(
+            torch.cat([pts, torch.linspace(lo, hi, 1 << 12, dtype=torch.float64)]).to(
+                dtype
+            )
+        )
+    return torch.cat([p.to(dtype) for p in parts])
+
+
+def int_inputs(dtype: torch.dtype) -> torch.Tensor:
+    if dtype == torch.bool:
+        return torch.tensor([True, False, True])
+    info = torch.iinfo(dtype)
+    vals = torch.arange(max(info.min, -300), min(info.max, 300) + 1)
+    return torch.cat([vals, torch.tensor([info.min, info.max])]).to(dtype)
+
+
+def _cuda_refuses_half(dtype: torch.dtype, half_ok: bool) -> bool:
+    return not half_ok and dtype in (torch.float16, torch.bfloat16)
+
+
+# (name, callable, in-place method, CUDA computes float16 / bfloat16,
+# dense sweeps around the routine's branch points)
+_UNARY: list[
+    tuple[
+        str,
+        Callable[..., torch.Tensor],
+        str | None,
+        bool,
+        tuple[tuple[float, float], ...],
+    ]
+] = [
+    ("erf", torch.erf, "erf_", True, ((-6.5, 6.5),)),
+    ("erfc", torch.erfc, "erfc_", True, ((-10.0, 30.0),)),
+    ("erfinv", torch.erfinv, "erfinv_", True, ((-1.0, 1.0), (0.99, 1.0))),
+    ("lgamma", torch.lgamma, "lgamma_", True, ((-40.0, 40.0), (0.0, 8.0))),
+    ("digamma", torch.digamma, "digamma_", True, ((-40.0, 40.0),)),
+    ("i0", torch.i0, "i0_", True, ((-100.0, 100.0),)),
+    ("sinc", torch.sinc, "sinc_", True, ((-30.0, 30.0),)),
+    ("logit", torch.logit, "logit_", True, ((-0.5, 1.5),)),
+    ("ndtr", S.ndtr, None, True, ((-40.0, 40.0),)),
+    ("entr", S.entr, None, True, ((-1.0, 30.0),)),
+    ("erfcx", S.erfcx, None, False, ((-30.0, 60.0), (-7.0, 7.0))),
+    ("i0e", S.i0e, None, True, ((-100.0, 100.0),)),
+    ("i1", S.i1, None, True, ((-100.0, 100.0),)),
+    ("i1e", S.i1e, None, True, ((-100.0, 100.0),)),
+    ("ndtri", S.ndtri, None, False, ((0.0, 1.0), (0.0, 0.2), (0.8, 1.0))),
+    ("log_ndtr", S.log_ndtr, None, False, ((-40.0, 10.0),)),
+    ("airy_ai", S.airy_ai, None, False, ((-30.0, 30.0), (-3.0, 10.0))),
+    ("bessel_j0", S.bessel_j0, None, False, ((-40.0, 40.0),)),
+    ("bessel_j1", S.bessel_j1, None, False, ((-40.0, 40.0),)),
+    ("bessel_y0", S.bessel_y0, None, False, ((0.0, 40.0),)),
+    ("bessel_y1", S.bessel_y1, None, False, ((0.0, 40.0),)),
+    ("modified_bessel_i0", S.modified_bessel_i0, None, False, ((-100.0, 100.0),)),
+    ("modified_bessel_i1", S.modified_bessel_i1, None, False, ((-100.0, 100.0),)),
+    (
+        "modified_bessel_k0",
+        S.modified_bessel_k0,
+        None,
+        False,
+        ((0.0, 100.0), (0.0, 3.0)),
+    ),
+    (
+        "modified_bessel_k1",
+        S.modified_bessel_k1,
+        None,
+        False,
+        ((0.0, 100.0), (0.0, 3.0)),
+    ),
+    (
+        "scaled_modified_bessel_k0",
+        S.scaled_modified_bessel_k0,
+        None,
+        False,
+        ((0.0, 100.0), (0.0, 3.0)),
+    ),
+    (
+        "scaled_modified_bessel_k1",
+        S.scaled_modified_bessel_k1,
+        None,
+        False,
+        ((0.0, 100.0), (0.0, 3.0)),
+    ),
+    ("spherical_bessel_j0", S.spherical_bessel_j0, None, False, ((-40.0, 40.0),)),
+]
+_UNARY_IDS = [c[0] for c in _UNARY]
+
+
+@pytest.mark.parametrize("dtype", _F, ids=str)
+@pytest.mark.parametrize(
+    ("name", "fn", "method", "half_ok", "sweeps"), _UNARY, ids=_UNARY_IDS
+)
+def test_unary_special_matches_cuda(
+    cuda_oracle: CudaOracle,
+    name: str,
+    fn: Callable[..., torch.Tensor],
+    method: str | None,
+    half_ok: bool,
+    sweeps: tuple[tuple[float, float], ...],
+    dtype: torch.dtype,
+):
+    x = float_inputs(dtype, sweeps)
+    cuda_oracle.assert_bitwise_equal(fn, x)
+
+
+@pytest.mark.parametrize("dtype", _INTS, ids=str)
+@pytest.mark.parametrize(
+    ("name", "fn", "method", "half_ok", "sweeps"), _UNARY, ids=_UNARY_IDS
+)
+def test_unary_special_integer_inputs_match_cuda(
+    cuda_oracle: CudaOracle,
+    name: str,
+    fn: Callable[..., torch.Tensor],
+    method: str | None,
+    half_ok: bool,
+    sweeps: tuple[tuple[float, float], ...],
+    dtype: torch.dtype,
+):
+    cuda_oracle.assert_bitwise_equal(fn, int_inputs(dtype))
+
+
+@pytest.mark.parametrize("dtype", (torch.complex64, torch.complex128), ids=str)
+@pytest.mark.parametrize(
+    ("name", "fn", "method", "half_ok", "sweeps"), _UNARY, ids=_UNARY_IDS
+)
+def test_unary_special_complex_inputs_match_cuda(
+    cuda_oracle: CudaOracle,
+    name: str,
+    fn: Callable[..., torch.Tensor],
+    method: str | None,
+    half_ok: bool,
+    sweeps: tuple[tuple[float, float], ...],
+    dtype: torch.dtype,
+):
+    """CUDA computes sinc on complex numbers and refuses the rest."""
+    re = float_inputs(torch.float32, ((-5.0, 5.0),))[:4096]
+    im = float_inputs(torch.float32, ((-5.0, 5.0),)).flip(0)[:4096]
+    cuda_oracle.assert_bitwise_equal(fn, torch.complex(re, im).to(dtype))
+
+
+@pytest.mark.parametrize("dtype", (torch.complex64, torch.complex128), ids=str)
+def test_sinc_complex_wide_range_and_variants_match_cuda(
+    cuda_oracle: CudaOracle, dtype: torch.dtype
+):
+    g = _gen(5)
+    mag = 10 ** (torch.rand(4096, generator=g) * 12 - 6)
+    re = (torch.randn(4096, generator=g) * mag).to(torch.float32)
+    im = (torch.randn(4096, generator=g) * mag.flip(0)).to(torch.float32)
+    z = torch.complex(re, im).to(dtype)
+    eq = cuda_oracle.assert_bitwise_equal
+    eq(torch.sinc, z, what="wide range")
+
+    def variants(t: torch.Tensor) -> object:
+        out = torch.empty_like(t)
+        torch.sinc(t, out=out)
+        strided = torch.zeros(2 * t.numel(), dtype=t.dtype, device=t.device)[::2]
+        torch.sinc(t, out=strided)
+        return out, strided, t.clone().sinc_(), t.t().sinc()
+
+    eq(variants, z.reshape(64, 64), what="out= / in-place / transposed")
+
+
+def _variants(fn: Callable[..., torch.Tensor], method: str | None, dtype: torch.dtype):
+    """out= (dense, strided, another dtype), a transposed and an offset
+    input, the in-place method on a view, a 0-dim and an empty input."""
+    base = float_inputs(torch.float32, ((-3.0, 3.0),))[: 64 * 33].reshape(64, 33)
+
+    def run(device: str) -> object:
+        x = base.to(device=device, dtype=dtype)
+        outs: dict[str, object] = {"t": fn(x.t()), "offset": fn(x.flatten()[1:])}
+        res = fn(x)
+        o = torch.empty_like(res)
+        fn(x, out=o)
+        outs["out"] = o
+        o64 = torch.zeros(64, 33, dtype=torch.float64, device=device)
+        fn(x, out=o64)
+        outs["out64"] = o64
+        strided = torch.full((33, 64), -7.0, dtype=res.dtype, device=device).t()
+        fn(x, out=strided)
+        outs["strided"] = strided
+        outs["scalar"] = fn(x[3, 4].clone())
+        outs["empty"] = fn(x[:0])
+        if method is not None and dtype.is_floating_point:
+            y = x.clone()
+            getattr(y[:, 1:], method)()
+            outs["inplace"] = y
+        return outs
+
+    return run
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.int32), ids=str)
+@pytest.mark.parametrize(
+    ("name", "fn", "method", "half_ok", "sweeps"), _UNARY, ids=_UNARY_IDS
+)
+def test_unary_special_variants_match_cuda(
+    cuda_oracle: CudaOracle,
+    name: str,
+    fn: Callable[..., torch.Tensor],
+    method: str | None,
+    half_ok: bool,
+    sweeps: tuple[tuple[float, float], ...],
+    dtype: torch.dtype,
+):
+    cuda_oracle.assert_bitwise_equal_by_device(_variants(fn, method, dtype))
+
+
+# --------------------------------------------------------------------------
+# parameterized unary ops: logit(eps), polygamma(n), mvlgamma(p)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", _F, ids=str)
+@pytest.mark.parametrize("eps", [None, 0.0, 1e-6, 0.25, 0.5, 0.75, -0.5])
+def test_logit_eps_matches_cuda(
+    cuda_oracle: CudaOracle, eps: float | None, dtype: torch.dtype
+):
+    x = float_inputs(dtype, ((-0.5, 1.5),))
+    cuda_oracle.assert_bitwise_equal(lambda t: torch.logit(t, eps), x)
+    cuda_oracle.assert_bitwise_equal(lambda t: t[1:].logit_(eps), x)
+
+
+@pytest.mark.parametrize("dtype", (*_F, torch.int32), ids=str)
+@pytest.mark.parametrize("n", [0, 1, 2, 3, 4, 7, 30])
+def test_polygamma_matches_cuda(cuda_oracle: CudaOracle, n: int, dtype: torch.dtype):
+    if dtype.is_floating_point:
+        x = float_inputs(dtype, ((-20.0, 30.0), (0.0, 3.0)))
+        if dtype == torch.float64 and n >= 2:
+            # zeta(n + 1, q) of a negative non-integer q walks |q| terms on
+            # CUDA and here alike (4 s at -1e7, over 150 s at -1e9, hours near
+            # -2**52): cap the walk instead of timing both sides out.
+            x = x[(x > -1e7) | (x == x.floor()) | x.isnan()]
+    else:
+        x = int_inputs(dtype)
+    cuda_oracle.assert_bitwise_equal(lambda t: torch.polygamma(n, t), x)
+    if dtype.is_floating_point:
+        cuda_oracle.assert_bitwise_equal(lambda t: t.polygamma_(n), x)
+
+
+@pytest.mark.parametrize("dtype", (*_F, torch.int64), ids=str)
+@pytest.mark.parametrize("p", [1, 2, 5])
+def test_mvlgamma_matches_cuda(cuda_oracle: CudaOracle, p: int, dtype: torch.dtype):
+    lo = (p - 1) / 2
+    g = _gen(p)
+    if dtype.is_floating_point:
+        x = torch.empty(1 << 14, dtype=torch.float64).uniform_(
+            lo + 0.01, lo + 60, generator=g
+        )
+        x = x.to(dtype)
+        x = x[x > lo]
+    else:
+        x = torch.arange(int(lo) + 1, int(lo) + 300).to(dtype)
+    cuda_oracle.assert_bitwise_equal(lambda t: torch.mvlgamma(t, p), x)
+    # below (p - 1) / 2 torch 2.11 has no domain check (CPU and CUDA return lgamma's values)
+    cuda_oracle.assert_bitwise_equal(lambda t: torch.mvlgamma(t, p), x - 100)
+
+
+# --------------------------------------------------------------------------
+# binary ops
+# --------------------------------------------------------------------------
+
+_SPECIAL_VALUES = [
+    0.0,
+    -0.0,
+    math.inf,
+    -math.inf,
+    math.nan,
+    1.0,
+    -1.0,
+    0.5,
+    -0.5,
+    2.0,
+    -2.0,
+    3.0,
+    1e-30,
+    -1e-30,
+    1e30,
+    -1e30,
+    1e-3,
+    0.999,
+    1.001,
+    5.0,
+    7.5,
+    10.0,
+    20.0,
+    30.5,
+    100.0,
+    1e4,
+    -3.5,
+    -10.0,
+    1e-45,
+    6.0,
+    0.1,
+    200.0,
+    250.0,
+    1e-8,
+]
+
+
+def pair_inputs(
+    dtype: torch.dtype, a_range: tuple[float, float], b_range: tuple[float, float]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The cartesian product of special values, pairs sampled in the given
+    ranges, and log-uniform pairs of both signs."""
+    sp = torch.tensor(_SPECIAL_VALUES, dtype=torch.float64)
+    a = [sp.repeat_interleave(len(sp))]
+    b = [sp.repeat(len(sp))]
+    g = _gen(7)
+    n = 1 << 15
+    a.append(torch.empty(n, dtype=torch.float64).uniform_(*a_range, generator=g))
+    b.append(torch.empty(n, dtype=torch.float64).uniform_(*b_range, generator=g))
+    for side in (a, b):
+        mag = torch.empty(n, dtype=torch.float64).uniform_(-30, 30, generator=g).exp()
+        sgn = (
+            torch.randint(0, 4, (n,), generator=g).to(torch.float64).clamp(max=1) * 2
+            - 1
+        )
+        side.append(mag * sgn)
+    if dtype in (torch.float16, torch.bfloat16):
+        # every pair of 256 patterns spread over the whole range
+        pat = (torch.arange(256, dtype=torch.int32) * 257).to(torch.int16).view(dtype)
+        a.append(pat.repeat_interleave(256).to(torch.float64))
+        b.append(pat.repeat(256).to(torch.float64))
+    if not dtype.is_floating_point:
+        return (
+            torch.cat(a).nan_to_num(0).clamp(-100, 100).to(dtype),
+            torch.cat(b).nan_to_num(0).clamp(-100, 100).to(dtype),
+        )
+    return torch.cat(a).to(dtype), torch.cat(b).to(dtype)
+
+
+_BINARY: list[
+    tuple[
+        str, Callable[..., torch.Tensor], bool, tuple[float, float], tuple[float, float]
+    ]
+] = [
+    ("xlogy", torch.xlogy, True, (-10.0, 10.0), (-10.0, 10.0)),
+    ("xlog1py", S.xlog1py, True, (-10.0, 10.0), (-2.0, 10.0)),
+    ("zeta", S.zeta, False, (0.0, 30.0), (-10.0, 30.0)),
+    ("igamma", torch.igamma, False, (0.0, 50.0), (0.0, 50.0)),
+    ("igammac", torch.igammac, False, (0.0, 50.0), (0.0, 50.0)),
+    ("igamma_large", torch.igamma, False, (100.0, 400.0), (50.0, 500.0)),
+    ("igammac_large", torch.igammac, False, (100.0, 400.0), (50.0, 500.0)),
+]
+_BINARY_IDS = [c[0] for c in _BINARY]
+
+
+@pytest.mark.parametrize("dtype", (*_F, torch.int32, torch.bool), ids=str)
+@pytest.mark.parametrize(
+    ("name", "fn", "half_ok", "a_range", "b_range"), _BINARY, ids=_BINARY_IDS
+)
+def test_binary_special_matches_cuda(
+    cuda_oracle: CudaOracle,
+    name: str,
+    fn: Callable[..., torch.Tensor],
+    half_ok: bool,
+    a_range: tuple[float, float],
+    b_range: tuple[float, float],
+    dtype: torch.dtype,
+):
+    a, b = pair_inputs(dtype, a_range, b_range)
+    cuda_oracle.assert_bitwise_equal(fn, a, b)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64), ids=str)
+@pytest.mark.parametrize("fn", (torch.igamma, torch.igammac), ids=("igamma", "igammac"))
+def test_igamma_branch_points_match_cuda(
+    cuda_oracle: CudaOracle, fn: Callable[..., torch.Tensor], dtype: torch.dtype
+):
+    """x ~ a over a log-uniform a in (1, 1100) (the asymptotic series and
+    the Lanczos prefactor), and a < 6, x < 2.5 (the x = 0.5 / 1.1 cuts
+    between the two series)."""
+    g = _gen(3)
+    n = 1 << 15
+    a = torch.empty(n, dtype=torch.float64).uniform_(0, 7, generator=g).exp()
+    x = a * (1 + torch.empty(n, dtype=torch.float64).uniform_(-0.45, 0.45, generator=g))
+    a2 = torch.empty(n, dtype=torch.float64).uniform_(0, 6, generator=g)
+    x2 = torch.empty(n, dtype=torch.float64).uniform_(0, 2.5, generator=g)
+    cuda_oracle.assert_bitwise_equal(
+        fn, torch.cat([a, a2]).to(dtype), torch.cat([x, x2]).to(dtype)
+    )
+
+
+@pytest.mark.parametrize("data_dtype", (torch.float32, torch.float64), ids=str)
+@pytest.mark.parametrize(
+    ("name", "fn", "half_ok", "a_range", "b_range"), _BINARY, ids=_BINARY_IDS
+)
+def test_binary_special_scalars_and_promotion_match_cuda(
+    cuda_oracle: CudaOracle,
+    name: str,
+    fn: Callable[..., torch.Tensor],
+    half_ok: bool,
+    a_range: tuple[float, float],
+    b_range: tuple[float, float],
+    data_dtype: torch.dtype,
+):
+    """Python scalars on either side (the CPU-scalar route of the kernel),
+    0-dim tensors, mixed dtypes, broadcasting, out= and in-place."""
+    a, b = pair_inputs(data_dtype, a_range, b_range)
+    a, b = a[:4096], b[:4096]
+    eq = cuda_oracle.assert_bitwise_equal
+    for s in (2.5, 3, True, -0.0, math.nan, 1e-3):
+        eq(lambda t, s=s: fn(t, s), b, what=f"(tensor, {s!r})")
+        eq(lambda t, s=s: fn(s, t), a, what=f"({s!r}, tensor)")
+    eq(lambda t: fn(t, torch.tensor(2.5, device=t.device)), a, what="0-dim f32")
+    eq(
+        lambda t: fn(t, torch.tensor(2.5, dtype=torch.float64, device=t.device)),
+        a,
+        what="0-dim f64",
+    )
+    eq(
+        lambda t: fn(torch.tensor(0.75, dtype=torch.float64, device=t.device), t),
+        b,
+        what="0-dim f64 lhs",
+    )
+    eq(
+        lambda t: fn(t.half(), torch.tensor(2.5, device=t.device)),
+        a,
+        what="f16, 0-dim f32",
+    )
+    eq(lambda t, u: fn(t.half(), u), a, b, what="f16, f32")
+    eq(lambda t, u: fn(t.double(), u), a, b, what="f64, f32")
+    eq(
+        lambda t, u: fn(t.to(torch.int32), u),
+        a.nan_to_num(0).clamp(-50, 50),
+        b,
+        what="i32, f32",
+    )
+    eq(
+        lambda t, u: fn(t.reshape(64, 64), u.reshape(64, 64)[:1]),
+        a,
+        b,
+        what="broadcast",
+    )
+    eq(
+        lambda t, u: fn(t.reshape(64, 64).t(), u.reshape(64, 64)),
+        a,
+        b,
+        what="transposed",
+    )
+
+    def out_variants(t: torch.Tensor, u: torch.Tensor) -> object:
+        o = torch.empty_like(t)
+        fn(t, u, out=o)
+        o64 = torch.empty(t.shape, dtype=torch.float64, device=t.device)
+        fn(t, u, out=o64)
+        strided = torch.full((2 * t.numel(),), -7.0, device=t.device)[::2]
+        fn(t, u, out=strided)
+        return o, o64, strided
+
+    eq(out_variants, a, b, what="out=")
+    method = {"xlogy": "xlogy_", "igamma": "igamma_", "igammac": "igammac_"}.get(name)
+    if method is not None:
+        eq(lambda t, u: getattr(t, method)(u), a, b, what="in-place")
+        eq(lambda t, u: getattr(t.half(), method)(u), a, b, what="in-place f16 self")
+
+
+_NAN_X_LAYOUTS = {
+    "contig": lambda a, b, n: (a, b),
+    "offset1": lambda a, b, n: (a[1:], b[1:]),
+    "stride2": lambda a, b, n: (a[::2], b[::2]),
+    "mixed_perm": lambda a, b, n: (
+        a[:n].reshape(-1, _inner(n, (10, 8))).t(),
+        b[:n].reshape(_inner(n, (10, 8)), -1),
+    ),
+    "unsqueezed_y": lambda a, b, n: (a[:n], b[:n].reshape(1, -1)),
+    "rank2_both": lambda a, b, n: (a[:n].reshape(1, -1), b[:n].reshape(1, -1)),
+    "broadcast": lambda a, b, n: (
+        a[:n].reshape(-1, _inner(n, (10, 8))),
+        b[: _inner(n, (10, 8))],
+    ),
+    "python_scalar_y": lambda a, b, n: (a, -1.0),
+    "python_scalar_x": lambda a, b, n: (math.nan, b),
+    "zero_dim_y": lambda a, b, n: (a, b[:1].reshape(())),
+    "zero_dim_x": lambda a, b, n: (a[:1].reshape(()), b),
+    "mixed_f32_y": lambda a, b, n: (a, b.float()),
+    "int_y": lambda a, b, n: (a, torch.full_like(b, 3, dtype=torch.int64)),
+}
+
+
+def _nan_x_inputs(n: int, payload: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """x NaN (the given payload) against y -inf, -1, -0.5, 2, 0, 1, NaN: the
+    log is -NaN for a negative y, so which NaN wins decides the bits."""
+    nan_bits = 0x7FF8000000000000 | payload
+    a = torch.full((n + 1,), nan_bits, dtype=torch.int64).view(torch.float64)
+    ys = torch.tensor(
+        [-math.inf, -1.0, -0.5, 2.0, 0.0, 1.0, math.nan], dtype=torch.float64
+    )
+    return a, ys.repeat(n // 7 + 1)[: n + 1]
+
+
+@pytest.mark.parametrize(
+    "payload", (0, 0x123, -(1 << 51)), ids=("qnan", "payload", "negative")
+)
+@pytest.mark.parametrize("n", (70, 1024, 4900))
+@pytest.mark.parametrize("layout", _NAN_X_LAYOUTS)
+@pytest.mark.parametrize("name", ("xlogy", "xlog1py"))
+def test_xlogy_float64_nan_x_matches_cuda(
+    cuda_oracle: CudaOracle, name: str, layout: str, n: int, payload: int
+):
+    """Which NaN CUDA returns for NaN x with a NaN log: log's in full
+    vectorized blocks and for broadcast operands, x's in the partial last
+    1024-block, for host scalar x and for mixed operand dtypes."""
+    fn = {"xlogy": torch.xlogy, "xlog1py": torch.special.xlog1py}[name]
+    if payload < 0:
+        a, b = _nan_x_inputs(n, 0)
+        a = -a
+    else:
+        a, b = _nan_x_inputs(n, payload)
+    view = _NAN_X_LAYOUTS[layout]
+    cuda_oracle.assert_bitwise_equal(lambda x, y: fn(*view(x, y, n)), a, b)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="CUDA's partial-block rule keys on the memory index of the (permuted) "
+    "output; ours iterates the logical order",
+)
+def test_xlogy_float64_nan_x_transposed_matches_cuda(cuda_oracle: CudaOracle):
+    a, b = _nan_x_inputs(4899, 0)
+    cuda_oracle.assert_bitwise_equal(
+        lambda x, y: torch.xlogy(
+            x[:4900].reshape(-1, 10).t(), y[:4900].reshape(-1, 10).t()
+        ),
+        a,
+        b,
+    )
+
+
+@pytest.mark.parametrize(
+    "q_bits", (0x7FF8000000000123, -0x0008000000000000, 0x4000000000000000)
+)
+@pytest.mark.parametrize(
+    "mix", ("f64_f64", "f16_f64", "f32_f64", "f64_f32", "f64_zero_dim_f32")
+)
+def test_zeta_float64_nan_operands_match_cuda(
+    cuda_oracle: CudaOracle, mix: str, q_bits: int
+):
+    """NaN x against NaN or finite q: which NaN CUDA returns (q's when both)."""
+    x = (
+        torch.tensor([0x7FF8000000000456], dtype=torch.int64)
+        .view(torch.float64)
+        .repeat(8)
+    )
+    q = torch.tensor([q_bits], dtype=torch.int64).view(torch.float64).repeat(8)
+    views = {
+        "f64_f64": lambda a, b: (a, b),
+        "f16_f64": lambda a, b: (a.half(), b),
+        "f32_f64": lambda a, b: (a.float(), b),
+        "f64_f32": lambda a, b: (a, b.float()),
+        "f64_zero_dim_f32": lambda a, b: (a, b[0].float()),
+    }
+    cuda_oracle.assert_bitwise_equal(lambda a, b: S.zeta(*views[mix](a, b)), x, q)
+
+
+_OUT_VIEWS = {
+    "dense": lambda o: o,
+    "offset1": lambda o: o[1:],
+    "stride2": lambda o: o[::2],
+    # a 2-D out= for 1-D operands is resized to a fresh dense tensor
+    "resized_2d": lambda o: o.reshape(-1, 10).t(),
+    # a 2-D out= of the same numel is resized in place on the offset storage
+    "offset1_resized": lambda o: o[1:].reshape(-1, 10),
+    "rank2_same_numel": lambda o: o.reshape(1, -1),
+    # a larger offset buffer resized down keeps its (misaligned) pointer
+    "offset1_oversized": lambda o: o[1:],
+}
+
+
+@pytest.mark.parametrize("n", (1000, 4900))
+@pytest.mark.parametrize("out_view", _OUT_VIEWS)
+@pytest.mark.parametrize("name", ("xlogy", "xlog1py"))
+def test_xlogy_float64_nan_x_out_views_match_cuda(
+    cuda_oracle: CudaOracle, name: str, out_view: str, n: int
+):
+    """The out= tensor's layout and alignment pick the CUDA kernel too."""
+    fn = {"xlogy": torch.xlogy, "xlog1py": torch.special.xlog1py}[name]
+    a, b = _nan_x_inputs(n, 0x123)
+    a, b = a[:n], b[:n]
+    size = {
+        "dense": n,
+        "offset1": n + 1,
+        "stride2": 2 * n,
+        "resized_2d": n,
+        "offset1_resized": n + 1,
+        "rank2_same_numel": n,
+        "offset1_oversized": n + 6,
+    }[out_view]
+
+    def run(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        buf = torch.zeros(size, dtype=torch.float64, device=x.device)
+        out = _OUT_VIEWS[out_view](buf)
+        fn(x, y, out=out)
+        return buf
+
+    cuda_oracle.assert_bitwise_equal(run, a, b)
+
+
+_POLY = [
+    "chebyshev_polynomial_t",
+    "chebyshev_polynomial_u",
+    "chebyshev_polynomial_v",
+    "chebyshev_polynomial_w",
+    "shifted_chebyshev_polynomial_t",
+    "shifted_chebyshev_polynomial_u",
+    "shifted_chebyshev_polynomial_v",
+    "shifted_chebyshev_polynomial_w",
+    "hermite_polynomial_h",
+    "hermite_polynomial_he",
+    "laguerre_polynomial_l",
+    "legendre_polynomial_p",
+]
+
+
+def poly_inputs(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """x: special values, [-2, 2] (the cos(n acos x) regime of |x| < 1
+    included), [-50, 50]; n: integers from -2 to 40 plus non-integers,
+    NaN and infinities (C++ casts n to int64)."""
+    g = _gen(11)
+    sp = torch.tensor(_SPECIAL_VALUES, dtype=torch.float64)
+    x = torch.cat(
+        [
+            sp.repeat_interleave(12),
+            torch.empty(1 << 14, dtype=torch.float64).uniform_(-2, 2, generator=g),
+            torch.empty(1 << 12, dtype=torch.float64).uniform_(-50, 50, generator=g),
+            torch.tensor([0.3, -0.3, 0.9, 1.0, -1.0, 0.0] * 8, dtype=torch.float64),
+        ]
+    )
+    n_sp = torch.tensor([0, 1, 2, 3, 5, 6, 7, 12, 25, -1, -2, 40], dtype=torch.float64)
+    n = torch.cat(
+        [
+            n_sp.repeat(len(_SPECIAL_VALUES)),
+            torch.randint(-2, 41, (1 << 14,), generator=g).to(torch.float64),
+            torch.randint(-2, 41, (1 << 12,), generator=g).to(torch.float64),
+            torch.tensor(
+                [1.5, 2.7, -0.5, math.nan, math.inf, -math.inf] * 8, dtype=torch.float64
+            ),
+        ]
+    )
+    return x.to(dtype), n.to(dtype)
+
+
+@pytest.mark.parametrize("dtype", (*_F, torch.int64), ids=str)
+@pytest.mark.parametrize("name", _POLY)
+def test_polynomial_matches_cuda(
+    cuda_oracle: CudaOracle, name: str, dtype: torch.dtype
+):
+    fn = getattr(S, name)
+    x, n = poly_inputs(torch.float64)
+    if dtype.is_floating_point:
+        x, n = x.to(dtype), n.to(dtype)
+    else:
+        x, n = (
+            x.nan_to_num(0).clamp(-50, 50).to(dtype),
+            n.nan_to_num(0).clamp(-5, 40).to(dtype),
+        )
+    cuda_oracle.assert_bitwise_equal(fn, x, n)
+
+
+@pytest.mark.parametrize("name", ("hermite_polynomial_he", "hermite_polynomial_h"))
+@pytest.mark.parametrize("dtype", (*_F, torch.int64), ids=str)
+def test_hermite_degree_limits_match_cuda(
+    cuda_oracle: CudaOracle, name: str, dtype: torch.dtype
+):
+    """Degrees around the recurrence limits (128 float / 512 double), negative
+    ones, and NaN / infinite x, for every dtype (half is refused by both)."""
+    fn = getattr(S, name)
+    degrees = [0, 1, 2, 127, 128, 129, 511, 512, 513, -1, -5, -(2**40)]
+    xs = [0.0, -0.0, 0.3, -1.5, 2.0, 7.5, math.nan, math.inf, -math.inf]
+    x = torch.tensor(xs * len(degrees), dtype=torch.float64)
+    n = torch.tensor(degrees, dtype=torch.float64).repeat_interleave(len(xs))
+    if dtype.is_floating_point:
+        x, n = x.to(dtype), n.to(dtype)
+    else:
+        x = x.nan_to_num(0).clamp(-50, 50).to(dtype)
+        n = n.nan_to_num(0).clamp(-5, 600).to(dtype)
+    cuda_oracle.assert_bitwise_equal(fn, x, n)
+
+
+@pytest.mark.parametrize("name", _POLY)
+def test_polynomial_scalars_match_cuda(cuda_oracle: CudaOracle, name: str):
+    fn = getattr(S, name)
+    x, n = poly_inputs(torch.float32)
+    eq = cuda_oracle.assert_bitwise_equal
+    for k in (0, 1, 2, 3, 6, 7, 30, 2.5, -1):
+        eq(lambda t, k=k: fn(t, k), x, what=f"n={k}")
+    if name == "legendre_polynomial_p":
+        # CUDA's recurrence never ends for |x| < 1 and an infinite degree
+        # (int64 max steps of a bounded, never-NaN sequence).
+        n = n.nan_to_num(0.0, 100.0, -100.0)
+    for v in (0.3, -0.7, 2.0, 0.5):
+        eq(lambda u, v=v: fn(v, u), n, what=f"x={v}")
+    eq(lambda t, u: fn(t.double(), u), x, n, what="f64, f32")
+    eq(
+        lambda t, u: fn(t, u.to(torch.int64)),
+        x,
+        n.nan_to_num(0).clamp(-5, 40),
+        what="f32, i64",
+    )
+
+    def out_variants(t: torch.Tensor, u: torch.Tensor) -> object:
+        o = torch.empty_like(t)
+        fn(t, u, out=o)
+        o64 = torch.empty(t.shape, dtype=torch.float64, device=t.device)
+        fn(t, u, out=o64)
+        return o, o64
+
+    eq(out_variants, x, n, what="out=")
+
+
+# --------------------------------------------------------------------------
+# backward-style binary ops
+# --------------------------------------------------------------------------
+
+
+# float32 (alpha, x) pairs whose small-x result depends on which product of
+# `(log x - digamma(alpha)) * cdf - pow(x, alpha) * series2` is rounded.
+_SGG_SENSITIVE = [
+    (0x40239F7C, 0x3B926571),
+    (0x37CAD36F, 0x2F391E82),
+    (0x394DEB88, 0x3D52C39C),
+    (0x30AAACDA, 0x2F0333D0),
+]
+
+
+def _sgg_sensitive() -> tuple[torch.Tensor, torch.Tensor]:
+    a, x = zip(*_SGG_SENSITIVE, strict=True)
+    return _from_bits(list(a), torch.float32), _from_bits(list(x), torch.float32)
+
+
+@pytest.mark.parametrize("dtype", (*_F, torch.int32), ids=str)
+def test_standard_gamma_grad_matches_cuda(cuda_oracle: CudaOracle, dtype: torch.dtype):
+    alpha, x = pair_inputs(dtype, (0.0, 20.0), (0.0, 20.0))
+    sa, sx = _sgg_sensitive()
+    alpha, x = torch.cat([alpha, sa.to(dtype)]), torch.cat([x, sx.to(dtype)])
+    cuda_oracle.assert_bitwise_equal(torch.ops.aten._standard_gamma_grad, alpha, x)
+
+
+def test_standard_gamma_grad_remainder_block_matches_cuda(cuda_oracle: CudaOracle):
+    """In whole 1024-element blocks CUDA rounds pow(x, alpha) * series2 and
+    fuses the other product; the first 128 elements of a partial last block
+    round the other product instead, so the same (alpha, x) gives different
+    bits there (`sgg_alt_contraction`). Several block counts and tails."""
+    sa, sx = _sgg_sensitive()
+    for n in (512, 1500, 2300, 5000):
+        alpha = torch.cat([sa.repeat(n // 4), torch.full((n % 4,), 3.0)])
+        x = torch.cat([sx.repeat(n // 4), torch.full((n % 4,), 0.5)])
+        cuda_oracle.assert_bitwise_equal(
+            torch.ops.aten._standard_gamma_grad, alpha, x, what=f"numel {n}"
+        )
+
+
+# Which CUDA kernel runs decides the gamma-grad contraction (the vectorized
+# one, the strided one, the unrolled one over misaligned storage), so every
+# layout below picks a path. Probed per index against stock CUDA.
+# (alpha, x) bit patterns whose small-x result depends on the contraction, per
+# dtype, found against stock CUDA (vectorized vs misaligned launch of one dataset).
+_SGG_PAIRS = {
+    torch.float32: [
+        (0x40772C7C, 0x3F48887C),
+        (0x405F171F, 0x3E4C4D00),
+        (0x408A91A2, 0x3EAE5D4B),
+        (0x3FFE0393, 0x3E95E8E9),
+    ],
+    torch.float16: [
+        (0x3825, 0x3991),
+        (0x41A3, 0x2A24),
+        (0x3149, 0x3974),
+        (0x41EF, 0x3901),
+    ],
+    torch.bfloat16: [
+        (0x3CFB, 0x3F05),
+        (0x3D4A, 0x3E76),
+        (0x3C82, 0x3ECC),
+        (0x3E1A, 0x3E2A),
+    ],
+    torch.float64: [
+        (0x400166546CF478C5, 0x3FD367BCCEFA37E2),
+        (0x400BE2E3E944DDBC, 0x3FC9899FFE4B738D),
+        (0x3FFF6DE837EA447A, 0x3FE2285E449AC33E),
+        (0x4013455E9F352FA4, 0x3FBD8701F8C41140),
+    ],
+}
+
+
+def _inner(n: int, options: tuple[int, ...]) -> int:
+    return next(f for f in options if n % f == 0)
+
+
+def _sgg_pairs(
+    dtype: torch.dtype, idx: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(alpha, x) of the dtype's sensitive pair number `idx % 4`, per element."""
+    int_dtype = {2: torch.int16, 4: torch.int32, 8: torch.int64}[
+        torch.empty(0, dtype=dtype).element_size()
+    ]
+    pairs = _SGG_PAIRS[dtype]
+    a = torch.tensor([u for u, _ in pairs], dtype=int_dtype).view(dtype)
+    x = torch.tensor([v for _, v in pairs], dtype=int_dtype).view(dtype)
+    return a[idx % 4], x[idx % 4]
+
+
+def _pad(t: torch.Tensor, front: int = 0, back: int = 0) -> torch.Tensor:
+    return torch.cat([t[:1].repeat(front), t, t[:1].repeat(back)])
+
+
+def _sgg_transposed_storage(t: torch.Tensor, f: int) -> torch.Tensor:
+    """Storage whose `.reshape(-1, f).t()` reads t in logical order."""
+    return t.reshape(f, -1).t().reshape(-1).contiguous()
+
+
+def _sgg_logical(dtype: torch.dtype, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return _sgg_pairs(dtype, torch.arange(n))
+
+
+# name -> (prep(dtype, n) -> (alpha storage, x storage), view(alpha, x, n)). The
+# prep puts the same sensitive pair on the two operands of every output element.
+_SGG_LAYOUTS = {
+    "contig": (lambda dt, n: _sgg_logical(dt, n), lambda a, x, n: (a, x)),
+    "offset1": (
+        lambda dt, n: tuple(_pad(t, 1) for t in _sgg_logical(dt, n)),
+        lambda a, x, n: (a[1:], x[1:]),
+    ),
+    "offset2": (
+        lambda dt, n: tuple(_pad(t, 2) for t in _sgg_logical(dt, n)),
+        lambda a, x, n: (a[2:], x[2:]),
+    ),
+    "offset3": (
+        lambda dt, n: tuple(_pad(t, 3) for t in _sgg_logical(dt, n)),
+        lambda a, x, n: (a[3:], x[3:]),
+    ),
+    "mixed_offsets": (
+        lambda dt, n: (
+            _pad(_sgg_logical(dt, n)[0], 1),
+            _pad(_sgg_logical(dt, n)[1], 0, 1),
+        ),
+        lambda a, x, n: (a[1:], x[:-1]),
+    ),
+    "stride2": (
+        lambda dt, n: tuple(t.repeat_interleave(2) for t in _sgg_logical(dt, n)),
+        lambda a, x, n: (a[::2], x[::2]),
+    ),
+    "transposed": (
+        lambda dt, n: tuple(
+            _sgg_transposed_storage(t, _inner(n, (10, 19))) for t in _sgg_logical(dt, n)
+        ),
+        lambda a, x, n: (
+            a.reshape(-1, _inner(n, (10, 19))).t(),
+            x.reshape(-1, _inner(n, (10, 19))).t(),
+        ),
+    ),
+    "mixed_perm": (
+        lambda dt, n: (
+            _sgg_transposed_storage(_sgg_logical(dt, n)[0], _inner(n, (10, 19))),
+            _sgg_logical(dt, n)[1],
+        ),
+        lambda a, x, n: (
+            a.reshape(-1, _inner(n, (10, 19))).t(),
+            x.reshape(_inner(n, (10, 19)), -1),
+        ),
+    ),
+    "broadcast": (
+        # output (r, c): alpha[r * f + c] with x[c], so both follow c % 4
+        lambda dt, n: (
+            _sgg_pairs(dt, torch.arange(n) % _inner(n, (10, 19)))[0],
+            _sgg_pairs(dt, torch.arange(_inner(n, (10, 19))))[1],
+        ),
+        lambda a, x, n: (a.reshape(-1, _inner(n, (10, 19))), x),
+    ),
+}
+
+
+@pytest.mark.parametrize("n", (1500, 1501, 2300))
+@pytest.mark.parametrize("layout", _SGG_LAYOUTS)
+@pytest.mark.parametrize("dtype", _F, ids=str)
+def test_standard_gamma_grad_launch_regimes_match_cuda(
+    cuda_oracle: CudaOracle, dtype: torch.dtype, layout: str, n: int
+):
+    """Remainder blocks and every launch path, per dtype: contraction-
+    sensitive pairs at every storage index of every layout."""
+    prep, view = _SGG_LAYOUTS[layout]
+    alpha, x = prep(dtype, n)
+    # every output element must see a matched sensitive pair of its dtype
+    va, vx = torch.broadcast_tensors(*view(alpha, x, n))
+    table_a, table_x = _sgg_pairs(dtype, torch.arange(4))
+    ia = (va.unsqueeze(-1) == table_a).to(torch.int64).argmax(-1)
+    assert (table_a[ia] == va).all() and (table_x[ia] == vx).all()
+    assert va.numel() == n
+    cuda_oracle.assert_bitwise_equal(
+        lambda a, b: torch.ops.aten._standard_gamma_grad(*view(a, b, n)), alpha, x
+    )
+
+
+@pytest.mark.parametrize("dtype", (*_F, torch.int32), ids=str)
+@pytest.mark.parametrize("eps", [None, 0.0, 1e-6, 0.25, -0.5])
+def test_logit_backward_matches_cuda(
+    cuda_oracle: CudaOracle, eps: float | None, dtype: torch.dtype
+):
+    grad, x = pair_inputs(dtype, (-3.0, 3.0), (-0.5, 1.5))
+    cuda_oracle.assert_bitwise_equal(
+        lambda g_, t: torch.ops.aten.logit_backward(g_, t, eps), grad, x
+    )

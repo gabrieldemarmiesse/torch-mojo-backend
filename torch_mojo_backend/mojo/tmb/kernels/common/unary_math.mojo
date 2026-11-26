@@ -33,7 +33,9 @@ from std.utils.numerics import isnan, max_or_inf, nan
 from tmb.kernels.common.cuda_math import (
     nv_asinf,
     nv_atanf,
+    nv_erf,
     nv_erfcf,
+    nv_erff,
     nv_erfinvf,
     nv_exp2f,
     nv_expm1f,
@@ -43,6 +45,9 @@ from tmb.kernels.common.cuda_math import (
 from tmb.kernels.common.libdevice_port import (
     nv_asinh,
     nv_asinhf,
+    nv_erfc,
+    nv_erfinv,
+    nv_lgamma,
     nv_log2f,
     nv_logf,
 )
@@ -78,7 +83,7 @@ from tmb.kernels.common.mps_math import (
     mps_sinc,
     rint_even,
 )
-from tmb.kernels.common.special_math import (
+from tmb.kernels.common.special_math_legacy import (
     airy_ai_f,
     bessel_j0_f,
     bessel_j1_f,
@@ -103,6 +108,32 @@ from tmb.kernels.common.special_math import (
     sinc_f,
     spherical_bessel_j0_f,
     trigamma_f,
+)
+from tmb.kernels.common.special_math import (
+    airy_ai,
+    bessel_j0,
+    bessel_j1,
+    bessel_y0,
+    bessel_y1,
+    digamma,
+    entr,
+    erfcx,
+    i0,
+    i0e,
+    i1,
+    i1e,
+    log_ndtr,
+    logit,
+    modified_bessel_i0,
+    modified_bessel_i1,
+    modified_bessel_k0,
+    modified_bessel_k1,
+    ndtri,
+    polygamma,
+    polygamma_series,
+    sinc,
+    spherical_bessel_j0,
+    trigamma,
 )
 
 
@@ -172,16 +203,28 @@ def _acosh[
 
 @always_inline
 def is_scalar_special[kind: StaticString]() -> Bool:
-    """The kinds computed one float32 lane at a time by a scalar port of the
-    CUDA routine stock torch runs (`cuda_math.mojo`, `special_math.mojo`):
+    """The kinds computed one lane at a time by a scalar port of the CUDA
+    routine stock torch runs (`cuda_math.mojo`, `special_math.mojo`):
     branchy Cephes/libdevice code, evaluated in float for float16/bfloat16
-    inputs as the jiterator does. float64 inputs (reachable only from the
-    torch.compile graph; the eager ops decline them) compute in float too.
+    inputs as the jiterator does, and in double for float64 where
+    `has_f64_port` (in float otherwise).
     """
     return (
-        kind == "airy_ai"
-        or kind == "asin"
+        kind == "asin"
         or kind == "atan"
+        or kind == "exp2"
+        or kind == "expm1"
+        or kind == "log10"
+        or has_f64_port[kind]()
+    )
+
+
+@always_inline
+def has_f64_port[kind: StaticString]() -> Bool:
+    """The scalar-special kinds with a double port (the special functions:
+    their jiterator strings / kernels instantiated for T = double)."""
+    return (
+        kind == "airy_ai"
         or kind == "bessel_j0"
         or kind == "bessel_j1"
         or kind == "bessel_y0"
@@ -191,14 +234,11 @@ def is_scalar_special[kind: StaticString]() -> Bool:
         or kind == "erfc"
         or kind == "erfcx"
         or kind == "erfinv"
-        or kind == "exp2"
-        or kind == "expm1"
         or kind == "i0"
         or kind == "i0e"
         or kind == "i1"
         or kind == "i1e"
         or kind == "lgamma"
-        or kind == "log10"
         or kind == "log_ndtr"
         or kind == "logit"
         or kind == "modified_bessel_i0"
@@ -215,7 +255,7 @@ def is_scalar_special[kind: StaticString]() -> Bool:
 
 
 @always_inline
-def _scalar_special[kind: StaticString](a: Float32) -> Float32:
+def _scalar_special_legacy[kind: StaticString](a: Float32) -> Float32:
     comptime if kind == "airy_ai":
         return airy_ai_f(a)
     elif kind == "asin":
@@ -294,6 +334,109 @@ def _scalar_special[kind: StaticString](a: Float32) -> Float32:
         return trigamma_f(a)
     else:
         comptime assert False, "unsupported scalar special kind"
+
+
+@always_inline
+def _scalar_special[kind: StaticString, ct: DType](a: Scalar[ct]) -> Scalar[ct]:
+    """`kind` in the compute type `ct`: float32, or float64 for the
+    `has_f64_port` kinds. Off NVIDIA the float ports these kinds always had."""
+    comptime if not is_nvidia_gpu():
+        return rebind[Scalar[ct]](
+            _scalar_special_legacy[kind](rebind[Float32](a))
+        )
+    elif kind == "airy_ai":
+        return airy_ai(a)
+    elif kind == "bessel_j0":
+        return bessel_j0(a)
+    elif kind == "bessel_j1":
+        return bessel_j1(a)
+    elif kind == "bessel_y0":
+        return bessel_y0(a)
+    elif kind == "bessel_y1":
+        return bessel_y1(a)
+    elif kind == "digamma":
+        return digamma(a)
+    elif kind == "entr":
+        return entr(a)
+    elif kind == "erfcx":
+        return erfcx(a)
+    elif kind == "i0":
+        return i0(a)
+    elif kind == "i0e":
+        return i0e(a)
+    elif kind == "i1":
+        return i1(a)
+    elif kind == "i1e":
+        return i1e(a)
+    elif kind == "log_ndtr":
+        return log_ndtr(a)
+    elif kind == "logit":
+        return logit(a, Scalar[ct](-1.0))
+    elif kind == "modified_bessel_i0":
+        return modified_bessel_i0(a)
+    elif kind == "modified_bessel_i1":
+        return modified_bessel_i1(a)
+    elif kind == "modified_bessel_k0":
+        return modified_bessel_k0[ct, False](a)
+    elif kind == "modified_bessel_k1":
+        return modified_bessel_k1[ct, False, fb=ct == DType.float32](a)
+    elif kind == "ndtri":
+        return ndtri(a)
+    elif kind == "scaled_modified_bessel_k0":
+        return modified_bessel_k0[ct, True, fb=True](a)
+    elif kind == "scaled_modified_bessel_k1":
+        return modified_bessel_k1[ct, True](a)
+    elif kind == "sinc":
+        return sinc(a)
+    elif kind == "spherical_bessel_j0":
+        return spherical_bessel_j0(a)
+    elif kind == "trigamma":
+        return trigamma(a)
+    elif ct == DType.float64:
+        var d = rebind[Float64](a)
+        comptime if kind == "erfc":
+            return rebind[Scalar[ct]](nv_erfc(d))
+        elif kind == "erfinv":
+            return rebind[Scalar[ct]](nv_erfinv(d))
+        else:
+            comptime assert kind == "lgamma", "no float64 port of this kind"
+            return rebind[Scalar[ct]](nv_lgamma(d))
+    else:
+        return rebind[Scalar[ct]](_scalar_special_f32[kind](rebind[Float32](a)))
+
+
+@always_inline
+def _scalar_special_f32[kind: StaticString](a: Float32) -> Float32:
+    """The libm kinds in float (CUDA's, or ocml's on AMD GPUs)."""
+    comptime if kind == "asin":
+        comptime if is_amd_gpu():
+            return oc_asinf(a)
+        return nv_asinf(a)
+    elif kind == "atan":
+        comptime if is_amd_gpu():
+            return oc_atanf(a)
+        return nv_atanf(a)
+    elif kind == "erfc":
+        return nv_erfcf(a)
+    elif kind == "erfinv":
+        comptime if is_amd_gpu():
+            return oc_erfinvf(a)
+        return nv_erfinvf(a)
+    elif kind == "exp2":
+        comptime if is_amd_gpu():
+            return oc_exp2f(a)
+        return nv_exp2f(a)
+    elif kind == "expm1":
+        comptime if is_amd_gpu():
+            return oc_expm1f(a)
+        return nv_expm1f(a)
+    elif kind == "lgamma":
+        return nv_lgammaf(a)
+    else:
+        comptime assert kind == "log10", "unsupported scalar special kind"
+        comptime if is_amd_gpu():
+            return oc_log10f(a)
+        return nv_log10f(a)
 
 
 @always_inline
@@ -510,7 +653,19 @@ def _float_unary[
     comptime if kind == "cosh":
         res = cosh(a)
     comptime if kind == "erf":
-        res = erf(a)
+        comptime if is_nvidia_gpu():
+            # erf_kernel_cuda's `::erf`: CUDA's erff / erf.
+            comptime for i in range(width):
+                comptime if dtype == DType.float32:
+                    res[i] = rebind[Scalar[dtype]](
+                        nv_erff(rebind[Float32](a[i]))
+                    )
+                else:
+                    res[i] = rebind[Scalar[dtype]](
+                        nv_erf(rebind[Float64](a[i]))
+                    )
+        else:
+            res = erf(a)
     comptime if (
         kind == "log" or kind == "log2"
     ) and dtype == DType.float32 and (is_nvidia_gpu() or is_amd_gpu()):
@@ -587,8 +742,10 @@ def _float_unary[
     # math preserves them already, so avoid an extra select on every lane.
     # Retain the existing correction on other backends and float64, except
     # for the vendor asinh ports, which quiet a signaling NaN as CUDA does.
-    comptime if not (is_nvidia_gpu() and dtype == DType.float32) and not (
-        kind == "asinh" and (is_nvidia_gpu() or is_amd_gpu())
+    comptime if (
+        not (is_nvidia_gpu() and dtype == DType.float32)
+        and not (kind == "asinh" and (is_nvidia_gpu() or is_amd_gpu()))
+        and not (kind == "erf" and is_nvidia_gpu())
     ):
         return isnan(a).select(a, res)
     else:
@@ -631,10 +788,20 @@ def elementwise_unary[
             r[i] = _mps_special[kind, dtype](xf[i])
         return r.cast[dtype]()
     elif is_scalar_special[kind]():
+        comptime if (
+            dtype == DType.float64 and has_f64_port[kind]() and is_nvidia_gpu()
+        ):
+            var r = SIMD[dtype, width]()
+            comptime for i in range(width):
+                r[i] = _scalar_special[kind, dtype](x[i])
+            return r
         var xf = x.cast[DType.float32]()
         var r = SIMD[DType.float32, width]()
         comptime for i in range(width):
-            r[i] = _scalar_special[kind](xf[i])
+            comptime if is_nvidia_gpu():
+                r[i] = _scalar_special[kind, DType.float32](xf[i])
+            else:
+                r[i] = _scalar_special_legacy[kind](xf[i])
         return r.cast[dtype]()
     elif kind == "acosh" and (
         dtype == DType.float16 or dtype == DType.bfloat16
@@ -792,6 +959,53 @@ def elementwise_unary_param[
                 return (_rounding["round"](q) * tp).cast[dtype]()
             var q = _to_dtype_rounded[dtype](xf * tp)
             return (_rounding["round"](q) / tp).cast[dtype]()
+    elif ct == DType.float64 and is_nvidia_gpu() and kind == "mvlgamma":
+        # The float32 sum below in double: same offsets, accumulator order
+        # and tree (CUDA's reduce over the p-long dim), nv_lgamma per term.
+        # The double tensor's offsets are exact, so nothing rounds per step.
+        var p = Int(rebind[Float64](p0))
+        var c = rebind[Float64](p1)
+        var start = Float64(1 - p) * Float64(0.5)
+        var r = SIMD[dtype, width]()
+        comptime for i in range(width):
+            var xi = rebind[Float64](x[i])
+            var acc = Array[Float64, 32](fill=Float64(0.0))
+            for j in range(p):
+                acc[j % 32] += nv_lgamma(
+                    xi + (start + Float64(j) * Float64(0.5))
+                )
+            comptime for level in range(5):
+                comptime half = 16 >> level
+                comptime for k in range(half):
+                    acc[k] += acc[k + half]
+            r[i] = rebind[Scalar[dtype]](acc[0] + c)
+        return r
+    elif (
+        ct == DType.float64
+        and is_nvidia_gpu()
+        and (kind == "logit" or kind == "polygamma")
+    ):
+        var r = SIMD[dtype, width]()
+        comptime if kind == "logit":
+            var eps = rebind[Scalar[dtype]](p0)
+            comptime for i in range(width):
+                r[i] = logit(x[i], eps)
+        else:
+            var n = Int32(Int(rebind[Float64](p0))) * Int32(65536) + Int32(
+                Int(rebind[Float64](p1))
+            )
+            var nf = rebind[Float64](p2)
+            comptime for i in range(width):
+                r[i] = rebind[Scalar[dtype]](
+                    polygamma_lane(
+                        rebind[Float64](x[i]),
+                        n,
+                        abs(nf),
+                        nf > 0.0,
+                        nf != 0.0,
+                    )
+                )
+        return r
     else:
         comptime assert ct == DType.float32, "float64 has no special port"
         var xf = x.cast[DType.float32]()
@@ -805,7 +1019,10 @@ def elementwise_unary_param[
                     r[i] = mps_logit(xf[i], eps, lo, hi)
             else:
                 comptime for i in range(width):
-                    r[i] = logit_f(xf[i], eps)
+                    comptime if is_nvidia_gpu():
+                        r[i] = logit(xf[i], eps)
+                    else:
+                        r[i] = logit_f(xf[i], eps)
         elif kind == "polygamma":
             # The order's int32 in two exact float halves, then 0 for
             # digamma / trigamma, else the order as a float, negated when
@@ -860,22 +1077,35 @@ def elementwise_unary_param[
 
 
 @always_inline
-def polygamma_lane(
-    x: Float32, n: Int32, nf: Float32, odd: Bool, series: Bool
-) -> Float32:
+def polygamma_lane[
+    dt: DType
+](x: Scalar[dt], n: Int32, nf: Scalar[dt], odd: Bool, series: Bool) -> Scalar[
+    dt
+]:
     """polygamma(n, x) as each backend's kernel computes it. ATen picks
     digamma / trigamma on the int64 order; `series` says it was 2 or more.
     CUDA's series then takes an `int` (`n`, the order truncated to 32 bits;
     0 or 1 itself when `series` is False), Apple's the int64 order itself
     (`nf` = its float, `odd` its parity)."""
     comptime if is_apple_gpu():
+        comptime assert dt == DType.float32, "no float64 on Apple GPUs"
+        var xf = rebind[Float32](x)
         if series:
-            return mps_polygamma_series(x, nf, odd)
-        return mps_polygamma(x, Int(n))
+            return rebind[Scalar[dt]](
+                mps_polygamma_series(xf, rebind[Float32](nf), odd)
+            )
+        return rebind[Scalar[dt]](mps_polygamma(xf, Int(n)))
     else:
+        comptime if not is_nvidia_gpu():
+            comptime assert dt == DType.float32, "float32 only off NVIDIA"
+            if series:
+                return rebind[Scalar[dt]](
+                    polygamma_series_f(rebind[Float32](x), n)
+                )
+            return rebind[Scalar[dt]](polygamma_f(rebind[Float32](x), Int(n)))
         if series:
-            return polygamma_series_f(x, n)
-        return polygamma_f(x, Int(n))
+            return polygamma_series(x, n)
+        return polygamma(x, Int(n))
 
 
 @always_inline
@@ -885,8 +1115,12 @@ def elementwise_polygamma[
     """The polygamma function lane by lane for the torch.compile graph, the
     order `n` (the int64 order) a custom-op parameter: exact, where a float
     operand of the input dtype would round it."""
-    var xf = x.cast[DType.float32]()
-    var r = SIMD[DType.float32, width]()
+    comptime f64_ok = dtype == DType.float64 and is_nvidia_gpu()
+    comptime ct = DType.float64 if f64_ok else DType.float32
+    var xf = x.cast[ct]()
+    var r = SIMD[ct, width]()
     comptime for i in range(width):
-        r[i] = polygamma_lane(xf[i], Int32(n), Float32(n), n % 2 != 0, series)
+        r[i] = polygamma_lane(
+            xf[i], Int32(n), Scalar[ct](n), n % 2 != 0, series
+        )
     return r.cast[dtype]()

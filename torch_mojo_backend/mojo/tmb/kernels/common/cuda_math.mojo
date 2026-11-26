@@ -24,6 +24,8 @@ from std.sys.info import is_apple_gpu, is_gpu, is_nvidia_gpu
 
 from tmb.kernels.common.libdevice_port import (
     _f2i_rn,
+    _fma_rm_f,
+    _sat_f,
     _trig_reduction_slowpath_f,
     nv_logf,
 )
@@ -51,6 +53,18 @@ def _trunc(x: Float32) -> Float32:
 def _round_away(x: Float32) -> Float32:
     """llvm.nvvm.round.f: nearest integer, halfway cases away from zero."""
     return llvm_intrinsic["llvm.round", Float32, has_side_effect=False](x)
+
+
+@always_inline
+def _rint(x: Float32) -> Float32:
+    """llvm.nvvm.round.f (libdevice's rintf): nearest integer, ties to even
+    (NVIDIA; other targets keep the ties-away `_round_away` they always ran)."""
+    comptime if is_nvidia_gpu():
+        return llvm_intrinsic["llvm.roundeven", Float32, has_side_effect=False](
+            x
+        )
+    else:
+        return _round_away(x)
 
 
 @always_inline
@@ -667,6 +681,88 @@ def nv_erfcf(a: Float32) -> Float32:
 
 
 @always_inline
+def _fd(bits: UInt64) -> Float32:
+    """A float32 constant spelled as libdevice's IR does, as a double."""
+    return Float64(from_bits=bits).cast[DType.float32]()
+
+
+@always_inline
+def _mul_rz(a: Float32, b: Float32) -> Float32:
+    """mul.rz.f32: the product rounded toward zero."""
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "mul.rz.f32 $0, $1, $2;",
+            Float32,
+            constraints="=f,f,f",
+            has_side_effect=False,
+        ](a, b)
+    else:
+        # The float64 product is exact (barring double underflow); step the
+        # nearest float32 toward zero when it rounded away.
+        var d = a.cast[DType.float64]() * b.cast[DType.float64]()
+        var r = d.cast[DType.float32]()
+        var rd = r.cast[DType.float64]()
+        if _abs(r) < _INF and (rd > d if d > 0 else rd < d):
+            r = Float32(from_bits=r.to_bits[DType.uint32]() - UInt32(1))
+        return r
+
+
+@always_inline
+def nv_erfcxf(a: Float32) -> Float32:
+    """`__nv_erfcxf` of CUDA 13's libdevice: erfc's rational kernel in
+    (|a| - 4) / (|a| + 4) below |a| = 10.05, an asymptotic series in 1/|a|
+    above; for a < 0, 2 exp(a^2) (exp as `__nv_expf`, the rounding of a^2
+    folded back in) minus that."""
+    var x = _abs(a)
+    var t1: Float32
+    if x < _fd(0x40241C2900000000):
+        var r = _rcp_approx_ftz(x + Float32(4.0))
+        var q = _mul_rn(x - Float32(4.0), r)
+        var f = fma(Float32(-4.0), q + Float32(1.0), x)
+        f = fma(-q, x, f)
+        var z = fma(r, f, q)
+        var p = fma(_fd(0x3F4D341220000000), z, _fd(0x3F7CDC0B60000000))
+        p = fma(p, z, _fd(0xBF903F6960000000))
+        p = fma(p, z, _fd(0x3FA2A6E760000000))
+        p = fma(p, z, _fd(0xBFB10F8B40000000))
+        p = fma(p, z, _fd(0x3FB8043AA0000000))
+        p = fma(p, z, _fd(0xBFB9DA8480000000))
+        p = fma(p, z, _fd(0x3FB16E9BC0000000))
+        p = fma(p, z, _fd(0x3F8F7E2E00000000))
+        p = fma(p, z, _fd(0xBFC1DF1A80000000))
+        p = fma(p, z, _fd(0x3FF3BA5920000000))
+        var rd = _rcp_approx_ftz(fma(Float32(2.0), x, Float32(1.0)))
+        var g = _mul_rn(p, rd)
+        var h = fma(x, Float32(-2.0) * g, p)
+        t1 = fma(h - g, rd, g)
+    else:
+        var w = _div_approx(Float32(0.25), Float32(0.25) * x)
+        var w2 = w * w
+        var p = fma(Float32(6.5625), w2, Float32(-1.875))
+        p = fma(p, w2, Float32(0.75))
+        p = fma(p, w2, Float32(-0.5))
+        p = fma(p, w2, Float32(1.0))
+        t1 = _mul_rn(p, _mul_rn(w, _fd(0x3FE20DD760000000)))  # 1/sqrt(pi)
+    if not (a < Float32(0.0)):
+        return t1
+    var x2 = _mul_rz(x, x)
+    var x2lo = fma(x, x, -x2)
+    # exp(x2) as __nv_expf
+    comptime magic = _f(0x4B400000)  # 1.5 * 2**23
+    var s = _sat_f(fma(x2, _f(0x3BBB989D), Float32(0.5)))  # log2(e) / 252
+    var k = _fma_rm_f(s, Float32(252.0), (Float32(-126.0) + magic) + 127.0)
+    var d = -(k - (magic + Float32(127.0)))
+    var e = fma(x2, _f(0x3FB8AA3B), d)
+    e = fma(x2, _f(0x32A57060), e)
+    var scale = Float32(from_bits=k.to_bits[DType.uint32]() << UInt32(23))
+    var ex = _mul_rn(_ex2_approx_ftz(e), scale)
+    var e2 = _add_rn(ex, ex)
+    if e2 == _INF:
+        return e2
+    return fma(e2, x2lo, e2) - t1
+
+
+@always_inline
 def nv_erfinvf(a: Float32) -> Float32:
     """`erfinvf` as the jiterator's NVRTC (CUDA 13) compiles it: libdevice's
     `__nv_erfinvf`, except that the tail takes sqrt(-w) as -w * rsqrt(-w)
@@ -766,7 +862,7 @@ def nv_erf(a: Float64) -> Float64:
     var tail = fma(p, x, x - t)
     var hi = -t
     var lo = -tail
-    var k = _round_away(hi.cast[DType.float32]() * _f(0x3FB8AA3B))
+    var k = _rint(hi.cast[DType.float32]() * _f(0x3FB8AA3B))
     var kd = k.cast[DType.float64]()
     var r = fma(-kd, Float64(from_bits=UInt64(0x3FE62E42FEFA39EF)), hi)
     comptime E = [
@@ -1198,8 +1294,68 @@ def nv_lgammaf(a: Float32) -> Float32:
             return t
         return -nv_logf(x)
     # sin(pi x) by the sine kernel on a quadrant reduction of 2x.
-    var q = _round_away(x * Float32(2.0))
+    var q = _rint(x * Float32(2.0))
     var qi = q.cast[DType.int32]()
     var r = fma(-q, Float32(0.5), x) * _f(0x40490FDB)
     var s = _abs(_sin_poly(r, qi))
     return (_f(0x3F928682) - nv_logf(x * s)) - t
+
+
+# --------------------------------------------------------------------------- #
+# sinhf / coshf
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _div_approx_ftz(a: Float32, b: Float32) -> Float32:
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "div.approx.ftz.f32 $0, $1, $2;",
+            Float32,
+            constraints="=f,f,f",
+            has_side_effect=False,
+        ](a, b)
+    else:
+        return a / b
+
+
+@always_inline
+def _expf_quarter(x: Float32) -> Float32:
+    """e^x / 4 for x >= 0 (`__internal_expf_kernel` with scale 2^-2, as
+    `__nv_sinhf` / `__nv_coshf` inline it): j = trunc(x log2(e)) capped at
+    126, a two-term ln 2 reduction, ex2.approx.ftz times 2^(j - 2)."""
+    var j = _trunc(_mul_rn(x, _f(0x3FB8AA3B)))
+    if _abs(j) > Float32(126.0):
+        j = _copysign(Float32(126.0), j)
+    var r = fma(j, -_f(0x3F317218), x)
+    r = fma(j, _f(0x3102E308), r)
+    var z = r * _f(0x3FB8AA3B)
+    # j + 1.5 * 2^23 + 125: its low mantissa bits shifted into the exponent
+    var bias = j + Float32(12583037.0)
+    var scale = Float32(from_bits=bias.to_bits[DType.uint32]() << UInt32(23))
+    return _ex2_approx_ftz(z) * scale
+
+
+@always_inline
+def nv_sinhf(a: Float32) -> Float32:
+    """`__nv_sinhf`: 2 E - 1 / (8 E), E = e^|a| / 4, signed by `a`, from
+    |a| = 1 on; an odd polynomial below."""
+    var x = _abs(a)
+    if x >= Float32(1.0):
+        var e = _expf_quarter(x)
+        return _copysign(
+            fma(Float32(2.0), e, _div_approx_ftz(Float32(-0.125), e)), a
+        )
+    var a2 = a * a
+    var p = fma(_f(0x363D0ADA), a2, _f(0x394FFF49))
+    p = fma(p, a2, _f(0x3C08889A))
+    p = fma(p, a2, _f(0x3E2AAAAB))
+    p = p * a2
+    return fma(p, a, a)
+
+
+@always_inline
+def nv_coshf(a: Float32) -> Float32:
+    """`__nv_coshf`: 2 E + 1 / (8 E), E = e^|a| / 4."""
+    var e = _expf_quarter(_abs(a))
+    return fma(Float32(2.0), e, _div_approx_ftz(Float32(0.125), e))

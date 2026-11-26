@@ -434,6 +434,85 @@ def _pw_device(a: Side, b: Side, c: Side) raises -> Int:
     return device
 
 
+def count_of(shape: IndexList[MAX_RANK]) -> Int:
+    var count = 1
+    for i in range(MAX_RANK):
+        count *= shape[i]
+    return count
+
+
+def _pw_xlogy_nan(
+    a: Side, b: Side, count: Int, compute: Int32, dst: Optional[T]
+) raises -> Float64:
+    """xlogy / xlog1py in float64 with a NaN x and a NaN log: which NaN stock
+    CUDA returns. 1: x's (a tensor operand or out= of another dtype, so the
+    casting kernel; a host scalar x; or misaligned dense storage); 0: log's
+    (a broadcast, strided, or differently laid out tensor operand or out=,
+    0-dim ones included); 2: x's in the partial last 1024-block of a dense
+    launch, log's before it. Known limit: for permuted-dense operands
+    (transposed) CUDA's block follows the memory index, ours the logical one
+    (strict xfail in the tests)."""
+    var misaligned = False
+    var tensors = List[T]()
+    for k in range(2):
+        var s = a.copy() if k == 0 else b.copy()
+        if s.is_t:
+            tensors.append(s.t.value().copy())
+    if dst:
+        # an out= of another shape is resized to a fresh dense tensor: only
+        # its dtype counts then
+        var same_shape = len(tensors) > 0
+        if same_shape:
+            for d in range(MAX_RANK):
+                if dst.value().shape[d] != tensors[0].shape[d]:
+                    same_shape = False
+        if same_shape or dst.value().stype != compute:
+            tensors.append(dst.value().copy())
+        elif dst.value().ptr % 16 != 0:
+            # resized over the same storage (resize_ keeps the pointer while
+            # the data fits): its alignment counts
+            misaligned = True
+    for i in range(len(tensors)):
+        if tensors[i].stype != compute:
+            return 1.0
+    if not a.is_t:
+        return 1.0
+    for i in range(len(tensors)):
+        ref t = tensors[i]
+        if t.numel != count or not is_dense(t.shape, t.strides, t.rank):
+            return 0.0
+        if i > 0:
+            for d in range(MAX_RANK):
+                # size-1 and pad dims carry no meaningful stride (TI drops them)
+                if t.shape[d] > 1 and t.strides[d] != tensors[0].strides[d]:
+                    return 0.0
+        if t.contig and t.ptr % 16 != 0:
+            misaligned = True
+    return 1.0 if misaligned else 2.0
+
+
+def _pw_sgg_path(a: Side, b: Side, count: Int, compute: Int32) -> Float64:
+    """Which CUDA kernel runs a tensor-tensor float op, as the code the
+    gamma-grad contraction keys on: 0 the vectorized one (every tensor
+    operand dense, same numel, aligned to two elements), 1 the strided
+    kernel (not dense or broadcast), 2 the unrolled one over misaligned
+    dense storage."""
+    var size = 8 if compute == ST_FLOAT64 else (
+        4 if compute == ST_FLOAT32 else 2
+    )
+    var path = 0
+    for k in range(2):
+        var s = a.copy() if k == 0 else b.copy()
+        if not s.is_t:
+            continue
+        var t = s.t.value().copy()
+        if not t.contig or t.numel != count:
+            return 1.0
+        if t.ptr % (2 * size) != 0:
+            path = 2
+    return Float64(path)
+
+
 def _pw_run(
     kind: StaticString,
     arity: Int,
@@ -450,9 +529,31 @@ def _pw_run(
     and a dense layout, else into a fresh tensor."""
     _pw_no_float8(kind, compute)
     var device = _pw_device(a, b, c)
+    var prm = params
     var bs = _pw_broadcast(a, b, c, arity)
     var shape = bs[0]
     var rank = bs[1]
+    var nv_ctx = ctx_for(device)
+    var cuda = nv_ctx.api() == "cuda"
+    _ = nv_ctx
+    if (
+        cuda
+        and (kind == "xlogy" or kind == "xlog1py")
+        and compute == ST_FLOAT64
+    ):
+        prm[0] = _pw_xlogy_nan(a, b, count_of(shape), compute, dst)
+        prm[1] = Float64(count_of(shape) % 4096)
+        prm[2] = Float64(count_of(shape) // 4096)
+    if cuda and kind == "standard_gamma_grad":
+        # the kernel's block-tail contraction needs the element count
+        var count = 1
+        for i in range(MAX_RANK):
+            count *= shape[i]
+        prm[0] = Float64(count % 4096)
+        prm[1] = Float64(count // 4096)
+        # p2: the CUDA launch path (see `_pw_sgg_path`); these parameters
+        # are written on CUDA devices only
+        prm[2] = _pw_sgg_path(a, b, count, compute)
     var fa = _pw_flat(a, compute, shape, rank)
     var fb = _pw_flat(b, compute, shape, rank) if arity >= 2 else _Flat(
         MODE_HOST, 0, 0.0
@@ -481,10 +582,10 @@ def _pw_run(
         if fits:
             # Elementwise and dense: writing out[i] from operand[i] is exact
             # even when `d` is one of the operands (same view).
-            _pw_launch(kind, d, compute, fa, fb, fc, params)
+            _pw_launch(kind, d, compute, fa, fb, fc, prm)
             return Res(d^, False)
     var out = own(new_tensor(shape, rank, out_stype, device))
-    _pw_launch(kind, out.t, compute, fa, fb, fc, params)
+    _pw_launch(kind, out.t, compute, fa, fb, fc, prm)
     return Res(out.take(), True)
 
 
@@ -601,6 +702,83 @@ def _pw_no_float8(kind: StaticString, compute: Int32) raises:
         )
 
 
+def _pw_no_half(kind: StaticString) -> Bool:
+    """The kinds whose CUDA kernel dispatches float and double only
+    (`AT_DISPATCH_FLOATING_TYPES`): half types raise NotImplementedError."""
+    return (
+        kind == "zeta"
+        or kind == "igamma"
+        or kind == "igammac"
+        or kind == "chebyshev_polynomial_t"
+        or kind == "chebyshev_polynomial_u"
+        or kind == "chebyshev_polynomial_v"
+        or kind == "chebyshev_polynomial_w"
+        or kind == "shifted_chebyshev_polynomial_t"
+        or kind == "shifted_chebyshev_polynomial_u"
+        or kind == "shifted_chebyshev_polynomial_v"
+        or kind == "shifted_chebyshev_polynomial_w"
+        or kind == "hermite_polynomial_h"
+        or kind == "hermite_polynomial_he"
+        or kind == "laguerre_polynomial_l"
+        or kind == "legendre_polynomial_p"
+    )
+
+
+def _pw_half_refuse(
+    kind: StaticString, compute: Int32, a: Side, b: Side
+) raises:
+    """`_pw_no_half` on CUDA devices only (MPS and the AMD path compute the
+    half types, as before)."""
+    if not _pw_no_half(kind) or (
+        compute != ST_FLOAT16 and compute != ST_BFLOAT16
+    ):
+        return
+    var device = a.t.value().device if a.is_t else b.t.value().device
+    var ctx = ctx_for(device)
+    var cuda = ctx.api() == "cuda"
+    _ = ctx
+    if not cuda:
+        return
+    unsupported(
+        '"'
+        + String(kind)
+        + "_cuda\" not implemented for '"
+        + _scalar_type_name(max_dtype(compute))
+        + "'"
+    )
+
+
+def _pw_cuda(side: Side) raises -> Bool:
+    """Whether the operand's device is an NVIDIA one."""
+    var device = side.t.value().device
+    var ctx = ctx_for(device)
+    var cuda = ctx.api() == "cuda"
+    _ = ctx
+    return cuda
+
+
+def _pw_igamma_policy(
+    kind: StaticString, a: Side, b: Side, policy: Int
+) raises -> Int:
+    """igamma / igammac: CUDA's floats-only dispatch (integers refused) on
+    NVIDIA; elsewhere the policy these ops always had (P_FLOAT)."""
+    if (kind == "igamma" or kind == "igammac") and not _pw_cuda(
+        a if a.is_t else b
+    ):
+        return P_FLOAT
+    return policy
+
+
+def _pw_igamma_f64(
+    kind: StaticString, a: Side, b: Side, f64_ok: Bool
+) raises -> Bool:
+    if (kind == "igamma" or kind == "igammac") and not _pw_cuda(
+        a if a.is_t else b
+    ):
+        return False
+    return f64_ok
+
+
 def _pw_math(
     kind: StaticString,
     policy: Int,
@@ -614,7 +792,8 @@ def _pw_math(
 ) raises:
     """A math op over args[0 .. arity): promoted, computed, stored.
     `exact_dtype` (or `_pw_out_exact(kind)`) demands an `out` of the result
-    dtype instead of casting into it."""
+    dtype instead of casting into it. A `_pw_no_half` kind refuses float16
+    / bfloat16 as its CUDA dispatch does."""
     var a = _b_side(args[unsafe_offset=0])
     var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
     var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
@@ -624,7 +803,13 @@ def _pw_math(
         # TensorIterator's out= checks and resize precede the kernel
         # dispatch (a float8 computation is refused after the resize).
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
-    var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
+    var compute = _pw_compute_dtype(
+        kind,
+        common,
+        _pw_igamma_policy(kind, a, b, policy),
+        _pw_igamma_f64(kind, a, b, f64_ok),
+    )
+    _pw_half_refuse(kind, compute, a, b)
     _pw_finish(
         rets,
         dest,
@@ -650,7 +835,13 @@ def _pw_math_inplace(
     var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
     var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
     var common = _pw_result_type(a, b, c, arity)
-    var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
+    var compute = _pw_compute_dtype(
+        kind,
+        common,
+        _pw_igamma_policy(kind, a, b, policy),
+        _pw_igamma_f64(kind, a, b, f64_ok),
+    )
+    _pw_half_refuse(kind, compute, a, b)
     _b_store_inplace(
         rets,
         self,
@@ -788,22 +979,22 @@ def op_hypot_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::igamma(Tensor self, Tensor other) -> Tensor
 def op_igamma(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igamma", P_FLOAT, False, 2, args, rets, -1)
+    _pw_math("igamma", P_FLOAT_ONLY, True, 2, args, rets, -1)
 
 
 # aten::igamma.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_igamma_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igamma", P_FLOAT, False, 2, args, rets, 2)
+    _pw_math("igamma", P_FLOAT_ONLY, True, 2, args, rets, 2)
 
 
 # aten::igammac(Tensor self, Tensor other) -> Tensor
 def op_igammac(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igammac", P_FLOAT, False, 2, args, rets, -1)
+    _pw_math("igammac", P_FLOAT_ONLY, True, 2, args, rets, -1)
 
 
 # aten::igammac.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_igammac_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("igammac", P_FLOAT, False, 2, args, rets, 2)
+    _pw_math("igammac", P_FLOAT_ONLY, True, 2, args, rets, 2)
 
 
 # aten::logaddexp(Tensor self, Tensor other) -> Tensor
@@ -3869,18 +4060,30 @@ def _pw_same_dtypes(args: Values, n: Int) raises -> Int32:
     return first
 
 
-def _pw_floating_dispatch(name: StaticString, st: Int32, half_ok: Bool) raises:
-    """ATen's AT_DISPATCH_FLOATING_TYPES(_AND2(Half, BFloat16)) refusal."""
+def _pw_floating_dispatch(
+    name: StaticString, st: Int32, half_ok: Bool, args: Values
+) raises:
+    """ATen's AT_DISPATCH_FLOATING_TYPES(_AND2(Half, BFloat16)) refusal (a
+    NotImplementedError on CUDA devices, the plain error elsewhere)."""
     var ok = st == ST_FLOAT32 or st == ST_FLOAT64
     if half_ok:
         ok = ok or st == ST_FLOAT16 or st == ST_BFLOAT16
     if not ok:
-        raise Error(
-            '"',
-            name,
-            "\" not implemented for '",
-            _scalar_type_name(max_dtype(st)),
-            "'",
+        var cuda = _pw_cuda(_b_side(args[unsafe_offset=0]))
+        if not cuda:
+            raise Error(
+                '"',
+                name,
+                "\" not implemented for '",
+                _scalar_type_name(max_dtype(st)),
+                "'",
+            )
+        unsupported(
+            String('"')
+            + name
+            + "\" not implemented for '"
+            + _scalar_type_name(max_dtype(st))
+            + "'"
         )
 
 
@@ -3909,7 +4112,7 @@ def op_prelu_kernel(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var st = _pw_same_dtypes(args, 2)
-    _pw_floating_dispatch("prelu_cuda", st, True)
+    _pw_floating_dispatch("prelu_cuda", st, True, args)
     _b_ret(rets, _pw_fixed("prelu", 2, args, 0, st, _p()))
 
 
@@ -3921,7 +4124,7 @@ def op_prelu_kernel_backward(
     the broadcast shape (prelu's composite backward reduces grad_weight to
     the weight's shape afterwards)."""
     var st = _pw_same_dtypes(args, 3)
-    _pw_floating_dispatch("prelu_backward_cuda", st, True)
+    _pw_floating_dispatch("prelu_backward_cuda", st, True, args)
     var g = _b_side(args[unsafe_offset=0])
     var x = _b_side(args[unsafe_offset=1])
     var w = _b_side(args[unsafe_offset=2])
@@ -4182,7 +4385,7 @@ def op_masked_scale(
     var mask = v_tensor(args[unsafe_offset=1])
     if mask.stype != ST_UINT8:
         raise Error("mask should be torch.uint8 dtype")
-    _pw_floating_dispatch("masked_scale", self.stype, True)
+    _pw_floating_dispatch("masked_scale", self.stype, True, args)
     var scale = v_f64(args[unsafe_offset=2])
     # TensorIterator resizes the fresh `empty_like(self)` output to the
     # broadcast of self and mask (self (1, 3), mask (4, 3): (4, 3)).
@@ -4205,7 +4408,7 @@ def op_standard_gamma_grad(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var st = _pw_same_dtypes(args, 2)
-    _pw_floating_dispatch("_standard_gamma_grad_cuda", st, True)
+    _pw_floating_dispatch("_standard_gamma_grad_cuda", st, True, args)
     _b_ret(rets, _pw_fixed("standard_gamma_grad", 2, args, 0, st, _p()))
 
 
@@ -4214,7 +4417,7 @@ def op_dirichlet_grad(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     var st = _pw_same_dtypes(args, 3)
-    _pw_floating_dispatch("_dirichlet_grad_cuda", st, False)
+    _pw_floating_dispatch("_dirichlet_grad_cuda", st, False, args)
     _b_ret(rets, _pw_fixed("dirichlet_grad", 3, args, 0, st, _p()))
 
 

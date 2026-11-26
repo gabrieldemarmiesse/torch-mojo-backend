@@ -48,18 +48,32 @@ from tmb.kernels.common.cuda_math import (
 )
 from tmb.kernels.common.libdevice_port import (
     _trig_reduction_slowpath_d,
+    nv_acos,
+    nv_cos,
     nv_exp,
     nv_expf,
     nv_log,
     nv_log1p,
     nv_log1pf,
     nv_logf,
+    nv_pow,
+    nv_sin,
+    nv_tan,
+    nv_tanf,
 )
 from tmb.kernels.common.dtype_arithmetic import amd_opaque, cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.op_utils import _fmod_f64_exact_scalar, _fmod_float32
 from tmb.kernels.common.pow_math import pow_c99, torch_pow
-from tmb.kernels.common.special_math import igamma_f, igammac_f, zeta_f
+from tmb.kernels.common.special_math import (
+    igamma,
+    igamma_f_legacy,
+    igammac,
+    igammac_f_legacy,
+    jit_nan,
+    zeta,
+    zeta_f_legacy,
+)
 
 
 @always_inline
@@ -400,7 +414,7 @@ def _hypot_f64(x: Float64, y: Float64) -> Float64:
 
 
 @always_inline
-def _zeta_scalar(x: Float64, q: Float64) -> Float64:
+def _zeta_scalar_legacy(x: Float64, q: Float64) -> Float64:
     """Hurwitz zeta, Cephes (aten/src/ATen/native/Math.h `zeta`), in double
     for every input dtype: CPU torch accumulates float in double too."""
     comptime MACHEP = 1.11022302462515654042e-16
@@ -471,74 +485,7 @@ def _zeta_pow(a: Float64, b: Float64) -> Float64:
 
 
 @always_inline
-def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
-    """`static_cast<int64_t>(n)` for the polynomial degree (truncation), in
-    the operand's own float type (no float64 on Apple GPUs); NaN and
-    degrees outside int64's range (-2^63, 2^63) read as -1, which every
-    polynomial maps to 0 (hermite does exactly this; the others are UB in
-    C++, which x86's cvttsd2si turns into INT64_MIN, a negative degree).
-    The cutoff is 2^63 exactly: every float below it converts, so a degree
-    such as 9.21e18 keeps its value."""
-    if isnan(n) or n >= 9223372036854775808.0 or n <= -9223372036854775808.0:
-        return -1
-    return Int(n)
-
-
-@always_inline
-def _sincos_f64(a: Float64) -> Tuple[Float64, Float64]:
-    """(sin a, cos a) in float64 (std.math has neither on NVIDIA or AMD):
-    libdevice's reduction by pi/2 (three-part Cody-Waite, Payne-Hanek past
-    2^31, `_trig_reduction_slowpath_d`), then fdlibm's sin and cos kernels
-    (within an ulp)."""
-    if isnan(a) or isinf(a):
-        return (nan[DType.float64](), nan[DType.float64]())
-    if a == 0.0:
-        return (a, 1.0)  # sin(-0) is -0
-    var qf = llvm_intrinsic["llvm.roundeven", Float64, has_side_effect=False](
-        a * Float64(from_bits=UInt64(0x3FE45F306DC9C883))
-    )
-    var t = fma(-qf, Float64(from_bits=UInt64(0x3FF921FB54442D18)), a)
-    t = fma(-qf, Float64(from_bits=UInt64(0x3C91A62633145C00)), t)
-    t = fma(-qf, Float64(from_bits=UInt64(0x397B839A252049C0)), t)
-    var q = Int(qf) if abs(a) < 2147483648.0 else 0
-    if abs(a) >= 2147483648.0:
-        var rq = _trig_reduction_slowpath_d(a, Int32(0))
-        t = rq[0]
-        q = Int(rq[1])
-    var z = t * t
-    var v = z * t
-    var rs = 8.33333333332248946124e-03 + z * (
-        -1.98412698298579493134e-04
-        + z
-        * (
-            2.75573137070700676789e-06
-            + z * (-2.50507602534068634195e-08 + z * 1.58969099521155010221e-10)
-        )
-    )
-    var sn = t + v * (-1.66666666666666324348e-01 + z * rs)
-    var w = z * z
-    var rc = z * (
-        4.16666666666666019037e-02
-        + z * (-1.38888888888741095749e-03 + z * 2.48015872894767294178e-05)
-    ) + w * w * (
-        -2.75573143513906633035e-07
-        + z * (2.08757232129817482790e-09 + z * -1.13596475577881948265e-11)
-    )
-    var hz = 0.5 * z
-    var ww = 1.0 - hz
-    var cs = ww + (((1.0 - ww) - hz) + z * rc)
-    var k = q & 3
-    if k == 0:
-        return (sn, cs)
-    elif k == 1:
-        return (cs, -sn)
-    elif k == 2:
-        return (-sn, -cs)
-    return (-cs, sn)
-
-
-@always_inline
-def _acos_f64(x: Float64) -> Float64:
+def _acos_f64_legacy(x: Float64) -> Float64:
     """fdlibm's `__ieee754_acos` (a rational fit of asin on [0, 1/2], within
     an ulp): std.math has no float64 acos on NVIDIA or AMD (`facos` has no
     libcall there)."""
@@ -598,13 +545,127 @@ def _acos_f64(x: Float64) -> Float64:
 
 
 @always_inline
+def _negn[w: DType](m: Int) -> Scalar[w]:
+    """`-(n + 1)` of the polynomials: the integer negation on NVIDIA (C++
+    negates the int64), the float one elsewhere."""
+    comptime if is_nvidia_gpu():
+        return Scalar[w](-m)
+    else:
+        return -Scalar[w](m)
+
+
+@always_inline
+def _polynan[w: DType]() -> Scalar[w]:
+    """The jiterator's NaN on NVIDIA, the plain one elsewhere."""
+    comptime if is_nvidia_gpu():
+        return jit_nan[w]()
+    else:
+        return nan[w]()
+
+
+@always_inline
+def _poly_n[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
+    """`static_cast<int64_t>(n)` for the polynomial degree. NVIDIA: as the GPU
+    converts (cvt.rzi.s64): truncation, saturating at int64's bounds, NaN to
+    INT64_MIN. Elsewhere NaN and degrees outside int64's range read as -1
+    (x86's cvttsd2si makes those a negative degree)."""
+    comptime if is_nvidia_gpu():
+        if _poly_isnan(n):
+            return Int.MIN
+        if n >= Scalar[w](9223372036854775808.0):
+            return Int.MAX
+        if n <= Scalar[w](-9223372036854775808.0):
+            return Int.MIN
+        return Int(n)
+    else:
+        if (
+            isnan(n)
+            or n >= 9223372036854775808.0
+            or n <= -9223372036854775808.0
+        ):
+            return -1
+        return Int(n)
+
+
+@always_inline
+def _poly_isnan[w: DType](x: Scalar[w]) -> Bool:
+    """On the bits, as `special_math._isnan` (NVIDIA; elsewhere isnan)."""
+    comptime if not is_nvidia_gpu():
+        return isnan(x)
+    elif w == DType.float64:
+        return (
+            rebind[Float64](x).to_bits[DType.uint64]()
+            & UInt64(0x7FFFFFFFFFFFFFFF)
+        ) > UInt64(0x7FF0000000000000)
+    else:
+        return (
+            rebind[Float32](x).to_bits[DType.uint32]() & UInt32(0x7FFFFFFF)
+        ) > UInt32(0x7F800000)
+
+
+@always_inline
+def _sincos_f64(a: Float64) -> Tuple[Float64, Float64]:
+    """(sin a, cos a) in float64 (std.math has neither on NVIDIA or AMD):
+    libdevice's reduction by pi/2 (three-part Cody-Waite, Payne-Hanek past
+    2^31, `_trig_reduction_slowpath_d`), then fdlibm's sin and cos kernels
+    (within an ulp)."""
+    if isnan(a) or isinf(a):
+        return (nan[DType.float64](), nan[DType.float64]())
+    if a == 0.0:
+        return (a, 1.0)  # sin(-0) is -0
+    var qf = llvm_intrinsic["llvm.roundeven", Float64, has_side_effect=False](
+        a * Float64(from_bits=UInt64(0x3FE45F306DC9C883))
+    )
+    var t = fma(-qf, Float64(from_bits=UInt64(0x3FF921FB54442D18)), a)
+    t = fma(-qf, Float64(from_bits=UInt64(0x3C91A62633145C00)), t)
+    t = fma(-qf, Float64(from_bits=UInt64(0x397B839A252049C0)), t)
+    var q = Int(qf) if abs(a) < 2147483648.0 else 0
+    if abs(a) >= 2147483648.0:
+        var rq = _trig_reduction_slowpath_d(a, Int32(0))
+        t = rq[0]
+        q = Int(rq[1])
+    var z = t * t
+    var v = z * t
+    var rs = 8.33333333332248946124e-03 + z * (
+        -1.98412698298579493134e-04
+        + z
+        * (
+            2.75573137070700676789e-06
+            + z * (-2.50507602534068634195e-08 + z * 1.58969099521155010221e-10)
+        )
+    )
+    var sn = t + v * (-1.66666666666666324348e-01 + z * rs)
+    var w = z * z
+    var rc = z * (
+        4.16666666666666019037e-02
+        + z * (-1.38888888888741095749e-03 + z * 2.48015872894767294178e-05)
+    ) + w * w * (
+        -2.75573143513906633035e-07
+        + z * (2.08757232129817482790e-09 + z * -1.13596475577881948265e-11)
+    )
+    var hz = 0.5 * z
+    var ww = 1.0 - hz
+    var cs = ww + (((1.0 - ww) - hz) + z * rc)
+    var k = q & 3
+    if k == 0:
+        return (sn, cs)
+    elif k == 1:
+        return (cs, -sn)
+    elif k == 2:
+        return (-sn, -cs)
+    return (-cs, sn)
+
+
+@always_inline
 def _pacos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
     """The polynomials' `acos`: the CUDA acosf on NVIDIA (n acos(x) carries
-    its last-ulp differences n-fold), `_acos_f64` for float64."""
+    its last-ulp differences n-fold), libdevice's acos for float64."""
     comptime if w == DType.float32 and is_nvidia_gpu():
         return cuda_acosf(x.cast[DType.float32]()).cast[w]()
+    elif w == DType.float64 and is_nvidia_gpu():
+        return nv_acos(x.cast[DType.float64]()).cast[w]()
     elif w == DType.float64:
-        return _acos_f64(x.cast[DType.float64]()).cast[w]()
+        return _acos_f64_legacy(x.cast[DType.float64]()).cast[w]()
     else:
         return acos(x)
 
@@ -643,12 +704,345 @@ def _psin[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
 
 
 @always_inline
-def _polynomial[
+def _poly_cos[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
+    """The polynomials' `cos`: libdevice's for double too."""
+    comptime if w == DType.float64 and is_nvidia_gpu():
+        return rebind[Scalar[w]](nv_cos(rebind[Float64](x)))
+    else:
+        return _pcos(x)
+
+
+@always_inline
+def _poly_sin[w: DType](x: Scalar[w]) -> Scalar[w] where w.is_floating_point():
+    comptime if w == DType.float64 and is_nvidia_gpu():
+        return rebind[Scalar[w]](nv_sin(rebind[Float64](x)))
+    else:
+        return _psin(x)
+
+
+@always_inline
+def _polynomial_nv[
     kind: StaticString, w: DType
 ](x: Scalar[w], n_f: Scalar[w]) -> Scalar[w] where w.is_floating_point():
     """The orthogonal polynomials of aten/src/ATen/native/Math.h
     (`*_polynomial_*_forward`), statement for statement, in the opmath type."""
     var n = _poly_n(n_f)
+    comptime one = Scalar[w](1.0)
+    comptime if kind == "hermite_polynomial_he":
+        # The same cases as the branchy form below, as selects: one straight
+        # line per thread (the branches cost this tiny kernel 12%).
+        comptime limit = 512 if w == DType.float64 else 128
+        var p = one
+        var q = x
+        var r = Scalar[w](0)
+        for k in range(1, n if n <= limit else 0):
+            r = x * q - Scalar[w](k) * p
+            p = q
+            q = r
+        var res = r
+        res = x if n == 1 else res
+        res = one if n == 0 else res
+        res = _polynan[w]() if n > limit else res
+        return Scalar[w](0) if n < 0 else res
+    if n < 0:
+        return 0
+    comptime if not is_nvidia_gpu():
+        if isnan(x):
+            # Every special case compares x and fails for NaN, so the result
+            # is the degree-0 constant or NaN; tested up front because the
+            # GPU's fast-math flags may fold those comparisons either way.
+            return one if n == 0 else x
+    comptime if kind == "chebyshev_polynomial_t":
+        if abs(x) == one:
+            if x > 0 or n % 2 == 0:
+                return one
+            return -one
+        if n > 6 and abs(x) < one:
+            return _poly_cos(Scalar[w](n) * _pacos(x))
+        if n == 0:
+            return one
+        if n == 1:
+            return x
+        var p = one
+        var q = x
+        var r = x
+        var k = 2
+        while k <= n and not _poly_isnan(q):
+            r = (x + x) * q - p
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "chebyshev_polynomial_u":
+        if abs(x) == one:
+            if x > 0 or n % 2 == 0:
+                return Scalar[w](n + 1)
+            return _negn[w](n + 1)
+        if n > 8 and abs(x) < one:
+            var t = _pacos(x)
+            if _poly_sin(t) != 0:
+                return _poly_sin(Scalar[w](n + 1) * t) / _poly_sin(t)
+            return Scalar[w](n + 1) * _poly_cos(Scalar[w](n + 1) * t) / x
+        if n == 0:
+            return one
+        if n == 1:
+            return x + x
+        var p = one
+        var q = x + x
+        var r = q
+        var k = 2
+        while k <= n and not _poly_isnan(q):
+            r = (x + x) * q - p
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "chebyshev_polynomial_v":
+        if abs(x) == one:
+            if x > 0:
+                return one
+            if n % 2 == 0:
+                return Scalar[w](n + n + 1)
+            return _negn[w](n + n + 1)
+        if n > 8 and abs(x) < one:
+            var t = _pacos(x)
+            if _poly_sin(t / 2) != one:
+                return _poly_cos((Scalar[w](n) + 0.5) * t) / _poly_cos(t / 2)
+            if n % 2 == 0:
+                return Scalar[w](n + n + 1)
+            return _negn[w](n + n + 1)
+        if n == 0:
+            return one
+        if n == 1:
+            return x + x - one
+        var p = one
+        var q = x + x - one
+        var r = q
+        var k = 2
+        while k <= n and not _poly_isnan(q):
+            r = (x + x) * q - p
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "chebyshev_polynomial_w":
+        if abs(x) == one:
+            if x > 0:
+                return Scalar[w](n + n + 1)
+            if n % 2 == 0:
+                return one
+            return -one
+        if n > 8 and abs(x) < one:
+            var t = _pacos(x)
+            if _poly_cos(t / 2) != one:
+                return _poly_sin((Scalar[w](n) + 0.5) * t) / _poly_sin(t / 2)
+            if x > 0:
+                return Scalar[w](n + n + 1)
+            if n % 2 == 0:
+                return one
+            return -one
+        if n == 0:
+            return one
+        if n == 1:
+            return x + x + one
+        var p = one
+        var q = x + x + one
+        var r = q
+        var k = 2
+        while k <= n and not _poly_isnan(q):
+            r = (x + x) * q - p
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "hermite_polynomial_h":
+        if n == 0:
+            return one
+        if n == 1:
+            return x + x
+        comptime limit = 512 if w == DType.float64 else 128
+        if n > limit:
+            return _polynan[w]()
+        var p = one
+        var q = x + x
+        var r = Scalar[w](0)
+        var k = 2
+        while k < n + n:
+            r = (x + x) * q - Scalar[w](k) * p
+            p = q
+            q = r
+            k += 2
+        return r
+    elif kind == "laguerre_polynomial_l":
+        if abs(x) == 0:
+            return one
+        if n == 0:
+            return one
+        if n == 1:
+            return one - x
+        var p = one
+        var q = one - x
+        var r = q
+        var k = 1
+        while k < n and not _poly_isnan(q):
+            r = (
+                (Scalar[w](k + k) + (one - x)) * q - Scalar[w](k) * p
+            ) / Scalar[w](k + 1)
+            p = q
+            q = r
+            k += 1
+        return r
+    elif kind == "legendre_polynomial_p":
+        if abs(x) == one:
+            if x > 0 or n % 2 == 0:
+                return one
+            return -one
+        if n == 0:
+            return one
+        if n == 1:
+            return x
+        var p = one
+        var q = x
+        var r = q
+        var k = 1
+        while k < n and not _poly_isnan(q):
+            r = (Scalar[w](k + k + 1) * x * q - Scalar[w](k) * p) / Scalar[w](
+                k + 1
+            )
+            p = q
+            q = r
+            k += 1
+        return r
+    else:
+        # The shifted Chebyshev polynomials: T*(x) = T(2x - 1) and friends,
+        # with their own boundary cases at x = 0 and x = 1.
+        var y = x + x - one
+        comptime if kind == "shifted_chebyshev_polynomial_t":
+            if x == one:
+                return one
+            if x == 0:
+                return one if n % 2 == 0 else -one
+            if n > 6 and abs(y) < one:
+                return _poly_cos(Scalar[w](n) * _pacos(y))
+            if n == 0:
+                return one
+            if n == 1:
+                return y
+            var p = one
+            var q = y
+            var r = q
+            var k = 2
+            while k <= n and not _poly_isnan(q):
+                r = (y + y) * q - p
+                p = q
+                q = r
+                k += 1
+            return r
+        elif kind == "shifted_chebyshev_polynomial_u":
+            if x == one:
+                return Scalar[w](n + 1)
+            if x == 0:
+                return Scalar[w](n + 1) if n % 2 == 0 else _negn[w](n + 1)
+            if n > 6 and abs(y) < one:
+                var t = _pacos(y)
+                if _poly_sin(t) != 0:
+                    return _poly_sin(Scalar[w](n + 1) * t) / _poly_sin(t)
+                return Scalar[w](n + 1) * _poly_cos(Scalar[w](n + 1) * t) / y
+            if n == 0:
+                return one
+            if n == 1:
+                return y + y
+            var p = one
+            var q = y + y
+            var r = q
+            var k = 2
+            while k <= n and not _poly_isnan(q):
+                r = (y + y) * q - p
+                p = q
+                q = r
+                k += 1
+            return r
+        elif kind == "shifted_chebyshev_polynomial_v":
+            if x == one:
+                return one
+            if x == 0:
+                return Scalar[w](n + n + 1) if n % 2 == 0 else Scalar[w](
+                    -(n + n + 1)
+                )
+            if n > 6 and abs(y) < one:
+                var t = _pacos(y)
+                if _poly_sin(t / 2) != one:
+                    return _poly_cos((Scalar[w](n) + 0.5) * t) / _poly_cos(
+                        t / 2
+                    )
+                return Scalar[w](n + n + 1) if n % 2 == 0 else Scalar[w](
+                    -(n + n + 1)
+                )
+            if n == 0:
+                return one
+            if n == 1:
+                return y + y - one
+            var p = one
+            var q = y + y - one
+            var r = q
+            var k = 2
+            while k <= n and not _poly_isnan(q):
+                r = (y + y) * q - p
+                p = q
+                q = r
+                k += 1
+            return r
+        else:
+            comptime assert (
+                kind == "shifted_chebyshev_polynomial_w"
+            ), "unknown polynomial kind"
+            if x == one:
+                return Scalar[w](n + n + 1)
+            if x == 0:
+                return one if n % 2 == 0 else -one
+            if n > 4 and abs(y) < one:
+                var t = _pacos(y)
+                if _poly_cos(t / 2) != one:
+                    return _poly_sin((Scalar[w](n) + 0.5) * t) / _poly_sin(
+                        t / 2
+                    )
+                return one if n % 2 == 0 else -one
+            if n == 0:
+                return one
+            if n == 1:
+                return y + y + one
+            var p = one
+            var q = y + y + one
+            var r = q
+            var k = 2
+            while k <= n and not _poly_isnan(q):
+                r = (y + y) * q - p
+                p = q
+                q = r
+                k += 1
+            return r
+
+
+def _poly_n_legacy[w: DType](n: Scalar[w]) -> Int where w.is_floating_point():
+    """`static_cast<int64_t>(n)` for the polynomial degree (truncation), in
+    the operand's own float type (no float64 on Apple GPUs); NaN and
+    degrees outside int64's range (-2^63, 2^63) read as -1, which every
+    polynomial maps to 0 (hermite does exactly this; the others are UB in
+    C++, which x86's cvttsd2si turns into INT64_MIN, a negative degree).
+    The cutoff is 2^63 exactly: every float below it converts, so a degree
+    such as 9.21e18 keeps its value."""
+    if isnan(n) or n >= 9223372036854775808.0 or n <= -9223372036854775808.0:
+        return -1
+    return Int(n)
+
+
+@always_inline
+def _polynomial_legacy[
+    kind: StaticString, w: DType
+](x: Scalar[w], n_f: Scalar[w]) -> Scalar[w] where w.is_floating_point():
+    """The orthogonal polynomials of aten/src/ATen/native/Math.h
+    (`*_polynomial_*_forward`), statement for statement, in the opmath type."""
+    var n = _poly_n_legacy(n_f)
     comptime one = Scalar[w](1.0)
     if n < 0:
         return 0
@@ -938,6 +1332,18 @@ def _polynomial[
                 q = r
                 k += 1
             return r
+
+
+@always_inline
+def _polynomial[
+    kind: StaticString, w: DType
+](x: Scalar[w], n_f: Scalar[w]) -> Scalar[w] where w.is_floating_point():
+    """NVIDIA: the CUDA-exact form; elsewhere the form this device always ran.
+    """
+    comptime if is_nvidia_gpu():
+        return _polynomial_nv[kind, w](x, n_f)
+    else:
+        return _polynomial_legacy[kind, w](x, n_f)
 
 
 @always_inline
@@ -1655,35 +2061,54 @@ def _wide[
         var r = a * l
         comptime if is_apple_gpu():
             r = a.eq(0).select(a, r)
+            r = isnan(a).select(a, r)
         else:
+            # A NaN x reaches `x * log(y)`: the GPU's NaN of a product.
             r = a.eq(0).select(zero, r)
-        r = isnan(a).select(a, r)
+            comptime if not is_nvidia_gpu():
+                r = isnan(a).select(a, r)
+            elif w == DType.float64:
+                # NaN x with a NaN log: the NaN of the operand CUDA's
+                # compiled product keeps. p[0] != 0: x's (casting kernel,
+                # host scalar x, partial last block); else log's.
+                var both = isnan(a) & isnan(l)
+                r = both.select(a + a if p[0] != 0 else l + l, r)
         return isnan(b).select(SIMD[w, n](nan[w]()), r)
     elif kind == "igamma" or kind == "igammac":
-        # IGammaKernel.cu calc_igamma / calc_igammac, float accscalar_t
-        # (special_math.mojo; stock torch has no float64 route to match here).
+        # IGammaKernel.cu calc_igamma / calc_igammac (special_math.mojo):
+        # accscalar_t is double for double, float otherwise.
+        comptime cw = DType.float64 if w == DType.float64 else DType.float32
         var r = SIMD[w, n]()
         comptime for i in range(n):
-            var ai = a[i].cast[DType.float32]()
-            var xi = b[i].cast[DType.float32]()
-            comptime if kind == "igamma":
-                r[i] = igamma_f(ai, xi).cast[w]()
+            comptime if is_nvidia_gpu():
+                var ai = a[i].cast[cw]()
+                var xi = b[i].cast[cw]()
+                comptime if kind == "igamma":
+                    r[i] = igamma(ai, xi).cast[w]()
+                else:
+                    r[i] = igammac(ai, xi).cast[w]()
             else:
-                r[i] = igammac_f(ai, xi).cast[w]()
+                # AMD / Apple keep their float-only form (not ported yet).
+                var ai = a[i].cast[DType.float32]()
+                var xi = b[i].cast[DType.float32]()
+                comptime if kind == "igamma":
+                    r[i] = igamma_f_legacy(ai, xi).cast[w]()
+                else:
+                    r[i] = igammac_f_legacy(ai, xi).cast[w]()
         return r
     elif kind == "zeta":
+        # CUDA's zeta_string in the opmath type (the jiterator's T, on ROCm
+        # as well; MPS's c10::metal::zeta is float too).
         var r = SIMD[w, n]()
         comptime for i in range(n):
-            comptime if w == DType.float32:
-                # CUDA's zeta_string runs in float (the jiterator's T, on
-                # ROCm as well), MPS's c10::metal::zeta too:
-                # special_math.zeta_f, about 3x cheaper than the double
-                # loop (special_zeta f32 357x789: 1.59x torch before).
-                r[i] = zeta_f(
+            comptime if is_nvidia_gpu():
+                r[i] = zeta(a[i], b[i])
+            elif w == DType.float32:
+                r[i] = zeta_f_legacy(
                     a[i].cast[DType.float32](), b[i].cast[DType.float32]()
                 ).cast[w]()
             else:
-                r[i] = _zeta_scalar(
+                r[i] = _zeta_scalar_legacy(
                     a[i].cast[DType.float64](), b[i].cast[DType.float64]()
                 ).cast[w]()
         return r
@@ -2237,10 +2662,88 @@ def _digamma_one[w: DType](x_in: Scalar[w]) -> Scalar[w]:
 
 
 @always_inline
-def _standard_gamma_grad_one[
+def _tan_cuda[w: DType](x: Scalar[w]) -> Scalar[w]:
+    """CUDA's tanf / tan on NVIDIA; elsewhere sin / cos, fdlibm's for
+    float64 (the reflection of `_digamma_one_cuda`, negative x only)."""
+    comptime if is_nvidia_gpu():
+        comptime if w == DType.float64:
+            return nv_tan(x.cast[DType.float64]()).cast[w]()
+        else:
+            return nv_tanf(x.cast[DType.float32]()).cast[w]()
+    elif w == DType.float64:
+        var sc = _sincos_f64(x.cast[DType.float64]())
+        return (sc[0] / sc[1]).cast[w]()
+    else:
+        var xf = x.cast[DType.float32]()
+        return (sin(xf) / cos(xf)).cast[w]()
+
+
+@always_inline
+def _digamma_one_cuda[w: DType](x_in: Scalar[w]) -> Scalar[w]:
+    """Distributions.h's `digamma_one` (Cephes), in the accumulate type, with
+    CUDA's rounding (fma where nvcc fuses); `_digamma_one` is the plain one."""
+    comptime PSI_10 = Float64(2.25175258906672110764).cast[w]()
+    comptime PI = Scalar[w](3.14159265358979323846)
+    var x = x_in
+    if x == 0:
+        return inf[w]()
+    var additional_summand = Scalar[w](0)
+    if x < 0:
+        if x == floor(x):
+            return inf[w]()
+        additional_summand = -PI / _tan_cuda(PI * x)
+        x = 1 - x
+    var result = Scalar[w](0)
+    # `while (x < 10)`, bounded: x >= 1 here, so at most 10 steps, and a
+    # NaN cannot spin it under the no-NaN flags.
+    for _ in range(11):
+        if not (x < 10):
+            break
+        result -= 1 / x
+        x += 1
+    if x == 10:
+        return result + PSI_10 + additional_summand
+    comptime A: Array[Float64, 7] = [
+        8.33333333333333333333e-2,
+        -2.10927960927960927961e-2,
+        7.57575757575757575758e-3,
+        -4.16666666666666666667e-3,
+        3.96825396825396825397e-3,
+        -8.33333333333333333333e-3,
+        8.33333333333333333333e-2,
+    ]
+    var y = Scalar[w](0)
+    if x < Float32(1.0e17).cast[w]():
+        var z = 1 / (x * x)
+        comptime a0 = A[0]
+        var poly = a0.cast[w]()
+        comptime for i in range(1, 7):
+            comptime ai = A[i]
+            poly = fma(poly, z, ai.cast[w]())
+        # rounded: nvcc keeps `- y` a separate subtraction
+        y = _mul_rn[w, 1](z, poly)
+    return (
+        result + _slog[w](x) - (Scalar[w](0.5) / x) - y + (additional_summand)
+    )
+
+
+@always_inline
+def _cuda_pow[w: DType](x: Scalar[w], y: Scalar[w]) -> Scalar[w]:
+    """compat_pow: CUDA's powf / pow (libdevice's double pow on NVIDIA)."""
+    comptime if w == DType.float64 and is_nvidia_gpu():
+        return nv_pow(x.cast[DType.float64](), y.cast[DType.float64]()).cast[
+            w
+        ]()
+    else:
+        return pow_c99[w](x, y)
+
+
+@always_inline
+# AMD / Apple form of _standard_gamma_grad_one, from before its CUDA-exact port.
+def _standard_gamma_grad_one_legacy[
     w: DType
 ](alpha: Scalar[w], x: Scalar[w]) -> Scalar[w]:
-    """Distributions.h's `standard_gamma_grad_one`: the reparameterized
+    """AMD / Apple: the float-only form before the CUDA-exact port (below). Distributions.h's `standard_gamma_grad_one`: the reparameterized
     gradient -(d/dalpha cdf(x; alpha)) / pdf(x; alpha), in the accumulate
     type."""
     comptime V = SIMD[w, 1]
@@ -2330,6 +2833,117 @@ def _standard_gamma_grad_one[
         coef_v[i] = Scalar[w](c0) + u * (Scalar[w](c1) + u * Scalar[w](c2))
     var pp = coef_v[0] + v * (coef_v[1] + v * (coef_v[2] + v * coef_v[3]))
     var q = coef_v[4] + v * (coef_v[5] + v * (coef_v[6] + v * coef_v[7]))
+    return _sexp[w](pp / q)
+
+
+@always_inline
+def _standard_gamma_grad_one[
+    w: DType
+](alpha: Scalar[w], x: Scalar[w], alt: Bool = False) -> Scalar[w]:
+    """Distributions.h's `standard_gamma_grad_one`: the reparameterized
+    gradient -(d/dalpha cdf(x; alpha)) / pdf(x; alpha), in the accumulate
+    type."""
+    comptime V = SIMD[w, 1]
+    if x < Scalar[w](0.8):
+        # Taylor series expansion for small x.
+        var numer = Scalar[w](1)
+        var denom = alpha
+        var series1 = numer / denom
+        var series2 = numer / (denom * denom)
+        comptime for i in range(1, 6):
+            numer *= -x / Scalar[w](i)
+            denom += 1
+            series1 += numer / denom
+            series2 += numer / (denom * denom)
+        var pow_x_alpha = _cuda_pow[w](x, alpha)
+        var gamma_pdf = _cuda_pow[w](x, alpha - 1) * _sexp[w](-x)
+        var gamma_cdf = pow_x_alpha * series1
+        # ptxas fuses the first product in the vectorized kernel's full
+        # blocks (the elementwise_kernel instance, and the first 128
+        # elements of a partial last block, fuse the second one instead)
+        var dg = _slog[w](x) - _digamma_one_cuda[w](alpha)
+        var gamma_cdf_alpha: Scalar[w]
+        if alt:
+            # the remainder block's first 128 elements (see
+            # `sgg_alt_contraction`) fuse the other product
+            gamma_cdf_alpha = fma(
+                -pow_x_alpha, series2, _mul_rn[w, 1](dg, gamma_cdf)
+            )
+        else:
+            gamma_cdf_alpha = fma(
+                dg, gamma_cdf, -_mul_rn[w, 1](pow_x_alpha, series2)
+            )
+        var result = -gamma_cdf_alpha / gamma_pdf
+        return Scalar[w](0) if isnan(result) else result
+    if alpha > 8:
+        # Rice saddle point expansion for large alpha.
+        if Scalar[w](0.9) * alpha <= x and x <= Scalar[w](1.1) * alpha:
+            comptime S = Scalar[w]
+            var numer_1 = fma(fma(alpha, S(12), S(1)), 24 * alpha, S(1))
+            var aa = alpha * alpha
+            var numer_2 = fma(
+                alpha,
+                fma(x, S(3600), S(107)),
+                fma(aa, S(1440), (6 * x) * fma(x, S(-120), S(53)))
+                - 65 * x * x / alpha,
+            )
+            var denom = aa * (1244160 * aa)
+            return numer_1 * numer_2 / denom
+        var denom = ieee_sqrt(8 * alpha)
+        var term2 = denom / (alpha - x)
+        var term3 = _cuda_pow[w](
+            fma(-alpha, _slog[w](x / alpha), x - alpha), Scalar[w](-1.5)
+        )
+        var term23 = term2 - term3 if x < alpha else term2 + term3
+        var term1 = _mul_rn[w, 1](_slog[w](x / alpha), term23) - ieee_sqrt(
+            2 / alpha
+        ) * (alpha + x) / ((alpha - x) * (alpha - x))
+        var stirling = fma(1 + 1 / (24 * alpha), 1 / (12 * alpha), 1)
+        var numer = x * term1
+        return -stirling * numer / denom
+    # Bivariate rational approximation to the reparameterized gradient.
+    var u = _slog[w](x / alpha)
+    var v = _slog[w](alpha)
+    comptime C: Array[Array[Float64, 8], 3] = [
+        [
+            0.16009398,
+            -0.094634809,
+            0.025146376,
+            -0.0030648343,
+            1.0,
+            0.32668115,
+            0.10406089,
+            0.0014179084,
+        ],
+        [
+            0.53487893,
+            0.1298071,
+            0.065735949,
+            -0.0015649758,
+            0.16639465,
+            0.020070113,
+            -0.0035938915,
+            -0.00058392623,
+        ],
+        [
+            0.040121004,
+            -0.0065914022,
+            -0.0026286047,
+            -0.0013441777,
+            0.017050642,
+            -0.0021309326,
+            0.00085092367,
+            -1.5247877e-07,
+        ],
+    ]
+    var coef_v = SIMD[w, 8]()
+    comptime for i in range(8):
+        comptime c0 = C[0][i]
+        comptime c1 = C[1][i]
+        comptime c2 = C[2][i]
+        coef_v[i] = fma(fma(u, c2.cast[w](), c1.cast[w]()), u, c0.cast[w]())
+    var pp = fma(v, fma(v, fma(v, coef_v[3], coef_v[2]), coef_v[1]), coef_v[0])
+    var q = fma(v, fma(v, fma(v, coef_v[7], coef_v[6]), coef_v[5]), coef_v[4])
     return _sexp[w](pp / q)
 
 
@@ -2578,6 +3192,23 @@ def _dirichlet_ratio[
 
 
 @always_inline
+def sgg_alt_contraction(i: Int, numel: Int) -> Bool:
+    """Stock CUDA's float32 `_standard_gamma_grad` (1024-element blocks of
+    its vectorized launch): the first 128 elements of a partial last block
+    run a second inlined copy of the small-x expression, which ptxas fuses
+    the other way. Probed per index at numel 512 / 1500 / 2300 / 5000.
+    The slice rules (here and for the other paths) were probed on sm_90
+    only; other NVIDIA architectures cap the vector width at 4, so the
+    half-precision rules are unverified there.
+    The other launch paths (strided, misaligned) are keyed in
+    kernels/pointwise/entry.mojo. Known limit: tensors of more than 2**31
+    elements run CUDA's 64-bit-indexing kernels, which were not probed (too
+    large to test)."""
+    var tail = (numel // 1024) * 1024
+    return numel % 1024 != 0 and i >= tail and i < tail + 128
+
+
+@always_inline
 def _gamma_grads[
     kind: StaticString, dtype: DType, n: Int
 ](a: SIMD[dtype, n], b: SIMD[dtype, n], c: SIMD[dtype, n]) -> SIMD[dtype, n]:
@@ -2585,13 +3216,28 @@ def _gamma_grads[
     var r = SIMD[dtype, n]()
     comptime for i in range(n):
         comptime if kind == "standard_gamma_grad":
-            r[i] = _standard_gamma_grad_one[w](
+            # AMD / Apple (NVIDIA runs `_sgg_alt_lanes`): the pre-port form.
+            r[i] = _standard_gamma_grad_one_legacy[w](
                 a[i].cast[w](), b[i].cast[w]()
             ).cast[dtype]()
         else:
             r[i] = _dirichlet_grad_one[w](
                 a[i].cast[w](), b[i].cast[w](), c[i].cast[w]()
             ).cast[dtype]()
+    return r
+
+
+@always_inline
+def _sgg_alt_lanes[
+    dtype: DType, n: Int
+](a: SIMD[dtype, n], b: SIMD[dtype, n], alt: Bool) -> SIMD[dtype, n]:
+    """NVIDIA's standard_gamma_grad with the runtime contraction choice."""
+    comptime w = wide_dtype[dtype]()
+    var r = SIMD[dtype, n]()
+    comptime for i in range(n):
+        r[i] = _standard_gamma_grad_one[w](
+            a[i].cast[w](), b[i].cast[w](), alt
+        ).cast[dtype]()
     return r
 
 
@@ -2660,7 +3306,10 @@ def pointwise_op_impl[
 
 @always_inline
 def pointwise[
-    kind: StaticString, dtype: DType, out_dtype: DType, n: Int
+    kind: StaticString,
+    dtype: DType,
+    out_dtype: DType,
+    n: Int,
 ](
     a: SIMD[dtype, n],
     b: SIMD[dtype, n],
@@ -2668,7 +3317,9 @@ def pointwise[
     p: SIMD[param_dtype[dtype](), 4],
 ) -> SIMD[out_dtype, n]:
     """`kind` of (a, b, c) with scalar parameters `p`, rounded once into
-    `out_dtype`. Unused operands and parameters are ignored."""
+    `out_dtype`. Unused operands and parameters are ignored. For
+    standard_gamma_grad p[3] != 0 selects the other ptxas contraction (see
+    `sgg_alt_contraction`)."""
     comptime if kind == "frexp_exponent":
         return _frexp_exponent(a).cast[out_dtype]()
     elif kind == "hardtanh" and dtype.is_integral():
@@ -2722,12 +3373,33 @@ def pointwise[
         return _prelu[kind](a, b, c).cast[out_dtype]()
     elif kind == "standard_gamma_grad" or kind == "dirichlet_grad":
         comptime assert dtype.is_floating_point(), "gamma grads take floats"
-        return _gamma_grads[kind](a, b, c).cast[out_dtype]()
+        comptime if kind == "standard_gamma_grad" and is_nvidia_gpu():
+            return _sgg_alt_lanes(a, b, p[3] != 0).cast[out_dtype]()
+        else:
+            return _gamma_grads[kind](a, b, c).cast[out_dtype]()
     elif is_native_kind[kind]():
         return _native[kind](a, b, c).cast[out_dtype]()
     elif is_scalar_t_kind[kind]():
         comptime assert dtype.is_floating_point(), "losses take floats"
         return _scalar_t[kind](a, b, c, p).cast[out_dtype]()
+    elif (
+        (kind == "xlogy" or kind == "xlog1py")
+        and (out_dtype == DType.float16 or out_dtype == DType.bfloat16)
+        and dtype != DType.float64
+        and is_nvidia_gpu()
+    ):
+        # `return NAN` as Half/BFloat16 is cvt.rn of a float NaN: 0x7fff
+        # (LLVM would fold the constant to the quiet 0x7e00 / 0x7fc0).
+        var r = _wide[kind](
+            a.cast[DType.float32](),
+            b.cast[DType.float32](),
+            c.cast[DType.float32](),
+            p.cast[DType.float32](),
+        )
+        var canon = SIMD[DType.float32, n](
+            Float32(from_bits=UInt32(0x7FFFFFFF))
+        )
+        return isnan(r).select(canon, r).cast[out_dtype]()
     else:
         var q = p
         comptime if dtype == DType.float64:
