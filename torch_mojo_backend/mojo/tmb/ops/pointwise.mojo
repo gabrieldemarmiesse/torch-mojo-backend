@@ -20,7 +20,13 @@ from std.utils import IndexList
 
 from tmb.backend.abi import (
     Owned,
+    ST_COMPLEX64,
+    TAG_DTYPE,
+    is_float8_stype,
+    is_complex_stype,
+    v_is_complex,
     is_dense,
+    new_scalar,
     new_strided,
     ST_BFLOAT16,
     ST_BOOL,
@@ -32,12 +38,20 @@ from tmb.backend.abi import (
     ST_INT64,
     ST_INT8,
     ST_UINT8,
+    ST_UINT16,
+    ST_UINT32,
+    ST_UINT64,
     T,
     TAG_BOOL,
+    TAG_INT,
     TAG_INT_LIST,
     TAG_NONE,
+    TAG_SCALAR_BOOL,
     TAG_SCALAR_DOUBLE,
     TAG_SCALAR_INT,
+    TAG_COMPLEX,
+    TAG_TENSOR,
+    TAG_TENSOR_REF,
     Value,
     bits_f64,
     call_op,
@@ -55,6 +69,7 @@ from tmb.backend.abi import (
     ret_tensor,
     tensor_arg,
     v_tensor_c,
+    v_complex,
     unsupported,
     v_bool,
     v_f64,
@@ -65,7 +80,7 @@ from tmb.backend.abi import (
     v_tensor,
     view_strided,
 )
-from tmb.backend.device import ctx_for, ctx_ptr
+from tmb.backend.device import ctx_for, ctx_ptr, dev
 from tmb.backend.kernel_call import KernelCall
 from tmb.ops.f8_iter import (
     f8_cx_scalar,
@@ -93,8 +108,14 @@ from tmb.ops.f8_iter import (
     softshrink_check,
 )
 from tmb.backend.registry import Site, impl
-from tmb.kernels.common.float8 import is_float8
 from tmb.ops.complex import (
+    _Operand,
+    _broadcast_into,
+    _first_tensor,
+    _flatten,
+    _operand,
+    _Call,
+    _store,
     routed,
 )
 from tmb.ops.complex_math import (
@@ -106,11 +127,27 @@ from tmb.ops.complex_math import (
     cx_rsub,
 )
 from tmb.kernels.common.op_utils import MAX_RANK
+from tmb.kernels.common.pow_math import (
+    POW_CUBE,
+    POW_GENERAL,
+    POW_INV_SQUARE,
+    POW_RECIPROCAL,
+    POW_RSQRT,
+    POW_SQRT,
+    POW_SQUARE,
+)
 from tmb.ops.binary import (
+    op_addcdiv_legacy,
+    op_addcdiv_out_legacy,
+    op_addcdiv__legacy,
+    op_addcmul_legacy,
+    op_addcmul_out_legacy,
+    op_addcmul__legacy,
     Res,
     Scal,
     Side,
     _b_alpha_check,
+    _b_exact_sides,
     _b_sub_check,
     _b_can_cast,
     _b_copy_into,
@@ -121,7 +158,9 @@ from tmb.ops.binary import (
     _b_no_partial_overlap,
     _b_ret,
     _b_self,
+    _b_same_tensor,
     _b_shape_list,
+    _b_args_device,
     _b_side,
     _b_sside,
     _b_store_inplace,
@@ -135,6 +174,9 @@ from tmb.ops.binary import (
     op_rsub,
 )
 from tmb.ops.common import (
+    check_broadcastable,
+    device_str,
+    is_wide_unsigned,
     threshold_into_overlapping,
     threshold_scalar_check,
     threshold_scalar_overflows,
@@ -142,7 +184,9 @@ from tmb.ops.common import (
     _repeats_elements,
     can_cast,
     decline_float8,
+    check_real_scalar_fits,
     fill_value,
+    is_wide_unsigned,
     scalar_type_name,
     ST_UNDEFINED,
     assert_no_internal_overlap,
@@ -157,6 +201,7 @@ from tmb.ops.common import (
     is_int_stype as _pw_is_int,
     known_stype as _pw_known,
     cast_to,
+    check_scalar_fits,
     promote_types,
     resize_out,
     scalar_to_float,
@@ -182,7 +227,7 @@ struct _TypeState(Copyable, Movable):
 
 
 def _pw_is_f8(st: Int32) raises -> Bool:
-    return st != ST_UNDEFINED and is_float8(max_dtype(st))
+    return st != ST_UNDEFINED and is_float8_stype(st)
 
 
 def _pw_promote(a: Int32, b: Int32) raises -> Int32:
@@ -576,7 +621,7 @@ def _pw_inplace_self(
     var self = _b_self(args[unsafe_offset=0], what)
     _b_inplace_destination(self)
     for i in range(1, n_operands):
-        var side = _b_side(args[unsafe_offset=i])
+        var side = _b_side(args[unsafe_offset=i], _b_args_device(args))
         if side.is_t:
             _b_inplace_operand(self, side.t.value())
     return self^
@@ -601,6 +646,33 @@ def _pw_no_float8(kind: StaticString, compute: Int32) raises:
         )
 
 
+def _pw_complex_out_check(args: Values, arity: Int, out_index: Int) raises:
+    """TensorIterator's out cast check for a complex operand, which comes
+    before the kernel's dispatch (and our refusal of complex operands): a
+    complex common dtype cannot be cast to a real `out`."""
+    if out_index < 0:
+        return
+    var cx = ST_UNDEFINED
+    for i in range(arity):
+        var tag = args[unsafe_offset=i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            var t = v_tensor_c(args[unsafe_offset=i])
+            if t.is_complex():
+                cx = t.stype if cx == ST_UNDEFINED else promote_types(
+                    cx, t.stype
+                )
+    if cx == ST_UNDEFINED:
+        return
+    var dest = v_tensor_c(args[unsafe_offset=out_index])
+    if not dest.is_complex():
+        raise Error(
+            "result type ",
+            scalar_type_name(cx),
+            " can't be cast to the desired output type ",
+            scalar_type_name(dest.dtype),
+        )
+
+
 def _pw_math(
     kind: StaticString,
     policy: Int,
@@ -615,15 +687,42 @@ def _pw_math(
     """A math op over args[0 .. arity): promoted, computed, stored.
     `exact_dtype` (or `_pw_out_exact(kind)`) demands an `out` of the result
     dtype instead of casting into it."""
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
-    var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
-    var common = _pw_result_type(a, b, c, arity)
+    if not exact_dtype and not _pw_out_exact(kind):
+        _pw_complex_out_check(args, arity, out_index)
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = (
+        _b_side(args[unsafe_offset=1], _b_args_device(args)) if arity
+        >= 2 else _none_side()
+    )
+    var c = (
+        _b_side(args[unsafe_offset=2], _b_args_device(args)) if arity
+        >= 3 else _none_side()
+    )
     var dest = Optional[T]()
     if out_index >= 0:
         # TensorIterator's out= checks and resize precede the kernel
         # dispatch (a float8 computation is refused after the resize).
         dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
+    # Its shape check precedes the dtype ones.
+    _ = _pw_broadcast(a, b, c, arity)
+    var common = _pw_result_type(a, b, c, arity)
+    if dest and policy == P_INT and not can_cast(common, dest.value().stype):
+        # TensorIterator's check on the output (`x.bitwise_left_shift_(2.0)`)
+        raise Error(
+            "result type ",
+            scalar_type_name(common),
+            " can't be cast to the desired output type ",
+            scalar_type_name(dest.value().stype),
+        )
+    if (
+        dest
+        and (kind == "fmax" or kind == "fmin")
+        and is_wide_unsigned(common)
+        and can_cast(common, dest.value().stype)
+    ):
+        # No uint16 / uint32 / uint64 kernel: the maximum runs in the wider
+        # out's dtype (monotone, so the same values CUDA stores).
+        common = dest.value().stype
     var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     _pw_finish(
         rets,
@@ -647,8 +746,15 @@ def _pw_math_inplace(
     it."""
     var self = _pw_inplace_self(args, kind, arity)
     var a = _b_tside(self)
-    var b = _b_side(args[unsafe_offset=1]) if arity >= 2 else _none_side()
-    var c = _b_side(args[unsafe_offset=2]) if arity >= 3 else _none_side()
+    var b = (
+        _b_side(args[unsafe_offset=1], _b_args_device(args)) if arity
+        >= 2 else _none_side()
+    )
+    var c = (
+        _b_side(args[unsafe_offset=2], _b_args_device(args)) if arity
+        >= 3 else _none_side()
+    )
+    _ = _pw_broadcast(a, b, c, arity)
     var common = _pw_result_type(a, b, c, arity)
     var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     _b_store_inplace(
@@ -661,6 +767,25 @@ def _pw_math_inplace(
 # ---------------------------------------------------------------------------
 # binary math
 # ---------------------------------------------------------------------------
+
+
+def _pw_same_device(args: Values, n: Int) raises:
+    """The dispatcher's device check of the ops without `device_check:
+    NoCheck` (nextafter, logaddexp(2), gcd, lcm): a CPU tensor among the
+    first `n` arguments -- a 0-d one too, which TensorIterator would read as
+    a scalar -- raises before anything else. CUDA only: elsewhere a CPU 0-d
+    operand keeps working as before."""
+    if not _pw_cuda_args(args):
+        return
+    for i in range(n):
+        var tag = args[unsafe_offset=i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            if not v_tensor_c(args[unsafe_offset=i]).on_mojo():
+                raise Error(
+                    "Expected all tensors to be on the same device, but got"
+                    " an argument on cpu, different from the other tensors"
+                    " on mojo"
+                )
 
 
 # aten::atan2(Tensor self, Tensor other) -> Tensor
@@ -686,55 +811,105 @@ def op_copysign_out(
     _pw_math("copysign", P_FLOAT, True, 2, args, rets, 2)
 
 
+def _pw_fmaxmin(
+    kind: StaticString,
+    args: Values,
+    n_args: Int,
+    rets: Values,
+    out_index: Int,
+) raises:
+    """fmax / fmin with a CPU scalar as the first operand, where CUDA's
+    symmetric scalar kernel puts it (`opmath_symmetric_gpu_kernel_with_
+    scalars`): two float64 NaNs give the scalar's, quieted."""
+    if v_is_complex(args[unsafe_offset=0]) or v_is_complex(
+        args[unsafe_offset=1]
+    ):
+        _pw_math(kind, P_ALL, True, 2, args, rets, out_index)
+        return
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    if not a.is_t or b.is_t or not _pw_cuda_args(args):
+        _pw_math(kind, P_ALL, True, 2, args, rets, out_index)
+        return
+    var swapped = List[Value](capacity=n_args)
+    for i in range(n_args):
+        swapped.append(args[unsafe_offset=i].copy())
+    swapped[0] = args[unsafe_offset=1].copy()
+    swapped[1] = args[unsafe_offset=0].copy()
+    _pw_math(
+        kind,
+        P_ALL,
+        True,
+        2,
+        Values(unsafe_from_address=Int(swapped.unsafe_ptr())),
+        rets,
+        out_index,
+    )
+    _ = swapped^
+
+
 # aten::fmax(Tensor self, Tensor other) -> Tensor
 def op_fmax(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmax", P_ALL, True, 2, args, rets, -1)
+    _pw_fmaxmin("fmax", args, n_args, rets, -1)
 
 
 # aten::fmax.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_fmax_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmax", P_ALL, True, 2, args, rets, 2)
+    _pw_fmaxmin("fmax", args, n_args, rets, 2)
 
 
 # aten::fmin(Tensor self, Tensor other) -> Tensor
 def op_fmin(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmin", P_ALL, True, 2, args, rets, -1)
+    _pw_fmaxmin("fmin", args, n_args, rets, -1)
 
 
 # aten::fmin.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_fmin_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmin", P_ALL, True, 2, args, rets, 2)
+    _pw_fmaxmin("fmin", args, n_args, rets, 2)
 
 
 # aten::fmod.Tensor(Tensor self, Tensor other) -> Tensor
 # aten::fmod.Scalar(Tensor self, Scalar other) -> Tensor
 def op_fmod(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, -1)
+    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, -1, _fmod_params(args))
+
+
+def _fmod_params(args: Values) raises -> SIMD[DType.float64, 4]:
+    """p0 = 2 when the divisor is a CPU scalar (its float64 NaN first)."""
+    return _p(
+        2.0 if not _b_side(
+            args[unsafe_offset=1], _b_args_device(args)
+        ).is_t else 0.0
+    )
 
 
 # aten::fmod.Tensor_out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 # aten::fmod.Scalar_out(Tensor self, Scalar other, *, Tensor(a!) out) -> Tensor(a!)
 def op_fmod_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, 2)
+    _pw_math("fmod", P_NUMERIC, True, 2, args, rets, 2, _fmod_params(args))
 
 
 # aten::gcd(Tensor self, Tensor other) -> Tensor
 def op_gcd(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_same_device(args, 2)
     _pw_math("gcd", P_INT, True, 2, args, rets, -1)
 
 
 # aten::gcd.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_gcd_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_same_device(args, 3)
     _pw_math("gcd", P_INT, True, 2, args, rets, 2)
 
 
 # aten::lcm(Tensor self, Tensor other) -> Tensor
 def op_lcm(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_same_device(args, 2)
     _pw_math("lcm", P_INT, True, 2, args, rets, -1)
 
 
 # aten::lcm.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
 def op_lcm_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_same_device(args, 3)
     _pw_math("lcm", P_INT, True, 2, args, rets, 2)
 
 
@@ -753,8 +928,8 @@ def _pw_side_stype(side: Side) -> Int32:
 def _pw_same_dtype(name: StaticString, args: Values) raises:
     """heaviside's meta check: both tensors of one dtype, a CPU 0-d
     `values` included."""
-    var a = _pw_side_stype(_b_side(args[unsafe_offset=0]))
-    var b = _pw_side_stype(_b_side(args[unsafe_offset=1]))
+    var a = _pw_side_stype(_b_side(args[unsafe_offset=0], _b_args_device(args)))
+    var b = _pw_side_stype(_b_side(args[unsafe_offset=1], _b_args_device(args)))
     if a != b:
         raise Error(
             String(name)
@@ -808,6 +983,7 @@ def op_igammac_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 
 # aten::logaddexp(Tensor self, Tensor other) -> Tensor
 def op_logaddexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_same_device(args, 2)
     _pw_math("logaddexp", P_FLOAT_ONLY, True, 2, args, rets, -1)
 
 
@@ -815,11 +991,13 @@ def op_logaddexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_logaddexp_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _pw_same_device(args, 3)
     _pw_math("logaddexp", P_FLOAT_ONLY, True, 2, args, rets, 2)
 
 
 # aten::logaddexp2(Tensor self, Tensor other) -> Tensor
 def op_logaddexp2(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_same_device(args, 2)
     _pw_math("logaddexp2", P_FLOAT_ONLY, True, 2, args, rets, -1)
 
 
@@ -827,11 +1005,13 @@ def op_logaddexp2(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_logaddexp2_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _pw_same_device(args, 3)
     _pw_math("logaddexp2", P_FLOAT_ONLY, True, 2, args, rets, 2)
 
 
 # aten::nextafter(Tensor self, Tensor other) -> Tensor
 def op_nextafter(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _pw_same_device(args, 2)
     _pw_math("nextafter", P_FLOAT_ONLY, True, 2, args, rets, -1)
 
 
@@ -839,6 +1019,7 @@ def op_nextafter(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
 def op_nextafter_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
+    _pw_same_device(args, 3)
     _pw_math("nextafter", P_FLOAT_ONLY, True, 2, args, rets, 2)
 
 
@@ -930,8 +1111,16 @@ def _pw_shift_inplace(kind: StaticString, args: Values, rets: Values) raises:
     as TensorIterator does for any in-place op (`_b_store_inplace`)."""
     var self = _pw_inplace_self(args, "an in-place shift", 2)
     var a = _b_tside(self)
-    var b = _b_side(args[unsafe_offset=1])
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var common = _pw_result_type(a, b, _none_side(), 2)
+    if not can_cast(common, self.stype):
+        # TensorIterator's check on the in-place output (`x <<= 2.0`)
+        raise Error(
+            "result type ",
+            scalar_type_name(common),
+            " can't be cast to the desired output type ",
+            scalar_type_name(self.stype),
+        )
     var compute = _pw_compute_dtype(kind, common, P_INT, True)
     var res = _pw_run(
         kind, 2, a, b, _none_side(), compute, compute, _p(), self.copy()
@@ -1027,14 +1216,700 @@ def _pw_store_slot(rets: Values, slot: Int, dest: T, var res: Res) raises:
 
 
 # ---------------------------------------------------------------------------
+# complex lerp / addcmul / addcdiv (tmb/kernels/complex_pointwise)
+# ---------------------------------------------------------------------------
+
+
+def _cx_result3(a: _Operand, b: _Operand, c: _Operand, n: Int) raises -> Int32:
+    """ResultTypeState over 2 or 3 operands (dimensioned, 0-dim, wrapped)."""
+    var dim = ST_UNDEFINED
+    var zero = ST_UNDEFINED
+    var wrapped = ST_UNDEFINED
+    for k in range(n):
+        var st = a.stype if k == 0 else (b.stype if k == 1 else c.stype)
+        var rk = a.rank_kind if k == 0 else (
+            b.rank_kind if k == 1 else c.rank_kind
+        )
+        if rk == 0:
+            dim = promote_types(dim, st)
+        elif rk == 1:
+            zero = promote_types(zero, st)
+        else:
+            wrapped = promote_types(wrapped, st)
+    return _pw_combine(dim, _pw_combine(zero, wrapped))
+
+
+def _cx_vectorizable(
+    o: _Operand, shape: IndexList[MAX_RANK], rank: Int, st: Int32
+) -> Bool:
+    if not o.is_t:
+        return True
+    var t = o.t.copy()
+    if t.rank != rank or not t.contig or t.ptr % 16 != 0 or t.stype != st:
+        return False
+    for i in range(MAX_RANK):
+        if t.shape[i] != shape[i]:
+            return False
+    return True
+
+
+def _cx_check_devices(like: T, vs: List[Value], dest: Optional[T]) raises:
+    """TensorIterator's device check, before any pointer is read: every mojo
+    operand (and the out= / in-place self) on one device."""
+    for i in range(len(vs)):
+        var tag = vs[i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            var t = v_tensor_c(vs[i])
+            if t.on_mojo() and (
+                t.device_type != like.device_type or t.device != like.device
+            ):
+                raise Error(
+                    (
+                        "Expected all tensors to be on the same device, but"
+                        " found at least two devices, "
+                    ),
+                    device_str(like),
+                    " and ",
+                    device_str(t),
+                    "!",
+                )
+    if dest:
+        var d = dest.value().copy()
+        if d.device_type != like.device_type or d.device != like.device:
+            raise Error(
+                (
+                    "Expected all tensors to be on the same device, but found"
+                    " at least two devices, "
+                ),
+                device_str(like),
+                " and ",
+                device_str(d),
+                "!",
+            )
+
+
+def _cx_check_overlap(vs: List[Value], dest: Optional[T], inplace: Bool) raises:
+    """The destination against the ORIGINAL operands, before computing: an
+    in-place op never changes self's shape and no operand may partially
+    overlap it (an `out=` is checked for the overlap alone)."""
+    if not dest:
+        return
+    var d = dest.value().copy()
+    var read_write = False
+    if inplace:
+        _b_inplace_destination(d)
+    for i in range(len(vs)):
+        var tag = vs[i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            var t = v_tensor_c(vs[i])
+            if not t.on_mojo():
+                continue
+            if inplace:
+                _b_inplace_operand(d, t)
+            else:
+                _b_no_partial_overlap(d, t)
+                if _b_same_tensor(d, t):
+                    read_write = True
+    if read_write and not inplace:
+        # an out= that IS an input is never resized (`_b_out_guard3`): the
+        # broadcast shape must be its own
+        var shape = IndexList[MAX_RANK](1)
+        var rank = 0
+        for i in range(len(vs)):
+            var tag = vs[i].tag
+            if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+                var t = v_tensor_c(vs[i])
+                if t.on_mojo():
+                    _broadcast_into(shape, rank, t)
+        var fits = d.rank == rank
+        for i in range(MAX_RANK):
+            if d.shape[i] != shape[i]:
+                fits = False
+        if not fits:
+            raise Error(
+                "output with shape ",
+                _b_shape_list(d.shape, d.rank),
+                " doesn't match the broadcast shape ",
+                _b_shape_list(shape, rank),
+            )
+
+
+def _cx_pw_launch(
+    kind: StaticString,
+    av: Value,
+    bv: Value,
+    cv: Value,
+    n: Int,
+    p_re: Float64,
+    p_im: Float64,
+    dest: Optional[T],
+    rets: Values,
+    st_in: Int32 = ST_UNDEFINED,
+    inplace: Bool = False,
+) raises:
+    """One complex_pointwise launch over the 2 (lerp.Scalar) or 3 operands,
+    promoted (or `st_in`), broadcast, flattened; stored into `dest` (out= /
+    in-place self) or returned."""
+    var like = _first_tensor(av, bv)
+    var ops = List[Value]()
+    ops.append(av.copy())
+    ops.append(bv.copy())
+    if n == 3:
+        ops.append(cv.copy())
+    _cx_check_devices(like, ops, dest)
+    _cx_check_overlap(ops, dest, inplace)
+    var a = _operand(av, like)
+    var b = _operand(bv, like)
+    var c = _operand(cv, like) if n == 3 else _operand(av, like)
+    var st = st_in if st_in != ST_UNDEFINED else _cx_result3(a, b, c, n)
+    if not is_complex_stype(st):
+        unsupported("a complex op whose result type is not complex")
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    if a.is_t:
+        _broadcast_into(shape, rank, a.t)
+    if b.is_t:
+        _broadcast_into(shape, rank, b.t)
+    if n == 3 and c.is_t:
+        _broadcast_into(shape, rank, c.t)
+    if dest:
+        var d = dest.value().copy()
+        if not can_cast(st, d.stype):
+            raise Error(
+                "result type ",
+                scalar_type_name(st),
+                " can't be cast to the desired output type ",
+                scalar_type_name(d.dtype),
+            )
+    # jitterator's vectorized kernel needs every operand dense, of the output's
+    # shape and 16-byte aligned; anything else runs its scalar kernel
+    var scalar_kernel = (
+        not _cx_vectorizable(a, shape, rank, st)
+        or not _cx_vectorizable(b, shape, rank, st)
+        or (n == 3 and not _cx_vectorizable(c, shape, rank, st))
+    )
+    var fa = _flatten(a, st, shape, rank)
+    var fb = _flatten(b, st, shape, rank)
+    var fc = _flatten(c, st, shape, rank)
+    var out = own(new_tensor(shape, rank, st, like.device))
+    if out.t.numel > 0:
+        var ctx = ctx_for(like.device)
+        var call = KernelCall("complex_pointwise", String(kind))
+        call.arg_dtype(
+            0, DType.float32 if st == ST_COMPLEX64 else DType.float64
+        )
+        call.int(out.t.ptr)
+        call.int(fa.addr)
+        call.int(fb.addr)
+        call.int(fc.addr)
+        call.int(
+            fa.mode
+            | (fb.mode << 2)
+            | (fc.mode << 4)
+            | (64 if scalar_kernel else 0)
+        )
+        call.f64(fa.re)
+        call.f64(fa.im)
+        call.f64(fb.re)
+        call.f64(fb.im)
+        call.f64(fc.re)
+        call.f64(fc.im)
+        call.int(out.t.numel)
+        call.f64(p_re)
+        call.f64(p_im)
+        call.int(ctx_ptr(ctx))
+        call.run()
+        _ = ctx
+    _ = a^
+    _ = b^
+    _ = c^
+    if dest:
+        var d = dest.value().copy()
+        _store(d, out^, rets)
+    else:
+        ret_owned(rets, 0, out)
+
+
+def _cx_same_dtype_end(args: Values) raises:
+    var a = v_tensor_c(args[unsafe_offset=0])
+    var b = v_tensor_c(args[unsafe_offset=1])
+    if a.stype != b.stype:
+        raise Error(
+            "expected dtype ",
+            dtype_name(a.stype),
+            " for `end` but got dtype ",
+            dtype_name(b.stype),
+        )
+
+
+def _cx_lerp_scalar(
+    args: Values, rets: Values, out_index: Int, inplace: Bool
+) raises:
+    """lerp.Scalar on complex tensors: Lerp.cu's jiterated lerp_scalar, the
+    weight `weight.to<opmath_t>()`."""
+    _cx_same_dtype_end(args)
+    var w = v_complex(args[unsafe_offset=2])
+    var st = v_tensor_c(args[unsafe_offset=0]).stype
+    check_scalar_fits(st, w[0], w[1])
+    var dest = Optional[T]()
+    if inplace:
+        dest = v_tensor_c(args[unsafe_offset=0])
+    elif out_index >= 0:
+        dest = v_tensor_c(args[unsafe_offset=out_index])
+    _cx_pw_launch(
+        "cx_lerp_scalar",
+        args[unsafe_offset=0].copy(),
+        args[unsafe_offset=1].copy(),
+        args[unsafe_offset=1].copy(),
+        2,
+        w[0],
+        w[1],
+        dest,
+        rets,
+        inplace=inplace,
+    )
+
+
+def _cx_lerp_tensor(
+    args: Values, rets: Values, out_index: Int, inplace: Bool
+) raises:
+    """lerp.Tensor with a complex operand: the jiterated lerp_tensor (a CPU
+    0-d weight: lerp_scalar with the weight as scalar_t, the same math)."""
+    _cx_same_dtype_end(args)
+    var self = v_tensor_c(args[unsafe_offset=0])
+    var wv = args[unsafe_offset=2].copy()
+    var w = v_tensor_c(wv)
+    if w.rank != 0 and w.stype != self.stype:
+        raise Error(
+            "expected dtype ",
+            dtype_name(self.stype),
+            " for `weight` but got dtype ",
+            dtype_name(w.stype),
+        )
+    var dest = Optional[T]()
+    if inplace:
+        dest = self.copy()
+    elif out_index >= 0:
+        dest = v_tensor_c(args[unsafe_offset=out_index])
+        if w.rank != 0 and dest.value().stype != self.stype:
+            raise Error(
+                "Expected out tensor to have dtype ",
+                dtype_name(self.stype),
+                ", but got ",
+                dtype_name(dest.value().stype),
+                " instead",
+            )
+    _cx_pw_launch(
+        "cx_lerp",
+        args[unsafe_offset=0].copy(),
+        args[unsafe_offset=1].copy(),
+        wv,
+        3,
+        0.0,
+        0.0,
+        dest,
+        rets,
+        inplace=inplace,
+    )
+
+
+def _cx_addc(
+    kind: StaticString,
+    args: Values,
+    rets: Values,
+    out_index: Int,
+    inplace: Bool,
+) raises:
+    """addcmul / addcdiv with a complex operand: the jiterated
+    `a + alpha * (b op c)`, alpha = value.to<scalar_t>()."""
+    var like = _first_tensor(args[unsafe_offset=0], args[unsafe_offset=1])
+    var a = _operand(args[unsafe_offset=0], like)
+    var b = _operand(args[unsafe_offset=1], like)
+    var c = _operand(args[unsafe_offset=2], like)
+    var st = _cx_result3(a, b, c, 3)
+    if kind == "cx_addcmul":
+        if not a.is_t:
+            raise Error(
+                "CPU Scalar support for self argument is not supported when"
+                " calling addcmul on CUDA tensors."
+            )
+        if not b.is_t:
+            raise Error(
+                "CPU Scalar support for tensor1 argument is not supported"
+                " when calling addcmul on CUDA tensors."
+            )
+    elif not a.is_t or not b.is_t or not c.is_t:
+        raise Error("expected a mojo device but found cpu")
+    var v = v_complex(args[unsafe_offset=3])
+    check_scalar_fits(st, v[0], v[1])
+    var dest = Optional[T]()
+    if inplace:
+        dest = v_tensor_c(args[unsafe_offset=0])
+    elif out_index >= 0:
+        dest = v_tensor_c(args[unsafe_offset=out_index])
+    _ = a^
+    _ = b^
+    _ = c^
+    _cx_pw_launch(
+        kind,
+        args[unsafe_offset=0].copy(),
+        args[unsafe_offset=1].copy(),
+        args[unsafe_offset=2].copy(),
+        3,
+        v[0],
+        v[1],
+        dest,
+        rets,
+        st,
+        inplace,
+    )
+
+
+def cx_addcmul(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_addc("cx_addcmul", args, rets, -1, False)
+
+
+def cx_addcmul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_addc("cx_addcmul", args, rets, 4, False)
+
+
+def cx_addcmul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_addc("cx_addcmul", args, rets, -1, True)
+
+
+def cx_addcdiv(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_addc("cx_addcdiv", args, rets, -1, False)
+
+
+def cx_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_addc("cx_addcdiv", args, rets, 4, False)
+
+
+def cx_addcdiv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_addc("cx_addcdiv", args, rets, -1, True)
+
+
+def cx_lerp_scalar(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_lerp_scalar(args, rets, -1, False)
+
+
+def cx_lerp_scalar_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _cx_lerp_scalar(args, rets, 3, False)
+
+
+def cx_lerp_scalar_(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _cx_lerp_scalar(args, rets, -1, True)
+
+
+def cx_logaddexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    """logaddexp on complex tensors: the jiterated logaddexp_complex."""
+    _pw_same_device(args, 2)
+    _cx_pw_launch(
+        "cx_logaddexp",
+        args[unsafe_offset=0].copy(),
+        args[unsafe_offset=1].copy(),
+        args[unsafe_offset=1].copy(),
+        2,
+        0.0,
+        0.0,
+        Optional[T](),
+        rets,
+    )
+
+
+def cx_logaddexp_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _pw_same_device(args, 3)
+    _cx_pw_launch(
+        "cx_logaddexp",
+        args[unsafe_offset=0].copy(),
+        args[unsafe_offset=1].copy(),
+        args[unsafe_offset=1].copy(),
+        2,
+        0.0,
+        0.0,
+        Optional[T](v_tensor_c(args[unsafe_offset=2])),
+        rets,
+    )
+
+
+def _cx_pow2(self: T, other: T) raises -> Owned:
+    """BinaryOps.cpp's `_pow2`: `pow(2.0, other)` for an integral or float32
+    self, else `full({}, 2.0, self.options()).pow(other)`."""
+    var st = self.stype
+    if _pw_is_int(st) or st == ST_BOOL or st == ST_FLOAT32:
+        var c = _Call("aten::pow", "Scalar")
+        c.s(2.0)
+        c.t(other)
+        return c.one()
+    var base: Owned
+    if self.on_mojo():
+        base = own(new_scalar(st, self.device))
+        var f = _Call("aten::fill_", "Scalar")
+        f.t(base.t)
+        f.s(2.0)
+        _ = f.run(1)
+    else:
+        var f = _Call("aten::full")
+        f.ints(List[Int]())
+        f.s(2.0)
+        f.dtype(st)
+        f.none()
+        f.none()
+        f.none()
+        base = f.one()
+    var c = _Call("aten::pow", "Tensor_Tensor")
+    c.t(base.t)
+    c.t(other)
+    var r = c.one()
+    _ = base^
+    return r^
+
+
+def _cx_ldexp(args: Values, rets: Values, out_index: Int, inplace: Bool) raises:
+    """ldexp with a complex operand: `mul(self, _pow2(self, other))`, as
+    BinaryOps.cpp composes it (no integral-exponent route for a complex
+    self)."""
+    var self = v_tensor_c(args[unsafe_offset=0])
+    var other = v_tensor_c(args[unsafe_offset=1])
+    var dest = Optional[T]()
+    if inplace:
+        dest = self.copy()
+    elif out_index >= 0:
+        dest = v_tensor_c(args[unsafe_offset=out_index])
+    if dest:
+        var ds = dest.value().stype
+        if not (_pw_is_float(ds) or is_complex_stype(ds)):
+            raise Error(
+                "ldexp can't be cast to the desired output type ",
+                scalar_type_name(ds),
+            )
+    var p = _cx_pow2(self, other)
+    if dest:
+        var d = dest.value().copy()
+        var m = _Call("aten::mul", "out")
+        m.t(self)
+        m.t(p.t)
+        m.t(d)
+        _ = m.run(1)
+        ret_ref(rets, 0, d)
+    else:
+        var m = _Call("aten::mul", "Tensor")
+        m.t(self)
+        m.t(p.t)
+        var r = m.one()
+        ret_owned(rets, 0, r)
+    _ = p^
+
+
+def cx_ldexp(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_ldexp(args, rets, -1, False)
+
+
+def cx_ldexp_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_ldexp(args, rets, 2, False)
+
+
+def cx_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_ldexp(args, rets, -1, True)
+
+
+def cx_lerp_tensor(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    _cx_lerp_tensor(args, rets, -1, False)
+
+
+def cx_lerp_tensor_out(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _cx_lerp_tensor(args, rets, 3, False)
+
+
+# ---------------------------------------------------------------------------
+# addcmul / addcdiv
+# ---------------------------------------------------------------------------
+
+
+def _pw_cuda_args(args: Values) raises -> Bool:
+    """Whether the call's first mojo tensor is on a cuda device: the CUDA-exact
+    pointwise routes run there; other devices keep their origin routing."""
+    # the first two arguments only: a 2-argument op has no args[2]
+    for i in range(2):
+        var tag = args[unsafe_offset=i].tag
+        if tag == TAG_TENSOR or tag == TAG_TENSOR_REF:
+            var t = v_tensor_c(args[unsafe_offset=i])
+            if t.on_mojo():
+                return dev(t.device)[].api == "cuda"
+    return True
+
+
+def _pw_addc(
+    kind: StaticString,
+    args: Values,
+    rets: Values,
+    out_index: Int,
+    inplace: Bool,
+) raises:
+    """PointwiseOps.cpp's addcmul / addcdiv over (self, tensor1, tensor2)
+    with `value` (arg 3), in stock CUDA's order: addcdiv's integer
+    refusal (meta), the iterator (out checks, broadcast, promotion, the out
+    cast), the kernel's CPU-scalar checks, its dtype dispatch, then
+    value.to<acc_type>() (int64 for the integers, float for the half
+    types)."""
+    var cname: StaticString = "addcmul_cuda" if kind == "addcmul" else (
+        "addcdiv_cuda"
+    )
+    if kind == "addcdiv":
+        var s1 = _pw_side_stype(
+            _b_side(args[unsafe_offset=1], _b_args_device(args))
+        )
+        var s2 = _pw_side_stype(
+            _b_side(args[unsafe_offset=2], _b_args_device(args))
+        )
+        var int1 = _pw_is_int(s1) or s1 == ST_BOOL or is_wide_unsigned(s1)
+        var int2 = _pw_is_int(s2) or s2 == ST_BOOL or is_wide_unsigned(s2)
+        if int1 and int2:
+            raise Error(
+                "Integer division with addcdiv is no longer supported, and in"
+                " a future release addcdiv will perform a true division of"
+                " tensor1 and tensor2."
+            )
+    var self: Optional[T] = None
+    if inplace:
+        self = _pw_inplace_self(args, kind, 3)
+    var a = _b_tside(self.value()) if inplace else _b_side(
+        args[unsafe_offset=0]
+    )
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    var c = _b_side(args[unsafe_offset=2], _b_args_device(args))
+    var dest = Optional[T]()
+    if out_index >= 0:
+        dest = _pw_out_of(args[unsafe_offset=out_index], a, b, c)
+    elif inplace:
+        dest = self.value().copy()
+    _ = _pw_broadcast(a, b, c, 3)
+    var common = _pw_result_type(a, b, c, 3)
+    if dest and not can_cast(common, dest.value().stype):
+        raise Error(
+            "result type ",
+            scalar_type_name(max_dtype(common)),
+            " can't be cast to the desired output type ",
+            scalar_type_name(dest.value().dtype),
+        )
+    if kind == "addcmul":
+        if not a.is_t:
+            raise Error(
+                "CPU Scalar support for self argument is not supported when"
+                " calling addcmul on CUDA tensors."
+            )
+        if not b.is_t:
+            raise Error(
+                "CPU Scalar support for tensor1 argument is not supported"
+                " when calling addcmul on CUDA tensors. However, CPU Scalar"
+                " support for tensor2 is supported, please swap your tensor1"
+                " and tensor2 terms."
+            )
+    elif not a.is_t or not b.is_t or not c.is_t:
+        # gpu_kernel's device assertion: addcdiv takes no CPU scalar.
+        raise Error("expected a mojo device but found cpu")
+    if (
+        common == ST_BOOL
+        or is_wide_unsigned(common)
+        or _pw_is_f8(common)
+        or not _pw_known(common)
+    ):
+        unsupported(
+            '"'
+            + String(cname)
+            + "\" not implemented for '"
+            + scalar_type_name(max_dtype(common))
+            + "'"
+        )
+    var v = args[unsafe_offset=3].copy()
+    var value: Float64
+    if _pw_is_int(common):
+        check_real_scalar_fits(ST_INT64, v)
+        value = bits_f64(Int64(scalar_to_int(_pw_real_value(v), ST_INT64)))
+    else:
+        var acc = ST_FLOAT64 if common == ST_FLOAT64 else ST_FLOAT32
+        check_real_scalar_fits(acc, v)
+        value = scalar_to_float(_pw_real_value(v), acc)
+    var res = _pw_run(kind, 3, a, b, c, common, common, _p(value), dest)
+    if inplace:
+        _b_store_inplace(rets, self.value(), res^)
+    else:
+        _pw_finish(rets, dest, res^)
+
+
+def _pw_real_value(v: Value) raises -> Value:
+    """A Scalar record with its real part only (a complex one that passed
+    `check_real_scalar_fits` has none other)."""
+    if v.tag == TAG_COMPLEX:
+        return Value(TAG_SCALAR_DOUBLE, 0, f64_bits(v_complex(v)[0]), 0)
+    return v.copy()
+
+
+# aten::addcmul(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+def op_addcmul(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_cuda_args(args):
+        op_addcmul_legacy(args, n_args, rets, n_rets)
+        return
+    _pw_addc("addcmul", args, rets, -1, False)
+
+
+# aten::addcmul.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
+def op_addcmul_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_cuda_args(args):
+        op_addcmul_out_legacy(args, n_args, rets, n_rets)
+        return
+    _pw_addc("addcmul", args, rets, 4, False)
+
+
+# aten::addcmul_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+def op_addcmul_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_cuda_args(args):
+        op_addcmul__legacy(args, n_args, rets, n_rets)
+        return
+    _pw_addc("addcmul", args, rets, -1, True)
+
+
+# aten::addcdiv(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor
+def op_addcdiv(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_cuda_args(args):
+        op_addcdiv_legacy(args, n_args, rets, n_rets)
+        return
+    _pw_addc("addcdiv", args, rets, -1, False)
+
+
+# aten::addcdiv.out(Tensor self, Tensor tensor1, Tensor tensor2, *, Scalar value=1, Tensor(a!) out) -> Tensor(a!)
+def op_addcdiv_out(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_cuda_args(args):
+        op_addcdiv_out_legacy(args, n_args, rets, n_rets)
+        return
+    _pw_addc("addcdiv", args, rets, 4, False)
+
+
+# aten::addcdiv_(Tensor(a!) self, Tensor tensor1, Tensor tensor2, *, Scalar value=1) -> Tensor(a!)
+def op_addcdiv_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_cuda_args(args):
+        op_addcdiv__legacy(args, n_args, rets, n_rets)
+        return
+    _pw_addc("addcdiv", args, rets, -1, True)
+
+
+# ---------------------------------------------------------------------------
 # ternary: lerp.Tensor, clamp.Tensor; pow with a Scalar base
 # ---------------------------------------------------------------------------
 
 
 def _pw_lerp(args: Values, rets: Values, out_index: Int) raises:
-    var start = _b_side(args[unsafe_offset=0])
-    var end = _b_side(args[unsafe_offset=1])
-    var weight = _b_side(args[unsafe_offset=2])
+    var start = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var end = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    var weight = _b_side(args[unsafe_offset=2], _b_args_device(args))
     if start.is_t and end.is_t:
         if start.t.value().stype != end.t.value().stype:
             raise Error(
@@ -1093,12 +1968,52 @@ def _pw_clamp_tensor(args: Values, rets: Values, out_index: Int) raises:
         raise Error(
             "torch.clamp: At least one of 'min' or 'max' must not be None"
         )
-    var a = _b_side(args[unsafe_offset=0])
+    var first = v_tensor_c(
+        args[unsafe_offset=out_index if out_index >= 0 else 0]
+    )
+    for i in range(1, 3 if _pw_cuda_args(args) else 1):
+        var v = args[unsafe_offset=i].copy()
+        if v.tag == TAG_NONE:
+            continue
+        var bt = v_tensor_c(v)
+        if bt.device_type != first.device_type or bt.device != first.device:
+            # the dispatcher wrapper's check_and_update_common_device
+            # (CLAMP_CONFIG's iterator allows no CPU scalar either)
+            raise Error(
+                "Expected all tensors to be on the same device, but got ",
+                "min" if i == 1 else "max",
+                " is on ",
+                device_str(bt),
+                ", different from other tensors on ",
+                device_str(first),
+                " (when checking argument in method ",
+                "wrapper_CUDA_clamp_out_Tensor_out" if out_index
+                >= 0 else "wrapper_CUDA_clamp_Tensor",
+                ")",
+            )
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
     if has_min and has_max:
+        var common = _pw_result_type(
+            a,
+            _b_side(args[unsafe_offset=1], _b_args_device(args)),
+            _b_side(args[unsafe_offset=2], _b_args_device(args)),
+            3,
+        )
+        if (common == ST_BOOL or is_wide_unsigned(common)) and _pw_cuda_args(
+            args
+        ):
+            # clamp_kernel_impl: AT_DISPATCH_ALL_TYPES_AND2(half, bf16)
+            unsupported(
+                '"clamp_cuda" not implemented for \''
+                + scalar_type_name(common)
+                + "'"
+            )
         _pw_math("clamp", P_ALL, True, 3, args, rets, out_index)
         return
     # One bound: ATen's maximum_stub / minimum_stub over the promoted pair.
-    var bound = _b_side(args[unsafe_offset=1 if has_min else 2])
+    var bound = _b_side(
+        args[unsafe_offset=1 if has_min else 2], _b_args_device(args)
+    )
     var common = _pw_result_type(a, bound, _none_side(), 2)
     var dest = Optional[T]()
     if out_index >= 0:
@@ -1169,8 +2084,8 @@ def _pw_pow_scalar_base(args: Values, rets: Values, out_index: Int) raises:
     to the result dtype as PowKernel.cu's cpu-scalar base
     (`iter.scalar_value<scalar_t>(1)`; MPS wraps it in a tensor of that
     dtype); floating results only."""
-    var base = _b_side(args[unsafe_offset=0])
-    var expo = _b_side(args[unsafe_offset=1])
+    var base = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var expo = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if base.is_t:
         unsupported("pow.Scalar with a tensor base")
     if _pw_int_side(base) and _pw_int_side(expo):
@@ -1239,14 +2154,20 @@ def _pw_pow_scalar_base(args: Values, rets: Values, out_index: Int) raises:
 def op_pow_scalar_base(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_pow_scalar_base(args, rets, -1)
+    if not _pw_cuda_args(args):
+        op_pow_scalar_base_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_ST, -1):
+        _pw_pow_scalar_base(args, rets, -1)
 
 
 # aten::pow.Scalar_out(Scalar self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
 def op_pow_scalar_base_out(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
-    _pw_pow_scalar_base(args, rets, 2)
+    if not _pw_cuda_args(args):
+        op_pow_scalar_base_out_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_ST, 2):
+        _pw_pow_scalar_base(args, rets, 2)
 
 
 def _pw_lerp_scalar(
@@ -1254,8 +2175,8 @@ def _pw_lerp_scalar(
 ) raises:
     """lerp.Scalar: the weight is a parameter, converted to opmath like
     Lerp.cu. `in_place` is lerp_ (self written, never resized)."""
-    var start = _b_side(args[unsafe_offset=0])
-    var end = _b_side(args[unsafe_offset=1])
+    var start = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var end = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if start.is_t and end.is_t and start.t.value().stype != end.t.value().stype:
         raise Error(
             "expected dtype "
@@ -1328,16 +2249,541 @@ def _pw_ipow(
 ) raises:
     """Integer pow (Pow.h powi) for two integral operands."""
     if scalar_exponent:
-        var e = _b_side(args[unsafe_offset=1])
+        var e = _b_side(args[unsafe_offset=1], _b_args_device(args))
         if e.s.value().i < 0:
             raise Error("Integers to negative integer powers are not allowed.")
     _pw_math("ipow", P_INT, True, 2, args, rets, out_index)
 
 
 def _pw_both_int(args: Values) raises -> Bool:
-    return _pw_int_side(_b_side(args[unsafe_offset=0])) and _pw_int_side(
-        _b_side(args[unsafe_offset=1])
+    return _pw_int_side(
+        _b_side(args[unsafe_offset=0], _b_args_device(args))
+    ) and _pw_int_side(_b_side(args[unsafe_offset=1], _b_args_device(args)))
+
+
+def _pw_rsub_check(args: Values) raises:
+    """BinaryOps.cpp's sub_check and alpha_check (rsub is sub(other, self,
+    alpha)): no bool operand, no bool alpha (it would need a bool result,
+    which sub_check already refused), no floating alpha for an integral
+    result."""
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    _b_sub_check(b, a)
+    _b_alpha_check(
+        _pw_result_type(a, b, _none_side(), 2), args[unsafe_offset=2]
     )
+
+
+# aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
+# aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
+def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
+    if not _pw_cuda_args(args):
+        op_rsub_any_legacy(args, n_args, rets, n_rets)
+        return
+    _pw_rsub_check(args)
+    op_rsub(args, n_args, rets, n_rets)
+
+
+# pow / float_power (float_power is composite: pow in float64 / complex128),
+# real dtypes. PowKernel.cu and Pow.cpp, case by case: a CPU-scalar base
+# (pow.Scalar, a 0-d CPU tensor) runs pow_scalar_tensor_impl with the base
+# converted to the common dtype; a CPU-scalar exponent runs
+# pow_tensor_scalar_kernel with it converted to the common dtype
+# (pow.Tensor_Tensor) or as the Scalar itself after Pow.cpp's 0 / 1
+# shortcuts (pow.Tensor_Scalar); two tensors run pow_ elementwise. The
+# complex dtypes take tmb/ops/complex_math.mojo, float8 operands the
+# binary.mojo routes (their refusals).
+
+comptime _POW_TT = 0  # pow.Tensor_Tensor
+comptime _POW_TS = 1  # pow.Tensor_Scalar
+comptime _POW_ST = 2  # pow.Scalar
+
+
+def _pw_pow_f8_side(side: Side) raises -> Bool:
+    if side.is_t:
+        return _pw_is_f8(side.t.value().stype)
+    return side.zero_st >= 0 and _pw_is_f8(side.zero_st)
+
+
+def _pw_wrap_int(v: Int, st: Int32) -> Int:
+    """`static_cast<scalar_t>(int64)`: two's complement wrap."""
+    var x = Int64(v)
+    if st == ST_INT8:
+        return Int(x.cast[DType.int8]())
+    if st == ST_UINT8:
+        return Int(x.cast[DType.uint8]())
+    if st == ST_INT16:
+        return Int(x.cast[DType.int16]())
+    if st == ST_INT32:
+        return Int(x.cast[DType.int32]())
+    return v
+
+
+def _pw_fill_ones_out(dest: T, base: Side, expo: Side, rets: Values) raises:
+    """Pow.cpp's `resize_output(result, sizes); result.fill_(1)`: ones go
+    straight into the caller's out=, whatever its dtype (no cast check)."""
+    var bs = _pw_broadcast(base, expo, _none_side(), 2)
+    var d = dest.copy()
+    var fits = d.rank == bs[1]
+    for i in range(MAX_RANK):
+        if d.shape[i] != bs[0][i]:
+            fits = False
+    if not fits:
+        resize_out(d, bs[0], bs[1])
+    fill_value(d, 1.0)
+    ret_ref(rets, 0, d)
+
+
+def _pw_pow_ones(base: Side, expo: Side, common: Int32) raises -> Res:
+    var t = expo.t.value().copy() if expo.is_t else base.t.value().copy()
+    var bs = _pw_broadcast(base, expo, _none_side(), 2)
+    var ones = own(new_tensor(bs[0], bs[1], common, t.device))
+    fill_value(ones.t, 1.0)
+    return Res(ones.take(), True)
+
+
+def _pw_pow_scalar_exp(
+    base: Side, ev: Value, common: Int32, dest: Optional[T]
+) raises -> Res:
+    """PowKernel.cu's pow_tensor_scalar_kernel(iter, exp_scalar) on a real
+    common dtype: an exponent EQUAL to 0.5 / -0.5 / -1 (the Scalar itself)
+    is the sqrt / rsqrt / reciprocal kernel; otherwise `exp_scalar.to<
+    scalar_t>()` (checked) whose value 2 / 3 / -2 is a product, the rest
+    the full pow."""
+    var is_bool = ev.tag == TAG_SCALAR_BOOL or ev.tag == TAG_BOOL
+    var is_int = ev.tag == TAG_SCALAR_INT or ev.tag == TAG_INT
+    var d = Float64(ev.a) if is_int else v_f64(ev)
+    var mode = POW_GENERAL
+    if not is_bool:
+        if d == 0.5:
+            mode = POW_SQRT
+        elif d == -0.5:
+            mode = POW_RSQRT
+        elif d == -1.0:
+            mode = POW_RECIPROCAL
+    if mode != POW_GENERAL and not _pw_is_float(common):
+        var k = "sqrt" if mode == POW_SQRT else (
+            "rsqrt" if mode == POW_RSQRT else "reciprocal"
+        )
+        unsupported(
+            '"'
+            + k
+            + "_cuda\" not implemented for '"
+            + scalar_type_name(max_dtype(common))
+            + "'"
+        )
+    var compute = _pw_compute_dtype("pow_exp", common, P_NUMERIC, True)
+    var params = _p(0.0, Float64(mode))
+    if mode == POW_GENERAL:
+        if _pw_is_float(compute):
+            var e = _round_to(scalar_to_float(ev, compute), compute)
+            if e == 2.0:
+                mode = POW_SQUARE
+            elif e == 3.0:
+                mode = POW_CUBE
+            elif e == -2.0:
+                mode = POW_INV_SQUARE
+            params = _p(e, Float64(mode))
+        else:
+            if not is_int:
+                raise Error(
+                    (
+                        "invalid combination of type in Pow function, common"
+                        " dtype:"
+                    ),
+                    scalar_type_name(max_dtype(compute)),
+                    "exp is integral?false",
+                )
+            var e = _pw_wrap_int(scalar_to_int(ev, compute), compute)
+            if e == 2:
+                mode = POW_SQUARE
+            elif e == 3:
+                mode = POW_CUBE
+            elif e == -2:
+                mode = POW_INV_SQUARE
+            params = _p(bits_f64(Int64(e)), bits_f64(Int64(mode)))
+    return _pw_run(
+        "pow_exp",
+        1,
+        base,
+        _none_side(),
+        _none_side(),
+        compute,
+        compute,
+        params,
+        dest,
+    )
+
+
+def _pw_pow_real(
+    args: Values, rets: Values, schema: Int, out_index: Int
+) raises -> Bool:
+    """pow of real operands (see above). False for what binary.mojo keeps:
+    float8 operands, and two tensors of one floating dtype (its PowSpec
+    kernels)."""
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    if _pw_pow_f8_side(a) or _pw_pow_f8_side(b):
+        return False
+    if out_index >= 0 and _pw_is_f8(
+        v_tensor(args[unsafe_offset=out_index]).stype
+    ):
+        return False
+    if (
+        schema == _POW_TT
+        and a.is_t
+        and b.is_t
+        and a.t.value().stype == b.t.value().stype
+        and _pw_is_float(a.t.value().stype)
+    ):
+        return False
+    if schema == _POW_TS:
+        var st = a.t.value().stype
+        var s = b.s.value().copy()
+        if (
+            (
+                _pw_is_int(st)
+                or st == ST_BOOL
+                or st == ST_UINT16
+                or st == ST_UINT32
+                or st == ST_UINT64
+            )
+            and s.is_int
+            and s.i < 0
+        ):
+            raise Error("Integers to negative integer powers are not allowed.")
+    var common = _pw_result_type(a, b, _none_side(), 2)
+    var dest = Optional[T]()
+    if out_index >= 0:
+        dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
+    var to_kernel = schema != _POW_TS and not (
+        schema == _POW_ST and _base_is_one(args[unsafe_offset=0])
+    )
+    if to_kernel and (common == ST_BOOL or not _pw_known(common)):
+        unsupported(
+            '"pow_cuda" not implemented for \''
+            + scalar_type_name(max_dtype(common))
+            + "'"
+        )
+    var res: Res
+    if schema == _POW_ST and _base_is_one(args[unsafe_offset=0]):
+        # pow_Scalar_out: a base equal to 1 fills ones, no kernel
+        if dest:
+            _pw_fill_ones_out(dest.value(), a, b, rets)
+            return True
+        res = _pw_pow_ones(a, b, common)
+    elif schema == _POW_TS:
+        var s = b.s.value().copy()
+        if (s.is_bool and s.i == 0) or (not s.is_bool and s.f == 0.0):
+            # Pow.cpp: `out.fill_(1)` (its meta's out cast check came first)
+            res = _pw_pow_ones(a, b, common)
+        elif (s.is_bool and s.i == 1) or (not s.is_bool and s.f == 1.0):
+            # Pow.cpp: `out.copy_(base)`, base converted to the common dtype
+            var t = a.t.value().copy()
+            var c = own(new_tensor(t.shape, t.rank, common, t.device))
+            if t.stype == common:
+                copy_strided_into(c.t, t)
+            else:
+                var conv = own(cast_for_copy(t, common, False))
+                copy_strided_into(c.t, conv.t)
+                _ = conv^
+            res = Res(c.take(), True)
+        else:
+            res = _pw_pow_scalar_exp(
+                a, args[unsafe_offset=1].copy(), common, dest
+            )
+    elif not a.is_t:
+        # pow_scalar_tensor_impl: the CPU-scalar base as the common dtype
+        # (`iter.scalar_value<scalar_t>(1)`)
+        var s = a.s.value().copy()
+        if _pw_is_float(common):
+            var v = Float64(s.i) if s.is_int else s.f
+            res = _pw_run(
+                "pow_scalar_base",
+                1,
+                b,
+                _none_side(),
+                _none_side(),
+                common,
+                common,
+                _p(_round_to(v, common), 1.0 if schema == _POW_ST else 0.0),
+                dest,
+            )
+        else:
+            res = _pw_run(
+                "ipow", 2, a, b, _none_side(), common, common, _p(), dest
+            )
+    elif not b.is_t:
+        # pow_tensor_scalar_kernel with `Scalar(iter.scalar_value<
+        # scalar_t>(2))`: the exponent converted to the common dtype first,
+        # no 0 / 1 shortcut
+        var s = b.s.value().copy()
+        var ev: Value
+        if _pw_is_float(common):
+            var v = Float64(s.i) if s.is_int else s.f
+            ev = Value(TAG_SCALAR_DOUBLE, 0, f64_bits(_round_to(v, common)), 0)
+        else:
+            var v = s.i if s.is_int else Int(s.f)
+            ev = Value(TAG_SCALAR_INT, 0, Int64(_pw_wrap_int(v, common)), 0)
+        res = _pw_pow_scalar_exp(a, ev, common, dest)
+    elif _pw_is_float(common):
+        res = _pw_run(
+            "pow_tt", 2, a, b, _none_side(), common, common, _p(), dest
+        )
+    else:
+        res = _pw_run("ipow", 2, a, b, _none_side(), common, common, _p(), dest)
+    _pw_finish(rets, dest, res^)
+    return True
+
+
+# aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
+def op_pow_tensor_any(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if not _pw_cuda_args(args):
+        op_pow_tensor_any_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_TT, -1):
+        op_pow_tensor(args, n_args, rets, n_rets)
+
+
+# aten::pow.Tensor_Tensor_out(Tensor self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
+def op_pow_tensor_out_any(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if not _pw_cuda_args(args):
+        op_pow_tensor_out_any_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_TT, 2):
+        op_pow_tensor_out(args, n_args, rets, n_rets)
+
+
+# aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
+def op_pow_scalar_any(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if not _pw_cuda_args(args):
+        op_pow_scalar_any_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_TS, -1):
+        op_pow_scalar(args, n_args, rets, n_rets)
+
+
+# aten::pow.Tensor_Scalar_out(Tensor self, Scalar exponent, *, Tensor(a!) out) -> Tensor(a!)
+def op_pow_scalar_out_any(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if not _pw_cuda_args(args):
+        op_pow_scalar_out_any_legacy(args, n_args, rets, n_rets)
+    elif not _pw_pow_real(args, rets, _POW_TS, 2):
+        op_pow_scalar_out(args, n_args, rets, n_rets)
+
+
+# Origin's ldexp host routing, verbatim (non-cuda devices).
+
+
+def _pw_ldexp_legacy(args: Values, rets: Values, out_index: Int) raises:
+    """BinaryOps.cpp's ldexp / ldexp_out. A floating `self` with an integral
+    exponent is its `_ldexp_int_exponent` route (::ldexp, the result in
+    self's dtype); everything else is `self * _pow2(self, other)`, fused.
+    (torch MPS registers no ldexp_stub and multiplies by pow(2, other) for an
+    integral exponent too, which under- and overflows where ::ldexp does
+    not: Apple GPUs keep the exact route.)"""
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    if not a.is_t:
+        unsupported("ldexp with a scalar self")
+    if not b.is_t and b.zero_st < 0:
+        unsupported("ldexp with a Python-number exponent")
+    var x = a.t.value().copy()
+    # An explicit CPU 0-d exponent is a rank-0 tensor of its own dtype.
+    var e_st = b.t.value().stype if b.is_t else b.zero_st
+    var e_rank = b.t.value().rank if b.is_t else 0
+    var dest = Optional[T]()
+    if out_index >= 0:
+        dest = _pw_out_of(args[unsafe_offset=out_index], a, b, _none_side())
+        var d = dest.value().copy()
+        if not (_pw_is_float(d.stype) or _pw_is_f8(d.stype)):
+            raise Error(
+                "ldexp can't be cast to the desired output type ",
+                scalar_type_name(d.dtype),
+            )
+    var e_integral = _pw_is_int(e_st) or e_st == ST_BOOL
+    if (
+        e_integral
+        and _pw_is_float(x.stype)
+        and (not dest or dest.value().stype == x.stype)
+    ):
+        _pw_ldexp_int_legacy(rets, a, b, x.stype, dest)
+        return
+    _pw_ldexp_pow2_legacy(rets, a, b, e_st, e_rank, dest)
+
+
+def _pw_ldexp_int_legacy(
+    rets: Values, a: Side, b: Side, x_st: Int32, dest: Optional[T]
+) raises:
+    """`_ldexp_int_exponent`: ::ldexp(x, int e), the result in x's dtype.
+    An int64 exponent is converted to that `int` first, wrapping as the C++
+    conversion does (2**32 is 0); the kernel then reads it in the float
+    compute dtype. bfloat16 computes in float32: its 8-bit mantissa cannot
+    carry every exponent that still changes the result."""
+    var compute = ST_FLOAT32 if x_st == ST_BFLOAT16 else x_st
+    if b.is_t and b.t.value().stype == ST_INT64:
+        var wrapped = own_if_new(cast_to(b.t.value(), ST_INT32), b.t.value())
+        _pw_finish(
+            rets,
+            dest,
+            _pw_run(
+                "ldexp",
+                2,
+                a,
+                _b_tside(wrapped.t),
+                _none_side(),
+                compute,
+                x_st,
+                _p(),
+                dest,
+            ),
+        )
+        _ = wrapped^
+        return
+    var e = b.copy()
+    if not b.is_t and b.zero_st == ST_INT64:
+        # A CPU 0-d int64 exponent, wrapped on the host.
+        var v = ((b.s.value().i + 2147483648) & 4294967295) - 2147483648
+        e = _b_sside(Scal(Float64(v), v, True, False))
+    _pw_finish(
+        rets,
+        dest,
+        _pw_run("ldexp", 2, a, e, _none_side(), compute, x_st, _p(), dest),
+    )
+
+
+def _pw_ldexp_pow2_legacy(
+    rets: Values, a: Side, b: Side, e_st: Int32, e_rank: Int, dest: Optional[T]
+) raises:
+    """`self * _pow2(self, other)` as one `ldexp_pow2` launch: pow runs in
+    its own result dtype `pdt`, and mul's TensorIterator casts that result
+    to mul's rank-aware common dtype before the product."""
+    var x = a.t.value().copy()
+    # _pow2: pow(2.0, other) for an integral or float32 self (a Python
+    # float base: an integral exponent gives the default dtype), else
+    # full({}, 2.0, self.dtype).pow(other), promoted as a 0-d tensor.
+    var pdt: Int32
+    if _pw_is_float(e_st):
+        pdt = e_st
+        if not (_pw_is_int(x.stype) or x.stype == ST_BOOL) and (
+            x.stype != ST_FLOAT32 and e_rank == 0
+        ):
+            pdt = promote_types(x.stype, e_st)
+    elif _pw_is_int(x.stype) or x.stype == ST_BOOL or x.stype == ST_FLOAT32:
+        pdt = default_dtype()
+    else:
+        pdt = x.stype
+    # mul(self, pow2): the pow result has other's rank.
+    var state = _TypeState(ST_UNDEFINED, ST_UNDEFINED, ST_UNDEFINED)
+    _pw_update(state, a)
+    if e_rank == 0:
+        state.zero = promote_types(state.zero, pdt)
+    else:
+        state.dim = promote_types(state.dim, pdt)
+    var compute = _pw_combine(state.dim, _pw_combine(state.zero, state.wrapped))
+    if not _pw_is_float(compute):
+        unsupported("ldexp on dtype " + String(compute))
+    var kernel_compute = compute
+    var narrow = pdt
+    if pdt != compute and promote_types(pdt, compute) != compute:
+        # A pow result wider than mul's common dtype (a 0-d float64 exponent
+        # against a float32 or half self): the exponent is not narrowed
+        # first, pow runs in pdt, and its result is rounded to the common
+        # dtype before the product. Reading the exponent as the narrower
+        # dtype instead turned 2^15.999 into 2^16 = inf in float16, and
+        # 2^127.999999 into 2^128 = inf in float32.
+        kernel_compute = promote_types(promote_types(pdt, compute), ST_FLOAT32)
+        narrow = compute
+        if kernel_compute == ST_FLOAT64 and not b.is_t:
+            # Metal has no double, so a CPU 0-d float64 exponent's pow runs
+            # on the host, in double, and only its result is rounded to the
+            # common dtype, as stock MPS does (the pow of CPU operands runs
+            # on CPU; exec_binary_kernel in mps/OperationUtils.mm then
+            # converts the 0-d double to float before the mul).
+            var ctx = ctx_for(x.device)
+            var metal = ctx.api() == "metal"
+            _ = ctx
+            if metal:
+                # The host pow returns 1 for 2^+-inf and inf for 2^NaN:
+                # the non-finite exponents take CUDA's values explicitly.
+                var e = b.s.value().f
+                var p2: Float64
+                if e != e or (e - e != 0.0 and e > 0.0):
+                    p2 = e  # NaN, +inf
+                elif e - e != 0.0:
+                    p2 = 0.0  # -inf
+                else:
+                    # The host pow returns 1 for 2^(2^32) too: past +-1100,
+                    # 2^e is inf / 0 in every floating dtype anyway.
+                    p2 = pow(Float64(2.0), min(max(e, -1100.0), 1100.0))
+                var pow2 = _round_to(p2, compute)
+                _pw_finish(
+                    rets,
+                    dest,
+                    _pw_run(
+                        "scale",
+                        1,
+                        a,
+                        _none_side(),
+                        _none_side(),
+                        compute,
+                        compute,
+                        _p(pow2),
+                        dest,
+                    ),
+                )
+                return
+    var params = _p(_pw_narrow_code(narrow, kernel_compute))
+    _pw_finish(
+        rets,
+        dest,
+        _pw_run(
+            "ldexp_pow2",
+            2,
+            a,
+            b,
+            _none_side(),
+            kernel_compute,
+            compute,
+            params,
+            dest,
+        ),
+    )
+
+
+def op_ldexp__legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    """ATen's ldexp_ is ldexp_out(self, self, other): exact in place, since
+    the kernel is elementwise and dense (`_pw_run` writes self directly).
+    Unlike ldexp_out, self is never resized: an `other` that broadcasts it
+    to a larger shape raises."""
+    var self = _pw_inplace_self(args, "ldexp_", 2)
+    var a = _b_tside(self)
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    _b_no_overlap_side(self, b)
+    if not b.is_t and b.zero_st < 0:
+        unsupported("ldexp_ with a Python-number exponent")
+    # An explicit CPU 0-d exponent is a rank-0 tensor of its own dtype.
+    var e_st = b.t.value().stype if b.is_t else b.zero_st
+    var e_rank = b.t.value().rank if b.is_t else 0
+    if not _pw_is_float(self.stype):
+        raise Error(
+            "ldexp can't be cast to the desired output type ", self.stype
+        )
+    var dest = Optional[T](self.copy())
+    if _pw_is_int(e_st) or e_st == ST_BOOL:
+        _pw_ldexp_int_legacy(rets, a, b, self.stype, dest)
+        return
+    _pw_ldexp_pow2_legacy(rets, a, b, e_st, e_rank, dest)
+
+
+# Origin's real pow / rsub-alpha host routing, verbatim: every non-cuda device
+# keeps it (the CUDA-exact routes above are cuda only).
 
 
 def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
@@ -1348,8 +2794,8 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
     var alpha = v_f64(args[unsafe_offset=2])
     if alpha == 1.0:
         return False
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not a.is_t:
         return False
     var common = _pw_result_type(a, b, _none_side(), 2)
@@ -1399,55 +2845,14 @@ def _pw_rsub_alpha(args: Values, rets: Values, out_index: Int) raises -> Bool:
     return True
 
 
-def _pw_rsub_check(args: Values) raises:
-    """BinaryOps.cpp's sub_check and alpha_check (rsub is sub(other, self,
-    alpha)): no bool operand, no bool alpha (it would need a bool result,
-    which sub_check already refused), no floating alpha for an integral
-    result."""
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
-    _b_sub_check(b, a)
-    _b_alpha_check(
-        _pw_result_type(a, b, _none_side(), 2), args[unsafe_offset=2]
-    )
-
-
-# aten::rsub.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor
-# aten::rsub.Scalar(Tensor self, Scalar other, Scalar alpha=1) -> Tensor
-def op_rsub_any(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    _pw_rsub_check(args)
-    if not _pw_rsub_alpha(args, rets, -1):
-        op_rsub(args, n_args, rets, n_rets)
-
-
-# aten::pow.Tensor_Tensor(Tensor self, Tensor exponent) -> Tensor
-def op_pow_tensor_any(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    if _pw_both_int(args):
-        _pw_ipow(args, rets, -1, False)
-    else:
-        op_pow_tensor(args, n_args, rets, n_rets)
-
-
-# aten::pow.Tensor_Tensor_out(Tensor self, Tensor exponent, *, Tensor(a!) out) -> Tensor(a!)
-def op_pow_tensor_out_any(
-    args: Values, n_args: Int, rets: Values, n_rets: Int
-) raises:
-    if _pw_both_int(args):
-        _pw_ipow(args, rets, 2, False)
-    else:
-        op_pow_tensor_out(args, n_args, rets, n_rets)
-
-
 def _pw_pow_f64_scalar(
     args: Values, rets: Values, out_index: Int
 ) raises -> Bool:
     """A float64 tensor to a real scalar power: PowKernel.cu's special
     exponents (products, sqrt, rsqrt, reciprocal) before the full pow, which
     the elementwise family's PowScalarSpec does for the float types only."""
-    var base = _b_side(args[unsafe_offset=0])
-    var expo = _b_side(args[unsafe_offset=1])
+    var base = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var expo = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not base.is_t or expo.is_t:
         return False
     if base.t.value().stype != ST_FLOAT64:
@@ -1479,15 +2884,34 @@ def _pw_int_scalar_pow(args: Values) raises -> Bool:
     """An integral result of pow.Tensor_Scalar: an integer tensor, or a bool
     one (`torch.square(bool_t)` is `pow(bool_t, 2)`, which promotes to int64),
     to a non-bool integer exponent."""
-    var base = _b_side(args[unsafe_offset=0])
-    if not base.is_t or not _pw_int_side(_b_side(args[unsafe_offset=1])):
+    var base = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    if not base.is_t or not _pw_int_side(
+        _b_side(args[unsafe_offset=1], _b_args_device(args))
+    ):
         return False
     var st = base.t.value().stype
     return _pw_is_int(st) or st == ST_BOOL
 
 
-# aten::pow.Tensor_Scalar(Tensor self, Scalar exponent) -> Tensor
-def op_pow_scalar_any(
+def op_pow_tensor_any_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _pw_both_int(args):
+        _pw_ipow(args, rets, -1, False)
+    else:
+        op_pow_tensor(args, n_args, rets, n_rets)
+
+
+def op_pow_tensor_out_any_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    if _pw_both_int(args):
+        _pw_ipow(args, rets, 2, False)
+    else:
+        op_pow_tensor_out(args, n_args, rets, n_rets)
+
+
+def op_pow_scalar_any_legacy(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     if _pw_int_scalar_pow(args):
@@ -1496,14 +2920,33 @@ def op_pow_scalar_any(
         op_pow_scalar(args, n_args, rets, n_rets)
 
 
-# aten::pow.Tensor_Scalar_out(Tensor self, Scalar exponent, *, Tensor(a!) out) -> Tensor(a!)
-def op_pow_scalar_out_any(
+def op_pow_scalar_out_any_legacy(
     args: Values, n_args: Int, rets: Values, n_rets: Int
 ) raises:
     if _pw_int_scalar_pow(args):
         _pw_ipow(args, rets, 2, True)
     elif not _pw_pow_f64_scalar(args, rets, 2):
         op_pow_scalar_out(args, n_args, rets, n_rets)
+
+
+def op_rsub_any_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _pw_rsub_check(args)
+    if not _pw_rsub_alpha(args, rets, -1):
+        op_rsub(args, n_args, rets, n_rets)
+
+
+def op_pow_scalar_base_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _pw_pow_scalar_base(args, rets, -1)
+
+
+def op_pow_scalar_base_out_legacy(
+    args: Values, n_args: Int, rets: Values, n_rets: Int
+) raises:
+    _pw_pow_scalar_base(args, rets, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -1544,9 +2987,12 @@ def _pw_act(
     dtype, operand a = args[a_index], b = args[b_index]. The result is in
     the compute dtype, or in `out_st` when given (a TensorIterator whose
     output is allocated from one input's options)."""
-    var a = _b_side(args[unsafe_offset=a_index])
+    var a = _b_side(args[unsafe_offset=a_index], _b_args_device(args))
     var arity = 1 if b_index < 0 else 2
-    var b = _b_side(args[unsafe_offset=b_index]) if arity == 2 else _none_side()
+    var b = (
+        _b_side(args[unsafe_offset=b_index], _b_args_device(args)) if arity
+        == 2 else _none_side()
+    )
     var common = _pw_result_type(a, b, _none_side(), arity)
     var compute = _pw_compute_dtype(kind, common, policy, f64_ok)
     var dest = Optional[T]()
@@ -1666,8 +3112,8 @@ def _shrink_backward_p(args: Values) raises -> SIMD[DType.float64, 4]:
     (grad, self) dtype, not self's (float16 self 0.3 is 0.30005, outside a
     float32 lambd of 0.3; a float16 lambd would round to 0.30005 too)."""
     var common = _pw_result_type(
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         2,
     )
@@ -2653,8 +4099,12 @@ def op_log_sigmoid_forward_output(
 def _log_sigmoid_backward_check(args: Values) raises:
     """ATen builds log_sigmoid_backward's iterator with the default
     check_all_same_dtype: grad_output must have self's dtype, no promotion."""
-    var grad = _pw_side_stype(_b_side(args[unsafe_offset=0]))
-    var self = _pw_side_stype(_b_side(args[unsafe_offset=1]))
+    var grad = _pw_side_stype(
+        _b_side(args[unsafe_offset=0], _b_args_device(args))
+    )
+    var self = _pw_side_stype(
+        _b_side(args[unsafe_offset=1], _b_args_device(args))
+    )
     if grad != self:
         raise Error(
             "Found dtype ", dtype_name(grad), " but expected ", dtype_name(self)
@@ -2886,14 +4336,15 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
     (torch MPS registers no ldexp_stub and multiplies by pow(2, other) for an
     integral exponent too, which under- and overflows where ::ldexp does
     not: Apple GPUs keep the exact route.)"""
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
-    if not a.is_t:
-        unsupported("ldexp with a scalar self")
-    if not b.is_t and b.zero_st < 0:
-        unsupported("ldexp with a Python-number exponent")
-    var x = a.t.value().copy()
-    # An explicit CPU 0-d exponent is a rank-0 tensor of its own dtype.
+    if not _pw_cuda_args(args):
+        _pw_ldexp_legacy(args, rets, out_index)
+        return
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    if not a.is_t and a.zero_st < 0 or not b.is_t and b.zero_st < 0:
+        unsupported("ldexp with a Python-number operand")
+    # An explicit CPU 0-d operand is a rank-0 tensor of its own dtype.
+    var x_st = _pw_side_stype(a)
     var e_st = b.t.value().stype if b.is_t else b.zero_st
     var e_rank = b.t.value().rank if b.is_t else 0
     var dest = Optional[T]()
@@ -2905,13 +4356,17 @@ def _pw_ldexp(args: Values, rets: Values, out_index: Int) raises:
                 "ldexp can't be cast to the desired output type ",
                 scalar_type_name(d.dtype),
             )
-    var e_integral = _pw_is_int(e_st) or e_st == ST_BOOL
+    var e_integral = (
+        _pw_is_int(e_st) or e_st == ST_BOOL or is_wide_unsigned(e_st)
+    )
     if (
         e_integral
-        and _pw_is_float(x.stype)
-        and (not dest or dest.value().stype == x.stype)
+        and _pw_is_float(x_st)
+        # the CPU scalar refusal is CUDA's iterator; elsewhere pow(2, e) as before
+        and ((a.is_t and b.is_t) or _b_exact_sides(a, b))
     ):
-        _pw_ldexp_int(rets, a, b, x.stype, dest)
+        # Any floating out: the kernel runs in self's dtype, cast on store.
+        _pw_ldexp_int(rets, a, b, x_st, dest)
         return
     _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
 
@@ -2924,8 +4379,15 @@ def _pw_ldexp_int(
     conversion does (2**32 is 0); the kernel then reads it in the float
     compute dtype. bfloat16 computes in float32: its 8-bit mantissa cannot
     carry every exponent that still changes the result."""
+    if not a.is_t or not b.is_t:
+        # Its TensorIterator takes no CPU scalars.
+        raise Error(
+            "Expected all tensors to be on the same device, but found at"
+            " least two devices, mojo and cpu!"
+        )
     var compute = ST_FLOAT32 if x_st == ST_BFLOAT16 else x_st
-    if b.is_t and b.t.value().stype == ST_INT64:
+    var e_st = b.t.value().stype
+    if e_st == ST_INT64 or is_wide_unsigned(e_st):
         var wrapped = own_if_new(cast_to(b.t.value(), ST_INT32), b.t.value())
         _pw_finish(
             rets,
@@ -2944,15 +4406,10 @@ def _pw_ldexp_int(
         )
         _ = wrapped^
         return
-    var e = b.copy()
-    if not b.is_t and b.zero_st == ST_INT64:
-        # A CPU 0-d int64 exponent, wrapped on the host.
-        var v = ((b.s.value().i + 2147483648) & 4294967295) - 2147483648
-        e = _b_sside(Scal(Float64(v), v, True, False))
     _pw_finish(
         rets,
         dest,
-        _pw_run("ldexp", 2, a, e, _none_side(), compute, x_st, _p(), dest),
+        _pw_run("ldexp", 2, a, b, _none_side(), compute, x_st, _p(), dest),
     )
 
 
@@ -2962,21 +4419,27 @@ def _pw_ldexp_pow2(
     """`self * _pow2(self, other)` as one `ldexp_pow2` launch: pow runs in
     its own result dtype `pdt`, and mul's TensorIterator casts that result
     to mul's rank-aware common dtype before the product."""
-    var x = a.t.value().copy()
+    var x_st = _pw_side_stype(a)
+    var device = b.t.value().device if b.is_t else a.t.value().device
     # _pow2: pow(2.0, other) for an integral or float32 self (a Python
     # float base: an integral exponent gives the default dtype), else
     # full({}, 2.0, self.dtype).pow(other), promoted as a 0-d tensor.
     var pdt: Int32
     if _pw_is_float(e_st):
         pdt = e_st
-        if not (_pw_is_int(x.stype) or x.stype == ST_BOOL) and (
-            x.stype != ST_FLOAT32 and e_rank == 0
-        ):
-            pdt = promote_types(x.stype, e_st)
-    elif _pw_is_int(x.stype) or x.stype == ST_BOOL or x.stype == ST_FLOAT32:
+        if not (
+            _pw_is_int(x_st) or x_st == ST_BOOL or is_wide_unsigned(x_st)
+        ) and (x_st != ST_FLOAT32 and e_rank == 0):
+            pdt = promote_types(x_st, e_st)
+    elif (
+        _pw_is_int(x_st)
+        or x_st == ST_BOOL
+        or is_wide_unsigned(x_st)
+        or x_st == ST_FLOAT32
+    ):
         pdt = default_dtype()
     else:
-        pdt = x.stype
+        pdt = x_st
     # mul(self, pow2): the pow result has other's rank.
     var state = _TypeState(ST_UNDEFINED, ST_UNDEFINED, ST_UNDEFINED)
     _pw_update(state, a)
@@ -2988,6 +4451,10 @@ def _pw_ldexp_pow2(
     if not _pw_is_float(compute):
         unsupported("ldexp on dtype " + String(compute))
     var kernel_compute = compute
+    if not a.is_t and (compute == ST_FLOAT16 or compute == ST_BFLOAT16):
+        # mul's CPU-scalar operand is read in opmath (float), not rounded
+        # to the half type first
+        kernel_compute = ST_FLOAT32
     var narrow = pdt
     if pdt != compute and promote_types(pdt, compute) != compute:
         # A pow result wider than mul's common dtype (a 0-d float64 exponent
@@ -3004,7 +4471,7 @@ def _pw_ldexp_pow2(
             # common dtype, as stock MPS does (the pow of CPU operands runs
             # on CPU; exec_binary_kernel in mps/OperationUtils.mm then
             # converts the 0-d double to float before the mul).
-            var ctx = ctx_for(x.device)
+            var ctx = ctx_for(device)
             var metal = ctx.api() == "metal"
             _ = ctx
             if metal:
@@ -3037,7 +4504,18 @@ def _pw_ldexp_pow2(
                     ),
                 )
                 return
-    var params = _p(_pw_narrow_code(narrow, kernel_compute))
+    # full({}, 2.0, self.dtype).pow(CPU scalar exponent): the scalar kernel
+    var scalar_pow = (
+        not b.is_t
+        and e_rank == 0
+        and (
+            not (_pw_is_int(x_st) or x_st == ST_BOOL or is_wide_unsigned(x_st))
+            and x_st != ST_FLOAT32
+        )
+    )
+    var params = _p(
+        _pw_narrow_code(narrow, kernel_compute), 1.0 if scalar_pow else 0.0
+    )
     _pw_finish(
         rets,
         dest,
@@ -3071,9 +4549,12 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     the kernel is elementwise and dense (`_pw_run` writes self directly).
     Unlike ldexp_out, self is never resized: an `other` that broadcasts it
     to a larger shape raises."""
+    if not _pw_cuda_args(args):
+        op_ldexp__legacy(args, n_args, rets, n_rets)
+        return
     var self = _pw_inplace_self(args, "ldexp_", 2)
     var a = _b_tside(self)
-    var b = _b_side(args[unsafe_offset=1])
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     _b_no_overlap_side(self, b)
     if not b.is_t and b.zero_st < 0:
         unsupported("ldexp_ with a Python-number exponent")
@@ -3085,7 +4566,9 @@ def op_ldexp_(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
             "ldexp can't be cast to the desired output type ", self.stype
         )
     var dest = Optional[T](self.copy())
-    if _pw_is_int(e_st) or e_st == ST_BOOL:
+    if (_pw_is_int(e_st) or e_st == ST_BOOL or is_wide_unsigned(e_st)) and (
+        b.is_t or _b_exact_sides(a, b)
+    ):
         _pw_ldexp_int(rets, a, b, self.stype, dest)
         return
     _pw_ldexp_pow2(rets, a, b, e_st, e_rank, dest)
@@ -3312,8 +4795,8 @@ def op_mse_loss(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     _loss_forward(
         "mse",
         2,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
         _p(),
@@ -3329,8 +4812,8 @@ def op_mse_loss_out(
     _loss_forward(
         "mse",
         2,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
         _p(),
@@ -3340,13 +4823,13 @@ def op_mse_loss_out(
 
 
 def _mse_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
-    var input = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var reduction = _loss_reduction(args[unsafe_offset=3])
     _loss_backward(
         "mse_backward",
-        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
         input,
-        _b_side(args[unsafe_offset=2]),
+        _b_side(args[unsafe_offset=2], _b_args_device(args)),
         _loss_norm(input, reduction, 2.0),
         0.0,
         out_v,
@@ -3375,8 +4858,8 @@ def _smooth_l1(args: Values, rets: Values, out_v: Optional[Value]) raises:
     _loss_forward(
         "smooth_l1",
         2,
-        _b_side(args[unsafe_offset=0]),
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
         _p(beta),
@@ -3403,13 +4886,13 @@ def op_smooth_l1_loss_out(
 def _smooth_l1_backward(
     args: Values, rets: Values, out_v: Optional[Value]
 ) raises:
-    var input = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var reduction = _loss_reduction(args[unsafe_offset=3])
     _loss_backward(
         "smooth_l1_backward",
-        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
         input,
-        _b_side(args[unsafe_offset=2]),
+        _b_side(args[unsafe_offset=2], _b_args_device(args)),
         _loss_norm(input, reduction, 1.0),
         v_f64(args[unsafe_offset=4]),
         out_v,
@@ -3437,7 +4920,7 @@ def _huber(args: Values, rets: Values, out_v: Optional[Value]) raises:
         raise Error(
             "huber_loss does not support non-positive values for delta."
         )
-    var a = _b_side(args[unsafe_offset=0])
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
     if not a.is_t:
         unsupported("huber with a scalar operand")
     # ATen's huber_loss allocates `empty_like(input)`: the loss is in the
@@ -3446,7 +4929,7 @@ def _huber(args: Values, rets: Values, out_v: Optional[Value]) raises:
         "huber",
         2,
         a,
-        _b_side(args[unsafe_offset=1]),
+        _b_side(args[unsafe_offset=1], _b_args_device(args)),
         _none_side(),
         _loss_reduction(args[unsafe_offset=2]),
         _p(delta),
@@ -3470,13 +4953,13 @@ def op_huber_loss_out(
 
 
 def _huber_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
-    var input = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var reduction = _loss_reduction(args[unsafe_offset=3])
     _loss_backward(
         "huber_backward",
-        _b_side(args[unsafe_offset=0]),
+        _b_side(args[unsafe_offset=0], _b_args_device(args)),
         input,
-        _b_side(args[unsafe_offset=2]),
+        _b_side(args[unsafe_offset=2], _b_args_device(args)),
         _loss_norm(input, reduction, 1.0),
         v_f64(args[unsafe_offset=4]),
         out_v,
@@ -3594,8 +5077,8 @@ def _bce(args: Values, rets: Values, out_v: Optional[Value]) raises:
     the loss in it (`loss.mul_(weight)` keeps it: a float32 weight on
     float16 inputs is a float16 loss), the weight never growing its shape."""
     var weight = _opt_weight(args[unsafe_offset=2])
-    var input = _b_side(args[unsafe_offset=0])
-    var raw_target = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var raw_target = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not input.is_t or not raw_target.is_t:
         unsupported("binary_cross_entropy with a scalar operand")
     _loss_same_dtype(input, raw_target)
@@ -3677,9 +5160,9 @@ def _bce_backward(args: Values, rets: Values, out_v: Optional[Value]) raises:
     """Loss.cu binary_cross_entropy_backward_out_cuda: the gradient kernel,
     then `mul_(weight)` and the mean's `div_(numel)` -- folded into the
     gradient kernel when there is no weight, a second kind when there is."""
-    var grad = _b_side(args[unsafe_offset=0])
-    var input = _b_side(args[unsafe_offset=1])
-    var raw_target = _b_side(args[unsafe_offset=2])
+    var grad = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var input = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    var raw_target = _b_side(args[unsafe_offset=2], _b_args_device(args))
     var weight = _opt_weight(args[unsafe_offset=3])
     var reduction = _loss_reduction(args[unsafe_offset=4])
     if not grad.is_t or not input.is_t or not raw_target.is_t:
@@ -3786,8 +5269,8 @@ def _bce_logits(args: Values, rets: Values, out_v: Optional[Value]) raises:
     its own derivatives.yaml formula."""
     var weight = _opt_weight(args[unsafe_offset=2])
     var pos_weight = _opt_weight(args[unsafe_offset=3])
-    var input = _b_side(args[unsafe_offset=0])
-    var target = _b_side(args[unsafe_offset=1])
+    var input = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var target = _b_side(args[unsafe_offset=1], _b_args_device(args))
     if not input.is_t or not target.is_t:
         unsupported("binary_cross_entropy_with_logits with a scalar operand")
     var c = _b_tside(pos_weight.value()) if pos_weight else _b_sside(
@@ -3856,9 +5339,13 @@ def op_binary_cross_entropy_with_logits_out(
 def _pw_same_dtypes(args: Values, n: Int) raises -> Int32:
     """TensorIterator's `check_all_same_dtype` over args[0 .. n): the
     common dtype, or CPU torch's "Found dtype X but expected Y"."""
-    var first = _pw_side_stype(_b_side(args[unsafe_offset=0]))
+    var first = _pw_side_stype(
+        _b_side(args[unsafe_offset=0], _b_args_device(args))
+    )
     for i in range(1, n):
-        var st = _pw_side_stype(_b_side(args[unsafe_offset=i]))
+        var st = _pw_side_stype(
+            _b_side(args[unsafe_offset=i], _b_args_device(args))
+        )
         if st != first:
             raise Error(
                 "Found dtype ",
@@ -3894,12 +5381,14 @@ def _pw_fixed(
 ) raises -> Res:
     """`kind` over args[first .. first + arity), all of dtype `st`, into a
     fresh tensor of their broadcast shape."""
-    var a = _b_side(args[unsafe_offset=first])
+    var a = _b_side(args[unsafe_offset=first], _b_args_device(args))
     var b = (
-        _b_side(args[unsafe_offset=first + 1]) if arity >= 2 else _none_side()
+        _b_side(args[unsafe_offset=first + 1], _b_args_device(args)) if arity
+        >= 2 else _none_side()
     )
     var c = (
-        _b_side(args[unsafe_offset=first + 2]) if arity >= 3 else _none_side()
+        _b_side(args[unsafe_offset=first + 2], _b_args_device(args)) if arity
+        >= 3 else _none_side()
     )
     return _pw_run(kind, arity, a, b, c, st, st, params, None)
 
@@ -3922,9 +5411,9 @@ def op_prelu_kernel_backward(
     the weight's shape afterwards)."""
     var st = _pw_same_dtypes(args, 3)
     _pw_floating_dispatch("prelu_backward_cuda", st, True)
-    var g = _b_side(args[unsafe_offset=0])
-    var x = _b_side(args[unsafe_offset=1])
-    var w = _b_side(args[unsafe_offset=2])
+    var g = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var x = _b_side(args[unsafe_offset=1], _b_args_device(args))
+    var w = _b_side(args[unsafe_offset=2], _b_args_device(args))
     var gi = _pw_run("prelu_backward_input", 3, x, w, g, st, st, _p(), None)
     var gw = _pw_run("prelu_backward_weight", 3, x, w, g, st, st, _p(), None)
     ret_tensor(rets, 0, gi.t)
@@ -3991,8 +5480,8 @@ def _add_relu(args: Values, rets: Values, out_index: Int, inplace: Bool) raises:
     if inplace:
         a = _b_tside(_pw_inplace_self(args, "_add_relu_", 2))
     else:
-        a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+        a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var c = _none_side()
     var common = _pw_result_type(a, b, c, 2)
     _add_relu_check(_pw_side_stype(a), common)
@@ -4049,9 +5538,139 @@ def _f32_bits_param(v: Float64) -> Float64:
 # CompositeImplicitAutograd upstream (eq, isnan, sub, mul, abs, add, le,
 # isfinite, and/or: about six kernels on CUDA); its bool output is not
 # differentiable, so one kernel here loses no gradient.
+def _pw_call1(
+    op: String, overload: String, var args: List[Value]
+) raises -> Owned:
+    var r = call_op(op, overload, args^, 1)
+    return own(r.take_tensor(0))
+
+
+def _pw_isclose_composite(args: Values, rets: Values) raises:
+    """isclose (TensorCompare.cpp) op by op through the dispatcher, for the
+    dtypes the fused kernel lacks (complex, uint16 / uint32 / uint64)."""
+    var av = args[unsafe_offset=0].copy()
+    var bv = args[unsafe_offset=1].copy()
+    var st = v_tensor_c(av).stype
+    var other_st = v_tensor_c(bv).stype
+    if st != other_st:
+        raise Error(
+            scalar_type_name(st), " did not match ", scalar_type_name(other_st)
+        )
+    var rtol = v_f64(args[unsafe_offset=2])
+    var atol = v_f64(args[unsafe_offset=3])
+    var equal_nan = v_bool(args[unsafe_offset=4])
+    if not (rtol >= 0):
+        raise Error(
+            "rtol must be greater than or equal to zero, but got ", rtol
+        )
+    if not (atol >= 0):
+        raise Error(
+            "atol must be greater than or equal to zero, but got ", atol
+        )
+    var eq0 = _pw_call1("aten::eq", "Tensor", [av.copy(), bv.copy()])
+    var nan_close = Optional[Owned]()
+    if equal_nan and is_complex_stype(st):
+        var na = _pw_call1("aten::isnan", "", [av.copy()])
+        var nb = _pw_call1("aten::isnan", "", [bv.copy()])
+        var both = _pw_call1(
+            "aten::logical_and", "", [tensor_arg(na.t), tensor_arg(nb.t)]
+        )
+        nan_close = _pw_call1(
+            "aten::logical_or", "", [tensor_arg(eq0.t), tensor_arg(both.t)]
+        )
+        _ = na^  # alive past the calls: the argument records only borrow
+        _ = nb^
+        _ = both^
+    var close_v = tensor_arg(nan_close.value().t) if nan_close else tensor_arg(
+        eq0.t
+    )
+    if rtol == 0 and atol == 0:
+        if nan_close:
+            var only = nan_close.take()
+            ret_owned(rets, 0, only)
+            _ = eq0^
+        else:
+            ret_owned(rets, 0, eq0)
+        return
+    var other = Optional[Owned]()
+    var other_v = bv.copy()
+    var selfc = Optional[Owned]()
+    var self_v = av.copy()
+    if not is_complex_stype(st):
+        # an integral tensor: both sides to the default dtype first
+        for k in range(2):
+            var cv = List[Value]()
+            cv.append(bv.copy() if k == 0 else av.copy())
+            cv.append(Value(TAG_DTYPE, 0, Int64(default_dtype()), 0))
+            for _ in range(3):  # layout, device, pin_memory
+                cv.append(Value(TAG_NONE, 0, 0, 0))
+            cv.append(Value(TAG_BOOL, 0, 0, 0))  # non_blocking
+            cv.append(Value(TAG_NONE, 0, 0, 0))  # memory_format
+            if k == 0:
+                other = _pw_call1("aten::_to_copy", "", cv^)
+                other_v = tensor_arg(other.value().t)
+            else:
+                selfc = _pw_call1("aten::_to_copy", "", cv^)
+                self_v = tensor_arg(selfc.value().t)
+    var scaled = _pw_call1(
+        "aten::mul",
+        "Scalar",
+        [other_v.copy(), Value(TAG_SCALAR_DOUBLE, 0, f64_bits(rtol), 0)],
+    )
+    var mag = _pw_call1("aten::abs", "", [tensor_arg(scaled.t)])
+    var allowed = _pw_call1(
+        "aten::add",
+        "Scalar",
+        [
+            tensor_arg(mag.t),
+            Value(TAG_SCALAR_DOUBLE, 0, f64_bits(atol), 0),
+            Value(TAG_SCALAR_INT, 0, 1, 0),
+        ],
+    )
+    var diff = _pw_call1(
+        "aten::sub",
+        "Tensor",
+        [self_v.copy(), other_v.copy(), Value(TAG_SCALAR_INT, 0, 1, 0)],
+    )
+    var actual = _pw_call1("aten::abs", "", [tensor_arg(diff.t)])
+    var fin = _pw_call1("aten::isfinite", "", [tensor_arg(actual.t)])
+    var within = _pw_call1(
+        "aten::le", "Tensor", [tensor_arg(actual.t), tensor_arg(allowed.t)]
+    )
+    var ok = _pw_call1(
+        "aten::logical_and", "", [tensor_arg(fin.t), tensor_arg(within.t)]
+    )
+    var res = _pw_call1(
+        "aten::logical_or", "", [close_v.copy(), tensor_arg(ok.t)]
+    )
+    _ = scaled^  # alive past the calls: the argument records only borrow
+    _ = mag^
+    _ = allowed^
+    _ = diff^
+    _ = actual^
+    _ = fin^
+    _ = within^
+    _ = ok^
+    _ = eq0^
+    _ = nan_close^
+    ret_owned(rets, 0, res)
+    _ = other^
+    _ = selfc^
+
+
 def op_isclose(args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
-    var a = _b_side(args[unsafe_offset=0])
-    var b = _b_side(args[unsafe_offset=1])
+    var at = v_tensor_c(args[unsafe_offset=0])
+    var bt = v_tensor_c(args[unsafe_offset=1])
+    if (
+        at.is_complex()
+        or bt.is_complex()
+        or is_wide_unsigned(at.stype)
+        or is_wide_unsigned(bt.stype)
+    ):
+        _pw_isclose_composite(args, rets)
+        return
+    var a = _b_side(args[unsafe_offset=0], _b_args_device(args))
+    var b = _b_side(args[unsafe_offset=1], _b_args_device(args))
     var st = _pw_side_stype(a)
     var other_st = _pw_side_stype(b)
     if st != other_st:
@@ -4371,6 +5990,66 @@ def register_pointwise(site: Site) raises:
         "__rshift__.Tensor",
     ](site)
     impl[
+        routed[
+            f8_iter[
+                op_addcdiv, "addcdiv_cuda", 7, -1, MODE_FN, False, PRE_NONE
+            ],
+            cx_addcdiv,
+            3,
+        ],
+        "addcdiv",
+    ](site)
+    impl[
+        routed[
+            f8_iter[
+                op_addcdiv_, "addcdiv_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
+            ],
+            cx_addcdiv_,
+            3,
+        ],
+        "addcdiv_",
+    ](site)
+    impl[
+        routed[
+            f8_iter[
+                op_addcdiv_out, "addcdiv_cuda", 7, 4, MODE_CAST, False, PRE_NONE
+            ],
+            cx_addcdiv_out,
+            3,
+        ],
+        "addcdiv.out",
+    ](site)
+    impl[
+        routed[
+            f8_iter[
+                op_addcmul, "addcmul_cuda", 7, -1, MODE_FN, False, PRE_NONE
+            ],
+            cx_addcmul,
+            3,
+        ],
+        "addcmul",
+    ](site)
+    impl[
+        routed[
+            f8_iter[
+                op_addcmul_, "addcmul_cuda", 7, 0, MODE_INPLACE, False, PRE_NONE
+            ],
+            cx_addcmul_,
+            3,
+        ],
+        "addcmul_",
+    ](site)
+    impl[
+        routed[
+            f8_iter[
+                op_addcmul_out, "addcmul_cuda", 7, 4, MODE_CAST, False, PRE_NONE
+            ],
+            cx_addcmul_out,
+            3,
+        ],
+        "addcmul.out",
+    ](site)
+    impl[
         f8_iter[op_atan2, "atan2_cuda", 3, -1, MODE_FN, False, PRE_NONE],
         "atan2",
     ](site)
@@ -4509,7 +6188,16 @@ def register_pointwise(site: Site) raises:
         "gcd",
     ](site)
     impl[
-        f8_iter[op_gcd_out, "gcd_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            op_gcd_out,
+            "gcd_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+            cast_first=True,
+        ],
         "gcd.out",
     ](site)
     impl[op_binary_cross_entropy, "binary_cross_entropy"](site)
@@ -4558,15 +6246,31 @@ def register_pointwise(site: Site) raises:
     impl[op_huber_loss_backward, "huber_loss_backward"](site)
     impl[op_huber_loss_backward_out, "huber_loss_backward.out"](site)
     impl[
-        f8_iter[op_ldexp, "pow_cuda", 3, -1, MODE_FN, False, PRE_LDEXP],
+        routed[
+            f8_iter[op_ldexp, "pow_cuda", 3, -1, MODE_FN, False, PRE_LDEXP],
+            cx_ldexp,
+            2,
+        ],
         "ldexp.Tensor",
     ](site)
     impl[
-        f8_iter[op_ldexp_out, "pow_cuda", 3, 2, MODE_CAST, False, PRE_LDEXP],
+        routed[
+            f8_iter[
+                op_ldexp_out, "pow_cuda", 3, 2, MODE_CAST, False, PRE_LDEXP
+            ],
+            cx_ldexp_out,
+            2,
+        ],
         "ldexp.out",
     ](site)
     impl[
-        f8_iter[op_ldexp_, "pow_cuda", 3, 0, MODE_INPLACE, False, PRE_LDEXP],
+        routed[
+            f8_iter[
+                op_ldexp_, "pow_cuda", 3, 0, MODE_INPLACE, False, PRE_LDEXP
+            ],
+            cx_ldexp_,
+            2,
+        ],
         "ldexp_",
     ](site)
     impl[op_mse_loss, "mse_loss"](site)
@@ -4833,7 +6537,16 @@ def register_pointwise(site: Site) raises:
         "lcm",
     ](site)
     impl[
-        f8_iter[op_lcm_out, "lcm_cuda", 3, 2, MODE_CAST, False, PRE_NONE],
+        f8_iter[
+            op_lcm_out,
+            "lcm_cuda",
+            3,
+            2,
+            MODE_CAST,
+            False,
+            PRE_NONE,
+            cast_first=True,
+        ],
         "lcm.out",
     ](site)
     impl[
@@ -4891,42 +6604,70 @@ def register_pointwise(site: Site) raises:
         "leaky_relu_backward.grad_input",
     ](site)
     impl[
-        f8_iter[
-            op_lerp_scalar_any, "lerp_cuda", 3, -1, MODE_FN, False, PRE_LERP
+        routed[
+            f8_iter[
+                op_lerp_scalar_any, "lerp_cuda", 3, -1, MODE_FN, False, PRE_LERP
+            ],
+            cx_lerp_scalar,
+            2,
         ],
         "lerp.Scalar",
     ](site)
     impl[
-        f8_iter[
-            op_lerp_scalar_out_any,
-            "lerp_cuda",
-            3,
-            3,
-            MODE_CAST,
-            False,
-            PRE_LERP,
+        routed[
+            f8_iter[
+                op_lerp_scalar_out_any,
+                "lerp_cuda",
+                3,
+                3,
+                MODE_CAST,
+                False,
+                PRE_LERP,
+            ],
+            cx_lerp_scalar_out,
+            2,
         ],
         "lerp.Scalar_out",
     ](site)
     impl[
-        f8_iter[
-            op_lerp_scalar__any,
-            "lerp_cuda",
-            3,
-            0,
-            MODE_INPLACE,
-            False,
-            PRE_LERP,
+        routed[
+            f8_iter[
+                op_lerp_scalar__any,
+                "lerp_cuda",
+                3,
+                0,
+                MODE_INPLACE,
+                False,
+                PRE_LERP,
+            ],
+            cx_lerp_scalar_,
+            2,
         ],
         "lerp_.Scalar",
     ](site)
     impl[
-        f8_iter[op_lerp_tensor, "lerp_cuda", 7, -1, MODE_FN, False, PRE_LERP],
+        routed[
+            f8_iter[
+                op_lerp_tensor, "lerp_cuda", 7, -1, MODE_FN, False, PRE_LERP
+            ],
+            cx_lerp_tensor,
+            3,
+        ],
         "lerp.Tensor",
     ](site)
     impl[
-        f8_iter[
-            op_lerp_tensor_out, "lerp_cuda", 7, 3, MODE_SAME, False, PRE_LERP
+        routed[
+            f8_iter[
+                op_lerp_tensor_out,
+                "lerp_cuda",
+                7,
+                3,
+                MODE_SAME,
+                False,
+                PRE_LERP,
+            ],
+            cx_lerp_tensor_out,
+            3,
         ],
         "lerp.Tensor_out",
     ](site)
@@ -4979,20 +6720,29 @@ def register_pointwise(site: Site) raises:
         "log_sigmoid_forward.output",
     ](site)
     impl[
-        f8_iter[
-            op_logaddexp, "logaddexp_cuda", 3, -1, MODE_FN, False, PRE_NONE
+        routed[
+            f8_iter[
+                op_logaddexp, "logaddexp_cuda", 3, -1, MODE_FN, False, PRE_NONE
+            ],
+            cx_logaddexp,
+            2,
         ],
         "logaddexp",
     ](site)
     impl[
-        f8_iter[
-            op_logaddexp_out,
-            "logaddexp_cuda",
-            3,
+        routed[
+            f8_iter[
+                op_logaddexp_out,
+                "logaddexp_cuda",
+                3,
+                2,
+                MODE_OUTDT,
+                False,
+                PRE_NONE,
+                convert_to_out=True,
+            ],
+            cx_logaddexp_out,
             2,
-            MODE_OUTDT,
-            False,
-            PRE_NONE,
         ],
         "logaddexp.out",
     ](site)
@@ -5011,6 +6761,7 @@ def register_pointwise(site: Site) raises:
             MODE_OUTDT,
             False,
             PRE_NONE,
+            convert_to_out=True,
         ],
         "logaddexp2.out",
     ](site)

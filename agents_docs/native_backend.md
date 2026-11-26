@@ -323,7 +323,9 @@ allocations until exit; pinned staging is retained unless completion is known.
 `.to` borrows contiguous, unchanged-dtype sources, otherwise packs/casts on
 the source, then restores destination memory format. `copy_` packs and moves
 before casting or copying into destination strides. Dtype pairs outside the
-fast cast kernel use CPU torch to preserve exact integer conversions.
+fast cast kernel use CPU torch to preserve exact integer conversions; on
+NVIDIA the kernel also converts uint16 / uint32 / uint64 against every dtype,
+with the cvt.rzi rules nvcc gives CUDA's copy kernel.
 
 `TORCH_MOJO_BACKEND_TEST_PEER_COPY` and `TORCH_MOJO_BACKEND_TEST_PEER_GATE_FD`
 are test-only hooks cached at initialization; unset leaves no-op checks.
@@ -375,9 +377,10 @@ One exception follows stock CUDA rather than c10: torch >= 2.12 on CUDA 13
 converts float / half / bfloat16 to e4m3fn on sm_89+ with the saturating
 intrinsic (Copy.cu, #177870), so a device-side copy of that kind (CastSpec,
 `.to()`, non-blocking transfers, `where`'s `.to(result_type)`) clamps an
-overflow to +-448 on those GPUs. Blocking host <-> device transfers convert
-on the CPU and type promotions (comparison operands) never saturate, as in
-stock torch.
+overflow to +-448 on those GPUs when the installed torch is 2.12 or newer
+(`tmb_torch_version`, from the shim's build); older torch converts like c10.
+Blocking host <-> device transfers convert on the CPU and type promotions
+(comparison operands) never saturate, as in stock torch.
 
 `torch._scaled_mm`, `_scaled_mm_v2` and the rowwise `_scaled_grouped_mm[_v2]`
 are `tmb/ops/scaled_mm.mojo`: dequantize to float32 (`scaled_mm` family,
@@ -597,8 +600,8 @@ the same `torch.rand` / `randn` / `randint` / `bernoulli` / dropout values on
 the mojo device (NVIDIA; on AMD and Apple the float transforms fall back to
 std.math and only the integer draws are bit-exact) and on a CUDA device of
 the same model, and
-`tests/native/test_random_parity.py` holds it to that against recorded CUDA
-digests (`rng_golden.json`, refreshed with `rng_parity_dump.py`). Not covered:
+`tests/native/test_random_parity.py` holds it to that against stock CUDA on the
+same GPU, live (`cuda_oracle.md`). Not covered:
 `multinomial`, `randperm`, `poisson`, `rrelu_with_noise` (unregistered).
 
 ## Distributed

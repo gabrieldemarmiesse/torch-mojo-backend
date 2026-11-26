@@ -37,6 +37,7 @@ from std.math import fma
 from std.math import log as _std_log
 from std.math import log1p as _std_log1p
 from std.math import sin as _std_sin
+from std.math import sqrt as _std_sqrt
 from std.math import tan as _std_tan
 from std.sys import llvm_intrinsic
 from std.sys._assembly import inlined_assembly
@@ -250,6 +251,49 @@ def _add_rn_d(a: Float64, b: Float64) -> Float64:
         ](a, b)
     else:
         return a + b
+
+
+@always_inline
+def _sub_rn_d(a: Float64, b: Float64) -> Float64:
+    """sub.rn.f64, unfusable (see `_add_rn_d`)."""
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "sub.rn.f64 $0, $1, $2;",
+            Float64,
+            constraints="=d,d,d",
+            has_side_effect=False,
+        ](a, b)
+    elif is_amd_gpu():
+        return inlined_assembly[
+            "v_add_f64 $0, $1, -$2",
+            Float64,
+            constraints="=v,v,v",
+            has_side_effect=False,
+        ](a, b)
+    else:
+        return a - b
+
+
+@always_inline
+def _mul_rn_d(a: Float64, b: Float64) -> Float64:
+    """mul.rn.f64: a product neither LLVM nor ptxas may fuse into the add
+    that consumes it (Mojo's GPU code is contractible down to ptxas)."""
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "mul.rn.f64 $0, $1, $2;",
+            Float64,
+            constraints="=d,d,d",
+            has_side_effect=False,
+        ](a, b)
+    elif is_amd_gpu():
+        return inlined_assembly[
+            "v_mul_f64 $0, $1, $2",
+            Float64,
+            constraints="=v,v,v",
+            has_side_effect=False,
+        ](a, b)
+    else:
+        return a * b
 
 
 @always_inline
@@ -893,7 +937,9 @@ def _trig_reduction_slowpath_d(
 
     var nz = count_leading_zeros(hi2).cast[DType.uint32]()
     var hi3 = hi2
-    if nz != UInt32(0) and nz != UInt32(64):
+    if nz == UInt32(64):  # PTX clamps the shift: hi2 << 64 | lo2 >> 0
+        hi3 = lo2
+    elif nz != UInt32(0):
         hi3 = (hi2 << _z64(nz)) | (lo2 >> _z64(UInt32(64) - nz))
 
     var prod2 = _z128(hi3) * _z128(UInt64(0xC90FDAA22168C235))
@@ -1137,12 +1183,15 @@ def _rsqrt_approx_ftz_f(x: Float32) -> Float32:
 
 @always_inline
 def _rsqrt_approx_ftz_d(x: Float64) -> Float64:
-    return inlined_assembly[
-        "rsqrt.approx.ftz.f64 $0, $1;",
-        Float64,
-        constraints="=d,d",
-        has_side_effect=False,
-    ](x)
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "rsqrt.approx.ftz.f64 $0, $1;",
+            Float64,
+            constraints="=d,d",
+            has_side_effect=False,
+        ](x)
+    else:
+        return Float64(1.0) / _std_sqrt(x)
 
 
 @always_inline
@@ -1196,3 +1245,836 @@ def nv_asinh(a: Float64) -> Float64:
     return _i2d(
         _lo(r), (_hi(r) & Int32(0x7FFFFFFF)) | (_hi(a) & Int32(-2147483648))
     )
+
+
+# --------------------------------------------------------------------------- #
+# CUDA 13 libdevice double routines of the special functions: lgamma, erfc,
+# erfinv, pow, acos, sin, cos. Mojo's GPU code is contractible down to ptxas;
+# CUDA contracts only where its SASS shows it (`_accurate_pow`), so every
+# other `*` whose product a `+`/`-` consumes is `_mul_rn_d` (or the sum
+# `_add_rn_d`/`_sub_rn_d`). `a + (-b)` is `_sub_rn_d(a, b)`: CUDA's fneg is a
+# DADD operand modifier, which a NaN passes through unflipped, where Mojo's
+# fneg into inline asm is a sign-bit xor. A routine returning a plain product
+# (nv_erfinv) can still fuse with the caller's next add.
+# Bit-exact against CUDA 13 on sm_90 (NaN payloads included); other GPUs and
+# the host run the same algorithm with IEEE stand-ins for the PTX
+# approximations (rcp/rsqrt seeds) and their own contraction: within an ulp.
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _d(bits: UInt64) -> Float64:
+    return Float64(from_bits=bits)
+
+
+@always_inline
+def _poly[*C: UInt64](x: Float64) -> Float64:
+    """Horner: ((C0 x + C1) x + C2) ... with an fma per step."""
+    var p = _d(C[0])
+    comptime for i in range(1, len(C)):
+        p = fma(p, x, _d(C[i]))
+    return p
+
+
+@always_inline
+def _rcp_d(x: Float64) -> Float64:
+    """1 / x as libdevice computes it: rcp.approx.ftz.f64, refined."""
+    var r0 = _rcp_approx_ftz_d(x)
+    var e = fma(-x, r0, Float64(1.0))
+    e = fma(e, e, e)
+    return fma(e, r0, r0)
+
+
+@always_inline
+def _sdiv2(j: Int32) -> Int32:
+    """`sdiv i32 j, 2` (rounds toward zero)."""
+    return (j + ((j >> Int32(31)) & Int32(1))) >> Int32(1)
+
+
+@always_inline
+def _sin_cos_kernel_d(z: Float64, i: Int32) -> Float64:
+    """`__internal_sin_cos_kerneld` (the non-sm_35/37 arm): sin(z) for an
+    even quadrant i, cos(z) for an odd one, from `__cudart_sin_cos_coeffs`;
+    negated when i & 2."""
+    var odd = (i & Int32(1)) != Int32(0)
+    var z2 = z * z
+    var p = fma(
+        _d(0xBDA8FF8320FD8164) if odd else _d(0x3DE5DB65F9785EBA),
+        z2,
+        _d(0x3E21EEA7C1EF8528) if odd else _d(0xBE5AE5F12CB0D246),
+    )
+    p = fma(p, z2, _d(0xBE927E4F8E06E6D9) if odd else _d(0x3EC71DE369ACE392))
+    p = fma(p, z2, _d(0x3EFA01A019DDBCE9) if odd else _d(0xBF2A01A019DB62A1))
+    p = fma(p, z2, _d(0xBF56C16C16C15D47) if odd else _d(0x3F81111111110818))
+    p = fma(p, z2, _d(0x3FA5555555555551) if odd else _d(0xBFC5555555555554))
+    p = fma(p, z2, Float64(-0.5) if odd else Float64(0.0))
+    var r = fma(p, z2, Float64(1.0)) if odd else fma(p, z, z)
+    if (i & Int32(2)) != Int32(0):
+        r = fma(r, Float64(-1.0), Float64(0.0))
+    return r
+
+
+@always_inline
+def _trig_reduce_d(a: Float64) -> Tuple[Float64, Int32]:
+    """`__internal_trig_reduction_kerneld` with __nv_sin's infinity test:
+    a - q pi/2 (three-part Cody-Waite, Payne-Hanek from 2**31 on) and q."""
+    if _fabs_d(a) == _F64_INF:
+        return (_mul_rn_d(a, Float64(0.0)), Int32(0))
+    var q = _d2i_rn(a * _d(0x3FE45F306DC9C883))  # 2/pi
+    var qf = q.cast[DType.float64]()
+    var t = fma(-qf, _d(0x3FF921FB54442D18), a)
+    t = fma(-qf, _d(0x3C91A62633145C00), t)
+    t = fma(-qf, _d(0x397B839A252049C0), t)
+    if _fabs_d(a) >= _d(0x41E0000000000000):  # 2**31
+        return _trig_reduction_slowpath_d(a, q)
+    return (t, q)
+
+
+@always_inline
+def nv_sin(a: Float64) -> Float64:
+    """`__nv_sin` of CUDA 13's libdevice (the non-sm_35/37 arm)."""
+    var r = _trig_reduce_d(a)
+    return _sin_cos_kernel_d(r[0], r[1])
+
+
+@always_inline
+def nv_cos(a: Float64) -> Float64:
+    """`__nv_cos` of CUDA 13's libdevice (the non-sm_35/37 arm)."""
+    var r = _trig_reduce_d(a)
+    return _sin_cos_kernel_d(r[0], r[1] + Int32(1))
+
+
+# --------------------------------------------------------------------------- #
+# __nv_lgamma
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _lgamma_pos(a: Float64) -> Float64:
+    """`__internal_lgamma_pos`: lgamma(a) for a >= +0 or +inf."""
+    var hi = _hi(a)
+    if hi >= Int32(0x40080000):  # 3
+        if hi >= Int32(0x40200000):  # 8: Stirling, in 1/a
+            var r = _rcp_d(a)
+            var s = _poly[
+                0xBF5AC321034783F9,
+                0x3F4B68B992738FBF,
+                0xBF4380D01E4F7B8C,
+                0x3F4A019FA29F7264,
+                0xBF66C16C16B2ACEC,
+                0x3FB5555555555545,
+            ](r * r)
+            s = fma(s, r, _d(0x3FED67F1C864BEAE))
+            var l = _log_core(a)
+            var hl = _i2d(_lo(l), _hi(l) - Int32(0x100000))  # log(a) / 2
+            var am = a - Float64(0.5)
+            var t = fma(hl, am, -a) + fma(hl, am, s)
+            return a if a == _F64_INF else t
+        var x = a - Float64(3.0)
+        var num = _poly[
+            0xC0AF7040BB18FB05,
+            0xC1122B7730207EF3,
+            0xC1585A0DB81DE7D0,
+            0xC18A992B8BA94677,
+            0xC1AAC5CB6957CC20,
+            0xC1BC0E2B308774BE,
+            0xC1C6BA13DCAE7F67,
+            0xC1CCF33B9C3D120C,
+        ](x)
+        var den = x - _d(0x408FF62E0BE189FE)
+        den = fma(den, x, _d(0xC10074FACE10C93F))
+        den = fma(den, x, _d(0xC151B662F8D75791))
+        den = fma(den, x, _d(0xC18EE64AB4D207F7))
+        den = fma(den, x, _d(0xC1B9051687C9951A))
+        den = fma(den, x, _d(0xC1D2B866BF0B853D))
+        den = fma(den, x, _d(0xC1D4E2130E9DC133))
+        return num / den + x
+    if hi >= Int32(0x3FF80000):  # 1.5
+        var x = a - Float64(2.0)
+        return _mul_rn_d(
+            _poly[
+                0x3E452636124338B3,
+                0xBE71FA71D78C0EE2,
+                0x3E8D111F31E61306,
+                0xBEA0502BBE1B2706,
+                0x3EB06850B2970292,
+                0xBEC108474875033D,
+                0x3ED24ACCC62909DC,
+                0xBEE3CB25209E63BE,
+                0x3EF581CBBC8CDC7B,
+                0xBF078E04B85C7597,
+                0x3F1A12730CF45051,
+                0xBF2D3FD354062012,
+                0x3F40B36B0B4DE323,
+                0xBF538AC5C6D0317A,
+                0x3F67ADD6EAAB19FC,
+                0xBF7E404FC20E4D5B,
+                0x3F951322AC7DA390,
+                0xBFB13E001A5578A3,
+                0x3FD4A34CC4A60FA3,
+                0x3FDB0EE6072093CF,
+            ](x),
+            x,
+        )
+    if hi >= Int32(0x3FE66666):  # 0.7
+        var x = Float64(1.0) - a
+        return _mul_rn_d(
+            _poly[
+                0x3F881F6D2A4C4310,
+                0x3FA3EB504359EB88,
+                0x3FAE35D8DEB06317,
+                0x3FAED469A8B6ECCE,
+                0x3FACC1B1C357BEFE,
+                0x3FAD7154DB67F79F,
+                0x3FAFCC622CF2F7BB,
+                0x3FB11747A4D1CC43,
+                0x3FB24CE16A21B8AC,
+                0x3FB3B1C21A7BCB00,
+                0x3FB556723452ED57,
+                0x3FB748C00891544F,
+                0x3FB9A0207808CF40,
+                0x3FBC80673B8AE26B,
+                0x3FC010B364B7E555,
+                0x3FC2703A1D239658,
+                0x3FC5B40CB1137E6E,
+                0x3FCA8B9C17AC4F03,
+                0x3FD151322AC7CB52,
+                0x3FD9A4D55BEAB1D4,
+                0x3FEA51A6625307D6,
+                0x3FE2788CFC6FB619,
+            ](x),
+            x,
+        )
+    var p = _poly[
+        0xBE7844988BFE6590,
+        0x3EA7B77CEB0625E8,
+        0xBE998C69C8710CC4,
+        0xBEF6527A5A11CF6E,
+        0x3F20EC2950B1B5DE,
+        0xBF2C4D80C24BA278,
+        0xBF5315B4E8CC0D09,
+        0x3F7D917F15D50020,
+        0xBF83B4ABB41CB6FA,
+        0xBFA59AF1275B7120,
+        0x3FC5512321A168A0,
+        0xBFA5815E8FDCE74C,
+        0xBFE4FCF4026ADD1A,
+        0x3FE2788CFC6FB5C8,
+    ](a)
+    return -_log_core(fma(p * a, a, a))  # -log(1 / Gamma(a))
+
+
+@always_inline
+def _sinpi_d(x: Float64) -> Float64:
+    """`__nv_sinpi` as inlined in __nv_lgamma (non-sm_35/37 arm), x finite."""
+    var two_x = _i2d(_lo(x), _hi(x) + Int32(0x100000))
+    var rn = _rint_d(two_x)
+    var i = rn.cast[DType.int64]().cast[DType.int32]()
+    var t = fma(-rn, Float64(0.5), x)
+    var r = fma(t, _d(0x400921FB54442D18), t * _d(0x3CA1A62633145C07))
+    var s = _sin_cos_kernel_d(r, i)
+    if x == _trunc_d(x):
+        s = _mul_rn_d(x, Float64(0.0))
+    return s
+
+
+@always_inline
+def nv_lgamma(a: Float64) -> Float64:
+    """`__nv_lgamma` of CUDA 13's libdevice: `_lgamma_pos(|a|)`, and for a
+    negative non-integer log(pi / |x sinpi(x)|) - lgamma(x)."""
+    var x = _fabs_d(a)
+    if not (x <= _F64_INF):
+        return a + a
+    var t = _lgamma_pos(x)
+    if _hi(a) >= Int32(0):
+        return t
+    if x == _trunc_d(x):
+        return _F64_INF
+    var tiny = _hi(x) < Int32(0x3C000000)  # 2**-63
+    var u = x
+    if not tiny:
+        u = _d(0x400921FB54442D18) / (_fabs_d(_sinpi_d(x)) * x)
+    var l = _log_core(u)
+    return -l if tiny else _sub_rn_d(l, t)
+
+
+# --------------------------------------------------------------------------- #
+# __nv_erfc
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def nv_erfc(a: Float64) -> Float64:
+    """`__nv_erfc` of CUDA 13's libdevice: a rational approximation of
+    erfcx(|a|) in (|a| - 4) / (|a| + 4) times a compensated exp(-a^2),
+    2 - erfc(|a|) for negative a."""
+    var hi = _hi(a)
+    var ahi = hi & Int32(0x7FFFFFFF)
+    var alo = _lo(a)
+    if ahi >= Int32(0x7FF00000):
+        if ahi == Int32(0x7FF00000) and alo == Int32(0):
+            return Float64(2.0) if hi < Int32(0) else Float64(0.0)
+        return a + a
+    var x = _i2d(alo, ahi)
+    var r = _rcp_d(x + Float64(4.0))
+    var q = (x - Float64(4.0)) * r
+    var f = fma(Float64(-4.0), _add_rn_d(q, Float64(1.0)), x)
+    f = fma(-q, x, f)
+    var z = fma(r, f, q)
+    var p = _poly[
+        0xBDF8774AD4E0BFD7,
+        0xBE44E1C6FD03D328,
+        0xBE4330149F7A56B6,
+        0x3E7BEDDED8376273,
+        0x3E6F9254C3ABF22B,
+        0xBEAB9068C2148CF0,
+        0x3E94C6454DB34009,
+        0x3ED7F1C378F2311D,
+        0xBEE78E051C6D5C58,
+        0xBEF995B4EAD14A90,
+        0x3F23BE27CF0A29B2,
+        0xBF2A1DEF3E81672E,
+        0xBF48D4ABE68C1713,
+        0x3F749C67210DD6B4,
+        0xBF9096238568E357,
+        0x3FA3079EDF8C2DC9,
+        0xBFB0FB06DFF601FC,
+        0x3FB7FEE004DFBCDC,
+        0xBFB9DDB23C3DB8C6,
+        0x3FB16ECEFCFA5FDA,
+        0x3F8F7F5DF66FB6D6,
+        0xBFC1DF1AD154A29D,
+        0x3FF3BA5916E9FD7F,
+    ](z)
+    # p / (1 + 2x), refined
+    var rd = _rcp_d(fma(Float64(2.0), x, Float64(1.0)))
+    var g = p * rd
+    var h = _sub_rn_d(fma(x, Float64(-2.0) * g, p), g)
+    var y = fma(h, rd, g)
+    # exp(-x^2) as __nv_exp, the rounding of x^2 corrected
+    var mx2 = (-x) * x
+    var kk = fma(mx2, _d(0x3FF71547652B82FE), _d(0x4338000000000000))
+    var j = _lo(kk)
+    var kf = _add_rn_d(kk, _d(0xC338000000000000))
+    var rr = fma(kf, _d(0xBFE62E42FEFA39EF), mx2)
+    rr = fma(kf, _d(0xBC7ABC9E3B39803F), rr)
+    var e = _poly[
+        0x3E5ADE1569CE2BDF,
+        0x3E928AF3FCA213EA,
+        0x3EC71DEE62401315,
+        0x3EFA01997C89EB71,
+        0x3F2A01A014761F65,
+        0x3F56C16C1852B7AF,
+        0x3F81111111122322,
+        0x3FA55555555502A1,
+        0x3FC5555555555511,
+        0x3FE000000000000B,
+        0x3FF0000000000000,
+        0x3FF0000000000000,
+    ](rr)
+    var jh = _sdiv2(j)
+    var s1 = _i2d(_lo(e), _hi(e) + (jh << Int32(20)))
+    var s2 = _i2d(Int32(0), Int32(0x3FF00000) + ((j - jh) << Int32(20)))
+    var ex = s1 * s2
+    ex = fma(ex, fma(-x, x, -mx2), ex)
+    var t1 = _mul_rn_d(y, ex)
+    if ahi > Int32(0x403B4000):  # 27.25
+        t1 = Float64(0.0)
+    if hi < Int32(0):
+        t1 = _sub_rn_d(Float64(2.0), t1)
+    return t1
+
+
+# --------------------------------------------------------------------------- #
+# __nv_erfinv
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def nv_erfinv(a: Float64) -> Float64:
+    """`__nv_erfinv` of CUDA 13's libdevice: w = -log(1 - a^2) (an inlined
+    log), then a polynomial in w - 3.125, sqrt(w) - 3.25 or sqrt(w) - 5,
+    times a."""
+    var r: Float64
+    if _fabs_f(_fr(_hi(a))) < _fr(Int32(0x3FF00000)):  # |a| < 1
+        var w = fma(a, -a, Float64(1.0))
+        var whi = _hi(w)
+        var e = _i32((_u32(whi) >> UInt32(20)) & UInt32(2046)) - Int32(1022)
+        var ef = _i2d(e ^ Int32(-2147483648), Int32(0x43300000)) - _i2d(
+            Int32(-2147483648), Int32(0x43300000)
+        )
+        var m = _i2d(_lo(w), (whi & Int32(-2145386497)) + Int32(0x3FE00000))
+        var u = m - Float64(1.0)
+        var rc = _rcp_d(m + Float64(1.0))
+        var q = u * rc
+        var s = fma(Float64(-2.0), q, u)
+        s = fma(-q, u, s)
+        var z = fma(s, rc, q)
+        var z2 = z * z
+        var p = _poly[
+            0x3FB5C5C218C775C9,
+            0x3FA55CF59CDC5D89,
+            0x3FAEFD18CF6EBB9C,
+            0x3FB10682EDCB8D1B,
+            0x3FB3B1DD3AC7FC96,
+            0x3FB745CB459B54A6,
+            0x3FBC71C741A0669F,
+            0x3FC249249209112E,
+            0x3FC99999999A06C1,
+            0x3FD5555555555535,
+        ](z2)
+        var l = fma(p * z2, z, z)
+        var lg = fma(ef, _d(0x3FE62E42FEFA39EF), l + l)  # log(1 - a^2)
+        if _u32(_hi(lg)) < UInt32(0xC0190000):  # -lg < 6.25
+            r = _poly[
+                0xBBB135D2E746E627,
+                0xBC08DDF93324D327,
+                0x3C37B83EEF0B7C9F,
+                0x3C69BA72CD589B91,
+                0xBCA33689090A6B96,
+                0x3C782E11898132E0,
+                0x3CFDE4ACFD9E26BA,
+                0xBD26D33EED66C487,
+                0xBD36F2167040D8E2,
+                0x3D872A22C2D77E20,
+                0xBDAC8859C4E5C0AF,
+                0xBDCDC583D118A561,
+                0x3E120F47CCF46B3C,
+                0xBE31A9E38DC84D60,
+                0xBE5F36CD6D3D46A9,
+                0x3E9C6B4F5D03B787,
+                0xBEB6E8A5434AE8A2,
+                0xBEED1D1F7B8736F6,
+                0x3F2879C2A212F024,
+                0xBF4845769484FCA8,
+                0xBF78B6C33114F909,
+                0x3FCEBD80D9B13E28,
+                0x3FFA755E7C99AE86,
+            ](-lg - Float64(3.125))
+        else:
+            var sq = _std_sqrt(-lg)
+            if _hi(sq) < Int32(0x40100000):  # 4
+                r = _poly[
+                    0x3E23040F87DBD932,
+                    0x3E785CBE52878635,
+                    0xBE92777453DD3955,
+                    0x3E5395ABCD554C6C,
+                    0x3EB936388A3790AD,
+                    0xBED0D5DB812B5083,
+                    0x3EC8860CD5D652F6,
+                    0x3EEA29A0CACDFB23,
+                    0xBF08CEF1F80281F2,
+                    0x3F11E684D0B9188A,
+                    0x3EF932CD54C8A222,
+                    0xBF37448A89EF8AA3,
+                    0x3F4F3CC55AD40C25,
+                    0xBF5BA924132F38B1,
+                    0x3F6468EECA533CF8,
+                    0xBF6EBADABB891BBD,
+                    0x3F75FFCFE5B76AFC,
+                    0x3FF0158A6D641D39,
+                    0x4008ABCC380D5A48,
+                ](sq - Float64(3.25))
+            else:
+                r = _poly[
+                    0xBDBDCEC3A7785389,
+                    0xBDF18FEEC0E38727,
+                    0x3E19E6BF2DDA45E3,
+                    0xBE30468FB24E2F5F,
+                    0x3E405AC6A8FBA182,
+                    0xBE50102E495FB9C0,
+                    0x3E5F4C20E1334AF8,
+                    0xBE722D220FDF9C3E,
+                    0x3E8EBC8BB824CB54,
+                    0xBEB0A8D40EA372CC,
+                    0x3ED2FBD29D093D2B,
+                    0xBEF4A3497E1E0FAC,
+                    0x3F13EBF4EB00938F,
+                    0xBF2C2F36A8FC5D53,
+                    0xBF222EA5DF04047C,
+                    0x3FF02A30D1FBA0DC,
+                    0x4013664DDD1AD7FB,
+                ](sq - Float64(5.0))
+    elif not (_fabs_d(a) <= _F64_INF):
+        r = a
+    elif _fabs_d(a) == Float64(1.0):
+        r = _F64_INF
+    else:
+        r = _d(0xFFF8000000000000)
+    return r * a
+
+
+# --------------------------------------------------------------------------- #
+# __nv_pow
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def _accurate_pow(a: Float64, b: Float64) -> Float64:
+    """`__internal_accurate_pow`: exp(b log a) for a >= 0, the log in
+    double-double. Every two-sum is spelled with `_add_rn_d`/`_sub_rn_d` so
+    nothing can reassociate it away."""
+    var ihi = _hi(a)
+    var ilo = _lo(a)
+    var expo = _i32(_u32(ihi) >> UInt32(20))
+    if expo == Int32(0):
+        var s = a * _d(0x4350000000000000)  # 2**54
+        ihi = _hi(s)
+        ilo = _lo(s)
+        expo = _i32(_u32(ihi) >> UInt32(20)) - Int32(54)
+    var e = expo - Int32(1023)
+    var mhi = (ihi & Int32(-2146435073)) | Int32(0x3FF00000)
+    var m = _i2d(ilo, mhi)
+    if _u32(mhi) > UInt32(1073127582):  # m > sqrt(2)
+        m = _i2d(_lo(m), _hi(m) - Int32(0x100000))
+        e = e + Int32(1)
+    var u = m - Float64(1.0)
+    var rc = _rcp_d(m + Float64(1.0))
+    var q = _mul_rn_d(u, rc)
+    var w = _add_rn_d(q, q)
+    var w2 = w * w
+    var p = _poly[
+        0x3EB0F5FF7D2CAFE2,
+        0x3ED0F5D241AD3B5A,
+        0x3EF3B20A75488A3F,
+        0x3F1745CDE4FAECD5,
+        0x3F3C71C7258A578B,
+        0x3F6249249242B910,
+        0x3F89999999999DFB,
+    ](w2)
+    var cc = fma(-w, u, Float64(2.0) * (u - w))
+    var lo45 = _mul_rn_d(rc, cc)
+    # (c_lo, c_hi) = 1/12 + p w2, two-sum, plus the 1/12 tail. CUDA's SASS
+    # contracts both adds of the product p w2 into fmas (and q + q into
+    # fma(u, rc, q), which equals 2q).
+    var c3 = _d(0x3FB5555555555555)
+    var s46 = fma(p, w2, c3)
+    var s48 = fma(p, w2, _sub_rn_d(c3, s46))
+    var s50 = _add_rn_d(_add_rn_d(s48, Float64(0.0)), _d(0xBC46A4CB00B9E7B0))
+    var c_hi = _add_rn_d(s46, s50)
+    var c_lo = _add_rn_d(_sub_rn_d(s46, c_hi), s50)
+    # w^3 in double-double
+    var ww = _mul_rn_d(w, w)
+    var ww_lo = fma(w, w, -ww)
+    ww_lo = fma(w, _i2d(_lo(lo45), _hi(lo45) + Int32(0x100000)), ww_lo)
+    var www = _mul_rn_d(ww, w)
+    var www_lo = fma(ww, w, -www)
+    www_lo = fma(ww, lo45, www_lo)
+    www_lo = fma(ww_lo, w, www_lo)
+    # c * w^3
+    var t_hi = _mul_rn_d(c_hi, www)
+    var t_lo = fma(c_hi, www, -t_hi)
+    t_lo = fma(c_hi, www_lo, t_lo)
+    t_lo = fma(c_lo, www, t_lo)
+    var v_hi = _add_rn_d(t_hi, t_lo)
+    var v_lo = _add_rn_d(_sub_rn_d(t_hi, v_hi), t_lo)
+    # log(m) = w + lo45 + c w^3
+    var l80 = _add_rn_d(w, v_hi)
+    var l84 = _add_rn_d(
+        _add_rn_d(_add_rn_d(_sub_rn_d(w, l80), v_hi), v_lo), lo45
+    )
+    var lm_hi = _add_rn_d(l80, l84)
+    var lm_lo = _add_rn_d(_sub_rn_d(l80, lm_hi), l84)
+    # + e ln 2
+    var ef = _i2d(e ^ Int32(-2147483648), Int32(0x43300000)) - _i2d(
+        Int32(-2147483648), Int32(0x43300000)
+    )
+    var l94 = fma(ef, _d(0x3FE62E42FEFA39EF), lm_hi)
+    var l96 = fma(-ef, _d(0x3FE62E42FEFA39EF), l94)
+    var l98 = _sub_rn_d(lm_lo, _sub_rn_d(l96, lm_hi))
+    var l99 = fma(ef, _d(0x3C7ABC9E3B39803F), l98)
+    var lg_hi = _add_rn_d(l94, l99)
+    var lg_lo = _add_rn_d(_sub_rn_d(l94, lg_hi), l99)
+    # b * log(a), b scaled down when huge so the product cannot overflow
+    var bhi = _hi(b)
+    if _u32(bhi + bhi) >= UInt32(0xFE000000):
+        bhi = bhi & Int32(-15728641)
+    var bb = _i2d(_lo(b), bhi)
+    var y_hi = _mul_rn_d(lg_hi, bb)
+    var y_lo = fma(lg_hi, bb, -y_hi)
+    y_lo = fma(lg_lo, bb, y_lo)
+    var y = _add_rn_d(y_hi, y_lo)
+    var y_tail = _add_rn_d(_sub_rn_d(y_hi, y), y_lo)
+    var z = nv_exp(y)
+    if _fabs_d(z) == _F64_INF:
+        return z
+    return fma(z, y_tail, z)
+
+
+@always_inline
+def nv_pow(a: Float64, b: Float64) -> Float64:
+    """`__nv_pow` of CUDA 13's libdevice, every C99 special case included."""
+    var ahi = _hi(a)
+    var bhi = _hi(b)
+    # b odd integer: its units bit is the top bit once shifted left by
+    # exponent - 1012; PTX clamps an out-of-range shift to 0.
+    var sh = _u32(((bhi & Int32(0x7FF00000)) >> Int32(20)) - Int32(1012))
+    var bits = b.to_bits[DType.uint64]()
+    var odd = sh < UInt32(64) and (bits << _z64(sh)) == UInt64(
+        0x8000000000000000
+    )
+    var t = _accurate_pow(_fabs_d(a), b)
+    if ahi < Int32(0) and odd:
+        t = -t
+    if a == Float64(0.0):
+        if _fabs_d(b) == Float64(0.5):
+            odd = False
+        var thi = ahi if odd else Int32(0)
+        if bhi < Int32(0):
+            thi = thi | Int32(0x7FF00000)
+        t = _i2d(Int32(0), thi)
+    elif ahi < Int32(0) and not (b == _trunc_d(b)):
+        t = _d(0xFFF8000000000000)
+    if (_hi(a + b) & Int32(0x7FF00000)) == Int32(0x7FF00000):
+        if not (_fabs_d(a) <= _F64_INF) or not (_fabs_d(b) <= _F64_INF):
+            t = _add_rn_d(a, b)
+        elif _fabs_d(b) == _F64_INF:
+            var thi = Int32(0x7FF00000) if _fabs_d(a) > Float64(1.0) else Int32(
+                0
+            )
+            if bhi < Int32(0):
+                thi = thi ^ Int32(0x7FF00000)
+            if a == Float64(-1.0):
+                thi = Int32(0x3FF00000)
+            t = _i2d(Int32(0), thi)
+        elif _fabs_d(a) == _F64_INF:
+            var thi = Int32(0x7FF00000) if bhi >= Int32(0) else Int32(0)
+            if (
+                ahi < Int32(0)
+                and odd
+                and (bhi & Int32(0x7FFFFFFF)) != Int32(0x3FE00000)
+            ):
+                thi = thi ^ Int32(-2147483648)
+            t = _i2d(Int32(0), thi)
+    if a == Float64(1.0) or b == Float64(0.0):
+        t = Float64(1.0)
+    return t
+
+
+# --------------------------------------------------------------------------- #
+# __nv_acos
+# --------------------------------------------------------------------------- #
+
+
+@always_inline
+def nv_acos(a: Float64) -> Float64:
+    """`__nv_acos` of CUDA 13's libdevice: pi/2 - asin(|a|) by a polynomial
+    below |a| = 0.575, else 2 asin(sqrt((1 - |a|) / 2)) with a refined
+    rsqrt.approx.ftz.f64; reflected for negative a."""
+    var hi = _hi(a)
+    var x = _fabs_d(a)
+    if _hi(x) < Int32(0x3FE26666):
+        var x2 = x * x
+        var p = _poly[
+            0x3FB0066BDC1895E9,
+            0xBFB3823B180754AF,
+            0x3FB11E52CC2F79AE,
+            0xBF924EAF3526861B,
+            0x3F91DF02A31E6CB7,
+            0x3F847D18B0EEC6CC,
+            0x3F8D0AF961BA53B0,
+            0x3F91BF7734CF1C48,
+            0x3F96E91483144EF7,
+            0x3F9F1C6E0A4F9F81,
+            0x3FA6DB6DC27FA92B,
+            0x3FB333333320F91B,
+            0x3FC5555555555F4D,
+        ](x2)
+        var s = fma(p * x2, x, x)  # asin(|a|)
+        if hi < Int32(0):
+            return _add_rn_d(
+                _d(0x3FF921FB54442D18), _add_rn_d(s, _d(0x3C91A62633145C07))
+            )
+        return _sub_rn_d(
+            _d(0x3FF921FB54442D18), _add_rn_d(s, _d(0xBC91A62633145C07))
+        )
+    var d = Float64(1.0) - x
+    var dh = _i2d(_lo(d), _hi(d) - Int32(0x100000))  # d / 2
+    var rs = _rsqrt_approx_ftz_d(dh)
+    var rh = _i2d(_lo(rs), _hi(rs) - Int32(0x100000))
+    var s0 = dh * rs
+    var s1 = fma(fma(s0, -s0, dh), rh, s0)
+    var rh2 = fma(fma(rs, -s1, Float64(1.0)), rh, rh)
+    var s2 = fma(fma(s1, -s1, dh), rh2, s1)  # sqrt(d / 2)
+    var sq = _i2d(_lo(s2), _hi(s2) + Int32(0x100000))
+    var p = _poly[
+        0x3EC715B371155F70,
+        0xBEBAC2FE66FAAC4B,
+        0x3ED9A9B88EFCD9B8,
+        0x3EDD0F40A8A0C4C3,
+        0x3EF46D4CFA9E0E1F,
+        0x3F079C168D1E2422,
+        0x3F1C9A88C3BCA540,
+        0x3F31C4E64BD476DF,
+        0x3F46E8BA60009C8F,
+        0x3F5F1C71C62B05A2,
+        0x3F76DB6DB6DC9F2C,
+        0x3F9333333333329C,
+        0x3FB5555555555555,
+    ](d)
+    var dhi = _hi(d)
+    var t: Float64
+    if dhi <= Int32(0):
+        t = _mul_rn_d(x, Float64(0.0))
+    else:
+        t = fma(p * d, sq, sq)
+    if dhi < Int32(0):
+        t = _mul_rn_d(t, _F64_INF)
+    if hi < Int32(0):
+        t = _sub_rn_d(
+            _d(0x400921FB54442D18), _add_rn_d(t, _d(0xBCA1A62633145C07))
+        )
+    return t
+
+
+@always_inline
+def nv_atan2(a: Float64, b: Float64) -> Float64:
+    """`__nv_atan2(a, b)` (atan2 of y = a, x = b): t = min / max of the
+    magnitudes by IEEE division, one odd polynomial, the octant fixed up
+    from b's sign, then the zero and |a| == |b| cases. Non-NaN operands
+    only: libdevice returns |b| + |a| for a NaN, whose kept NaN depends on
+    the add's operand slots (the caller's choice)."""
+    var ab = abs(b)
+    var aa = abs(a)
+    var swap = aa > ab
+    var mx = aa if swap else ab
+    var mn = ab if swap else aa
+    var t = mn / mx
+    var s = t * t
+    var p = fma(
+        Float64(from_bits=UInt64(0xBEF53E1D2A25FF7E)),
+        s,
+        Float64(from_bits=UInt64(0x3F2D3B63DBB65B49)),
+    )
+    p = fma(p, s, Float64(from_bits=UInt64(0xBF5312788DDE082E)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3F6F9690C8249315)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBF82CF5AABC7CF0D)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3F9162B0B2A3BFDE)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBF9A7256FEB6FC6B)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FA171560CE4A489)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFA4F44D841450E4)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FA7EE3D3F36BB95)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFAAD32AE04A9FD1)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FAE17813D66954F)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFB11089CA9A5BCD)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FB3B12B2DB51738)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFB745D022F8DC5C)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FBC71C709DFE927)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFC2492491FA1744)))
+    p = fma(p, s, Float64(from_bits=UInt64(0x3FC99999999840D2)))
+    p = fma(p, s, Float64(from_bits=UInt64(0xBFD555555555544C)))
+    var r = fma(p * s, t, t)
+    comptime PIO2 = Float64(from_bits=UInt64(0x3FF921FB54442D18))
+    comptime PI = Float64(from_bits=UInt64(0x400921FB54442D18))
+    var bneg = _hi(b) < 0
+    if swap:
+        r = (PIO2 + r) if bneg else (PIO2 - r)
+    elif bneg:
+        r = PI - r
+    if mx == 0.0:
+        r = PI if bneg else Float64(0.0)
+    elif ab == aa:
+        r = Float64(from_bits=UInt64(0x4002D97C7F3321D2)) if bneg else Float64(
+            from_bits=UInt64(0x3FE921FB54442D18)
+        )
+    return _i2d(
+        _lo(r), (_hi(r) & Int32(0x7FFFFFFF)) | (_hi(a) & Int32(-2147483648))
+    )
+
+
+@always_inline
+def _mul_rn_f(a: Float32, b: Float32) -> Float32:
+    """mul.rn.f32: a product the fast-math flags may not reassociate."""
+    comptime if is_nvidia_gpu():
+        return inlined_assembly[
+            "mul.rn.f32 $0, $1, $2;",
+            Float32,
+            constraints="=f,f,f",
+            has_side_effect=False,
+        ](a, b)
+    else:
+        return a * b
+
+
+@always_inline
+def nv_ldexpf(a: Float32, b: Int32) -> Float32:
+    """`__nv_ldexpf`: the exponent clamped to +-278 and applied as four
+    rounded products by powers of two (one, then 2^0 three times when
+    |b| <= 100)."""
+    var e = min(max(b, Int32(-278)), Int32(278))
+    var t = e + 508
+    var s0 = t >> 2
+    var s1 = t - 3 * s0
+    if abs(e) <= 100:
+        s0 = 127
+        s1 = e + 127
+    var f0 = _fr(s0 << 23)
+    var r = _mul_rn_f(a, _fr(s1 << 23))
+    r = _mul_rn_f(r, f0)
+    r = _mul_rn_f(r, f0)
+    return _mul_rn_f(r, f0)
+
+
+@always_inline
+def nv_ldexp(a: Float64, b: Int32) -> Float64:
+    """`__nv_ldexp`: as `nv_ldexpf`, the exponent clamped to +-2099 (|b| <=
+    216 in one product)."""
+    var e = min(max(b, Int32(-2099)), Int32(2099))
+    var t = e + 4092
+    var s0 = t >> 2
+    var s1 = t - 3 * s0
+    if abs(e) <= 216:
+        s0 = 1023
+        s1 = e + 1023
+    var f0 = _i2d(0, s0 << 20)
+    var r = _mul_rn_d(a, _i2d(0, s1 << 20))
+    r = _mul_rn_d(r, f0)
+    r = _mul_rn_d(r, f0)
+    return _mul_rn_d(r, f0)
+
+
+@always_inline
+def nv_exp2(a: Float64) -> Float64:
+    """`__nv_exp2`: a = j + f by the 1.5 * 2^52 rounding trick, 2^f =
+    e^(f ln 2) by one polynomial, 2^j added to the exponent (in two steps
+    near the range ends)."""
+    comptime SHIFT = Float64(from_bits=UInt64(0x4338000000000000))
+    var t = _add_rn_d(a, SHIFT)
+    var j = _add_rn_d(t, -SHIFT)
+    var k = _lo(t)
+    var f = a - j
+    var x = fma(
+        f,
+        Float64(from_bits=UInt64(0x3FE62E42FEFA39EF)),
+        f * Float64(from_bits=UInt64(0x3C7ABC9E3B39803F)),
+    )
+    var p = fma(
+        Float64(from_bits=UInt64(0x3E5ADE1569CE2BDF)),
+        x,
+        Float64(from_bits=UInt64(0x3E928AF3FCA213EA)),
+    )
+    p = fma(p, x, Float64(from_bits=UInt64(0x3EC71DEE62401315)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3EFA01997C89EB71)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3F2A01A014761F65)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3F56C16C1852B7AF)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3F81111111122322)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3FA55555555502A1)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3FC5555555555511)))
+    p = fma(p, x, Float64(from_bits=UInt64(0x3FE000000000000B)))
+    p = fma(p, x, Float64(1.0))
+    p = fma(p, x, Float64(1.0))
+    var ahi = _u32(_hi(a)) & UInt32(0x7FFFFFFF)
+    if ahi < UInt32(1083174912):  # |a| < 1022
+        return _i2d(_lo(p), (k << 20) + _hi(p))
+    var z: Float64
+    if _hi(a) < 0:
+        z = 0.0
+    else:
+        z = _F64_INF
+    if ahi > UInt32(0x7FF00000) or (ahi == UInt32(0x7FF00000) and _lo(a) != 0):
+        z = a + a  # NaN
+    if ahi < UInt32(1083231232):  # |a| < 1075
+        var k1 = (k + (k >> 31 & 1)) >> 1  # C's k / 2, truncating
+        var hi = _i2d(_lo(p), _hi(p) + (k1 << 20))
+        z = hi * _i2d(0, Int32(1072693248) + ((k - k1) << 20))
+    return z

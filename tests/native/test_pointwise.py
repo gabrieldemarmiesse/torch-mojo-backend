@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.native.conftest import is_metal, skip_if_metal
+from tests.native.conftest import is_cuda, is_metal, skip_if_metal
 from torch_mojo_backend import get_accelerators, native
 
 FLOATS = [torch.float32, torch.float16, torch.bfloat16]
@@ -1136,7 +1136,8 @@ def test_ldexp_large_float_exponent_tensor(mojo_gpu):
 
 def test_ldexp_int64_exponent_wraps_to_int(mojo_gpu):
     """An int64 exponent is converted to ::ldexp's int first (2**32 is 0),
-    for a device tensor, a CPU 0-d tensor and in place."""
+    for a device tensor and in place; a CPU 0-d one raises, as on CUDA (the
+    integer-exponent kernel's iterator takes no CPU scalar)."""
     x = torch.tensor([1.0, 0.5, -3.0])
     e = torch.tensor([2**32, -(2**32), 2**32 + 3])
     _close(
@@ -1146,24 +1147,41 @@ def test_ldexp_int64_exponent_wraps_to_int(mojo_gpu):
         atol=0.0,
     )
     for v in (2**32, 2**32 + 3, -(2**33) - 1):
-        e0 = torch.tensor(v)
-        _close(torch.ldexp(x.to(mojo_gpu), e0), torch.ldexp(x, e0), rtol=0.0, atol=0.0)
+        if is_cuda(mojo_gpu):
+            with pytest.raises(RuntimeError, match="same device"):
+                torch.ldexp(x.to(mojo_gpu), torch.tensor(v))
+        else:
+            _close(
+                torch.ldexp(x.to(mojo_gpu), torch.tensor(v)),
+                torch.ldexp(x, torch.tensor(v)),
+                rtol=0.0,
+                atol=0.0,
+            )
     y = x.to(mojo_gpu)
     y.ldexp_(e.to(mojo_gpu))
     _close(y, x.clone().ldexp_(e), rtol=0.0, atol=0.0)
 
 
 def test_ldexp_inplace_cpu_scalar_exponent(mojo_gpu):
-    """ldexp_ takes an explicit CPU 0-d exponent, float or integral."""
-    for e_cpu in (
-        torch.tensor(3.5, dtype=torch.float64),
-        torch.tensor(3),
-        torch.tensor(-2.25),
-    ):
+    """ldexp_ takes an explicit CPU 0-d float exponent (pow(2, e) is a CPU
+    scalar of mul); an integral one raises, as on CUDA."""
+    for e_cpu in (torch.tensor(3.5, dtype=torch.float64), torch.tensor(-2.25)):
         x_cpu = torch.tensor([1.0, 0.5, -3.0])
         x = x_cpu.to(mojo_gpu)
         x.ldexp_(e_cpu)
         _close(x, x_cpu.clone().ldexp_(e_cpu), rtol=0.0, atol=0.0)
+    if is_cuda(mojo_gpu):
+        with pytest.raises(RuntimeError, match="same device"):
+            torch.tensor([1.0], device=mojo_gpu).ldexp_(torch.tensor(3))
+    else:
+        y = torch.tensor([1.0, 0.5, -3.0], device=mojo_gpu)
+        y.ldexp_(torch.tensor(3))
+        _close(
+            y.cpu(),
+            torch.ldexp(torch.tensor([1.0, 0.5, -3.0]), torch.tensor(3)),
+            rtol=0.0,
+            atol=0.0,
+        )
 
 
 def test_frexp_out_partially_overlapping_input(mojo_gpu):
@@ -2632,3 +2650,115 @@ def test_isclose_integers_under_another_default_dtype(mojo_gpu, default, dtype):
             assert torch.equal(got.cpu(), torch.isclose(big, same, 0.0, 1e-3))
     finally:
         torch.set_default_dtype(before)
+
+
+def _cx(shape, device, dtype=torch.complex64):
+    return torch.complex(torch.randn(shape), torch.randn(shape)).to(dtype).to(device)
+
+
+@pytest.mark.parametrize("op", ["lerp_scalar", "lerp_tensor", "addcmul", "addcdiv"])
+def test_complex_inplace_never_resizes_self(mojo_gpu, op):
+    """A complex in-place op whose operands broadcast past self raises (as
+    TensorIterator's in-place meta does) and leaves self alone."""
+    x = _cx((1, 3), mojo_gpu)
+    y = _cx((2, 3), mojo_gpu)
+    keep = x.clone()
+    with pytest.raises(RuntimeError):
+        if op == "lerp_scalar":
+            x.lerp_(y, 0.5)
+        elif op == "lerp_tensor":
+            x.lerp_(y, _cx((2, 3), mojo_gpu))
+        elif op == "addcmul":
+            x.addcmul_(y, y)
+        else:
+            x.addcdiv_(y, y)
+    assert x.shape == (1, 3)
+    torch.testing.assert_close(x.cpu(), keep.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("op", ["lerp_scalar", "addcmul"])
+def test_complex_partial_overlap_is_refused(mojo_gpu, op):
+    """An operand sharing storage with the written tensor without being the
+    same view of it (`x[1:].lerp_(x[:-1])`) raises, in place and with out=."""
+    x = _cx((6,), mojo_gpu)
+    keep = x.clone()
+    with pytest.raises(RuntimeError, match="single memory location"):
+        if op == "lerp_scalar":
+            x[1:].lerp_(x[:-1], 0.5)
+        else:
+            x[1:].addcmul_(x[:-1], x[:-1])
+    with pytest.raises(RuntimeError, match="single memory location"):
+        if op == "lerp_scalar":
+            torch.lerp(x[:-1], x[:-1], 0.5, out=x[1:])
+        else:
+            torch.addcmul(x[:-1], x[:-1], x[:-1], out=x[1:])
+    torch.testing.assert_close(x.cpu(), keep.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("op", ["lerp_scalar", "lerp_tensor", "addcmul", "addcdiv"])
+def test_complex_operands_on_two_gpus_are_refused(mojo_gpu, op):
+    """Operands on different mojo GPUs raise TensorIterator's device error
+    before any pointer is read."""
+    if len(list(get_accelerators())) < 2:
+        pytest.skip("needs two mojo GPUs")
+    a = _cx((4,), "mojo:0")
+    b = _cx((4,), "mojo:1")
+    with pytest.raises(RuntimeError, match="same device"):
+        if op == "lerp_scalar":
+            torch.lerp(a, b, 0.5)
+        elif op == "lerp_tensor":
+            torch.lerp(a, b, b)
+        elif op == "addcmul":
+            torch.addcmul(a, b, a)
+        else:
+            torch.addcdiv(a, a, b)
+
+
+@pytest.mark.parametrize("op", ["lerp_scalar", "lerp_tensor", "addcmul", "addcdiv"])
+def test_complex_out_that_is_an_input_is_never_resized(mojo_gpu, op):
+    """`op(x, y, ..., out=x)` where the broadcast shape is larger than x
+    raises (an out that is read and written is never resized) and leaves x
+    alone; the same call with matching shapes works."""
+    x = _cx((1,), mojo_gpu)
+    y = _cx((3,), mojo_gpu)
+    keep = x.clone()
+    calls = {
+        "lerp_scalar": lambda a, b: torch.lerp(a, b, 0.5, out=a),
+        "lerp_tensor": lambda a, b: torch.lerp(a, b, b, out=a),
+        "addcmul": lambda a, b: torch.addcmul(a, b, b, out=a),
+        "addcdiv": lambda a, b: torch.addcdiv(a, b, b, out=a),
+    }
+    with pytest.raises(RuntimeError, match="doesn't match the broadcast shape"):
+        calls[op](x, y)
+    assert x.shape == (1,)
+    torch.testing.assert_close(x.cpu(), keep.cpu(), rtol=0, atol=0)
+    z = _cx((3,), mojo_gpu)
+    w = _cx((3,), mojo_gpu)
+    ref = calls[op](z.cpu().clone(), w.cpu())
+    calls[op](z, w)
+    torch.testing.assert_close(z.cpu(), ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.int64, torch.float16, torch.bool])
+def test_pow_scalar_base_one_fills_any_out(cuda_oracle, out_dtype):
+    """pow(1, float_exponents, out=...) resizes and fills the supplied out
+    directly (Pow.cpp's pow_Scalar_out): no cast check, whatever its dtype
+    (stock CUDA; CPU torch refuses the cast)."""
+    e = torch.tensor([0.5, 2.0, -1.0, 3.0])
+
+    def f(x):
+        o = torch.empty(0, dtype=out_dtype, device=x.device)
+        return torch.pow(1, x, out=o), o
+
+    cuda_oracle.assert_bitwise_equal(f, e)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.int64, torch.bool])
+def test_pow_tensor_exponent_zero_checks_the_out_cast(cuda_oracle, out_dtype):
+    """pow(float, 0, out=int) fails the out cast check first (its meta)."""
+    e = torch.tensor([0.5, 2.0])
+
+    def f(x):
+        return torch.pow(x, 0, out=torch.empty(0, dtype=out_dtype, device=x.device))
+
+    cuda_oracle.assert_bitwise_equal(f, e)

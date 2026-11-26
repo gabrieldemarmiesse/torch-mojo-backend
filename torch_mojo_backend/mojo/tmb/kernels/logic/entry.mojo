@@ -28,14 +28,28 @@ from std.math import ceildiv
 from std.memory import bitcast
 from std.utils.numerics import isnan
 from std.sys import is_amd_gpu, is_nvidia_gpu, llvm_intrinsic
-from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
+from std.sys.info import (
+    has_accelerator,
+    has_apple_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
+    size_of,
+)
 from std.utils.coord import Coord
 
 from std.utils import IndexList
 
 from tmb.kernels.common.cuda_math import _add_rn, _mul_rn
-from tmb.kernels.common.div_math import floor_div, trunc_div
+from tmb.kernels.common.cuda_div_math import (
+    cuda_floor_div,
+    cuda_floor_div_by_scalar,
+    cuda_mul_by_inverse,
+    cuda_remainder,
+    cuda_trunc_div,
+    cuda_trunc_div_by_scalar,
+)
+from tmb.kernels.common.div_math import trunc_div
 from tmb.kernels.common.gpu_elementwise import elementwise
+from tmb.kernels.common.nan_order import nan_first2, nan_first3
 from tmb.kernels.common.pow_math import torch_pow
 from tmb.kernels.common.op_utils import (
     Arg,
@@ -55,7 +69,6 @@ from tmb.kernels.common.op_utils import (
     _raw_tuple_int,
     _spec_dispatcher3,
     _spec_ptr,
-    custom_remainder,
 )
 
 from tmb.kernels.common.variant_gates import (
@@ -103,6 +116,12 @@ comptime BOP_TRUNCDIV = 12
 # BOP_TRUNCDIV of a bf16/fp16 tensor by a ONE-ELEMENT tensor, divided in
 # float32 (see there).
 comptime BOP_TRUNCDIV_OPMATH = 13
+# True / trunc / floor division by a CPU scalar, stock CUDA's own route for
+# it: `alpha` carries the double reciprocal (div) or the divisor (trunc,
+# floor); the `b` operand is not read.
+comptime BOP_DIV_BY_SCALAR = 14
+comptime BOP_TRUNCDIV_BY_SCALAR = 15
+comptime BOP_FLOORDIV_BY_SCALAR = 16
 
 comptime COP_EQ = 0
 comptime COP_NE = 1
@@ -171,6 +190,12 @@ def _op_token[op_code: Int, is_cmp: Bool]() -> StaticString:
             return "trunc_divide"
         comptime if op_code == BOP_TRUNCDIV_OPMATH:
             return "trunc_divide_opmath"
+        comptime if op_code == BOP_DIV_BY_SCALAR:
+            return "div_by_scalar"
+        comptime if op_code == BOP_TRUNCDIV_BY_SCALAR:
+            return "trunc_divide_by_scalar"
+        comptime if op_code == BOP_FLOORDIV_BY_SCALAR:
+            return "floor_divide_by_scalar"
     return "binop"
 
 
@@ -249,6 +274,32 @@ def _add_f32_bf16_contig(
 
 
 @always_inline
+def _scalar_nan_first[
+    dtype: DType, w: Int
+](
+    r: SIMD[dtype, w], a: SIMD[dtype, w], b: SIMD[dtype, w], scalar_side: Int
+) -> SIMD[dtype, w]:
+    """`r` with the CPU-scalar operand's float64 NaN first (see
+    `_bin_vec_op`). NVIDIA's CUDA kernels only; elsewhere `r` as is."""
+    comptime if not is_nvidia_gpu():
+        return r
+    if scalar_side == 1:
+        return nan_first2(r, a, b)
+    if scalar_side == 2:
+        return nan_first2(r, b, a)
+    return r
+
+
+@always_inline
+def _opmath[dtype: DType]() -> DType:
+    """at::opmath_type: float32 for the half types, the dtype otherwise."""
+    comptime if dtype == DType.float16 or dtype == DType.bfloat16:
+        return DType.float32
+    else:
+        return dtype
+
+
+@always_inline
 def _nonzero[
     dtype: DType, width: Int
 ](a: SIMD[dtype, width]) -> SIMD[DType.bool, width]:
@@ -299,8 +350,21 @@ def _bin_vec_op[
     op_code: Int,
     is_cmp: Bool,
     width: Int,
-](a: SIMD[dtype, width], b: SIMD[dtype, width]) -> SIMD[out_dtype, width]:
+](
+    a: SIMD[dtype, width],
+    b: SIMD[dtype, width],
+    alpha: Scalar[_opmath[dtype]()] = 1,
+    scalar_side: Int = 0,
+) -> SIMD[out_dtype, width]:
     """The op itself on one SIMD group: `dtype x dtype -> out_dtype`.
+
+    `alpha` is add / sub's (float dtypes; the ops layer scales integer
+    operands itself). `scalar_side` is 1 when `a`, 2 when `b` was a CPU
+    scalar in stock CUDA's kernel: a uniform operand, whose float64 NaN the
+    result then carries first (`nan_order`). Between two tensor NaNs the
+    payload CUDA keeps depends on its launch (the operand slots differ
+    between the vectorized body and the tail of the same kernel), so that
+    case is left to the hardware.
 
     Every kernel in this family funnels through this one body -- the general
     strided kernel and the CPU closure at width 1, the vectorized kernels at
@@ -360,15 +424,45 @@ def _bin_vec_op[
             else:
                 return (la ^ lb).cast[out_dtype]()
     else:
-        comptime if op_code == BOP_ADD:
-            return (a + b).cast[out_dtype]()
-        comptime if op_code == BOP_SUB:
-            return (a - b).cast[out_dtype]()
+        comptime if op_code == BOP_ADD or op_code == BOP_SUB:
+            comptime if dtype.is_floating_point() and is_nvidia_gpu():
+                # ufunc::add's `self + alpha * other` in opmath, which nvcc
+                # contracts to fma(alpha, other, self); sub is add with
+                # -alpha. A float64 NaN: alpha's, then self's, then
+                # other's -- other's first when it was the CPU scalar.
+                comptime om = _opmath[dtype]()
+                var al = SIMD[om, width](alpha)
+                comptime if op_code == BOP_SUB:
+                    al = -al
+                var x = a.cast[om]()
+                var y = b.cast[om]()
+                var r = y.fma(al, x)
+                if scalar_side == 2:
+                    r = nan_first3(r, y, x, al)  # DFMA(alpha, other_, self)
+                elif scalar_side == 1:
+                    r = nan_first3(r, al, x, y)  # DFMA(other, alpha, self_)
+                else:
+                    r = nan_first2(r, al, al)
+                return r.cast[out_dtype]()
+            elif op_code == BOP_ADD:
+                return (a + b).cast[out_dtype]()
+            else:
+                return (a - b).cast[out_dtype]()
         comptime if op_code == BOP_MUL:
-            return (a * b).cast[out_dtype]()
+            comptime if dtype.is_floating_point() and is_nvidia_gpu():
+                return _scalar_nan_first(a * b, a, b, scalar_side).cast[
+                    out_dtype
+                ]()
+            else:
+                return (a * b).cast[out_dtype]()
         comptime if op_code == BOP_DIV:
             comptime if dtype.is_floating_point():
-                return (a / b).cast[out_dtype]()
+                comptime if is_nvidia_gpu():
+                    return _scalar_nan_first(a / b, a, b, scalar_side).cast[
+                        out_dtype
+                    ]()
+                else:
+                    return (a / b).cast[out_dtype]()
         comptime if op_code == BOP_MAX or op_code == BOP_MIN:
             var r = max(a, b) if op_code == BOP_MAX else min(a, b)
             comptime if dtype.is_floating_point():
@@ -377,6 +471,11 @@ def _bin_vec_op[
                 # max/min may drop it.
                 r = isnan(b).select(b, r)
                 r = isnan(a).select(a, r)
+                comptime if is_nvidia_gpu():
+                    if scalar_side == 2:
+                        # the CPU scalar is the functor's first operand
+                        # (opmath_symmetric_gpu_kernel_with_scalars)
+                        r = isnan(b).select(b, r)
             return r.cast[out_dtype]()
         comptime if op_code == BOP_AND:
             comptime if not dtype.is_floating_point():
@@ -388,18 +487,18 @@ def _bin_vec_op[
             comptime if not dtype.is_floating_point():
                 return (a ^ b).cast[out_dtype]()
         comptime if op_code == BOP_REMAINDER:
-            # NOT Mojo's `%`: that one has the right (divisor's) sign, but
-            # loses the answer outright on bf16/fp16 operands.
-            # `op_utils.custom_remainder` routes those two through a bit-exact
-            # fp32 fmod and explains why.
-            return custom_remainder(a, b).cast[out_dtype]()
+            # A CPU scalar's float64 NaN first (__nv_fmod; between two
+            # tensor NaNs the payload depends on the launch).
+            comptime if dtype.is_floating_point():
+                return _scalar_nan_first(
+                    cuda_remainder(a, b), a, b, scalar_side
+                ).cast[out_dtype]()
+            else:
+                return cuda_remainder(a, b).cast[out_dtype]()
         comptime if op_code == BOP_FLOORDIV:
-            return floor_div(a, b).cast[out_dtype]()
+            return cuda_floor_div(a, b).cast[out_dtype]()
         comptime if op_code == BOP_TRUNCDIV:
-            # Native precision for floats: the ops layer sends ATen's
-            # float32 scalar-divisor path to TruncDivScalarSpec and
-            # BOP_TRUNCDIV_OPMATH.
-            return trunc_div(a, b).cast[out_dtype]()
+            return cuda_trunc_div(a, b).cast[out_dtype]()
         comptime if op_code == BOP_TRUNCDIV_OPMATH:
             # ATen's div_trunc_kernel for a reduced-float operand over a
             # one-element tensor (`iter.is_scalar(2)`): divided in float32,
@@ -410,6 +509,22 @@ def _bin_vec_op[
                 ).cast[out_dtype]()
             else:
                 return trunc_div(a, b).cast[out_dtype]()
+        comptime if dtype.is_floating_point():
+            comptime om = _opmath[dtype]()
+            comptime if op_code == BOP_DIV_BY_SCALAR:
+                return cuda_mul_by_inverse[dtype](
+                    a.cast[om](), alpha.cast[om]()
+                ).cast[out_dtype]()
+            comptime if op_code == BOP_TRUNCDIV_BY_SCALAR:
+                var inv = Scalar[om](1) / alpha.cast[om]()
+                return cuda_trunc_div_by_scalar[dtype](
+                    a.cast[om](), inv, alpha.cast[om]()
+                ).cast[out_dtype]()
+            comptime if op_code == BOP_FLOORDIV_BY_SCALAR:
+                var bs = alpha.cast[om]()
+                return cuda_floor_div_by_scalar[dtype](
+                    a.cast[om](), bs, Scalar[om](1) / bs
+                ).cast[out_dtype]()
         comptime if op_code == BOP_POW:
             # Float only (gated at the launcher). pow_math.torch_pow: C's
             # special cases (infinite / NaN exponents, signed zeros, negative
@@ -420,8 +535,8 @@ def _bin_vec_op[
     return a.cast[out_dtype]()
 
 
-@__name(t"binary_strided_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
-def _bin_bcast_kernel[
+@always_inline
+def _bin_bcast_body[
     dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
     out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
@@ -439,6 +554,8 @@ def _bin_bcast_kernel[
     rs2_arg: Int64,
     rs3_arg: Int64,
     total_arg: Int64,
+    alpha: Scalar[_opmath[dtype]()],
+    scalar_side_arg: Int64,
 ):
     """Fully general arm: any broadcast strides, one element per thread.
 
@@ -472,12 +589,99 @@ def _bin_bcast_kernel[
         var b = r_ptr[unsafe_offset=i0 * rs0 + i1 * rs1 + i2 * rs2 + i3 * rs3]
         out_ptr[unsafe_offset=i] = _bin_vec_op[
             dtype, out_dtype, op_code, is_cmp, 1
-        ](a, b)[0]
+        ](a, b, alpha, Int(scalar_side_arg))[0]
         i += gstride
 
 
-@__name(t"binary_flat_vec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
-def _bin_flat_vec_kernel[
+@__name(t"binary_strided_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_bcast_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    ls3_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rs3_arg: Int64,
+    total_arg: Int64,
+):
+    """The pre-exactness signature, launched on every non-NVIDIA target so
+    their kernels stay the ones measured there."""
+    _bin_bcast_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        d1_arg,
+        d2_arg,
+        d3_arg,
+        ls0_arg,
+        ls1_arg,
+        ls2_arg,
+        ls3_arg,
+        rs0_arg,
+        rs1_arg,
+        rs2_arg,
+        rs3_arg,
+        total_arg,
+        1,
+        0,
+    )
+
+
+@__name(t"binary_strided_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_bcast_exact_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    ls3_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rs3_arg: Int64,
+    total_arg: Int64,
+    alpha: Scalar[_opmath[dtype]()],
+    scalar_side_arg: Int64,
+):
+    """With add / sub's alpha and the CPU-scalar side (NVIDIA)."""
+    _bin_bcast_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        d1_arg,
+        d2_arg,
+        d3_arg,
+        ls0_arg,
+        ls1_arg,
+        ls2_arg,
+        ls3_arg,
+        rs0_arg,
+        rs1_arg,
+        rs2_arg,
+        rs3_arg,
+        total_arg,
+        alpha,
+        scalar_side_arg,
+    )
+
+
+@always_inline
+def _bin_flat_vec_body[
     dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
     out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
@@ -486,6 +690,8 @@ def _bin_flat_vec_kernel[
     total_arg: Int64,
     l_bcast_arg: Int64,
     r_bcast_arg: Int64,
+    alpha: Scalar[_opmath[dtype]()],
+    scalar_side_arg: Int64,
 ):
     """16-byte-vectorized binary op for the no-broadcast, all-contiguous
     case: both operands flat over the same extent as the output, or a
@@ -529,7 +735,10 @@ def _bin_flat_vec_kernel[
                 width=VW, alignment=vec_align
             ](i)
             out_ptr.unsafe_store[width=VW, alignment=out_align](
-                i, _bin_vec_op[dtype, out_dtype, op_code, is_cmp, VW](a, b)
+                i,
+                _bin_vec_op[dtype, out_dtype, op_code, is_cmp, VW](
+                    a, b, alpha, Int(scalar_side_arg)
+                ),
             )
             c += gstride
         var tail = total - nvec * VW
@@ -539,7 +748,7 @@ def _bin_flat_vec_kernel[
             var b = r_splat[0] if r_b else r_ptr[unsafe_offset=i]
             out_ptr[unsafe_offset=i] = _bin_vec_op[
                 dtype, out_dtype, op_code, is_cmp, 1
-            ](a, b)[0]
+            ](a, b, alpha, Int(scalar_side_arg))[0]
 
     # The splat flags are loop-invariant, so each arm is INSTANTIATED rather
     # than branched on per iteration: that keeps the tensor-tensor arm the
@@ -558,8 +767,52 @@ def _bin_flat_vec_kernel[
         pass_over[False, False]()
 
 
-@__name(t"binary_rowvec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
-def _bin_rowvec_kernel[
+@__name(t"binary_flat_vec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_flat_vec_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    total_arg: Int64,
+    l_bcast_arg: Int64,
+    r_bcast_arg: Int64,
+):
+    """The pre-exactness signature, launched on every non-NVIDIA target so
+    their kernels stay the ones measured there."""
+    _bin_flat_vec_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr, l_ptr, r_ptr, total_arg, l_bcast_arg, r_bcast_arg, 1, 0
+    )
+
+
+@__name(t"binary_flat_vec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_flat_vec_exact_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    total_arg: Int64,
+    l_bcast_arg: Int64,
+    r_bcast_arg: Int64,
+    alpha: Scalar[_opmath[dtype]()],
+    scalar_side_arg: Int64,
+):
+    """With add / sub's alpha and the CPU-scalar side (NVIDIA)."""
+    _bin_flat_vec_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        total_arg,
+        l_bcast_arg,
+        r_bcast_arg,
+        alpha,
+        scalar_side_arg,
+    )
+
+
+@always_inline
+def _bin_rowvec_body[
     dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
 ](
     out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
@@ -575,6 +828,8 @@ def _bin_rowvec_kernel[
     rs1_arg: Int64,
     rs2_arg: Int64,
     rows_arg: Int64,
+    alpha: Scalar[_opmath[dtype]()],
+    scalar_side_arg: Int64,
 ):
     """Vectorized along a stride-1 innermost dim; outer dims may be strided
     or broadcast (stride 0). One block per row (grid-stride over rows); the
@@ -611,10 +866,91 @@ def _bin_rowvec_kernel[
             var b = r_ptr.unsafe_load[width=VW, alignment=vec_align](rbase + j)
             out_ptr.unsafe_store[width=VW, alignment=out_align](
                 obase + j,
-                _bin_vec_op[dtype, out_dtype, op_code, is_cmp, VW](a, b),
+                _bin_vec_op[dtype, out_dtype, op_code, is_cmp, VW](
+                    a, b, alpha, Int(scalar_side_arg)
+                ),
             )
             j += step
         row += Int(grid_dim.x)
+
+
+@__name(t"binary_rowvec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_rowvec_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rows_arg: Int64,
+):
+    """The pre-exactness signature, launched on every non-NVIDIA target so
+    their kernels stay the ones measured there."""
+    _bin_rowvec_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        d1_arg,
+        d2_arg,
+        d3_arg,
+        ls0_arg,
+        ls1_arg,
+        ls2_arg,
+        rs0_arg,
+        rs1_arg,
+        rs2_arg,
+        rows_arg,
+        1,
+        0,
+    )
+
+
+@__name(t"binary_rowvec_{_op_token[op_code, is_cmp]()}_{dtype}_{out_dtype}")
+def _bin_rowvec_exact_kernel[
+    dtype: DType, out_dtype: DType, op_code: Int, is_cmp: Bool
+](
+    out_ptr: Pointer[Scalar[out_dtype], MutAnyOrigin],
+    l_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    r_ptr: Pointer[Scalar[dtype], ImmutAnyOrigin],
+    d1_arg: Int64,
+    d2_arg: Int64,
+    d3_arg: Int64,
+    ls0_arg: Int64,
+    ls1_arg: Int64,
+    ls2_arg: Int64,
+    rs0_arg: Int64,
+    rs1_arg: Int64,
+    rs2_arg: Int64,
+    rows_arg: Int64,
+    alpha: Scalar[_opmath[dtype]()],
+    scalar_side_arg: Int64,
+):
+    """With add / sub's alpha and the CPU-scalar side (NVIDIA)."""
+    _bin_rowvec_body[dtype, out_dtype, op_code, is_cmp](
+        out_ptr,
+        l_ptr,
+        r_ptr,
+        d1_arg,
+        d2_arg,
+        d3_arg,
+        ls0_arg,
+        ls1_arg,
+        ls2_arg,
+        rs0_arg,
+        rs1_arg,
+        rs2_arg,
+        rows_arg,
+        alpha,
+        scalar_side_arg,
+    )
 
 
 @always_inline
@@ -637,6 +973,8 @@ def _binary_bcast[
     rs3: Int,
     total: Int,
     ctx: DeviceContext,
+    alpha: Float64 = 1.0,
+    scalar_side: Int = 0,
 ) raises:
     comptime if (
         not is_cmp
@@ -735,74 +1073,155 @@ def _binary_bcast[
                         var blocks = _l2_wave_blocks(
                             slots, traffic, ctx
                         ) if is_cmp else _bw_flat_blocks(slots, traffic)
-                        _enqueue_cached[
-                            _bin_flat_vec_kernel[
-                                dtype, out_dtype, op_code, is_cmp
-                            ]
-                        ](
-                            ctx,
-                            blocks,
-                            1,
-                            1,
-                            GS_THREADS,
-                            out_ptr.as_unsafe_any_origin(),
-                            l_ptr.as_unsafe_any_origin().as_imm(),
-                            r_ptr.as_unsafe_any_origin().as_imm(),
-                            Int64(total),
-                            Int64(l_scalar),
-                            Int64(r_scalar),
-                        )
+                        comptime if has_nvidia_gpu_accelerator():
+                            _enqueue_cached[
+                                _bin_flat_vec_exact_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                blocks,
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(total),
+                                Int64(l_scalar),
+                                Int64(r_scalar),
+                                alpha.cast[_opmath[dtype]()](),
+                                Int64(scalar_side),
+                            )
+                        else:
+                            _enqueue_cached[
+                                _bin_flat_vec_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                blocks,
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(total),
+                                Int64(l_scalar),
+                                Int64(r_scalar),
+                            )
                     elif aligned16 and rows_aligned:
                         var rows = total // d3
-                        _enqueue_cached[
-                            _bin_rowvec_kernel[
-                                dtype, out_dtype, op_code, is_cmp
-                            ]
-                        ](
-                            ctx,
-                            max(1, min(rows, 65535)),
-                            1,
-                            1,
-                            GS_THREADS,
-                            out_ptr.as_unsafe_any_origin(),
-                            l_ptr.as_unsafe_any_origin().as_imm(),
-                            r_ptr.as_unsafe_any_origin().as_imm(),
-                            Int64(d1),
-                            Int64(d2),
-                            Int64(d3),
-                            Int64(ls0),
-                            Int64(ls1),
-                            Int64(ls2),
-                            Int64(rs0),
-                            Int64(rs1),
-                            Int64(rs2),
-                            Int64(rows),
-                        )
+                        comptime if has_nvidia_gpu_accelerator():
+                            _enqueue_cached[
+                                _bin_rowvec_exact_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                max(1, min(rows, 65535)),
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rows),
+                                alpha.cast[_opmath[dtype]()](),
+                                Int64(scalar_side),
+                            )
+                        else:
+                            _enqueue_cached[
+                                _bin_rowvec_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                max(1, min(rows, 65535)),
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rows),
+                            )
                     else:
-                        _enqueue_cached[
-                            _bin_bcast_kernel[dtype, out_dtype, op_code, is_cmp]
-                        ](
-                            ctx,
-                            _gs_blocks(total),
-                            1,
-                            1,
-                            GS_THREADS,
-                            out_ptr.as_unsafe_any_origin(),
-                            l_ptr.as_unsafe_any_origin().as_imm(),
-                            r_ptr.as_unsafe_any_origin().as_imm(),
-                            Int64(d1),
-                            Int64(d2),
-                            Int64(d3),
-                            Int64(ls0),
-                            Int64(ls1),
-                            Int64(ls2),
-                            Int64(ls3),
-                            Int64(rs0),
-                            Int64(rs1),
-                            Int64(rs2),
-                            Int64(rs3),
-                            Int64(total),
-                        )
+                        comptime if has_nvidia_gpu_accelerator():
+                            _enqueue_cached[
+                                _bin_bcast_exact_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                _gs_blocks(total),
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(ls3),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rs3),
+                                Int64(total),
+                                alpha.cast[_opmath[dtype]()](),
+                                Int64(scalar_side),
+                            )
+                        else:
+                            _enqueue_cached[
+                                _bin_bcast_kernel[
+                                    dtype, out_dtype, op_code, is_cmp
+                                ]
+                            ](
+                                ctx,
+                                _gs_blocks(total),
+                                1,
+                                1,
+                                GS_THREADS,
+                                out_ptr.as_unsafe_any_origin(),
+                                l_ptr.as_unsafe_any_origin().as_imm(),
+                                r_ptr.as_unsafe_any_origin().as_imm(),
+                                Int64(d1),
+                                Int64(d2),
+                                Int64(d3),
+                                Int64(ls0),
+                                Int64(ls1),
+                                Int64(ls2),
+                                Int64(ls3),
+                                Int64(rs0),
+                                Int64(rs1),
+                                Int64(rs2),
+                                Int64(rs3),
+                                Int64(total),
+                            )
                 else:
                     raise Error("no GPU accelerator available at compile time")
 
@@ -1035,14 +1454,22 @@ def _clamp_scalar[
     2**53 has no exact float64)."""
     var out_ptr = _make_ptr[dtype](out_addr)
     var in_ptr = _make_ptr[dtype](in_addr)
-    var lo_s: Scalar[dtype]
-    var hi_s: Scalar[dtype]
+    # The 16-bit floats clamp in float32 (ClampLimits in opmath: a bound below
+    # the type's subnormals still rounds into it), one rounding at the end.
+    # (Only the NVIDIA device code uses it: the other backends keep the native
+    # 16-bit max/min.)
+    comptime lim = DType.float32 if (
+        has_nvidia_gpu_accelerator()
+        and (dtype == DType.float16 or dtype == DType.bfloat16)
+    ) else dtype
+    var lo_s: Scalar[lim]
+    var hi_s: Scalar[lim]
     comptime if dtype.is_floating_point():
-        lo_s = _raw_f64(lo).cast[dtype]()
-        hi_s = _raw_f64(hi).cast[dtype]()
+        lo_s = _raw_f64(lo).cast[lim]()
+        hi_s = _raw_f64(hi).cast[lim]()
     else:
-        lo_s = Scalar[dtype](lo)
-        hi_s = Scalar[dtype](hi)
+        lo_s = Scalar[lim](lo)
+        hi_s = Scalar[lim](hi)
 
     @always_inline
     @__parameter
@@ -1051,10 +1478,18 @@ def _clamp_scalar[
         var i = Int(idx[0].value())
         var x = in_ptr[unsafe_offset=i]
         var v = x
-        if has_min != 0:
-            v = max(v, lo_s)
-        if has_max != 0:
-            v = min(v, hi_s)
+        comptime if lim != dtype:
+            var vf = x.cast[lim]()
+            if has_min != 0:
+                vf = max(vf, rebind[Scalar[lim]](lo_s))
+            if has_max != 0:
+                vf = min(vf, rebind[Scalar[lim]](hi_s))
+            v = vf.cast[dtype]()
+        else:
+            if has_min != 0:
+                v = max(v, rebind[Scalar[dtype]](lo_s))
+            if has_max != 0:
+                v = min(v, rebind[Scalar[dtype]](hi_s))
         comptime if dtype.is_floating_point():
             # clamp_scalar_kernel_impl returns a NaN value as is (max/min
             # may drop it under the GPU build's fast-math flags; the
@@ -1733,9 +2168,44 @@ def _add_f32_bf16_spec_into_go(a_o: Arg, b_o: Arg, out_o: Arg) raises:
         )
 
 
-def _binary_spec_into_go[
+def _binary_spec_base[
     op_code: Int, is_cmp: Bool
 ](a_o: Arg, b_o: Arg, out_o: Arg) raises:
+    _binary_spec_into_go[op_code, is_cmp](a_o, b_o, out_o, 1.0, 0)
+
+
+def _binary_dispatcher[
+    op_code: Int, is_cmp: Bool
+](argv: Argv, argc: Int) raises:
+    """Slots: a, b, out specs, then optionally alpha (f64 bits, add / sub)
+    and scalar_side (see `_bin_vec_op`)."""
+    comptime if not has_nvidia_gpu_accelerator():
+        # Without the alpha / scalar_side slots the base's own spec call:
+        # the same kernels as before the CUDA-only operand routes.
+        if argc == 3:
+            _spec_dispatcher3[
+                _binary_spec_base[op_code, is_cmp], "a binary spec op"
+            ](argv, argc)
+            return
+    if argc != 3 and argc != 5:
+        raise Error("a binary spec op expects 3 or 5 arguments, got ", argc)
+    var alpha = 1.0
+    var scalar_side = 0
+    if argc == 5:
+        alpha = _raw_f64(argv[unsafe_offset=3])
+        scalar_side = _raw_int(argv[unsafe_offset=4])
+    _binary_spec_into_go[op_code, is_cmp](
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        alpha,
+        scalar_side,
+    )
+
+
+def _binary_spec_into_go[
+    op_code: Int, is_cmp: Bool
+](a_o: Arg, b_o: Arg, out_o: Arg, alpha: Float64, scalar_side: Int) raises:
     """Launch into a caller-allocated contiguous output. Python owns
     allocation and shape math, so the call returns nothing and can hold a
     FIFO slot while its unit builds."""
@@ -1855,6 +2325,8 @@ def _binary_spec_into_go[
                         rs[3],
                         numel,
                         ctx,
+                        alpha,
+                        scalar_side,
                     )
 
 
@@ -1875,123 +2347,82 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
             )
             return 0
         comptime if _op_on["AddSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_ADD, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_ADD, False](argv, argc)
             return 0
         comptime if _op_on["SubSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_SUB, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_SUB, False](argv, argc)
             return 0
         comptime if _op_on["MulSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_MUL, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_MUL, False](argv, argc)
             return 0
         comptime if _op_on["DivSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_DIV, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_DIV, False](argv, argc)
             return 0
         comptime if _op_on["MaximumSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_MAX, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_MAX, False](argv, argc)
             return 0
         comptime if _op_on["MinimumSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_MIN, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_MIN, False](argv, argc)
             return 0
         comptime if _op_on["PowSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_POW, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_POW, False](argv, argc)
             return 0
         comptime if _op_on["RemainderSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_REMAINDER, False],
-                "a binary spec op",
-            ](argv, argc)
+            _binary_dispatcher[BOP_REMAINDER, False](argv, argc)
             return 0
         comptime if _op_on["FloorDivSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_FLOORDIV, False],
-                "a binary spec op",
-            ](argv, argc)
+            _binary_dispatcher[BOP_FLOORDIV, False](argv, argc)
             return 0
         comptime if _op_on["TruncDivSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_TRUNCDIV, False],
-                "a binary spec op",
-            ](argv, argc)
+            _binary_dispatcher[BOP_TRUNCDIV, False](argv, argc)
             return 0
         comptime if _op_on["TruncDivOpmathSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_TRUNCDIV_OPMATH, False],
-                "a binary spec op",
-            ](argv, argc)
+            _binary_dispatcher[BOP_TRUNCDIV_OPMATH, False](argv, argc)
+            return 0
+        comptime if _op_on["DivByScalarSpec"]():
+            _binary_dispatcher[BOP_DIV_BY_SCALAR, False](argv, argc)
+            return 0
+        comptime if _op_on["TruncDivByScalarSpec"]():
+            _binary_dispatcher[BOP_TRUNCDIV_BY_SCALAR, False](argv, argc)
+            return 0
+        comptime if _op_on["FloorDivByScalarSpec"]():
+            _binary_dispatcher[BOP_FLOORDIV_BY_SCALAR, False](argv, argc)
             return 0
         comptime if _op_on["BitwiseAndSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_AND, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_AND, False](argv, argc)
             return 0
         comptime if _op_on["BitwiseOrSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_OR, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_OR, False](argv, argc)
             return 0
         comptime if _op_on["BitwiseXorSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[BOP_XOR, False], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[BOP_XOR, False](argv, argc)
             return 0
         comptime if _op_on["EqSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[COP_EQ, True], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[COP_EQ, True](argv, argc)
             return 0
         comptime if _op_on["NeSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[COP_NE, True], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[COP_NE, True](argv, argc)
             return 0
         comptime if _op_on["LtSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[COP_LT, True], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[COP_LT, True](argv, argc)
             return 0
         comptime if _op_on["LeSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[COP_LE, True], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[COP_LE, True](argv, argc)
             return 0
         comptime if _op_on["GtSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[COP_GT, True], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[COP_GT, True](argv, argc)
             return 0
         comptime if _op_on["GeSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[COP_GE, True], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[COP_GE, True](argv, argc)
             return 0
         comptime if _op_on["LogicalAndSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[COP_LAND, True], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[COP_LAND, True](argv, argc)
             return 0
         comptime if _op_on["LogicalXorSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[COP_LXOR, True], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[COP_LXOR, True](argv, argc)
             return 0
         comptime if _op_on["LogicalOrSpec"]():
-            _spec_dispatcher3[
-                _binary_spec_into_go[COP_LOR, True], "a binary spec op"
-            ](argv, argc)
+            _binary_dispatcher[COP_LOR, True](argv, argc)
             return 0
         comptime if _op_on["BitwiseNot"]():
             _bitwise_not_dispatcher(argv, argc)

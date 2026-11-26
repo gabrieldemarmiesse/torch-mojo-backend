@@ -8,12 +8,8 @@ public API only; `CallChecker` (or `native.op_count` for the ops with no
 """
 
 import contextlib
-import functools
 import itertools
-import json
 import math
-import pathlib
-import sys
 from typing import TypeAlias
 
 import pytest
@@ -21,10 +17,11 @@ import torch
 
 from tests.native.conftest import (
     flush_subnormals_on_metal,
+    is_cuda,
     is_metal,
-    require_stock_cuda,
     skip_if_metal,
 )
+from tests.native.cuda_oracle import CudaOracle
 from torch_mojo_backend import aten_functions, get_accelerators, native
 
 
@@ -124,6 +121,38 @@ def test_div_int_honours_a_changed_default_dtype(mojo_gpu):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_add_sub_alpha_reduced_precision_is_one_float_fma(mojo_gpu, dtype):
+    """CUDA's add kernel computes `a + alpha * b` in float (opmath) with alpha
+    converted straight to float, as one fma, and rounds to the half type
+    once (sub: alpha negated); tests/native/test_binary_cuda_parity.py holds
+    it to stock CUDA bit for bit where CUDA runs."""
+    if not is_cuda(mojo_gpu):
+        pytest.skip("CUDA's opmath fma alpha applies on NVIDIA only")
+    a = (torch.arange(64, dtype=torch.float32) / 7.0 - 4.0).to(dtype)
+    b = (torch.arange(64, dtype=torch.float32) / 3.0 - 10.0).to(dtype)
+    alpha = 1.0 / 3.0
+    alpha32 = torch.tensor(alpha, dtype=torch.float32).double()
+    ad, bd = a.to(mojo_gpu), b.to(mojo_gpu)
+
+    def fma(sign: float) -> torch.Tensor:
+        # exact in float64 (11-bit operands, a 24-bit alpha), one float
+        # rounding, then the half type
+        return (a.double() + sign * alpha32 * b.double()).float().to(dtype)
+
+    got = torch.add(ad, bd, alpha=alpha)
+    assert got.dtype == dtype
+    torch.testing.assert_close(got.cpu(), fma(1.0), atol=0, rtol=0)
+    got_sub = torch.sub(ad, bd, alpha=alpha)
+    torch.testing.assert_close(got_sub.cpu(), fma(-1.0), atol=0, rtol=0)
+    # alpha rounded to the half type first (CPU torch's scalar loop) gives a
+    # DIFFERENT tensor: without this the test would pass on the
+    # implementation it is meant to reject.
+    alpha_r = torch.tensor(alpha).to(dtype).float()
+    rounded = (a.float() + (alpha_r * b.float()).to(dtype).float()).to(dtype)
+    assert not torch.equal(rounded, got.cpu())
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_add_sub_alpha_reduced_precision_rounds_like_cpu(mojo_gpu, dtype):
     """ATen's CPU add/sub kernel takes `alpha` as a scalar_t (rounded to the
     half type) and its scalar loop computes `a + alpha * b` one rounding at a
@@ -132,6 +161,8 @@ def test_add_sub_alpha_reduced_precision_rounds_like_cpu(mojo_gpu, dtype):
     and add into one rounding, so which loop a given element hits depends on
     the tensor size and the CPU's vector width. The conformance suite is the
     CPU-parity check, on the small samples where the two agree."""
+    if is_cuda(mojo_gpu):
+        pytest.skip("NVIDIA computes alpha in float opmath (the test above)")
     a = (torch.arange(64, dtype=torch.float32) / 7.0 - 4.0).to(dtype)
     b = (torch.arange(64, dtype=torch.float32) / 3.0 - 10.0).to(dtype)
     alpha = 1.0 / 3.0
@@ -245,20 +276,15 @@ def test_bool_add_alpha_checks(mojo_gpu):
 
 
 # add / sub / rsub with an alpha into an output of another dtype, against
-# stock CUDA (torch 2.11, H100; binary_alpha_cuda.json next to this file):
+# stock CUDA (the live oracle, tests/native/cuda_oracle.py):
 # CUDA's alpha_check reads the iterator's OUTPUT dtype (the out=, or self in
 # place), after compute_types' canCast of the common dtype into it, and the
 # kernel then converts alpha into the computation dtype (a float truncated,
 # a bool from nonzero, -alpha for sub, range-checked). CPU torch shares the
 # meta, but a same-dtype out cannot show the difference.
 #
-# The JSON maps a case id, "op/variant/input-dtype[->out-dtype]/alpha=<repr>",
-# to its outcome: {"dtype", "values"} or {"error", "message"}, one case per
-# line in generation order. To rewrite it, on a machine with stock CUDA
-# torch:
-#   uv run python -c "from tests.native.test_binary import write_alpha_cuda_json; write_alpha_cuda_json()"
-_ALPHA_JSON = pathlib.Path(__file__).parent / "binary_alpha_cuda.json"
-# one case's outcome: {"dtype", "values"} or {"error", "message"}
+# A case id, "op/variant/input-dtype[->out-dtype]/alpha=<repr>", maps to its
+# outcome: {"dtype", "values"} or {"error", "message"}.
 _Outcome: TypeAlias = dict[
     str,
     str
@@ -307,9 +333,9 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-def _json_number(v: float) -> float | str:
-    """A value JSON holds and `==` compares: NaN and the infinities as
-    "nan", "inf", "-inf"."""
+def _comparable(v: float) -> float | str:
+    """A value `==` compares: NaN and the infinities as "nan", "inf",
+    "-inf"."""
     return v if math.isfinite(v) else str(v)
 
 
@@ -321,9 +347,9 @@ def _alpha_outcome(fn) -> _Outcome:
         return {"error": type(error).__name__, "message": message}
     values = t.cpu().tolist()
     if t.is_complex():  # JSON has no complex: [re, im]
-        values = [[_json_number(v.real), _json_number(v.imag)] for v in values]
+        values = [[_comparable(v.real), _comparable(v.imag)] for v in values]
     elif t.dtype.is_floating_point:
-        values = [_json_number(v) for v in values]
+        values = [_comparable(v) for v in values]
     return {"dtype": _dtype_name(t.dtype), "values": values}
 
 
@@ -369,59 +395,14 @@ _ALPHA_GROUPS = [
 ]
 
 
-def _all_alpha_cases(device: str) -> dict[str, _Outcome]:
-    cases = {}
-    for op, variant in _ALPHA_GROUPS:
-        cases.update(_alpha_cases(device, op, variant))
-    return cases
-
-
-def write_alpha_cuda_json():
-    """Rewrite binary_alpha_cuda.json from stock CUDA torch (see above)."""
-    assert torch.version.cuda is not None and torch.cuda.is_available(), (
-        "needs stock CUDA torch"
-    )
-    cases = _all_alpha_cases("cuda")
-    # one case per line, so a diff names the cases that changed
-    lines = [f" {json.dumps(k)}: {json.dumps(v)}" for k, v in cases.items()]
-    _ALPHA_JSON.write_text("{\n" + ",\n".join(lines) + "\n}\n")
-
-
-@functools.cache
-def _alpha_cuda() -> dict[str, _Outcome]:
-    return json.loads(_ALPHA_JSON.read_text())
-
-
-# The C++ type names in CUDA's messages are the host compiler's (Linux
-# GCC); the mojo device prints the names of the host it runs on.
-_MACOS_TYPE_NAMES = [
-    ("long unsigned int", "unsigned long long"),
-    ("short unsigned int", "unsigned short"),
-    ("long int", "long long"),
-    ("short int", "short"),
-]
-
-
-def _as_on_this_host(outcome: _Outcome) -> _Outcome:
-    if sys.platform != "darwin" or "message" not in outcome:
-        return outcome
-    message = outcome["message"]
-    for linux, macos in _MACOS_TYPE_NAMES:
-        message = message.replace(linux, macos)
-    return {**outcome, "message": message}
-
-
 @pytest.mark.parametrize(
     ("op", "variant"), _ALPHA_GROUPS, ids=[f"{o}/{v}" for o, v in _ALPHA_GROUPS]
 )
-def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(mojo_gpu, op, variant):
-    got = _alpha_cases(mojo_gpu, op, variant)
-    recorded = _alpha_cuda()
-    want = {
-        key: _as_on_this_host(recorded[key])
-        for key in recorded
-        if key.startswith(f"{op}/{variant}/")
-    }
+def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(
+    cuda_oracle: CudaOracle, op, variant
+):
+    got = _alpha_cases(cuda_oracle.mojo, op, variant)
+    want = _alpha_cases(cuda_oracle.cuda, op, variant)
     assert got.keys() == want.keys()
     mismatches = {
         key: {"got": got[key], "want": want[key]}
@@ -429,15 +410,6 @@ def test_add_sub_alpha_into_another_out_dtype_matches_stock_cuda(mojo_gpu, op, v
         if got[key] != want[key]
     }
     assert mismatches == {}
-
-
-@pytest.mark.gpu  # the mojo GPU shards: the CI runners with stock CUDA torch
-def test_add_sub_alpha_data_regenerates_on_stock_cuda():
-    require_stock_cuda()
-    got = _all_alpha_cases("cuda")
-    want = _alpha_cuda()
-    assert list(got) == list(want)
-    assert {k: v for k, v in got.items() if v != want[k]} == {}
 
 
 def test_inplace_add_rejects_partial_overlap(mojo_gpu):
@@ -534,14 +506,15 @@ def test_non_contiguous_mixed_dtype(mojo_device):
 
 
 def test_unsupported_mix_declines(mojo_device):
-    """A promotion needing a cast the cast kernel lacks (uint16) declines
-    (NotImplementedError); one it has promotes like `torch.result_type`
-    (int8 + int16 is int16, float32 + int64 is float32)."""
+    """uint16 with a signed integer is c10's "Promotion for uint16, uint32,
+    uint64 types is not supported" RuntimeError (as on CUDA); the ones it has
+    promote like `torch.result_type` (int8 + int16 is int16, float32 + int64
+    is float32)."""
     a8_cpu, a8 = _both((4,), torch.int8, mojo_device)
     b16_cpu, b16 = _both((4,), torch.int16, mojo_device)
     torch.testing.assert_close((a8 + b16).cpu(), a8_cpu + b16_cpu)
     u = torch.ones(4, dtype=torch.uint16, device=mojo_device)
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(RuntimeError, match="Promotion for uint16"):
         u + b16
     a_cpu, a = _both((4,), torch.float32, mojo_device)
     b_cpu, b = _both((4,), torch.int64, mojo_device)
@@ -960,12 +933,43 @@ def test_floor_divide(mojo_device):
 @pytest.mark.parametrize(
     "divisor", ["number", "one_element", "zero_dim", "cpu_zero_dim"]
 )
-def test_div_rounding_narrow_float_scalar_divisor(mojo_device, mode, dtype, divisor):
+def test_div_rounding_narrow_float_scalar_divisor(cuda_oracle, mode, dtype, divisor):
+    """A CPU-scalar divisor (a number, a CPU 0-d tensor) takes CUDA's scalar
+    route: read as a float and multiplied by its float reciprocal. A device
+    divisor, one element or not, is an ordinary tensor: the quotient rounds
+    to bf16 before the trunc (-6.3125 / -1.0547 is 6)."""
+    a = torch.tensor([-6.3125, 7.0, 3.0, -3.0, 0.5, -1e-3], dtype=dtype)
+    for value in (-1.0547, 1.0001, -2.5):
+
+        def fn(x, value=value):
+            if divisor == "number":
+                b = value
+            elif divisor == "one_element":
+                b = torch.tensor([value], dtype=dtype, device=x.device)
+            elif divisor == "zero_dim":
+                b = torch.tensor(value, dtype=dtype, device=x.device)
+            else:
+                b = torch.tensor(value, dtype=dtype)
+            return torch.div(x, b, rounding_mode=mode)
+
+        cuda_oracle.assert_bitwise_equal(fn, a)
+
+
+@pytest.mark.parametrize("mode", ["floor", "trunc"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "divisor", ["number", "one_element", "zero_dim", "cpu_zero_dim"]
+)
+def test_div_rounding_narrow_float_scalar_divisor_non_cuda(
+    mojo_device, mode, dtype, divisor
+):
     """ATen divides a bf16/fp16 tensor by a scalar-shaped divisor in float32
     (`iter.is_scalar(2)`): -6.3125 / -1.0547 is 5.985, which rounds to 6.0 in
     bf16 before a native-precision trunc but truncates to 5 in float32. And
     a Python number keeps its own value: 3 / 1.0001 floors to 2, while
     1.0001 rounded to bf16 is 1.0 and gives 3."""
+    if is_cuda(str(mojo_device)):
+        pytest.skip("CUDA semantics: the cuda_oracle twin of this test")
     a_cpu = torch.tensor([-6.3125, 7.0, 3.0, -3.0, 0.5, -1e-3], dtype=dtype)
     a = a_cpu.to(mojo_device)
     for value in (-1.0547, 1.0001, -2.5):
@@ -983,18 +987,9 @@ def test_div_rounding_narrow_float_scalar_divisor(mojo_device, mode, dtype, divi
         )
 
 
-def test_div_trunc_narrow_float_tensor_divisor_native_precision(mojo_device):
-    """A multi-element divisor is ATen's general trunc loop: the quotient is
-    rounded to bf16 before the trunc (6.0 here, not the scalar path's 5)."""
-    a_cpu = torch.tensor([-6.3125, -6.3125], dtype=torch.bfloat16)
-    b_cpu = torch.tensor([-1.0547, -1.0547], dtype=torch.bfloat16)
-    expected = torch.div(a_cpu, b_cpu, rounding_mode="trunc")
-    assert expected.tolist() == [6.0, 6.0]
-    out = torch.div(a_cpu.to(mojo_device), b_cpu.to(mojo_device), rounding_mode="trunc")
-    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
-
-
-def test_floor_divide_narrow_float_scalar(mojo_device):
+def test_floor_divide_narrow_float_scalar_non_cuda(mojo_device):
+    if is_cuda(str(mojo_device)):
+        pytest.skip("CUDA semantics: the cuda_oracle twin of this test")
     a_cpu = torch.tensor([3.0, -3.0, 5.0, 7.0], dtype=torch.bfloat16)
     with native_ran("aten::floor_divide", "aten::floor_divide.Scalar"):
         out = a_cpu.to(mojo_device) // 1.0001
@@ -1002,9 +997,11 @@ def test_floor_divide_narrow_float_scalar(mojo_device):
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.uint8])
-def test_div_int_by_zero_host_scalar_raises(mojo_device, dtype):
+def test_div_int_by_zero_host_scalar_raises_non_cuda(mojo_device, dtype):
     """CPU torch raises for an integer quotient by zero. A host-scalar zero is
     known without touching the device, so the mojo device raises too."""
+    if is_cuda(str(mojo_device)):
+        pytest.skip("CUDA semantics: the cuda_oracle twin of this test")
     a = torch.tensor([1, 5, 0], dtype=dtype).to(mojo_device)
     for mode in ("floor", "trunc"):
         with pytest.raises(RuntimeError, match="ZeroDivisionError"):
@@ -1016,17 +1013,52 @@ def test_div_int_by_zero_host_scalar_raises(mojo_device, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_div_int_by_zero_tensor_gives_zero(mojo_device, dtype):
+def test_div_int_by_zero_tensor_gives_zero_non_cuda(mojo_device, dtype):
     """A zero element of a DEVICE divisor cannot raise without a sync; floor
     and trunc both give 0 for it (ATen's `div_floor_integer` value), and
     trunc's sign fixup no longer turns that into 1 for a negative
     numerator."""
+    if is_cuda(str(mojo_device)):
+        pytest.skip("CUDA semantics: the cuda_oracle twin of this test")
     a = torch.tensor([1, -1, -7, 7], dtype=dtype).to(mojo_device)
     b = torch.tensor([0, 0, 2, -2], dtype=dtype).to(mojo_device)
     for mode, rest in (("floor", [-4, -4]), ("trunc", [-3, -3])):
         with native_ran("aten::div.Tensor_mode"):
             out = torch.div(a, b, rounding_mode=mode)
         assert out.cpu().tolist() == [0, 0, *rest]
+
+
+def test_div_trunc_narrow_float_tensor_divisor_native_precision(mojo_device):
+    """A tensor divisor: the quotient is rounded to bf16 before the trunc
+    (6.0 here, not the scalar route's 5)."""
+    a_cpu = torch.tensor([-6.3125, -6.3125], dtype=torch.bfloat16)
+    b_cpu = torch.tensor([-1.0547, -1.0547], dtype=torch.bfloat16)
+    expected = torch.div(a_cpu, b_cpu, rounding_mode="trunc")
+    assert expected.tolist() == [6.0, 6.0]
+    out = torch.div(a_cpu.to(mojo_device), b_cpu.to(mojo_device), rounding_mode="trunc")
+    torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+
+def test_floor_divide_narrow_float_scalar(cuda_oracle):
+    a = torch.tensor([3.0, -3.0, 5.0, 7.0], dtype=torch.bfloat16)
+    cuda_oracle.assert_bitwise_equal(lambda x: x // 1.0001, a)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.uint8])
+def test_div_int_by_zero_does_not_raise(cuda_oracle, dtype):
+    """Stock CUDA does not raise for an integer quotient by zero (CPU torch
+    does): it returns what the GPU's division sequence gives, by a number,
+    a CPU 0-d tensor or a device tensor alike."""
+    a = torch.tensor([1, 5, 0, 7, 100], dtype=dtype)
+    for mode in ("floor", "trunc"):
+        cuda_oracle.assert_bitwise_equal(
+            lambda x, mode=mode: torch.div(x, 0, rounding_mode=mode), a
+        )
+    cuda_oracle.assert_bitwise_equal(lambda x: x // 0, a)
+    cuda_oracle.assert_bitwise_equal(
+        lambda x: torch.floor_divide(x, torch.tensor(0)), a
+    )
+    cuda_oracle.assert_bitwise_equal(lambda x: x // torch.zeros_like(x), a)
 
 
 @pytest.mark.parametrize("mode", ["floor", "trunc"])
@@ -2033,7 +2065,11 @@ def test_clamp_scalar_bound_overflow(mojo_device, dtype):
     """A finite Scalar bound past the result dtype's range raises as c10's
     checked conversion does, even on an empty tensor; inf and NaN bounds
     are fine, and a NaN fill never converts the other bound."""
-    big = {torch.float16: 70000.0, torch.bfloat16: 1e39, torch.float32: 1e40}[dtype]
+    # CUDA converts the bound to opmath float (ClampLimits), so a half bound
+    # of 70000 is fine there; past float32 it raises
+    big = {torch.float16: 1e39, torch.bfloat16: 1e39, torch.float32: 1e40}[dtype]
+    if dtype == torch.float16 and not is_cuda(str(mojo_device)):
+        big = 70000.0  # the bound converts to float16 itself off NVIDIA
     x_cpu = torch.tensor([1.0, -2.0, 3.0], dtype=dtype)
     x = x_cpu.to(mojo_device)
     raising = [
@@ -2145,7 +2181,13 @@ def test_rsub_checks_and_rank_promotion(mojo_gpu):
 )
 def test_rsub_alpha_overflowing_result_dtype(mojo_gpu, dtype, alpha, ok_alpha):
     """A finite alpha past the result dtype's range raises, as CPU torch's
-    checked `alpha.to<scalar_t>()` does, instead of scaling by inf."""
+    checked `alpha.to<scalar_t>()` does, instead of scaling by inf. CUDA
+    raises the same for these dtypes (checked on stock CUDA); float16 is
+    the exception, see test_rsub_float16_alpha_is_float_opmath. Off NVIDIA
+    the message is CPU torch's (the result dtype's name)."""
+    cuda = is_cuda(mojo_gpu)
+    if cuda and dtype == torch.float16:
+        pytest.skip("CUDA converts a half alpha to float: no overflow")
     x_cpu = torch.tensor([1.0], dtype=dtype)
     x = x_cpu.to(mojo_gpu)
     for other_cpu in (3, x_cpu):
@@ -2154,11 +2196,38 @@ def test_rsub_alpha_overflowing_result_dtype(mojo_gpu, dtype, alpha, ok_alpha):
             torch.rsub(x_cpu, other_cpu, alpha=alpha)
         with pytest.raises(RuntimeError, match="without overflow") as err:
             torch.rsub(x, other, alpha=alpha)
-        assert str(err.value).startswith(str(cpu_err.value).splitlines()[0])
+        if cuda:
+            # CUDA converts alpha to opmath: "float" for bfloat16 too
+            assert str(err.value).startswith(
+                "value cannot be converted to type float without overflow"
+            )
+        else:
+            assert str(err.value).startswith(str(cpu_err.value).splitlines()[0])
         torch.testing.assert_close(
             torch.rsub(x, other, alpha=ok_alpha).cpu(),
             torch.rsub(x_cpu, other_cpu, alpha=ok_alpha),
         )
+
+
+def test_rsub_float16_alpha_is_float_opmath(mojo_gpu):
+    if not is_cuda(mojo_gpu):
+        pytest.skip("CUDA-only: a half alpha converts to float there")
+    """CUDA converts alpha to opmath (float) and rounds the result to half
+    once, so a half-range alpha of 7e4 does not raise there (CPU torch
+    does): `3 - 7e4 * 1` is -inf in half. Verified on stock CUDA."""
+    x = torch.tensor([1.0], dtype=torch.float16).to(mojo_gpu)
+    for other_cpu in (
+        torch.tensor([3.0], dtype=torch.float16),
+        torch.tensor([-2.5], dtype=torch.float16),
+    ):
+        other = other_cpu.to(mojo_gpu)
+        for alpha in (7e4, 6e4):
+            expect = (other_cpu.float() - torch.tensor(alpha, dtype=torch.float32)).to(
+                torch.float16
+            )
+            torch.testing.assert_close(
+                torch.rsub(x, other, alpha=alpha).cpu(), expect, atol=0, rtol=0
+            )
 
 
 def test_rsub_integral_promotes_before_alpha(mojo_gpu):
@@ -2397,7 +2466,35 @@ def test_floor_divide_out_errors(mojo_gpu):
     a = torch.ones(3, device=mojo_gpu)
     with pytest.raises(RuntimeError, match="can't be cast"):
         torch.floor_divide(a, a, out=torch.empty(3, dtype=torch.long, device=mojo_gpu))
-    with pytest.raises(RuntimeError, match="ZeroDivisionError"):
-        torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
+    if is_cuda(mojo_gpu):
+        # CUDA does not raise on an integer division by zero: the GPU's
+        # division sequence gives 2**32 - 1 for these int64 operands
+        # (test_divmod_cuda_parity)
+        z = torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
+        assert z.cpu().tolist() == [2**32 - 1] * 3
+    else:
+        with pytest.raises(RuntimeError, match="ZeroDivisionError"):
+            torch.ones(3, dtype=torch.long, device=mojo_gpu).floor_divide_(0)
     with pytest.raises(RuntimeError):
         a.clone().floor_divide_(torch.ones(2, 3, device=mojo_gpu))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.int32])
+@pytest.mark.parametrize("fn", [torch.add, torch.sub, torch.mul, torch.rsub])
+def test_rank5_tensor_with_python_scalar(mojo_gpu, fn, dtype):
+    """Rank > 4 with a number used to raise "rank > 4 needs equal shapes"
+    (float64 add / sub / mul, int rsub): the number runs against the dense
+    tensor as one flat span."""
+    x_cpu = torch.arange(2 * 3 * 4 * 5 * 6).reshape(2, 3, 4, 5, 6).to(dtype)
+    x = x_cpu.to(mojo_gpu)
+    for scalar in (2, 3.5) if dtype.is_floating_point else (2,):
+        torch.testing.assert_close(
+            fn(x, scalar).cpu(), fn(x_cpu, scalar), rtol=0, atol=0
+        )
+        if fn is not torch.rsub:
+            torch.testing.assert_close(
+                fn(scalar, x).cpu() if fn is not torch.sub else (scalar - x).cpu(),
+                fn(scalar, x_cpu) if fn is not torch.sub else scalar - x_cpu,
+                rtol=0,
+                atol=0,
+            )

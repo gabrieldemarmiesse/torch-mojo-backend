@@ -24,10 +24,12 @@ for every registered op; tests/native/test_float8.py pins them.
 """
 from std.ffi import external_call
 
+from tmb.backend.device import dev
 from tmb.backend.abi import (
     default_complex_dtype,
     default_dtype,
     is_complex_stype,
+    v_tensor_c,
     TAG_BOOL,
     TAG_COMPLEX,
     TAG_DOUBLE,
@@ -697,6 +699,8 @@ def f8_iter[
     label: StaticString = "",
     overlap: Bool = True,
     alpha_idx: Int = -1,
+    convert_to_out: Bool = False,
+    cast_first: Bool = False,
 ](args: Values, n_args: Int, rets: Values, n_rets: Int) raises:
     """`ins`: bitmask of the operand args; `out_idx`: the out= (or, inside
     `ins`, the in-place self) arg, -1 for none; `alpha_idx`: add / sub's
@@ -710,6 +714,39 @@ def f8_iter[
     comptime if out_idx >= 0:
         if _f8_rec(args[unsafe_offset=out_idx]):
             touched = True
+        comptime if int_only or cast_first:
+            # a float operand reaches the can't-cast check before the
+            # kernel's integer-only dispatch refuses it
+            for i in range(_MAX_ARGS):
+                if (ins >> i) & 1 == 1 and _rec_tensor(args[unsafe_offset=i]):
+                    var st = external_call["tmb_tensor_dtype", Int32](
+                        Int(args[unsafe_offset=i].a)
+                    )
+                    if i != out_idx and (
+                        is_float_stype(st) or is_complex_stype(st)
+                    ):
+                        touched = True
+        comptime if convert_to_out:
+            # the kernel computes in out's dtype: operands of another one
+            # (an int pair into a float out) are converted first. CUDA only:
+            # elsewhere the common dtype is computed and cast on store.
+            var od = external_call["tmb_tensor_dtype", Int32](
+                Int(args[unsafe_offset=out_idx].a)
+            )
+            var out_t = v_tensor_c(args[unsafe_offset=out_idx])
+            if out_t.on_mojo() and dev(out_t.device)[].api == "cuda":
+                for i in range(_MAX_ARGS):
+                    if (ins >> i) & 1 == 1 and _rec_tensor(
+                        args[unsafe_offset=i]
+                    ):
+                        if (
+                            i != out_idx
+                            and external_call["tmb_tensor_dtype", Int32](
+                                Int(args[unsafe_offset=i].a)
+                            )
+                            != od
+                        ):
+                            touched = True
     if not touched:
         op(args, n_args, rets, n_rets)
         return

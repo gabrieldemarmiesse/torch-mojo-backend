@@ -600,6 +600,68 @@ def test_pow(
         )
 
 
+_POW_EXPONENTS = {"rsqrt": -0.5, "sqrt": 0.5, "recip": -1.0}
+
+
+@pytest.mark.parametrize("dtype_id", ("f32", "f64"))
+@pytest.mark.parametrize("layout", tuple(_POW_EXPONENTS))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("pow")
+def test_pow_special_exponent(
+    shape_id: str,
+    layout: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    """pow with the exponents PowKernel.cu sends to the sqrt / rsqrt /
+    reciprocal kernels."""
+    dtype = torch.float64 if dtype_id == "f64" else DTYPES[dtype_id]
+    a_ref, a_our = both(unit_interval(SHAPES[shape_id], dtype), hw, mojo_device)
+    e = _POW_EXPONENTS[layout]
+    bench.run(
+        lambda: torch.pow(a_ref, e),
+        lambda: torch.pow(a_our, e),
+        flops=float(a_ref.numel()),
+    )
+
+
+@pytest.mark.parametrize("dtype_id", ("c128",))
+@pytest.mark.parametrize("layout", ("Scalar", "Tensor"))
+@pytest.mark.parametrize("shape_id", SHAPES)
+@pytest.mark.bench_op("pow")
+def test_pow_complex128(
+    shape_id: str,
+    layout: str,
+    dtype_id: str,
+    bench: Bench,
+    hw: Hardware,
+    mojo_device: torch.device,
+):
+    shape = SHAPES[shape_id]
+    a = torch.complex(
+        unit_interval(shape, torch.float64), unit_interval(shape, torch.float64)
+    )
+    b = torch.complex(
+        unit_interval(shape, torch.float64), unit_interval(shape, torch.float64)
+    )
+    a_ref, a_our = both(a, hw, mojo_device)
+    b_ref, b_our = both(b, hw, mojo_device)
+    if layout == "Scalar":
+        bench.run(
+            lambda: torch.pow(a_ref, 1.5),
+            lambda: torch.pow(a_our, 1.5),
+            flops=float(a_ref.numel()),
+        )
+    else:
+        bench.run(
+            lambda: torch.pow(a_ref, b_ref),
+            lambda: torch.pow(a_our, b_our),
+            flops=float(a_ref.numel()),
+        )
+
+
 @pytest.mark.parametrize("dtype_id", ("f32",))
 @pytest.mark.parametrize("layout", ("Scalar", "Tensor"))
 @pytest.mark.parametrize("shape_id", SHAPES)

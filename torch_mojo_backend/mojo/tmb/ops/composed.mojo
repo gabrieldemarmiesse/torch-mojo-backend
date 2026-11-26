@@ -575,6 +575,19 @@ def op_where_self_out(
     the functional result rather than recomputed, so the two overloads can
     never disagree about it; ATen requires `out` to be exactly that dtype."""
     var out = v_tensor(args[unsafe_offset=3])
+    if out.on_mojo() and dev(out.device)[].api == "cuda":
+        var common = result_type(
+            v_tensor_c(args[unsafe_offset=1]), v_tensor_c(args[unsafe_offset=2])
+        )
+        if common != out.stype:
+            # where_self_out's first check (CUDA's order; elsewhere the
+            # functional result is computed first, as before)
+            raise Error(
+                "Expected out type to be ",
+                scalar_type_name(common),
+                " but got ",
+                scalar_type_name(out.stype),
+            )
     var r = own(
         _dispatch(
             "aten::where",

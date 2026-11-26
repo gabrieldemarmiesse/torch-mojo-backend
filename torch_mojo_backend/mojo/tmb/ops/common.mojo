@@ -17,6 +17,9 @@ from tmb.backend.abi import (
     ST_FLOAT8_E8M0FNU,
     ST_BFLOAT16,
     TAG_BOOL,
+    TAG_DTYPE,
+    TAG_NONE,
+    TAG_TENSOR,
     TAG_COMPLEX,
     TAG_DOUBLE,
     TAG_SCALAR_DOUBLE,
@@ -183,6 +186,28 @@ def broadcast_shape(a: T, b: T) raises -> IndexList[MAX_RANK]:
         else:
             raise Error("shapes are not broadcastable")
     return shape
+
+
+def check_broadcastable(ts: List[T]) raises:
+    """TensorIterator's compute_shape over `ts` in operand order: infer_size's
+    error, trailing dims first, raised before any dtype or device check."""
+    var shape = IndexList[MAX_RANK](1)
+    var rank = 0
+    for n in range(len(ts)):
+        rank = max(rank, ts[n].rank)
+        for j in range(MAX_RANK):
+            var k = MAX_RANK - 1 - j
+            if shape[k] == 1:
+                shape[k] = ts[n].shape[k]
+            elif ts[n].shape[k] != 1 and ts[n].shape[k] != shape[k]:
+                raise Error(
+                    "The size of tensor a (",
+                    shape[k],
+                    ") must match the size of tensor b (",
+                    ts[n].shape[k],
+                    ") at non-singleton dimension ",
+                    k - (MAX_RANK - rank),
+                )
 
 
 def _sizes_str(t: T) -> String:
@@ -802,18 +827,27 @@ def is_cast_pair_on(a: DType, b: DType, t: T) raises -> Bool:
     def wide_unsigned(d: DType) -> Bool:
         return d == DType.uint16 or d == DType.uint32 or d == DType.uint64
 
-    return (is_float8(a) and wide_unsigned(b)) or (
+    if (is_float8(a) and wide_unsigned(b)) or (
         is_float8(b) and wide_unsigned(a)
-    )
+    ):
+        return True
+    # On NVIDIA the kernel converts them against every dtype the way CUDA's
+    # copy does (cvt.rzi.u32 / u64 from a float); elsewhere CPU torch does.
+    if t.on_mojo() and dev(t.device)[].api == "cuda":
+        return (wide_unsigned(a) and is_cast_dtype_on(b, t)) or (
+            wide_unsigned(b) and is_cast_dtype_on(a, t)
+        )
+    return False
 
 
 def cast_into(dst: T, src: T, saturate: Bool = True) raises:
     """dst = src.to(dst.dtype) for a contiguous dst (data_movement CastSpec).
 
     `saturate` is copy_ / to()'s float -> e4m3fn rule on an sm_89+ NVIDIA
-    GPU (stock torch's SATFINITE intrinsic, see the kernel); a type
-    promotion (a comparison's operand, ...) converts like c10 instead and
-    passes False."""
+    GPU (stock torch's SATFINITE intrinsic from torch 2.12 on, see the
+    kernel); a type promotion (a comparison's operand, ...) converts like
+    c10 instead and passes False, and so does every copy under an older
+    torch."""
     if src.numel == 0:
         return
     var ctx = ctx_for(dst.device)
@@ -821,7 +855,15 @@ def cast_into(dst: T, src: T, saturate: Bool = True) raises:
     var call = KernelCall("data_movement", "CastSpec")
     call.arg_dtype(0, src.dtype)
     call.out_dtype(dst.dtype)
-    if not saturate and dst.dtype == DType.float8_e4m3fn:
+    # (the torch < 2.12 clause only matters where the kernel saturates: cuda;
+    # elsewhere the specialization stays origin's)
+    if dst.dtype == DType.float8_e4m3fn and (
+        not saturate
+        or (
+            dev(dst.device)[].api == "cuda"
+            and external_call["tmb_torch_version", Int32]() < 212
+        )
+    ):
         call.flag("FP8_NOSAT", 1)
     call.spec(src.spec(cp))
     call.int(dtype_code(dst.dtype))
@@ -840,6 +882,25 @@ def cast_to(t: T, stype: Int32, saturate: Bool = True) raises -> T:
     cast_into(out.t, src.t, saturate)
     _ = src^  # alive past the launch (its last use above is the pointer read)
     return out.take()
+
+
+def cast_any(t: T, stype: Int32) raises -> T:
+    """`cast_to` without saturation, through the dispatcher's `_to_copy`
+    for a pair the device cast kernel does not convert (a uint16 / uint32 /
+    uint64 end). `t` itself when unchanged: wrap it in `own_if_new`."""
+    if t.stype == stype:
+        return t.copy()
+    if is_cast_pair_on(t.dtype, max_dtype(stype), t):
+        return cast_to(t, stype, False)
+    var args = List[Value](capacity=7)
+    args.append(Value(TAG_TENSOR, 0, Int64(t.h), 0))
+    args.append(Value(TAG_DTYPE, 0, Int64(stype), 0))
+    for _ in range(3):  # layout, device, pin_memory
+        args.append(Value(TAG_NONE, 0, 0, 0))
+    args.append(Value(TAG_BOOL, 0, 0, 0))  # non_blocking=False
+    args.append(Value(TAG_NONE, 0, 0, 0))  # memory_format
+    var rets = call_op("aten::_to_copy", "", args^, 1)
+    return rets.take_tensor(0)
 
 
 def one_device(a: T, b: T) raises:
@@ -1086,6 +1147,10 @@ def _pw_float_rank(st: Int32) -> Int:
     return 3
 
 
+def _wide_unsigned_stype(st: Int32) -> Bool:
+    return st == ST_UINT16 or st == ST_UINT32 or st == ST_UINT64
+
+
 def promote_types(a: Int32, b: Int32) raises -> Int32:
     """c10::promoteTypes over the dtypes the mojo device computes on,
     complex included."""
@@ -1098,6 +1163,22 @@ def promote_types(a: Int32, b: Int32) raises -> Int32:
             (
                 "Promotion for Float8 Types is not supported, attempted to"
                 " promote "
+            ),
+            scalar_type_name(a),
+            " and ",
+            scalar_type_name(b),
+        )
+    if is_wide_unsigned(a) or is_wide_unsigned(b):
+        # c10: a uint16 / uint32 / uint64 promotes with a floating type
+        # only (bool, the other integers and complex all raise)
+        if is_float_stype(a):
+            return a
+        if is_float_stype(b):
+            return b
+        raise Error(
+            (
+                "Promotion for uint16, uint32, uint64 types is not supported,"
+                " attempted to promote "
             ),
             scalar_type_name(a),
             " and ",
@@ -1912,9 +1993,8 @@ def cast_complex(t: T, stype: Int32) raises -> T:
     if is_complex_stype(stype):
         # real -> complex: zero the pairs, then the real parts in place
         var part = real_of(stype)
-        if src.t.stype != part and not (
-            is_cast_dtype_on(src.t.dtype, src.t)
-            and is_cast_dtype_on(max_dtype(part), src.t)
+        if src.t.stype != part and not is_cast_pair_on(
+            src.t.dtype, max_dtype(part), src.t
         ):
             var converted = own(host_convert(src.t, stype))
             _ = src^
@@ -1932,9 +2012,8 @@ def cast_complex(t: T, stype: Int32) raises -> T:
         cx_unary_into("nonzero", truth.t, src.t)
         _ = src^
         return truth.take()
-    if stype != real_of(src.t.stype) and not (
-        is_cast_dtype_on(src.t.dtype, src.t)
-        and is_cast_dtype_on(max_dtype(stype), src.t)
+    if stype != real_of(src.t.stype) and not is_cast_pair_on(
+        max_dtype(real_of(src.t.stype)), max_dtype(stype), src.t
     ):
         var converted = own(host_convert(src.t, stype))
         _ = src^
@@ -2249,6 +2328,8 @@ def scalar_type_name(st: Int32) -> String:
         return "ComplexFloat"
     if st == ST_COMPLEX128:
         return "ComplexDouble"
+    if st == 8:  # complex32: a promotion result only, never held here
+        return "ComplexHalf"
     if st == ST_FLOAT8_E4M3FN:
         return "Float8_e4m3fn"
     if st == ST_FLOAT8_E5M2:

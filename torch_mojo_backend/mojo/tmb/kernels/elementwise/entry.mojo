@@ -83,6 +83,10 @@ from tmb.kernels.common.variant_gates import (
     _tmb_entry_error,
 )
 from tmb.kernels.common.div_math import floor_div, trunc_div
+from tmb.kernels.common.cuda_div_math import (
+    cuda_floor_div_by_scalar,
+    cuda_trunc_div_by_scalar,
+)
 from tmb.kernels.common.dtype_arithmetic import cast_rounded
 from tmb.kernels.common.math_utils import ieee_sqrt
 from tmb.kernels.common.pow_math import powf_c99, torch_pow
@@ -1097,17 +1101,14 @@ def _unary_bool[
 comptime SOP_ADD = 0
 comptime SOP_MUL = 1
 comptime SOP_POW = 2
-# Rounding divisions by a scalar, for bf16/fp16 tensors: ATen's CPU
-# div_floor_kernel / div_trunc_kernel take a separate path when the divisor
-# is a scalar (`iter.is_scalar(2)`) and the dtype is a reduced float, and
-# divide in float32 by the scalar's ORIGINAL value (`original_scalar_value
-# <opmath_t>`, a Python number never rounded to bf16). That is this family's
-# float32 body exactly; the logic family's broadcast route would round the
-# scalar to the tensor's dtype first, and trunc there divides in bf16.
+# Rounding divisions by a CPU scalar: stock CUDA's div_trunc / div_floor
+# kernels read it as a float (never rounded to the half dtype) and multiply
+# by its float reciprocal (cuda_div_math). A zero divisor of floor is the
+# ops layer's (true division).
 comptime SOP_FLOORDIV = 3
 comptime SOP_TRUNCDIV = 4
-# rsub(Tensor, Scalar other) with alpha 1: other - self in opmath, one
-# rounding (the CUDA sub kernel's fma(-1, self, other)).
+# `scalar + alpha * self` in opmath, one rounding: CUDA's add functor with
+# the CPU scalar first (rsub passes -alpha, its sub kernel's fma).
 comptime SOP_RSUB = 5
 
 
@@ -1187,7 +1188,10 @@ def _scalar_elementwise[
     scalar: Float32,
     size: Int,
     ctx: DeviceContext,
+    alpha: Float32 = 1,
 ) raises:
+    """`alpha`: add's `a + alpha * scalar` and rsub's `scalar + alpha * a`
+    (rsub passes -alpha), each one fma in float as CUDA's add functors."""
     comptime if not dtype.is_floating_point():
         raise Error("scalar elementwise ops require a floating point dtype")
     else:
@@ -1223,6 +1227,8 @@ def _scalar_elementwise[
         # (ROCm runs the same source). torch MPS passes it as a float
         # (UnaryKernel.mm `pow_tensor_scalar_kernel`), unrounded.
         var sv = scalar
+        # acc(1) / acc(b), on the host as CUDA does
+        var inv = Float32(1) / scalar
         comptime if (
             op_code == SOP_POW
             and not has_apple_gpu_accelerator()
@@ -1230,10 +1236,50 @@ def _scalar_elementwise[
         ):
             sv = scalar.cast[dtype]().cast[DType.float32]()
 
+        # NVIDIA only: add / rsub take alpha as one fma. Elsewhere the plain
+        # body is launched (an unused closure compiles to nothing), so those
+        # kernels stay the ones that were measured.
+        @always_inline
+        @__parameter
+        @__copy_capture(out_ptr, in_ptr, sv, alpha, inv)
+        def body_exact[width: Int, al: Int, pk: Int](i: Int):
+            var a = in_ptr.unsafe_load[width=width, alignment=al](i).cast[
+                DType.float32
+            ]()
+            var s = SIMD[DType.float32, width](sv)
+            comptime if op_code == SOP_ADD:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i,
+                    SIMD[DType.float32, width](alpha).fma(s, a).cast[dtype](),
+                )
+            comptime if op_code == SOP_MUL:
+                # The float product rounds before the half conversion
+                # (mul_kernel_cuda's opmath): see `cast_rounded`.
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, cast_rounded[dtype](a * s)
+                )
+            comptime if op_code == SOP_FLOORDIV:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, cuda_floor_div_by_scalar[dtype](a, sv, inv)
+                )
+            comptime if op_code == SOP_TRUNCDIV:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, cuda_trunc_div_by_scalar[dtype](a, inv, sv)
+                )
+            comptime if op_code == SOP_POW:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i, _pow_scalar_body[dtype, pk](a, s)
+                )
+            comptime if op_code == SOP_RSUB:
+                out_ptr.unsafe_store[width=width, alignment=al](
+                    i,
+                    SIMD[DType.float32, width](alpha).fma(a, s).cast[dtype](),
+                )
+
         @always_inline
         @__parameter
         @__copy_capture(out_ptr, in_ptr, sv)
-        def body[width: Int, al: Int, pk: Int](i: Int):
+        def body_plain[width: Int, al: Int, pk: Int](i: Int):
             var a = in_ptr.unsafe_load[width=width, alignment=al](i).cast[
                 DType.float32
             ]()
@@ -1274,7 +1320,10 @@ def _scalar_elementwise[
             @always_inline
             @__parameter
             def func[width: Int, alignment: Int = 1](idx: Coord):
-                body[width, size_of[dtype](), pk](Int(idx[0].value()))
+                comptime if has_nvidia_gpu_accelerator():
+                    body_exact[width, size_of[dtype](), pk](Int(idx[0].value()))
+                else:
+                    body_plain[width, size_of[dtype](), pk](Int(idx[0].value()))
 
             # 16-byte vectors once both bases proved aligned; the launcher's
             # width-1 tail lanes are element-aligned only.
@@ -1282,14 +1331,20 @@ def _scalar_elementwise[
             @__parameter
             def func_vec[width: Int, alignment: Int = 1](idx: Coord):
                 comptime al = 16 if width > 1 else size_of[dtype]()
-                body[width, al, pk](Int(idx[0].value()))
+                comptime if has_nvidia_gpu_accelerator():
+                    body_exact[width, al, pk](Int(idx[0].value()))
+                else:
+                    body_plain[width, al, pk](Int(idx[0].value()))
 
             # Every vector at 16-byte alignment: only launched when there
             # is no tail (the route other GPUs keep).
             @always_inline
             @__parameter
             def func_vec_no_tail[width: Int, alignment: Int = 1](idx: Coord):
-                body[width, 16, pk](Int(idx[0].value()))
+                comptime if has_nvidia_gpu_accelerator():
+                    body_exact[width, 16, pk](Int(idx[0].value()))
+                else:
+                    body_plain[width, 16, pk](Int(idx[0].value()))
 
             comptime if has_accelerator():
                 # scalar lanes moved 1.5 TB/s on H100, vectors ~3.
@@ -1980,9 +2035,21 @@ def _unary_bool_spec_into_go[op_code: Int](a_o: Arg, out_o: Arg) raises:
                     )
 
 
+def _scalar_dispatcher[op_code: Int](argv: Argv, argc: Int) raises:
+    """Slots: a, scalar, out, and optionally alpha (f64 bits)."""
+    if argc != 3 and argc != 4:
+        raise Error("a float-scalar spec op expects 3 or 4 arguments")
+    _scalar_spec_into_go[op_code](
+        argv[unsafe_offset=0],
+        argv[unsafe_offset=1],
+        argv[unsafe_offset=2],
+        Float32(_raw_f64(argv[unsafe_offset=3])) if argc == 4 else 1,
+    )
+
+
 def _scalar_spec_into_go[
     op_code: Int
-](a_o: Arg, scalar_o: Arg, out_o: Arg) raises:
+](a_o: Arg, scalar_o: Arg, out_o: Arg, alpha: Float32) raises:
     ref a = _spec_ptr(a_o)[]
     ref out = _spec_ptr(out_o)[]
     if not _dtype_supported[List[DType](FLOAT_DTYPES)](a.dtype):
@@ -2009,6 +2076,7 @@ def _scalar_spec_into_go[
                         scalar,
                         a.numel,
                         ctx,
+                        alpha,
                     )
 
 
@@ -2051,7 +2119,9 @@ def _param_unary_spec_into_go[
                     )
 
 
-def _scalar_inplace_go[op_code: Int](a_o: Arg, scalar_o: Arg) raises:
+def _scalar_inplace_go[
+    op_code: Int
+](a_o: Arg, scalar_o: Arg, alpha: Float32) raises:
     """`a op= scalar` for a contiguous float tensor, in place.
 
     The functional spec above allocates an output buffer, and the ATen in-place
@@ -2082,13 +2152,19 @@ def _scalar_inplace_go[op_code: Int](a_o: Arg, scalar_o: Arg) raises:
                     scalar,
                     a.numel,
                     ctx,
+                    alpha,
                 )
     return
 
 
 def _scalar_inplace_dispatcher[op_code: Int](argv: Argv, argc: Int) raises:
+    """Slots: a, scalar, and optionally alpha (f64 bits)."""
     var args = argv
-    _scalar_inplace_go[op_code](args[unsafe_offset=0], args[unsafe_offset=1])
+    _scalar_inplace_go[op_code](
+        args[unsafe_offset=0],
+        args[unsafe_offset=1],
+        Float32(_raw_f64(args[unsafe_offset=2])) if argc == 3 else 1,
+    )
 
 
 def _int_scalar_spec_into_go[
@@ -2367,34 +2443,22 @@ def tmb_call(argv: Argv, argc: Int, err: ErrBuf, errcap: Int) abi("C") -> Int32:
                 ](argv, argc)
                 return 0
         comptime if _op_on["AddScalarSpec"]():
-            _spec_dispatcher3[
-                _scalar_spec_into_go[SOP_ADD], "a float-scalar spec op"
-            ](argv, argc)
+            _scalar_dispatcher[SOP_ADD](argv, argc)
             return 0
         comptime if _op_on["MulScalarSpec"]():
-            _spec_dispatcher3[
-                _scalar_spec_into_go[SOP_MUL], "a float-scalar spec op"
-            ](argv, argc)
+            _scalar_dispatcher[SOP_MUL](argv, argc)
             return 0
         comptime if _op_on["PowScalarSpec"]():
-            _spec_dispatcher3[
-                _scalar_spec_into_go[SOP_POW], "a float-scalar spec op"
-            ](argv, argc)
+            _scalar_dispatcher[SOP_POW](argv, argc)
             return 0
         comptime if _op_on["RsubScalarSpec"]():
-            _spec_dispatcher3[
-                _scalar_spec_into_go[SOP_RSUB], "a float-scalar spec op"
-            ](argv, argc)
+            _scalar_dispatcher[SOP_RSUB](argv, argc)
             return 0
         comptime if _op_on["FloorDivScalarSpec"]():
-            _spec_dispatcher3[
-                _scalar_spec_into_go[SOP_FLOORDIV], "a float-scalar spec op"
-            ](argv, argc)
+            _scalar_dispatcher[SOP_FLOORDIV](argv, argc)
             return 0
         comptime if _op_on["TruncDivScalarSpec"]():
-            _spec_dispatcher3[
-                _scalar_spec_into_go[SOP_TRUNCDIV], "a float-scalar spec op"
-            ](argv, argc)
+            _scalar_dispatcher[SOP_TRUNCDIV](argv, argc)
             return 0
         comptime if _op_on["AddScalarInplace"]():
             _scalar_inplace_dispatcher[SOP_ADD](argv, argc)

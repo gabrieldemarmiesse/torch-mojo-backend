@@ -22,7 +22,7 @@
 #   cx -> cx : conj neg reciprocal exp log sqrt rsqrt sgn square
 #   cx -> re : abs angle real imag
 #   cx -> b  : isnan isinf isfinite nonzero
-#   cx, cx -> cx : add (a + p * b) mul div pow
+#   cx, cx -> cx : add (a + p * b) mul div pow pow_b0 exp_mul (exp(a * b))
 #   cx, cx -> b  : eq ne
 #   re, re -> cx : make (complex(real, imag)) polar (polar(abs, angle))
 #
@@ -34,6 +34,7 @@
 # ===----------------------------------------------------------------------=== #
 
 from max.gpu.host import DeviceContext
+from std.sys import is_nvidia_gpu
 from std.sys.info import has_accelerator, has_apple_gpu_accelerator, size_of
 from std.utils.coord import Coord
 from std.utils.numerics import isinf, isnan
@@ -48,6 +49,10 @@ from tmb.kernels.common.complex_math import (
     chypot,
     clog_jit,
     cmul,
+    cexp_mul,
+    clog,
+    cmul_scalar_first,
+    cmul_scalar_second,
     cpow,
     creciprocal,
     csgn,
@@ -88,7 +93,15 @@ comptime KINDS_CX_CX = [
 ]
 comptime KINDS_CX_RE = ["abs", "angle", "real", "imag"]
 comptime KINDS_CX_B = ["isnan", "isinf", "isfinite", "nonzero"]
-comptime KINDS_CXCX_CX = ["add", "mul", "div", "pow"]
+comptime KINDS_CXCX_CX = [
+    "add",
+    "mul",
+    "mul_recip",
+    "div",
+    "pow",
+    "pow_b0",
+    "exp_mul",
+]
 comptime KINDS_CXCX_B = ["eq", "ne"]
 comptime KINDS_RERE_CX = ["make", "polar"]
 
@@ -145,7 +158,7 @@ def _unary_b[kind: StaticString, dt: DType](z: Cx[dt]) -> Bool:
 @always_inline
 def _binary_cx[
     kind: StaticString, dt: DType
-](a: Cx[dt], b: Cx[dt], p: Cx[dt]) -> Cx[dt]:
+](a: Cx[dt], b: Cx[dt], p: Cx[dt], mode_a: Int, mode_b: Int) -> Cx[dt]:
     comptime if kind == "add":
         # BinaryAddSubKernel.cu's AddFunctor: a + alpha * b, the product
         # always formed (alpha = 1 still turns inf * 0 into NaN, as on
@@ -153,9 +166,30 @@ def _binary_cx[
         var ab = cmul(p, b)
         return Cx[dt](a.re + ab.re, a.im + ab.im)
     elif kind == "mul":
+        # MulFunctor through opmath_symmetric_gpu_kernel_with_scalars: a CPU
+        # scalar operand is always the left factor (AUnaryFunctor)
+        comptime if is_nvidia_gpu():
+            if mode_b == MODE_HOST and mode_a != MODE_HOST:
+                return cmul_scalar_first(b, a)
+            if mode_a == MODE_HOST and mode_b != MODE_HOST:
+                return cmul_scalar_first(a, b)
         return cmul(a, b)
+    elif kind == "mul_recip":
+        # div_true_kernel_cuda's `a * (1 / b)` for a CPU-scalar divisor, its
+        # reciprocal in `b` (BUnaryFunctor)
+        return cmul_scalar_second(a, b)
     elif kind == "div":
         return cdiv(a, b)
+    elif kind == "pow_b0":
+        # pow.Scalar with a complex number base: the same `exp(log(a) * b)`,
+        # whose multiply CUDA schedules with the tensor operand in the
+        # DFMA's A slot, as exp_mul's (a real number or a 0-d tensor base
+        # keeps `pow`'s order).
+        return cexp_mul(clog(a), b)
+    elif kind == "exp_mul":
+        # pow_scalar_tensor_impl's `std::exp(fct * exp)`: a = fct, the
+        # CPU-scalar base's log taken on the host
+        return cexp_mul(a, b)
     else:
         comptime assert kind == "pow", "unknown complex binary kind"
         return cpow(a, b)
@@ -214,8 +248,11 @@ def _arity[kind: StaticString]() -> Int:
     comptime if (
         kind == "add"
         or kind == "mul"
+        or kind == "mul_recip"
         or kind == "div"
         or kind == "pow"
+        or kind == "pow_b0"
+        or kind == "exp_mul"
         or kind == "eq"
         or kind == "ne"
         or _real_in[kind]()
@@ -317,7 +354,9 @@ def _launch[
                         a, b
                     ) else UInt8(0)
                 else:
-                    var r = _binary_cx[kind, dt](a, b, Cx[dt](hp_re, hp_im))
+                    var r = _binary_cx[kind, dt](
+                        a, b, Cx[dt](hp_re, hp_im), mode_a, mode_b
+                    )
                     out_ptr[unsafe_offset=2 * i] = r.re
                     out_ptr[unsafe_offset=2 * i + 1] = r.im
 

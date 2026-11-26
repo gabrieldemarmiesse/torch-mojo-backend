@@ -21,16 +21,32 @@ torch runs on CUDA, in float32 arithmetic alone (Apple GPUs have no float64;
 MPS computes a float pow there too). float64 is `_pow_f64_core`: a
 double-double log and a corrected exp, within about an ulp like CUDA's
 double pow (std.math.pow's float64 GPU lowering is 2^-12 relative off).
+
+On NVIDIA both are CUDA's own, bit for bit: float64 is libdevice's
+`nv_pow` whole (special cases included), and a float32 NaN result is the
+canonical 0x7FFFFFFF every CUDA float operation returns.
 """
 
-from std.math import floor, fma
+from std.math import floor, fma, sqrt
 from std.memory import bitcast
 from std.sys._assembly import inlined_assembly
 from std.sys.info import is_amd_gpu, is_apple_gpu, is_nvidia_gpu
 from std.utils.numerics import inf, isinf, isnan, nan
 
 from tmb.kernels.common.cuda_math import cuda_powf_core
-from tmb.kernels.common.libdevice_port import nv_exp, nv_log
+from tmb.kernels.common.libdevice_port import nv_exp, nv_log, nv_pow
+
+
+# How PowKernel.cu's pow_tensor_scalar_kernel computes `base ** exponent`
+# for a scalar exponent (the "pow_exp" pointwise kind; the host picks one):
+# the full pow, or the special exponents' own kernels.
+comptime POW_GENERAL = 0
+comptime POW_SQUARE = 1  # base * base
+comptime POW_CUBE = 2  # base * base * base
+comptime POW_INV_SQUARE = 3  # 1.0 / (base * base)
+comptime POW_SQRT = 4  # sqrt_kernel_cuda
+comptime POW_RSQRT = 5  # rsqrt_kernel_cuda
+comptime POW_RECIPROCAL = 6  # reciprocal_kernel_cuda
 
 
 @always_inline
@@ -169,7 +185,19 @@ def _core[w: DType](ax: Scalar[w], y: Scalar[w]) -> Scalar[w]:
 
 
 @always_inline
+def _nan_result[w: DType]() -> Scalar[w]:
+    """The NaN `pow` returns: CUDA's float powf gives the canonical
+    0x7FFFFFFF."""
+    comptime if w == DType.float32 and is_nvidia_gpu():
+        return rebind[Scalar[w]](Float32(from_bits=UInt32(0x7FFFFFFF)))
+    else:
+        return nan[w]()
+
+
+@always_inline
 def _pow_scalar[w: DType](x: Scalar[w], y: Scalar[w]) -> Scalar[w]:
+    comptime if w == DType.float64 and is_nvidia_gpu():
+        return rebind[Scalar[w]](nv_pow(rebind[Float64](x), rebind[Float64](y)))
     comptime if w == DType.float32 and is_nvidia_gpu():
         # The common case first, on the bits: x positive, finite and not 1,
         # y finite and nonzero need none of the selects below (three integer
@@ -189,7 +217,7 @@ def _pow_scalar[w: DType](x: Scalar[w], y: Scalar[w]) -> Scalar[w]:
     if x == 1:
         return 1
     if isnan(x) or isnan(y):
-        return nan[w]()
+        return _nan_result[w]()
     var ax = abs(x)
     if isinf(y):
         if ax == 1:
@@ -213,7 +241,7 @@ def _pow_scalar[w: DType](x: Scalar[w], y: Scalar[w]) -> Scalar[w]:
         mag = Scalar[w](0) if y < 0 else inf[w]()
     else:
         if negative and not integral:
-            return nan[w]()
+            return _nan_result[w]()
         mag = _core(ax, y)
     return -mag if negative and odd else mag
 
@@ -245,3 +273,76 @@ def pow_c99[w: DType](a: Scalar[w], b: Scalar[w]) -> Scalar[w]:
     """`powf_c99`, or for float64 the C99 double `pow` (`_pow_f64_core`)."""
     comptime assert w == DType.float32 or w == DType.float64
     return _pow_scalar[w](a, b)
+
+
+@always_inline
+def cuda_rsqrt[dtype: DType, n: Int](x: SIMD[dtype, n]) -> SIMD[dtype, n]:
+    """torch's rsqrt_kernel_cuda on float32 / float64 (`rsqrtf` / `rsqrt`):
+    PTX `rsqrt.approx.f32` / `rsqrt.approx.f64`, not correctly rounded
+    (rsqrt(0.5) is an ulp below 1 / sqrt(0.5)). Off NVIDIA: 1 / sqrt."""
+    comptime if is_nvidia_gpu() and (
+        dtype == DType.float32 or dtype == DType.float64
+    ):
+        var r = x
+        comptime for i in range(n):
+            comptime if dtype == DType.float32:
+                r[i] = rebind[Scalar[dtype]](
+                    inlined_assembly[
+                        "rsqrt.approx.f32 $0, $1;",
+                        Float32,
+                        constraints="=f,f",
+                        has_side_effect=False,
+                    ](rebind[Float32](x[i]))
+                )
+            else:
+                r[i] = rebind[Scalar[dtype]](
+                    inlined_assembly[
+                        "rsqrt.approx.f64 $0, $1;",
+                        Float64,
+                        constraints="=d,d",
+                        has_side_effect=False,
+                    ](rebind[Float64](x[i]))
+                )
+        return r
+    else:
+        return SIMD[dtype, n](1) / sqrt(x)
+
+
+@always_inline
+def cuda_sqrt[dtype: DType, n: Int](x: SIMD[dtype, n]) -> SIMD[dtype, n]:
+    """sqrt; float64 on NVIDIA as `sqrt.rn.f64`: a signalling NaN comes back
+    quieted, payload kept (the generic lowering hands it back unquieted)."""
+    comptime if is_nvidia_gpu() and dtype == DType.float64:
+        var r = x
+        comptime for i in range(n):
+            r[i] = rebind[Scalar[dtype]](
+                inlined_assembly[
+                    "sqrt.rn.f64 $0, $1;",
+                    Float64,
+                    constraints="=d,d",
+                    has_side_effect=False,
+                ](rebind[Float64](x[i]))
+            )
+        return r
+    else:
+        return sqrt(x)
+
+
+@always_inline
+def cuda_reciprocal[dtype: DType, n: Int](x: SIMD[dtype, n]) -> SIMD[dtype, n]:
+    """`1 / x`; float64 on NVIDIA as `rcp.rn.f64`, which quiets a signalling
+    NaN (payload kept) where the generic lowering returns it unquieted."""
+    comptime if is_nvidia_gpu() and dtype == DType.float64:
+        var r = x
+        comptime for i in range(n):
+            r[i] = rebind[Scalar[dtype]](
+                inlined_assembly[
+                    "rcp.rn.f64 $0, $1;",
+                    Float64,
+                    constraints="=d,d",
+                    has_side_effect=False,
+                ](rebind[Float64](x[i]))
+            )
+        return r
+    else:
+        return SIMD[dtype, n](1) / x

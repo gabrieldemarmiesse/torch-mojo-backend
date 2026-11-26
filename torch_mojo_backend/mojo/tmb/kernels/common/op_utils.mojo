@@ -30,6 +30,7 @@ from std.sys.info import (
     _has_sm_9x,
     has_accelerator,
     has_apple_gpu_accelerator,
+    has_nvidia_gpu_accelerator,
     is_nvidia_gpu,
     simd_width_of,
     size_of,
@@ -2267,6 +2268,17 @@ def _fill_bits[dtype: DType, bits: DType](value: Float64) -> Scalar[bits]:
     """
     comptime if dtype == DType.bool:
         return Scalar[bits](1) if value != Float64(0) else Scalar[bits](0)
+    elif has_nvidia_gpu_accelerator() and dtype == DType.bfloat16:
+        # (CUDA's host conversion only; other targets keep the plain cast)
+        # c10::BFloat16(float(value)) on the host: round to nearest even on
+        # the bits (subnormals kept), a NaN 0x7FC0
+        var f = bitcast[DType.uint32](value.cast[DType.float32]())
+        if (f & 0x7FFFFFFF) > 0x7F800000:
+            return Scalar[bits](0x7FC0)
+        return ((f + 0x7FFF + ((f >> 16) & 1)) >> 16).cast[bits]()
+    elif has_nvidia_gpu_accelerator() and dtype == DType.float16:
+        # c10::Half(float(value)): through float, as c10 converts a double
+        return bitcast[bits](value.cast[DType.float32]().cast[dtype]())
     else:
         return bitcast[bits](value.cast[dtype]())
 
